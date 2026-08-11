@@ -1219,6 +1219,31 @@ pub(crate) fn run(
         }
     }
 
+    // v7.37 (round 999) — SELECT DISTINCT over a GROUP BY query.
+    //
+    // Every other path deduplicates: the scan paths, the window path and
+    // the set operations all call `dedup_rows`. This one never did, so
+    // `SELECT DISTINCT count(*) FROM t GROUP BY g` returned one row per
+    // GROUP — 200 where PG18.4 returns 1, all of them the same value.
+    // Not an error, not a missing column: 199 extra rows, silently.
+    //
+    // The gate on the top-K sink above says it in as many words — "no
+    // DISTINCT (would need post-dedup, can't truncate during sort)" — so
+    // the sink correctly declines to truncate, and the post-dedup it
+    // names was never written. This is it.
+    //
+    // After the ORDER BY, like the window path: duplicate rows carry
+    // identical sort keys, so removing them cannot disturb the order.
+    // Before the LIMIT, which the caller applies, because PG deduplicates
+    // and then counts.
+    //
+    // Only `out_rows` needs it: `deferred` is empty whenever DISTINCT is
+    // set (`defer_enabled` requires `!stmt.distinct`), so nothing indexes
+    // into `kept_synth` alongside these rows.
+    if stmt.distinct {
+        out_rows = crate::select::dedup_rows(out_rows, engine.is_some_and(|e| e.backslash_escapes));
+    }
+
     let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
         (Vec::new(), Vec::new())
     } else {

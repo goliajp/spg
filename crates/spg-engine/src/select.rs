@@ -8848,7 +8848,7 @@ impl<'r> PeerIndex<'r> {
     }
 }
 
-fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
+pub(crate) fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
     dedup_by_row(rows, |r| r, mysql)
 }
 
