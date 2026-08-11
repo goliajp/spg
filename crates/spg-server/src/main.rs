@@ -798,7 +798,8 @@ fn main() {
     let limits = Limits {
         max_connections: parse_env_usize("SPG_MAX_CONNECTIONS"),
         max_query_rows: parse_env_usize("SPG_MAX_QUERY_ROWS"),
-        max_query_bytes: parse_env_u64("SPG_MAX_QUERY_BYTES"),
+        // Zero is meaningful here — see `parse_env_u64_allow_zero`.
+        max_query_bytes: parse_env_u64_allow_zero("SPG_MAX_QUERY_BYTES"),
         query_timeout_ms: parse_env_u64("SPG_QUERY_TIMEOUT_MS"),
         max_query_ns: parse_env_u64("SPG_MAX_QUERY_NS"),
         idle_timeout_sec: parse_env_u64("SPG_IDLE_TIMEOUT_SEC"),
@@ -881,9 +882,75 @@ fn parse_env_usize(env_key: &str) -> Option<usize> {
 }
 
 fn parse_env_u64(env_key: &str) -> Option<u64> {
-    env_resolve(env_key)
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
+    u64_from_raw(env_resolve(env_key), false)
+}
+
+/// The parse both readers share, taking the raw value so the ZERO rule is
+/// testable without touching the process environment.
+///
+/// `allow_zero` false drops a zero, which reads as "unset" for a timeout
+/// or an interval. True keeps it, for the knobs where zero is a setting.
+fn u64_from_raw(raw: Option<String>, allow_zero: bool) -> Option<u64> {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| allow_zero || n > 0)
+}
+
+/// v7.37 (round 996) — [`parse_env_u64`] for the knobs where an explicit
+/// zero is a SETTING rather than the absence of one.
+///
+/// `parse_env_u64` drops zero, which reads as "unset" for a timeout or an
+/// interval and is right for those. It is wrong for the query budget:
+/// `QueryBytesExceeded` tells the operator "set SPG_MAX_QUERY_BYTES to
+/// raise, 0 to disable", and the code below it has a `Some(0) => None`
+/// arm to honour that — but the zero never survived the parser, so the
+/// arm was unreachable and `=0` silently left the 256 MiB default in
+/// place. Measured: `SPG_MAX_QUERY_BYTES=1` refuses a 5000-row scan with
+/// `max_query_bytes=1`, so the value does reach the engine; `=0` reports
+/// `max_query_bytes=268435456`, the default it was supposed to remove.
+///
+/// An escape hatch named in an error message has to work, or the message
+/// sends the reader in a circle.
+fn parse_env_u64_allow_zero(env_key: &str) -> Option<u64> {
+    u64_from_raw(env_resolve(env_key), true)
+}
+
+#[cfg(test)]
+mod env_knob_tests {
+    use super::u64_from_raw;
+
+    /// r996 — `SPG_MAX_QUERY_BYTES=0` did not disable the query budget.
+    ///
+    /// `QueryBytesExceeded` tells the operator "0 to disable" and the
+    /// wiring has a `Some(0) => None` arm to honour it, but the reader
+    /// filtered zero away first, so the arm could not be reached and the
+    /// 256 MiB default stayed on. Measured against a live server before
+    /// the fix: `=1` refused a 5000-row scan citing `max_query_bytes=1`,
+    /// so the value did arrive; `=0` refused a large query citing
+    /// `max_query_bytes=268435456`, the default it was meant to remove.
+    ///
+    /// Pinned on the shared parse rather than end to end, because an
+    /// end-to-end pin would have to allocate past the DEFAULT ceiling —
+    /// a quarter of a gigabyte — to tell the two behaviours apart, and
+    /// would pass with the bug present at any smaller size.
+    #[test]
+    fn an_explicit_zero_survives_only_where_zero_is_a_setting() {
+        let zero = Some("0".to_string());
+        assert_eq!(
+            u64_from_raw(zero.clone(), true),
+            Some(0),
+            "a knob whose zero means 'disable' must receive the zero"
+        );
+        assert_eq!(
+            u64_from_raw(zero, false),
+            None,
+            "a knob whose zero means 'unset' keeps dropping it"
+        );
+        // The rest of the surface is unchanged by the split.
+        assert_eq!(u64_from_raw(Some(" 42 ".into()), false), Some(42));
+        assert_eq!(u64_from_raw(Some(" 42 ".into()), true), Some(42));
+        assert_eq!(u64_from_raw(Some("not a number".into()), true), None);
+        assert_eq!(u64_from_raw(None, true), None);
+    }
 }
 
 /// v7.37.25 (25.5) — PG GUC name alignment.
