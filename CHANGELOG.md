@@ -48,6 +48,30 @@ changes rather than by round.
 
 ### Correctness
 
+- **`SELECT DISTINCT` deduplicates over a `GROUP BY`.** It never had:
+  `SELECT DISTINCT count(*) FROM t GROUP BY g` returned one row per group
+  — 200 where PG returns 1, all the same value. Not an error and not a
+  missing column, 199 extra rows. Every other path deduplicates; the
+  aggregate one did not, and the top-K sink beside it names the missing
+  step in as many words. (r999)
+- **An `ORDER BY` can name a set-returning output column.** `SELECT
+  unnest(ARRAY[2,1]) AS u, count(*) … GROUP BY g ORDER BY 1` answered
+  `column "u" does not exist`, and `ORDER BY u` answered `function
+  unnest(integer[]) does not exist` — one gap, refused two ways, which is
+  what made it look like two. The aggregate sort now reads such a key
+  from the projected row, where the expansion has already put one value
+  per row. (r1000)
+- **A set-returning SELECT item is not deferred past its own expansion.**
+  The projection deferral added for `GROUP BY … ORDER BY <agg> LIMIT k`
+  skips the branch that expands one group into one row per element, so a
+  qualifying query came back as `function unnest(integer[]) does not
+  exist` — the error round 621 had fixed, reintroduced for the shapes
+  that qualify to defer. (r997)
+- **`SPG_MAX_QUERY_BYTES=0` disables the query budget.** The error it
+  raises says "0 to disable" and the wiring has an arm to honour it, but
+  the env reader dropped a zero before that arm could see it, so `=0`
+  read as "unset" and left the 256 MiB default in force. An escape hatch
+  named in an error message has to work. (r996)
 - **Row security binds the authenticated session.** `is_superuser()`
   answered true whenever no `SET ROLE` had been issued, so RLS never
   engaged for a connection that had authenticated normally — every
@@ -72,6 +96,14 @@ changes rather than by round.
 
 ### Performance
 
+- **A `HAVING` no longer stands down the projection deferral.** `GROUP BY
+  g ORDER BY <agg> LIMIT k` projects the k survivors instead of every
+  group; any HAVING turned that off. Worth 12.8-13.8 ms of 83.7 on the
+  mailrs Track A query, which is what took its dogfood budget from
+  failing to passing (p50 89.4 ms -> 72.7 against a budget of 85).
+  Neither clause is expensive alone — the cost appeared only together,
+  and tracks what the aggregates COST rather than how many there are.
+  (r998)
 - **The sort carries only the columns the query reads.** The prune mask
   reached the decode but not the encode, so a sort of `SELECT id FROM t
   ORDER BY k` put every row's whole payload into the batch and out to
