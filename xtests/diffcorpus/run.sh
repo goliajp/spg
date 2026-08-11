@@ -147,6 +147,33 @@ set -- ${args[@]+"${args[@]}"}
 
 : > "$OUT/actual.tsv"
 files=("$@"); [ ${#files[@]} -eq 0 ] && files=("$HERE"/[0-9]*.sql)
+
+# v7.37 (round 1007) — prove both legs answer before scoring anything.
+#
+# The scoring below diffs stdout AND stderr, so two legs that fail the SAME
+# way score zero differences and print IDENTICAL. That is what happened the
+# first time `gate.sh --full` reached here after a reboot: the psql container
+# was down, every file produced an empty stdout and the byte-identical error
+# `container ... is not running`, and the corpus reported every one of its
+# twenty categories IDENTICAL — a jump from the baseline's 29 differing lines
+# to zero, which reads exactly like a sweeping improvement.
+#
+# The next step after such a run is `--rebaseline`, which would have written
+# all-zeros over the recorded 29 and left this gate unable to fail again.
+#
+# So: ask each leg for a row before trusting anything it says.
+probe_leg() { # $1=name $2=fn
+  local got
+  got="$(printf 'SELECT 1;\n' | "$2" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$got" != "1" ]; then
+    echo "diffcorpus: the $1 leg answered '${got:-<nothing>}' to SELECT 1 — it is not up." >&2
+    echo "            Scoring now would compare two broken legs and call them identical." >&2
+    return 1
+  fi
+}
+probe_leg SPG SPG || exit 2
+probe_leg PG18 PGG || exit 2
+
 rc=0
 for f in "${files[@]}"; do
   n="$(basename "$f" .sql)"

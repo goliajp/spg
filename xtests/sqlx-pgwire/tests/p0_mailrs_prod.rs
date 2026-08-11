@@ -243,9 +243,37 @@ async fn measure_or_skip(pool: &PgPool, sql: &str, label: &str, iters: usize) {
     measure(pool, sql, label, iters).await;
 }
 
+/// v7.37 (round 1004) — a reproducer that needs live servers SKIPS when it
+/// has none, rather than failing.
+///
+/// Both measurements take their DSN from the environment, and `connect`
+/// panics when it is unset. `#[ignore]` used to be enough to keep that off
+/// an ordinary run, but `gate.sh --full` passes `--include-ignored`, so the
+/// first full-tier run on this branch ended with two panics reading
+/// `SPG_PG_URL not set` — a configuration statement, dressed as a failure.
+///
+/// The perf gate already had the answer for this: it says what is missing,
+/// skips, and only fails when the release run demands the comparison
+/// (`PERF_REQUIRED=1`). These follow it.
+fn dsn_or_skip(env_var: &str) -> Option<String> {
+    match std::env::var(env_var) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            eprintln!(
+                "skipping: {env_var} is unset, so there is nothing to measure against. \
+                 See this file's docs for the two DSNs."
+            );
+            None
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore]
 async fn p0_mailrs_prod_via_spgs_measure() {
+    if dsn_or_skip("SPG_PG_URL").is_none() {
+        return;
+    }
     let n = seed_n();
     let spg = connect("SPG_PG_URL").await;
     if std::env::var("SPG_P0_SKIP_SEED").is_err() {
@@ -260,6 +288,9 @@ async fn p0_mailrs_prod_via_spgs_measure() {
 #[tokio::test]
 #[ignore]
 async fn p0_mailrs_prod_via_pg18_measure() {
+    if dsn_or_skip("PG_URL").is_none() {
+        return;
+    }
     let n = seed_n();
     let pg = connect("PG_URL").await;
     if std::env::var("SPG_P0_SKIP_SEED").is_err() {

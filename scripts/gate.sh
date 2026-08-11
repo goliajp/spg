@@ -73,7 +73,23 @@ run_lint() {
 
 run_unit() {
     banner unit
-    cargo test --workspace --locked --lib --bins -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+    # The everyday tier runs the unit tests unoptimised, which is the right
+    # trade for a loop that runs constantly.
+    #
+    # `--full` adds `--include-ignored`, and some of those ignored tests are
+    # ignored precisely BECAUSE they measure something — they carry budgets
+    # in nanoseconds and say in their own comments to run them with
+    # `--release`. Handing them a debug build fails them by construction: the
+    # first `--full` run this branch ever did died on a 200 ns budget
+    # measured at 1913 ns, which is 48 ns when built the way the test asks
+    # for. That is the profile, not a regression.
+    #
+    # So the ignored pass runs in release, where its numbers mean something,
+    # and the ordinary pass stays as it was.
+    cargo test --workspace --locked --lib --bins
+    if [[ "$FULL" == 1 ]]; then
+        cargo test --release --workspace --locked --lib --bins -- --ignored
+    fi
     cargo test --workspace --locked --doc
 }
 
