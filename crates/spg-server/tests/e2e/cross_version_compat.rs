@@ -271,6 +271,34 @@ fn capture_v5_2_fixture() {
 }
 
 fn capture_fixture(label: &str) {
+    // v7.37 (round 1003) — regenerating a committed fixture is opt-in.
+    //
+    // These captures write into `xtests/compat-fixtures/<version>/`, which
+    // is the checked-in corpus this gate exists to replay. The doc above
+    // says why they are `#[ignore]`d: the bundles "are committed and must
+    // stay byte-stable so future binaries can replay them".
+    //
+    // `--include-ignored` walks straight past that. The first `--full` run
+    // on this branch ran the captures alongside `every_fixture_restores_and
+    // _verifies`, which failed — its log line lands BEFORE both captures
+    // report ok, so it was reading a fixture directory while a capture was
+    // rewriting it.
+    //
+    // The race is the smaller half. Overwriting these with the CURRENT
+    // binary's output turns a cross-version gate into "this version can
+    // restore its own backups", and the originals cannot be recaptured —
+    // the binaries that wrote them are gone. So the capture now refuses
+    // unless it was asked for by name:
+    //
+    //     SPG_CAPTURE_FIXTURES=1 cargo test --release -p spg-server \
+    //         --test e2e -- --ignored capture_v5_2_fixture
+    if std::env::var_os("SPG_CAPTURE_FIXTURES").is_none() {
+        eprintln!(
+            "skipping capture of {label}: it would overwrite a committed \
+             cross-version fixture — set SPG_CAPTURE_FIXTURES=1 to do that"
+        );
+        return;
+    }
     let dest = workspace_root().join("xtests/compat-fixtures").join(label);
     std::fs::create_dir_all(&dest).expect("mkdir fixture dir");
 

@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `duckdb` | 148 | 0 | 0 | 100.0% |
 | `mysql` | 142 | 0 | 0 | 100.0% |
-| `pg_regress` | 1366 | 0 | 0 | 100.0% |
+| `pg_regress` | 1371 | 0 | 0 | 100.0% |
 | `pgvector` | 63 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 110 | 0 | 0 | 100.0% |
 | `spg_baseline/02_data_types` | 97 | 0 | 0 | 100.0% |
@@ -15,7 +15,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/05_aggregates` | 57 | 0 | 0 | 100.0% |
 | `spg_baseline/06_subqueries` | 25 | 0 | 0 | 100.0% |
 | `spg_baseline/07_cte` | 12 | 0 | 0 | 100.0% |
-| `spg_baseline/08_partition` | 41 | 0 | 0 | 100.0% |
+| `spg_baseline/08_partition` | 45 | 0 | 0 | 100.0% |
 | `spg_baseline/09_indexes` | 26 | 0 | 0 | 100.0% |
 | `spg_baseline/10_constraints` | 30 | 0 | 0 | 100.0% |
 | `spg_baseline/11_dialect` | 53 | 0 | 0 | 100.0% |
@@ -77,7 +77,7 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip |
 |---|---|---|---|
-| `01_create_table_shapes.test` | 6 | 0 | 0 |
+| `01_create_table_shapes.test` | 8 | 0 | 0 |
 | `02_insert_shapes.test` | 9 | 0 | 0 |
 | `03_dml_v2_unsupported.test` | 25 | 0 | 0 |
 | `04_pg_types.test` | 24 | 0 | 0 |
@@ -91,7 +91,7 @@ Per-corpus pass / fail / skip:
 | `12_pg_trgm.test` | 16 | 0 | 0 |
 | `13_timestamptz_offset.test` | 11 | 0 | 0 |
 | `14_disable_trigger_tsvector.test` | 23 | 0 | 0 |
-| `15_do_block_information_schema.test` | 21 | 0 | 0 |
+| `15_do_block_information_schema.test` | 22 | 0 | 0 |
 | `16_sequences.test` | 50 | 0 | 0 |
 | `17_views.test` | 28 | 0 | 0 |
 | `18_materialized_views.test` | 27 | 0 | 0 |
@@ -143,7 +143,7 @@ Per-corpus pass / fail / skip:
 | `64_pg_typeof.test` | 15 | 0 | 0 |
 | `65_pg_time.test` | 10 | 0 | 0 |
 | `66_mysql_year.test` | 13 | 0 | 0 |
-| `67_pg_timetz.test` | 11 | 0 | 0 |
+| `67_pg_timetz.test` | 12 | 0 | 0 |
 | `68_pg_money.test` | 10 | 0 | 0 |
 | `69_mysql_inline_enum.test` | 11 | 0 | 0 |
 | `70_mysql_inline_set.test` | 10 | 0 | 0 |
@@ -158,7 +158,7 @@ Per-corpus pass / fail / skip:
 | `79_lateral_join.test` | 9 | 0 | 0 |
 | `80_pg_type_view.test` | 6 | 0 | 0 |
 | `81_pg_proc_view.test` | 4 | 0 | 0 |
-| `82_pg_namespace_view.test` | 4 | 0 | 0 |
+| `82_pg_namespace_view.test` | 5 | 0 | 0 |
 | `83_pg_indexes_view.test` | 6 | 0 | 0 |
 | `84_pg_constraint_view.test` | 4 | 0 | 0 |
 | `85_pg_database_roles_view.test` | 3 | 0 | 0 |
@@ -285,7 +285,7 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip |
 |---|---|---|---|
-| `partition_attach_detach.test` | 12 | 0 | 0 |
+| `partition_attach_detach.test` | 16 | 0 | 0 |
 | `partition_explain_kept_names.test` | 7 | 0 | 0 |
 | `partition_hash_basic.test` | 10 | 0 | 0 |
 | `partition_list_basic.test` | 12 | 0 | 0 |

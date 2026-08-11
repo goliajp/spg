@@ -1982,15 +1982,50 @@ mod tests {
         // amortise instant() noise; on Apple-M release it lands
         // well under the budget. Marked #[ignore] so a noisy host
         // doesn't fail CI; run with `--ignored` to verify.
+        // v7.37 (round 1001) — best of five, not one.
+        //
+        // `--full` runs the ignored tests, and this one is ignored because a
+        // shared machine's noise blows past 200 ns — its own comment said so
+        // before this branch ever ran `--full`. A single wall-clock pass over
+        // 10 000 iterations measures whatever else the box is doing: isolated
+        // it reports 48 ns/call, and inside a full gate run, with the rest of
+        // the workspace's tests alive around it, the same build reported 243.
+        //
+        // The minimum of several passes is the statistic that survives that:
+        // interference can only make a pass slower, so the fastest one is the
+        // closest to what the code costs. It cannot rescue a real regression,
+        // because a regression slows every pass.
         const ITERS: u32 = 10_000;
+        const PASSES: u32 = 5;
         let sql = "INSERT INTO some_table_name VALUES (1, 'hello world', 3.14)";
-        let t0 = std::time::Instant::now();
-        for _ in 0..ITERS {
-            let r = std::hint::black_box(extract_owner_from_sql(std::hint::black_box(sql)));
-            std::hint::black_box(r);
+        let mut ns_per_call = u128::MAX;
+        for _ in 0..PASSES {
+            let t0 = std::time::Instant::now();
+            for _ in 0..ITERS {
+                let r = std::hint::black_box(extract_owner_from_sql(std::hint::black_box(sql)));
+                std::hint::black_box(r);
+            }
+            ns_per_call = ns_per_call.min(t0.elapsed().as_nanos() / u128::from(ITERS));
         }
-        let ns_per_call = t0.elapsed().as_nanos() / u128::from(ITERS);
-        eprintln!("extract_owner_from_sql: {ns_per_call} ns/call (budget ≤ 200 ns)");
+        eprintln!(
+            "extract_owner_from_sql: {ns_per_call} ns/call (best of {PASSES}, budget ≤ 200 ns)"
+        );
+        // The budget is a RELEASE budget — the comment above has said so
+        // since v6.1.5, and the numbers agree: 32 ns/call optimised against
+        // 1000-1900 unoptimised. So an unoptimised build measures the
+        // profile, not the code, and asserting on it fails by construction.
+        //
+        // `gate.sh --full` reaches this test twice: `run_unit` runs the
+        // ignored pass in release (round 1001), and `run_e2e`'s
+        // `cargo test --tests` sweeps every target with `test = true` —
+        // which includes this bin's unit tests — in debug. Rather than
+        // narrow what that stage selects, which would change which tests
+        // run, the measurement reports itself in both and only judges where
+        // judging means something.
+        if cfg!(debug_assertions) {
+            eprintln!("  (unoptimised build — measured, not judged)");
+            return;
+        }
         assert!(
             ns_per_call < 200,
             "owner scanner exceeded the v6.1.5 200 ns budget: {ns_per_call} ns/call"
