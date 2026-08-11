@@ -41,10 +41,13 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
-## [Unreleased — feature/v7.37.15-mvcc-cf-ceiling]
+## [7.37.13] — 2026-08-12
 
-Work on the branch since 7.37.12, not versioned yet. Grouped by what it
-changes rather than by round.
+Everything on the branch since 7.37.12, grouped by what it changes
+rather than by round. Four of the correctness entries below were found
+while measuring something else — the sort's payload, a query's HAVING,
+a gate that had never run — which is why they are here at all: none was
+reported by a customer.
 
 ### Correctness
 
