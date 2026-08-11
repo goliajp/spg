@@ -275,3 +275,67 @@ fn select_distinct_deduplicates_over_a_group_by() {
     let r = e.execute("SELECT count(*) FROM dg GROUP BY g").unwrap();
     assert_eq!(rows(r).len(), 20, "no DISTINCT, no dedup");
 }
+
+/// r1000 — an aggregate ORDER BY may name a set-returning output column.
+///
+/// `SELECT unnest(ARRAY[2,1]) AS u, count(*) FROM t GROUP BY g ORDER BY 1`
+/// answered `column "u" does not exist`, and spelled `ORDER BY u` it
+/// answered `function unnest(integer[]) does not exist` instead — two
+/// spellings of one thing, both refused, both answered by PG18.4.
+///
+/// Round 80 had already decided the hard part: a positional key over a
+/// set-returning item resolves to the item's output NAME rather than its
+/// expression, because the expression is the whole set and evaluates once
+/// per group, which silently sorted nothing. What was missing was the
+/// other half on each side — the aggregate sort evaluated that name
+/// against the synthetic group schema, which carries `__agg_N` and
+/// `__grp_K` and no output aliases; and the alias spelling still
+/// substituted the expression, so it failed differently for the same
+/// reason.
+///
+/// Now a key that names an output column and nothing in the synthetic
+/// schema is read from the projected row, where expansion has already put
+/// the per-row value. Synthetic names keep precedence, so keys that
+/// resolved before resolve the same way.
+#[test]
+fn an_aggregate_order_by_can_name_a_set_returning_output_column() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE og (g INT, v INT)").unwrap();
+    for i in 1..=20 {
+        e.execute(&format!("INSERT INTO og VALUES ({}, {i})", i % 5))
+            .unwrap();
+    }
+    let first = |r: QueryResult| -> Vec<i32> {
+        rows(r)
+            .into_iter()
+            .map(|vals| match vals[0] {
+                Value::Int(n) => n,
+                ref other => panic!("int expected, got {other:?}"),
+            })
+            .collect()
+    };
+
+    // ARRAY[2,1] expands to 2 then 1 per group, so a sort that works puts
+    // every 1 before every 2 — and a sort that silently does nothing
+    // leaves them alternating.
+    let r = e
+        .execute("SELECT unnest(ARRAY[2,1]) AS u, count(*) FROM og GROUP BY g ORDER BY 1")
+        .expect("ORDER BY a positional set-returning key");
+    let got = first(r);
+    assert_eq!(got.len(), 10, "5 groups x 2 elements");
+    assert!(got.windows(2).all(|w| w[0] <= w[1]), "sorted, got {got:?}");
+
+    // The same query by alias must behave identically; it used to fail
+    // differently, which is how one bug looked like two.
+    let r = e
+        .execute("SELECT unnest(ARRAY[2,1]) AS u, count(*) FROM og GROUP BY g ORDER BY u")
+        .expect("ORDER BY the alias of a set-returning item");
+    assert_eq!(first(r), got, "the alias spelling matches the ordinal one");
+
+    // And a key that resolves in the synthetic schema still does: this is
+    // the control for "output names take over too much".
+    let r = e
+        .execute("SELECT count(*) AS c, g FROM og GROUP BY g ORDER BY c, g")
+        .expect("ORDER BY an aggregate alias");
+    assert_eq!(rows(r).len(), 5);
+}

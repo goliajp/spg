@@ -1168,6 +1168,7 @@ pub(crate) fn run(
     if !stmt.order_by.is_empty() {
         let (sorted_synth, sorted_out) = sort_synth_by_order_by(
             &synth_schema,
+            &columns,
             &stmt.order_by,
             &order_rewritten,
             kept_synth,
@@ -4653,6 +4654,7 @@ fn project_groups(
 /// against the surviving groups after the caller's LIMIT truncation.
 fn sort_synth_by_order_by(
     synth_schema: &[ColumnSchema],
+    out_columns: &[ColumnSchema],
     order_by: &[spg_sql::ast::OrderBy],
     order_rewritten: &[Expr],
     mut kept_synth: Vec<Row<'static>>,
@@ -4709,11 +4711,51 @@ fn sort_synth_by_order_by(
     // The synth row rides through the sort so deferred exprs can
     // evaluate against the surviving groups after the caller's
     // LIMIT truncation.
+    // v7.37 (round 1000) — a sort key that names an OUTPUT column.
+    //
+    // `ORDER BY 1` over a set-returning item does not substitute the
+    // item's expression: round 80 resolved it to the item's output NAME
+    // instead, because a positional key means the Nth OUTPUT column and
+    // substituting the expression would make the key "the whole set",
+    // evaluated once per group, which silently sorted nothing. The
+    // non-aggregate paths then evaluate that name against the output
+    // schema.
+    //
+    // This one evaluated it against the SYNTHETIC schema, which carries
+    // `__agg_N` / `__grp_K` and no output aliases, so
+    // `SELECT unnest(ARRAY[1,2]) AS u, count(*) … GROUP BY g ORDER BY 1`
+    // answered `column "u" does not exist` — a query PG18.4 answers.
+    // Spelling it `ORDER BY u` failed differently and for the same
+    // reason: the alias resolved to the expression, and a set-returning
+    // call cannot be evaluated scalarly on a group row.
+    //
+    // So: a key that names an output column and NOTHING in the synthetic
+    // schema is read from the projected row, where expansion has already
+    // put the per-row value. Synthetic names keep precedence, so nothing
+    // that resolved before resolves differently now.
+    let out_key_idx: Vec<Option<usize>> = order_rewritten
+        .iter()
+        .map(|e| {
+            let spg_sql::ast::Expr::Column(c) = e else {
+                return None;
+            };
+            if c.qualifier.is_some() || crate::eval::find_column_pos(c, &synth_ctx).is_some() {
+                return None;
+            }
+            out_columns
+                .iter()
+                .position(|oc| oc.name.eq_ignore_ascii_case(&c.name))
+        })
+        .collect();
     let mut keystack: Vec<Value<'static>> = Vec::new();
     let mut tagged: Vec<(Vec<Value<'static>>, Row, Row)> = Vec::with_capacity(kept_synth.len());
     for (s, o) in kept_synth.into_iter().zip(out_rows) {
         let mut keys = Vec::with_capacity(order_rewritten.len());
-        for (e, oc) in order_rewritten.iter().zip(&order_compiled) {
+        for (i, (e, oc)) in order_rewritten.iter().zip(&order_compiled).enumerate() {
+            if let Some(oi) = out_key_idx[i] {
+                keys.push(o.values.get(oi).cloned().unwrap_or(Value::Null));
+                continue;
+            }
             keys.push(if let Some(oc) = oc {
                 eval::eval_compiled(oc, &s, &synth_ctx, &mut keystack)?
             } else {

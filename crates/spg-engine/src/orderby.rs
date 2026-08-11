@@ -905,6 +905,20 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                     } = item
                         && a == &target
                     {
+                        // v7.37 (round 1000) — a set-returning item is left
+                        // named, not substituted, for the reason round 80
+                        // gave the positional branch above: the alias stands
+                        // for the Nth OUTPUT column, which after expansion
+                        // holds one value per row, while the expression is
+                        // the whole set and evaluates once. Substituting it
+                        // made `SELECT unnest(...) AS u … GROUP BY g ORDER BY
+                        // u` answer `function unnest(integer[]) does not
+                        // exist`, where the same query spelled `ORDER BY 1`
+                        // worked — two spellings of one thing disagreeing.
+                        if crate::select::expr_contains_builtin_srf(expr) {
+                            bound = true;
+                            break;
+                        }
                         order.expr = expr.clone();
                         bound = true;
                         break;
