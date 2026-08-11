@@ -220,3 +220,58 @@ fn a_set_returning_item_survives_order_by_with_limit() {
         .expect("no SRF");
     assert_eq!(rows(r).len(), 5);
 }
+
+/// r999 — `SELECT DISTINCT` deduplicates over a GROUP BY query.
+///
+/// It never had. Every other path does: the scan paths, the window path
+/// and the set operations all call `dedup_rows`, and the aggregate path
+/// simply returned one row per group. `SELECT DISTINCT count(*) FROM t
+/// GROUP BY g` came back with 200 rows where PG18.4 returns 1, all of
+/// them the same value — not an error, not a missing column, 199 extra
+/// rows in a query anyone might write.
+///
+/// The top-K sink in that same function says it outright — "no DISTINCT
+/// (would need post-dedup, can't truncate during sort)" — so the sink
+/// correctly declined to truncate, and the post-dedup it named was never
+/// written.
+///
+/// Found while validating an unrelated change, and confirmed against the
+/// previous binary before being attributed: the behaviour is identical on
+/// round 997, so it predates that work.
+#[test]
+fn select_distinct_deduplicates_over_a_group_by() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE dg (g INT, v INT)").unwrap();
+    for i in 1..=200 {
+        e.execute(&format!("INSERT INTO dg VALUES ({}, {i})", i % 20))
+            .unwrap();
+    }
+
+    // Twenty groups, every count the same: one distinct row.
+    let r = e
+        .execute("SELECT DISTINCT count(*) FROM dg GROUP BY g")
+        .unwrap();
+    assert_eq!(rows(r).len(), 1, "twenty identical counts are one row");
+
+    let r = e
+        .execute("SELECT DISTINCT count(*) FROM dg GROUP BY g HAVING count(*) > 0")
+        .unwrap();
+    assert_eq!(rows(r).len(), 1, "a HAVING does not change the dedup");
+
+    // Partial: g % 4 collapses twenty groups onto four values.
+    let r = e
+        .execute("SELECT DISTINCT g % 4 FROM dg GROUP BY g ORDER BY 1")
+        .unwrap();
+    assert_eq!(rows(r).len(), 4, "collapses onto four");
+
+    // And rows that genuinely differ are all kept — the control that
+    // separates "deduplicates" from "drops rows".
+    let r = e
+        .execute("SELECT DISTINCT count(*), g FROM dg GROUP BY g")
+        .unwrap();
+    assert_eq!(rows(r).len(), 20, "distinct rows survive");
+
+    // Without DISTINCT nothing is removed.
+    let r = e.execute("SELECT count(*) FROM dg GROUP BY g").unwrap();
+    assert_eq!(rows(r).len(), 20, "no DISTINCT, no dedup");
+}
