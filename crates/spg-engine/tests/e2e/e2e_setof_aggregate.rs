@@ -150,3 +150,73 @@ fn group_by_with_generate_series_via_mod_fn() {
     assert_eq!(r[0][1], Value::BigInt(5));
     assert_eq!(r[1][1], Value::BigInt(5));
 }
+
+/// r997 — a set-returning SELECT item must not be deferred past the sort.
+///
+/// v7.37.x added a deferral: on `GROUP BY g ORDER BY <agg> LIMIT k` the
+/// per-item projection is skipped for every group and run afterwards on
+/// the top-k survivors, which on the mailrs shape turns 40 000 evaluations
+/// into 100. The completion evaluates each item scalarly, and the branch
+/// that expands a set-returning item into one row per element is the one
+/// the deferral skips — so a qualifying query came back as
+/// `function unnest(integer[]) does not exist`, the exact error round 621
+/// had fixed, reintroduced for the shapes that qualify.
+///
+/// Differential against live PG18.4 showed the same query answering
+/// correctly without LIMIT, with LIMIT >= the group count, and with a
+/// HAVING — the three cases where the deferral was already off — which is
+/// what identified the deferral rather than the expansion.
+///
+/// The row COUNT is what this pins. Which rows survive a LIMIT that cuts
+/// inside a group is not pinned, because the ORDER BY here ties across a
+/// group's expanded rows and neither engine promises an order there.
+#[test]
+fn a_set_returning_item_survives_order_by_with_limit() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE srf_defer (g INT, v INT)").unwrap();
+    for i in 1..=40 {
+        e.execute(&format!("INSERT INTO srf_defer VALUES ({}, {i})", i % 20))
+            .unwrap();
+    }
+
+    // 20 groups, two elements per group, LIMIT below the group count: the
+    // shape that qualifies to defer.
+    let r = e
+        .execute(
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM srf_defer \
+             GROUP BY g ORDER BY count(*) DESC, g LIMIT 5",
+        )
+        .expect("a set-returning item with ORDER BY + LIMIT must not error");
+    assert_eq!(rows(r).len(), 5, "LIMIT 5 over expanded rows returns 5");
+
+    // The cases the deferral never covered, unchanged: two rows per group
+    // across all twenty groups.
+    let r = e
+        .execute(
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM srf_defer \
+             GROUP BY g ORDER BY count(*) DESC, g",
+        )
+        .expect("no LIMIT");
+    assert_eq!(rows(r).len(), 40, "20 groups x 2 elements");
+
+    let r = e
+        .execute(
+            "SELECT unnest(ARRAY[1,2]), count(*) FROM srf_defer \
+             GROUP BY g ORDER BY count(*) DESC, g LIMIT 100",
+        )
+        .expect("LIMIT above the group count");
+    assert_eq!(
+        rows(r).len(),
+        40,
+        "a LIMIT that cannot bite changes nothing"
+    );
+
+    // And the deferral still applies when nothing is set-returning: this
+    // one is here so a fix that simply turned the optimisation off would
+    // not pass unnoticed — it pins the answer, and the perf gate pins the
+    // speed.
+    let r = e
+        .execute("SELECT g, count(*) FROM srf_defer GROUP BY g ORDER BY count(*) DESC, g LIMIT 5")
+        .expect("no SRF");
+    assert_eq!(rows(r).len(), 5);
+}

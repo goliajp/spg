@@ -1070,10 +1070,25 @@ pub(crate) fn run(
     // allocations before discarding 99.75 % at the sort truncation
     // step. HAVING still runs inline on every group because it
     // filters BEFORE the LIMIT; we only skip the SELECT-list eval.
+    // v7.37 (round 997) — a set-returning item must NOT defer. The
+    // deferred completion at the end of this function evaluates each item
+    // scalarly; the expansion that turns one group into one row per
+    // element lives in the branch the deferral skips. So a deferred
+    // `unnest(...)` in the select list came back as
+    // `function unnest(integer[]) does not exist` — the exact error round
+    // 621 had fixed, reintroduced for the shapes that qualify to defer.
+    // Differential against PG18.4: the same query answers correctly
+    // without LIMIT, with LIMIT >= the group count, or with a HAVING —
+    // all three being cases where the deferral is off.
+    let any_srf_item = stmt.items.iter().any(|i| match i {
+        SelectItem::Expr { expr, .. } => crate::select::top_level_srf_kind(expr).is_some(),
+        _ => false,
+    });
     let defer_projection = !stmt.order_by.is_empty()
         && !stmt.distinct
         && !stmt.limit_with_ties
         && stmt.having.is_none()
+        && !any_srf_item
         && stmt.limit_literal().is_some_and(|l| {
             let off = stmt.offset_literal().unwrap_or(0) as usize;
             let k = (l as usize).saturating_add(off);
