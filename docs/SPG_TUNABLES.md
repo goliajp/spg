@@ -44,10 +44,27 @@ one-to-one to a PG GUC with the matching unit-of-measure.
 | `SPG_QUERY_TIMEOUT_MS`    | `0` (off) | Hard wall-clock cap per query (matches PG `statement_timeout`). |
 | `SPG_MAX_QUERY_NS`        | `0`     | Per-query CPU budget. |
 | `SPG_MAX_QUERY_ROWS`      | `0`     | Maximum rows a single query may return (defensive). |
-| `SPG_MAX_QUERY_BYTES`     | `268435456` (256 MiB) | Maximum raw bytes returned in a single rowset. Unlike the rest of this table, unset does NOT mean unlimited — the server applies 256 MiB and refuses a larger result with `query materialisation exceeded max_query_bytes=…`. Set it to `0` for no limit. |
+| `SPG_MAX_QUERY_BYTES`     | `268435456` (256 MiB) | Maximum raw bytes returned in a single rowset. Unlike the rest of this table, unset does NOT mean unlimited — the server applies 256 MiB and refuses a larger result with `query materialisation exceeded max_query_bytes=…`. Set it to `0` for no limit — **honoured from v7.37.13; before that the zero was dropped by the env reader and the 256 MiB default stayed in force**. |
 | `SPG_SLOW_QUERY_THRESHOLD_MS` | `0` (off) | Emit a `slow_query` event when wall-clock exceeds the threshold. |
-| `SPG_SLOW_QUERY_LOG_MS`   | `1000`  | Same idea, log-stream variant. Also unset-is-not-off: queries over one second are logged unless this is set to `0`. |
+| `SPG_SLOW_QUERY_LOG_MS`   | `1000`  | Same idea, log-stream variant. Also unset-is-not-off: queries over one second are logged unless this is set to `0` — **honoured from v7.37.16; between v7.37.7 and v7.37.15 the zero was dropped and the one-second default silently stayed on**. |
 | `SPG_PLAN_CACHE_MAX`      | `256`   | Plan-cache entry cap. |
+
+### A note on knobs whose zero means something
+
+Most variables here read "unset" and "0" the same way, and their reader
+drops a zero on purpose — for a timeout or an interval, zero and absent do
+mean the same thing.
+
+Two do not: `SPG_MAX_QUERY_BYTES` and `SPG_SLOW_QUERY_LOG_MS`, where zero is
+the way to turn the feature OFF and the default is ON. Both were documented
+that way for versions before they behaved that way, because they went
+through the zero-dropping reader; both now use `parse_env_u64_allow_zero`
+and are pinned in `main.rs`'s `env_knob_tests`.
+
+If a new knob's zero is a setting rather than an absence, it needs that
+reader — and for a threshold, the zero has to become `None` rather than
+`Some(0)`, or the comparison downstream fires on everything instead of
+nothing.
 
 ## Storage tiering & freeze cycle
 

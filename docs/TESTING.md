@@ -30,6 +30,45 @@ Timing-gated targets carry two tiers:
 The same convention applies anywhere a target has both a quick regression
 probe and a long-running deep version: default = fast, `#[ignore]` = full.
 
+**`--full` runs the ignored unit tests in release.** The everyday unit pass
+stays unoptimised, which is right for a loop that runs constantly. But some
+`#[ignore]`d tests are ignored *because they measure something* and say in
+their own comments to run them with `--release`; handing those a debug build
+fails them by construction. The first `--full` run this repo ever did died on
+a 200 ns budget measured at 1913 ns — 48 ns when built the way the test asks
+for. So `run_unit` adds a second pass, `cargo test --release … -- --ignored`,
+and the ordinary pass is untouched.
+
+A measurement that must survive a shared machine takes the **best of N**
+passes rather than one: interference can only make a pass slower, so the
+fastest is closest to what the code costs, and a real regression still slows
+every pass. Where a budget is meaningless without optimisation, the test
+prints its number under `debug_assertions` and declines to judge — the same
+reasoning `#![cfg(not(debug_assertions))]` applies to a whole `perf_gate`
+target, applied to one assertion that lives in a unit test.
+
+### Opt-in tests
+
+`--include-ignored` cannot tell "long-running" from "needs conditions this
+machine cannot give". Two groups therefore opt in by environment variable
+instead of relying on `#[ignore]` alone:
+
+| Variable | Gates | Why it is not merely `#[ignore]` |
+|---|---|---|
+| `SPG_SOAK_TESTS=1` | the 100M-row restart, the 30M-row RSS ceiling, the SQ8 1M kNN/RSS gates, the 1M-row WAL throughput gate, the 1M-row cold-start gate | They need a machine to themselves. A 6 GiB RSS ceiling measured beside another project's compiler is measuring the machine; the 100M restart sat at 0% CPU for 94 minutes and took a whole `--full` run with it. |
+| `SPG_CAPTURE_FIXTURES=1` | `capture_v4_41_fixture`, `capture_v5_2_fixture` | They **write into** `xtests/compat-fixtures/`, the corpus the cross-version gate replays. Regenerating those with the current binary turns "an old version's bytes still restore" into "this version restores its own output", and the originals cannot be recaptured — the binaries that wrote them are gone. |
+
+Both print why they skipped, so a run that did not exercise them says so.
+
+### Tests that need something outside the process
+
+A suite that needs a live server, a DSN, or a container **skips and names
+what is missing** — it does not panic. `gate.sh`'s perf category is the
+model: it says what is unset, skips, and only fails when `PERF_REQUIRED=1`
+marks a release run. `xtests/sqlx-pgwire`'s two suites follow it. A missing
+DSN is a statement about the environment, not a failing test, and a run that
+reports it as a failure hides the failures that matter.
+
 ## perf_gate convention
 
 Every perf target is one `perf_gate` integration target per crate
@@ -60,9 +99,17 @@ scripts/test-on-mini.sh e2e          # functional sweep, off-box
 scripts/test-on-mini.sh gates --full # long-running perf tiers
 ```
 
-Caveat: `biz` needs Docker (its harnesses run psql from the postgres:15
-image) and a `.git` dir for `git rev-parse` — neither exists on the
-testbed mirror, so run biz locally.
+Caveat: `biz` needs Docker — its harnesses run psql out of a container —
+and the `diffcorpus` runner needs a live PG18 beside it (the
+`spg-bench-postgres` container, PG on 25432). Both exist on the testbed, so
+`biz` runs there; what it needs is for those containers to be **up**. After
+a reboot they are not, and the failure mode is quiet: every leg errors
+identically, the runner diffs stderr too, and twenty categories come back
+`IDENTICAL` with the baseline's 31 differing lines reported as zero — a
+result that reads like a sweeping improvement and whose documented next step
+(`--rebaseline`) would overwrite the record and leave the gate unable to
+fail again. `diffcorpus/run.sh` now asks each leg for a row before scoring
+anything and refuses if either cannot answer.
 
 ## Acceptance-shape conventions (rounds 12-20 lessons)
 
@@ -101,3 +148,28 @@ Before any release ack, all of the following must be green (see
    outside this repo)
 3. `scripts/dropin-acceptance.sh` against the candidate image (CI runs this
    as the `dropin_acceptance` job)
+
+### Where the drop-in panel sits, and what that costs
+
+Inside `scripts/release.sh` the panel runs **after** crates.io and docker.
+It is a mirror held up to a published artefact, not a gate in front of one.
+That is worth stating plainly because it has been paid for: `text || <REAL>`
+regressed between 7.37.9 and 7.37.13, the panel's
+`round20.aggregate_group_composite` case caught it exactly as designed, and
+by then thirteen crates and three image tags were already public. The fix
+shipped as 7.37.15.
+
+So a shape that the panel covers is **not** thereby covered before a
+release. When a panel case matters, put the same shape somewhere
+`gate.sh all` reaches — the sqllogictest corpus (`15_regressions/`) is the
+cheapest home, and it is where that concat shape now lives.
+
+The panel asserts the **last line of stdout**. It used to read stdout and
+stderr merged, which cannot be made reliable: a psql error is two lines
+(`ERROR:` then `DETAIL:`), psql block-buffers stdout when it is not a tty
+while stderr stays unbuffered, and so a case whose last row is the assertion
+could read back a `DETAIL:` line instead. `round13.inline_pk_enforces` did
+that on the 7.37.15 panel having passed on 7.37.9 and 7.37.14, with nothing
+between them that could touch it. Filtering more prefixes would chase the
+symptom; the rows come from stdout, so the assertion reads stdout and the
+diagnostics are reported from stderr.

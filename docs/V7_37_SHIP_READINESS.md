@@ -10,11 +10,34 @@
 > Two things were stale and are corrected:
 >
 > - `SHOW ALL` was written as 13 rows; it returns 21.
-> - Five sections credited work to **v7.37.17**, a version that does not
->   exist — `git tag` stops at 7.37.12, which is also the workspace
->   version. The capabilities are real and measured; the version they
->   were filed under was not. They now read "the post-7.37.12 branch",
->   which is what they are until something ships.
+> - Five sections credited work to **v7.37.17**, a version that did not
+>   exist — at the time `git tag` stopped at 7.37.12, which was also the
+>   workspace version. The capabilities are real and measured; the
+>   version they were filed under was not. They read "the post-7.37.12
+>   branch", which is what they were until something shipped.
+>
+> **Since shipped (2026-08-12).** That branch became 7.37.13, and the
+> publish train then produced 7.37.14 and 7.37.15 in quick succession —
+> the sequence is itself the record:
+>
+> - **7.37.13** — the branch's whole body of work. Nine of its thirteen
+>   crates reached crates.io before the train stopped on a packaging
+>   gap, so it exists there as a partial version and should not be
+>   depended on.
+> - **7.37.14** — 7.37.13 republished whole, plus the three gaps that
+>   stopping it found: `spg-embedded-tokio` declaring tokio's `time`
+>   feature only under dev-dependencies (it built here and nowhere
+>   else), `spg-tzif` missing from the publish list, and a timeout test
+>   seeding fifty thousand rows through the 50 ms budget it was testing.
+> - **7.37.15** — `text || <REAL>` answering `cannot convert text to
+>   FLOAT`. Caught by the drop-in panel against the published 7.37.14
+>   image, which is after the fact by design; the shape now lives in the
+>   sqllogictest corpus where `gate.sh all` sees it before a release.
+>
+> Two release-gate results are recorded but unresolved, both needing a
+> machine to themselves (`SPG_SOAK_TESTS=1`): the freezer had not
+> quiesced after 300 s at 1616 segments, and the 30M-row RSS ceiling
+> failed at 6 GiB. Both ran beside another project's build.
 
 > Authoritative snapshot of v7.37's ship surface vs the items deferred
 > to v7.38+. The complete-roadmap file
