@@ -142,8 +142,25 @@ run_case_expect() {
   local name="$1"
   local sql="$2"
   local want="$3"
-  local out rc got
-  out=$(echo "$sql" | $PSQL -t -A 2>&1)
+  # v7.37.16 — assert on STDOUT, never on the two streams merged.
+  #
+  # `2>&1` used to fold psql's diagnostics into the rows, and a psql error
+  # is two lines: `ERROR: …` and `DETAIL: …`. Whether the DETAIL lands
+  # before or after a row is a matter of buffering — psql block-buffers
+  # stdout when it is not a tty while stderr stays unbuffered — so a case
+  # whose last row is the assertion could read back `DETAIL: Key (id)=(1)
+  # already exists.` instead. `round13.inline_pk_enforces` did exactly
+  # that on the 7.37.15 panel, having passed on 7.37.9 and 7.37.14 with
+  # no relevant change between them; five direct runs against the same
+  # published image returned the expected row every time.
+  #
+  # Filtering more prefixes (DETAIL, HINT, CONTEXT, LINE, the caret line)
+  # would be chasing the symptom. The rows come from stdout, so the
+  # assertion reads stdout and the diagnostics stay where they can still
+  # be reported.
+  local out rc got err
+  err=$(mktemp)
+  out=$(echo "$sql" | $PSQL -t -A 2>"$err")
   rc=$?
   got=$(echo "$out" | grep -v '^$' | tail -1 | tr -s ' ')
   if [ "$rc" -eq 0 ] && [ "$got" = "$want" ]; then
@@ -153,12 +170,14 @@ run_case_expect() {
     FAIL_COUNT=$((FAIL_COUNT+1))
     local detail
     if [ "$rc" -ne 0 ]; then
-      detail=$(echo "$out" | grep -E "^(ERROR|psql: error)" | head -1 | tr -s ' ')
+      detail=$(grep -E "^(ERROR|psql: error)" "$err" | head -1 | tr -s ' ')
+      [ -n "$detail" ] || detail=$(head -1 "$err" | tr -s ' ')
     else
       detail="expected [$want] got [$got]"
     fi
     CASES+=("$name|FAIL|$detail")
   fi
+  rm -f "$err"
 }
 
 # Tolerant variant: statement errors do NOT stop the chunk (for
@@ -168,9 +187,12 @@ run_case_expect_tolerant() {
   local name="$1"
   local sql="$2"
   local want="$3"
+  # An error is EXPECTED here (that is the assertion), so the diagnostics
+  # are discarded rather than filtered — see run_case_expect above for why
+  # filtering them out of a merged stream cannot be made reliable.
   local out got
-  out=$(echo "$sql" | ${PSQL/ON_ERROR_STOP=on/ON_ERROR_STOP=off} -t -A 2>&1)
-  got=$(echo "$out" | grep -vE '^$|^ERROR' | tail -1 | tr -s ' ')
+  out=$(echo "$sql" | ${PSQL/ON_ERROR_STOP=on/ON_ERROR_STOP=off} -t -A 2>/dev/null)
+  got=$(echo "$out" | grep -v '^$' | tail -1 | tr -s ' ')
   if [ "$got" = "$want" ]; then
     PASS_COUNT=$((PASS_COUNT+1))
     CASES+=("$name|PASS|")

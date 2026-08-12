@@ -810,7 +810,28 @@ fn main() {
         // **default 1000ms** so any prod deploy automatically captures
         // slow queries without operator opt-in. Explicit unsets are
         // still possible via `SPG_SLOW_QUERY_LOG_MS=0`.
-        slow_query_log_ms: parse_env_u64("SPG_SLOW_QUERY_LOG_MS").or(Some(1000)),
+        //
+        // v7.37.16 — and now they actually are. `parse_env_u64` drops a
+        // zero, so `=0` arrived as `None`, `.or(Some(1000))` restored the
+        // one-second default, and the operator who had just turned the
+        // slowlog off kept getting it. The comment above and
+        // `docs/SPG_TUNABLES.md` had promised otherwise since v7.37.7.
+        //
+        // Reading the zero also has to mean OFF rather than ZERO: the
+        // consumer multiplies to microseconds and compares, so a literal
+        // `Some(0)` would log EVERY query — the opposite of the request.
+        // `None` is what the slow-query guard reads as "no threshold".
+        //
+        // Same shape as SPG_MAX_QUERY_BYTES=0 (round 996): a knob whose
+        // zero is a setting cannot be read by a parser that treats zero as
+        // absence. Those two are the only knobs in this table where zero
+        // means something; the timeouts and intervals below keep the
+        // zero-is-unset reading, which is right for them.
+        slow_query_log_ms: match parse_env_u64_allow_zero("SPG_SLOW_QUERY_LOG_MS") {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(1000),
+        },
         wal_min_free_bytes: parse_env_u64("SPG_WAL_MIN_FREE_BYTES"),
         shutdown_deadline_sec: parse_env_u64("SPG_SHUTDOWN_DEADLINE_SEC"),
     };
@@ -950,6 +971,32 @@ mod env_knob_tests {
         assert_eq!(u64_from_raw(Some(" 42 ".into()), true), Some(42));
         assert_eq!(u64_from_raw(Some("not a number".into()), true), None);
         assert_eq!(u64_from_raw(None, true), None);
+    }
+
+    /// r1016 — the slowlog's zero means OFF, and the default means ON.
+    ///
+    /// `SPG_SLOW_QUERY_LOG_MS=0` had been documented as the way to turn the
+    /// slowlog off since v7.37.7, in both the code comment and
+    /// `docs/SPG_TUNABLES.md`. It did not work: the zero was dropped by the
+    /// reader, `.or(Some(1000))` put the one-second default back, and the
+    /// operator kept the logging they had just disabled.
+    ///
+    /// Reading the zero is only half of it — it has to become `None`, not
+    /// `Some(0)`. The consumer multiplies to microseconds and compares
+    /// `elapsed >= threshold`, so `Some(0)` would log every query, which is
+    /// the opposite of what was asked for. This pins all three cases.
+    #[test]
+    fn the_slowlog_threshold_reads_zero_as_off_and_unset_as_default() {
+        let resolve = |raw: Option<&str>| -> Option<u64> {
+            match u64_from_raw(raw.map(str::to_string), true) {
+                Some(0) => None,
+                Some(n) => Some(n),
+                None => Some(1000),
+            }
+        };
+        assert_eq!(resolve(Some("0")), None, "an explicit zero is OFF");
+        assert_eq!(resolve(None), Some(1000), "unset keeps the default on");
+        assert_eq!(resolve(Some("250")), Some(250), "a value is itself");
     }
 }
 
