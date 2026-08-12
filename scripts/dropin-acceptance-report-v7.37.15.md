@@ -1,9 +1,9 @@
 # SPG drop-in acceptance report
 
 - image: `goliakk/spg:7.37.15`
-- panel cases: 57  (pass 57  / fail 0)
+- panel cases: 59  (pass 58  / fail 1)
 
-**Verdict: PASS — every probed PG dialect feature lands on this SPG image.**
+**Verdict: FAIL — 1 case(s) below show real SPG dialect gaps. See the table.**
 
 ## Cases
 
@@ -50,7 +50,7 @@
 | `round12.extract_epoch` | ✅ | |
 | `round12.update_where_in_subquery` | ✅ | |
 | `round13.serial_continuity_multirow` | ✅ | |
-| `round13.inline_pk_enforces` | ✅ | |
+| `round13.inline_pk_enforces` | ❌ | expected [1] got [DETAIL: Key (id)=(1) already exists.] |
 | `round21.bytea_above_64k` | ✅ | |
 | `round21.text_array_elem_above_64k` | ✅ | |
 | `round14.text_above_64k` | ✅ | |
@@ -66,6 +66,8 @@
 | `round20.aggregate_group_composite` | ✅ | |
 | `round26.backfill_keyset_offset_skips_orphan` | ✅ | |
 | `round26.backfill_desc_limit_top_end` | ✅ | |
+| `fixture.mailrs-pg-extensions.sql` | ✅ | |
+| `fixture.mailrs-init-schema-v1.7.142.sql` | ✅ | |
 
 ## Reproducer
 
