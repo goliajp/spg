@@ -1,0 +1,80 @@
+# v7.37.15 — `text || <REAL>` is concatenation, not arithmetic
+#
+# The numeric fast path in `apply_binary` keys on the OPERAND type and
+# ignores the operator. When `Value::Real` joined it with first-class
+# REAL/float4 (7c36d30d, between 7.37.9 and 7.37.13), a REAL on either
+# side started capturing `||` as well: the TEXT side was then read as a
+# float and the query answered
+#
+#     ERROR:  cannot convert text to FLOAT
+#
+# The asymmetry is what makes this worth pinning rather than assuming:
+# `|| MAX(bigint)` worked because Int was never on that path, and
+# `|| 1.5` worked because a float LITERAL is Value::Float, not
+# Value::Real. Only a REAL column or an aggregate over one failed —
+# which is why every hand-written smoke test kept passing.
+#
+# It reached a published release. The drop-in acceptance panel does
+# carry this shape (`round20.aggregate_group_composite`), but that panel
+# runs AFTER crates.io and docker in release.sh, so it reported the
+# regression on an artefact that could no longer be changed. This file
+# puts the same shape in front of the gate instead.
+
+statement ok
+CREATE TABLE tcr (id BIGINT NOT NULL, t TEXT NOT NULL, d BIGINT NOT NULL, pin BOOLEAN NOT NULL, score REAL NOT NULL)
+
+statement ok
+INSERT INTO tcr VALUES (1, 'th', 100, true, 0.5), (2, 'th', 200, false, 0.9)
+
+# The shape the acceptance panel asserts, whole.
+query T nosort
+SELECT COUNT(DISTINCT id) || '/' || MAX(d) || '/' || COALESCE(BOOL_OR(pin), false) || '/' || COALESCE(MAX(score), 0.0) FROM tcr GROUP BY t
+----
+2/200/true/0.9
+
+# Its pieces, so a future break says which one moved.
+query T nosort
+SELECT 'v=' || score FROM tcr WHERE id = 1
+----
+v=0.5
+
+query T nosort
+SELECT 'v=' || MAX(score) FROM tcr
+----
+v=0.9
+
+query T nosort
+SELECT 'v=' || MAX(d) FROM tcr
+----
+v=200
+
+query T nosort
+SELECT 'v=' || 1.5
+----
+v=1.5
+
+# NUMERIC shares that fast path with REAL and must concatenate too.
+query T nosort
+SELECT 'v=' || 1.5::NUMERIC
+----
+v=1.5
+
+# And the path itself still owns arithmetic and comparison for both
+# types — the fix excludes ONE operator, and this is the control that
+# says so.
+query T nosort
+SELECT 'v=' || (score + 1)::TEXT FROM tcr WHERE id = 1
+----
+v=1.5
+
+query T nosort
+SELECT 'v=' || (1.5::NUMERIC * 2)::TEXT
+----
+v=3.0
+
+# A bare boolean renders as 1/0 here, while a boolean concatenated INTO
+# text renders as `true` — both appear above, deliberately.
+query B nosort
+SELECT MIN(score) < MAX(score) FROM tcr
+----
+1
