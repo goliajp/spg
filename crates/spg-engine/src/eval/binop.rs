@@ -879,6 +879,21 @@ pub(crate) fn apply_binary(
         // range arms below handle it.
         && !matches!(l, Value::Range { .. })
         && !matches!(r, Value::Range { .. })
+        // v7.37.15 — `||` is not arithmetic, whatever the operands are.
+        //
+        // This fast path keys on the OPERAND type and ignores the operator,
+        // so once `Value::Real` joined it (T-float4, 7c36d30d) a REAL on
+        // either side captured concatenation too: `'x' || score` reached
+        // `apply_binary_numeric`, which tried to read the TEXT side as a
+        // float and answered `cannot convert text to FLOAT`. The Concat arm
+        // below, which formats the number and joins, was unreachable for
+        // exactly the types that needed formatting.
+        //
+        // The asymmetry it left is what the drop-in panel saw: `|| MAX(d)`
+        // (BIGINT) worked, `|| 1.5` (a Float literal) worked, and only
+        // `|| score` (REAL) failed. Interval and Range already opt out of
+        // this path the same way.
+        && !matches!(op, BinOp::Concat)
     {
         return apply_binary_numeric(op, l, r);
     }
