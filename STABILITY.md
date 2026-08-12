@@ -937,6 +937,12 @@ sub-version.
   - `SPG_SLOW_QUERY_THRESHOLD_MS` — slow-query log floor (ms).
     Default 100. Crossings emit a structured log line via
     `observability::log_event("warn", "slow_query", …)`.
+    v7.37.16 widened the accepted range to PG's `log_min_
+    duration_statement` scale — `-1` turns the log off, `0`
+    reports every statement — which is an addition, not a
+    change: every value that parsed before means what it
+    meant before. Negatives previously failed to parse and
+    silently took the 100 ms default.
   - `SPG_PLAN_CACHE_MAX` — runtime cap on the v6.3.0 plan cache.
     Default 256; values above the compile-time `PLAN_CACHE_MAX_
     ENTRIES` (256) are clamped down.
