@@ -41,6 +41,24 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.15] — 2026-08-12
+
+### Fixed
+
+- **`text || <REAL>` concatenates instead of failing.** `SELECT 'v=' ||
+  score FROM t` answered `cannot convert text to FLOAT` whenever the
+  column was REAL. The numeric fast path in `apply_binary` keys on the
+  operand type and ignores the operator, so `||` fell into arithmetic
+  once first-class REAL joined that list — and arithmetic read the text
+  side as a float. `|| MAX(bigint)` and `|| 1.5` kept working, which is
+  why hand-written smoke tests never saw it; only a REAL column or an
+  aggregate over one failed. Found by the drop-in panel against the
+  published 7.37.14 image, on a case that had passed since 7.37.4, and
+  now pinned in the sqllogictest corpus so the same shape is checked
+  BEFORE a release rather than after one.
+
+---
+
 ## [7.37.14] — 2026-08-12
 
 The 7.37.13 train reached crates.io and stopped twice, leaving nine of
