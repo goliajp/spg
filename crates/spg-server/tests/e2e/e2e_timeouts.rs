@@ -55,7 +55,19 @@ fn exec_ok(s: &mut TcpStream, sql: &str) {
 fn query_timeout_cancels_long_scan() {
     // 50 ms budget — well under what scanning 50k rows + per-row
     // WHERE eval takes in debug build.
-    let (raw, addrs) = local_spawn(&[("SPG_QUERY_TIMEOUT_MS", "50")]);
+    // v7.37.14 — seed WITHOUT the budget this test is about.
+    //
+    // The 50 ms budget applies to every statement, and the seeding loop
+    // below sends fifty thousand of them. On a busy machine one INSERT
+    // crosses 50 ms and is cancelled by the very timeout under test —
+    // which is the server behaving correctly, failing a test that was
+    // asking about something else. It stopped a release train on exactly
+    // that: `expected CC for "INSERT INTO t VALUES (47809)"`.
+    //
+    // So the server starts without a budget and the session sets one
+    // after the rows are in, which is also closer to how a client meets
+    // this feature.
+    let (raw, addrs) = local_spawn(&[]);
     let mut child = common::ChildGuard(raw);
     let mut s = common::connect_to(&addrs.native);
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -67,6 +79,8 @@ fn query_timeout_cancels_long_scan() {
     for i in 0..50_000 {
         exec_ok(&mut s, &format!("INSERT INTO t VALUES ({i})"));
     }
+
+    exec_ok(&mut s, "SET statement_timeout = 50");
 
     // Now run a deliberately heavy SELECT — UDF-free but
     // per-row arithmetic is enough to take >>50 ms in debug.
