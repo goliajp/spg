@@ -41,6 +41,28 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.14] — 2026-08-12
+
+The 7.37.13 train reached crates.io and stopped twice, leaving nine of
+its thirteen crates published and unrecallable. 7.37.14 is 7.37.13 plus
+the three fixes that stopping found, republished whole so the tag and the
+registry hold the same bytes.
+
+### Fixed
+
+- **`spg-embedded-tokio` builds outside this workspace.** It called
+  `tokio::time::sleep` in library code while declaring tokio's `time`
+  feature only under dev-dependencies; cargo's feature unification hid
+  that here, and `cargo publish`'s standalone verification did not. Any
+  `cargo add spg-embedded-tokio` would have failed the same way.
+- **The publish list had twelve of thirteen crates.** `spg-tzif` was
+  never on it, and the train found out at crate seven.
+- **A timeout test seeded fifty thousand rows through the 50 ms budget
+  it was testing**, so a busy machine failed it for the server behaving
+  correctly.
+
+---
+
 ## [7.37.13] — 2026-08-12
 
 Everything on the branch since 7.37.12, grouped by what it changes
