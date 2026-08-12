@@ -20,7 +20,16 @@ spg-embedded = { workspace = true }
 # downstream consumers can run on any tokio runtime flavour
 # (`current-thread` or multi-thread). Default features OFF for
 # the same reason — we opt into the exact two we need.
-tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+# v7.37.14 — `time` belongs here, not only in dev-dependencies.
+#
+# `AsyncDatabase`'s checkpoint tick and the race guard both call
+# `tokio::time::sleep`, in LIBRARY code. The feature was declared only
+# under [dev-dependencies], and inside the workspace cargo's feature
+# unification handed it to the library anyway, so it built here and
+# nowhere else: `cargo publish` verifies the packaged crate on its own
+# and stopped with `cannot find `time` in `tokio``. Anyone running
+# `cargo add spg-embedded-tokio` would have met the same wall.
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "time"] }
 
 # v7.10.0 — engine error types surface through the async API
 # unchanged. Pulling spg-engine here too lets downstream `use

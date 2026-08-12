@@ -38,8 +38,12 @@ done
 
 # crates.io topological order — leaves first; crates.io rejects
 # dependency-before-dependent publishes.
+# v7.37.14 — spg-tzif was missing, and the train only found out at
+# spg-engine: `no matching package named spg-tzif found`, with six crates
+# already up and unrecallable. It has no dependencies of its own, so it
+# goes first.
 CRATES=(
-    spg-wire spg-crypto spg-sql spg-storage spg-audit spg-manifest
+    spg-tzif spg-wire spg-crypto spg-sql spg-storage spg-audit spg-manifest
     spg-engine spg-embedded spg-embedded-tokio spg-sqlx spg-server spgctl
 )
 
