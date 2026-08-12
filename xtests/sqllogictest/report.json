@@ -523,7 +523,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 46, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 57, "fail": 0, "skip": 0,
       "files": [
         { "file": "k02_in_list_visitor.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -538,6 +538,8 @@
         { "file": "round_28_update_correlated.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "round_29_filter_clause.test", "pass": 5, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "text_concat_real.test", "pass": 11, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "spg_baseline/16_isolation", "pass": 18, "fail": 0, "skip": 0,
