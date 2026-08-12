@@ -323,6 +323,17 @@ impl Engine {
         self
     }
 
+    /// v7.37.16 — turn the slow-query log off, the state PG expresses
+    /// as `log_min_duration_statement = -1`. Clears the floor and the
+    /// callback together, so an engine re-registered in the same
+    /// process cannot inherit a threshold from an earlier boot.
+    #[must_use]
+    pub const fn without_slow_query_log(mut self) -> Self {
+        self.slow_query_threshold_us = None;
+        self.slow_query_logger = None;
+        self
+    }
+
     /// v6.5.6 — operator knob for plan cache cap. spg-server reads
     /// `SPG_PLAN_CACHE_MAX` env at startup; uses this to override
     /// the compile-time default of 256.

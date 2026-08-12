@@ -935,6 +935,27 @@ fn parse_env_u64_allow_zero(env_key: &str) -> Option<u64> {
     u64_from_raw(env_resolve(env_key), true)
 }
 
+/// v7.37.16 — the slow-query floor, on PG's `log_min_duration_statement`
+/// scale: a negative disables the log, `0` reports every statement, and a
+/// positive value is the millisecond floor. Returns microseconds, the unit
+/// the engine compares against, or `None` when the log is off.
+///
+/// The reader this replaces parsed the value as `u64`, so SPG had no off
+/// switch at all: a negative failed to parse and fell back to the same
+/// 100 ms as an unset variable. PG has had one since 8.4, and the tunables
+/// table claimed a `0` (off) default this knob has never had — its zero
+/// reports everything, exactly as PG's does.
+///
+/// Takes the raw value so the scale is testable without the process
+/// environment, matching [`u64_from_raw`].
+fn slow_query_threshold_us_from_raw(raw: Option<String>) -> Option<u64> {
+    let ms: i64 = raw
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(100);
+    // try_from fails on exactly the negatives, which are the off switch.
+    u64::try_from(ms).ok().map(|ms| ms.saturating_mul(1_000))
+}
+
 #[cfg(test)]
 mod env_knob_tests {
     use super::u64_from_raw;
@@ -997,6 +1018,41 @@ mod env_knob_tests {
         assert_eq!(resolve(Some("0")), None, "an explicit zero is OFF");
         assert_eq!(resolve(None), Some(1000), "unset keeps the default on");
         assert_eq!(resolve(Some("250")), Some(250), "a value is itself");
+    }
+
+    /// r1017 — the OTHER slow-query knob, and the one that had no off
+    /// switch at all.
+    ///
+    /// `SPG_SLOW_QUERY_THRESHOLD_MS` drives the engine's `slow_query`
+    /// event; `SPG_SLOW_QUERY_LOG_MS` above drives the server log. Their
+    /// zeroes do NOT mean the same thing, which is why they get separate
+    /// pins: this one rides PG's `log_min_duration_statement` scale, where
+    /// zero reports every statement and the off switch is `-1`.
+    ///
+    /// Found by auditing every knob the tunables table documents a zero
+    /// for, after the two zero-dropping bugs above. The table said this
+    /// one defaulted to `0` (off); it has always defaulted to 100 ms, and
+    /// the old `u64` parse meant a `-1` written by an operator reading
+    /// across from PG landed on that same 100 ms — the log stayed on, and
+    /// nothing reported that the value had been rejected.
+    #[test]
+    fn the_slow_query_event_threshold_rides_pgs_scale() {
+        use super::slow_query_threshold_us_from_raw;
+        let us = |raw: Option<&str>| slow_query_threshold_us_from_raw(raw.map(str::to_string));
+
+        assert_eq!(us(Some("-1")), None, "PG's -1 turns the log off");
+        assert_eq!(us(Some("-250")), None, "any negative is off, as in PG");
+        assert_eq!(
+            us(Some("0")),
+            Some(0),
+            "zero reports every statement — it is NOT the off switch here"
+        );
+        assert_eq!(us(Some("250")), Some(250_000), "a floor arrives in µs");
+        assert_eq!(us(None), Some(100_000), "unset is the 100 ms default");
+        assert_eq!(us(Some("junk")), Some(100_000), "so is an unreadable value");
+        // The floor is operator-supplied, so the ms→µs conversion has to
+        // hold at the top of the range rather than wrap into a tiny one.
+        assert_eq!(us(Some(&i64::MAX.to_string())), Some(u64::MAX));
     }
 }
 
@@ -1636,14 +1692,15 @@ fn run(
         // v6.5.6 — slow-query log threshold from env, default 100ms.
         // v7.37.25 (25.5) — honours `SPG_LOG_MIN_DURATION` (PG-aligned
         // alias) ahead of the legacy `SPG_SLOW_QUERY_THRESHOLD_MS`.
-        let slow_us: u64 = env_resolve("SPG_SLOW_QUERY_THRESHOLD_MS")
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(100)
-            * 1_000;
-        *e = prev
+        // v7.37.16 — the value rides PG's `log_min_duration_statement`
+        // scale, negatives included; see `slow_query_threshold_us_from_raw`.
+        let wired = prev
             .with_activity_provider(activity_snapshot)
-            .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot)
-            .with_slow_query_log(slow_us, log_slow_query);
+            .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot);
+        *e = match slow_query_threshold_us_from_raw(env_resolve("SPG_SLOW_QUERY_THRESHOLD_MS")) {
+            Some(slow_us) => wired.with_slow_query_log(slow_us, log_slow_query),
+            None => wired.without_slow_query_log(),
+        };
         // v7.39 (round 476) — `pg_current_wal_lsn()` reports the WAL's real
         // byte position. Only when a WAL exists: without one, 0/0 is the
         // truth rather than a stub.

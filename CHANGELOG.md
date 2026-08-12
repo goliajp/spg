@@ -41,6 +41,50 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.16] — 2026-08-13
+
+Three fixes found by checking the apparatus and the documentation
+against the code, rather than by a failing query. Two of them are the
+same bug in different knobs, and the third is the audit that ended it.
+
+### Fixed
+
+- **The drop-in acceptance panel asserted on stderr.** `psql` writes an
+  error as `ERROR:` plus a `DETAIL:` line; the harness merged both
+  streams into the text it compared, filtered the first line and kept
+  the second, so two cases went red against a server that answered them
+  correctly — and whether they did depended on how the two streams
+  interleaved. It now captures stderr separately and asserts on stdout
+  alone. Verified twice against the published 7.37.15 image: 59/59.
+- **`SPG_SLOW_QUERY_LOG_MS=0` turns the slow-query log off.** It had
+  been documented as the way to do that since v7.37.7, in the code
+  comment as well as the tunables table, and it never worked: the env
+  reader dropped the zero, the one-second default went back in, and the
+  operator kept the logging they had just disabled.
+- **`SPG_SLOW_QUERY_THRESHOLD_MS` can be turned off at all.** The
+  separate knob driving the engine's `slow_query` event parsed as `u64`,
+  so the `-1` an operator writes when moving a `log_min_duration_
+  statement` across from PG did not parse and fell back to the same
+  100 ms as leaving it unset — the log stayed on, and nothing said the
+  value had been rejected. It now rides PG's scale exactly: `-1` off,
+  `0` reports every statement, `>0` is the floor in ms. The tunables
+  table had claimed a default of `0` (off) for this knob, which was
+  wrong twice over: the default has always been 100 ms, and its zero has
+  always reported everything.
+
+Each knob is pinned separately in `main.rs`'s `env_knob_tests`. The two
+slow-query variables sit one line apart in the tunables table and mean
+opposite things by zero, so a shared pin would only encode whichever was
+written second.
+
+`docs/SPG_TUNABLES.md` now carries the mechanical audit that found the
+third one: grep the table for knobs documented with a `0` default, then
+check what each reader does with an explicit zero. Most are safe for a
+dull reason — their default already is off, so a dropped zero lands on
+the same behaviour. Only the ones whose default is not zero can break.
+
+---
+
 ## [7.37.15] — 2026-08-12
 
 ### Fixed
