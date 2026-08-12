@@ -164,6 +164,14 @@ release. When a panel case matters, put the same shape somewhere
 `gate.sh all` reaches — the sqllogictest corpus (`15_regressions/`) is the
 cheapest home, and it is where that concat shape now lives.
 
+The panel reports two different totals depending on how it was invoked, and
+neither is stale. `scripts/dropin-acceptance.sh` on its own runs its **57**
+built-in cases and writes `./dropin-acceptance-report.md`; `release.sh` adds
+`--fixture` twice (the mailrs pg-extensions and init-schema files) for
+**59**, and directs the report to `scripts/dropin-acceptance-report-v<X.Y.Z>
+.md`. Only the versioned one records a release. Grepping the script for
+`^run_case` gives 60, three of which are the function definitions.
+
 The panel asserts the **last line of stdout**. It used to read stdout and
 stderr merged, which cannot be made reliable: a psql error is two lines
 (`ERROR:` then `DETAIL:`), psql block-buffers stdout when it is not a tty
