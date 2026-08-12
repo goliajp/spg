@@ -33,6 +33,16 @@
 >   FLOAT`. Caught by the drop-in panel against the published 7.37.14
 >   image, which is after the fact by design; the shape now lives in the
 >   sqllogictest corpus where `gate.sh all` sees it before a release.
+> - **7.37.16** — three apparatus and operator-surface fixes, none of
+>   them found by a failing query. The drop-in panel was asserting on
+>   stdout and stderr merged together, so two cases went red against a
+>   server that answered them correctly. `SPG_SLOW_QUERY_LOG_MS=0` had
+>   been the documented way to turn the slow-query log off since
+>   v7.37.7 and had never worked. Auditing the rest of the table for
+>   the same shape turned up `SPG_SLOW_QUERY_THRESHOLD_MS`, which had
+>   no off switch at all — PG's `-1` did not parse and took the 100 ms
+>   default, and the table documented a `0` (off) default this knob has
+>   never had.
 >
 > Two release-gate results are recorded but unresolved, both needing a
 > machine to themselves (`SPG_SOAK_TESTS=1`): the freezer had not
