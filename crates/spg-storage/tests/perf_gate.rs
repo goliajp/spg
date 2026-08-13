@@ -826,3 +826,91 @@ fn sq8_recall_at_10_above_0_95_perf_gate() {
     eprintln!("sq8_recall_at_10_unit_sphere_dim128: {avg:.4}");
     assert!(avg >= 0.95, "sq8 recall@10 average = {avg} (need ≥ 0.95)");
 }
+
+/// r1018 — a trigram GIN index must not re-copy a posting list per row.
+///
+/// mailrs (2026-08-13): four `gin_trgm_ops` indexes over message text were
+/// 93 % of a 14,000-row load — 43.6 s with them, 2.9 s without — and the
+/// cost per row rose with the rows already present. Recording a row against
+/// a trigram read that trigram's posting list, CLONED it, pushed one
+/// locator and put the clone back, so a trigram already in k rows cost a
+/// k-element copy to record the (k+1)-th. Common trigrams of prose are in
+/// nearly every row, which is why their synthetic control — one repeated
+/// character, hence one trigram — never showed it.
+///
+/// A ratio, not a budget: the defect is that the eighth batch costs eight
+/// times the first, and a ratio needs no per-machine calibration. Thread
+/// CPU time for the same reason the gates above use it.
+///
+/// Verified in both directions before it was committed, because a timing
+/// assertion that has not been shown to fail pins nothing: with the append
+/// in place the eight batches are flat (0.0174-0.0190 s, ratio 1.05); with
+/// the clone restored they ramp 0.29 -> 1.01 s and the ratio is 3.5. The
+/// bound sits at 2.0, roughly a factor of two from each side. An earlier
+/// version of this test used 400-row batches and PASSED against the
+/// reverted code — the constant cost of shingling diluted the signal to
+/// 3.9x and one run landed under the bound.
+#[test]
+fn gin_trgm_append_does_not_recopy_the_posting_list() {
+    let _perf = perf_lock();
+    // Sized so the quadratic term dominates. At 400 rows a batch the
+    // constant cost of shingling each row's text into trigrams diluted the
+    // signal to 3.9x with the defect present — close enough to the bound
+    // that one run of the reverted code passed. Posting-list copying grows
+    // with rows while shingling does not, so more rows separate them.
+    const BATCH: i64 = 1500;
+    const BATCHES: i64 = 8;
+
+    let mut cat = Catalog::new();
+    cat.create_table(TableSchema::new(
+        "docs",
+        vec![
+            ColumnSchema::new("id", DataType::Int, false),
+            ColumnSchema::new("body", DataType::Text, false),
+        ],
+    ))
+    .unwrap();
+    let t = cat.get_mut("docs").unwrap();
+    t.add_gin_trgm_index("docs_body_trgm".into(), "body")
+        .unwrap();
+
+    // Every row shares one paragraph's worth of trigrams and differs only in
+    // a short suffix — prose, in other words, which is the shape that made
+    // the posting lists long.
+    let shared = "the quick brown fox jumps over the lazy dog while the \
+                  rain in spain stays mainly on the plain and the cat sat";
+    let mut cost = Vec::with_capacity(BATCHES as usize);
+    for b in 0..BATCHES {
+        let start = thread_cpu_now();
+        for i in (b * BATCH)..((b + 1) * BATCH) {
+            let t = cat.get_mut("docs").unwrap();
+            t.insert(Row::new(vec![
+                Value::Int(i as i32),
+                Value::text(format!("{shared} {i}")),
+            ]))
+            .unwrap();
+        }
+        cost.push(thread_cpu_now() - start);
+    }
+
+    for (b, c) in cost.iter().enumerate() {
+        eprintln!("batch {b}: {:.4}s", c.as_secs_f64());
+    }
+    // Batch 0 pays first-touch and allocator warm-up — measured at 2.5x its
+    // successors on the fixed code. Using it as the denominator would inflate
+    // the baseline and blunt the very comparison this test exists to make, so
+    // the reference is batch 1.
+    let first = cost[1].as_secs_f64();
+    let last = cost[(BATCHES - 1) as usize].as_secs_f64();
+    assert!(
+        first > 0.0,
+        "the reference batch measured zero CPU time — the clock, not the code"
+    );
+    let ratio = last / first;
+    assert!(
+        ratio < 2.0,
+        "the last batch of {BATCH} rows cost {ratio:.1}x the first \
+         ({last:.4}s vs {first:.4}s) — posting-list append is scaling with \
+         the rows already indexed"
+    );
+}

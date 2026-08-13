@@ -201,22 +201,37 @@ fn pipelined_batch_under_1_3x_single_rtt() {
         run_single_cycle(&mut s);
     }
 
-    // Measure single-cycle baseline.
-    let t0 = Instant::now();
+    // r1018 — INTERLEAVED, one of each per iteration, rather than all the
+    // singles and then all the batches.
+    //
+    // The ratio is the whole assertion, and measuring its two halves in
+    // sequence lets anything that changes the machine BETWEEN them forge
+    // one. The r1018 gate run failed here at 1.471 against a 1.3 bound,
+    // and the change under test touched only the write path while this
+    // measures a prepared SELECT; two further runs of the same binary
+    // passed. What moved was the testbed, during the second half — the
+    // parallel e2e runner is the load, so the gate supplies its own
+    // false positives. Interleaving cancels drift that is slower than
+    // one iteration, which is what machine load is.
+    //
+    // The reading moved as well as steadied: interleaved, three runs give
+    // 0.221-0.252 against a 1.3 bound, which is the four-fold gain saving
+    // N-1 round trips is supposed to produce. Sequentially it read 1.471.
+    // The bound is left where V6_3_DESIGN put it; the headroom is now
+    // visible rather than assumed.
+    let mut single_total = Duration::ZERO;
+    let mut pipelined_total = Duration::ZERO;
     for _ in 0..ITERS {
+        let t0 = Instant::now();
         run_single_cycle(&mut s);
-    }
-    let single_total = t0.elapsed();
-    let single_per_cycle = single_total / ITERS;
+        single_total += t0.elapsed();
 
-    // Measure pipelined batch of BATCH_SIZE: each iteration does the
-    // same total work as BATCH_SIZE single cycles, but with one Sync
-    // for the whole batch.
-    let t1 = Instant::now();
-    for _ in 0..ITERS {
+        // Same total work as BATCH_SIZE single cycles, one Sync for all.
+        let t1 = Instant::now();
         run_pipelined_batch(&mut s, BATCH_SIZE);
+        pipelined_total += t1.elapsed();
     }
-    let pipelined_total = t1.elapsed();
+    let single_per_cycle = single_total / ITERS;
     let pipelined_per_batch = pipelined_total / ITERS;
     let pipelined_amortised_per_cycle = pipelined_per_batch / BATCH_SIZE as u32;
 
