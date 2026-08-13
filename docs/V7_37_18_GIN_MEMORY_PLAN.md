@@ -174,7 +174,7 @@ because that is where the measurement puts it. Land in this order, measuring
 after each, and stop as soon as the number is acceptable — every step below
 is cheaper and less invasive than the one after it.
 
-### B1 — bound the import's transaction (~890 MB, the largest lever)
+### B1 — bound the import's transaction — DONE, measured −690 MB
 
 `spg import` wraps the whole file in one transaction so a failing statement
 leaves the catalog untouched. That atomicity is a real feature — it is what
@@ -189,6 +189,29 @@ peak; everyone else is byte-for-byte unchanged.
 Then say so where it will be read: the `spg import` usage line, and the
 progress line r1018 added, which is exactly where someone watching a large
 seed is looking.
+
+**Result (r1019).** `--batch-commit N` shipped, default off. Interleaved
+median of three on mailrs's full schema and file:
+
+| | runs | median |
+|---|---|---:|
+| default, one transaction | 2785 / 2890 / 2818 | **2818 MB** |
+| `--batch-commit 1` | 2079 / 2145 / 2128 | **2128 MB** |
+
+−690 MB, −24 %, non-overlapping ranges. On the PK-only schema it is
+1838 → 1010 MB, which corroborates the 1873 → 984 measured before the flag
+existed.
+
+**It does not reach the target on its own.** 2,128 MB against a goal of under
+1,000. B2 is required, and what is left after B1 is the catalog load path and
+the index structures rather than the transaction. Intermediate batch sizes
+(10, 25) were measured once each, disagreed with each other, and are not
+reported — one run is not a reading.
+
+Two pins, both semantic rather than timing: the default stays all-or-nothing,
+and a batched failure keeps its committed batches AND stops claiming "the
+catalog is unchanged" — the sentence an operator decides whether to re-run
+the file on.
 
 ### B2 — stop holding the catalog file while decoding it (~250 MB)
 

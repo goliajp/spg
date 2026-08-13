@@ -41,6 +41,35 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.18] — Unreleased
+
+Working the memory half of mailrs's 2026-08-13 report, plan and measurements
+in `docs/V7_37_18_GIN_MEMORY_PLAN.md`.
+
+### Added
+
+- **`spg import --batch-commit N`** commits every N statements instead of
+  running the whole file in one transaction. Default off, so an import is
+  all-or-nothing exactly as before unless the flag is passed.
+
+  The single wrapping transaction is what makes a large seed cost gigabytes:
+  the catalog is copy-on-write, an import touches every structure in it, and
+  the pre-transaction version stays alive until COMMIT. Interleaved median of
+  three on mailrs's schema and file — 2,818 MB default against 2,128 MB with
+  `--batch-commit 1`, non-overlapping ranges. On a primary-key-only schema it
+  is 1,838 → 1,010 MB.
+
+  It is a trade, so it is opt-in and the failure path says which one you
+  took: a batched import that fails keeps the batches it already committed,
+  and its error names how many rather than repeating "the catalog is
+  unchanged", which is the sentence an operator decides whether to re-run the
+  whole file on.
+
+  This does not reach the target of under 1 GB on its own — the rest is the
+  catalog load path and the index structures, not the transaction.
+
+---
+
 ## [7.37.17] — 2026-08-14
 
 mailrs reactivated their SQL lane against 7.37.16 and reported that a 98 MB
