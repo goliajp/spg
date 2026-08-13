@@ -32,14 +32,44 @@
 extern crate alloc;
 
 use alloc::collections::BTreeSet;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
+
+/// r1019 — a trigram, as three bytes rather than a `String`.
+///
+/// It was a `String`, and `extract_trigrams` allocated one per WINDOW —
+/// before deduplication, so a 3.4 KB message body cost ~3,400 heap
+/// allocations per trigram index, four times over on mailrs's schema.
+/// Measured: their four `gin_trgm_ops` indexes were 9.2 GB of the 16.7 GB
+/// this import allocates in total, 797 MB of its 1,382 MB live high-water,
+/// and 1,044 MB of its 2,193 MB peak RSS. Three bytes in a 24-byte header
+/// plus a heap block, hundreds of millions of times.
+///
+/// Words are ASCII (`is_word_char` admits only ASCII alphanumerics and the
+/// apostrophe), so a trigram is always exactly three ASCII bytes and
+/// `[u8; 3]` holds one with no allocation at all. Ordering is bytewise in
+/// both representations and every trigram is the same length, so the sort
+/// order of a set of these is identical to the sort order of the strings
+/// they replace.
+pub type Trigram = [u8; 3];
+
+/// The trigram as a `&str`, for the places that address a `String`-keyed
+/// map or hand a trigram back to SQL. Borrowed, so it does not allocate.
+///
+/// # Panics
+/// Never in practice — every `Trigram` this module produces has passed a
+/// `from_utf8` check at construction. The expect names that invariant
+/// rather than hiding a silent empty string behind it.
+#[must_use]
+pub fn trigram_str(t: &Trigram) -> &str {
+    core::str::from_utf8(t).expect("Trigram is validated UTF-8 at construction")
+}
 
 /// Extract the set of trigrams (lowercased, space-padded) from
 /// the input. Returns a deduplicated, sorted `BTreeSet`.
 ///
 /// Matches PG `show_trgm` for ASCII inputs.
-pub fn extract_trigrams(input: &str) -> BTreeSet<String> {
+pub fn extract_trigrams(input: &str) -> BTreeSet<Trigram> {
     let mut out = BTreeSet::new();
     for word in split_into_words(input) {
         let padded = pad_word(&word);
@@ -51,8 +81,12 @@ pub fn extract_trigrams(input: &str) -> BTreeSet<String> {
             // bytes already pass through `pad_word`, which keeps
             // only ASCII alphanumerics (and the apostrophe);
             // pre-validated UTF-8.
-            if let Ok(s) = core::str::from_utf8(&bytes[i..i + 3]) {
-                out.insert(s.to_string());
+            // The from_utf8 check stays: it is what skipped a window that
+            // straddles a multi-byte boundary, and dropping it here would
+            // change which trigrams exist rather than only how they are held.
+            let w = [bytes[i], bytes[i + 1], bytes[i + 2]];
+            if core::str::from_utf8(&w).is_ok() {
+                out.insert(w);
             }
         }
     }
@@ -98,7 +132,7 @@ pub fn similarity(a: &str, b: &str) -> f64 {
 /// Returns `None` when the pattern carries no usable constraint
 /// (no literal run of length ≥ 1 after wildcard analysis), which
 /// signals the caller to fall back to a full scan.
-pub fn trigrams_from_like_pattern(pattern: &str) -> Option<BTreeSet<String>> {
+pub fn trigrams_from_like_pattern(pattern: &str) -> Option<BTreeSet<Trigram>> {
     // Split on wildcards, honoring backslash escapes.
     let mut runs: Vec<(
         String,
@@ -146,8 +180,12 @@ pub fn trigrams_from_like_pattern(pattern: &str) -> Option<BTreeSet<String>> {
             continue;
         }
         for i in 0..=bytes.len() - 3 {
-            if let Ok(s) = core::str::from_utf8(&bytes[i..i + 3]) {
-                out.insert(s.to_string());
+            // Patterns, unlike indexed words, can carry non-ASCII, so this
+            // check does real work here: a window straddling a multi-byte
+            // char is skipped exactly as before.
+            let w = [bytes[i], bytes[i + 1], bytes[i + 2]];
+            if core::str::from_utf8(&w).is_ok() {
+                out.insert(w);
             }
         }
     }
@@ -193,10 +231,14 @@ fn pad_word(word: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use alloc::vec;
 
     fn collect(input: &str) -> Vec<String> {
-        extract_trigrams(input).into_iter().collect()
+        extract_trigrams(input)
+            .iter()
+            .map(|t| trigram_str(t).to_string())
+            .collect()
     }
 
     #[test]
@@ -232,9 +274,9 @@ mod tests {
         // `LIKE 'foo%'` → leading-anchored literal "foo", which
         // pads as "  foo".
         let trs = trigrams_from_like_pattern("foo%").unwrap();
-        assert!(trs.contains("  f"));
-        assert!(trs.contains(" fo"));
-        assert!(trs.contains("foo"));
+        assert!(trs.contains(b"  f"));
+        assert!(trs.contains(b" fo"));
+        assert!(trs.contains(b"foo"));
     }
 
     #[test]
@@ -242,8 +284,8 @@ mod tests {
         // `LIKE '%foo%'` → unanchored literal "foo". Only
         // internal trigram "foo" applies; no padding.
         let trs = trigrams_from_like_pattern("%foo%").unwrap();
-        assert!(trs.contains("foo"));
-        assert!(!trs.contains("  f"));
+        assert!(trs.contains(b"foo"));
+        assert!(!trs.contains(b"  f"));
     }
 
     #[test]
@@ -260,6 +302,6 @@ mod tests {
         // `LIKE '\%foo'` → leading-anchored literal "%foo".
         let trs = trigrams_from_like_pattern("\\%foo").unwrap();
         // First trigram pads with two leading spaces then '%'.
-        assert!(trs.contains("  %"));
+        assert!(trs.contains(b"  %"));
     }
 }

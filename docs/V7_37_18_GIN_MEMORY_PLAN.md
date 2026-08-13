@@ -213,28 +213,102 @@ and a batched failure keeps its committed batches AND stops claiming "the
 catalog is unchanged" — the sentence an operator decides whether to re-run
 the file on.
 
-### B2 — stop holding the catalog file while decoding it (~250 MB)
+### B2 — WITHDRAWN: it was aimed at the wrong path
 
-Opening a 250 MB catalog peaks at 625 MB to produce 213 MB of structures.
-The file is read whole into a `Vec<u8>` and that buffer stays live through
-the decode. Either decode from a reader, or `mmap` and decode from the
-mapping so the page cache owns the bytes rather than the heap.
+Opening a 250 MB catalog does peak at 625 MB to produce 213 MB of structures,
+so the load path is genuinely heavy — for a server starting on a large
+database. It is not mailrs's cost: their import writes into a database that
+starts empty, so there is no 250 MB file to read at open. The number came
+from a `SELECT 1` experiment, which measured opening, and was then written
+into a plan about importing.
 
-Measure the decode transient separately first (A3 owes this): if the ~160 MB
-that is neither file nor structures turns out to be per-table scratch, that
-is a second, smaller lever in the same path.
+Kept as a real finding for whoever works on server start-up. Not part of this
+version.
 
-### B3 — the remaining ~260 MB that is not yet named
+### B3 — the ~700 MB, named (Phase A3)
 
-Blocked on A3/A4. Do not guess at it — the last two guesses in this document
-(posting lists dominate; the save path double-copies) were both wrong, and
-both were code reads standing in for measurements.
+A counting global allocator (`spg-embedded/examples/mem_census.rs`) separates
+what a run ALLOCATES from what it ends up resident. Both numbers, same run,
+PK-only schema with `--batch-commit 1`:
 
-### B4 — serialisation buffers (138 MB)
+| | |
+|---|---:|
+| peak live (allocator high-water) | **582.6 MB** |
+| peak RSS | **994 MB** |
+| **gap — allocator retention** | **~411 MB (41 %)** |
+| total ever allocated | **7,590 MB** |
+| live catalog after the script is dropped | 326 MB |
+| snapshot buffer | 140 MB |
 
-Real, small, and easy: build the envelope into the buffer the catalog
-serialises into rather than copying, and reserve capacity from the known
-size. Worth doing when B1-B2 are in, not before — it is 5 % of the peak.
+So 41 % of the peak is memory the process allocated, freed, and the system
+allocator never returned. It is driven by churn: **7.6 GB allocated to load a
+95 MB file, 80x**. On mailrs's full schema it is **16.7 GB, 176x**, peak live
+1,382 MB against 2,193 MB resident.
+
+Isolating the four trigram GIN indexes (full schema, minus only those four):
+
+| | full | minus 4 trgm GIN | delta |
+|---|---:|---:|---:|
+| ever allocated | 16,699 MB | 7,454 MB | **−9,245 MB** |
+| peak live | 1,382 MB | 585 MB | −797 MB |
+| peak RSS | 2,193 MB | 1,149 MB | −1,044 MB |
+| live catalog | 675 MB | 384 MB | −291 MB |
+
+The trigram path is the dominant term — but as **churn during maintenance**,
+not as stored size, which is not what this document originally claimed.
+
+### B3a — trigrams off the heap: measured, and it was not the term
+
+`extract_trigrams` returned `BTreeSet<String>` and allocated one `String` per
+WINDOW, before deduplication: ~3,400 heap allocations per 3.4 KB body per
+index, four indexes, 54,941 rows. Hundreds of millions of three-byte strings
+in twenty-four-byte headers. It looked like the obvious cause of 9.2 GB.
+
+It is not. Trigrams are now `[u8; 3]` on the stack, the `String`-keyed maps
+are addressed through a new `Borrow`-generic `get_by`/`get_mut_by`, and a
+`String` is allocated only for a key the map has never seen:
+
+| | before | after |
+|---|---:|---:|
+| ever allocated | 16,699 MB | **15,219 MB** (−9 %) |
+| peak live | 1,382 MB | **1,411 MB** (no change) |
+
+Peak live comes from the allocator counter rather than from RSS, so "no
+change" is a fact and not a noise band. **The third guess in this document to
+be refuted by its own measurement.**
+
+By arithmetic the remaining term is the posting lists' own growth: ~36 M
+entries per index at 16 bytes is 583 MB, and a `Vec` that doubles copies
+about twice that over its life — ~4.7 GB across four indexes. That is not
+removable by allocating less; it needs the list to stop being one contiguous
+`Vec`, which is B5's blocked representation arriving from a different
+direction than compression.
+
+The change is kept: −1.5 GB of churn and hundreds of millions of allocations
+are worth having, and `get_by`/`get_mut_by` is the lookup a blocked
+representation will need. It is recorded as hygiene, not as the fix.
+
+### B3b — the 640 MB inside one statement
+
+Peak live 1,411 MB against 770 MB live at COMMIT: ~640 MB is transient within
+a single statement. With `--batch-commit 1` each statement is its own
+transaction, so this is copy-on-write duplicating the structures a 500-row
+INSERT touches — 500 rows x ~1,500 trigrams x 4 indexes is 3 M key touches,
+and the first touch of each node copies it.
+
+B1 already reduces this as far as batching can: one statement is the floor.
+Going below it means the import path not taking a transaction snapshot at
+all, which is an engine change and not a 7.37.18 one.
+
+### B4 — WITHDRAWN: it does not touch the peak
+
+The snapshot buffer is real — 233.5 MB live on mailrs's schema — but it is
+built at the END, and peak live by then is 1,411 MB against the 931 MB the
+snapshot pushes live to. Streaming it would remove 233 MB of memory that is
+never the high-water mark.
+
+Measured before it was implemented, which is the only reason it is not in
+this version by mistake.
 
 ### B5 — posting-list representation (was the whole of this document)
 
