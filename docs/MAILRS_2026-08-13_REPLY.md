@@ -173,6 +173,93 @@ delta and varint encoding. Size for it until then, and if the mail corpus is
 the driver, note that four trigram GIN indexes over four text columns is the
 expensive part rather than the row count.
 
+> **Correction, 2026-08-14 (7.37.18).** The paragraph above is wrong in the
+> way that matters for sizing, and it was written from a code read rather
+> than a measurement. See the addendum.
+
 **§6 is noted as written.** In-memory only, seven-thread datasets, no
 query-side numbers at scale — none of the above is read-path evidence, and
 your third column is the thing that would produce it.
+
+
+---
+
+# Addendum — 7.37.18, and a correction to what we told you about memory
+
+## The correction
+
+We said the resident cost was the posting lists and that you should size for
+it. Both halves are wrong, and the second one would have had you buying the
+wrong machine.
+
+**A server holding your loaded catalog is 256 MB.** Not 2.87 GB. Measured by
+opening the finished database and reading the process's resident set:
+
+| schema | peak RSS while importing | db file | **server holding it** |
+|---|---:|---:|---:|
+| yours, as shipped | 2,614 MB | 329 MB | **256 MB** |
+| minus the four `gin_trgm_ops` | 1,831 MB | 246 MB | 212 MB |
+| minus every secondary index | 1,855 MB | 236 MB | 209 MB |
+| primary key only | 1,714 MB | 235 MB | 213 MB |
+
+So: **size the running server for ~2.5x your corpus text, not for gigabytes.**
+What costs gigabytes is the *import process*, transiently, and only while it
+runs. Your "on course to take the machine rather than the file" was the right
+read of what you saw — it just was not the database's steady footprint.
+
+The second thing that table says: peak barely moves with indexes. With no
+secondary index at all it is still 1,714 MB. The four trigram GIN indexes we
+named as the cause are 783 MB of a 2,614 MB peak and ~45 MB of the 256 MB
+steady state. An encoder for posting lists would have attacked 30 % of the
+one and none of the other. We were about to build it.
+
+## What 7.37.18 gives you
+
+**`spg import --batch-commit N`.** The import runs the whole file in one
+transaction so a failure leaves the catalog untouched. That atomicity is
+worth having and stays the default — but it is also what makes a large seed
+cost gigabytes, because the catalog is copy-on-write, an import touches every
+structure in it, and the pre-transaction version stays alive until COMMIT.
+
+Interleaved median of three, your schema and your file:
+
+| | runs | median |
+|---|---|---:|
+| default, one transaction | 2785 / 2890 / 2818 | **2,818 MB** |
+| `--batch-commit 1` | 2079 / 2145 / 2128 | **2,128 MB** |
+
+−690 MB, ranges non-overlapping. On a primary-key-only schema, 1,838 → 1,010.
+
+It is a trade, so it is opt-in, and a batched import that fails tells you
+which trade you took: it reports how many statements are committed and remain
+rather than repeating "the catalog is unchanged". Seeding a fresh database is
+exactly the case where atomicity buys you nothing — if it fails you start
+over anyway — so that is where the flag pays.
+
+## What is left, with numbers instead of adjectives
+
+A counting allocator (`spg-embedded/examples/mem_census.rs`) separates what a
+run allocates from what it ends up resident. On your file:
+
+- **Peak live 1,382 MB against 2,193 MB resident.** ~41 % of the peak is
+  memory allocated, freed, and never returned to the OS by the system
+  allocator.
+- **16.7 GB allocated in total to load 95 MB** — 176x churn. That churn is
+  what produces the retention.
+- Two terms remain, both architectural, neither shipped: the posting lists'
+  own `Vec` growth (~4.7 GB of copying across four indexes — it needs the
+  list to stop being one contiguous vector, which is a different change from
+  compressing it), and copy-on-write duplicating what a single 500-row
+  statement touches (~640 MB; `--batch-commit` is already at its floor there,
+  since one statement is the smallest transaction available).
+
+Three things we expected to ship were withdrawn by their own measurements
+before any of them was written: compressing the posting lists (aimed at a
+steady state that was never the problem), streaming the catalog file during
+decode (that 250 MB is the cost of OPENING a large database — real, but your
+import writes into one that starts empty), and streaming the snapshot write
+(233 MB that is never the high-water mark).
+
+We are telling you what was withdrawn as well as what shipped because the
+first version of this letter told you a fix was coming that we now know would
+not have helped you.
