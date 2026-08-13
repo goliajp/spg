@@ -19234,9 +19234,12 @@ fn apply_function_dispatch(
             // PG returns the trigram set sorted lexicographically.
             // `extract_trigrams` already returns a BTreeSet so the
             // order is canonical.
+            // r1019 — trigrams are `[u8; 3]` now; show_trgm is the one caller
+            // that genuinely wants them as text, so it is the one that pays
+            // for the strings.
             let trigrams: Vec<Option<String>> = spg_storage::trgm::extract_trigrams(s)
-                .into_iter()
-                .map(Some)
+                .iter()
+                .map(|t| Some(spg_storage::trgm::trigram_str(t).to_string()))
                 .collect();
             Ok(Value::TextArray(trigrams))
         }

@@ -457,6 +457,48 @@ impl<K: Ord + Clone, V: Clone> PersistentBTreeMap<K, V> {
     /// inside a TX wrap), `Arc::make_mut` path-copies just the affected
     /// node and the snapshot stays untouched. Either way, callers see the
     /// same end state as the immutable `insert` followed by reassignment.
+    /// r1019 — `get` / `get_mut` addressed by a BORROWED form of the key.
+    ///
+    /// The GIN maps are keyed by `String`, and their maintenance now holds
+    /// trigrams as `[u8; 3]` on the stack. Without this, every lookup would
+    /// have to allocate a `String` just to be allowed to ask — which is the
+    /// allocation r1019 exists to remove. `map.get_mut_by(trigram_str(&t))`
+    /// asks with a `&str` and allocates only when a genuinely new key has to
+    /// be inserted.
+    ///
+    /// Same descent as [`Self::get`] / [`Self::get_mut`], same copy-on-write
+    /// discipline; `K: Borrow<Q>` is what guarantees the two orderings agree.
+    pub fn get_by<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: core::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        let mut node: &Arc<BNode<K, V>> = &self.root;
+        loop {
+            match &**node {
+                BNode::Leaf { entries } => {
+                    return linear_find_entry_by(entries, key).map(|i| &entries[i].1);
+                }
+                BNode::Internal { entries, children } => {
+                    match linear_position_internal_by(entries, key) {
+                        FoundOrDescend::Found(i) => return Some(&entries[i].1),
+                        FoundOrDescend::Descend(i) => node = &children[i],
+                    }
+                }
+            }
+        }
+    }
+
+    /// See [`Self::get_by`]. Walks `Arc::make_mut`, like `get_mut`.
+    pub fn get_mut_by<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: core::borrow::Borrow<Q> + Clone,
+        V: Clone,
+        Q: Ord + ?Sized,
+    {
+        get_mut_by_helper(&mut self.root, key)
+    }
+
     /// r1018 — `O(log₈ N)` mutable borrow of an existing value, under the
     /// same copy-on-write discipline as [`Self::insert_mut`]: uniquely-owned
     /// spine nodes mutate in place, an outstanding snapshot path-copies only
@@ -747,10 +789,57 @@ fn merge_children<K: Ord + Clone, V: Clone>(
     }
 }
 
-/// Transient insert worker — walks `Arc::make_mut` down the spine so each
-/// uniquely-owned node mutates in place. Splits still allocate fresh
-/// `Arc<BNode>` for the new right sibling (those are genuinely new nodes,
-/// not CoW copies).
+/// r1019 — the `Borrow`-generic twins of `linear_find_entry` /
+/// `linear_position_internal`, and of `get_mut_helper`. Identical searches;
+/// the key is compared through `Borrow` so a `&str` can address a `String`.
+fn linear_find_entry_by<K, V, Q>(entries: &[(K, V)], key: &Q) -> Option<usize>
+where
+    K: core::borrow::Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    for (i, (k, _)) in entries.iter().enumerate() {
+        match k.borrow().cmp(key) {
+            core::cmp::Ordering::Equal => return Some(i),
+            core::cmp::Ordering::Greater => return None,
+            core::cmp::Ordering::Less => continue,
+        }
+    }
+    None
+}
+
+fn linear_position_internal_by<K, V, Q>(entries: &[(K, V)], key: &Q) -> FoundOrDescend
+where
+    K: core::borrow::Borrow<Q>,
+    Q: Ord + ?Sized,
+{
+    for (i, (k, _)) in entries.iter().enumerate() {
+        match k.borrow().cmp(key) {
+            core::cmp::Ordering::Equal => return FoundOrDescend::Found(i),
+            core::cmp::Ordering::Greater => return FoundOrDescend::Descend(i),
+            core::cmp::Ordering::Less => continue,
+        }
+    }
+    FoundOrDescend::Descend(entries.len())
+}
+
+fn get_mut_by_helper<'a, K, V, Q>(node: &'a mut Arc<BNode<K, V>>, key: &Q) -> Option<&'a mut V>
+where
+    K: core::borrow::Borrow<Q> + Clone,
+    V: Clone,
+    Q: Ord + ?Sized,
+{
+    match Arc::make_mut(node) {
+        BNode::Leaf { entries } => {
+            let i = linear_find_entry_by(entries, key)?;
+            Some(&mut entries[i].1)
+        }
+        BNode::Internal { entries, children } => match linear_position_internal_by(entries, key) {
+            FoundOrDescend::Found(i) => Some(&mut entries[i].1),
+            FoundOrDescend::Descend(i) => get_mut_by_helper(&mut children[i], key),
+        },
+    }
+}
+
 /// r1018 — the descent behind [`PersistentBTreeMap::get_mut`]. Mirrors
 /// [`PersistentBTreeMap::get`]'s search exactly; the only difference is that
 /// it walks `Arc::make_mut` so the borrow it hands back is unique.
@@ -770,6 +859,10 @@ fn get_mut_helper<'a, K: Ord + Clone, V: Clone>(
     }
 }
 
+/// Transient insert worker — walks `Arc::make_mut` down the spine so each
+/// uniquely-owned node mutates in place. Splits still allocate fresh
+/// `Arc<BNode>` for the new right sibling (those are genuinely new nodes,
+/// not CoW copies).
 fn insert_transient_helper<K: Ord + Clone, V: Clone>(
     node: &mut Arc<BNode<K, V>>,
     k: K,
