@@ -41,6 +41,72 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.18] — Unreleased
+
+Working the memory half of mailrs's 2026-08-13 report, plan and measurements
+in `docs/V7_37_18_GIN_MEMORY_PLAN.md`.
+
+### Added
+
+- **`spg import --batch-commit N`** commits every N statements instead of
+  running the whole file in one transaction. Default off, so an import is
+  all-or-nothing exactly as before unless the flag is passed.
+
+  The single wrapping transaction is what makes a large seed cost gigabytes:
+  the catalog is copy-on-write, an import touches every structure in it, and
+  the pre-transaction version stays alive until COMMIT. Interleaved median of
+  three on mailrs's schema and file — 2,818 MB default against 2,128 MB with
+  `--batch-commit 1`, non-overlapping ranges. On a primary-key-only schema it
+  is 1,838 → 1,010 MB.
+
+  It is a trade, so it is opt-in and the failure path says which one you
+  took: a batched import that fails keeps the batches it already committed,
+  and its error names how many rather than repeating "the catalog is
+  unchanged", which is the sentence an operator decides whether to re-run the
+  whole file on.
+
+  This does not reach the target of under 1 GB on its own.
+
+### Changed
+
+- **Trigrams are `[u8; 3]` rather than `String`.** `extract_trigrams`
+  allocated one heap string per WINDOW, before deduplication — roughly 3,400
+  three-byte strings in twenty-four-byte headers per 3.4 KB body per index,
+  four indexes, 54,941 rows. The `String`-keyed GIN maps are now addressed
+  through a `Borrow`-generic lookup, so a string is allocated only for a key
+  the map has never seen.
+
+  Recorded as hygiene rather than as a fix: it removes 1.5 GB of the import's
+  16.7 GB of allocation, and moves the live high-water not at all
+  (1,382 → 1,411 MB, measured by an allocator counter rather than by RSS, so
+  that is a fact and not a noise band). The obvious cause of the churn was
+  not the cause.
+
+### Measured, not fixed
+
+Phase A of `docs/V7_37_18_GIN_MEMORY_PLAN.md` ran, and three of the things
+this version was expected to contain were withdrawn by their own
+measurements.
+
+- **Steady state was never the problem.** A server holding mailrs's loaded
+  catalog is 209-256 MB. The gigabytes are the import process, transiently.
+- **41 % of the peak is allocator retention.** A counting global allocator
+  (`spg-embedded/examples/mem_census.rs`) puts peak live at 582.6 MB against
+  994 MB resident on a primary-key-only load — memory allocated, freed, and
+  never returned to the OS, driven by 7.6 GB of churn to load a 95 MB file.
+  On the full schema it is 16.7 GB of churn, 176x the input.
+- **What remains is architectural**: the posting lists' own `Vec` growth
+  (~4.7 GB of copying across four indexes, which needs a blocked
+  representation rather than fewer allocations) and copy-on-write duplicating
+  what a single 500-row statement touches (~640 MB, already at the floor
+  `--batch-commit` can reach).
+
+Withdrawn on measurement: streaming the catalog file during decode (aimed at
+server start-up, not at import), and streaming the snapshot write (233 MB
+that is never the high-water mark).
+
+---
+
 ## [7.37.17] — 2026-08-14
 
 mailrs reactivated their SQL lane against 7.37.16 and reported that a 98 MB
