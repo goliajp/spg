@@ -41,6 +41,94 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.17] — 2026-08-14
+
+mailrs reactivated their SQL lane against 7.37.16 and reported that a 98 MB
+dump PostgreSQL 18 loads in 10.9 s had not finished after forty minutes, at
+99.8 % CPU and 3.85 GB resident. They named three suspects, all in the
+insert-time full-text path their schema carries. Ablation on their file
+cleared all three — everything the trigger touches is 15 % of the load — and
+found two unrelated O(n²) loops in the write path. Same file, same schema,
+one machine: **PostgreSQL 18.4 10.41 s, spg 11.84 s**, against a 7.37.16 that
+does not finish.
+
+### Fixed
+
+- **A composite `UNIQUE` whose leading column does not discriminate no
+  longer scans the table once per inserted row.** Enforcement descended the
+  key's btree on its LEADING column and then compared the full key against
+  every row it found. `UNIQUE(mailbox_id, uid)` on a single-mailbox table
+  therefore selected everything: 4,750 locators per probe at 9,500 rows,
+  growing in step with the table. The probe is only a superset filter — each
+  candidate is re-folded and compared on the whole key — so any key column
+  with a usable btree is equally correct to descend on. It now picks the one
+  that discriminates, measured against a real row of the statement, and
+  declines to a single per-statement fold when none of them beats it. No
+  tuning constant: both sides of that comparison count the same unit of
+  work. 175.4 ms → 1.6 ms on a 9,500-row table; the already-selective shape
+  is unchanged at 0.7 ms.
+
+  This is the third time this O(n²) has been closed (v7.29, v7.39, now), and
+  the first time the fix does not assume the leading column is selective. A
+  composite unique whose leading column is a scope — `(mailbox_id, uid)`,
+  `(tenant_id, external_id)`, any owner-and-id pair — is both the worst case
+  for that assumption and a very ordinary schema.
+
+- **GIN posting lists append in place instead of being copied per row.**
+  Recording a row against an index term read that term's posting list out of
+  the map, **cloned it**, pushed one locator and inserted the clone back, so
+  a term already present in k rows cost a k-element copy to record the
+  (k+1)-th. All four GIN kinds did it, in nineteen places. mailrs's four
+  `gin_trgm_ops` indexes over message text were 93 % of a 14,000-row load:
+  43.6 s with them, 2.9 s without. The persistent map gained `get_mut`,
+  which path-copies under the same copy-on-write discipline as `insert_mut`.
+  Whole-load figures on that schema: 43.6 s → 6.5 s.
+
+  It is also why their synthetic control was fast and misleading: a body of
+  one repeated character yields one trigram, so there was no posting list to
+  copy.
+
+- **`spg --version` and `spg --help` work**, and the usage line names all
+  nineteen subcommands rather than eight. `import` — the one an operator
+  seeding a database reaches for first — was among the eleven missing.
+
+- **`spg import` reports progress and elapsed time.** The summary counted
+  statements and rows, and neither answers the question an operator has
+  while watching a large seed: is this slow, or is it stuck? mailrs could
+  not tell those apart for forty minutes. It now prints statements, MiB and
+  elapsed every five seconds while it runs — time-based, so a fast import
+  stays silent — and the final line carries bytes and elapsed.
+
+### Documented
+
+- **Result ordering among rows equal under `ORDER BY` is not defined**, and
+  may differ between identical calls (`STABILITY.md`). PostgreSQL's contract
+  too; stated because it is the one people assume they have. mailrs hit it as
+  a paging defect and as a difference between two backends.
+
+- **`EXPLAIN` already works through `SpgPool`** — as a query, no
+  spg-specific API — and the plan distinguishes an index scan from a
+  sequential one. `spg-embedded::Database::explain` has existed since v7.36
+  for this ask but sits on a handle a `SpgPool` consumer cannot reach, which
+  is why the ask came back. Both shapes are now pinned by tests.
+
+### Known, not fixed
+
+- **Resident memory.** 2.87 GB to load that 95 MB file. Most of it is the
+  trigram posting lists themselves — one locator per (row, term), held
+  uncompressed in memory, where PostgreSQL keeps them compressed and on
+  disk. A design difference rather than a leak, and closing it means delta
+  and varint encoding for posting lists. Size for it until then.
+
+  Planned for 7.37.18 — `docs/V7_37_18_GIN_MEMORY_PLAN.md`. It does not
+  start with the encoder: the only evidence that posting lists dominate is
+  one ablation at 14,000 rows, and scaling it by rows under-predicts the
+  full file by more than half, so something is unaccounted for. Phase A is
+  an accounting that has to reconcile to ±20 % of measured RSS before any
+  encoder is written.
+
+---
+
 ## [7.37.16] — 2026-08-13
 
 Three fixes found by checking the apparatus and the documentation

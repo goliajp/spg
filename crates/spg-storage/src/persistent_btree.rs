@@ -457,6 +457,27 @@ impl<K: Ord + Clone, V: Clone> PersistentBTreeMap<K, V> {
     /// inside a TX wrap), `Arc::make_mut` path-copies just the affected
     /// node and the snapshot stays untouched. Either way, callers see the
     /// same end state as the immutable `insert` followed by reassignment.
+    /// r1018 — `O(log₈ N)` mutable borrow of an existing value, under the
+    /// same copy-on-write discipline as [`Self::insert_mut`]: uniquely-owned
+    /// spine nodes mutate in place, an outstanding snapshot path-copies only
+    /// the spine it touches.
+    ///
+    /// The map is the posting-list store for every GIN index kind, whose
+    /// maintenance had no way to APPEND to a list. It read the list out,
+    /// cloned it, pushed one locator and inserted the clone back — so a
+    /// trigram already present in k rows cost a k-element copy to record the
+    /// (k+1)-th, and a text column's common trigrams are present in nearly
+    /// every row. Measured on mailrs's schema (2026-08-13): four trigram GIN
+    /// indexes over message text took 93 % of a 14,000-row load, superlinearly
+    /// — 43.6 s with them, 2.9 s without.
+    ///
+    /// Returns `None` when the key is absent; the caller inserts a fresh
+    /// single-element list in that case, which is the only path that needs to
+    /// grow the tree.
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        get_mut_helper(&mut self.root, key)
+    }
+
     pub fn insert_mut(&mut self, key: K, value: V) -> Option<V> {
         let (split, prev_v) = insert_transient_helper(&mut self.root, key, value);
         if let Some((right, median)) = split {
@@ -730,6 +751,25 @@ fn merge_children<K: Ord + Clone, V: Clone>(
 /// uniquely-owned node mutates in place. Splits still allocate fresh
 /// `Arc<BNode>` for the new right sibling (those are genuinely new nodes,
 /// not CoW copies).
+/// r1018 — the descent behind [`PersistentBTreeMap::get_mut`]. Mirrors
+/// [`PersistentBTreeMap::get`]'s search exactly; the only difference is that
+/// it walks `Arc::make_mut` so the borrow it hands back is unique.
+fn get_mut_helper<'a, K: Ord + Clone, V: Clone>(
+    node: &'a mut Arc<BNode<K, V>>,
+    key: &K,
+) -> Option<&'a mut V> {
+    match Arc::make_mut(node) {
+        BNode::Leaf { entries } => {
+            let i = linear_find_entry(entries, key)?;
+            Some(&mut entries[i].1)
+        }
+        BNode::Internal { entries, children } => match linear_position_internal(entries, key) {
+            FoundOrDescend::Found(i) => Some(&mut entries[i].1),
+            FoundOrDescend::Descend(i) => get_mut_helper(&mut children[i], key),
+        },
+    }
+}
+
 fn insert_transient_helper<K: Ord + Clone, V: Clone>(
     node: &mut Arc<BNode<K, V>>,
     k: K,
