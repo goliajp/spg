@@ -6,8 +6,8 @@
 //! assertion failed for the apparatus rather than the code.
 //!
 //! The gate runner invokes this target separately with `--features
-//! perf-counters` (scripts/gates.sh), which is also what keeps the feature
-//! out of the workspace build graph.
+//! perf-counters` (`scripts/gate.sh run_gates`), which is also what keeps the
+//! feature out of the workspace build graph.
 
 use spg_engine::Engine;
 
