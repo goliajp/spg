@@ -41,7 +41,10 @@ Server (default addr 127.0.0.1:5544):
   spg \\d | \\dt | \\di | \\dv | \\df | \\du | \\l | \\dn [addr]
 
 Database files (offline, no server):
-  spg import --db <path> --file <sql> [--wal <path>]
+  spg import --db <path> --file <sql> [--batch-commit <n>]
+                                      commit every <n> statements; bounds
+                                      peak memory on a large seed at the
+                                      cost of all-or-nothing (default: off)
   spg backup <db> <dest>              snapshot copy
   spg restore <src> <db>              restore a snapshot
   spg revert <db> --to-seq <n>        replay the WAL's first n records
@@ -256,10 +259,28 @@ fn main() {
             let mut db_path: Option<String> = None;
             let mut file: Option<String> = None;
             let mut force_unlock = false;
+            let mut batch_commit: Option<usize> = None;
             while let Some(a) = args.next() {
                 match a.as_str() {
                     "--db" => db_path = args.next(),
                     "--file" => file = args.next(),
+                    // r1019 (B1) — bound the peak memory of a large seed by
+                    // committing every N statements. Off by default; see
+                    // `import_script` for what it trades.
+                    "--batch-commit" => {
+                        let raw = args.next();
+                        match raw.as_deref().map(str::trim).map(str::parse::<usize>) {
+                            Some(Ok(n)) if n > 0 => batch_commit = Some(n),
+                            _ => {
+                                die(
+                                    "import: --batch-commit takes a positive number of \
+                                     statements",
+                                    2,
+                                );
+                                return;
+                            }
+                        }
+                    }
                     // v7.27 (round-21 B) — recovery-window ergonomics:
                     // clear a lock whose owner is gone (e.g. a stopped
                     // container whose pid is meaningless here) without
@@ -272,7 +293,8 @@ fn main() {
             }
             let (Some(db_path), Some(file)) = (db_path, file) else {
                 die(
-                    "usage: spg import --db <catalog.spg> --file <script.sql> [--force-unlock]",
+                    "usage: spg import --db <catalog.spg> --file <script.sql> \
+                     [--batch-commit <n>] [--force-unlock]",
                     2,
                 );
                 return;
@@ -283,7 +305,7 @@ fn main() {
                 }
                 eprintln!("spg import: cleared lock for {db_path} (--force-unlock)");
             }
-            match import_script(&db_path, &file) {
+            match import_script(&db_path, &file, batch_commit) {
                 Ok(o) => {
                     println!(
                         "imported {} statements ({} rows affected, {:.1} MiB) into {db_path} \
@@ -1932,7 +1954,43 @@ struct ImportOutcome {
 /// and wildly different amounts of work.
 const IMPORT_PROGRESS_EVERY: Duration = Duration::from_secs(5);
 
-fn import_script(db_path: &str, file: &str) -> Result<ImportOutcome, String> {
+/// r1019 (B1) — the aftermath line for a batched import that failed. Split
+/// out so the sentence is one place rather than inline in a format!.
+fn alloc_fmt_committed(committed: usize, batch: usize) -> String {
+    if committed == 0 {
+        format!(
+            "\n  (rolled back to the start — --batch-commit {batch} had not \
+             reached its first boundary, so the catalog is unchanged)"
+        )
+    } else {
+        format!(
+            "\n  (--batch-commit {batch}: the first {committed} statements are \
+             COMMITTED and remain; only the statements after them were rolled \
+             back. Re-running the whole file will replay those {committed}.)"
+        )
+    }
+}
+
+/// r1019 (B1) — `batch_commit` bounds the peak memory of a large seed.
+///
+/// The whole file runs inside one transaction so a failing statement leaves
+/// the catalog untouched, and that atomicity is a feature. It is also what
+/// makes a 95 MB seed cost gigabytes: the catalog is copy-on-write, an
+/// import touches every structure in it, and the pre-transaction version
+/// stays alive until COMMIT. Measured on mailrs's file — peak RSS 1,873 MB
+/// under one transaction against 984 MB committing per statement, and
+/// 2,855 vs 2,095 MB on their full schema.
+///
+/// `Some(n)` commits every n statements and starts a fresh transaction, so
+/// the retained pre-image is bounded by n rather than by the file. `None`
+/// is today's behaviour, byte for byte, and stays the default: an operator
+/// seeding a fresh database can trade atomicity they do not need, and
+/// nobody else should have it traded for them.
+fn import_script(
+    db_path: &str,
+    file: &str,
+    batch_commit: Option<usize>,
+) -> Result<ImportOutcome, String> {
     let script = std::fs::read_to_string(file).map_err(|e| format!("read {file:?}: {e}"))?;
     let mut db =
         spg_embedded::Database::open_path(db_path).map_err(|e| format!("open {db_path:?}: {e}"))?;
@@ -1983,16 +2041,40 @@ fn import_script(db_path: &str, file: &str) -> Result<ImportOutcome, String> {
                     let _ = db.execute("ROLLBACK");
                 }
                 let snippet: String = stmt.trim().chars().take(120).collect();
-                return Err(format!(
-                    "statement #{}: {e:?}\n  {snippet}…{}",
-                    i + 1,
-                    if wrap {
-                        "\n  (import rolled back — the catalog is unchanged)"
-                    } else {
-                        ""
+                // r1019 (B1) — under --batch-commit the rollback undoes the
+                // CURRENT batch only; everything before the last boundary is
+                // already durable. Saying "the catalog is unchanged" there
+                // would be a lie, and it is the sentence an operator decides
+                // whether to re-run the whole file on.
+                let aftermath = match (wrap, batch_commit) {
+                    (false, _) => String::new(),
+                    (true, None) => {
+                        "\n  (import rolled back — the catalog is unchanged)".to_string()
                     }
+                    (true, Some(n)) => {
+                        let committed = (i / n) * n;
+                        alloc_fmt_committed(committed, n)
+                    }
+                };
+                return Err(format!(
+                    "statement #{}: {e:?}\n  {snippet}…{aftermath}",
+                    i + 1
                 ));
             }
+        }
+        // r1019 (B1) — close and reopen the transaction on the batch
+        // boundary. Only meaningful under `wrap`: a script that owns its own
+        // transactions keeps them, and one that runs unwrapped is already
+        // committing per statement.
+        if wrap
+            && let Some(n) = batch_commit
+            && (i + 1) % n == 0
+            && i + 1 < statements.len()
+        {
+            db.execute("COMMIT")
+                .map_err(|e| format!("COMMIT at statement #{}: {e:?}", i + 1))?;
+            db.execute("BEGIN")
+                .map_err(|e| format!("BEGIN after statement #{}: {e:?}", i + 1))?;
         }
     }
     if wrap {
@@ -2038,7 +2120,7 @@ mod tests {
              INSERT INTO no_such_table VALUES (1);",
         )
         .unwrap();
-        let err = import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap_err();
+        let err = import_script(db.to_str().unwrap(), script.to_str().unwrap(), None).unwrap_err();
         assert!(err.contains("statement #3"), "got: {err}");
         assert!(err.contains("rolled back"), "got: {err}");
         // The failed import must leave nothing behind — `good` was
@@ -2055,7 +2137,7 @@ mod tests {
             "CREATE TABLE good (id INT NOT NULL);\nINSERT INTO good VALUES (1);",
         )
         .unwrap();
-        let o = import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap();
+        let o = import_script(db.to_str().unwrap(), script.to_str().unwrap(), None).unwrap();
         assert_eq!((o.statements, o.affected), (2, 1));
         // r1018 — the figures the summary gained. Bytes counts statement
         // text, so it is bounded by the script and cannot be the zero a
@@ -2068,6 +2150,85 @@ mod tests {
         );
         let mut reopened = spg_embedded::Database::open_path(&db).unwrap();
         assert_eq!(reopened.query("SELECT id FROM good").unwrap().len(), 1);
+    }
+
+    /// r1019 (B1) — `--batch-commit N` keeps what it has already committed,
+    /// and says so.
+    ///
+    /// The default is all-or-nothing and stays that way (pinned by
+    /// `import_script_is_atomic_on_failure` above). This pins the other half:
+    /// with a batch boundary crossed, a later failure must NOT take the
+    /// earlier statements with it, because that is the whole trade being
+    /// offered — a bounded pre-image in exchange for the guarantee.
+    ///
+    /// It also pins the sentence. The unbatched failure says "the catalog is
+    /// unchanged", which is exactly the thing an operator decides whether to
+    /// re-run the file on, and it is false once a batch has committed.
+    #[test]
+    fn batch_commit_keeps_the_batches_it_committed() {
+        let db = tmp_path("import-batch");
+        let script = tmp_path("import-batch-sql");
+        std::fs::write(
+            &script,
+            "CREATE TABLE b (id INT NOT NULL);\n\
+             INSERT INTO b VALUES (1);\n\
+             INSERT INTO b VALUES (2);\n\
+             INSERT INTO b VALUES (3);\n\
+             INSERT INTO no_such_table VALUES (4);",
+        )
+        .unwrap();
+
+        // Boundary every 2 statements: CREATE+INSERT(1) commit, then
+        // INSERT(2)+INSERT(3) commit, then the bad statement rolls back
+        // alone.
+        let err =
+            import_script(db.to_str().unwrap(), script.to_str().unwrap(), Some(2)).unwrap_err();
+        assert!(
+            err.contains("are\n  COMMITTED and remain") || err.contains("COMMITTED and remain"),
+            "the failure must not claim the catalog is unchanged: {err}"
+        );
+        assert!(
+            !err.contains("the catalog is unchanged"),
+            "batched failure claimed atomicity it does not have: {err}"
+        );
+
+        let mut reopened = spg_embedded::Database::open_path(&db).unwrap();
+        let rows = reopened.query("SELECT id FROM b").unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "the three committed inserts must survive the later failure"
+        );
+
+        let _ = std::fs::remove_file(&script);
+    }
+
+    /// r1019 (B1) — a boundary that never lands leaves atomicity intact, and
+    /// the message stays honest about it.
+    #[test]
+    fn batch_commit_wider_than_the_script_is_still_all_or_nothing() {
+        let db = tmp_path("import-batch-wide");
+        let script = tmp_path("import-batch-wide-sql");
+        std::fs::write(
+            &script,
+            "CREATE TABLE w (id INT NOT NULL);\n\
+             INSERT INTO w VALUES (1);\n\
+             INSERT INTO no_such_table VALUES (2);",
+        )
+        .unwrap();
+        let err =
+            import_script(db.to_str().unwrap(), script.to_str().unwrap(), Some(100)).unwrap_err();
+        assert!(
+            err.contains("the catalog is unchanged"),
+            "no boundary was crossed, so nothing was committed: {err}"
+        );
+        assert!(
+            spg_embedded::Database::open_path(&db)
+                .and_then(|mut d| d.query("SELECT id FROM w"))
+                .is_err(),
+            "the table must not exist — the whole import rolled back"
+        );
+        let _ = std::fs::remove_file(&script);
     }
 
     #[test]

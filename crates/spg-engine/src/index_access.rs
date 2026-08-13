@@ -1362,13 +1362,17 @@ pub(crate) fn try_trgm_seek<'a>(
     let mut iter = trigrams.iter();
     let first = iter.next()?;
     let mut acc: Vec<spg_storage::RowLocator> = {
-        let mut v = idx.gin_trgm_lookup(first).to_vec();
+        let mut v = idx
+            .gin_trgm_lookup(spg_storage::trgm::trigram_str(first))
+            .to_vec();
         v.sort_by_key(locator_sort_key);
         v.dedup_by_key(|l| locator_sort_key(l));
         v
     };
     for tri in iter {
-        let mut next: Vec<spg_storage::RowLocator> = idx.gin_trgm_lookup(tri).to_vec();
+        let mut next: Vec<spg_storage::RowLocator> = idx
+            .gin_trgm_lookup(spg_storage::trgm::trigram_str(tri))
+            .to_vec();
         next.sort_by_key(locator_sort_key);
         next.dedup_by_key(|l| locator_sort_key(l));
         // Sorted-merge intersection.
