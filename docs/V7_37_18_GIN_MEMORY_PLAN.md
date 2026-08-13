@@ -1,5 +1,9 @@
 # v7.37.18 — the memory half of mailrs's report
 
+> **Phase A has run. It inverted this document's target — see §A-RESULTS
+> before Phase B. The posting-list encoder this was named for is not the
+> lever, and steady-state memory was never the problem.**
+
 **Target:** loading their 95 MB seed costs 2.87 GB resident. Bring that down
 far enough that a full-text mail schema sizes like a database rather than
 like a memory cache.
@@ -25,6 +29,74 @@ cost the kevy v1.29 train three throughput-neutral attacks: userspace memcpy
 was genuinely 16 % of cycles, eliminating it moved throughput by nothing,
 because 16 % of cycles is a tax and not the bottleneck. The same trap exists
 for memory. Phase A is the pre-Phase-B gate.
+
+---
+
+## A-RESULTS — what Phase A measured (2026-08-14)
+
+Every figure below is the full 95 MB file, 54,941 rows, on the same machine.
+
+### The headline: the resident cost is transient, and it is not the indexes
+
+| schema | peak RSS (import) | db file | **server holding it** |
+|---|---:|---:|---:|
+| full, as mailrs ships it | 2,614 MB | 329 MB | **256 MB** |
+| minus the 4 `gin_trgm_ops` | 1,831 MB | 246 MB | 212 MB |
+| minus every secondary index | 1,855 MB | 236 MB | 209 MB |
+| primary key only | **1,714 MB** | 235 MB | **213 MB** |
+
+Two things fall out and both contradict the premise this document was
+written on:
+
+1. **Steady state is 209-256 MB, not 2.87 GB.** A server holding the loaded
+   catalog is roughly 2.5x the input text, which is an ordinary number. What
+   costs gigabytes is the *import process*, transiently.
+2. **Peak barely moves with indexes.** With no secondary index at all it is
+   still 1,714 MB. The four trigram GIN indexes are 783 MB of a 2,614 MB
+   peak — real, but not the majority, and none of the steady state.
+
+An encoder for posting lists would therefore attack ~30 % of the peak and
+0 % of what an operator's machine holds afterwards.
+
+### Where the transient peak actually goes
+
+| lever | measured |
+|---|---:|
+| the single wrapping transaction | **~890 MB** |
+| loading the catalog file | ~250 MB (file buffer held through decode) |
+| serialising it back out | 138 MB |
+| the script text itself | 95 MB |
+| the catalog, in memory, for real | 213 MB |
+
+- **Wrapping transaction.** `import_script` runs the whole file inside one
+  `BEGIN`/`COMMIT` unless the script owns its own transaction. Forcing
+  per-statement commits (a `BEGIN; COMMIT;` at the head of the file makes
+  `script_owns_tx` true) drops the peak from 1,873 to 984 MB on the PK-only
+  schema, and from 2,855 to 2,095 MB on the full one. This is the largest
+  single lever by a wide margin, and it is the copy-on-write catalog keeping
+  the pre-transaction version alive while a transaction that touches every
+  structure stays open.
+- **Load, not save.** Opening the finished 250 MB catalog and running
+  `SELECT 1` peaks at 625 MB; adding a `CHECKPOINT` takes it to 763 MB. So
+  reading and decoding costs ~410 MB over the 213 MB it produces, while
+  serialising the whole thing back out costs 138 MB. The guess this document
+  was about to act on — that the save path holds two full copies plus `Vec`
+  doubling — is **wrong**, and it was a code read rather than a measurement.
+- **Chunked import confirms the shape.** Ten ~10 MB chunks, each its own
+  process, peak at 83, 138, 178, 283, 354, 412, 473, 532, 679, 1,128 MB as
+  the catalog grows. Each process holds only its own 10 MB of script, so the
+  peak tracks the catalog it must load, not the SQL it must run.
+
+### Where the accounting still does not close
+
+984 MB (PK-only, per-statement commits) against 213 MB of real catalog plus
+95 MB of script leaves ~670 MB, and the load-path measurement above accounts
+for roughly 410 MB of it. The remaining ~260 MB is not yet named. **A3 and A4
+still owe an absolute per-structure accounting**; the ±20 % rule stands, and
+this document does not authorise Phase B until it closes.
+
+What A5 already settled is that the question changed: this is about the
+import path's transient memory, not about how the database stores anything.
 
 ---
 
@@ -95,11 +167,69 @@ solves.
 
 ---
 
-## Phase B — the change, ordered so the risky step is small
+## Phase B — REORDERED BY MEASUREMENT (2026-08-14)
 
-Only if A says posting lists are a double-digit share of steady-state RSS.
+The original Phase B, an encoder for posting lists, is kept at the bottom
+because that is where the measurement puts it. Land in this order, measuring
+after each, and stop as soon as the number is acceptable — every step below
+is cheaper and less invasive than the one after it.
 
-### B0 — decide the representation against the read path
+### B1 — bound the import's transaction (~890 MB, the largest lever)
+
+`spg import` wraps the whole file in one transaction so a failing statement
+leaves the catalog untouched. That atomicity is a real feature — it is what
+prints "import rolled back — the catalog is unchanged" — and it is also what
+keeps the pre-transaction catalog alive for the length of a 95 MB seed.
+
+Do not silently drop it. Add `--batch-commit N`, defaulting to **off**
+(today's atomic behaviour), which commits every N statements. An operator
+seeding a fresh database trades atomicity they do not need for a bounded
+peak; everyone else is byte-for-byte unchanged.
+
+Then say so where it will be read: the `spg import` usage line, and the
+progress line r1018 added, which is exactly where someone watching a large
+seed is looking.
+
+### B2 — stop holding the catalog file while decoding it (~250 MB)
+
+Opening a 250 MB catalog peaks at 625 MB to produce 213 MB of structures.
+The file is read whole into a `Vec<u8>` and that buffer stays live through
+the decode. Either decode from a reader, or `mmap` and decode from the
+mapping so the page cache owns the bytes rather than the heap.
+
+Measure the decode transient separately first (A3 owes this): if the ~160 MB
+that is neither file nor structures turns out to be per-table scratch, that
+is a second, smaller lever in the same path.
+
+### B3 — the remaining ~260 MB that is not yet named
+
+Blocked on A3/A4. Do not guess at it — the last two guesses in this document
+(posting lists dominate; the save path double-copies) were both wrong, and
+both were code reads standing in for measurements.
+
+### B4 — serialisation buffers (138 MB)
+
+Real, small, and easy: build the envelope into the buffer the catalog
+serialises into rather than copying, and reserve capacity from the known
+size. Worth doing when B1-B2 are in, not before — it is 5 % of the peak.
+
+### B5 — posting-list representation (was the whole of this document)
+
+The four trigram GIN indexes are 783 MB of the full schema's 2,614 MB peak
+and ~45 MB of its 256 MB steady state. If B1-B4 bring the peak under the
+target, this is not needed for mailrs's report at all, and it should then be
+justified on its own terms (snapshot size, cold-start time) rather than on
+theirs.
+
+If it is still wanted, the original staging holds and is still the right
+shape: change the lookup API to an iterator while the representation stays a
+`Vec<RowLocator>` (zero behaviour change, provable by the gate alone), then
+narrow the element to `u32` row indices, and only then encode. The detail is
+preserved below under "B5 detail (original Phase B)".
+
+### B5 detail (original Phase B)
+
+### B5.0 — decide the representation against the read path
 
 Two candidates:
 
@@ -120,7 +250,7 @@ Delta + varint is the default because it is small and self-contained; a
 periodic skip index (every 128th entry, absolute) keeps intersection from
 degenerating to full decode.
 
-### B1 — change the API shape first, keeping the representation
+### B5.1 — change the API shape first, keeping the representation
 
 `Index::gin_lookup_word`, `gin_trgm_lookup`, `gin_jsonb_lookup` all return
 `&[RowLocator]`, which a compressed list cannot produce. Turn them into
@@ -130,7 +260,7 @@ Zero behaviour change, so the full gate proves the refactor on its own. Every
 caller is then already shaped for a compressed backing, and the step that
 actually changes representation touches storage internals only.
 
-### B2 — narrow the element
+### B5.2 — narrow the element
 
 Hot locators are row indices. `Vec<u32>` for the hot postings plus a rare
 side list for cold ones is 16 → 4 bytes with no encoder at all. Land and
@@ -138,7 +268,7 @@ measure this before B3: if it takes 2.87 GB to something acceptable, B3 may
 not be needed, and 4× for a mechanical change is a good trade against the
 complexity of an encoder.
 
-### B3 — encode
+### B5.3 — encode
 
 Delta + varint + skip index, behind the B1 iterator. Append becomes
 "append to the tail block"; the structure stays append-friendly because
@@ -148,7 +278,7 @@ property r1018's in-place append relies on, so it is already true.
 Deletes and vacuum rewrite blocks rather than removing an element in place.
 Cost is bounded by block size; measure it against the autovacuum gate.
 
-### B4 — the on-disk form
+### B5.4 — the on-disk form
 
 Posting lists are persisted (catalog tags 3/4/5/6, FILE_VERSION 21/24+).
 Keeping the disk format as it is means decode-on-load and encode-on-save,
@@ -191,24 +321,29 @@ which is why B1 is cheap.
 
 ## Stop conditions
 
-- **A does not reconcile to ±20 %.** Do not start B. Find the missing term.
-- **A says rows, not postings, dominate.** This document is the wrong plan;
-  write the row-storage one.
-- **A says the 2× is `Vec` capacity slack.** Ship `shrink_to_fit` at quiesce
-  and re-measure before committing to an encoder.
-- **B2 alone reaches an acceptable number.** Stop there and say so; an
-  encoder that buys nothing is complexity with a story attached.
-- **B0's bench says intersection regresses materially** and a skip index does
-  not recover it. Then the representation is wrong for this workload and
-  roaring gets its turn.
+Rewritten after Phase A, which tripped two of the originals.
 
----
+- **The account still does not close to ±20 %.** ~260 MB of the PK-only peak
+  is unnamed. B1 and B2 are justified by their own measurements and may
+  proceed; B3 may not, and anything past B4 waits on A3/A4.
+- **B1 alone reaches the target.** Then stop and say so. `--batch-commit` is
+  ~890 MB of a ~1,700 MB floor.
+- **A guess is standing in for a measurement.** Twice now in this document:
+  posting lists were assumed to dominate (they are 30 % of peak and none of
+  steady state), and the save path was assumed to hold two full copies plus
+  doubling (it costs 138 MB). Both were code reads. Neither survived an
+  hour of measurement.
+- **Steady state was never the problem.** 209-256 MB for a 95 MB corpus is
+  ordinary. Anything proposed here that improves steady state at the cost of
+  the transient peak has the trade backwards.
 
 ## What "done" means
 
-mailrs loads their 95 MB file and the resident cost is proportional to what a
-database would hold, not 30× the input. A number to beat rather than a
-direction: **under 1 GB for the full seed**, with the read-side gate green.
-If Phase A shows that number is not reachable without also changing row
-storage, then it says so, and 7.37.18 carries the part that is reachable
-along with the measured reason for the rest.
+mailrs can load their 95 MB seed without the import process threatening the
+machine. A number rather than a direction: **peak RSS under 1 GB for the full
+schema**, against 2,614 MB today — and stated as peak, because the resident
+cost afterwards is already 256 MB and was never what they hit.
+
+If B1 and B2 get there, 7.37.18 is those two, the measurements above, and an
+honest note that the posting-list encoder this document was named for was not
+needed. If they do not, the remaining ~260 MB has to be named first.
