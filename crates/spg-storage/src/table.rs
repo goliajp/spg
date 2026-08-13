@@ -1126,9 +1126,14 @@ impl Table {
                     // no lexemes to index).
                     if let Value::TsVector(lexemes) = &row.values[idx.column_position] {
                         for lex in lexemes {
-                            let mut entries = map.get(&lex.word).cloned().unwrap_or_default();
-                            entries.push(RowLocator::Hot(new_row_idx));
-                            map.insert_mut(lex.word.clone(), entries);
+                            if let Some(entries) = map.get_mut(&lex.word) {
+                                entries.push(RowLocator::Hot(new_row_idx));
+                            } else {
+                                map.insert_mut(
+                                    lex.word.clone(),
+                                    alloc::vec![RowLocator::Hot(new_row_idx)],
+                                );
+                            }
                         }
                     }
                 }
@@ -1138,9 +1143,11 @@ impl Table {
                     // each trigram's posting list.
                     if let Value::Text(s) = &row.values[idx.column_position] {
                         for tri in trgm::extract_trigrams(s) {
-                            let mut entries = map.get(&tri).cloned().unwrap_or_default();
-                            entries.push(RowLocator::Hot(new_row_idx));
-                            map.insert_mut(tri, entries);
+                            if let Some(entries) = map.get_mut(&tri) {
+                                entries.push(RowLocator::Hot(new_row_idx));
+                            } else {
+                                map.insert_mut(tri, alloc::vec![RowLocator::Hot(new_row_idx)]);
+                            }
                         }
                     }
                 }
@@ -1160,9 +1167,11 @@ impl Table {
                     };
                     if let Some(s) = text_cell {
                         for lex in fts_simple::simple_lex(s) {
-                            let mut entries = map.get(&lex).cloned().unwrap_or_default();
-                            entries.push(RowLocator::Hot(new_row_idx));
-                            map.insert_mut(lex, entries);
+                            if let Some(entries) = map.get_mut(&lex) {
+                                entries.push(RowLocator::Hot(new_row_idx));
+                            } else {
+                                map.insert_mut(lex, alloc::vec![RowLocator::Hot(new_row_idx)]);
+                            }
                         }
                     }
                 }
@@ -1179,9 +1188,11 @@ impl Table {
                     };
                     if let Some(s) = json_cell {
                         for tok in jsonb_gin::extract_tokens(s) {
-                            let mut entries = map.get(&tok).cloned().unwrap_or_default();
-                            entries.push(RowLocator::Hot(new_row_idx));
-                            map.insert_mut(tok, entries);
+                            if let Some(entries) = map.get_mut(&tok) {
+                                entries.push(RowLocator::Hot(new_row_idx));
+                            } else {
+                                map.insert_mut(tok, alloc::vec![RowLocator::Hot(new_row_idx)]);
+                            }
                         }
                     }
                 }
@@ -1286,9 +1297,11 @@ impl Table {
         if let IndexKind::BTree(map) = &mut idx.kind {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
-                    let mut entries = map.get(&key).cloned().unwrap_or_default();
-                    entries.push(RowLocator::Hot(i));
-                    map.insert_mut(key, entries);
+                    if let Some(entries) = map.get_mut(&key) {
+                        entries.push(RowLocator::Hot(i));
+                    } else {
+                        map.insert_mut(key, alloc::vec![RowLocator::Hot(i)]);
+                    }
                 }
             }
         }
@@ -1316,9 +1329,11 @@ impl Table {
             if let Some(v) = row.values.get(column_position)
                 && let Some(key) = crate::range_excl_index_key(v)
             {
-                let mut entries = map.get(&key).cloned().unwrap_or_default();
-                entries.push(RowLocator::Hot(i));
-                map.insert_mut(key, entries);
+                if let Some(entries) = map.get_mut(&key) {
+                    entries.push(RowLocator::Hot(i));
+                } else {
+                    map.insert_mut(key, alloc::vec![RowLocator::Hot(i)]);
+                }
             }
         }
         self.excl_indexes.push(crate::ExclRangeIndex {
@@ -1350,9 +1365,12 @@ impl Table {
             if let Some(v) = row.values.get(ex.column_position)
                 && let Some(key) = crate::range_excl_index_key(v)
             {
-                let mut entries = ex.map.get(&key).cloned().unwrap_or_default();
-                entries.push(RowLocator::Hot(row_idx));
-                ex.map.insert_mut(key, entries);
+                if let Some(entries) = ex.map.get_mut(&key) {
+                    entries.push(RowLocator::Hot(row_idx));
+                } else {
+                    ex.map
+                        .insert_mut(key, alloc::vec![RowLocator::Hot(row_idx)]);
+                }
             }
         }
     }
@@ -1577,9 +1595,11 @@ impl Table {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Value::TsVector(lexemes) = &row.values[column_position] {
                     for lex in lexemes {
-                        let mut entries = map.get(&lex.word).cloned().unwrap_or_default();
-                        entries.push(RowLocator::Hot(i));
-                        map.insert_mut(lex.word.clone(), entries);
+                        if let Some(entries) = map.get_mut(&lex.word) {
+                            entries.push(RowLocator::Hot(i));
+                        } else {
+                            map.insert_mut(lex.word.clone(), alloc::vec![RowLocator::Hot(i)]);
+                        }
                     }
                 }
             }
@@ -1644,9 +1664,11 @@ impl Table {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Value::Text(s) = &row.values[column_position] {
                     for tri in trgm::extract_trigrams(s) {
-                        let mut entries = map.get(&tri).cloned().unwrap_or_default();
-                        entries.push(RowLocator::Hot(i));
-                        map.insert_mut(tri, entries);
+                        if let Some(entries) = map.get_mut(&tri) {
+                            entries.push(RowLocator::Hot(i));
+                        } else {
+                            map.insert_mut(tri, alloc::vec![RowLocator::Hot(i)]);
+                        }
                     }
                 }
             }
@@ -1711,9 +1733,11 @@ impl Table {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Value::Text(s) = &row.values[column_position] {
                     for lex in fts_simple::simple_lex(s) {
-                        let mut entries = map.get(&lex).cloned().unwrap_or_default();
-                        entries.push(RowLocator::Hot(i));
-                        map.insert_mut(lex, entries);
+                        if let Some(entries) = map.get_mut(&lex) {
+                            entries.push(RowLocator::Hot(i));
+                        } else {
+                            map.insert_mut(lex, alloc::vec![RowLocator::Hot(i)]);
+                        }
                     }
                 }
             }
@@ -1780,9 +1804,11 @@ impl Table {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Value::Json(s) = &row.values[column_position] {
                     for tok in jsonb_gin::extract_tokens(s) {
-                        let mut entries = map.get(&tok).cloned().unwrap_or_default();
-                        entries.push(RowLocator::Hot(i));
-                        map.insert_mut(tok, entries);
+                        if let Some(entries) = map.get_mut(&tok) {
+                            entries.push(RowLocator::Hot(i));
+                        } else {
+                            map.insert_mut(tok, alloc::vec![RowLocator::Hot(i)]);
+                        }
                     }
                 }
             }
@@ -1857,9 +1883,11 @@ impl Table {
         };
         let mut count = 0usize;
         for (key, locator) in locators {
-            let mut entries = map.get(&key).cloned().unwrap_or_default();
-            entries.push(locator);
-            map.insert_mut(key, entries);
+            if let Some(entries) = map.get_mut(&key) {
+                entries.push(locator);
+            } else {
+                map.insert_mut(key, alloc::vec![locator]);
+            }
             count += 1;
         }
         Ok(count)
@@ -1902,9 +1930,11 @@ impl Table {
         };
         let mut count = 0usize;
         for (word, locator) in locators {
-            let mut entries = map.get(&word).cloned().unwrap_or_default();
-            entries.push(locator);
-            map.insert_mut(word, entries);
+            if let Some(entries) = map.get_mut(&word) {
+                entries.push(locator);
+            } else {
+                map.insert_mut(word, alloc::vec![locator]);
+            }
             count += 1;
         }
         Ok(count)
@@ -2625,9 +2655,11 @@ impl Table {
                         map.insert_mut(k, locs);
                     }
                     if let Some(k) = new_key {
-                        let mut entries = map.get(&k).cloned().unwrap_or_default();
-                        entries.push(RowLocator::Hot(position));
-                        map.insert_mut(k, entries);
+                        if let Some(entries) = map.get_mut(&k) {
+                            entries.push(RowLocator::Hot(position));
+                        } else {
+                            map.insert_mut(k, alloc::vec![RowLocator::Hot(position)]);
+                        }
                     }
                 }
             }
@@ -2652,9 +2684,11 @@ impl Table {
                 ex.map.insert_mut(k, locs);
             }
             if let Some(k) = new_k {
-                let mut entries = ex.map.get(&k).cloned().unwrap_or_default();
-                entries.push(RowLocator::Hot(position));
-                ex.map.insert_mut(k, entries);
+                if let Some(entries) = ex.map.get_mut(&k) {
+                    entries.push(RowLocator::Hot(position));
+                } else {
+                    ex.map.insert_mut(k, alloc::vec![RowLocator::Hot(position)]);
+                }
             }
         }
         Ok(())
@@ -2874,10 +2908,14 @@ impl Table {
                         for (i, row) in self.rows.iter().enumerate() {
                             if let Value::TsVector(lexemes) = &row.values[column_position] {
                                 for lex in lexemes {
-                                    let mut entries =
-                                        map.get(&lex.word).cloned().unwrap_or_default();
-                                    entries.push(RowLocator::Hot(i));
-                                    map.insert_mut(lex.word.clone(), entries);
+                                    if let Some(entries) = map.get_mut(&lex.word) {
+                                        entries.push(RowLocator::Hot(i));
+                                    } else {
+                                        map.insert_mut(
+                                            lex.word.clone(),
+                                            alloc::vec![RowLocator::Hot(i)],
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2890,9 +2928,11 @@ impl Table {
                         for (i, row) in self.rows.iter().enumerate() {
                             if let Value::Text(s) = &row.values[column_position] {
                                 for tri in trgm::extract_trigrams(s) {
-                                    let mut entries = map.get(&tri).cloned().unwrap_or_default();
-                                    entries.push(RowLocator::Hot(i));
-                                    map.insert_mut(tri, entries);
+                                    if let Some(entries) = map.get_mut(&tri) {
+                                        entries.push(RowLocator::Hot(i));
+                                    } else {
+                                        map.insert_mut(tri, alloc::vec![RowLocator::Hot(i)]);
+                                    }
                                 }
                             }
                         }
@@ -2910,9 +2950,11 @@ impl Table {
                         for (i, row) in self.rows.iter().enumerate() {
                             if let Value::Text(s) = &row.values[column_position] {
                                 for lex in fts_simple::simple_lex(s) {
-                                    let mut entries = map.get(&lex).cloned().unwrap_or_default();
-                                    entries.push(RowLocator::Hot(i));
-                                    map.insert_mut(lex, entries);
+                                    if let Some(entries) = map.get_mut(&lex) {
+                                        entries.push(RowLocator::Hot(i));
+                                    } else {
+                                        map.insert_mut(lex, alloc::vec![RowLocator::Hot(i)]);
+                                    }
                                 }
                             }
                         }
@@ -2927,9 +2969,11 @@ impl Table {
                         for (i, row) in self.rows.iter().enumerate() {
                             if let Value::Json(s) = &row.values[column_position] {
                                 for tok in jsonb_gin::extract_tokens(s) {
-                                    let mut entries = map.get(&tok).cloned().unwrap_or_default();
-                                    entries.push(RowLocator::Hot(i));
-                                    map.insert_mut(tok, entries);
+                                    if let Some(entries) = map.get_mut(&tok) {
+                                        entries.push(RowLocator::Hot(i));
+                                    } else {
+                                        map.insert_mut(tok, alloc::vec![RowLocator::Hot(i)]);
+                                    }
                                 }
                             }
                         }

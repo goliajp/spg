@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use spg_storage::Catalog;
 use spg_wire::{
@@ -24,6 +24,34 @@ use spg_wire::{
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:5544";
+
+/// r1018 (mailrs §5) — the usage line named eight subcommands and the
+/// binary answers nineteen. `import` was among the missing, which is the
+/// one an operator seeding a database reaches for first and the one this
+/// tool is most often run for.
+const USAGE: &str = "\
+spg — SPG command-line client
+
+Server (default addr 127.0.0.1:5544):
+  spg ping [addr]                     liveness check
+  spg query <sql> [addr]              run one statement, print rows
+  spg stats [addr]                    engine counters
+  spg top [addr]                      live activity view
+  spg describe[-tables|-indexes|-views|-functions|-roles|-databases|-schemas] [addr]
+  spg \\d | \\dt | \\di | \\dv | \\df | \\du | \\l | \\dn [addr]
+
+Database files (offline, no server):
+  spg import --db <path> --file <sql> [--wal <path>]
+  spg backup <db> <dest>              snapshot copy
+  spg restore <src> <db>              restore a snapshot
+  spg revert <db> --to-seq <n>        replay the WAL's first n records
+  spg wal-lint <wal> --against-schema <db>
+
+PITR:
+  spg backup-pitr | verify-pitr | prune-pitr | pitr-restore ...
+
+  spg version | --version | -V
+  spg help    | --help    | -h";
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
@@ -55,8 +83,17 @@ fn main() {
                 Err(e) => die(&format!("stats failed: {e}"), 1),
             }
         }
-        Some("version") => {
+        // r1018 (mailrs §5) — `spg --version` answered `unknown command`.
+        // Every other tool on an operator's PATH takes the flag, so the flag
+        // is what gets typed first; answering "unknown command" to it reads
+        // as "this binary is broken" rather than "try the subcommand". Same
+        // for help, which had no spelling at all: `spg`, `spg help` and
+        // `spg --help` all died with usage on stderr and exit 2.
+        Some("version" | "--version" | "-V") => {
             println!("spg {}", env!("CARGO_PKG_VERSION"));
+        }
+        Some("help" | "--help" | "-h") => {
+            println!("{USAGE}");
         }
         // v7.37.23 (23.2) — psql meta-command equivalents:
         //   \d  / describe          — list relations  (tables + views + indexes + sequences)
@@ -247,9 +284,14 @@ fn main() {
                 eprintln!("spg import: cleared lock for {db_path} (--force-unlock)");
             }
             match import_script(&db_path, &file) {
-                Ok((stmts, affected)) => {
+                Ok(o) => {
                     println!(
-                        "imported {stmts} statements ({affected} rows affected) into {db_path}"
+                        "imported {} statements ({} rows affected, {:.1} MiB) into {db_path} \
+                         in {:.2}s",
+                        o.statements,
+                        o.affected,
+                        o.bytes as f64 / 1_048_576.0,
+                        o.elapsed.as_secs_f64()
                     );
                 }
                 Err(e) => die(&format!("import failed: {e}"), 1),
@@ -580,10 +622,7 @@ fn main() {
             }
         }
         Some(other) => die(&format!("unknown command: {other}"), 2),
-        None => die(
-            "usage: spg <ping|query|stats|backup|restore|wal-lint|revert|version> ...",
-            2,
-        ),
+        None => die(USAGE, 2),
     }
 }
 
@@ -1870,7 +1909,30 @@ fn format_value(v: &WireValue) -> String {
 /// import left a half-applied prefix behind). A script that carries
 /// its own BEGIN/COMMIT (`pg_dump --single-transaction` output) owns
 /// its boundaries and runs unwrapped.
-fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
+/// r1018 (mailrs §5) — what an import did, and how long it took doing it.
+///
+/// The summary used to read `imported 129 statements (14 rows affected)`.
+/// Both numbers are true and neither answers the question an operator has
+/// while watching a large seed: is this slow, or is it stuck? mailrs could
+/// not tell those apart for forty minutes. Elapsed time and bytes consumed
+/// answer it after the fact; the progress line inside the loop answers it
+/// during.
+#[derive(Debug)]
+struct ImportOutcome {
+    statements: usize,
+    affected: usize,
+    bytes: usize,
+    elapsed: Duration,
+}
+
+/// How long the import stays silent before it starts reporting progress.
+/// Time-based rather than per-N-statements so a fast import prints nothing
+/// at all and a slow one speaks up regardless of how coarse its statements
+/// are — a 500-tuple INSERT and a one-row INSERT are the same event count
+/// and wildly different amounts of work.
+const IMPORT_PROGRESS_EVERY: Duration = Duration::from_secs(5);
+
+fn import_script(db_path: &str, file: &str) -> Result<ImportOutcome, String> {
     let script = std::fs::read_to_string(file).map_err(|e| format!("read {file:?}: {e}"))?;
     let mut db =
         spg_embedded::Database::open_path(db_path).map_err(|e| format!("open {db_path:?}: {e}"))?;
@@ -1891,7 +1953,23 @@ fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
     }
     let mut stmts = 0usize;
     let mut affected = 0usize;
+    let mut bytes = 0usize;
+    let total_bytes = script.len();
+    let started = Instant::now();
+    let mut last_report = started;
     for (i, stmt) in statements.iter().enumerate() {
+        bytes += stmt.len();
+        if last_report.elapsed() >= IMPORT_PROGRESS_EVERY {
+            last_report = Instant::now();
+            eprintln!(
+                "spg import: {}/{} statements, {:.1}/{:.1} MiB, {:.0}s elapsed",
+                i,
+                statements.len(),
+                bytes as f64 / 1_048_576.0,
+                total_bytes as f64 / 1_048_576.0,
+                started.elapsed().as_secs_f64(),
+            );
+        }
         match db.execute_dump_statement(stmt) {
             Ok(spg_embedded::QueryResult::CommandOk { affected: n, .. }) => {
                 stmts += 1;
@@ -1920,7 +1998,12 @@ fn import_script(db_path: &str, file: &str) -> Result<(usize, usize), String> {
     if wrap {
         db.execute("COMMIT").map_err(|e| format!("COMMIT: {e:?}"))?;
     }
-    Ok((stmts, affected))
+    Ok(ImportOutcome {
+        statements: stmts,
+        affected,
+        bytes,
+        elapsed: started.elapsed(),
+    })
 }
 
 #[cfg(test)]
@@ -1972,9 +2055,17 @@ mod tests {
             "CREATE TABLE good (id INT NOT NULL);\nINSERT INTO good VALUES (1);",
         )
         .unwrap();
-        let (stmts, affected) =
-            import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap();
-        assert_eq!((stmts, affected), (2, 1));
+        let o = import_script(db.to_str().unwrap(), script.to_str().unwrap()).unwrap();
+        assert_eq!((o.statements, o.affected), (2, 1));
+        // r1018 — the figures the summary gained. Bytes counts statement
+        // text, so it is bounded by the script and cannot be the zero a
+        // never-updated counter would report.
+        let script_len = std::fs::read_to_string(&script).unwrap().len();
+        assert!(
+            o.bytes > 0 && o.bytes <= script_len,
+            "bytes {} outside (0, {script_len}]",
+            o.bytes
+        );
         let mut reopened = spg_embedded::Database::open_path(&db).unwrap();
         assert_eq!(reopened.query("SELECT id FROM good").unwrap().len(), 1);
     }

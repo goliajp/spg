@@ -123,6 +123,25 @@ run_gates() {
         cargo test --release --locked -p "$crate" --test perf_gate -- \
             --test-threads=1 --nocapture "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
     done
+    # r1018 — the two counter pins, each its own cargo invocation.
+    #
+    # They read process-global `UNIQ_PROBE_*` counters, which only exist
+    # under `perf-counters`, and that feature must not unify into the
+    # workspace build (round 718: it leaked through a shared build graph and
+    # made target/release/spg-server 7-13x slower). Separate invocation,
+    # separate build graph. Separate TARGETS too, because the counters are
+    # process-global and two tests in one binary dilute each other's reading
+    # — measured, not assumed (round 751, and again in r1018).
+    #
+    # They ran nowhere before this. `scripts/gates.sh` had the round-751
+    # step and is a hand-copied testbed script `gate.sh` never calls, whose
+    # `cd ~/spg` points at a clone that had been stale for six days. A pin
+    # outside the gate that runs is a pin that does not exist.
+    for target in uniq_prune_counters uniq_composite_probe; do
+        banner "gates: ${target} (perf-counters, own process)"
+        cargo test --release --locked -p spg-engine --features perf-counters \
+            --test "$target"
+    done
 }
 
 run_biz() {

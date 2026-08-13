@@ -11,6 +11,7 @@ mod mailrs_round12;
 mod mailrs_round20;
 mod mailrs_round26;
 mod mailrs_round27;
+mod mailrs_round28_explain;
 mod smoke;
 mod snapshot_routing;
 mod types;

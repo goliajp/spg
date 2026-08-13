@@ -108,7 +108,7 @@ pub use execute::{RowCells, StreamItem};
 use bytebudget::*;
 pub(crate) use clock::{rewrite_clock_calls, value_to_literal};
 use constraints::*;
-pub use constraints::{UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
+pub use constraints::{UNIQ_FOLD_CHOSEN, UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
 use conversions::*;
 pub use conversions::{
     format_bigint_2d_text_pub, format_bit_string, format_circle, format_hstore_text, format_inet,
