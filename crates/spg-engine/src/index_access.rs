@@ -198,6 +198,34 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     if !matches!(index.kind, spg_storage::IndexKind::BTree(_)) {
         return None;
     }
+    // r1020 — a NULL key is not in the btree, so walking the btree cannot
+    // see the rows that carry one. That is a silent wrong answer, in both
+    // directions, and it shipped:
+    //
+    //   ORDER BY k DESC LIMIT 3   PG: NULL NULL 30    us: 30 20 10
+    //   ORDER BY k ASC  LIMIT 5   PG: 10 20 30 NULL NULL
+    //                             us: 10 20 30          (two rows dropped)
+    //
+    // DESC returns the wrong rows because PG orders NULLS FIRST there;
+    // ASC returns too few because the walk runs out of indexed rows and
+    // has nothing to fall back on. The unbounded ORDER BY is unaffected —
+    // it sorts, and the sort sees every row.
+    //
+    // A NOT NULL column cannot carry one, so the fast path is exact there
+    // and keeps its win. A nullable column falls back to the sort. That is
+    // conservative: most such queries have no NULLs at all, and reclaiming
+    // them means the walker learning to emit NULL-keyed rows at the right
+    // end, which is a change to what it walks rather than a guard on when.
+    // DESC is unrecoverable here: PG orders NULLS FIRST, so a NULL-keyed
+    // row belongs at the very front and the walk would have to know about
+    // it before emitting anything. ASC is recoverable, because NULLs belong
+    // last — see the short-walk check after the loop.
+    let key_nullable = schema_cols
+        .get(col_pos)
+        .is_none_or(|c: &ColumnSchema| c.nullable);
+    if key_nullable && order.desc {
+        return None;
+    }
     let where_expr = stmt.where_.as_ref();
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
     let table_name = table.schema().name.as_str();
@@ -287,6 +315,19 @@ pub(crate) fn try_pk_walk_top_n<'a>(
                 return Some(kept);
             }
         }
+    }
+    // r1020 — the walk ran out of INDEXED rows before filling the request.
+    // On a nullable key that is exactly the case where NULL-keyed rows —
+    // which no btree holds — would have completed it, and PG places them
+    // last under ASC. Returning what we have would be a short answer, so
+    // hand the query back to the sort, which sees every row.
+    //
+    // A NOT NULL key cannot be short for that reason, so it keeps its
+    // result. On a nullable key this costs the walk when the limit was not
+    // satisfied anyway, and keeps the fast path for every request the
+    // indexed rows do satisfy — which is the shape that wins.
+    if key_nullable && kept.len() < want {
+        return None;
     }
     Some(kept)
 }

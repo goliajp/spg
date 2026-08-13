@@ -41,6 +41,50 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.19] — 2026-08-14
+
+### Fixed
+
+- **`ORDER BY <indexed nullable column>` with a `LIMIT` dropped the rows
+  whose key is NULL.** Silent wrong answers in both directions, against
+  PG 18.4:
+
+  ```
+  ORDER BY k DESC LIMIT 3   PG: NULL NULL 30    us: 30 20 10
+  ORDER BY k ASC  LIMIT 5   PG: 10 20 30 NULL NULL
+                            us: 10 20 30        (two rows dropped)
+  ```
+
+  The top-N fast path walks the column's btree in key order, and a NULL key
+  is not in a btree. DESC returned the wrong rows because PG orders NULLS
+  FIRST there; ASC returned too few because the walk ran out of indexed rows
+  with nothing to fall back on. An unbounded `ORDER BY` was never affected —
+  it sorts, and the sort sees every row, which is why this survived.
+
+  The fast path is kept where it is exact. A `NOT NULL` key is unchanged.
+  A nullable key under DESC falls back to the sort. A nullable key under ASC
+  still walks, and falls back only when the walk ends short of what was
+  asked for — which is exactly when the NULL-keyed rows, ordered last, would
+  have completed it.
+
+  The differential corpus had already caught this: `10-index` T13 is
+  `ORDER BY id DESC NULLS FIRST LIMIT 3` over a table carrying two all-NULL
+  rows, and the baseline recorded it as four accepted differing lines. The
+  oracle worked; the baseline turned the catch into a standing shrug.
+
+### Measured
+
+- **The perf sweep is not blocked**, which the working ledger had said for
+  four days. It runs with `control_false_differences=0` — a zero noise floor,
+  so every verdict sits outside the instrument's own resolution — and reports
+  **20 of 32 cells losing to PG18**. The largest family is `ORDER BY` on an
+  indexed column (2.16x at 50k rows), where `EXPLAIN` shows PG doing an
+  `Index Scan` and SPG doing `Sort ← Seq Scan`: the planner does not yet use
+  an index to satisfy an ordering unless there is a `LIMIT`. Reading why that
+  restriction exists is what surfaced the NULL defect above.
+
+---
+
 ## [7.37.18] — 2026-08-14
 
 Working the memory half of mailrs's 2026-08-13 report, plan and measurements
