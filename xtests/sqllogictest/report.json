@@ -523,9 +523,11 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 57, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 69, "fail": 0, "skip": 0,
       "files": [
         { "file": "k02_in_list_visitor.test", "pass": 6, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "orderby_null_index_walk.test", "pass": 12, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "round_14_text_jumbo.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
