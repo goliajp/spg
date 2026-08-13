@@ -1,0 +1,85 @@
+# r1020 — ORDER BY an indexed nullable column with a LIMIT dropped the rows
+# whose key is NULL.
+#
+# The top-N fast path walks the column's btree in key order. A NULL key is
+# not in a btree, so those rows were invisible to it — and the unbounded
+# ORDER BY was unaffected, because it sorts and the sort sees every row.
+# Two silent wrong answers, measured against PG 18.4:
+#
+#   ORDER BY k DESC LIMIT 3   PG: NULL NULL 30    us: 30 20 10
+#   ORDER BY k ASC  LIMIT 5   PG: 10 20 30 NULL NULL
+#                             us: 10 20 30        (two rows dropped)
+#
+# DESC returned the wrong rows because PG orders NULLS FIRST there; ASC
+# returned too few because the walk ran out of indexed rows.
+
+statement ok
+CREATE TABLE onw (id BIGINT PRIMARY KEY, k BIGINT)
+
+statement ok
+INSERT INTO onw VALUES (1,10),(2,NULL),(3,30),(4,NULL),(5,20)
+
+statement ok
+CREATE INDEX onw_k ON onw(k)
+
+# DESC: PG puts NULLs first, so the top 3 are both NULLs and then 30.
+query T
+SELECT coalesce(k::text,'NULL') FROM onw ORDER BY k DESC LIMIT 3
+----
+NULL
+NULL
+30
+
+# ASC with a limit wider than the non-NULL rows: the NULLs must still come
+# back, last. This is the shape that returned three rows instead of five.
+query T
+SELECT coalesce(k::text,'NULL') FROM onw ORDER BY k ASC LIMIT 5
+----
+10
+20
+30
+NULL
+NULL
+
+# The limit that the non-NULL rows satisfy on their own was already right,
+# and must stay right.
+query T
+SELECT coalesce(k::text,'NULL') FROM onw ORDER BY k ASC LIMIT 3
+----
+10
+20
+30
+
+# Unbounded ORDER BY sorts rather than walking, and was never affected.
+query T
+SELECT coalesce(k::text,'NULL') FROM onw ORDER BY k
+----
+10
+20
+30
+NULL
+NULL
+
+# OFFSET rides the same walker.
+query T
+SELECT coalesce(k::text,'NULL') FROM onw ORDER BY k DESC LIMIT 2 OFFSET 1
+----
+NULL
+30
+
+# A NOT NULL column keeps the fast path, and keeps answering correctly.
+statement ok
+CREATE TABLE onw2 (id BIGINT PRIMARY KEY, k BIGINT NOT NULL)
+
+statement ok
+INSERT INTO onw2 VALUES (1,10),(2,40),(3,30),(4,50),(5,20)
+
+statement ok
+CREATE INDEX onw2_k ON onw2(k)
+
+query I
+SELECT k FROM onw2 ORDER BY k DESC LIMIT 3
+----
+50
+40
+30
