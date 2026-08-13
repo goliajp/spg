@@ -37,6 +37,29 @@ without ever having needed a MAJOR break). v4.31's CI gates
 this for the snapshot format; the others are gated by per-row
 `prod_ready` tests.
 
+### What result ordering is NOT
+
+Rows equal under a query's `ORDER BY` come back in **no defined order**, and
+two identical calls may order them differently. Nothing about the engine's
+current behaviour is a promise here: the order among equals falls out of the
+plan, and the plan can change with the data, the statistics, or a release.
+This is PostgreSQL's contract too, and it is stated here because it is the
+one people assume they have without checking.
+
+`LIMIT`/`OFFSET` is where the assumption gets expensive. A paged reader whose
+`ORDER BY` does not settle every tie can see a row twice or miss it entirely,
+because page 2 is a fresh query and free to break the tie the other way.
+
+The fix is the same as on PostgreSQL: end the sort on something unique. A
+primary key is the usual choice — `ORDER BY internal_date DESC, id DESC`
+rather than `ORDER BY internal_date DESC` where `internal_date` is whole
+seconds and ties are common.
+
+Reported by mailrs (2026-08-13), whose conversation list ordered on a
+pinned flag and a whole-second timestamp and nothing else. It surfaced as a
+difference between two of their backends — both entitled to any order among
+equals, and they chose differently.
+
 ### Native wire protocol (port `SPG_ADDR`)
 
 The 13 opcodes are fixed. Adding new opcodes is a MINOR bump;

@@ -38,9 +38,9 @@ echo "=== DATA-COMPAT ==="
 echo "=== CORPUS ==="
 xtests/diffcorpus/run.sh; corpus_rc=$?
 [ $corpus_rc -eq 0 ] || echo "CORPUS GATE RED"
-echo "=== UNIQ-PRUNE (perf-counters, own process) ==="
-cargo test --release -p spg-engine --test uniq_prune_counters --features perf-counters > /tmp/gu.log 2>&1
-uniq_rc=$?
-grep "test result" /tmp/gu.log
-[ $uniq_rc -eq 0 ] || echo "UNIQ-PRUNE GATE RED"
+# r1018 — the UNIQ-PRUNE step moved into `scripts/gate.sh run_gates`,
+# alongside its new sibling UNIQ-COMPOSITE. It had lived only here, and
+# `gate.sh` does not call this script — so the round-751 pin was running
+# nowhere, and would have run against `~/spg` (a clone six days stale on
+# the testbed) if anyone had invoked it.
 echo GATES_DONE

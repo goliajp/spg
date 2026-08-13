@@ -660,12 +660,79 @@ fn probe_btree(table: &spg_storage::Table, leading_pos: usize) -> Option<&spg_st
 ///    key would be missed);
 ///  * the leading column's type always produces an IndexKey (otherwise
 ///    rows could be absent from the btree entirely).
-fn uc_probe_index<'t>(
+/// r1018 — WHICH of the key's columns should the probe descend on, and is
+/// descending worth it at all?
+///
+/// v7.39 took the leading column, on the assumption that it discriminates.
+/// A composite UNIQUE whose leading column names a scope — `UNIQUE(mailbox_id,
+/// uid)`, `UNIQUE(tenant_id, external_id)`, any (owner, id) pair — breaks that
+/// assumption completely: every row shares the leading value, `lookup_eq` hands
+/// back the entire table, and the probe walks all of it once per inserted row.
+/// That is the O(n²) the probe was introduced to remove, back again on the
+/// shape it is most likely to meet. Measured on mailrs's schema (2026-08-13):
+/// locators = 500 × rows-already-present per statement, and a 98 MB dump that
+/// PostgreSQL 18 loads in 10.9 s had not finished after forty minutes.
+///
+/// The probe is only a superset filter — every candidate it returns is
+/// re-folded and compared on the FULL key by [`probe_key_conflict`] — so any
+/// key column carrying a usable btree is equally correct to descend on. This
+/// picks the one that actually discriminates, by counting locators against a
+/// real row of the batch rather than trusting position.
+///
+/// It also declines. Probing costs one descent plus `locators` folds for every
+/// row in the statement; folding costs one fold per live row, once for the
+/// whole statement. When the cheapest candidate loses that comparison the
+/// caller takes the fold, which is O(table) per statement rather than per row.
+/// No tuning constant: both sides of the inequality are counts of the same
+/// unit of work.
+fn uc_probe_choice<'t>(
     table: &'t spg_storage::Table,
     columns: &[usize],
     nulls_not_distinct: bool,
     mysql: bool,
-) -> Option<&'t spg_storage::Index> {
+    sample: Option<&[Value<'static>]>,
+    batch_len: usize,
+) -> Option<(usize, &'t spg_storage::Index)> {
+    let sample = sample?;
+    uc_probe_guards(table, columns, nulls_not_distinct, mysql)?;
+    let schema = table.schema();
+    let mut best: Option<(usize, usize, &spg_storage::Index)> = None;
+    for &col in columns {
+        if !schema
+            .columns
+            .get(col)
+            .is_some_and(|c| indexkeyable_type(&c.ty))
+        {
+            continue;
+        }
+        let Some(idx) = probe_btree(table, col) else {
+            continue;
+        };
+        let Some(ik) = sample.get(col).and_then(spg_storage::IndexKey::from_value) else {
+            continue;
+        };
+        let n = idx.lookup_eq(&ik).len();
+        if best.is_none_or(|(bn, _, _)| n < bn) {
+            best = Some((n, col, idx));
+        }
+        if n == 0 {
+            break;
+        }
+    }
+    let (locators, col, idx) = best?;
+    if locators.saturating_mul(batch_len) >= table.rows().len().saturating_add(batch_len) {
+        crate::bump_counter!(crate::constraints::UNIQ_FOLD_CHOSEN);
+        return None;
+    }
+    Some((col, idx))
+}
+
+fn uc_probe_guards(
+    table: &spg_storage::Table,
+    columns: &[usize],
+    nulls_not_distinct: bool,
+    mysql: bool,
+) -> Option<()> {
     if nulls_not_distinct || columns.is_empty() {
         return None;
     }
@@ -687,14 +754,10 @@ fn uc_probe_index<'t>(
     if !collation_ok {
         return None;
     }
-    if !schema
-        .columns
-        .get(columns[0])
-        .is_some_and(|c| indexkeyable_type(&c.ty))
-    {
-        return None;
-    }
-    probe_btree(table, columns[0])
+    // r1018 — the per-column "does this type always produce an IndexKey"
+    // check moved to the chooser, which asks it of whichever column it is
+    // considering rather than only of the first.
+    Some(())
 }
 
 /// v7.39 (round 166) — probe `idx` for a live row whose collated key
@@ -716,6 +779,11 @@ fn uc_probe_index<'t>(
 pub static UNIQ_PROBE_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub static UNIQ_PROBE_LOCATORS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+/// r1018 — statements where [`uc_probe_choice`] declined the btree and took
+/// the per-statement fold instead. Without this the two paths are
+/// indistinguishable from the outside, and a regression that silently put the
+/// unselective probe back would read as a slowdown with no cause attached.
+pub static UNIQ_FOLD_CHOSEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn probe_key_conflict(
     table: &spg_storage::Table,
@@ -788,7 +856,21 @@ pub(crate) fn enforce_uniqueness_inserts(
         // installs it) is maintained incrementally on every write, so
         // a probe is O(log n) per row — this was the 6.3ms/row (94%)
         // component of the r164 write losses.
-        if let Some(idx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct, mysql) {
+        // r1018 — the chooser needs a real row to count locators against.
+        // Take the first whose folded key carries no NULL, since a
+        // NULL-bearing key sits out of the constraint entirely.
+        let sample = rows
+            .iter()
+            .find(|r| !fold_key(r).iter().any(|v| matches!(v, Value::Null)))
+            .map(alloc::vec::Vec::as_slice);
+        if let Some((probe_col, idx)) = uc_probe_choice(
+            table,
+            &uc.columns,
+            uc.nulls_not_distinct,
+            mysql,
+            sample,
+            rows.len(),
+        ) {
             let mut batch_seen: hashbrown::HashSet<String> =
                 hashbrown::HashSet::with_capacity(rows.len());
             let mut probe_ok = true;
@@ -797,10 +879,7 @@ pub(crate) fn enforce_uniqueness_inserts(
                 if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
                     continue;
                 }
-                let leading = row_values
-                    .get(uc.columns[0])
-                    .cloned()
-                    .unwrap_or(Value::Null);
+                let leading = row_values.get(probe_col).cloned().unwrap_or(Value::Null);
                 if spg_storage::IndexKey::from_value(&leading).is_none() {
                     // A value the btree can't key (shouldn't happen for
                     // the whitelisted types) — fall back to the fold.
@@ -1844,6 +1923,9 @@ pub(crate) fn enforce_unique_index_inserts(
 fn probe_replay(
     table: &spg_storage::Table,
     idx: &spg_storage::Index,
+    // r1018 — the key column the caller's chooser settled on. Not
+    // necessarily `columns[0]`: see `uc_probe_choice`.
+    probe_col: usize,
     columns: &[usize],
     planned: &[(usize, Vec<Value<'static>>)],
     schema: &spg_storage::TableSchema,
@@ -1882,7 +1964,7 @@ fn probe_replay(
             }
             if !removed.contains(&nk) {
                 let key_vec = fold(new_vals);
-                let leading = new_vals.get(columns[0]).cloned().unwrap_or(Value::Null);
+                let leading = new_vals.get(probe_col).cloned().unwrap_or(Value::Null);
                 if spg_storage::IndexKey::from_value(&leading).is_none() {
                     return Ok(false);
                 }
@@ -1992,18 +2074,32 @@ pub(crate) fn enforce_unique_updates(
             ))
         };
         // v7.39 (round 166, attack A3) — probe path first.
-        if let Some(pidx) = uc_probe_index(table, &uc.columns, uc.nulls_not_distinct, mysql)
-            && probe_replay(
-                table,
-                pidx,
-                &uc.columns,
-                planned,
-                schema,
-                &key_str,
-                &on_conflict,
-                mysql,
-            )?
-        {
+        // r1018 — same chooser as the insert path: the probe descends on
+        // whichever key column discriminates, and declines to the fold when
+        // none of them beats it.
+        let sample = planned.iter().map(|(_, v)| v.as_slice()).find(|v| {
+            !uc.columns
+                .iter()
+                .any(|&i| matches!(v.get(i), Some(Value::Null) | None))
+        });
+        if let Some((probe_col, pidx)) = uc_probe_choice(
+            table,
+            &uc.columns,
+            uc.nulls_not_distinct,
+            mysql,
+            sample,
+            planned.len(),
+        ) && probe_replay(
+            table,
+            pidx,
+            probe_col,
+            &uc.columns,
+            planned,
+            schema,
+            &key_str,
+            &on_conflict,
+            mysql,
+        )? {
             continue;
         }
         replay(&key_str, &on_conflict)?;
@@ -2091,22 +2187,32 @@ pub(crate) fn enforce_unique_updates(
         // v7.39 (round 166, attack A3) — a plain unique index probes its
         // own btree (expression / partial / NULLS-NOT-DISTINCT / collated
         // shapes stay on the fold replay).
-        if !mysql
-            && !is_expr_or_partial
-            && !idx.nulls_not_distinct
+        // r1018 — this used to descend on `idx.column_position`, the index's
+        // own leading column, which has the same blind spot the insert path
+        // had: a unique index over (scope, id) probes the scope and walks
+        // every row sharing it. The chooser subsumes the dialect, collation,
+        // NULLS-NOT-DISTINCT and indexkeyable guards that stood here, and
+        // adds the two this path was missing — pick the key column that
+        // discriminates, and decline to the fold when none does.
+        let sample = planned.iter().map(|(_, v)| v.as_slice()).find(|v| {
+            !key_positions
+                .iter()
+                .any(|&i| matches!(v.get(i), Some(Value::Null) | None))
+        });
+        if !is_expr_or_partial
             && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-            && key_positions.iter().all(|&i| {
-                schema.columns.get(i).is_some_and(|c| {
-                    !matches!(c.collation, spg_storage::Collation::CaseInsensitive)
-                })
-            })
-            && schema
-                .columns
-                .get(idx.column_position)
-                .is_some_and(|c| indexkeyable_type(&c.ty))
+            && let Some((probe_col, pidx)) = uc_probe_choice(
+                table,
+                &key_positions,
+                idx.nulls_not_distinct,
+                mysql,
+                sample,
+                planned.len(),
+            )
             && probe_replay(
                 table,
-                idx,
+                pidx,
+                probe_col,
                 &key_positions,
                 planned,
                 schema,
