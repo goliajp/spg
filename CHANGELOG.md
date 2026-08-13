@@ -41,7 +41,7 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
-## [7.37.18] — Unreleased
+## [7.37.18] — 2026-08-14
 
 Working the memory half of mailrs's 2026-08-13 report, plan and measurements
 in `docs/V7_37_18_GIN_MEMORY_PLAN.md`.
