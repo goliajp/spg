@@ -6794,7 +6794,7 @@ impl Engine {
         // eval (the dominant per-row cost of `DISTINCT … ORDER BY`) nor
         // a tagged slot, and the sort below runs over u survivors, not
         // n input rows — PG's hash-distinct-then-sort plan shape.
-        let mut seen_distinct: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+        let mut seen_distinct: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
             hashbrown::HashMap::new();
         let distinct_hb = hashbrown::DefaultHashBuilder::default();
         // v7.39 (round 485) — one projection buffer for the whole scan
@@ -6916,7 +6916,7 @@ impl Engine {
                             .or_default();
                         if bucket
                             .iter()
-                            .any(|&i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect))
+                            .any(|i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect))
                         {
                             continue;
                         }
@@ -7007,7 +7007,7 @@ impl Engine {
                         .or_default();
                     if bucket
                         .iter()
-                        .any(|&i| values_eq_norm(&tagged[i].1.values, &proj_buf, ctx.mysql_dialect))
+                        .any(|i| values_eq_norm(&tagged[i].1.values, &proj_buf, ctx.mysql_dialect))
                     {
                         crate::bump_counter!(crate::select::DISTINCT_DUP_DROPPED);
                         return Ok(());
@@ -8570,7 +8570,7 @@ impl Engine {
             None
         };
         // v7.37.16 — streaming DISTINCT seen-set (see scan-path twin).
-        let mut seen_distinct: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+        let mut seen_distinct: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
             hashbrown::HashMap::new();
         let distinct_hb = hashbrown::DefaultHashBuilder::default();
         for surv_i in 0..n_surv {
@@ -8652,7 +8652,7 @@ impl Engine {
                     .or_default();
                 if bucket
                     .iter()
-                    .any(|&i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect))
+                    .any(|i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect))
                 {
                     continue;
                 }
@@ -9177,14 +9177,14 @@ fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>, mysql: b
     // equal rows different hashes and never dedup.
     let bh = hashbrown::DefaultHashBuilder::default();
     let mut out: Vec<T> = Vec::with_capacity(items.len().min(1024));
-    let mut buckets: hashbrown::HashMap<u64, alloc::vec::Vec<usize>> =
+    let mut buckets: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
         hashbrown::HashMap::with_capacity(items.len());
     for it in items {
         let h = norm_hash_row(row_of(&it), &bh, mysql);
         let bucket = buckets.entry(h).or_default();
         if !bucket
             .iter()
-            .any(|&i| row_eq_norm(row_of(&out[i]), row_of(&it), mysql))
+            .any(|i| row_eq_norm(row_of(&out[i]), row_of(&it), mysql))
         {
             bucket.push(out.len());
             out.push(it);
