@@ -218,3 +218,33 @@ drift rather than sampling noise.
 So: −11 % in process, on the path the server takes, below what this testbed
 can resolve at the socket. Not a wire win, and not evidence of absence
 either.
+
+---
+
+## r1033 — the merge stopped allocating a key vector per row too
+
+The remaining candidate the r1032 note named: only `runs.len()` heads are
+alive at once, so their key buffers can be recycled instead of reallocated.
+`keys_of` now appends into a caller's buffer rather than returning one —
+`build_order_keys_bound` already worked that way, and the closure was
+creating a fresh `Vec` only to hand it back — and the merge passes the
+consumed head's buffer to the row that replaces it.
+
+Interleaved, five rounds, two binaries, server configuration:
+
+| | base (r1032) | keys recycled |
+|---|---:|---:|
+| allocations per query | 800,231 | **400,237** |
+| bytes per query | 148.3 MB | **75.1 MB** |
+| time | 51.80-54.40 ms | **45.79-48.92 ms** |
+
+No round overlaps. Cumulative over r1032 and r1033, on the path the server
+takes for a 400 k `ORDER BY`:
+
+| | before | after |
+|---|---:|---:|
+| allocations per row | **4** | **1** |
+| bytes per query | 151.7 MB | 75.1 MB |
+| time | 57.30-63.45 ms | 45.79-48.92 ms — **−22 %** |
+
+The one that remains is the decoded row itself, which is the answer.
