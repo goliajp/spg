@@ -7700,6 +7700,269 @@ impl Engine {
         Ok(Some(count))
     }
 
+    /// r1031 — `ORDER BY` over NOT NULL integer columns, sorted without
+    /// building an `OrderKey` vector per row.
+    ///
+    /// The row-returning sorted scan allocates twice per row: one
+    /// `Vec<OrderKey>` for the sort keys and one `Vec<Value>` for the
+    /// projection. Counted over 400 k rows (r1030,
+    /// `docs/PERF_SORTED_SCAN_ALLOCATIONS_2026-08-15.md`), that is 800,067
+    /// allocations and 208 MB of traffic for an answer of four hundred
+    /// thousand integers.
+    ///
+    /// The key half is pure ceremony on this shape.
+    /// `sort_tagged_by_inline_int_key` already sorts indices rather than
+    /// rows, so the per-row vector is built, has one integer taken out of
+    /// it, and is then dragged through the permutation — it exists to carry
+    /// a number the row's column already held. This lane carries the number
+    /// instead, in a fixed-size array that lives inside the buffer element
+    /// and allocates nothing. Same idea as the predicate VM's integer lane.
+    ///
+    /// Declines to `None` for anything it does not cover, and every caller
+    /// falls through to the general path, so the gate list is the
+    /// specification.
+    ///
+    /// Ties: equal keys keep scan order, as the stable sort on the general
+    /// path does. Rows that tie on every ORDER BY term are entitled to any
+    /// order among themselves either way — see `STABILITY.md`.
+    fn try_int_key_sorted_stream<F>(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        /// Sort terms this lane carries inline. Four covers every ORDER BY
+        /// in the endpoint sweep and in the dogfood corpus; wider ones fall
+        /// through rather than growing the buffer element for everybody.
+        const MAX_KEYS: usize = 4;
+
+        if stmt.order_by.is_empty()
+            || stmt.order_by.len() > MAX_KEYS
+            || stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.having.is_some()
+            || stmt.group_by.is_some()
+            || !stmt.unions.is_empty()
+            || !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.as_of_segment.is_some()
+            || from.primary.generate_series_args.is_some()
+            || select_has_window(stmt)
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Ok(None);
+        }
+        if stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
+        {
+            return Ok(None);
+        }
+        crate::orderby::check_order_by_legality(stmt)?;
+        crate::orderby::check_order_by_positions(stmt)?;
+        crate::window::reject_window_in_row_clauses(stmt)?;
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+        if !from.primary.only
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+
+        // Every ORDER BY term must be a NOT NULL integer column of this
+        // table. NOT NULL is what lets the key be a bare integer: with
+        // NULLs the lane would have to carry their ordering too, and
+        // getting that subtly wrong is the r1020 defect.
+        let mut key_pos = [0usize; MAX_KEYS];
+        let mut descs = [false; MAX_KEYS];
+        // PG's default is NULLS LAST for ASC and NULLS FIRST for DESC,
+        // which the AST records as `None`; `unwrap_or(desc)` is how the
+        // rest of the engine resolves it.
+        let mut nulls_first = [false; MAX_KEYS];
+        let n_keys = stmt.order_by.len();
+        for (slot, order) in stmt.order_by.iter().enumerate() {
+            let Expr::Column(oc) = &order.expr else {
+                return Ok(None);
+            };
+            if let Some(q) = &oc.qualifier
+                && !q.eq_ignore_ascii_case(alias)
+            {
+                return Ok(None);
+            }
+            let Some(pos) = cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&oc.name))
+            else {
+                return Ok(None);
+            };
+            if !matches!(
+                cols[pos].ty,
+                spg_storage::DataType::SmallInt
+                    | spg_storage::DataType::Int
+                    | spg_storage::DataType::BigInt
+            ) {
+                return Ok(None);
+            }
+            key_pos[slot] = pos;
+            descs[slot] = order.desc;
+            nulls_first[slot] = order.nulls_first.unwrap_or(order.desc);
+        }
+
+        let sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&sess);
+        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
+                c
+            })
+            .collect();
+        let bound_pos: Vec<Option<usize>> = projection
+            .iter()
+            .map(|p| match &p.expr {
+                Expr::Column(c) => match crate::eval::locate_column(c, &ctx) {
+                    Ok(Some(pos)) => Some(pos),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let compiled_where: Option<crate::eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| crate::eval::fully_compilable(w))
+            .map(|w| crate::eval::compile_expr(w, &ctx));
+
+        // The same first-observable point the materialising planner fires,
+        // placed after the gates so it fires exactly once: this lane runs
+        // BEFORE that planner and would otherwise be a hole in the
+        // panic-isolation and cancellation-race coverage rather than a
+        // faster path through it.
+        crate::injection_point!("planner_first_row_fetch", &stmt.from);
+
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
+        let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+        let mut budget = ByteBudget::new(self.max_query_bytes);
+        let snapshot = self.current_snapshot();
+        // Keys, a NULL bit per key slot, and the row. The bitmask keeps
+        // the element small: a nullable key still costs one bit rather
+        // than a second array.
+        let mut sorted: Vec<([i64; MAX_KEYS], u8, Vec<Value<'static>>)> = Vec::new();
+
+        for (ri, row) in table.rows().iter().enumerate() {
+            if ri.is_multiple_of(256) {
+                cancel.check()?;
+            }
+            if !table.is_row_visible(ri, &snapshot) {
+                continue;
+            }
+            // The key comes from the STORED row, before projection: an
+            // ORDER BY column need not appear in the select list.
+            let mut keys = [0i64; MAX_KEYS];
+            let mut nulls = 0u8;
+            let mut keyed = true;
+            for slot in 0..n_keys {
+                match row.values.get(key_pos[slot]) {
+                    Some(Value::SmallInt(v)) => keys[slot] = i64::from(*v),
+                    Some(Value::Int(v)) => keys[slot] = i64::from(*v),
+                    Some(Value::BigInt(v)) => keys[slot] = *v,
+                    Some(Value::Null) | None => nulls |= 1 << slot,
+                    // An integer column holding something else is a row
+                    // this lane cannot order; hand the whole query back
+                    // rather than guess at it.
+                    _ => {
+                        keyed = false;
+                        break;
+                    }
+                }
+            }
+            if !keyed {
+                return Ok(None);
+            }
+            if !Self::stream_filter_project(
+                row,
+                stmt.where_.as_ref(),
+                compiled_where.as_ref(),
+                &mut eval_stack,
+                &projection,
+                &bound_pos,
+                &ctx,
+                &mut values,
+            )? {
+                continue;
+            }
+            budget.charge(crate::bytebudget::approx_values_bytes(&values))?;
+            sorted.push((keys, nulls, core::mem::take(&mut values)));
+            values.reserve(projection.len());
+        }
+
+        sorted.sort_by(|a, b| {
+            use core::cmp::Ordering;
+            for slot in 0..n_keys {
+                let bit = 1u8 << slot;
+                let ord = match (a.1 & bit != 0, b.1 & bit != 0) {
+                    (true, true) => Ordering::Equal,
+                    // Where the NULLs go is already decided — `nulls_first`
+                    // resolved DESC's default when it was read. Reversing
+                    // this for DESC as well would apply the direction
+                    // twice and put them at the wrong end.
+                    (true, false) => {
+                        if nulls_first[slot] {
+                            Ordering::Less
+                        } else {
+                            Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if nulls_first[slot] {
+                            Ordering::Greater
+                        } else {
+                            Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let o = a.0[slot].cmp(&b.0[slot]);
+                        if descs[slot] { o.reverse() } else { o }
+                    }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            Ordering::Equal
+        });
+
+        emit(crate::StreamItem::Header(&columns))?;
+        let count = sorted.len();
+        for (_, _, vals) in &sorted {
+            emit(crate::StreamItem::Row(crate::RowCells::Values(vals)))?;
+        }
+        Ok(Some(count))
+    }
+
     fn try_spill_sorted_stream<F>(
         &self,
         stmt: &SelectStatement,
@@ -7916,7 +8179,8 @@ impl Engine {
     /// in — a shared hot path pays for a new abstraction whether or not it
     /// uses it, and this one is on the scan.
     #[inline]
-    fn stream_project_row<F>(
+    #[allow(clippy::too_many_arguments)]
+    fn stream_filter_project(
         row: &spg_storage::Row<'static>,
         where_: Option<&Expr>,
         // r1023 — the same WHERE, compiled once by the caller. `None` means
@@ -7927,11 +8191,7 @@ impl Engine {
         bound_pos: &[Option<usize>],
         ctx: &crate::eval::EvalContext<'_>,
         values: &mut Vec<Value<'static>>,
-        emit: &mut F,
-    ) -> Result<bool, EngineError>
-    where
-        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
-    {
+    ) -> Result<bool, EngineError> {
         // r1023 — this scan ran its predicate through the TREE INTERPRETER,
         // once per row, and it was the only row-returning path that did.
         // The aggregate path, `table_access`, and the PK walker all compile
@@ -7967,6 +8227,40 @@ impl Engine {
                 Some(pos) => crate::eval::column_at(*pos, row, ctx).map_err(EngineError::Eval)?,
                 None => crate::eval::eval_expr(&p.expr, row, ctx).map_err(EngineError::Eval)?,
             });
+        }
+        Ok(true)
+    }
+
+    /// The same filter and projection, then emit. Split from
+    /// [`Self::stream_filter_project`] so a path that has to BUFFER rows
+    /// before it can emit them — a sort — runs the identical predicate and
+    /// projection rather than a second copy of them.
+    #[allow(clippy::too_many_arguments)]
+    fn stream_project_row<F>(
+        row: &spg_storage::Row<'static>,
+        where_: Option<&Expr>,
+        compiled_where: Option<&crate::eval::CompiledExpr>,
+        eval_stack: &mut Vec<Value<'static>>,
+        projection: &[ProjectedItem],
+        bound_pos: &[Option<usize>],
+        ctx: &crate::eval::EvalContext<'_>,
+        values: &mut Vec<Value<'static>>,
+        emit: &mut F,
+    ) -> Result<bool, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        if !Self::stream_filter_project(
+            row,
+            where_,
+            compiled_where,
+            eval_stack,
+            projection,
+            bound_pos,
+            ctx,
+            values,
+        )? {
+            return Ok(false);
         }
         emit(crate::StreamItem::Row(crate::RowCells::Values(values)))?;
         Ok(true)
@@ -8189,6 +8483,17 @@ impl Engine {
         if !stmt.order_by.is_empty()
             && from.joins.is_empty()
             && let Some(n) = self.try_spill_sorted_stream(stmt, from, cancel, emit)?
+        {
+            return Ok(Some(n));
+        }
+        // r1031 — integer keys carried inline instead of an `OrderKey`
+        // vector per row. Tried AFTER the spill sort on purpose: this lane
+        // buffers the whole answer, so anything the spill path would take
+        // must keep taking it rather than be turned back into an in-memory
+        // sort that answers with a budget error.
+        if !stmt.order_by.is_empty()
+            && from.joins.is_empty()
+            && let Some(n) = self.try_int_key_sorted_stream(stmt, from, cancel, emit)?
         {
             return Ok(Some(n));
         }

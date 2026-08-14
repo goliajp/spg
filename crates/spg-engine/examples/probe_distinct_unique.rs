@@ -25,7 +25,7 @@
 // unsafe, and `GlobalAlloc` cannot be implemented without it.
 #![allow(unsafe_code)]
 
-use spg_engine::Engine;
+use spg_engine::{Engine, TempRun, TempStoreError};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -50,8 +50,27 @@ std::thread_local! {
     static IN_SAMPLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Attribution is opt-in (`SPG_PROBE_SAMPLE=1`). Capturing thousands of
+/// backtraces inside the timed window would be paid by the clock, and this
+/// probe's whole job is to compare two clocks.
+static SAMPLING: AtomicU64 = AtomicU64::new(u64::MAX);
+
+fn sampling_on() -> bool {
+    let cached = SAMPLING.load(Relaxed);
+    if cached != u64::MAX {
+        return cached == 1;
+    }
+    let on = u64::from(std::env::var("SPG_PROBE_SAMPLE").as_deref() == Ok("1"));
+    SAMPLING.store(on, Relaxed);
+    on == 1
+}
+
 fn maybe_sample(count_after: u64) {
     if count_after < NEXT_SAMPLE.load(Relaxed) {
+        return;
+    }
+    if !sampling_on() {
+        NEXT_SAMPLE.store(count_after + SAMPLE_EVERY, Relaxed);
         return;
     }
     NEXT_SAMPLE.store(count_after + SAMPLE_EVERY, Relaxed);
@@ -59,7 +78,10 @@ fn maybe_sample(count_after: u64) {
         return;
     }
     let bt = std::backtrace::Backtrace::force_capture().to_string();
-    if let Ok(mut v) = SAMPLES.lock() {
+    // `try_lock`, never `lock`: this runs INSIDE the allocator, and
+    // blocking here on a lock some other allocating code holds is a
+    // deadlock. Dropping a sample is the correct loss.
+    if let Ok(mut v) = SAMPLES.try_lock() {
         v.push(bt);
     }
     IN_SAMPLER.with(|f| f.set(false));
@@ -81,9 +103,16 @@ fn owner_frame(bt: &str) -> String {
 }
 
 fn report_samples(label: &str) {
-    let Ok(v) = SAMPLES.lock() else { return };
+    // Take the samples OUT and drop the lock before aggregating. Holding
+    // it while building the map deadlocks: the map allocates, the
+    // allocator samples, and the sampler wants this same lock. Cost five
+    // hours of a hung run to find.
+    let taken: Vec<String> = match SAMPLES.lock() {
+        Ok(mut v) => core::mem::take(&mut *v),
+        Err(_) => return,
+    };
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for bt in v.iter() {
+    for bt in taken.iter() {
         *counts.entry(owner_frame(bt)).or_insert(0) += 1;
     }
     let mut rows: Vec<_> = counts.into_iter().collect();
@@ -119,6 +148,44 @@ unsafe impl GlobalAlloc for Counting {
 
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
+
+/// A spill sink, so the probe can be run in BOTH configurations. The
+/// server installs one and `Engine::new()` does not, and that difference
+/// decides which executor serves an ORDER BY: with a sink present the
+/// spill sorter takes the query before any later lane sees it. A probe
+/// that only ever ran without one measured a lane the server never
+/// reaches (r1031).
+struct MemRun {
+    buf: Vec<u8>,
+    read_at: usize,
+}
+
+impl TempRun for MemRun {
+    fn append(&mut self, bytes: &[u8]) -> Result<(), TempStoreError> {
+        self.buf.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn seal(&mut self) -> Result<(), TempStoreError> {
+        self.read_at = 0;
+        Ok(())
+    }
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, TempStoreError> {
+        let n = core::cmp::min(buf.len(), self.buf.len() - self.read_at);
+        buf[..n].copy_from_slice(&self.buf[self.read_at..self.read_at + n]);
+        self.read_at += n;
+        Ok(n)
+    }
+    fn bytes_written(&self) -> u64 {
+        self.buf.len() as u64
+    }
+}
+
+fn mem_run() -> Result<Box<dyn TempRun>, TempStoreError> {
+    Ok(Box::new(MemRun {
+        buf: Vec::new(),
+        read_at: 0,
+    }))
+}
 
 const ROWS: i64 = 400_000;
 /// Coprime with `ROWS`, so `k` is a permutation of `0..ROWS` and DISTINCT
@@ -157,18 +224,41 @@ fn seed(eng: &mut Engine) {
     );
 }
 
+/// Run through the STREAMING entry point, which is what pgwire uses.
+///
+/// `Engine::execute` materialises instead, and the two take different
+/// executors — r1031 wired an ORDER BY lane into the streaming one and this
+/// probe reported no change at all, because it was timing the other path.
+/// An instrument that does not exercise the path under test reads exactly
+/// like a change that did nothing.
 fn run(eng: &mut Engine, label: &str, sql: &str, reps: u32) {
     let mut best = f64::MAX;
     let mut worst: f64 = 0.0;
     let a0 = ALLOCS.load(Relaxed);
     let b0 = ALLOC_BYTES.load(Relaxed);
     for _ in 0..reps {
+        let spg_sql::ast::Statement::Select(stmt) =
+            spg_sql::parser::parse_statement(sql).expect("parse")
+        else {
+            panic!("{label}: not a SELECT");
+        };
+        let mut rows = 0usize;
         let t0 = std::time::Instant::now();
-        let out = eng.execute(sql).expect("query");
+        eng.execute_prepared_select_streaming(&stmt, spg_engine::CancelToken::none(), |item| {
+            if matches!(item, spg_engine::StreamItem::Row(_)) {
+                rows += 1;
+            }
+            Ok(())
+        })
+        .expect("query");
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        // Keep the result alive past the timer, so the work cannot be
-        // optimised out or dropped inside the measured window.
-        core::hint::black_box(&out);
+        // A row count is the witness that the query ran: a lane that
+        // declines silently and one that answers with nothing look the
+        // same on the clock.
+        assert_eq!(
+            rows, ROWS as usize,
+            "{label} returned {rows} rows, wanted {ROWS}"
+        );
         best = best.min(ms);
         worst = worst.max(ms);
     }
@@ -182,11 +272,30 @@ fn run(eng: &mut Engine, label: &str, sql: &str, reps: u32) {
 }
 
 fn main() {
+    // Symbolising a backtrace taken deep inside the spill sorter's merge
+    // overflows the default main-thread stack. The work runs on a thread
+    // with room for it rather than the attribution being unavailable
+    // exactly where it is wanted.
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run_all)
+        .expect("probe thread")
+        .join()
+        .expect("probe thread");
+}
+
+fn run_all() {
     let mut args = std::env::args().skip(1);
     let which = args.next().unwrap_or_else(|| "both".into());
     let reps: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
 
     let mut eng = Engine::new();
+    // `SPG_PROBE_SPILL=1` reproduces the server's configuration.
+    if std::env::var("SPG_PROBE_SPILL").as_deref() == Ok("1") {
+        eng.set_temp_run_factory(mem_run);
+        assert!(eng.can_spill(), "the spill sink did not take");
+        println!("(spill sink installed — the server's configuration)");
+    }
     seed(&mut eng);
 
     let distinct = "SELECT DISTINCT k FROM t ORDER BY k";
@@ -194,13 +303,17 @@ fn main() {
     match which.as_str() {
         "distinct" => {
             run(&mut eng, "distinct", distinct, 1);
-            SAMPLES.lock().map(|mut v| v.clear()).ok();
+            if let Ok(mut v) = SAMPLES.lock() {
+                v.clear();
+            }
             run(&mut eng, "distinct", distinct, reps);
             report_samples("distinct");
         }
         "plain" => {
             run(&mut eng, "plain", plain, 1);
-            SAMPLES.lock().map(|mut v| v.clear()).ok();
+            if let Ok(mut v) = SAMPLES.lock() {
+                v.clear();
+            }
             run(&mut eng, "plain", plain, reps);
             report_samples("plain");
         }

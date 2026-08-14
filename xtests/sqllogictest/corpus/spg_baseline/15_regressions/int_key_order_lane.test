@@ -1,0 +1,190 @@
+# ORDER BY over NOT NULL integer columns takes a lane that carries the keys
+# inline instead of building an OrderKey vector per row (r1031).
+#
+# The lane is a separate executor, so every ordering rule has to hold in it
+# independently: multiple keys, mixed ASC/DESC, a WHERE in front, and the
+# columns it must DECLINE — a nullable key, a text key, an expression key.
+# Those decline cases are here because a lane that silently took them would
+# answer wrongly, not slowly.
+
+statement ok
+CREATE TABLE ikl (id INT PRIMARY KEY, a INT NOT NULL, b BIGINT NOT NULL, s SMALLINT NOT NULL, maybe INT, label TEXT NOT NULL)
+
+statement ok
+INSERT INTO ikl VALUES
+ (1, 2, 100, 7, 5,    'e'),
+ (2, 1, 300, 9, NULL, 'c'),
+ (3, 2,  50, 7, 1,    'a'),
+ (4, 3, 200, 8, NULL, 'd'),
+ (5, 1, 400, 9, 3,    'b')
+
+# Single ascending key.
+query I
+SELECT id FROM ikl ORDER BY a, id
+----
+2
+5
+1
+3
+4
+
+# Descending, and a second key that settles every tie.
+query I
+SELECT id FROM ikl ORDER BY a DESC, id DESC
+----
+4
+3
+1
+5
+2
+
+# Mixed directions across two integer keys.
+query I
+SELECT id FROM ikl ORDER BY a ASC, b DESC
+----
+5
+2
+1
+3
+4
+
+# Three keys of three different integer widths.
+query I
+SELECT id FROM ikl ORDER BY s, a, b
+----
+3
+1
+4
+2
+5
+
+# BIGINT key on its own.
+query I
+SELECT id FROM ikl ORDER BY b DESC
+----
+5
+2
+4
+1
+3
+
+# A WHERE in front: the lane runs the predicate itself, so it has to filter
+# and order in one pass.
+query I
+SELECT id FROM ikl WHERE a = 2 ORDER BY b
+----
+3
+1
+
+query I
+SELECT id FROM ikl WHERE b > 150 ORDER BY b DESC
+----
+5
+2
+4
+
+# An ORDER BY column that is not in the select list.
+query T
+SELECT label FROM ikl ORDER BY b
+----
+a
+e
+d
+c
+b
+
+# --- nullable integer keys: the lane carries these, NULLs and all ---
+#
+# Where the NULLs go is decided by `nulls_first`, which already resolved
+# DESC's default when the key was read. Applying the direction to the NULL
+# placement a second time would put them at the wrong end, and these cases
+# are here to catch exactly that.
+query I
+SELECT id FROM ikl ORDER BY maybe, id
+----
+3
+5
+1
+2
+4
+
+query I
+SELECT id FROM ikl ORDER BY maybe DESC, id
+----
+2
+4
+1
+5
+3
+
+# Explicit NULLS FIRST on an ascending key — the opposite of the default.
+query I
+SELECT id FROM ikl ORDER BY maybe NULLS FIRST, id
+----
+2
+4
+3
+5
+1
+
+# Explicit NULLS LAST on a descending key — also the opposite of ITS
+# default.
+query I
+SELECT id FROM ikl ORDER BY maybe DESC NULLS LAST, id
+----
+1
+5
+3
+2
+4
+
+# A NULL-bearing key behind a non-null one: the second key only decides
+# ties, so the NULLs must not disturb the first key's order.
+query I
+SELECT id FROM ikl ORDER BY a, maybe
+----
+5
+2
+3
+1
+4
+
+# --- shapes the lane still declines, and must answer correctly anyway ---
+
+# Text key.
+query I
+SELECT id FROM ikl ORDER BY label
+----
+3
+5
+2
+4
+1
+
+# Expression key.
+query I
+SELECT id FROM ikl ORDER BY a + b
+----
+3
+1
+4
+2
+5
+
+# Integer keys with LIMIT — the top-N path owns this, not the lane.
+query I
+SELECT id FROM ikl ORDER BY b DESC LIMIT 2
+----
+5
+2
+
+# DISTINCT over an integer key.
+query I
+SELECT DISTINCT a FROM ikl ORDER BY a
+----
+1
+2
+3
+
+statement ok
+DROP TABLE ikl
