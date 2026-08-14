@@ -22,7 +22,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/12_explain` | 9 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 27 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
-| `spg_baseline/15_regressions` | 85 | 0 | 0 | 100.0% |
+| `spg_baseline/15_regressions` | 101 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -355,6 +355,7 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip |
 |---|---|---|---|
+| `index_order_stream.test` | 16 | 0 | 0 |
 | `k02_in_list_visitor.test` | 6 | 0 | 0 |
 | `orderby_null_index_walk.test` | 12 | 0 | 0 |
 | `pred_int_arith_lane.test` | 16 | 0 | 0 |
