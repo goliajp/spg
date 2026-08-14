@@ -154,3 +154,40 @@ serialise/deserialise pair across the run file. Attacking it is a change to
 `extsort.rs`, not to the scan — and it is on shapes SPGS currently WINS
 (`narrow` 73.4-75.6 against PG18's 104.1-126.7), so it is a lead to widen,
 not a loss to close.
+
+---
+
+## r1032 — the merge stopped allocating to read four bytes
+
+The call tree named all four of the external sorter's per-row allocations:
+
+| # | site | what |
+|---|---|---|
+| 1 | `extsort.rs:302` `read_exact(run, 4)` | **a fresh `Vec<u8>` to hold a four-byte length prefix** |
+| 2 | same function, the body read | another `Vec<u8>` |
+| 3 | `codec.rs:1935` | the decoded row's `Vec<Value>` — the answer itself |
+| 4 | `orderby.rs:1618` | the row's `Vec<OrderKey>` |
+
+1,600,236 = 4 × 400,000 + 236, so the count agrees with the tree.
+
+The first two are pure ceremony: `read_exact` allocated its own buffer on
+every call, and the merge calls it twice per row. It now fills a buffer the
+merge owns, which grows once to the widest row and then stops.
+
+Interleaved, five rounds, two binaries, server configuration:
+
+| | base | reused buffer |
+|---|---:|---:|
+| allocations per query | 1,600,236 | **800,231** |
+| time | 57.30-63.45 ms | **50.65-53.36 ms** |
+
+Halved, −11 %, and no round overlaps. The embedded configuration is the
+negative control in the same run: identical allocation counts on both legs,
+because the external sorter is not on that path.
+
+What is left is two per row, and both are real: the decoded row is the
+answer, and the `Vec<OrderKey>` is the tournament's comparison key. The
+keys are the more attackable of the two — only `runs.len()` heads are alive
+at once, so their buffers could be recycled rather than reallocated, which
+would need `keys_of` to write into a caller's buffer instead of returning
+one.
