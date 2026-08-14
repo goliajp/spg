@@ -72,25 +72,77 @@ operator, and only bitwise/inet ops route to `Step::Subtree`). The cost is
 not interpretation of the tree. It is that the general VM loop costs ~10 ns
 a step where the special case costs ~11 ns for the whole predicate.
 
+## The profile — where the step loop's time actually goes
+
+Phase A stopped here on purpose: the ~10 ns a step was arithmetic on wall
+clock, not an attribution. A leaf-symbol profile of each predicate,
+separately, with `sample` over `probe_pred_vm`
+(`crates/spg-engine/examples/probe_pred_vm.rs`, built `--profile
+release-dbg`):
+
+**`WHERE id % 3 = 0` — 6,000 reps**
+
+| leaf | samples |
+|---|---:|
+| `core::ptr::drop_glue<spg_storage::Value>` | **1983** |
+| `eval::compiled::run_compiled_steps` | 1939 |
+| `eval::binop::apply_binary_by_ref` | 1228 |
+| `eval::binop::mod_op` | 1224 |
+| `run_single_table_aggregate` | 901 |
+| `eval::binop::compare` | 385 |
+| `Value::clone` | 355 |
+| `Value::data_type` | 243 |
+
+**`WHERE id > 0` — 30,000 reps (five times as many)**
+
+| leaf | samples |
+|---|---:|
+| `run_single_table_aggregate` | 1771 |
+| `eval::compiled::eval_compiled_pred` | 1629 |
+| `eval::binop::apply_binary_by_ref` | 1528 |
+| `eval::binop::compare` | 1336 |
+| `Table::header_visible` | 636 |
+| `predicate_is_true` | 612 |
+| `drop_glue<Value>` | 450 |
+| `run_compiled_steps` | — absent |
+
+Normalised per rep, `drop_glue` is **22× heavier** in the arithmetic
+predicate (0.331 samples/rep against 0.015), and `run_compiled_steps` does
+not appear in the control at all — the three-step special case bypasses the
+step machine entirely, which is the mechanism Phase A inferred and this
+confirms.
+
+**The largest single leaf is destroying `Value`s, ahead of the modulo it is
+carrying.** The step machine materialises an intermediate `Value` per step —
+`id % 3` becomes one, pushed, popped, compared, dropped — and `Value` has
+heap-carrying variants, so its drop glue runs on every one of them.
+
+So the cost is not the arithmetic and not interpretation of a tree. It is
+`Value` construction and destruction churn, per row, in the general loop.
+
 ## Attack candidates, in the order the measurement supports
 
-1. **Make the general step loop cheaper.** Five steps at 10 ns each is the
-   whole gap, and it is the broad fix: every predicate that is not
-   `column <cmp> literal` pays it, which on this corpus is most of them.
-   Wants a leaf-symbol profile first — the per-step cost has not been
-   attributed, and guessing at it is what this campaign keeps punishing.
+1. **A typed lane for scalar arithmetic chains.** Compile integer-only
+   arithmetic into steps that operate on `i64` without materialising a
+   `Value` between them, falling back to the general machine for anything
+   else. This is what the existing three-step case already does in spirit —
+   it reaches the answer without touching the stack — generalised from one
+   hard-coded shape to a class.
 2. **Widen the recognised shape** to `column <arith> literal <cmp> literal`.
-   Narrow, mechanical, and it covers the bucketing and parity predicates
-   that show up in real schemas. Worth doing only if (1) turns out to be
-   architectural — a second special case is a worse answer than a faster
-   loop.
-3. **Wide-payload sort, 1.37×.** Separate from this document's subject and
-   already an area with history (the v7.37.13 sort projection pruning).
+   Mechanical, covers bucketing and parity predicates, and strictly worse
+   than (1) as an answer: a second hard-coded shape rather than a machine
+   that stops churning. Worth it only if (1) proves architectural.
+3. **Wide-payload sort, 1.37×.** Separate subject, separate history (the
+   v7.37.13 sort projection pruning).
 
-## What this does NOT say
+Phase B may now start on (1): the target is named and attributed, which is
+what this document required of it.
 
-No profile has been taken. The 10 ns/step figure is arithmetic on wall-clock
-differences, not an attribution to any line inside the loop. Phase B does not
-start until a profile says which part of a step costs what — this campaign
-has already refuted three code-read hypotheses by measurement, and the step
-loop is a place where "it must be the Value moves" would be the fourth.
+## What this still does NOT say
+
+How much of `drop_glue` is recoverable. A typed lane removes the
+intermediates it covers; it does not remove the row's own values, and the
+control shows 450 samples of drop glue on a predicate that never enters the
+step machine. The number to beat is the difference, not the total — and it
+should be measured on the same harness before and after rather than
+predicted.
