@@ -7352,11 +7352,40 @@ impl Engine {
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
         let mut keys: Vec<OrderKey> = Vec::new();
+        // r1024 — compile the predicate once for the scan.
+        //
+        // These two sorted-spill scans are the paths a single-table SELECT
+        // with an ORDER BY takes, and they were the last row-returning ones
+        // still walking the expression tree per row. r1023 did the
+        // no-ORDER-BY sibling; the sweep's two remaining losing cells are
+        // exactly this shape.
+        //
+        // Found from the profile's CALL TREE rather than its leaves. The
+        // leaves say what is expensive — `eval_expr` 320, `apply_binary`
+        // 261, `mod_op` 178 — and two attempts at reasoning out which
+        // function asked for it were both wrong. The tree names the caller
+        // chain, and it named this one.
+        let compiled_where: Option<crate::eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| crate::eval::fully_compilable(w))
+            .map(|w| crate::eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         for (i, row) in table.scan_visible_from(0, &snapshot) {
             if i.is_multiple_of(256) {
                 cancel.check()?;
             }
-            if let Some(w) = &stmt.where_ {
+            if let Some(c) = &compiled_where {
+                if !crate::eval::compiled::eval_compiled_pred(
+                    c,
+                    row,
+                    &ctx,
+                    &mut eval_stack,
+                    ctx.mysql_dialect,
+                )? {
+                    continue;
+                }
+            } else if let Some(w) = &stmt.where_ {
                 let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
                 if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     continue;
@@ -7587,11 +7616,40 @@ impl Engine {
         // One key buffer for the whole scan: `push` drains it and leaves
         // the capacity behind.
         let mut keys: Vec<OrderKey> = Vec::new();
+        // r1024 — compile the predicate once for the scan.
+        //
+        // These two sorted-spill scans are the paths a single-table SELECT
+        // with an ORDER BY takes, and they were the last row-returning ones
+        // still walking the expression tree per row. r1023 did the
+        // no-ORDER-BY sibling; the sweep's two remaining losing cells are
+        // exactly this shape.
+        //
+        // Found from the profile's CALL TREE rather than its leaves. The
+        // leaves say what is expensive — `eval_expr` 320, `apply_binary`
+        // 261, `mod_op` 178 — and two attempts at reasoning out which
+        // function asked for it were both wrong. The tree names the caller
+        // chain, and it named this one.
+        let compiled_where: Option<crate::eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| crate::eval::fully_compilable(w))
+            .map(|w| crate::eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         for (i, row) in table.scan_visible_from(0, &snapshot) {
             if i.is_multiple_of(256) {
                 cancel.check()?;
             }
-            if let Some(w) = &stmt.where_ {
+            if let Some(c) = &compiled_where {
+                if !crate::eval::compiled::eval_compiled_pred(
+                    c,
+                    row,
+                    &ctx,
+                    &mut eval_stack,
+                    ctx.mysql_dialect,
+                )? {
+                    continue;
+                }
+            } else if let Some(w) = &stmt.where_ {
                 let cond = crate::eval::eval_expr(w, row, &ctx).map_err(EngineError::Eval)?;
                 if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                     continue;

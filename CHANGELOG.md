@@ -41,6 +41,47 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.22] — 2026-08-14
+
+### Performance
+
+- **The sorted scans compile their `WHERE` too.** `try_spill_sorted_scan`
+  and `try_spill_sorted_stream` — the paths a single-table `SELECT` with an
+  `ORDER BY` takes — walked the expression tree per row. 7.37.21 did the
+  no-`ORDER BY` sibling; these two are byte-identical loops and both needed
+  it.
+
+  `SELECT pad FROM t WHERE id % 3 = 0 ORDER BY k` over 50,000 rows:
+  **8.396 ms → 4.105 ms**, from losing PG18 1.40× to winning at 0.68×. An
+  always-true filter over the same shape goes 1.16× → 0.97×. The sweep's
+  `filtered then order` family, which had been its only losing one, now wins
+  at 400,000 rows as well: 59.3-60.8 ms against PG's 66.7-89.0.
+
+  Found from the profile's **call tree** rather than its leaves. The leaves
+  named the cost — `eval_expr` 320, `apply_binary` 261, `mod_op` 178 — and
+  two attempts at reasoning out which function asked for it were both wrong;
+  one of them was written, measured to change nothing, and reverted. The
+  tree gives the caller chain outright and settled it immediately.
+
+### Measured, not fixed
+
+- **`ORDER BY` on an indexed column costs 2× at 400,000 rows**: 138.1-144.2
+  ms against PG18's 64.5-75.1, ranges well apart. PG serves the ordering
+  from the index and never sorts; SPG sorts. The fast path that walks an
+  index in key order exists but requires a `LIMIT`
+  (`index_access.rs try_pk_walk_top_n`).
+
+  7.37.19 recorded a retraction of this as a performance claim, and that
+  retraction was right for the sizes measured then — at 50,000 rows it wins
+  or does not resolve. What is added here is the size at which the
+  capability gap starts costing.
+
+- `distinct then order` at 400,000 rows reads as a loss with the two ranges
+  nearly touching (126.7-130.6 against 99.5-126.3), on one run. Not repeated,
+  so not attributed.
+
+---
+
 ## [7.37.21] — 2026-08-14
 
 ### Performance
