@@ -263,3 +263,84 @@ import writes into one that starts empty), and streaming the snapshot write
 We are telling you what was withdrawn as well as what shipped because the
 first version of this letter told you a fix was coming that we now know would
 not have helped you.
+
+---
+
+# Addendum 2 — 7.37.19 through 7.37.23
+
+Five versions since the last note. Two of them touch shapes you named.
+
+## Read this one first: a wrong answer your paging could have hit
+
+**7.37.19.** `ORDER BY <indexed nullable column> DESC LIMIT n` returned the
+wrong rows, and `ASC` with a limit wider than the non-NULL rows returned too
+few. Silent — no error, no warning. Against PG 18.4:
+
+```
+ORDER BY k DESC LIMIT 3   PG: NULL NULL 30      us: 30 20 10
+ORDER BY k ASC  LIMIT 5   PG: 10 20 30 NULL NULL
+                          us: 10 20 30          (two rows dropped)
+```
+
+The top-N fast path walked the column's btree in key order, and a NULL key is
+not in a btree. An unbounded `ORDER BY` was never affected, because it sorts
+and the sort sees every row — which is why this survived as long as it did.
+
+Your §5 is a paged conversation list ordered by `BOOL_OR(pinned) DESC,
+MAX(internal_date) DESC`. Aggregates are not the shape above, so we do not
+believe you were hit; but a paged `ORDER BY <nullable column> DESC LIMIT`
+over a plain column is, and it is worth grepping for. Fixed and pinned.
+
+## Ordering among ties changed in 7.37.23
+
+Also yours, from the other direction. You wrote that ties in your list "could
+differ between identical calls" and that you had assumed a stability you were
+never promised. We wrote that down in `STABILITY.md` — no order is implied
+among rows equal under the `ORDER BY`.
+
+7.37.23 now makes good on it in a way you can see: `ORDER BY <indexed NOT
+NULL column>` walks the index instead of sorting, and ties come back in index
+order rather than scan order. Same rows, different order among equals. If any
+of your assertions still compare ordered output without a tie-breaker, this
+is the release that will find them. The fix on your side is the one you
+already made: end the sort on something unique.
+
+## What got faster, and on which shapes
+
+Each figure is one client driving both engines over the same route, min of
+three per sample, PG18 alongside.
+
+| shape | before | after |
+|---|---:|---:|
+| `count(*) … WHERE id % 3 = 0`, 50k rows | 3.30 ms (3.0× PG) | 0.71 ms (0.6×) |
+| `SELECT … WHERE id % 3 = 0`, 50k scanned | 6.38 ms (1.3× PG) | 2.39 ms (0.5×) |
+| same, with `ORDER BY` | 8.40 ms (1.4× PG) | 4.11 ms (0.7×) |
+| `SELECT … ORDER BY <indexed>`, 400k rows | 138 ms (≈2× PG) | 34 ms (0.6×) |
+
+Three of those were one defect wearing three hats: the compiled expression VM
+was reached by the aggregate path but not by the paths that return rows, so a
+predicate with any arithmetic in it was interpreted per row. The fourth is
+that an ordering the index already holds was being produced by sorting.
+
+Our release-blocking comparison against PG18 — 32 shapes across four sizes —
+now reports **0 losses, 21 wins, 11 unresolved**. It reported 20 losses a day
+ago, and most of that was our own harness: it reached PG over an in-container
+loopback and reached us over a container-to-host hop, handing PG 0.17 ms on
+every cell. Corrected, and the harness now refuses to score two engines
+reached over different routes.
+
+We mention that because the same figure appeared in a note to you: any
+comparison we have sent that was drawn from that sweep before 2026-08-14 was
+pessimistic about us by that constant, and the ones drawn from in-process
+measurements were not affected.
+
+## Still open from your report
+
+**§3's memory half.** Peak resident during import, not steady state — a
+server holding your loaded catalog is 256 MB. `--batch-commit N` (7.37.18)
+takes the peak from 2,818 to 2,128 MB. What remains is architectural and not
+started: the posting lists' own growth, and copy-on-write duplication inside
+a single statement. No date.
+
+**§4** is answered — `EXPLAIN` works through `SpgPool` — and **§5**'s three
+items shipped in 7.37.16.
