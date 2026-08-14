@@ -48,6 +48,7 @@ pub mod copy;
 mod cursor;
 mod ddl;
 pub mod describe;
+mod distinct;
 mod dml;
 mod envelope;
 pub mod eval;
