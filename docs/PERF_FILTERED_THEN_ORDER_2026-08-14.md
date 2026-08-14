@@ -1,5 +1,27 @@
 # `filtered then order` — Phase A, and what the 1.8-2.1× actually is
 
+> **RETRACTION (2026-08-14, r1022).** The sweep figures this document opens
+> with were taken with the two legs at different network distances from the
+> client: PG18 over an in-container loopback, SPGS over a container-to-host
+> hop worth ~0.17 ms on that testbed. Every SPG-vs-PG ratio here is
+> therefore pessimistic for SPG by that constant.
+>
+> With both legs on the same route, same binaries, same hour: **32 cells, 2
+> losses** — not 20. `indexed key` is no longer a loss at any size, so the
+> "2.16× because PG uses an Index Scan and we sort" reading below is
+> withdrawn as a PERFORMANCE claim; the plan difference is real and the cost
+> is not. `filtered then order` remains, at 10k and 50k, which is why the
+> rest of this document still stands.
+>
+> What survives untouched: everything measured IN PROCESS (the profile, the
+> ns/row figures, the integer lane's 69.1 → 11.7) since it never crosses a
+> socket; and any conclusion drawn from a DIFFERENCE between two cells of
+> the same run, since the constant cancels — which includes the
+> row-delivery target named at the end.
+>
+> The harness now refuses to score two legs reached over different hosts
+> (`scripts/perf-endpoint-sweep.sh`).
+
 **Context.** The release-blocking sweep (`scripts/perf-endpoint-sweep.sh`)
 reports 20 of 32 cells losing to PG18, with `control_false_differences=0` —
 a zero noise floor, so every verdict sits outside the instrument's own
