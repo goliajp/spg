@@ -5,9 +5,9 @@
 #
 # Syncs the working tree (gitignore-filtered, so target/ and
 # .claude/ never travel) to $SPG_MINI_HOST:$SPG_MINI_DIR and execs
-# gate.sh there. The remote keeps its own target/ between runs —
-# rsync's gitignore filter protects it from --delete — so repeat
-# runs build incrementally.
+# gate.sh there. The remote keeps its own target/ between runs, so
+# repeat runs build incrementally — see the `P /target/` protect rule
+# at the rsync below for why the gitignore filter alone did not do it.
 #
 # Usage: scripts/test-on-mini.sh <gate.sh args...>
 #   scripts/test-on-mini.sh e2e
@@ -30,7 +30,20 @@ ssh "$HOST" "mkdir -p '$RDIR'"
 # Sync .git so biz / sqllogictest harnesses that call `git rev-parse`
 # don't fail with "not a git repository". target/ stays via gitignore
 # (rsync's --filter ignores .gitignore'd paths).
-rsync -az --delete --filter=':- .gitignore' \
+# r1022 — `P /target/` PROTECTS the remote build directory from --delete.
+#
+# The line above used to be the two filters without it, and the comment
+# below it said the gitignore filter kept the remote `target/` between
+# runs. It did not. Tested directly: drop a marker file in the remote
+# `target/`, run this rsync, and the marker — and the whole directory — is
+# gone. An exclude keeps rsync from SENDING a path; it does not, through a
+# per-directory merge file, keep --delete from removing it on the receiver.
+#
+# So every run here was a cold rebuild. That is where this session's
+# 1200-1500 s gate runs and two-minute single-crate builds came from.
+# `P` is a protect rule, which is the receiver-side half the exclude was
+# assumed to carry.
+rsync -az --delete --filter='P /target/' --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
 # OrbStack PATH so `docker` resolves on the non-interactive ssh shell.
 # `export` (not just prefix) so child processes — including `cargo run`
