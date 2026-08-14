@@ -320,7 +320,8 @@ over 15,967 copied lists at 16 bytes a locator, that is ~2,690 locators per
 list — which is the right order for a table holding 20-30k rows at that
 point, where common trigrams are in most of them.
 
-**The fix, not yet written.** Make the value cheap to clone:
+**The fix that was written, and did nothing (r1026).** Make the value cheap
+to clone:
 `Arc<Vec<RowLocator>>` instead of `Vec<RowLocator>`. A node copy then moves
 pointers, and a posting list is cloned only when the statement actually
 appends to that list — once, after which the handle is unique and the rest of
@@ -328,8 +329,33 @@ the statement mutates in place. With eight entries a node and typically one
 or two of them being written, most of those 70,468 copies are collateral.
 
 Blast radius: the four GIN kinds and `BTree`, their maintenance sites, the
-three lookup methods, and the catalog codec. It is a storage-core type
-change and wants its own cycle rather than the tail of another one.
+three lookup methods, and the catalog codec — about forty sites. It was
+written, the workspace compiled, and the lookups kept handing out
+`&[RowLocator]` so nothing outside the crate changed shape.
+
+**It moved nothing.** Peak live 1,415.3 → 1,413.6 MB, total allocated
+15,219 → 15,234 MB, peak RSS 2,406 → 2,408. Reverted.
+
+The null result is the useful part. Had those 70,468 copied entries been
+posting lists averaging the ~2,690 locators the arithmetic suggested, the
+change would have removed about 3 GB from the 15.2 GB total. Nothing moved,
+so **the copied entries are mostly SHORT lists** and the arithmetic fit was a
+coincidence.
+
+And the mechanism explains itself in hindsight: `Arc::make_mut` clones a
+shared list too. The change moved the copy from "when the node is copied" to
+"when the list is first written", it did not remove it — and the lists that
+get copied are the ones being WRITTEN, not innocent neighbours sharing a
+node. There is no collateral to save.
+
+**Which points at the other item.** The copying that remains is a
+2,690-element list being cloned to append one locator. That is not fixable by
+making the value cheap to clone; it needs the list to stop being one
+contiguous `Vec`, so an append touches a tail block instead of the whole
+list. B5's blocked representation, arriving from the memory side rather than
+the churn side.
+
+**The fix, not yet written.** Make the value cheap to clone:
 
 ### B4 — WITHDRAWN: it does not touch the peak
 
