@@ -41,6 +41,46 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.23] — 2026-08-14
+
+### Performance
+
+- **`ORDER BY <indexed NOT NULL column>` walks the index instead of
+  sorting.** PG serves such an ordering from the index and never sorts; SPG
+  encoded every row into the external sorter's arena and decoded it back
+  out, for an order the index already held. The walk existed
+  (`try_pk_walk_top_n`) and required a `LIMIT`, because it was built for
+  top-N; this is the unbounded sibling.
+
+  400,000 rows, `SELECT pad FROM t ORDER BY id`: **138-144 ms → 34.1 ms**,
+  from losing PG18 about 2× to winning at 0.63×. `DESC` is 0.59×. The
+  control — the same query ordered by an unindexed column, which keeps the
+  sort — is unchanged at 1.08×.
+
+  **The release-blocking sweep now reports 32 cells, 0 losses**, 21 wins and
+  11 unresolved, with `control_false_differences=0`. It was 2 losses before
+  this and 20 before the harness was fixed to reach both engines over the
+  same route.
+
+  `NOT NULL` is a hard gate rather than a simplification: a NULL key is not
+  in a btree, so walking one silently drops those rows. That is the defect
+  7.37.19 fixed on the top-N path, where it had already shipped.
+
+### Changed — visible
+
+- **Rows equal under an `ORDER BY` may come back in a different order than
+  before.** The walk yields ties in index order where the sort yielded them
+  in scan order. Neither is promised: `STABILITY.md` states that no order is
+  implied among rows equal under the `ORDER BY` and that identical calls may
+  differ, which is PostgreSQL's contract too — and PG's own tie order for the
+  same data differs from both. Called out because it is observable, and
+  because anyone relying on the previous accidental stability will see it.
+
+  A `SELECT` whose `ORDER BY` settles every tie is unaffected by
+  construction.
+
+---
+
 ## [7.37.22] — 2026-08-14
 
 ### Performance

@@ -1,0 +1,116 @@
+# r1025 — `ORDER BY <indexed NOT NULL column>` walks the index instead of
+# sorting.
+#
+# PG serves the ordering from the index; we sorted, encoding every row into
+# the external sorter's arena and decoding it back out. At 400,000 rows that
+# was 138-144 ms against PG18's 64-75. Walking it: 34.1 ms against 54.2.
+#
+# What this pins is that the walk returns the SAME ROWS as the sort did.
+# Two ways it could not:
+#
+#   * a NULL key is absent from a btree, so a nullable column must keep the
+#     sort — this is the defect r1020 fixed on the top-N walker, where it had
+#     shipped and silently dropped rows;
+#   * a btree holds one locator per row VERSION, so an UPDATE that moves a
+#     key leaves the row under two of them, and a walk that emitted both
+#     would duplicate it.
+#
+# Tie order among rows equal under the ORDER BY is NOT pinned here: it is
+# undefined by contract (STABILITY.md) and PG does not promise it either.
+# The walk does order ties differently from the sort it replaces, which is
+# why that section exists.
+
+statement ok
+CREATE TABLE ios (id INT NOT NULL, g INT NOT NULL, pad TEXT)
+
+statement ok
+INSERT INTO ios VALUES (3,1,'c'),(1,1,'a'),(4,2,'d'),(2,2,'b'),(5,3,'e')
+
+statement ok
+CREATE INDEX ios_id ON ios(id)
+
+query I
+SELECT id FROM ios ORDER BY id
+----
+1
+2
+3
+4
+5
+
+query I
+SELECT id FROM ios ORDER BY id DESC
+----
+5
+4
+3
+2
+1
+
+# An UPDATE that moves the key: the row must appear once, at its new place.
+statement ok
+UPDATE ios SET id = 9 WHERE id = 2
+
+query I
+SELECT id FROM ios ORDER BY id
+----
+1
+3
+4
+5
+9
+
+# A DELETE must remove it from the walk, not leave a dead version behind.
+statement ok
+DELETE FROM ios WHERE id = 4
+
+query I
+SELECT id FROM ios ORDER BY id
+----
+1
+3
+5
+9
+
+# The WHERE still applies, and on the walked path it is the compiled one.
+query I
+SELECT id FROM ios WHERE id > 3 ORDER BY id
+----
+5
+9
+
+# A projection over a non-key column comes back in key order.
+query T
+SELECT pad FROM ios ORDER BY id
+----
+a
+c
+e
+b
+
+# A NULLABLE key must NOT take the walk: its NULL rows are not in the btree,
+# and PG orders them last on ASC and first on DESC.
+statement ok
+CREATE TABLE ion (id INT, pad TEXT)
+
+statement ok
+INSERT INTO ion VALUES (2,'two'),(NULL,'null1'),(1,'one'),(NULL,'null2')
+
+statement ok
+CREATE INDEX ion_id ON ion(id)
+
+query T
+SELECT coalesce(id::text,'NULL') FROM ion ORDER BY id
+----
+1
+2
+NULL
+NULL
+
+query T
+SELECT coalesce(id::text,'NULL') FROM ion ORDER BY id DESC
+----
+NULL
+NULL
+2
+1

@@ -7506,6 +7506,200 @@ impl Engine {
         mask
     }
 
+    /// r1025 — `ORDER BY <indexed NOT NULL column>` walks the index instead
+    /// of sorting.
+    ///
+    /// PG serves such an ordering from the index and never sorts. We sorted:
+    /// measured at 400,000 rows, `SELECT pad FROM t ORDER BY id` costs
+    /// 138-144 ms against PG18's 64-75, and the call tree puts the cost in
+    /// the sorter's own round trip — `ExternalSorter::finish_each` →
+    /// `next_row` → `decode_row_body_dense_pruned` → `read_value_body`.
+    /// Every row is encoded into the sorter's arena and decoded back out,
+    /// for an order the index already holds.
+    ///
+    /// The walk exists — `try_pk_walk_top_n` — and requires a `LIMIT`,
+    /// because it was built for top-N. This is the unbounded sibling.
+    ///
+    /// NOT NULL is a hard gate, not a simplification: a NULL key is absent
+    /// from a btree, so walking one would silently drop those rows. That is
+    /// exactly the defect r1020 fixed on the top-N path, where it had
+    /// shipped.
+    fn try_index_order_stream<F>(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        // The same shape gates the spill sort applies, minus `can_spill`:
+        // this path never spills.
+        if stmt.order_by.len() != 1
+            || stmt.distinct
+            || stmt.limit_with_ties
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.having.is_some()
+            || stmt.group_by.is_some()
+            || !stmt.unions.is_empty()
+            || !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.as_of_segment.is_some()
+            || from.primary.generate_series_args.is_some()
+            || select_has_window(stmt)
+            || aggregate::uses_aggregate(stmt)
+        {
+            return Ok(None);
+        }
+        if stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
+        {
+            return Ok(None);
+        }
+        crate::orderby::check_order_by_legality(stmt)?;
+        crate::orderby::check_order_by_positions(stmt)?;
+        crate::window::reject_window_in_row_clauses(stmt)?;
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        // Cold rows are reachable through locators, but the walk would have
+        // to resolve them per key; the ordinary path already covers that.
+        if table.has_cold_rows_fast() {
+            return Ok(None);
+        }
+        if !from.primary.only
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+
+        let order = &stmt.order_by[0];
+        let Expr::Column(oc) = &order.expr else {
+            return Ok(None);
+        };
+        if let Some(q) = &oc.qualifier
+            && !q.eq_ignore_ascii_case(alias)
+        {
+            return Ok(None);
+        }
+        let Some(order_pos) = cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&oc.name))
+        else {
+            return Ok(None);
+        };
+        // See the NOT NULL note above: this is the r1020 defect's gate.
+        if cols[order_pos].nullable {
+            return Ok(None);
+        }
+        let Some(index) = table.index_on(order_pos) else {
+            return Ok(None);
+        };
+        if !matches!(index.kind, spg_storage::IndexKind::BTree(_))
+            || index.expression.is_some()
+            || index.partial_predicate.is_some()
+        {
+            return Ok(None);
+        }
+
+        let sess = self.dml_session();
+        let ctx = EvalContext::new(&cols, Some(alias))
+            .with_catalog(self.active_catalog())
+            .with_session(&sess);
+        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let columns: Vec<ColumnSchema> = projection
+            .iter()
+            .map(|p| {
+                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
+                c.user_enum_type = p.user_enum_type.clone();
+                c.mysql_fsp = p.mysql_fsp;
+                c
+            })
+            .collect();
+        emit(crate::StreamItem::Header(&columns))?;
+        let bound_pos: Vec<Option<usize>> = projection
+            .iter()
+            .map(|p| match &p.expr {
+                Expr::Column(c) => match crate::eval::locate_column(c, &ctx) {
+                    Ok(Some(pos)) => Some(pos),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
+        let compiled_where: Option<crate::eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| crate::eval::fully_compilable(w))
+            .map(|w| crate::eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
+        let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+        let snapshot = self.current_snapshot();
+
+        // A btree holds one locator per row VERSION, so a row whose key was
+        // updated can sit under two keys and a dead one can sit beside its
+        // replacement. The visibility gate drops the dead; `seen` drops a
+        // live row that the walk reaches twice, which would otherwise be a
+        // duplicated output row rather than a slow one.
+        let mut emitted_rows = alloc::vec![false; table.rows().len()];
+        let walker: alloc::boxed::Box<
+            dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>,
+        > = if order.desc {
+            alloc::boxed::Box::new(index.iter_desc())
+        } else {
+            alloc::boxed::Box::new(index.iter_asc())
+        };
+        let mut count = 0usize;
+        let mut visited = 0usize;
+        for (_key, locators) in walker {
+            for loc in locators {
+                let spg_storage::RowLocator::Hot(ri) = *loc else {
+                    continue;
+                };
+                if emitted_rows.get(ri).copied().unwrap_or(true) {
+                    continue;
+                }
+                if !table.is_row_visible(ri, &snapshot) {
+                    continue;
+                }
+                let Some(row) = table.rows().get(ri) else {
+                    continue;
+                };
+                visited += 1;
+                if visited.is_multiple_of(256) {
+                    cancel.check()?;
+                }
+                emitted_rows[ri] = true;
+                if Self::stream_project_row(
+                    row,
+                    stmt.where_.as_ref(),
+                    compiled_where.as_ref(),
+                    &mut eval_stack,
+                    &projection,
+                    &bound_pos,
+                    &ctx,
+                    &mut values,
+                    emit,
+                )? {
+                    count += 1;
+                }
+            }
+        }
+        Ok(Some(count))
+    }
+
     fn try_spill_sorted_stream<F>(
         &self,
         stmt: &SelectStatement,
@@ -7984,6 +8178,14 @@ impl Engine {
         let _single_table = from.joins.is_empty();
         // An ORDER BY that the bounded sort can serve streams; everything
         // else still falls to the materialising fallback below.
+        // r1025 — an ordering the index already holds needs no sort at all.
+        // Tried before the spill sort, which is the path it replaces.
+        if !stmt.order_by.is_empty()
+            && from.joins.is_empty()
+            && let Some(n) = self.try_index_order_stream(stmt, from, cancel, emit)?
+        {
+            return Ok(Some(n));
+        }
         if !stmt.order_by.is_empty()
             && from.joins.is_empty()
             && let Some(n) = self.try_spill_sorted_stream(stmt, from, cancel, emit)?
