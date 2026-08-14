@@ -398,6 +398,42 @@ The profiler stays in `mem_census`. It is what ended two rounds of fitting
 arithmetic to mechanisms, and the next attempt should start by re-running it
 rather than by reasoning.
 
+### B3d — the number that makes B5's payoff computable (r1028)
+
+Chunking a posting list trades one copy of the whole list for one copy of a
+tail block. Whether that wins depends on how often each happens, and the
+ratio had never been measured. Two temporary counters, removed after the
+reading:
+
+| | |
+|---|---:|
+| `get_mut_by` calls — one per posting-list append | **13,194,459** |
+| B-tree node clones | **16,343** |
+
+**807 appends per node clone.** `Arc::make_mut` finds the node uniquely owned
+almost always: a statement copies a node once on first touch, and the next
+eight hundred appends land in place. So the 8 GB is charged per
+(node, statement), not per append — which is what makes chunking safe to
+reason about.
+
+| | per node copy | total |
+|---|---:|---:|
+| today | eight full lists, ~500 KB | ~8 GB |
+| chunked | eight arrays of block pointers (~1 KB) plus one tail-block clone per list on first append (8 × 4 KB) | ~33 KB |
+| | | **~0.54 GB** |
+
+About fifteen-fold, or **~7.5 GB off a 15.2 GB total** — and the tail-block
+clones are bounded by (node copies × lists per node), not by the 13.2 million
+appends, because after the first one the block is unique for the rest of the
+statement.
+
+The transient peak should follow: the 612 MB spike is node copies holding
+copied lists, and copying pointers instead would leave tens of megabytes.
+
+That is the first payoff estimate on this line that is computed from measured
+counts rather than fitted to a mechanism. Two earlier ones were fitted, and
+both were wrong.
+
 ### B4 — WITHDRAWN: it does not touch the peak
 
 The snapshot buffer is real — 233.5 MB live on mailrs's schema — but it is
