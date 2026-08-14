@@ -168,3 +168,46 @@ control shows 450 samples of drop glue on a predicate that never enters the
 step machine. The number to beat is the difference, not the total — and it
 should be measured on the same harness before and after rather than
 predicted.
+
+---
+
+## r1024 — where `filtered then order` actually evaluates its predicate
+
+The remaining loss was traced twice and named wrong once each time. Recorded
+so the third attempt starts from the right place.
+
+**Attempt one (r1023, shipped).** Fixed `stream_project_row`, the
+no-ORDER-BY streaming scan. Real and measured — 6.375 → 2.393 ms on the
+unsorted filtered shape — but it is not the path `filtered then order`
+takes, and the sweep's two losing cells did not move.
+
+**Attempt two (r1024, reverted unmeasured).** Fixed the `passes` closure at
+`select.rs:237`, on the reading that a query with `ORDER BY` materialises
+through it. It does not. Re-profiling after the change found `eval_expr`
+320, `apply_binary` 261, `mod_op` 178 — identical to before it. The change
+was reverted rather than kept: it is a hot-path edit with no shape shown to
+benefit from it.
+
+**Where it really goes.** The call tree, not the leaf aggregation, answers
+this — and it should have been read first:
+
+```
+handle_pg_simple_query
+  → Engine::execute_readonly_select_streaming_prepared
+    → Engine::try_exec_joined_streaming          1448 samples
+      → eval::eval_expr                          1063
+        → eval::resolve::eval_expr_cow           1023
+```
+
+A single-table SELECT with an ORDER BY goes through the JOIN machinery —
+`try_exec_joined_streaming` builds a deferred join even with one table, and
+its filter is `Engine::build_joined_filtered_rows` (`join.rs:1254`). That is
+where the interpretation is. `join.rs` already compiles predicates in two
+places (its build-side probe and its streaming projection), so the machinery
+is present; this call site does not use it.
+
+**A method note.** Two wrong readings came from grepping for `eval_expr` and
+reasoning about which function looked right; both were settled in seconds by
+the profile's call tree, which names the caller chain directly. Leaf
+aggregation says WHAT is expensive; the tree says WHO asked for it, and the
+second question is the one that finds the code to change.
