@@ -1016,13 +1016,13 @@ fn deserialize_indices(
 /// uses the v5.1 tag-prefixed wire format (`RowLocator::read_le`).
 fn read_btree_map(
     cur: &mut Cursor<'_>,
-) -> Result<PersistentBTreeMap<IndexKey, Vec<RowLocator>>, StorageError> {
+) -> Result<PersistentBTreeMap<IndexKey, crate::posting::PostingList>, StorageError> {
     let entry_count = cur.read_u32()? as usize;
     let mut map = PersistentBTreeMap::new();
     for _ in 0..entry_count {
         let key = cur.read_index_key()?;
         let locator_count = cur.read_u32()? as usize;
-        let mut locators = Vec::with_capacity(locator_count);
+        let mut locators = crate::posting::PostingList::new();
         for _ in 0..locator_count {
             let tail = &cur.buf[cur.pos..];
             let (loc, consumed) = RowLocator::read_le(tail).map_err(|e| {
@@ -1041,13 +1041,13 @@ fn read_btree_map(
 /// FILE_VERSION 21+ only.
 fn read_gin_map(
     cur: &mut Cursor<'_>,
-) -> Result<PersistentBTreeMap<String, Vec<RowLocator>>, StorageError> {
+) -> Result<PersistentBTreeMap<String, crate::posting::PostingList>, StorageError> {
     let entry_count = cur.read_u32()? as usize;
     let mut map = PersistentBTreeMap::new();
     for _ in 0..entry_count {
         let word = cur.read_str()?;
         let locator_count = cur.read_u32()? as usize;
-        let mut locators = Vec::with_capacity(locator_count);
+        let mut locators = crate::posting::PostingList::new();
         for _ in 0..locator_count {
             let tail = &cur.buf[cur.pos..];
             let (loc, consumed) = RowLocator::read_le(tail).map_err(|e| {
