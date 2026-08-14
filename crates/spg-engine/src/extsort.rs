@@ -298,9 +298,19 @@ impl HeadHeap {
     }
 }
 
-/// Read exactly `n` bytes, or `None` at a clean end of stream.
-fn read_exact(run: &mut dyn TempRun, n: usize) -> Result<Option<Vec<u8>>, EngineError> {
-    let mut buf = alloc::vec![0u8; n];
+/// Read exactly `n` bytes into `buf`, or `None` at a clean end of stream.
+///
+/// The buffer is the caller's and is reused across rows. It used to be a
+/// fresh `Vec` per call, which the merge makes twice per row — once for a
+/// FOUR-BYTE length prefix — and r1032 counted that as half of the external
+/// sorter's four allocations per row.
+fn read_exact(
+    run: &mut dyn TempRun,
+    n: usize,
+    buf: &mut Vec<u8>,
+) -> Result<Option<()>, EngineError> {
+    buf.clear();
+    buf.resize(n, 0u8);
     let mut filled = 0;
     while filled < n {
         let got = run
@@ -316,7 +326,7 @@ fn read_exact(run: &mut dyn TempRun, n: usize) -> Result<Option<Vec<u8>>, Engine
         }
         filled += got;
     }
-    Ok(Some(buf))
+    Ok(Some(()))
 }
 
 /// Accumulate rows, spilling sorted runs once the budget is reached.
@@ -675,12 +685,17 @@ impl<'a> ExternalSorter<'a> {
         // advanced, which a single `Vec<RunReader>` would not allow.
         let mut runs: Vec<Box<dyn TempRun>> = core::mem::take(&mut self.runs);
         let mut heads: Vec<Head> = Vec::with_capacity(runs.len());
+        // One read buffer for the whole merge. Every row of every run
+        // borrows it and hands it straight to the decoder, so it grows
+        // once to the widest row and then stops allocating.
+        let mut readbuf: Vec<u8> = Vec::new();
         for run in &mut runs {
             heads.push(Self::next_row(
                 &mut **run,
                 &self.record_schema,
                 &keys_of,
                 needed,
+                &mut readbuf,
             )?);
         }
 
@@ -693,7 +708,13 @@ impl<'a> ExternalSorter<'a> {
             project(&record, &mut scratch)?;
             emit(&scratch)?;
             emitted += 1;
-            heads[w] = Self::next_row(&mut *runs[w], &self.record_schema, &keys_of, needed)?;
+            heads[w] = Self::next_row(
+                &mut *runs[w],
+                &self.record_schema,
+                &keys_of,
+                needed,
+                &mut readbuf,
+            )?;
             heap.settle_root(&heads, self.descs);
         }
         Ok(emitted)
@@ -730,21 +751,24 @@ impl<'a> ExternalSorter<'a> {
         schema: &TableSchema,
         keys_of: &K,
         needed: &[bool],
+        // Reused across every row of every run: see `read_exact`.
+        buf: &mut Vec<u8>,
     ) -> Result<Option<(Vec<OrderKey>, Row<'static>)>, EngineError>
     where
         K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
     {
-        let Some(len_bytes) = read_exact(run, 4)? else {
+        if read_exact(run, 4, buf)?.is_none() {
             return Ok(None);
-        };
-        let len = u32::from_le_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]);
-        let Some(body) = read_exact(run, len as usize)? else {
+        }
+        let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let body = buf;
+        if read_exact(run, len as usize, body)?.is_none() {
             return Err(EngineError::Internal(alloc::string::String::from(
                 "temp run ended before its row body",
             )));
-        };
+        }
         let (row, _) = spg_storage::decode_row_body_dense_pruned(
-            &body,
+            body,
             schema,
             spg_storage::CURRENT_ROW_CODEC_VERSION,
             needed,
