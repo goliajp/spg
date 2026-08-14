@@ -137,7 +137,7 @@ run_gates() {
     # step and is a hand-copied testbed script `gate.sh` never calls, whose
     # `cd ~/spg` points at a clone that had been stale for six days. A pin
     # outside the gate that runs is a pin that does not exist.
-    for target in uniq_prune_counters uniq_composite_probe; do
+    for target in uniq_prune_counters uniq_composite_probe pred_int_lane_counters; do
         banner "gates: ${target} (perf-counters, own process)"
         cargo test --release --locked -p spg-engine --features perf-counters \
             --test "$target"
