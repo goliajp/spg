@@ -357,6 +357,47 @@ the churn side.
 
 **The fix, not yet written.** Make the value cheap to clone:
 
+### B3c — the allocation profile, and the size of what is left (r1027)
+
+Two hypotheses about this import's 15.2 GB had been refuted by measurement,
+both of them arithmetic fitted to a plausible mechanism. A total says how
+much; it cannot say who, and guessing who had by then cost two rounds.
+
+So `mem_census` gained a sampling allocation profiler: capture a backtrace
+every 4 MiB allocated, attribute it to the deepest frame naming spg code,
+aggregate. 3,585 samples over the import, 15.0 GB attributed:
+
+| site | GB |
+|---|---:|
+| `persistent_btree.rs:831` — `Arc::make_mut(node)` in `get_mut_by_helper` | **4.1** |
+| `persistent_btree.rs:74` — `entries.clone()` in `BNode::clone` | **4.0** |
+| `persistent_btree.rs:77` — `children.clone()` | 0.8 |
+| `lib.rs:668` | 0.7 |
+| `trgm.rs:207` | 0.6 |
+| `codec.rs:1826` | 0.5 |
+| everything else | ~4.3 |
+
+The first two are one event seen at two frames — `make_mut` calling `clone` —
+and together with the third they are **~8.9 GB of 15.0, sixty per cent of
+everything this import allocates**, spent copying B-tree nodes so a shared
+spine can be written to.
+
+Divide it: 8 GB over the 16,343 node clones r1026 counted is ~500 KB a clone,
+which is eight posting lists of ~4,000 locators at 16 bytes. So the copied
+bytes ARE the posting lists, and r1026's null result was not evidence
+otherwise — it was evidence that moving them behind an `Arc` relocates the
+copy (node-copy time → `make_mut`-on-list time) without removing it.
+
+**What is left, with a size.** An append to a 4,000-element posting list
+copies 4,000 elements, because the list is one contiguous `Vec` inside a
+copy-on-write node. Sixty per cent of the import's allocation is that. The
+only representation that removes it is one where an append touches a tail
+block — B5, reached from the memory side.
+
+The profiler stays in `mem_census`. It is what ended two rounds of fitting
+arithmetic to mechanisms, and the next attempt should start by re-running it
+rather than by reasoning.
+
 ### B4 — WITHDRAWN: it does not touch the peak
 
 The snapshot buffer is real — 233.5 MB live on mailrs's schema — but it is
