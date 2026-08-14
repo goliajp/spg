@@ -1,7 +1,13 @@
 # The row-returning sorted scan allocates twice per row
 
-Phase A. Measured and attributed; nothing implemented. The attack list at
-the end is what Phase B should start from.
+Phase A, then Phase B underneath it.
+
+**Read the r1031 section at the bottom first.** Phase A measured the
+EMBEDDED executor throughout and called it "the row-returning sorted scan".
+The server runs a different one — the external sorter — and that one
+allocates four times per row, not twice. Everything above the divider is
+correct about the path it measured and wrong about which path the server
+takes.
 
 ## How this came up
 
@@ -90,3 +96,61 @@ change priced ITS allocations at 46 ns apiece after the fact, having
 predicted 70 — half again too high. Applying either figure here would be
 predicting, not measuring. Phase B measures before and after on this same
 probe.
+
+---
+
+## r1031 — what got built, and the thing the Phase A above got wrong
+
+Attack 1 is implemented as `try_int_key_sorted_stream`
+(`crates/spg-engine/src/select.rs`): ORDER BY over up to four integer
+columns, keys carried in a fixed array with a NULL bitmask instead of a
+`Vec<OrderKey>` per row. Interleaved, three rounds, two binaries built
+minutes apart:
+
+| `SELECT k FROM t ORDER BY k`, 400 k | base | lane |
+|---|---:|---:|
+| allocations per query | 800,068 | **400,054** |
+| time | 62.22-68.04 ms | **43.05-46.60 ms** |
+
+Exactly halved, −31 %, non-overlapping.
+
+**And it is unreachable from the server.** The same two binaries, same
+probe, with a spill sink installed — which is the ONLY difference between
+`Engine::new()` and what `spg-server` configures:
+
+| same query, spill sink present | base | lane |
+|---|---:|---:|
+| allocations per query | 1,600,236 | 1,600,236 |
+| time | 56.63-64.27 ms | 57.08-63.42 ms |
+
+Identical. `try_spill_sorted_stream` runs first and takes the query, so
+the lane never sees it. Two endpoint A/B runs had already reported
+`B_faster=0 B_slower=0` with a clean control leg; that was a correct
+measurement of a change the server cannot reach, and it took installing
+the sink in the probe to say so rather than guess.
+
+So the lane is an embedded-path (SPGE) improvement, and the document above
+measured the embedded path while calling it "the row-returning sorted
+scan". The server's row-returning sorted scan is the external sorter, and
+it allocates **four times per row**, not twice.
+
+### The next target, measured
+
+`sample` over the probe in the server configuration, 400 k rows:
+
+| leaf | samples |
+|---|---:|
+| allocator family (`xzm_free`, `xzone_malloc`, `free`, …) | **2,564** |
+| `ExternalSorter::sorted_orders` quicksort | 992 |
+| `platform_memmove` | 920 |
+| `orderby::build_order_keys_bound` | 525 |
+| `extsort::HeadHeap::sift_down` | 466 |
+| `ExternalSorter::push` | 402 |
+| `orderby::order_key_elem_cmp` | 363 |
+| `codec::decode_row_body_dense_pruned` | 293 |
+
+Four per row is one `Vec<OrderKey>`, one row buffer on the way in, and the
+serialise/deserialise pair across the run file. Attacking it is a change to
+`extsort.rs`, not to the scan — and it is on shapes SPGS currently WINS
+(`narrow` 73.4-75.6 against PG18's 104.1-126.7), so it is a lead to widen,
+not a loss to close.
