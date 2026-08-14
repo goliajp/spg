@@ -35,13 +35,77 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Sampling attribution. The counts above say HOW MANY; they cannot say
+/// WHICH SITE, and this line has already been wrong twice about a mechanism
+/// it reasoned out instead of measuring. Sampling by allocation COUNT and
+/// not by bytes is the point: the allocations in question are tiny, and
+/// byte-sampling would barely see them.
+///
+/// Capturing a backtrace allocates, hence the re-entry guard.
+const SAMPLE_EVERY: u64 = 4096;
+static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(SAMPLE_EVERY);
+static SAMPLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+std::thread_local! {
+    static IN_SAMPLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn maybe_sample(count_after: u64) {
+    if count_after < NEXT_SAMPLE.load(Relaxed) {
+        return;
+    }
+    NEXT_SAMPLE.store(count_after + SAMPLE_EVERY, Relaxed);
+    if IN_SAMPLER.with(|f| f.replace(true)) {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    if let Ok(mut v) = SAMPLES.lock() {
+        v.push(bt);
+    }
+    IN_SAMPLER.with(|f| f.set(false));
+}
+
+/// The deepest frame naming engine code — the site that wanted the memory,
+/// rather than the `RawVec::grow` that literally asked for it.
+fn owner_frame(bt: &str) -> String {
+    for line in bt.lines() {
+        let l = line.trim();
+        if (l.contains("spg_engine::") || l.contains("spg_storage::"))
+            && !l.contains("probe_distinct_unique")
+        {
+            let cut = l.split_once(": ").map_or(l, |(_, r)| r);
+            return cut.chars().take(100).collect();
+        }
+    }
+    "<no engine frame>".to_string()
+}
+
+fn report_samples(label: &str) {
+    let Ok(v) = SAMPLES.lock() else { return };
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for bt in v.iter() {
+        *counts.entry(owner_frame(bt)).or_insert(0) += 1;
+    }
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by_key(|r| core::cmp::Reverse(r.1));
+    println!("\n{label}: allocation owners, one sample per {SAMPLE_EVERY} allocations");
+    for (frame, n) in rows.iter().take(12) {
+        println!(
+            "  {:>6}k allocs   {frame}",
+            n * SAMPLE_EVERY as usize / 1000
+        );
+    }
+}
+
 struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
+        let n = ALLOCS.fetch_add(1, Relaxed) + 1;
         ALLOC_BYTES.fetch_add(layout.size() as u64, Relaxed);
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        maybe_sample(n);
+        p
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) }
@@ -128,8 +192,18 @@ fn main() {
     let distinct = "SELECT DISTINCT k FROM t ORDER BY k";
     let plain = "SELECT k FROM t ORDER BY k";
     match which.as_str() {
-        "distinct" => run(&mut eng, "distinct", distinct, reps),
-        "plain" => run(&mut eng, "plain", plain, reps),
+        "distinct" => {
+            run(&mut eng, "distinct", distinct, 1);
+            SAMPLES.lock().map(|mut v| v.clear()).ok();
+            run(&mut eng, "distinct", distinct, reps);
+            report_samples("distinct");
+        }
+        "plain" => {
+            run(&mut eng, "plain", plain, 1);
+            SAMPLES.lock().map(|mut v| v.clear()).ok();
+            run(&mut eng, "plain", plain, reps);
+            report_samples("plain");
+        }
         _ => {
             run(&mut eng, "plain", plain, reps);
             run(&mut eng, "distinct", distinct, reps);
