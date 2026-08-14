@@ -41,6 +41,42 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.21] — 2026-08-14
+
+### Performance
+
+- **A row-returning scan compiles its `WHERE` instead of interpreting it per
+  row.** `try_stream_single_table` walked the predicate's expression tree for
+  every row it looked at. The aggregate path, `table_access` and the PK
+  walker all compile theirs; this was the one row-returning path that did
+  not, so r7.37.20's integer lane reached `count(*)` and never reached the
+  `SELECT` that returns the rows.
+
+  Over the wire, 50,000 rows scanned and 16,667 returned:
+  **6.375 ms → 2.393 ms**, from losing PG18 1.29× to winning at 0.49×.
+
+  It was found by naming the target wrong. The gap between returning those
+  rows and counting them was 5.70 ms, which read as "delivering rows after a
+  filter is expensive" — until a profile of the server put `eval_expr` 99,
+  `apply_binary` 81 and `mod_op` 29 at the top and delivery nowhere. 5.70 ms
+  over 50,000 scanned rows is 114 ns each, which is what an interpreted
+  predicate costs against the compiled lane's 11.7. It was never delivery.
+
+### Measured, not fixed
+
+- The same interpretation remains on the **materialising** path, the one a
+  query with `ORDER BY` takes — `select.rs:237`, where the row filter is a
+  closure calling `eval_expr`. Profiled on
+  `SELECT pad FROM d WHERE id % 3 = 0 ORDER BY k`: `eval_expr` 314,
+  `apply_binary` 248, `mod_op` 162, well past the sort's own quicksort. It
+  is why `filtered then order` is still the sweep's only losing family
+  (10k and 50k; 1k and 400k unresolved).
+
+  Six further `eval_expr`-per-row sites remain in `select.rs`; three are
+  set-returning-function paths and are not this shape.
+
+---
+
 ## [7.37.20] — 2026-08-14
 
 ### Performance

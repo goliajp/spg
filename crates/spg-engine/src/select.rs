@@ -7667,6 +7667,10 @@ impl Engine {
     fn stream_project_row<F>(
         row: &spg_storage::Row<'static>,
         where_: Option<&Expr>,
+        // r1023 — the same WHERE, compiled once by the caller. `None` means
+        // the expression did not qualify and `where_` is evaluated as before.
+        compiled_where: Option<&crate::eval::CompiledExpr>,
+        eval_stack: &mut Vec<Value<'static>>,
         projection: &[ProjectedItem],
         bound_pos: &[Option<usize>],
         ctx: &crate::eval::EvalContext<'_>,
@@ -7676,7 +7680,30 @@ impl Engine {
     where
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
-        if let Some(w) = where_ {
+        // r1023 — this scan ran its predicate through the TREE INTERPRETER,
+        // once per row, and it was the only row-returning path that did.
+        // The aggregate path, `table_access`, and the PK walker all compile
+        // theirs. Profiled: on `SELECT pad FROM d WHERE id % 3 = 0` the
+        // server's live samples were `eval_expr` 99, `apply_binary` 81,
+        // `mod_op` 29 — the interpreter, not delivery.
+        //
+        // The arithmetic accounted for it exactly. Over the wire, the same
+        // filter costs 6.375 ms returning rows and 0.679 ms counting them;
+        // the 5.70 ms difference over 50,000 scanned rows is 114 ns each,
+        // which is what an interpreted predicate costs against the compiled
+        // lane's 11.7. It was named "delivery after a filter" before this
+        // profile, and it was never delivery.
+        if let Some(c) = compiled_where {
+            if !crate::eval::compiled::eval_compiled_pred(
+                c,
+                row,
+                ctx,
+                eval_stack,
+                ctx.mysql_dialect,
+            )? {
+                return Ok(false);
+            }
+        } else if let Some(w) = where_ {
             let cond = crate::eval::eval_expr(w, row, ctx).map_err(EngineError::Eval)?;
             if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                 return Ok(false);
@@ -7798,6 +7825,15 @@ impl Engine {
         });
 
         let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());
+        // r1023 — compile the predicate once for the whole scan. Same gate
+        // every other path uses: `fully_compilable` or keep the interpreter,
+        // so a shape the VM cannot take answers exactly as it did before.
+        let compiled_where: Option<crate::eval::CompiledExpr> = stmt
+            .where_
+            .as_ref()
+            .filter(|w| crate::eval::fully_compilable(w))
+            .map(|w| crate::eval::compile_expr(w, &ctx));
+        let mut eval_stack: Vec<Value<'static>> = Vec::new();
         let mut count: usize = 0;
         match seek_positions {
             Some(mut positions) => {
@@ -7812,6 +7848,8 @@ impl Engine {
                     if Self::stream_project_row(
                         row,
                         stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        &mut eval_stack,
                         &projection,
                         &bound_pos,
                         &ctx,
@@ -7830,6 +7868,8 @@ impl Engine {
                     if Self::stream_project_row(
                         row,
                         stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        &mut eval_stack,
                         &projection,
                         &bound_pos,
                         &ctx,
