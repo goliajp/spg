@@ -52,21 +52,45 @@ PSQL="${PSQL:-psql}"
 
 echo "load before: $(uptime)"
 
-# One client, both legs. `\timing` reports the round trip psql measures,
-# which excludes process startup — that is the number to compare.
-# Each sample is the best of three executions in one session, not one
-# execution. Round 935 measured the difference this makes on this
-# testbed, in the same window, on the same 400k shapes: a run whose
-# samples were single executions carried a baseline spread of 9-25%,
-# and one whose samples were min-of-three carried 1-2%. A panel that
-# blocks the release cannot resolve a 10% regression at the former, and
-# resolves it comfortably at the latter — that round's own 10% change
-# had to be measured OUTSIDE this script for exactly that reason.
+# r1022 — the two legs must reach the client over the SAME route, and this
+# refuses to score them when the URIs say they do not.
 #
-# The minimum is the right statistic here because the thing being
-# compared is how long the work takes, and everything else the machine
-# does can only add. Both legs are treated identically, so no warmth
-# accrues to one side.
+# It was scored with them unequal. `PG_URI` pointed at 127.0.0.1 inside the
+# oracle container while `SPG_URI` went out to `host.docker.internal`, so
+# every SPG statement paid a container-to-host hop that no PG statement
+# paid. Measured on that testbed: PG's own `SELECT 1` is 0.011 ms over the
+# in-container loopback and 0.177 ms over the crossing — 0.166 ms handed to
+# one side of every cell, which sub-millisecond cells are entirely made of.
+#
+# The verdicts it produced: 20 of 32 cells losing. With both legs at
+# host.docker.internal, on the same binaries in the same hour: 2. A whole
+# campaign's headline, and it was the harness.
+#
+# The check is on the URIs and not on a measurement, because the measurement
+# cannot tell the two apart. A table-free `SELECT 1` costs the path AND the
+# engine's own per-statement work, and those are not separable from outside:
+# over one route this pair reads 0.094 ms on SPGS against 0.175 on PG18 —
+# an honest 1.9x that says nothing about the network. A first version of
+# this gate compared those floors and refused a correctly-configured run.
+host_of() { # postgres://user[:pw]@HOST:port/db -> HOST
+  printf '%s\n' "$1" | sed -E 's|^[a-z+]*://||; s|^[^@]*@||; s|[:/].*$||'
+}
+pg_host=$(host_of "${PG_URI}")
+spg_host=$(host_of "${SPG_URI}")
+echo "route: SPGS via ${spg_host}, PG18 via ${pg_host}"
+if [[ "$pg_host" != "$spg_host" && "${ALLOW_ASYMMETRIC_HOSTS:-0}" != 1 ]]; then
+    cat >&2 <<ROUTE
+fatal: the two legs are reached over different hosts.
+       PG18 via '${pg_host}', SPGS via '${spg_host}'.
+       A container-to-host hop costs ~0.17 ms on this testbed, which is
+       more than several cells below take in total, and it would be
+       charged to one engine and not the other. Point both URIs through
+       the same route and run again.
+       If they genuinely are equidistant, set ALLOW_ASYMMETRIC_HOSTS=1.
+ROUTE
+    exit 2
+fi
+
 time_one() { # $1=uri $2=sql $3=work_mem setting
   "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" -c '\timing on' -c "$2" -c "$2" -c "$2" 2>&1 |
     grep -E '^Time:' | sed 's/Time: //; s/ ms//' | sort -g | head -1
