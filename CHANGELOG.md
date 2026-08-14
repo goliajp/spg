@@ -41,6 +41,52 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.20] — 2026-08-14
+
+### Performance
+
+- **Integer arithmetic in a predicate no longer builds a `Value` per step.**
+  `WHERE id % 3 = 0` cost 69.1 ns/row against 13.7 for `WHERE id > 0`; a
+  leaf-symbol profile put `drop_glue<spg_storage::Value>` as the largest
+  single leaf, ahead of the modulo it was carrying, and 22× heavier per rep
+  than on the shape that skips the step machine. It is now 11.7 ns/row —
+  faster than the comparison-only fast path, because it does not build the
+  comparison result either.
+
+  End to end through the wire, `count(*) … WHERE id % 3 = 0` over 50k rows
+  went from 3.30 ms against PG18's 1.11 (a 3.01× loss) to 0.71 against 1.17
+  — a win. The comparison-only predicate is unchanged at 13.8 ns/row.
+
+  The lane recognises a CLASS rather than a shape: integer columns, integer
+  literals, `+ - * / %`, ending in one comparison. Round 482 answered the
+  same `Value` churn with one hard-coded shape (`column <cmp> literal`),
+  which is why arithmetic still paid for it; a second hard-coded shape would
+  have been the same answer again.
+
+  **It is only allowed to be faster, never to be different.** Every case it
+  cannot decide hands the row back to the ordinary machine: NULL, a
+  non-integer, `smallint`, a zero divisor, an overflow, and a result that
+  leaves the width its operands imply (`int4 op int4` stays `int4`, as in
+  PG). So answers and error texts still come from where they always did —
+  verified differentially against PG 18.4 across 18 shapes including
+  `division by zero`, `integer out of range` and `bigint out of range`, all
+  identical.
+
+  Pinned twice: sixteen corpus records for the answers, and a counter test
+  for whether the lane runs at all — because a lane that never fires also
+  produces PG's results, by falling back.
+
+### Measured, not fixed
+
+- Delivering rows **after** a filter is disproportionately expensive, and
+  this round isolated it by removing the predicate cost that had been hiding
+  it. Same run: 16,667 filtered rows cost 5.82 ms to deliver against PG's
+  1.19, while 50,000 unfiltered rows cost 4.77 against 3.86. More rows,
+  less time. That is the next target on this line, and it is not the
+  predicate.
+
+---
+
 ## [7.37.19] — 2026-08-14
 
 ### Fixed

@@ -263,6 +263,9 @@ pub(crate) struct CompiledExpr {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PredShape {
     Other,
+    /// r1021 — an integer-only arithmetic predicate, run without building a
+    /// single `Value`. See [`CompiledExpr::is_int_arith_pred`].
+    IntArith,
     ColumnCmpLit,
     ColumnInSet,
     ColumnLike,
@@ -274,6 +277,131 @@ impl CompiledExpr {
     /// `Some(pos)` iff this compiled expression is exactly the
     /// single step `ColumnLength { pos }` — i.e. `LENGTH(<column>)`
     /// on a bound text column with no surrounding work.
+    /// r1021 — the deepest an integer lane will go. A predicate needing
+    /// more stack than this falls back; measured shapes use two or three.
+    const INT_LANE_DEPTH: usize = 8;
+
+    /// r1021 — is this predicate built only from integer columns, integer
+    /// literals and integer arithmetic, ending in one comparison?
+    ///
+    /// Round 482 traced the per-row predicate cost to `Value` churn and
+    /// answered it with ONE hard-coded shape, `<column> <cmp> <literal>`.
+    /// Anything with arithmetic in it — `id % 3 = 0`, the bucketing and
+    /// parity predicates real schemas are full of — still builds and
+    /// destroys a `Value` per step. Profiled (2026-08-14, see
+    /// `docs/PERF_FILTERED_THEN_ORDER_2026-08-14.md`):
+    /// `drop_glue<Value>` is the LARGEST leaf on `WHERE id % 3 = 0`, ahead
+    /// of the modulo it carries, and 22x heavier per rep than on the shape
+    /// that skips the step machine.
+    ///
+    /// So this recognises a CLASS rather than a shape. Structural only —
+    /// no column types are consulted here — because every value the lane
+    /// cannot handle makes it fall back at run time instead of guessing.
+    fn is_int_arith_pred(&self) -> bool {
+        let mut depth = 0usize;
+        let mut comparisons = 0usize;
+        for (i, step) in self.steps.iter().enumerate() {
+            match step {
+                Step::Column(_) => depth += 1,
+                Step::Lit(v) => {
+                    if !matches!(v, Value::Int(_) | Value::BigInt(_)) {
+                        return false;
+                    }
+                    depth += 1;
+                }
+                Step::Binary(op) => {
+                    if depth < 2 {
+                        return false;
+                    }
+                    depth -= 1;
+                    if is_int_comparison(*op) {
+                        comparisons += 1;
+                        // The comparison is the answer, so it ends the
+                        // program; a later step would consume a bool the
+                        // lane does not carry.
+                        if i + 1 != self.steps.len() {
+                            return false;
+                        }
+                    } else if !is_int_arithmetic(*op) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+            if depth > Self::INT_LANE_DEPTH {
+                return false;
+            }
+        }
+        depth == 1 && comparisons == 1
+    }
+
+    /// r1021 — run an [`Self::is_int_arith_pred`] program over `i64`s.
+    ///
+    /// `None` means "this row is not for the lane" and the caller runs the
+    /// ordinary machine. Every case that could answer differently from the
+    /// interpreter takes that exit rather than deciding for itself: a NULL
+    /// or non-integer cell, a division by zero, an overflow, and a result
+    /// that would not fit the width the operands imply. The lane therefore
+    /// cannot change a single answer — it can only reach the same one
+    /// without a heap type in the middle.
+    ///
+    /// Width follows PG: `int4 op int4` stays `int4` and overflowing it is
+    /// an error, so a 32-bit result that leaves 32-bit range hands the row
+    /// back and the interpreter raises exactly as before. Mixed widths
+    /// widen to 64-bit, and `smallint` is simply not admitted.
+    fn eval_int_arith_pred(&self, row: &Row<'static>) -> Option<bool> {
+        let mut vals = [0i64; Self::INT_LANE_DEPTH];
+        let mut narrow = [false; Self::INT_LANE_DEPTH];
+        let mut n = 0usize;
+        for step in &self.steps {
+            match step {
+                Step::Column(pos) => {
+                    let (v, is32) = int_operand(row.values.get(*pos)?)?;
+                    vals[n] = v;
+                    narrow[n] = is32;
+                    n += 1;
+                }
+                Step::Lit(lit) => {
+                    let (v, is32) = int_operand(lit)?;
+                    vals[n] = v;
+                    narrow[n] = is32;
+                    n += 1;
+                }
+                Step::Binary(op) => {
+                    let (rhs, rhs32) = (vals[n - 1], narrow[n - 1]);
+                    let (lhs, lhs32) = (vals[n - 2], narrow[n - 2]);
+                    n -= 2;
+                    if is_int_comparison(*op) {
+                        return Some(match op {
+                            BinOp::Eq => lhs == rhs,
+                            BinOp::NotEq => lhs != rhs,
+                            BinOp::Lt => lhs < rhs,
+                            BinOp::LtEq => lhs <= rhs,
+                            BinOp::Gt => lhs > rhs,
+                            _ => lhs >= rhs,
+                        });
+                    }
+                    let out = match op {
+                        BinOp::Add => lhs.checked_add(rhs)?,
+                        BinOp::Sub => lhs.checked_sub(rhs)?,
+                        BinOp::Mul => lhs.checked_mul(rhs)?,
+                        BinOp::Div => lhs.checked_div(rhs)?,
+                        _ => lhs.checked_rem(rhs)?,
+                    };
+                    let out32 = lhs32 && rhs32;
+                    if out32 && i32::try_from(out).is_err() {
+                        return None;
+                    }
+                    vals[n] = out;
+                    narrow[n] = out32;
+                    n += 1;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     /// v7.39 (round 482) — is this exactly `<column> <cmp> <literal>`?
     ///
     /// Rounds 478-481 traced the per-row predicate cost to `Value` churn:
@@ -1405,6 +1533,34 @@ fn is_pure_scalar_function(name: &str) -> bool {
         )
 }
 
+/// r1021 — the arithmetic the integer lane runs. `Div` and `Mod` are in
+/// because their zero divisor is handled by falling back, not by guessing.
+const fn is_int_arithmetic(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+    )
+}
+
+/// r1021 — the comparison that ends an integer-lane program.
+const fn is_int_comparison(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
+    )
+}
+
+/// r1021 — `(value, is_32_bit)` for the two widths the lane admits. NULL,
+/// `smallint` and every non-integer answer `None`, which sends the row to
+/// the ordinary machine.
+const fn int_operand(v: &Value<'_>) -> Option<(i64, bool)> {
+    match v {
+        Value::Int(i) => Some((*i as i64, true)),
+        Value::BigInt(i) => Some((*i, false)),
+        _ => None,
+    }
+}
+
 pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
     let mut steps = Vec::new();
     compile_into(e, ctx, &mut steps);
@@ -1420,6 +1576,8 @@ pub(crate) fn compile_expr(e: &Expr, ctx: &EvalContext<'_>) -> CompiledExpr {
         PredShape::ColumnInSet
     } else if c.as_column_like().is_some() {
         PredShape::ColumnLike
+    } else if c.is_int_arith_pred() {
+        PredShape::IntArith
     } else {
         PredShape::Other
     };
@@ -1479,6 +1637,17 @@ pub(crate) fn eval_compiled_pred(
     // The shape was settled at compile time; the row loop reads one
     // discriminant instead of re-matching the step list per row.
     match c.pred_shape {
+        // r1021 — integer arithmetic runs on an i64 stack, building no
+        // `Value` at all. `None` means the row carried something the lane
+        // does not decide (NULL, a non-integer, a zero divisor, an
+        // overflow) and the ordinary machine below answers it instead.
+        PredShape::IntArith => {
+            if let Some(verdict) = c.eval_int_arith_pred(row) {
+                crate::bump_counter!(STEP_VM_INTLANE_FIRE);
+                return Ok(verdict);
+            }
+            crate::bump_counter!(STEP_VM_INTLANE_FALLBACK);
+        }
         // v7.39 (round 482) — `<column> <cmp> <literal>` compares in place.
         //
         // The general path builds three `Value`s a row and drops them;
@@ -2520,6 +2689,16 @@ pub static STEP_VM_LIT_HEAP_ALLOC: core::sync::atomic::AtomicU64 =
 /// predicate fires, so "is it even reached" is a number and not a guess
 /// (round 480 was spent on a branch that turned out to be unreachable).
 pub static STEP_VM_FASTPRED_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// r1021 — how often the integer lane answers, and how often a row makes it
+/// hand back. Round 480 was spent on a branch that turned out unreachable,
+/// so "is it even reached" stays a number here too — and the fallback
+/// counter is the one that matters for correctness review: it is every row
+/// the lane declined to decide.
+pub static STEP_VM_INTLANE_FIRE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static STEP_VM_INTLANE_FALLBACK: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 pub static STEP_VM_STACK_LEFTOVER: core::sync::atomic::AtomicU64 =

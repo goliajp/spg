@@ -1,0 +1,101 @@
+# r1021 — the compiled predicate VM runs integer arithmetic on an i64 stack
+# instead of building a `Value` per step.
+#
+# `WHERE id % 3 = 0` cost 69.1 ns/row against 13.7 for `WHERE id > 0`, and a
+# leaf-symbol profile put `drop_glue<Value>` as the largest single leaf —
+# ahead of the modulo it was carrying. The lane answers without materialising
+# an intermediate at all: 11.7 ns/row.
+#
+# The runner asserts THAT a statement errors, not which error. The message
+# text was checked separately in the same round, differentially against
+# PG 18.4 over the same shapes: `division by zero`, `integer out of range`
+# and `bigint out of range` came back identical on both engines, as did
+# every row set below.
+#
+# It is only allowed to be FAST, never to be different. Every case it cannot
+# decide — NULL, smallint, a zero divisor, an overflow, a result leaving the
+# width its operands imply — hands the row back to the ordinary machine, so
+# the answer and the error text come from where they always did. This pins
+# that, against PG 18.4.
+
+statement ok
+CREATE TABLE ial (i4 INT, i8 BIGINT, i2 SMALLINT, n INT)
+
+statement ok
+INSERT INTO ial VALUES (7,7,7,7),(8,8,8,NULL),(0,0,0,0),(-9,-9,-9,-9)
+
+# The shape the lane exists for.
+query I
+SELECT i4 FROM ial WHERE i4 % 3 = 0 ORDER BY i4
+----
+-9
+0
+
+# Every comparison the lane ends on.
+query I
+SELECT i4 FROM ial WHERE i4 + 1 <> i4 ORDER BY i4
+----
+-9
+0
+7
+8
+
+query I
+SELECT i4 FROM ial WHERE i4 * 2 > 10 ORDER BY i4
+----
+7
+8
+
+query I
+SELECT i4 FROM ial WHERE i4 / 2 <= 0 ORDER BY i4
+----
+-9
+0
+
+# NULL is not the lane's to decide: it hands the row back, and the ordinary
+# path treats a NULL predicate as not-true.
+query I
+SELECT i4 FROM ial WHERE n % 3 = 0 ORDER BY i4
+----
+-9
+0
+
+# smallint is not admitted at all — the answer must be unchanged.
+query I
+SELECT i4 FROM ial WHERE i2 % 3 = 0 ORDER BY i4
+----
+-9
+0
+
+# Mixed widths widen, exactly as PG does.
+query I
+SELECT i4 FROM ial WHERE i4 + i8 = 14 ORDER BY i4
+----
+7
+
+# Negative operands: truncated remainder, PG's sign rule.
+query I
+SELECT i4 FROM ial WHERE i4 % -3 = 1 ORDER BY i4
+----
+7
+
+# A zero divisor raises rather than being decided.
+statement error
+SELECT i4 FROM ial WHERE i4 % 0 = 1
+
+statement error
+SELECT i4 FROM ial WHERE i4 / 0 = 1
+
+# An int4 result that leaves int4 range raises, as it did before the lane.
+statement ok
+INSERT INTO ial VALUES (2147483647, 1, 1, 1)
+
+statement error
+SELECT i4 FROM ial WHERE i4 * 2 = 0
+
+# 64-bit range still raises on the 64-bit side.
+statement ok
+INSERT INTO ial VALUES (1, 9223372036854775807, 1, 1)
+
+statement error
+SELECT i4 FROM ial WHERE i8 * 2 = 0
