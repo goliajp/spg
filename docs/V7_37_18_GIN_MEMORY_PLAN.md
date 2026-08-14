@@ -288,17 +288,48 @@ The change is kept: −1.5 GB of churn and hundreds of millions of allocations
 are worth having, and `get_by`/`get_mut_by` is the lookup a blocked
 representation will need. It is recorded as hygiene, not as the fix.
 
-### B3b — the 640 MB inside one statement
+### B3b — the 612 MB inside one statement, named (r1026)
 
-Peak live 1,411 MB against 770 MB live at COMMIT: ~640 MB is transient within
-a single statement. With `--batch-commit 1` each statement is its own
-transaction, so this is copy-on-write duplicating the structures a 500-row
-INSERT touches — 500 rows x ~1,500 trigrams x 4 indexes is 3 M key touches,
-and the first touch of each node copies it.
+Peak live 1,382 MB against 770 live at COMMIT: ~612 MB is transient within a
+single 500-row statement, even with `--batch-commit 1`, where that statement
+IS the transaction.
 
-B1 already reduces this as far as batching can: one statement is the floor.
-Going below it means the import path not taking a transaction snapshot at
-all, which is an engine change and not a 7.37.18 one.
+**Who holds the second reference.** A transaction keeps its own handle on the
+catalog (`state.catalog`) so it can roll back, while the engine keeps
+`self.catalog`. Two handles means `Arc::make_mut` finds the spine shared, so
+every node the statement touches is copied. That much is the price of
+transactional rollback on a copy-on-write catalog, and it is not a defect.
+
+**What is a defect is what a node copy copies.** `BNode::clone` does
+`children.clone()` — a `Vec<Arc<_>>`, so pointers — and `entries.clone()`,
+a `Vec<(K, V)>`, which clones the VALUES. The GIN and btree maps store
+`Vec<RowLocator>` posting lists directly as `V`. So copying one node
+deep-copies **every posting list it holds**, including the ones the statement
+is not touching.
+
+Counted rather than argued (temporary counters in the `Clone` impl, removed
+after the reading):
+
+| | over the whole import | stmt 40 → 60 |
+|---|---:|---:|
+| node clones | 16,343 | 3,697 |
+| entries (posting lists) copied | 70,468 | 15,967 |
+
+Peak live rose 727.9 → 1,415.3 MB across that same window, +687 MB. Spread
+over 15,967 copied lists at 16 bytes a locator, that is ~2,690 locators per
+list — which is the right order for a table holding 20-30k rows at that
+point, where common trigrams are in most of them.
+
+**The fix, not yet written.** Make the value cheap to clone:
+`Arc<Vec<RowLocator>>` instead of `Vec<RowLocator>`. A node copy then moves
+pointers, and a posting list is cloned only when the statement actually
+appends to that list — once, after which the handle is unique and the rest of
+the statement mutates in place. With eight entries a node and typically one
+or two of them being written, most of those 70,468 copies are collateral.
+
+Blast radius: the four GIN kinds and `BTree`, their maintenance sites, the
+three lookup methods, and the catalog codec. It is a storage-core type
+change and wants its own cycle rather than the tail of another one.
 
 ### B4 — WITHDRAWN: it does not touch the peak
 
