@@ -191,3 +191,30 @@ keys are the more attackable of the two — only `runs.len()` heads are alive
 at once, so their buffers could be recycled rather than reallocated, which
 would need `keys_of` to write into a caller's buffer instead of returning
 one.
+
+### Does it reach the server, and can the wire see it?
+
+Two different questions, and the r1031 lane made the mistake of answering
+the first by looking at the second.
+
+**Reach — yes, witnessed.** `pg_stat_database.temp_files` against a running
+server, on the sweep's own table and its own `work_mem = 4096`:
+
+| | temp_files |
+|---|---|
+| `SELECT id FROM sw ORDER BY k`, work_mem 4 MB | 0 → **6** |
+| the same query, work_mem 4 GB | 6 → 6 |
+
+It spills at the setting the endpoint panel uses, and does not when given
+room — the counter moving in one direction and holding still in the other
+is what makes it a witness rather than a reading.
+
+**Wire visibility — no, and the harness says why.** Three legs at N=31 on
+`narrow, non-indexed key`: A 71.9-80.6, B 72.8-80.9, C 72.8-81.5. The
+control leg is the SAME BINARY as A and spans nine milliseconds; the effect
+is about seven. Raising N did not narrow it, because that spread is machine
+drift rather than sampling noise.
+
+So: −11 % in process, on the path the server takes, below what this testbed
+can resolve at the socket. Not a wire win, and not evidence of absence
+either.
