@@ -44,9 +44,10 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = unsafe { System.alloc(l) };
         if !p.is_null() {
-            TOTAL.fetch_add(l.size(), Relaxed);
+            let total = TOTAL.fetch_add(l.size(), Relaxed) + l.size();
             let now = LIVE.fetch_add(l.size(), Relaxed) + l.size();
             PEAK.fetch_max(now, Relaxed);
+            maybe_sample(total);
         }
         p
     }
@@ -66,6 +67,91 @@ unsafe impl GlobalAlloc for Counting {
             }
         }
         q
+    }
+}
+
+// r1027 — WHERE the bytes come from, not just how many.
+//
+// Two hypotheses about this import's 15.2 GB of allocation have now been
+// refuted by measurement — that per-trigram `String`s dominated it (removing
+// them took 9 %), and that copy-on-write node copies dragged whole posting
+// lists (putting the lists behind an `Arc` moved nothing). Both were
+// arithmetic fitted to a plausible mechanism, and the arithmetic fit both
+// times.
+//
+// A total tells you how much. It cannot tell you who, and guessing who is
+// what has cost two rounds. So: sample a backtrace every `SAMPLE_EVERY`
+// bytes and aggregate the frames. The allocator itself allocates when it
+// captures one, hence the re-entry guard — without it the first sample
+// recurses until the stack ends.
+const SAMPLE_EVERY: usize = 4 * 1024 * 1024;
+static NEXT_SAMPLE: AtomicUsize = AtomicUsize::new(SAMPLE_EVERY);
+
+std::thread_local! {
+    static IN_SAMPLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+static SAMPLES: std::sync::Mutex<Vec<std::string::String>> = std::sync::Mutex::new(Vec::new());
+
+fn maybe_sample(total_after: usize) {
+    if total_after < NEXT_SAMPLE.load(Relaxed) {
+        return;
+    }
+    NEXT_SAMPLE.store(total_after + SAMPLE_EVERY, Relaxed);
+    let already = IN_SAMPLER.with(|f| f.replace(true));
+    if already {
+        return;
+    }
+    let bt = std::backtrace::Backtrace::force_capture().to_string();
+    if let Ok(mut v) = SAMPLES.lock() {
+        v.push(bt);
+    }
+    IN_SAMPLER.with(|f| f.set(false));
+}
+
+/// The deepest frame naming spg code — the allocation's owner, as opposed to
+/// the `Vec::reserve` or `RawVec::grow` that literally asked.
+fn owner_frame(bt: &str) -> std::string::String {
+    for line in bt.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.split_once("at ").map(|(_, r)| r)
+            && (rest.contains("/spg-") || rest.contains("crates/spg"))
+            && !rest.contains("mem_census")
+        {
+            return rest.split('/').next_back().unwrap_or(rest).to_string();
+        }
+    }
+    for line in bt.lines() {
+        let l = line.trim();
+        if l.contains("spg_storage::") || l.contains("spg_engine::") {
+            let cut = l.split_once(": ").map_or(l, |(_, r)| r);
+            return cut.chars().take(90).collect();
+        }
+    }
+    "<no spg frame>".to_string()
+}
+
+fn report_samples() {
+    let Ok(v) = SAMPLES.lock() else { return };
+    let mut counts: std::collections::BTreeMap<std::string::String, usize> =
+        std::collections::BTreeMap::new();
+    for bt in v.iter() {
+        *counts.entry(owner_frame(bt)).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(std::string::String, usize)> = counts.into_iter().collect();
+    rows.sort_by_key(|r| core::cmp::Reverse(r.1));
+    println!(
+        "\n=== allocation samples ({} at one per {} MiB = {:.1} GB attributed)",
+        v.len(),
+        SAMPLE_EVERY / 1_048_576,
+        v.len() as f64 * SAMPLE_EVERY as f64 / 1e9
+    );
+    for (frame, n) in rows.iter().take(18) {
+        println!(
+            "  {:5}  {:5.1} GB  {frame}",
+            n,
+            *n as f64 * SAMPLE_EVERY as f64 / 1e9
+        );
     }
 }
 
@@ -141,4 +227,5 @@ fn main() {
 
     drop(db);
     report("db dropped");
+    report_samples();
 }
