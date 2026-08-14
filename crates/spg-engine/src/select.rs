@@ -7398,16 +7398,8 @@ impl Engine {
 
         let key_ctx = &ctx;
         let rows = sorter.finish(
-            |src| {
-                let mut buf = Vec::new();
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    src,
-                    key_ctx,
-                    &mut buf,
-                )?;
-                Ok(buf)
+            |src, buf| {
+                crate::orderby::build_order_keys_bound(&order_by, &order_bound, src, key_ctx, buf)
             },
             |src| {
                 let mut values = Vec::with_capacity(projection.len());
@@ -8131,16 +8123,8 @@ impl Engine {
         let key_ctx = &ctx;
         let mut emitted_since_check = 0usize;
         let n = sorter.finish_each(
-            |src| {
-                let mut buf = Vec::new();
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    src,
-                    key_ctx,
-                    &mut buf,
-                )?;
-                Ok(buf)
+            |src, buf| {
+                crate::orderby::build_order_keys_bound(&order_by, &order_bound, src, key_ctx, buf)
             },
             |src, values| {
                 for p in &projection {
