@@ -45,6 +45,7 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 const SAMPLE_EVERY: u64 = 4096;
 static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(SAMPLE_EVERY);
 static SAMPLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static DEPTH: AtomicU64 = AtomicU64::new(0);
 
 std::thread_local! {
     static IN_SAMPLER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -77,7 +78,15 @@ fn maybe_sample(count_after: u64) {
     if IN_SAMPLER.with(|f| f.replace(true)) {
         return;
     }
+    // Is the overflow recursion or genuine depth? A depth counter says
+    // so directly; the guard above is supposed to make >1 impossible.
+    let depth = DEPTH.fetch_add(1, Relaxed) + 1;
+    if depth > 1 {
+        eprintln!("!! sampler re-entered, depth {depth} — the guard did not hold");
+        std::process::abort();
+    }
     let bt = std::backtrace::Backtrace::force_capture().to_string();
+    DEPTH.fetch_sub(1, Relaxed);
     // `try_lock`, never `lock`: this runs INSIDE the allocator, and
     // blocking here on a lock some other allocating code holds is a
     // deadlock. Dropping a sample is the correct loss.

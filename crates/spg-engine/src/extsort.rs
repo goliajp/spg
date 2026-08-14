@@ -643,7 +643,7 @@ impl<'a> ExternalSorter<'a> {
         mut emit: E,
     ) -> Result<usize, EngineError>
     where
-        K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+        K: Fn(&Row<'static>, &mut Vec<OrderKey>) -> Result<(), EngineError>,
         P: Fn(&Row<'static>, &mut Vec<Value<'static>>) -> Result<(), EngineError>,
         E: FnMut(&[Value<'static>]) -> Result<(), EngineError>,
     {
@@ -696,12 +696,13 @@ impl<'a> ExternalSorter<'a> {
                 &keys_of,
                 needed,
                 &mut readbuf,
+                Vec::new(),
             )?);
         }
 
         let mut heap = HeadHeap::build(heads.len(), &heads, self.descs);
         while let Some(w) = heap.peek() {
-            let Some((_, record)) = heads[w].take() else {
+            let Some((keys, record)) = heads[w].take() else {
                 break;
             };
             scratch.clear();
@@ -714,6 +715,7 @@ impl<'a> ExternalSorter<'a> {
                 &keys_of,
                 needed,
                 &mut readbuf,
+                keys,
             )?;
             heap.settle_root(&heads, self.descs);
         }
@@ -726,7 +728,7 @@ impl<'a> ExternalSorter<'a> {
         project: P,
     ) -> Result<Vec<Row<'static>>, EngineError>
     where
-        K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+        K: Fn(&Row<'static>, &mut Vec<OrderKey>) -> Result<(), EngineError>,
         P: Fn(&Row<'static>) -> Result<Row<'static>, EngineError>,
     {
         let mut out: Vec<Row<'static>> = Vec::new();
@@ -753,9 +755,13 @@ impl<'a> ExternalSorter<'a> {
         needed: &[bool],
         // Reused across every row of every run: see `read_exact`.
         buf: &mut Vec<u8>,
+        // The key buffer of the head this one replaces. Only `runs.len()`
+        // heads are alive at once, so recycling theirs means the merge
+        // allocates key storage that many times rather than once per row.
+        mut keys: Vec<OrderKey>,
     ) -> Result<Option<(Vec<OrderKey>, Row<'static>)>, EngineError>
     where
-        K: Fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+        K: Fn(&Row<'static>, &mut Vec<OrderKey>) -> Result<(), EngineError>,
     {
         if read_exact(run, 4, buf)?.is_none() {
             return Ok(None);
@@ -774,7 +780,8 @@ impl<'a> ExternalSorter<'a> {
             needed,
         )
         .map_err(|e| EngineError::Internal(alloc::format!("temp run row decode: {e:?}")))?;
-        let keys = keys_of(&row)?;
+        keys.clear();
+        keys_of(&row, &mut keys)?;
         Ok(Some((keys, row)))
     }
 }
@@ -841,11 +848,23 @@ mod tests {
 
     /// Pack the key from the SOURCE row, standing in for
     /// `build_order_keys_bound` (which needs an evaluation context).
-    fn keys_of(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+    /// Appends, like the real one, so the merge can hand it a recycled
+    /// buffer.
+    fn keys_of(src: &Row<'static>, out: &mut Vec<OrderKey>) -> Result<(), EngineError> {
         match &src.values[0] {
-            Value::Int(n) => Ok(alloc::vec![OrderKey::Int(i128::from(*n))]),
+            Value::Int(n) => {
+                out.push(OrderKey::Int(i128::from(*n)));
+                Ok(())
+            }
             other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
         }
+    }
+
+    /// The same, for the tests that want the keys as a value.
+    fn keys_vec(src: &Row<'static>) -> Vec<OrderKey> {
+        let mut out = Vec::new();
+        keys_of(src, &mut out).expect("test row has an int key");
+        out
     }
 
     fn ids_of(rows: &[Row<'static>], at: usize) -> Vec<i32> {
@@ -901,9 +920,9 @@ mod tests {
         let mut lean = ExternalSorter::new(None, usize::MAX, cols, &descs).with_pruned(&mask);
         for i in 0..1000i32 {
             let r = wide((i * 7919) % 1000);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             full.push(&mut k, &r).unwrap();
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             lean.push(&mut k, &r).unwrap();
         }
 
@@ -975,7 +994,7 @@ mod tests {
                 .with_pruned(needed);
             for i in 0..2000i32 {
                 let r = wide((i * 7919) % 2000);
-                let mut k = keys_of(&r).unwrap();
+                let mut k = keys_vec(&r);
                 s.push(&mut k, &r).unwrap();
             }
             assert!(s.spilled(), "a 4 KB budget over 2000 wide rows must spill");
@@ -1033,7 +1052,7 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
         for i in 0..5000i32 {
             let r = record((i * 7919) % 5000);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
 
@@ -1076,8 +1095,8 @@ mod tests {
             let mut b = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
             for i in 0..2000i32 {
                 let r = record((i * 7919) % 2000);
-                a.push(&mut keys_of(&r).unwrap(), &r).unwrap();
-                b.push(&mut keys_of(&r).unwrap(), &r).unwrap();
+                a.push(&mut keys_vec(&r), &r).unwrap();
+                b.push(&mut keys_vec(&r), &r).unwrap();
             }
             let spilled = !a.runs.is_empty();
             assert_eq!(
@@ -1145,7 +1164,7 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % rows).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let mut k = keys_of(&r).unwrap();
+                let mut k = keys_vec(&r);
                 s.push(&mut k, &r).unwrap();
             }
             let runs = s.runs.len() + usize::from(!s.ends.is_empty());
@@ -1352,9 +1371,12 @@ mod tests {
         let descs = [false];
 
         // What every earlier bench used: a projected column, read back.
-        fn free_keys(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+        fn free_keys(src: &Row<'static>, out: &mut Vec<OrderKey>) -> Result<(), EngineError> {
             match &src.values[0] {
-                Value::Int(n) => Ok(alloc::vec![OrderKey::Int(i128::from(*n))]),
+                Value::Int(n) => {
+                    out.push(OrderKey::Int(i128::from(*n)));
+                    Ok(())
+                }
                 other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
             }
         }
@@ -1363,7 +1385,7 @@ mod tests {
         // shape stands in for `build_order_keys_bound` walking a small
         // expression — an allocation and arithmetic per row, which is
         // what an ORDER BY operand costs when it is not a bare column.
-        fn computed_keys(src: &Row<'static>) -> Result<Vec<OrderKey>, EngineError> {
+        fn computed_keys(src: &Row<'static>, out: &mut Vec<OrderKey>) -> Result<(), EngineError> {
             let Value::Int(n) = &src.values[0] else {
                 return Err(EngineError::Internal(alloc::string::String::from(
                     "bad key",
@@ -1375,7 +1397,8 @@ mod tests {
                 )));
             };
             let folded = i128::from(*n) + i128::try_from(t.len()).unwrap_or(0);
-            Ok(alloc::vec![OrderKey::Int(folded)])
+            out.push(OrderKey::Int(folded));
+            Ok(())
         }
 
         // Third variant: the same merge, but the projection keeps one
@@ -1385,7 +1408,7 @@ mod tests {
         for (label, keyfn, narrow) in [
             (
                 "free",
-                free_keys as fn(&Row<'static>) -> Result<Vec<OrderKey>, EngineError>,
+                free_keys as fn(&Row<'static>, &mut Vec<OrderKey>) -> Result<(), EngineError>,
                 false,
             ),
             ("computed", computed_keys, false),
@@ -1397,7 +1420,8 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let mut k = keyfn(&r).unwrap();
+                let mut k = Vec::new();
+                keyfn(&r, &mut k).unwrap();
                 s.push(&mut k, &r).unwrap();
             }
             let t = Instant::now();
@@ -1451,7 +1475,7 @@ mod tests {
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
                     Value::text(pad.clone()),
                 ]);
-                let mut k = keys_of(&r).unwrap();
+                let mut k = keys_vec(&r);
                 s.push(&mut k, &r).unwrap();
             }
             let runs = s.runs.len() + usize::from(!s.ends.is_empty());
@@ -1563,7 +1587,7 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), WORK_MEM, cols, &descs);
         let t1 = Instant::now();
         for r in rows {
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
         let push_phase = t1.elapsed();
@@ -1589,7 +1613,7 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled(), "a 1-byte budget must have produced runs");
@@ -1622,7 +1646,7 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled());
@@ -1641,7 +1665,7 @@ mod tests {
         let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
         for id in [3, 1, 2] {
             let r = record(id);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
         assert!(s.spilled());
@@ -1662,7 +1686,7 @@ mod tests {
         let mut s = ExternalSorter::new(None, 1, record_cols(), &descs);
         for id in [2, 0, 1] {
             let r = record(id);
-            let mut k = keys_of(&r).unwrap();
+            let mut k = keys_vec(&r);
             s.push(&mut k, &r).unwrap();
         }
         assert!(!s.spilled(), "nothing to spill to means nothing spilled");
@@ -1765,7 +1789,7 @@ mod tests {
             let mut s = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
             for i in 0..2000i32 {
                 let r = record((i * 7919) % 2000);
-                s.push(&mut keys_of(&r).unwrap(), &r).unwrap();
+                s.push(&mut keys_vec(&r), &r).unwrap();
             }
             assert_eq!(s.spilled(), budget == 4096, "budget {budget}");
             let out = s.finish(keys_of, project_identity).unwrap();
