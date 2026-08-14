@@ -20,6 +20,7 @@ pub mod jsonb_gin;
 mod nsw;
 pub mod persistent;
 pub mod persistent_btree;
+pub mod posting;
 pub mod quantize;
 pub mod row_header;
 pub mod row_locator;
@@ -45,6 +46,12 @@ pub use self::codec::{
 // `Table` insert paths in the `table` module.
 pub(crate) use self::nsw::nsw_insert_at;
 pub use self::nsw::{NswMetric, cosine_dot_norms_f32, inner_product_f32, nsw_index_on, nsw_query};
+pub use self::posting::PostingList;
+
+/// The list handed back for an absent key, so callers cannot tell an
+/// absent key from an empty posting list — the property the old
+/// `&[][..]` return had, kept.
+static EMPTY_POSTINGS: crate::posting::PostingList = crate::posting::PostingList::new();
 pub use self::row_locator::{RowLocator, RowLocatorError};
 pub use self::segment::{
     BRIN_SIDECAR_MAGIC, BrinSummary, OwnedSegment, SEGMENT_COMPRESS_ALGO_LZSS,
@@ -2600,7 +2607,7 @@ pub enum IndexKind {
     /// because every locator round-trips through `RowLocator::from_legacy_v8_u64`
     /// without information loss. `FILE_VERSION` 9 with tagged encoding lands
     /// alongside the first freezer commit (v5.1 step 2b / v5.2).
-    BTree(PersistentBTreeMap<IndexKey, Vec<RowLocator>>),
+    BTree(PersistentBTreeMap<IndexKey, crate::posting::PostingList>),
     /// Navigable-small-world graph for vector kNN search.
     Nsw(NswGraph),
     /// v6.7.1 — BRIN (Block Range INdex). Pure metadata: BRIN
@@ -2630,7 +2637,7 @@ pub enum IndexKind {
     /// Backed by a `PersistentBTreeMap` so `Catalog::clone` (the
     /// per-write snapshot) stays O(1) — same structural-sharing
     /// invariant as BTree.
-    Gin(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    Gin(PersistentBTreeMap<alloc::string::String, crate::posting::PostingList>),
     /// v7.15.0 — `USING gin (col gin_trgm_ops)` over a `TEXT`
     /// column. Posting lists map `trigram` (PG-compatible 3-byte
     /// shingle on the lower-cased + space-padded input) to row
@@ -2641,7 +2648,7 @@ pub enum IndexKind {
     /// lists, and the LIKE / similarity predicate is re-evaluated
     /// per candidate row to filter the over-approximation.
     /// Persisted via tag-4 index payload in `FILE_VERSION` 24+.
-    GinTrgm(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    GinTrgm(PersistentBTreeMap<alloc::string::String, crate::posting::PostingList>),
     /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY (col)` over a
     /// `TEXT` / `VARCHAR` column. Posting lists map
     /// `tsvector('simple') lexeme` to row locators. At insert /
@@ -2654,7 +2661,7 @@ pub enum IndexKind {
     /// queries by mapping them onto the existing tsquery `@@`
     /// walker. Persisted via tag-5 index payload in
     /// `FILE_VERSION` 33+.
-    GinFulltext(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    GinFulltext(PersistentBTreeMap<alloc::string::String, crate::posting::PostingList>),
     /// v7.37.8(sentori Epic 5 P2)— `USING gin (col)` over a
     /// `JSON` / `JSONB` column. Posting lists map a canonical
     /// `(path, leaf)` token(see [`crate::jsonb_gin::extract_tokens`])
@@ -2665,7 +2672,7 @@ pub enum IndexKind {
     /// BTree fallback so `pg_dump` JSONB-GIN scripts kept loading
     /// without query-time acceleration. Persisted via tag-6 index
     /// payload in `FILE_VERSION` 51+.
-    GinJsonb(PersistentBTreeMap<alloc::string::String, Vec<RowLocator>>),
+    GinJsonb(PersistentBTreeMap<alloc::string::String, crate::posting::PostingList>),
 }
 
 impl IndexKind {
@@ -2965,7 +2972,7 @@ impl Index {
     /// large tables (mailrs `content_worker` at 250 k rows).
     pub fn iter_desc(
         &self,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &alloc::vec::Vec<RowLocator>)> + '_>
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &crate::posting::PostingList)> + '_>
     {
         match &self.kind {
             IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter_rev()),
@@ -2982,7 +2989,7 @@ impl Index {
     /// pairs. Mirror of `iter_desc` for ORDER BY ... ASC + LIMIT N.
     pub fn iter_asc(
         &self,
-    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &alloc::vec::Vec<RowLocator>)> + '_>
+    ) -> alloc::boxed::Box<dyn Iterator<Item = (&IndexKey, &crate::posting::PostingList)> + '_>
     {
         match &self.kind {
             IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter()),
@@ -3003,9 +3010,9 @@ impl Index {
     /// Pre-v5.2 callers can read the slice and `.as_hot().unwrap()`
     /// each entry (no `Cold` variants exist until the freezer lands);
     /// post-v5.2 callers dispatch hot vs. cold per locator.
-    pub fn lookup_eq(&self, key: &IndexKey) -> &[RowLocator] {
+    pub fn lookup_eq(&self, key: &IndexKey) -> &crate::posting::PostingList {
         match &self.kind {
-            IndexKind::BTree(m) => m.get(key).map_or(&[][..], Vec::as_slice),
+            IndexKind::BTree(m) => m.get(key).map_or(&EMPTY_POSTINGS, |l| l),
             // BRIN / NSW / GIN / trigram-GIN / fulltext-GIN have
             // no IndexKey-keyed map; lookup is a no-op. GIN uses
             // [`Index::gin_lookup_word`] instead.
@@ -3014,7 +3021,7 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &[][..],
+            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3024,15 +3031,15 @@ impl Index {
     /// trip and build the key inline. ~20 ns × N_survivors saved on
     /// the INSUBQ hot loop.
     #[inline]
-    pub fn lookup_eq_i64(&self, n: i64) -> &[RowLocator] {
+    pub fn lookup_eq_i64(&self, n: i64) -> &crate::posting::PostingList {
         match &self.kind {
-            IndexKind::BTree(m) => m.get(&IndexKey::Int(n)).map_or(&[][..], Vec::as_slice),
+            IndexKind::BTree(m) => m.get(&IndexKey::Int(n)).map_or(&EMPTY_POSTINGS, |l| l),
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &[][..],
+            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3136,19 +3143,19 @@ impl Index {
     /// v7.12.3 — GIN posting-list lookup. Returns the row locators
     /// whose `tsvector` cell contains `word`. Empty when the word is
     /// absent from the index or this isn't a GIN index.
-    pub fn gin_lookup_word(&self, word: &str) -> &[RowLocator] {
+    pub fn gin_lookup_word(&self, word: &str) -> &crate::posting::PostingList {
         match &self.kind {
             // v7.17.0 Phase 2.2 — fulltext-GIN shares the same
             // lexeme-keyed posting list shape as the
             // tsvector-typed GIN, so the same lookup applies.
             IndexKind::Gin(m) | IndexKind::GinFulltext(m) => {
-                m.get(&String::from(word)).map_or(&[][..], Vec::as_slice)
+                m.get(&String::from(word)).map_or(&EMPTY_POSTINGS, |l| l)
             }
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinJsonb(_) => &[][..],
+            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3156,15 +3163,15 @@ impl Index {
     /// locators whose indexed `TEXT` cell contains the trigram
     /// `tri`. Empty when the trigram is absent or this isn't a
     /// trigram-GIN index.
-    pub fn gin_trgm_lookup(&self, tri: &str) -> &[RowLocator] {
+    pub fn gin_trgm_lookup(&self, tri: &str) -> &crate::posting::PostingList {
         match &self.kind {
-            IndexKind::GinTrgm(m) => m.get(&String::from(tri)).map_or(&[][..], Vec::as_slice),
+            IndexKind::GinTrgm(m) => m.get(&String::from(tri)).map_or(&EMPTY_POSTINGS, |l| l),
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &[][..],
+            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3173,15 +3180,15 @@ impl Index {
     /// the canonical `token`(see [`crate::jsonb_gin::extract_tokens`]).
     /// Empty when the token is absent or this isn't a JSONB-GIN
     /// index. Planners drive `<col> @> <jsonb_literal>` through here.
-    pub fn gin_jsonb_lookup(&self, token: &str) -> &[RowLocator] {
+    pub fn gin_jsonb_lookup(&self, token: &str) -> &crate::posting::PostingList {
         match &self.kind {
-            IndexKind::GinJsonb(m) => m.get(&String::from(token)).map_or(&[][..], Vec::as_slice),
+            IndexKind::GinJsonb(m) => m.get(&String::from(token)).map_or(&EMPTY_POSTINGS, |l| l),
             IndexKind::BTree(_)
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => &[][..],
+            | IndexKind::GinFulltext(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3783,7 +3790,7 @@ pub struct ExclRangeIndex {
     /// Lower-bound key → row locators. A key maps to a `Vec` because a
     /// tombstoned-then-reinserted bound can transiently collide; live rows
     /// under the constraint are disjoint so each key has one live locator.
-    pub map: PersistentBTreeMap<(i128, u8), Vec<RowLocator>>,
+    pub map: PersistentBTreeMap<(i128, u8), crate::posting::PostingList>,
 }
 
 #[derive(Debug, Clone)]
@@ -7413,7 +7420,7 @@ impl Catalog {
         // the merged segment. Use a flat collect-then-replace
         // pattern so we never hold a `&self` borrow across the
         // `&mut self` write.
-        let entries: Vec<(IndexKey, Vec<RowLocator>)> = {
+        let entries: Vec<(IndexKey, crate::posting::PostingList)> = {
             let t = self
                 .get(table_name)
                 .expect("table existed at the start of this fn");
@@ -7439,7 +7446,7 @@ impl Catalog {
             unreachable!("validated above");
         };
         for (key, locators) in entries {
-            let mut new_locs: Vec<RowLocator> = Vec::with_capacity(locators.len());
+            let mut new_locs = crate::posting::PostingList::new();
             let mut changed = false;
             for loc in &locators {
                 match *loc {
@@ -7451,7 +7458,7 @@ impl Catalog {
                             segment_id: merged_segment_id,
                             page_offset: 0,
                         };
-                        if !new_locs.contains(&replacement) {
+                        if !new_locs.contains(replacement) {
                             new_locs.push(replacement);
                         }
                         changed = true;

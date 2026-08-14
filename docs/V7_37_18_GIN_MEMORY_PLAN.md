@@ -434,6 +434,39 @@ That is the first payoff estimate on this line that is computed from measured
 counts rather than fitted to a mechanism. Two earlier ones were fitted, and
 both were wrong.
 
+### B5 — chunked posting lists (r1029): 9.7 GB off the import
+
+Built on the B3d ratio: `PostingList` (`spg-storage/src/posting.rs`) replaces
+`Vec<RowLocator>` as the value in every index map. A full prefix of shared
+`Arc<[RowLocator]>` blocks of 256, plus an owned tail shorter than a block.
+Cloning copies block pointers and the tail, so it costs a few kilobytes
+however long the list is — and, unlike the `Arc<Vec<_>>` shape B3c withdrew,
+appending afterwards needs no copy at all, because the tail is already owned.
+
+Measured with the same corpus (`init-schema.sql` + `seed.sql`, 99.8 MB), the
+same command, two binaries built minutes apart, interleaved three rounds:
+
+| | `Vec` (develop) | chunked | |
+|---|---:|---:|---:|
+| ever allocated | 14,717–14,845 MB | **5,075.3 MB** | **−9.7 GB, −66%** |
+| peak live | 1,154.3 MB | **965.8 MB** | −188.5 MB |
+| live at end | 901.7–1,029.7 MB | **713.2 MB** | −188.5 MB |
+| max RSS | 2,591–2,687 MB | **1,872–1,973 MB** | **−700 MB, −27%** |
+| wall clock | 6.75–6.95 s | **6.46–6.59 s** | −4% |
+
+Non-overlapping on every row, and the chunked leg reported byte-identical
+totals in all three rounds.
+
+**Predicted 7.5 GB, measured 9.7 GB.** The prediction counted only the
+locators inside a copied node. It missed that the copy also stops
+reallocating the lists' own buffers, and that the prune path — which rebuilds
+a list — now rebuilds pointer arrays over shared blocks. Being wrong in this
+direction is still being wrong about the mechanism, and it is recorded rather
+than rounded away.
+
+The on-disk format does not change: the codec writes a length and then the
+locators in order, which the blocked list yields identically.
+
 ### B4 — WITHDRAWN: it does not touch the peak
 
 The snapshot buffer is real — 233.5 MB live on mailrs's schema — but it is
