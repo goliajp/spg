@@ -467,6 +467,22 @@ than rounded away.
 The on-disk format does not change: the codec writes a length and then the
 locators in order, which the blocked list yields identically.
 
+### B5 on the path the customer runs
+
+The census measures the embedded API. mailrs imports through `spg import`,
+so the same A/B was repeated there — same corpus, same command, the two
+binaries built minutes apart, interleaved three rounds. Both legs report
+243 statements, which is the witness that they did the same work:
+
+| `spg import` | `Vec` | blocked |
+|---|---:|---:|
+| max RSS | 1,951 MB | **1,583-1,584 MB** (-368 MB, -19%) |
+| wall clock | 6.40-6.45 s | 6.28-6.31 s |
+
+Smaller than the census's -700 MB because `spg import` already commits in
+batches, so it was not holding as much to begin with — the two savings
+overlap rather than add.
+
 ### B4 — WITHDRAWN: it does not touch the peak
 
 The snapshot buffer is real — 233.5 MB live on mailrs's schema — but it is
