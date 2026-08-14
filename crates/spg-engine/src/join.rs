@@ -3525,7 +3525,7 @@ impl Engine {
         // direction. Rows arrive already sorted; plain_sink + early
         // stop replaces the heap.
         let walker: alloc::boxed::Box<
-            dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>,
+            dyn Iterator<Item = (&spg_storage::IndexKey, &spg_storage::PostingList)>,
         > = if order.desc {
             alloc::boxed::Box::new(order_index.iter_desc())
         } else {
