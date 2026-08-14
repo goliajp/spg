@@ -7655,7 +7655,7 @@ impl Engine {
         // duplicated output row rather than a slow one.
         let mut emitted_rows = alloc::vec![false; table.rows().len()];
         let walker: alloc::boxed::Box<
-            dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>,
+            dyn Iterator<Item = (&spg_storage::IndexKey, &spg_storage::PostingList)>,
         > = if order.desc {
             alloc::boxed::Box::new(index.iter_desc())
         } else {

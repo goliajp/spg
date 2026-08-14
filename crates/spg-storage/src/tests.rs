@@ -4327,8 +4327,9 @@ fn freeze_keeps_remaining_hot_rows_addressable_via_secondary_index() {
     let idx = cat.get("users").unwrap().index_on(1).unwrap();
     let got = idx.lookup_eq(&IndexKey::Text("u-4".into()));
     assert_eq!(got.len(), 1);
-    assert!(got[0].is_hot(), "kept-hot rows still surface as Hot");
-    match got[0] {
+    let first = got.first().expect("one locator");
+    assert!(first.is_hot(), "kept-hot rows still surface as Hot");
+    match first {
         RowLocator::Hot(i) => {
             // The 4th-inserted row was at position 4; after
             // dropping positions 0..3 it sits at position 1.
@@ -4381,7 +4382,10 @@ fn promote_cold_row_pulls_frozen_row_back_to_hot_tier() {
     // row) — no Cold locator left for PK 2.
     let entries = t.index_on(0).unwrap().lookup_eq(&IndexKey::Int(2));
     assert_eq!(entries.len(), 1, "exactly one locator per key");
-    assert!(entries[0].is_hot(), "promote retired the Cold locator");
+    assert!(
+        entries.first().expect("one locator").is_hot(),
+        "promote retired the Cold locator"
+    );
     // End-to-end: lookup_by_pk still returns the row body.
     assert_eq!(
         cat.lookup_by_pk("users", "by_id", &IndexKey::Int(2))

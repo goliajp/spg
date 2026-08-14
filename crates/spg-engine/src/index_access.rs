@@ -255,7 +255,7 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     // in the requested direction; per-key locator order within the
     // map preserves insertion order, which matches the legacy stable-
     // sort tie-break for equal keys.
-    let walker: Box<dyn Iterator<Item = (&spg_storage::IndexKey, &Vec<spg_storage::RowLocator>)>> =
+    let walker: Box<dyn Iterator<Item = (&spg_storage::IndexKey, &spg_storage::PostingList)>> =
         if order.desc {
             Box::new(index.iter_desc())
         } else {

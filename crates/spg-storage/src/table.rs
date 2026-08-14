@@ -1061,8 +1061,9 @@ impl Table {
                         // in-place MVCC an UPDATE appends a new row VERSION, so an
                         // ordinary `SET flag = 'done'` over a batch lands every
                         // one of them on the same key.
-                        let mut entries =
-                            map.insert_mut(key.clone(), Vec::new()).unwrap_or_default();
+                        let mut entries = map
+                            .insert_mut(key.clone(), crate::posting::PostingList::new())
+                            .unwrap_or_default();
                         // v7.39 (round 493) — drop this key's dead versions while
                         // the list is already in hand.
                         //
@@ -1110,7 +1111,7 @@ impl Table {
                         // untouched.
                         if horizon > 0 && entries.len() > 1 && entries.len().is_power_of_two() {
                             entries.retain(|loc| match loc {
-                                RowLocator::Hot(i) => headers.get(*i).is_none_or(|h| {
+                                RowLocator::Hot(i) => headers.get(i).is_none_or(|h| {
                                     !crate::vacuum::is_reclaimable(h.xmax, horizon)
                                 }),
                                 RowLocator::Cold { .. } => true,
@@ -1131,7 +1132,9 @@ impl Table {
                             } else {
                                 map.insert_mut(
                                     lex.word.clone(),
-                                    alloc::vec![RowLocator::Hot(new_row_idx)],
+                                    crate::posting::PostingList::single(RowLocator::Hot(
+                                        new_row_idx,
+                                    )),
                                 );
                             }
                         }
@@ -1152,7 +1155,9 @@ impl Table {
                             } else {
                                 map.insert_mut(
                                     alloc::string::ToString::to_string(key),
-                                    alloc::vec![RowLocator::Hot(new_row_idx)],
+                                    crate::posting::PostingList::single(RowLocator::Hot(
+                                        new_row_idx,
+                                    )),
                                 );
                             }
                         }
@@ -1177,7 +1182,12 @@ impl Table {
                             if let Some(entries) = map.get_mut(&lex) {
                                 entries.push(RowLocator::Hot(new_row_idx));
                             } else {
-                                map.insert_mut(lex, alloc::vec![RowLocator::Hot(new_row_idx)]);
+                                map.insert_mut(
+                                    lex,
+                                    crate::posting::PostingList::single(RowLocator::Hot(
+                                        new_row_idx,
+                                    )),
+                                );
                             }
                         }
                     }
@@ -1198,7 +1208,12 @@ impl Table {
                             if let Some(entries) = map.get_mut(&tok) {
                                 entries.push(RowLocator::Hot(new_row_idx));
                             } else {
-                                map.insert_mut(tok, alloc::vec![RowLocator::Hot(new_row_idx)]);
+                                map.insert_mut(
+                                    tok,
+                                    crate::posting::PostingList::single(RowLocator::Hot(
+                                        new_row_idx,
+                                    )),
+                                );
                             }
                         }
                     }
@@ -1307,7 +1322,10 @@ impl Table {
                     if let Some(entries) = map.get_mut(&key) {
                         entries.push(RowLocator::Hot(i));
                     } else {
-                        map.insert_mut(key, alloc::vec![RowLocator::Hot(i)]);
+                        map.insert_mut(
+                            key,
+                            crate::posting::PostingList::single(RowLocator::Hot(i)),
+                        );
                     }
                 }
             }
@@ -1330,7 +1348,7 @@ impl Table {
         {
             return;
         }
-        let mut map: crate::PersistentBTreeMap<(i128, u8), Vec<RowLocator>> =
+        let mut map: crate::PersistentBTreeMap<(i128, u8), crate::posting::PostingList> =
             crate::PersistentBTreeMap::new();
         for (i, row) in self.rows.iter().enumerate() {
             if let Some(v) = row.values.get(column_position)
@@ -1339,7 +1357,7 @@ impl Table {
                 if let Some(entries) = map.get_mut(&key) {
                     entries.push(RowLocator::Hot(i));
                 } else {
-                    map.insert_mut(key, alloc::vec![RowLocator::Hot(i)]);
+                    map.insert_mut(key, crate::posting::PostingList::single(RowLocator::Hot(i)));
                 }
             }
         }
@@ -1357,7 +1375,7 @@ impl Table {
     pub fn excl_range_index(
         &self,
         column_position: usize,
-    ) -> Option<&crate::PersistentBTreeMap<(i128, u8), Vec<RowLocator>>> {
+    ) -> Option<&crate::PersistentBTreeMap<(i128, u8), crate::posting::PostingList>> {
         self.excl_indexes
             .iter()
             .find(|e| e.column_position == column_position)
@@ -1375,8 +1393,10 @@ impl Table {
                 if let Some(entries) = ex.map.get_mut(&key) {
                     entries.push(RowLocator::Hot(row_idx));
                 } else {
-                    ex.map
-                        .insert_mut(key, alloc::vec![RowLocator::Hot(row_idx)]);
+                    ex.map.insert_mut(
+                        key,
+                        crate::posting::PostingList::single(RowLocator::Hot(row_idx)),
+                    );
                 }
             }
         }
@@ -1509,7 +1529,7 @@ impl Table {
         &mut self,
         name: String,
         column_name: &str,
-        map: PersistentBTreeMap<IndexKey, Vec<RowLocator>>,
+        map: PersistentBTreeMap<IndexKey, crate::posting::PostingList>,
     ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -1605,7 +1625,10 @@ impl Table {
                         if let Some(entries) = map.get_mut(&lex.word) {
                             entries.push(RowLocator::Hot(i));
                         } else {
-                            map.insert_mut(lex.word.clone(), alloc::vec![RowLocator::Hot(i)]);
+                            map.insert_mut(
+                                lex.word.clone(),
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
+                            );
                         }
                     }
                 }
@@ -1623,7 +1646,7 @@ impl Table {
         &mut self,
         name: String,
         column_name: &str,
-        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+        map: PersistentBTreeMap<String, crate::posting::PostingList>,
     ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -1680,7 +1703,7 @@ impl Table {
                         } else {
                             map.insert_mut(
                                 alloc::string::ToString::to_string(key),
-                                alloc::vec![RowLocator::Hot(i)],
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
                             );
                         }
                     }
@@ -1697,7 +1720,7 @@ impl Table {
         &mut self,
         name: String,
         column_name: &str,
-        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+        map: PersistentBTreeMap<String, crate::posting::PostingList>,
     ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -1750,7 +1773,10 @@ impl Table {
                         if let Some(entries) = map.get_mut(&lex) {
                             entries.push(RowLocator::Hot(i));
                         } else {
-                            map.insert_mut(lex, alloc::vec![RowLocator::Hot(i)]);
+                            map.insert_mut(
+                                lex,
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
+                            );
                         }
                     }
                 }
@@ -1767,7 +1793,7 @@ impl Table {
         &mut self,
         name: String,
         column_name: &str,
-        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+        map: PersistentBTreeMap<String, crate::posting::PostingList>,
     ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -1821,7 +1847,10 @@ impl Table {
                         if let Some(entries) = map.get_mut(&tok) {
                             entries.push(RowLocator::Hot(i));
                         } else {
-                            map.insert_mut(tok, alloc::vec![RowLocator::Hot(i)]);
+                            map.insert_mut(
+                                tok,
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
+                            );
                         }
                     }
                 }
@@ -1837,7 +1866,7 @@ impl Table {
         &mut self,
         name: String,
         column_name: &str,
-        map: PersistentBTreeMap<String, Vec<RowLocator>>,
+        map: PersistentBTreeMap<String, crate::posting::PostingList>,
     ) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -1900,7 +1929,7 @@ impl Table {
             if let Some(entries) = map.get_mut(&key) {
                 entries.push(locator);
             } else {
-                map.insert_mut(key, alloc::vec![locator]);
+                map.insert_mut(key, crate::posting::PostingList::single(locator));
             }
             count += 1;
         }
@@ -1947,7 +1976,7 @@ impl Table {
             if let Some(entries) = map.get_mut(&word) {
                 entries.push(locator);
             } else {
-                map.insert_mut(word, alloc::vec![locator]);
+                map.insert_mut(word, crate::posting::PostingList::single(locator));
             }
             count += 1;
         }
@@ -1994,13 +2023,12 @@ impl Table {
         let Some(entries) = map.get(key) else {
             return Ok(0);
         };
-        let mut kept: Vec<RowLocator> =
+        let mut kept: crate::posting::PostingList =
             entries.iter().copied().filter(RowLocator::is_hot).collect();
         let removed = entries.len() - kept.len();
         if removed == 0 {
             return Ok(0);
         }
-        kept.shrink_to_fit();
         // PersistentBTreeMap has no remove API in v5.2; when every
         // locator for `key` was Cold, the key keeps an empty Vec
         // entry. `Index::lookup_eq` already treats `Some(&[])` and
@@ -2661,7 +2689,7 @@ impl Table {
                         && let Some(locs) = map.get(&k)
                     {
                         let mut locs = locs.clone();
-                        locs.retain(|l| *l != RowLocator::Hot(position));
+                        locs.retain(|l| l != RowLocator::Hot(position));
                         // No remove_mut on the persistent map: an
                         // empty locator list is the tombstone —
                         // lookup_eq returns an empty slice, and the
@@ -2672,7 +2700,10 @@ impl Table {
                         if let Some(entries) = map.get_mut(&k) {
                             entries.push(RowLocator::Hot(position));
                         } else {
-                            map.insert_mut(k, alloc::vec![RowLocator::Hot(position)]);
+                            map.insert_mut(
+                                k,
+                                crate::posting::PostingList::single(RowLocator::Hot(position)),
+                            );
                         }
                     }
                 }
@@ -2694,14 +2725,17 @@ impl Table {
                 && let Some(locs) = ex.map.get(&k)
             {
                 let mut locs = locs.clone();
-                locs.retain(|l| *l != RowLocator::Hot(position));
+                locs.retain(|l| l != RowLocator::Hot(position));
                 ex.map.insert_mut(k, locs);
             }
             if let Some(k) = new_k {
                 if let Some(entries) = ex.map.get_mut(&k) {
                     entries.push(RowLocator::Hot(position));
                 } else {
-                    ex.map.insert_mut(k, alloc::vec![RowLocator::Hot(position)]);
+                    ex.map.insert_mut(
+                        k,
+                        crate::posting::PostingList::single(RowLocator::Hot(position)),
+                    );
                 }
             }
         }
@@ -2904,11 +2938,14 @@ impl Table {
                         }
                     }
                     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                    let mut grouped: Vec<(IndexKey, Vec<RowLocator>)> = Vec::new();
+                    let mut grouped: Vec<(IndexKey, crate::posting::PostingList)> = Vec::new();
                     for (key, i) in pairs {
                         match grouped.last_mut() {
                             Some((k, locs)) if *k == key => locs.push(RowLocator::Hot(i)),
-                            _ => grouped.push((key, alloc::vec![RowLocator::Hot(i)])),
+                            _ => grouped.push((
+                                key,
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
+                            )),
                         }
                     }
                     idx.kind = IndexKind::BTree(
@@ -2927,7 +2964,7 @@ impl Table {
                                     } else {
                                         map.insert_mut(
                                             lex.word.clone(),
-                                            alloc::vec![RowLocator::Hot(i)],
+                                            crate::posting::PostingList::single(RowLocator::Hot(i)),
                                         );
                                     }
                                 }
@@ -2951,7 +2988,7 @@ impl Table {
                                     } else {
                                         map.insert_mut(
                                             alloc::string::ToString::to_string(key),
-                                            alloc::vec![RowLocator::Hot(i)],
+                                            crate::posting::PostingList::single(RowLocator::Hot(i)),
                                         );
                                     }
                                 }
@@ -2974,7 +3011,10 @@ impl Table {
                                     if let Some(entries) = map.get_mut(&lex) {
                                         entries.push(RowLocator::Hot(i));
                                     } else {
-                                        map.insert_mut(lex, alloc::vec![RowLocator::Hot(i)]);
+                                        map.insert_mut(
+                                            lex,
+                                            crate::posting::PostingList::single(RowLocator::Hot(i)),
+                                        );
                                     }
                                 }
                             }
@@ -2993,7 +3033,10 @@ impl Table {
                                     if let Some(entries) = map.get_mut(&tok) {
                                         entries.push(RowLocator::Hot(i));
                                     } else {
-                                        map.insert_mut(tok, alloc::vec![RowLocator::Hot(i)]);
+                                        map.insert_mut(
+                                            tok,
+                                            crate::posting::PostingList::single(RowLocator::Hot(i)),
+                                        );
                                     }
                                 }
                             }

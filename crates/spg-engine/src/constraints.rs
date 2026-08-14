@@ -1050,39 +1050,39 @@ fn excl_probe_existing(
     let Some(cand_key) = spg_storage::range_excl_index_key(&cand) else {
         return Ok(ExclProbe::Inconclusive); // unkeyable range → O(n)
     };
-    let probe_entry = |entry: Option<(&(i128, u8), &Vec<spg_storage::RowLocator>)>|
-     -> Result<KeyProbe, EngineError> {
-        let Some((_, locs)) = entry else {
-            return Ok(KeyProbe::Absent);
+    let probe_entry =
+        |entry: Option<(&(i128, u8), &spg_storage::PostingList)>| -> Result<KeyProbe, EngineError> {
+            let Some((_, locs)) = entry else {
+                return Ok(KeyProbe::Absent);
+            };
+            let mut saw_live = false;
+            for loc in locs {
+                if locator_is_tombstoned(table, loc) {
+                    continue;
+                }
+                let spg_storage::RowLocator::Hot(ri) = loc else {
+                    continue; // cold-tier rows aren't in the hot scan either (parity)
+                };
+                // v7.39 (round 216) — UPDATE excludes each updated row's own
+                // pre-image (it is being replaced): skip it like a tombstone, so
+                // an all-excluded probe key is inconclusive → the O(n) fallback.
+                if exclude.is_some_and(|s| s.contains(ri)) {
+                    continue;
+                }
+                let Some(prow) = table.rows().get(*ri) else {
+                    continue;
+                };
+                saw_live = true;
+                if excl_rows_conflict(ex, newr, &prow.values)? {
+                    return Ok(KeyProbe::Conflict(prow.values.clone()));
+                }
+            }
+            Ok(if saw_live {
+                KeyProbe::LiveClear
+            } else {
+                KeyProbe::AllDead
+            })
         };
-        let mut saw_live = false;
-        for loc in locs {
-            if locator_is_tombstoned(table, loc) {
-                continue;
-            }
-            let spg_storage::RowLocator::Hot(ri) = loc else {
-                continue; // cold-tier rows aren't in the hot scan either (parity)
-            };
-            // v7.39 (round 216) — UPDATE excludes each updated row's own
-            // pre-image (it is being replaced): skip it like a tombstone, so
-            // an all-excluded probe key is inconclusive → the O(n) fallback.
-            if exclude.is_some_and(|s| s.contains(ri)) {
-                continue;
-            }
-            let Some(prow) = table.rows().get(*ri) else {
-                continue;
-            };
-            saw_live = true;
-            if excl_rows_conflict(ex, newr, &prow.values)? {
-                return Ok(KeyProbe::Conflict(prow.values.clone()));
-            }
-        }
-        Ok(if saw_live {
-            KeyProbe::LiveClear
-        } else {
-            KeyProbe::AllDead
-        })
-    };
     let pred = probe_entry(map.predecessor(&cand_key))?;
     if let KeyProbe::Conflict(old) = pred {
         return Ok(ExclProbe::Conflict(old));

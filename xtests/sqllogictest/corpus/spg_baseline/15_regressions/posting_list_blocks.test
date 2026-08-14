@@ -1,0 +1,90 @@
+# Posting lists longer than one block (r1029).
+#
+# Index maps store a key's locators in a blocked list — a prefix of shared
+# 256-locator blocks plus an open tail — so that copy-on-write node clones
+# copy pointers instead of locators. A key holding more than one block is
+# the shape the blocking exists for, and the one where a boundary error
+# shows up as a wrong count rather than a crash.
+#
+# 700 rows share one indexed value: two full blocks and a partial tail.
+
+statement ok
+CREATE TABLE posting_blocks (id INT PRIMARY KEY, bucket INT NOT NULL, note TEXT)
+
+statement ok
+CREATE INDEX posting_blocks_bucket ON posting_blocks (bucket)
+
+statement ok
+INSERT INTO posting_blocks SELECT g, CASE WHEN g <= 700 THEN 1 ELSE 2 END, 'r' || g FROM generate_series(1, 1000) AS g
+
+# Spans two block boundaries.
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 1
+----
+700
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 2
+----
+300
+
+# The whole list is walked, not just its first block: the extremes live at
+# opposite ends of it.
+query II
+SELECT min(id), max(id) FROM posting_blocks WHERE bucket = 1
+----
+1
+700
+
+# Every locator is distinct — a block read twice would inflate this.
+query I
+SELECT count(DISTINCT id) FROM posting_blocks WHERE bucket = 1
+----
+700
+
+# Appending past a boundary after the index already exists.
+statement ok
+INSERT INTO posting_blocks SELECT g, 1, 'late' || g FROM generate_series(1001, 1300) AS g
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 1
+----
+1000
+
+query II
+SELECT min(id), max(id) FROM posting_blocks WHERE bucket = 1
+----
+1
+1300
+
+# Deleting from the middle of a shared block: the survivors must be exactly
+# the ones not deleted, across the boundary in both directions.
+statement ok
+DELETE FROM posting_blocks WHERE bucket = 1 AND id % 2 = 0
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 1
+----
+500
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 1 AND id % 2 = 0
+----
+0
+
+# Updating a key moves locators between two lists that both span blocks.
+statement ok
+UPDATE posting_blocks SET bucket = 2 WHERE bucket = 1 AND id <= 700
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 1
+----
+150
+
+query I
+SELECT count(*) FROM posting_blocks WHERE bucket = 2
+----
+650
+
+statement ok
+DROP TABLE posting_blocks
