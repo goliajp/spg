@@ -14,6 +14,23 @@
 #   scripts/test-on-mini.sh gates --full
 #   scripts/test-on-mini.sh biz       # now supported (was previously local-only)
 #
+# Long runs: --detach / --result
+#
+#   scripts/test-on-mini.sh --detach all    # sync, start, return
+#   scripts/test-on-mini.sh --result        # verdict, or "still running"
+#
+# A `gate.sh all` takes over twelve minutes, and an ssh that drops in the
+# middle of one is not a failed run — it is a run that KEEPS GOING on the
+# testbed while the caller is told it finished. r1034 lost an hour to
+# that: three "completed" gates whose logs stopped mid-way, and an
+# orphaned `cargo test` still holding the build lock, which made the next
+# run block and then look like it had been killed too.
+#
+# Detached, the verdict is a file on the machine that produced it, so a
+# dropped connection costs nothing and there is never more than one
+# runner. `--result` refuses to guess: it reports "still running" rather
+# than an empty log, because an empty log and a clean pass look alike.
+#
 # Mini.local has OrbStack docker (per `feedback-offload-heavy-to-mini`
 # memory + verified during v7.37 ship cycle running docker-fair bench).
 # We export the OrbStack PATH so the remote shell finds `docker`, and
@@ -24,7 +41,32 @@ cd "$(dirname "$0")/.."
 HOST="${SPG_MINI_HOST:-mini.local}"
 RDIR="${SPG_MINI_DIR:-workspace/goliajp/spg-ci}"
 
-[[ $# -ge 1 ]] || { echo "usage: $0 <gate.sh args...>" >&2; exit 2; }
+[[ $# -ge 1 ]] || { echo "usage: $0 [--detach|--result] <gate.sh args...>" >&2; exit 2; }
+
+REMOTE_LOG=/tmp/spg-gate.log
+REMOTE_DONE=/tmp/spg-gate.done
+
+if [[ "$1" == "--result" ]]; then
+    ssh "$HOST" "
+        if [ -f '$REMOTE_DONE' ]; then
+            grep -aE 'GATE EXIT|TOTAL |FAILING|gate\.sh .*(PASS|FAIL)' '$REMOTE_LOG' | tail -20
+        elif pgrep -qf 'scripts/gate\.sh'; then
+            echo 'still running:'
+            tail -2 '$REMOTE_LOG' 2>/dev/null
+        else
+            echo 'NOT RUNNING and no sentinel — the run died. Last lines:'
+            tail -5 '$REMOTE_LOG' 2>/dev/null
+            exit 1
+        fi"
+    exit $?
+fi
+
+DETACH=""
+if [[ "$1" == "--detach" ]]; then
+    DETACH=1
+    shift
+    [[ $# -ge 1 ]] || { echo "usage: $0 --detach <gate.sh args...>" >&2; exit 2; }
+fi
 
 ssh "$HOST" "mkdir -p '$RDIR'"
 # Sync .git so biz / sqllogictest harnesses that call `git rev-parse`
@@ -45,6 +87,15 @@ ssh "$HOST" "mkdir -p '$RDIR'"
 # assumed to carry.
 rsync -az --delete --filter='P /target/' --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
+if [[ -n "$DETACH" ]]; then
+    # One runner at a time: a second would fight the first for the cargo
+    # build lock and both would look hung.
+    ssh "$HOST" "pkill -f 'scripts/gate\\.sh' 2>/dev/null; sleep 1; true"
+    ssh "$HOST" "cd '$RDIR' && nohup bash scripts/mini-gate-runner.sh $* > /dev/null 2>&1 &"
+    echo "started on $HOST — read it with: scripts/test-on-mini.sh --result"
+    exit 0
+fi
+
 # OrbStack PATH so `docker` resolves on the non-interactive ssh shell.
 # `export` (not just prefix) so child processes — including `cargo run`
 # subprocesses spawned by gate.sh — inherit the PATH and can find
