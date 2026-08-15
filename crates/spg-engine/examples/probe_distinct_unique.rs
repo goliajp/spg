@@ -42,7 +42,7 @@ static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 /// byte-sampling would barely see them.
 ///
 /// Capturing a backtrace allocates, hence the re-entry guard.
-const SAMPLE_EVERY: u64 = 4096;
+const SAMPLE_EVERY: u64 = 16_384;
 static NEXT_SAMPLE: AtomicU64 = AtomicU64::new(SAMPLE_EVERY);
 static SAMPLES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 static DEPTH: AtomicU64 = AtomicU64::new(0);
@@ -54,17 +54,30 @@ std::thread_local! {
 /// Attribution is opt-in (`SPG_PROBE_SAMPLE=1`). Capturing thousands of
 /// backtraces inside the timed window would be paid by the clock, and this
 /// probe's whole job is to compare two clocks.
-static SAMPLING: AtomicU64 = AtomicU64::new(u64::MAX);
+static SAMPLING: AtomicU64 = AtomicU64::new(0);
 
-fn sampling_on() -> bool {
-    let cached = SAMPLING.load(Relaxed);
-    if cached != u64::MAX {
-        return cached == 1;
-    }
+/// Resolve the switch ONCE, from `main`, before anything is measured.
+///
+/// It used to be resolved lazily from inside `maybe_sample` — and
+/// `std::env::var` allocates. That allocation re-entered `maybe_sample`
+/// before the threshold had been advanced and before the re-entry guard
+/// had been taken, so it called `env::var` again, and again: an infinite
+/// recursion that presented as a stack overflow. The re-entry counter
+/// never fired because the recursion happened upstream of it.
+fn init_sampling() {
     let on = u64::from(std::env::var("SPG_PROBE_SAMPLE").as_deref() == Ok("1"));
     SAMPLING.store(on, Relaxed);
-    on == 1
 }
+
+fn sampling_on() -> bool {
+    SAMPLING.load(Relaxed) == 1
+}
+
+/// Resolving a backtrace to function names is the expensive half, and on a
+/// `release-dbg` binary this size it is SECONDS per sample. Keep few enough
+/// that the report cannot turn into a hang: the question is which sites
+/// dominate, and a hundred samples answers that as well as a thousand.
+const MAX_SAMPLES: usize = 512;
 
 fn maybe_sample(count_after: u64) {
     if count_after < NEXT_SAMPLE.load(Relaxed) {
@@ -78,19 +91,27 @@ fn maybe_sample(count_after: u64) {
     if IN_SAMPLER.with(|f| f.replace(true)) {
         return;
     }
-    // Is the overflow recursion or genuine depth? A depth counter says
-    // so directly; the guard above is supposed to make >1 impossible.
-    let depth = DEPTH.fetch_add(1, Relaxed) + 1;
-    if depth > 1 {
-        eprintln!("!! sampler re-entered, depth {depth} — the guard did not hold");
+    // A re-entry check that does NOT allocate. The earlier version
+    // reported through `eprintln!`, which allocates, so its silence
+    // proved nothing — it could have overflowed before printing.
+    // `abort` here is distinguishable from a stack overflow by the
+    // signal alone, which is the whole point.
+    if DEPTH.fetch_add(1, Relaxed) != 0 {
         std::process::abort();
     }
+    // Resolve HERE, at capture. Deferring resolution to the report was
+    // tried, on the theory that symbolising inside the allocator was what
+    // overflowed the stack; it was not — that was the `env::var` recursion
+    // fixed above — and deferring made the report take tens of minutes
+    // where resolving at capture takes seconds. The guard makes this safe.
     let bt = std::backtrace::Backtrace::force_capture().to_string();
     DEPTH.fetch_sub(1, Relaxed);
     // `try_lock`, never `lock`: this runs INSIDE the allocator, and
     // blocking here on a lock some other allocating code holds is a
     // deadlock. Dropping a sample is the correct loss.
-    if let Ok(mut v) = SAMPLES.try_lock() {
+    if let Ok(mut v) = SAMPLES.try_lock()
+        && v.len() < MAX_SAMPLES
+    {
         v.push(bt);
     }
     IN_SAMPLER.with(|f| f.set(false));
@@ -108,7 +129,22 @@ fn owner_frame(bt: &str) -> String {
             return cut.chars().take(100).collect();
         }
     }
-    "<no engine frame>".to_string()
+    // Say which frame WAS seen rather than only that none matched: a
+    // build without debug info resolves to something, just not to a
+    // name this filter recognises, and reporting `<none>` for all of
+    // them hides that the run worked and the filter did not.
+    for line in bt.lines() {
+        let l = line.trim();
+        if !l.is_empty() && !l.starts_with("stack backtrace") {
+            return alloc_fmt_unmatched(l);
+        }
+    }
+    "<empty backtrace>".to_string()
+}
+
+fn alloc_fmt_unmatched(line: &str) -> String {
+    let cut: String = line.chars().take(80).collect();
+    format!("[no engine frame] {cut}")
 }
 
 fn report_samples(label: &str) {
@@ -281,19 +317,6 @@ fn run(eng: &mut Engine, label: &str, sql: &str, reps: u32) {
 }
 
 fn main() {
-    // Symbolising a backtrace taken deep inside the spill sorter's merge
-    // overflows the default main-thread stack. The work runs on a thread
-    // with room for it rather than the attribution being unavailable
-    // exactly where it is wanted.
-    std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
-        .spawn(run_all)
-        .expect("probe thread")
-        .join()
-        .expect("probe thread");
-}
-
-fn run_all() {
     let mut args = std::env::args().skip(1);
     let which = args.next().unwrap_or_else(|| "both".into());
     let reps: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
@@ -306,6 +329,10 @@ fn run_all() {
         println!("(spill sink installed — the server's configuration)");
     }
     seed(&mut eng);
+    // AFTER seeding: loading four hundred thousand rows allocates far more
+    // than the queries do, and sampling it costs minutes and answers a
+    // question nobody asked.
+    init_sampling();
 
     let distinct = "SELECT DISTINCT k FROM t ORDER BY k";
     let plain = "SELECT k FROM t ORDER BY k";
