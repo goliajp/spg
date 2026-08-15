@@ -344,3 +344,72 @@ a single statement. No date.
 
 **§4** is answered — `EXPLAIN` works through `SpgPool` — and **§5**'s three
 items shipped in 7.37.16.
+
+
+---
+
+# Addendum 3 — §3's memory half is closed
+
+Landed on `develop`; not in a released version yet, so nothing here is
+something you can pull today. Numbers first, mechanism second.
+
+## The import peak
+
+Your report's §3 was 2.87 GB of resident memory to load a 95 MB file. The
+two halves of that are now both attacked:
+
+| on the same 99.8 MB corpus, `spg import` | |
+|---|---:|
+| before either change | 2,818 MB |
+| `--batch-commit N` (7.37.18) | 2,128 MB |
+| **blocked posting lists (develop)** | **1,583-1,584 MB** |
+
+Measured interleaved, three rounds, two binaries built minutes apart, both
+legs reporting the same 243 statements so they demonstrably did the same
+work. Through the embedded API, where the census can also count
+allocations rather than only resident bytes, the total allocated for that
+import fell from **14.7 GB to 5.1 GB** and peak resident from 2.66 GB to
+1.92 GB.
+
+**What it was.** Index maps are copy-on-write B-trees. Writing to one
+copies any node still shared with a reader — entries and all — and the
+locator list under each key lived inline in those entries, so a copy
+carried every locator under every key in that node. Counted: 13,194,459
+posting-list appends against 16,343 node copies, about half a megabyte
+each.
+
+The list is now a chain of shared 256-locator blocks plus a short open
+tail, so a copy carries block POINTERS and costs a few kilobytes however
+long the list is. The on-disk format did not change.
+
+An earlier attempt put the whole list behind a reference count and
+measured as nothing at all; the reason is instructive and is why this one
+works. Behind a plain reference count the first append still copies the
+whole list — the copy moves from node granularity to list granularity, and
+a statement touches most of a node's lists anyway.
+
+## Two query-side changes you may notice
+
+**`SELECT DISTINCT`** stopped allocating once per row. On a column with no
+duplicates it was one heap allocation per row for a list that only ever
+held one element: 1,200,087 allocations per query against a plain scan's
+800,067. At 400 k rows the query went from 123-139 ms to 92-96 ms over the
+wire, which turned the one shape where PostgreSQL 18 was ahead of us at
+that size into one where it is not.
+
+**Sorting more rows than `work_mem` holds** — which your import and any
+large `ORDER BY` does — now allocates once per row in the merge instead of
+four times. Two of the four were a fresh buffer per read, one of them for
+a four-byte length prefix; the third was a key vector rebuilt for every row
+when only a handful are ever live at once. 151.7 MB of allocation per
+query became 75.1 MB, and the merge is about 22 % faster in process. Over
+the socket our testbed cannot resolve a change that size — every leg of
+the comparison, including one that is the same binary as the baseline,
+spans nine milliseconds against an effect of about seven — so we are not
+claiming you will see it on a stopwatch.
+
+## What is still open
+
+Nothing from your report. The remaining allocation in that merge is the
+decoded row itself, which is the answer, and the steady-state figure is
+unchanged from Addendum 2: a server holding your catalog is 256 MB.
