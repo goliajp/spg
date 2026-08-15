@@ -1436,12 +1436,20 @@ mod wal_sync_tests {
     /// with the default (F_BARRIERFSYNC on macOS) and with the strict
     /// opt-in path's primitive (`sync_data`, exercised directly since the
     /// env override is process-wide and cached).
+    fn alloc_fmt_probe_name() -> String {
+        format!("probe-{}.wal", std::process::id())
+    }
+
     #[test]
     fn wal_sync_completes_and_preserves_bytes() {
         use std::io::Write as _;
+        // Per-process path. A fixed name here made the test fail whenever
+        // two runs of this binary overlapped: one truncates the file while
+        // the other is reading it back, and the reader reports NotFound on
+        // a line that looks like a WAL defect rather than a shared path.
         let dir = std::env::temp_dir().join("spg_wal_sync_test");
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("probe.wal");
+        let path = dir.join(alloc_fmt_probe_name());
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
