@@ -237,6 +237,63 @@ const ROWS: i64 = 400_000;
 /// drops nothing. Same generator as `scripts/perf-endpoint-sweep.sh`.
 const STRIDE: i64 = 7919;
 
+/// Where the seeded catalog is cached between runs.
+///
+/// Loading four hundred thousand rows takes about a minute, and an A/B of
+/// two binaries over five rounds pays for it ten times. `Engine::snapshot`
+/// and `Engine::restore_envelope` already exist, so the seed is written
+/// once and every later run opens it.
+///
+/// The cache is keyed by ROWS and STRIDE: change either and the file name
+/// changes with it, because silently timing a differently-shaped table is
+/// worse than reseeding.
+fn cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("spg-probe-distinct-{ROWS}-{STRIDE}.snap"))
+}
+
+/// The seeded engine, from cache when there is one.
+fn seeded_engine() -> Engine {
+    let path = cache_path();
+    if let Ok(bytes) = std::fs::read(&path)
+        && let Ok(eng) = Engine::restore_envelope(&bytes)
+    {
+        // Trust nothing about a file on disk: check the shape before
+        // timing against it. A stale or truncated cache that still parses
+        // would silently move the measurement.
+        let mut eng = eng;
+        if seed_is_intact(&mut eng) {
+            println!("(seed restored from {})", path.display());
+            return eng;
+        }
+        println!(
+            "(cached seed at {} did not verify — reseeding)",
+            path.display()
+        );
+    }
+    let mut eng = Engine::new();
+    let t0 = std::time::Instant::now();
+    seed(&mut eng);
+    let secs = t0.elapsed().as_secs_f64();
+    match std::fs::write(&path, eng.snapshot()) {
+        Ok(()) => println!("(seeded in {secs:.1}s, cached at {})", path.display()),
+        Err(e) => println!("(seeded in {secs:.1}s; cache write failed: {e})"),
+    }
+    eng
+}
+
+/// Both counts, because either one being wrong changes what is timed: the
+/// row count is what the query returns, and the distinct count is what
+/// makes DISTINCT a no-op rather than a filter.
+fn seed_is_intact(eng: &mut Engine) -> bool {
+    let want = ROWS.to_string();
+    let rows = eng.execute("SELECT count(*) FROM t");
+    let distinct = eng.execute("SELECT count(DISTINCT k) FROM t");
+    match (rows, distinct) {
+        (Ok(r), Ok(d)) => format!("{r:?}").contains(&want) && format!("{d:?}").contains(&want),
+        _ => false,
+    }
+}
+
 fn seed(eng: &mut Engine) {
     eng.execute("CREATE TABLE t (id INT PRIMARY KEY, k INT NOT NULL)")
         .expect("create");
@@ -321,14 +378,15 @@ fn main() {
     let which = args.next().unwrap_or_else(|| "both".into());
     let reps: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
 
-    let mut eng = Engine::new();
-    // `SPG_PROBE_SPILL=1` reproduces the server's configuration.
+    let mut eng = seeded_engine();
+    // `SPG_PROBE_SPILL=1` reproduces the server's configuration. Installed
+    // AFTER the catalog is in place, so the seeding path never spills and
+    // the cache is the same either way.
     if std::env::var("SPG_PROBE_SPILL").as_deref() == Ok("1") {
         eng.set_temp_run_factory(mem_run);
         assert!(eng.can_spill(), "the spill sink did not take");
         println!("(spill sink installed — the server's configuration)");
     }
-    seed(&mut eng);
     // AFTER seeding: loading four hundred thousand rows allocates far more
     // than the queries do, and sampling it costs minutes and answers a
     // question nobody asked.
