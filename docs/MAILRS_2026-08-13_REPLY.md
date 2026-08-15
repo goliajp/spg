@@ -350,8 +350,13 @@ items shipped in 7.37.16.
 
 # Addendum 3 — §3's memory half is closed
 
-Landed on `develop`; not in a released version yet, so nothing here is
-something you can pull today. Numbers first, mechanism second.
+**Released as 7.37.24.** Docker manifest digest
+`sha256:1e15587cde667e91556aa7d3d3045399b8667487d36a58e44548d0a1bf0f9926`;
+all thirteen crates report 7.37.24 on crates.io. The drop-in panel is
+59/59 against that image, and the full gate ran green on the same commit
+the tag carries (2412 sqllogictest cases, 0 failures).
+
+Numbers first, mechanism second.
 
 ## The import peak
 
