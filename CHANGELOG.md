@@ -41,6 +41,78 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.24] — 2026-08-15
+
+### Performance
+
+- **Blocked posting lists.** Index maps are copy-on-write B-trees, and the
+  locator list under each key lived inline in the nodes, so copying a node
+  still shared with a reader carried every locator under every key in it.
+  Counted on the mailrs import: 13,194,459 posting-list appends against
+  16,343 node copies, about half a megabyte each.
+
+  A posting list is now a chain of shared 256-locator blocks plus a short
+  open tail, so a copy carries block POINTERS and costs a few kilobytes
+  however long the list is. On a 99.8 MB corpus, total allocation for the
+  import fell **14.7 GB → 5.1 GB** and peak resident **2.66 GB → 1.92 GB**;
+  through `spg import`, peak RSS **1,951 MB → 1,583 MB**. Interleaved,
+  three rounds, non-overlapping on every metric; the on-disk format is
+  unchanged.
+
+  An earlier attempt put the whole list behind a reference count and
+  measured as nothing, which is why this shape works: behind a plain
+  reference count the first append still copies the whole list, moving the
+  copy from node granularity to list granularity while a statement touches
+  most of a node's lists anyway.
+
+- **`SELECT DISTINCT` stopped allocating once per row.** The seen-set was
+  `HashMap<u64, Vec<usize>>`, so a column with no duplicates got one heap
+  allocation per row for a list that only ever held one element:
+  1,200,087 allocations per query against a plain scan's 800,067. The first
+  index is now inline. At 400 k rows, over the wire, **123.2-138.9 ms →
+  92.3-96.2 ms** — the one shape at that size where PG18's floor sat below
+  ours becomes a clean win.
+
+- **The external sorter's merge allocates once per row instead of four
+  times.** Two of the four were a fresh buffer per `read_exact`, one of
+  them for a four-byte length prefix; the third was a key vector rebuilt
+  per row when only `runs.len()` are ever live. **151.7 MB → 75.1 MB** of
+  allocation per query and **57.30-63.45 ms → 45.79-48.92 ms** in process,
+  five interleaved rounds, none overlapping. That the server takes this
+  path is witnessed by `pg_stat_database.temp_files` moving 0 → 6 at the
+  endpoint panel's `work_mem` and holding at 4 GB. Over the socket the
+  panel cannot resolve an effect that size — every leg, including one that
+  is the same binary as the baseline, spans nine milliseconds — and no wire
+  win is claimed.
+
+- **An integer `ORDER BY` lane** (`try_int_key_sorted_stream`) carries up
+  to four integer keys inline with a NULL bitmask instead of building an
+  `OrderKey` vector per row. Embedded path: allocations **800,068 →
+  400,054**, **−31 %**. The same measurement shows it is unreachable from
+  the server, where the spill sorter takes the query first — stated as an
+  SPGE improvement rather than an SPGS one.
+
+### Fixed
+
+- `wal_sync_completes_and_preserves_bytes` wrote a fixed
+  `$TMPDIR/spg_wal_sync_test/probe.wal`, so two overlapping runs of the
+  binary raced and the reader failed with `NotFound` on a line that read
+  like a WAL defect. Per-process name now.
+
+### Internal
+
+- `scripts/test-on-mini.sh --detach` / `--result`: the gate runs on the
+  testbed under nohup and its verdict is read from a file there, so an ssh
+  that drops mid-run no longer reports a completed gate while the run
+  continues and holds the build lock.
+
+- `probe_distinct_unique`: a counting global allocator, count-sampled
+  allocation attribution, a spill mode reproducing the server's
+  configuration, and a per-query row-count assertion — a lane that declines
+  silently and one that answers with nothing look the same on a clock.
+
+---
+
 ## [7.37.23] — 2026-08-14
 
 ### Performance
