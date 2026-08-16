@@ -88,8 +88,9 @@ c
 e
 b
 
-# A NULLABLE key must NOT take the walk: its NULL rows are not in the btree,
-# and PG orders them last on ASC and first on DESC.
+# r1046 — a NULLABLE key walks too, but its NULL rows are not in the
+# btree: the walk emits them itself, last on ASC and first on DESC (PG's
+# defaults). These pins predate that change and did not move under it.
 statement ok
 CREATE TABLE ion (id INT, pad TEXT)
 

@@ -1422,6 +1422,15 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
     if let Some((idx_name, _)) = &walk
         && let Some(from) = stmt.from.as_ref()
     {
+        // r1047 — under DISTINCT the node built above is the
+        // HashAggregate wrapper, which the walk does not run: the
+        // executor emits one row per key group. Unwrap to the scan it
+        // wraps, and put a `Unique` on top instead — PG's plan shape for
+        // distinct over sorted input, and the thing that actually runs.
+        let mut base = node;
+        if stmt.distinct && !base.children.is_empty() {
+            base = base.children.remove(0);
+        }
         let name = from.primary.name.as_str();
         let alias_sfx = from
             .primary
@@ -1440,16 +1449,24 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         // `child_cost` here instead gave `cost=0.15..0.00 rows=1` on a
         // 2,000-row table: a total below its own startup, which is not a
         // number anything should print.
-        let (_, ct, cr, cw) = node.cost.unwrap_or((0.0, 0.0, 0, 0));
+        let (_, ct, cr, cw) = base.cost.unwrap_or((0.0, 0.0, 0, 0));
         // No sort to pay for: the rows arrive in order.
         n.cost = Some((0.15, ct, cr, cw));
-        n.children = core::mem::take(&mut node.children);
-        for a in &node.attrs {
+        n.children = core::mem::take(&mut base.children);
+        for a in &base.attrs {
             if a.starts_with("Filter:") {
                 n.attrs.push(a.clone());
             }
         }
-        node = n;
+        if stmt.distinct {
+            let mut u = PlanNode::new(String::from("Unique"));
+            u.children.push(n);
+            let (cs, ct, cr, cw) = child_cost(&u);
+            u.cost = Some((cs, ct + cr as f64 * 0.0025, (cr / 10).max(1), cw));
+            node = u;
+        } else {
+            node = n;
+        }
     } else if !stmt.order_by.is_empty() {
         let mut s = PlanNode::new(String::from("Sort"));
         let keys: Vec<String> = stmt
