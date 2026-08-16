@@ -203,25 +203,14 @@ impl Engine {
         sql: &str,
     ) -> Result<spg_sql::ast::SelectStatement, EngineError> {
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
-        let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(
-            &mut stmt,
-            now_micros,
-            self.backslash_escapes,
-            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
-        );
-        let Statement::Select(mut s) = stmt else {
+        // r1043 — the shared pre-pass. This was the third copy of the
+        // list; see `Engine::preprocess`.
+        self.preprocess(&mut stmt);
+        let Statement::Select(s) = stmt else {
             return Err(EngineError::Unsupported(
                 "prepare_select_streaming: not a SELECT".into(),
             ));
         };
-        resolve_order_by_position(&mut s);
-        reorder::reorder_joins_with(
-            &mut s,
-            &self.catalog,
-            &self.statistics,
-            self.env_cfg.plan_deterministic,
-        );
         Ok(s)
     }
 
@@ -379,25 +368,18 @@ impl Engine {
     {
         cancel.check()?;
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
-        let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(
-            &mut stmt,
-            now_micros,
-            self.backslash_escapes,
-            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
-        );
-        let Statement::Select(mut s) = stmt else {
+        // r1043 — the shared pre-pass. THIS is the route every autocommit
+        // SELECT takes over the wire, and it was the copy that mattered:
+        // `WHERE b = decode(lpad(to_hex(7),16,'0'),'hex')` came through
+        // here unfolded and cost 198 ms against 0.013 ms for the same
+        // statement's `EXPLAIN ANALYZE` on the same connection, because
+        // EXPLAIN went through `prepare` and the query did not.
+        self.preprocess(&mut stmt);
+        let Statement::Select(s) = stmt else {
             return Err(EngineError::Unsupported(
                 "execute_readonly_select_streaming: not a SELECT".into(),
             ));
         };
-        resolve_order_by_position(&mut s);
-        reorder::reorder_joins_with(
-            &mut s,
-            &self.catalog,
-            &self.statistics,
-            self.env_cfg.plan_deterministic,
-        );
         // Streaming fast path: joined non-aggregate projection of
         // bound columns. Falls back to the materialising path inside
         // `try_exec_joined_streaming` returning None for any shape
@@ -432,25 +414,11 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
-        let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(
-            &mut stmt,
-            now_micros,
-            self.backslash_escapes,
-            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
-        );
-        if let Statement::Select(s) = &mut stmt {
-            resolve_order_by_position(s);
-            // v6.2.3 — cost-based JOIN reorder (read path).
-            // v7.38 元机制 D — gated on plan_deterministic so
-            // regression tests pin a stable join order.
-            reorder::reorder_joins_with(
-                s,
-                &self.catalog,
-                &self.statistics,
-                self.env_cfg.plan_deterministic,
-            );
-        }
+        // r1043 — the SAME pre-pass `prepare` runs. This path had its own
+        // copy of the list, one pass short of it, and every autocommit
+        // SELECT over the wire comes through here: a plan `EXPLAIN`
+        // described was not the plan this ran.
+        self.preprocess(&mut stmt);
         self.execute_readonly_stmt_with_cancel(stmt, cancel)
     }
 

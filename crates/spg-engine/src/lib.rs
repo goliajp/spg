@@ -59,6 +59,7 @@ mod expr_analysis;
 pub(crate) mod extsort;
 pub mod fts;
 mod guc_catalog;
+mod immutable_fn;
 mod index_access;
 mod join;
 mod join_using;

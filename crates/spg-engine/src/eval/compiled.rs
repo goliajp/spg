@@ -1833,12 +1833,22 @@ pub(crate) fn constant_projection_value(e: &Expr, ctx: &EvalContext<'_>) -> Opti
 /// An allowlist of node kinds, for the reason rounds 590 and 596 recorded:
 /// asking "does it mention a column" would admit a node the walk did not
 /// know about, and a function whose volatility SPG cannot look up.
+///
+/// r1043 — there is a lookup now, so a call to a function on
+/// [`crate::immutable_fn`]'s positive list joins the list. Round 605's
+/// own note recorded `upper('abc')` as the one it could not fold; the
+/// gate it was missing was never the node kind, it was the volatility.
+/// A name that has not been checked against `pg_proc` is still refused,
+/// so the failure mode stays "not folded" rather than "folded wrongly".
 pub(crate) fn constant_expr(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) => true,
         Expr::Array(items) => items.iter().all(constant_expr),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => constant_expr(expr),
         Expr::Binary { lhs, rhs, .. } => constant_expr(lhs) && constant_expr(rhs),
+        Expr::FunctionCall { name, args } => {
+            crate::immutable_fn::is_immutable_builtin(name) && args.iter().all(constant_expr)
+        }
         _ => false,
     }
 }

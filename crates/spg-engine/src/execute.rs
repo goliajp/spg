@@ -437,9 +437,31 @@ impl Engine {
     /// Pgwire's `Parse` (P) message lands here.
     pub fn prepare(&self, sql: &str) -> Result<Statement, ParseError> {
         let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        self.preprocess(&mut stmt);
+        Ok(stmt)
+    }
+
+    /// r1043 — every pre-pass a parsed statement gets before execution,
+    /// in one place.
+    ///
+    /// There were two copies. `prepare` had clock rewrites, `GROUP BY
+    /// ALL` expansion, ORDER BY position resolution and the JOIN reorder;
+    /// `execute_readonly_with_cancel` — the path EVERY autocommit SELECT
+    /// takes over the wire — had the same list minus the `GROUP BY ALL`
+    /// expansion, and then r1042 added constant folding to one of them.
+    ///
+    /// The result was a plan that `EXPLAIN` described and the wire did not
+    /// run: `WHERE b = decode(lpad(to_hex(7),16,'0'),'hex')` planned as an
+    /// index scan and took 194 ms, against 0.009 ms for the same statement
+    /// through the embedded API, on the same build and the same 400,000
+    /// rows. EXPLAIN went through `prepare`; the query did not.
+    ///
+    /// One function, both callers. A pass added here reaches every route
+    /// by construction rather than by remembering.
+    pub(crate) fn preprocess(&self, stmt: &mut Statement) {
         let now_micros = self.clock.map(|f| f());
         rewrite_clock_calls(
-            &mut stmt,
+            stmt,
             now_micros,
             self.backslash_escapes,
             now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
@@ -448,8 +470,8 @@ impl Engine {
         // here, instead of once per row. A cast on a literal is the
         // common case and it was costing an index seek: `WHERE id = 7`
         // sought and `WHERE id = 7::int` scanned, 23x apart at 400k rows.
-        crate::constfold::fold_statement(&mut stmt);
-        if let Statement::Select(s) = &mut stmt {
+        crate::constfold::fold_statement(stmt);
+        if let Statement::Select(s) = stmt {
             // v6.4.1 — expand `GROUP BY ALL` to every non-aggregate
             // SELECT-list item BEFORE position / alias resolution so
             // downstream passes see the explicit list.
@@ -466,7 +488,6 @@ impl Engine {
                 self.env_cfg.plan_deterministic,
             );
         }
-        Ok(stmt)
     }
 
     /// v6.3.0 — cached prepare. Returns a cloned `Statement` from

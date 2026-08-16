@@ -152,12 +152,35 @@ fn is_context_free(e: &Expr) -> bool {
         Expr::Cast { expr, target } => target_is_context_free(target) && is_context_free(expr),
         Expr::Unary { op, expr } => matches!(op, UnOp::Neg | UnOp::Plus) && is_context_free(expr),
         Expr::Binary { lhs, op, rhs } => {
+            // Arithmetic, and `||`. Concatenation joins bytes and reads
+            // no collation; the comparison family is deliberately absent
+            // because `'a' < 'b'` over text does read one.
+            //
+            // r1043 — `||` was missing from the first version and the
+            // omission was invisible: this test is ANDed with the shape
+            // test, so the narrower of the two silently wins. It cost a
+            // fold on `decode(…, chr(104)||chr(101)||chr(120))`, which
+            // then measured 373 ms against 0.143 for the same value
+            // spelled `'hex'`. Failing closed is the right direction —
+            // the cast-target list failed OPEN once and that was wrong
+            // answers — but a silent miss is still a miss.
             matches!(
                 op,
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::IntDiv | BinOp::Mod
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::IntDiv
+                    | BinOp::Mod
+                    | BinOp::Concat
             ) && is_context_free(lhs)
                 && is_context_free(rhs)
         }
+        // r1043 — a call to a function the shape test already cleared as
+        // immutable. Immutable means "depends only on its arguments",
+        // which is the same statement as context-free; the arguments
+        // still have to be.
+        Expr::FunctionCall { args, .. } => args.iter().all(is_context_free),
         // Not "not constant" — the shape test already answered that.
         // False because this pass has not been shown what the node
         // depends on.

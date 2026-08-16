@@ -193,7 +193,11 @@ TYPED_SHAPES=(
   'numeric equality|SELECT count(*) FROM @N@ WHERE n = 1.23'
   'numeric range|SELECT count(*) FROM @N@ WHERE n BETWEEN 1 AND 2'
   'bytea key|SELECT id FROM @N@ ORDER BY b'
-  'bytea equality|SELECT count(*) FROM @N@ WHERE b = decode(lpad(to_hex(7), 16, chr(48)), chr(104)||chr(101)||chr(120))'
+  # Dollar-quoted so the shape reads the way a person would write it.
+  # It was spelled with chr() to dodge this file's own quoting, and that
+  # spelling folded differently from the ordinary one — the panel is for
+  # measuring what users send, not what the harness found easy to quote.
+  'bytea equality|SELECT count(*) FROM @N@ WHERE b = decode(lpad(to_hex(7), 16, $q$0$q$), $q$hex$q$)'
 )
 
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0
