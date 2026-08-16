@@ -2293,7 +2293,17 @@ pub enum IndexKey {
     Bytes(Vec<u8>),
     /// r1039 — exact decimal, in the canonical form described on
     /// [`NumericKey`].
-    Numeric(NumericKey),
+    ///
+    /// r1040 — BOXED, and the box is load-bearing for every OTHER index.
+    /// A `NumericKey` is 48 bytes against `Text(String)`'s 24, so inline
+    /// it set the size of the whole enum and every B-tree node in every
+    /// index grew with it: 32 bytes per key to 48, align 8 to 16.
+    /// Measured through the release sweep, `SELECT pad FROM t ORDER BY
+    /// id` over 400,000 rows — a walk of the primary key's index — went
+    /// 39.4-40.6 ms to 42.3-44.1, in both leg orders. The indirection is
+    /// charged to numeric keys, which are new, instead of to every index
+    /// that existed already.
+    Numeric(alloc::boxed::Box<NumericKey>),
 }
 
 /// r1039 — an exact-decimal index key, canonical so that representation
@@ -2709,7 +2719,7 @@ impl IndexKey {
     /// An integer as a NUMERIC key. Exact by construction — no scale, no
     /// rounding — which is why the conversion is allowed at all.
     fn exact_int_key(n: i128) -> Self {
-        Self::Numeric(NumericKey::from_i128(n))
+        Self::Numeric(alloc::boxed::Box::new(NumericKey::from_i128(n)))
     }
 
     pub fn from_value(v: &Value<'_>) -> Option<Self> {
@@ -2758,13 +2768,13 @@ impl IndexKey {
             Value::Hstore(_) => None,
             // r1039 — exact decimals index through the canonical
             // [`NumericKey`], which is what makes `1.5` and `1.50` one key.
-            Value::NumericBig(b) => Some(Self::Numeric(NumericKey::from_big(b))),
+            Value::NumericBig(b) => Some(Self::Numeric(alloc::boxed::Box::new(NumericKey::from_big(b)))),
             Value::Numeric {
                 scaled,
                 scale,
                 kind,
-            } => Some(Self::Numeric(NumericKey::from_numeric(
-                *scaled, *scale, *kind,
+            } => Some(Self::Numeric(alloc::boxed::Box::new(
+                NumericKey::from_numeric(*scaled, *scale, *kind),
             ))),
             // r1039 — bytea orders by plain byte comparison, which is
             // `Vec<u8>`'s own.

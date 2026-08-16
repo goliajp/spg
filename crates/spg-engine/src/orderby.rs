@@ -1033,7 +1033,14 @@ pub(crate) enum OrderKey {
     ///
     /// The specials ride here too, so `ORDER BY` and a B-tree walk order
     /// a NUMERIC column the same way, from one definition.
-    Numeric(spg_storage::NumericKey),
+    ///
+    /// r1040 — BOXED for the same reason [`spg_storage::IndexKey`]'s is:
+    /// a `NumericKey` is 48 bytes where the next largest variant is 24,
+    /// so inline it sets the size of every sort key in every ORDER BY.
+    /// Measured against 7.37.24 through the release sweep,
+    /// `SELECT DISTINCT k FROM t ORDER BY k` over 400,000 rows was
+    /// 7-9% slower in both leg orders until this box.
+    Numeric(alloc::boxed::Box<spg_storage::NumericKey>),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -1160,7 +1167,9 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         // alone, which was sound only while every value in the variant
         // overflowed `i128`; an ordinary NUMERIC in the same variant
         // would have made `3.0 > 5` true.
-        (OrderKey::Numeric(x), OrderKey::Int(y)) => x.cmp(&spg_storage::NumericKey::from_i128(*y)),
+        (OrderKey::Numeric(x), OrderKey::Int(y)) => {
+            (**x).cmp(&spg_storage::NumericKey::from_i128(*y))
+        }
         (OrderKey::Int(x), OrderKey::Numeric(y)) => spg_storage::NumericKey::from_i128(*x).cmp(y),
         // Against a FLOAT key the numeric is demoted, which is how PG
         // defines `numeric <op> float8` — and it is the only place this
