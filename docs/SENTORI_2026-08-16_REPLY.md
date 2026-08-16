@@ -43,10 +43,11 @@ smallint, int, bigint, bool, float, text — and answered `Literal::Null` to
 everything else. `IN (NULL)` is never true. Every matching row vanished,
 silently. The conversion now refuses a key it cannot express, and the fold
 is skipped: the join runs unfolded, which is correct and merely
-unoptimised.
+unoptimised. (A `numeric` key HAS an exact literal form, so those joins
+fold again — see the last section.)
 
 **B. The index-nested-loop probe treated an unrepresentable key as a
-miss.** Its lookup key has four forms — Int, Text, Bool, Uuid — and a
+miss.** Its lookup key had four forms — Int, Text, Bool, Uuid — and a
 `bytea` or `numeric` join key produced none of them. The row then fell
 past the lookup and was left unmatched, so an inner join dropped it. It
 now hands the whole stage back and the hash join, which compares values
@@ -80,13 +81,42 @@ column:
 |---|---:|---:|---:|---:|
 | uuid, date, timestamp, bytea, int, text, bool | 1 | 1 | 1 | 1 |
 
-## What we did NOT do
+## The part we said we were leaving — and then did
 
-We did not make `IndexKey` learn `bytea` and `numeric`. That would let
-those types take the index paths rather than declining them, and it is a
-performance change with its own measurements to do. Refusing is correct
-today; being fast about it is separate work, and we would rather tell you
-it is unoptimised than imply it is.
+The first version of this letter said we were not making `IndexKey`
+learn `bytea` and `numeric`: refusing is correct, being fast about it is
+separate work, and we would rather tell you it is unoptimised than imply
+it is not. That paragraph is why the work happened straight after, so
+here is the corrected version.
+
+Both types have index keys now. `bytea` is the easy half — PostgreSQL
+orders it by plain byte comparison, shorter prefix first, which is what
+a byte vector already does. `numeric` is not easy, and the reason is
+worth stating because it is the same red line as everything above:
+`1.5`, `1.50` and `1.500` are one value in SQL, and they reach the index
+as three different pairs of digits and scale. A key built from those
+pairs files them in three places, and `WHERE n = 1.5` stops finding a
+row stored as `1.50`. The key is canonical instead, so equal values are
+literally the same key — including `NaN` and `±Infinity`, which carry a
+canonical zero and would otherwise all file as the number 0.
+
+Two defects fell out of that, both older than this change and neither
+about indexes:
+
+- `WHERE n = 0` MATCHED a stored `NaN`, while `SELECT n = 0` on the same
+  row correctly answered false. Two comparison paths, one rule between
+  them.
+- `ORDER BY n` sorted `NaN`, `Infinity` and `-Infinity` as zero.
+
+Both are wrong answers with no error, on ordinary NUMERIC columns, with
+no index anywhere in sight. If you have a column that can hold `NaN` —
+a computed rate, an imported measurement — those are worth knowing about
+independently of anything else in this letter.
+
+And one about our own instruments: the corpus runner rendered a stored
+`'NaN'::numeric` as `0`, so this class of defect could not have been
+pinned by a test before now. It could not be *seen* by the thing whose
+job is seeing it.
 
 ---
 
