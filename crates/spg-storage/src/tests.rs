@@ -5692,3 +5692,209 @@ fn pruned_decode_agrees_with_the_full_decode_and_ends_in_the_same_place() {
         );
     }
 }
+
+/// r1039 — the canonical NUMERIC index key.
+///
+/// The property under test is that representation equality IS value
+/// equality: `1.5`, `1.50` and `1.500` are one NUMERIC in SQL, so a B-tree
+/// keyed on them must file them in one place or an index would change an
+/// answer. Ordering is PG18.4's, measured:
+/// `-Infinity < -2 < -1.5 < 0 < 0.001 < 1.5 < 2 < 1000000 < Infinity < NaN`.
+mod numeric_index_key {
+    use crate::{IndexKey, NumericKind, Value};
+    use alloc::vec::Vec;
+    use core::cmp::Ordering;
+
+    fn num(scaled: i128, scale: u16) -> IndexKey {
+        IndexKey::from_value(&Value::Numeric {
+            scaled,
+            scale,
+            kind: NumericKind::Finite,
+        })
+        .expect("numeric is keyable")
+    }
+
+    fn special(kind: NumericKind) -> IndexKey {
+        IndexKey::from_value(&Value::Numeric {
+            scaled: 0,
+            scale: 0,
+            kind,
+        })
+        .expect("special is keyable")
+    }
+
+    #[test]
+    fn one_value_at_several_scales_is_one_key() {
+        assert_eq!(num(15, 1), num(150, 2));
+        assert_eq!(num(15, 1), num(1500, 3));
+        assert_eq!(num(2, 0), num(200, 2));
+        // …and zero has exactly one spelling, including no `-0`.
+        assert_eq!(num(0, 0), num(0, 5));
+        assert_eq!(num(0, 0), num(-0, 3));
+    }
+
+    #[test]
+    fn distinct_values_stay_distinct() {
+        assert_ne!(num(15, 1), num(16, 1));
+        assert_ne!(num(15, 1), num(-15, 1));
+        assert_ne!(num(15, 1), num(15, 2));
+    }
+
+    /// `Ord` and `Eq` must agree, or a B-tree built on the key cannot be
+    /// searched. This is the invariant `BigNumeric::cmp` declines to
+    /// promise, which is why it is not an `Ord` impl there.
+    #[test]
+    fn equal_keys_compare_equal_and_unequal_ones_do_not() {
+        let keys = [
+            num(15, 1),
+            num(150, 2),
+            num(0, 0),
+            num(-15, 1),
+            num(1_000_000, 0),
+            special(NumericKind::NaN),
+            special(NumericKind::PosInf),
+            special(NumericKind::NegInf),
+        ];
+        for a in &keys {
+            for b in &keys {
+                assert_eq!(
+                    a == b,
+                    a.cmp(b) == Ordering::Equal,
+                    "Eq and Ord disagree: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pg18_ordering() {
+        let mut keys: Vec<IndexKey> = alloc::vec![
+            special(NumericKind::NaN),
+            num(2, 0),
+            num(-15, 1),
+            special(NumericKind::NegInf),
+            num(1, 3),
+            num(0, 0),
+            special(NumericKind::PosInf),
+            num(15, 1),
+            num(-2, 0),
+            num(1_000_000, 0),
+        ];
+        keys.sort();
+        let expect = alloc::vec![
+            special(NumericKind::NegInf),
+            num(-2, 0),
+            num(-15, 1),
+            num(0, 0),
+            num(1, 3),
+            num(15, 1),
+            num(2, 0),
+            num(1_000_000, 0),
+            special(NumericKind::PosInf),
+            special(NumericKind::NaN),
+        ];
+        assert_eq!(keys, expect);
+    }
+
+    /// A key whose mantissa overflows `i128` takes the same canonical
+    /// form, so the two representations of one value are one key.
+    #[test]
+    fn the_big_representation_lands_on_the_same_key() {
+        let big = crate::bignum::BigNumeric::from_i128(150, 2);
+        let via_big = IndexKey::from_value(&Value::NumericBig(alloc::boxed::Box::new(big)))
+            .expect("big numeric is keyable");
+        assert_eq!(via_big, num(15, 1));
+    }
+
+    /// bytea orders by plain byte comparison, shorter prefix first —
+    /// PG18.4: `'' < \x00 < \x0000 < \x01ff < \xff`.
+    #[test]
+    fn bytea_orders_bytewise() {
+        let mk = |b: &[u8]| {
+            IndexKey::from_value(&Value::Bytes(alloc::borrow::Cow::Owned(b.to_vec())))
+                .expect("bytea is keyable")
+        };
+        let mut keys = alloc::vec![
+            mk(&[0xff]),
+            mk(&[0x01, 0xff]),
+            mk(&[]),
+            mk(&[0x00, 0x00]),
+            mk(&[0x00]),
+        ];
+        keys.sort();
+        assert_eq!(
+            keys,
+            alloc::vec![
+                mk(&[]),
+                mk(&[0x00]),
+                mk(&[0x00, 0x00]),
+                mk(&[0x01, 0xff]),
+                mk(&[0xff]),
+            ]
+        );
+    }
+
+    /// The probe key belongs to the COLUMN's space, not the value's
+    /// incidental type: `WHERE n = 2` on a NUMERIC column must not seek
+    /// with an integer key.
+    #[test]
+    fn a_column_typed_key_lands_in_the_columns_space() {
+        let numeric_col = crate::DataType::Numeric {
+            precision: 10,
+            scale: 2,
+        };
+        let from_int = IndexKey::from_value_for_column(&Value::Int(2), numeric_col)
+            .expect("an integer is exactly a numeric");
+        assert_eq!(from_int, num(2, 0));
+        // A float is NOT converted — rounding into another space is how a
+        // seek reaches the wrong row.
+        assert_eq!(
+            IndexKey::from_value_for_column(&Value::Float(2.0), numeric_col),
+            None
+        );
+        // And a numeric key may not be used for a column of another type.
+        assert_eq!(
+            IndexKey::from_value_for_column(
+                &Value::Numeric {
+                    scaled: 2,
+                    scale: 0,
+                    kind: NumericKind::Finite
+                },
+                crate::DataType::BigInt
+            ),
+            None
+        );
+    }
+
+    /// The catalog codec round-trips both new key spaces, and refuses a
+    /// non-canonical numeric rather than building a B-tree it cannot
+    /// search.
+    #[test]
+    fn the_codec_round_trips_and_refuses_non_canonical() {
+        for key in [
+            num(15, 1),
+            num(0, 0),
+            num(-1_000_000, 3),
+            special(NumericKind::NaN),
+            special(NumericKind::NegInf),
+            IndexKey::Bytes(alloc::vec![0x00, 0xde, 0xad]),
+            IndexKey::Bytes(Vec::new()),
+        ] {
+            let mut buf = Vec::new();
+            crate::codec::write_index_key(&mut buf, &key);
+            let mut cur = crate::codec::Cursor::new(&buf);
+            assert_eq!(cur.read_index_key().expect("round trip"), key);
+        }
+        // A digit vector with a trailing zero is not canonical: it would
+        // be `Eq`-distinct from the same value without it, while `Ord`
+        // calls them equal.
+        assert_eq!(
+            crate::NumericKey::from_parts(1, false, 0, alloc::vec![1, 0]),
+            None
+        );
+        assert_eq!(
+            crate::NumericKey::from_parts(1, true, 0, alloc::vec![]),
+            None
+        );
+    }
+}
