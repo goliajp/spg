@@ -296,6 +296,32 @@ fn est_width(cols: &[ColumnSchema]) -> u64 {
         .sum()
 }
 
+/// The number of rows an indexed range in `where_` actually covers, when
+/// the index can say so under a cap.
+///
+/// This is the difference between a `rows=` a reader can act on and one
+/// they cannot: mailrs measured a 200-fold change in selectivity moving
+/// the estimate not at all, because [`est_scan_rows`] answers `n / 3` to
+/// everything that is not equality. `None` here means the range was too
+/// wide to count cheaply — and a wide range is where the old fraction was
+/// closest to right.
+fn real_range_rows(
+    engine: &Engine,
+    name: &str,
+    alias: Option<&str>,
+    where_: Option<&Expr>,
+) -> Option<u64> {
+    let w = where_?;
+    let table = engine.active_catalog().get(name)?;
+    crate::index_access::count_indexed_range_capped(
+        w,
+        &table.schema().columns,
+        table,
+        alias.unwrap_or(name),
+        &engine.current_snapshot(),
+    )
+}
+
 /// Row-count estimate for a scan: no predicate = the real live count;
 /// an equality lands 1 (unique-ish assumption on the seek path) or n/10;
 /// anything else n/3 (PG's default_selectivity flavour).
@@ -474,6 +500,13 @@ fn split_index_cond<'a>(
     // Whole-predicate seek that is NOT decomposable (a two-sided range like
     // BETWEEN) stays one Index Cond.
     if conjuncts.len() == 1 {
+        return (Some(where_), Vec::new());
+    }
+    // r1035 — several conjuncts can still be ONE seek. A BETWEEN is two of
+    // them on the same column, and now that each half seeks on its own the
+    // loop below would claim one and call the other a Filter, which reads
+    // as a re-check the executor never performs.
+    if crate::index_access::whole_predicate_is_one_range(where_, cols, table, alias) {
         return (Some(where_), Vec::new());
     }
     for (i, c) in conjuncts.iter().enumerate() {
@@ -680,6 +713,10 @@ fn scan_node(
             "Index Scan using"
         };
         let mut n = PlanNode::new(alloc::format!("{verb} {idx_name} on {name}{alias_sfx}"));
+        // r1038 — the conjunct this plan SEEKS, taken before `split` is
+        // consumed below. `None` from the split means the seek took the
+        // whole predicate, so `where_` is that conjunct.
+        let seek_cond: Option<&Expr> = split.as_ref().and_then(|(c, _)| *c).or(where_);
         if let Some(w) = where_ {
             let (cond, residual) = split.expect("computed alongside where_");
             match cond {
@@ -698,7 +735,15 @@ fn scan_node(
                 None => n.attrs.push(alloc::format!("Index Cond: {}", pg_cond(w))),
             }
         }
-        let rows = est_scan_rows(table_rows, where_, true);
+        // r1035 — ask the index rather than guessing, when it is cheap.
+        //
+        // r1038 — ask it about the conjunct this plan says it SEEKS, not
+        // about the whole predicate. `WHERE id = 7 AND ts > <x>` seeks the
+        // equality and filters the range; counting the range there gave a
+        // node that printed `Index Cond: (id = 7)` above `rows=199`, an
+        // estimate for work the plan does not do.
+        let rows = real_range_rows(engine, name, alias, seek_cond)
+            .unwrap_or_else(|| est_scan_rows(table_rows, where_, true));
         // Index descent + per-row fetch (SPG's own constants, PG's format).
         n.cost = Some((0.15, 0.15 + 8.0 + rows as f64 * 0.01, rows, width));
         n
@@ -708,7 +753,8 @@ fn scan_node(
         if let Some(w) = where_ {
             n.attrs.push(alloc::format!("Filter: {}", pg_cond(w)));
         }
-        let rows = est_scan_rows(table_rows, where_, false);
+        let rows = real_range_rows(engine, name, alias, where_)
+            .unwrap_or_else(|| est_scan_rows(table_rows, where_, false));
         let total = 1.0
             + table_rows as f64 * 0.01
             + if filtered {

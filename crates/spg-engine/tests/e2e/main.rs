@@ -270,6 +270,7 @@ mod e2e_explain_costs_dml_round225;
 mod e2e_explain_index_only_round565;
 mod e2e_explain_names_the_index_round551;
 mod e2e_explain_pg_shape_round224;
+mod e2e_explain_range_rows_r1038;
 mod e2e_explain_split_json_round226;
 mod e2e_explain_xml_yaml_round228;
 mod e2e_expr_errors_round704;

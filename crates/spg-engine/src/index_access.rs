@@ -425,35 +425,53 @@ pub(crate) fn try_index_seek_positions(
     // The dead versions are now dropped INSIDE the walk, by the same
     // `is_row_visible` test the caller applies, so the budget is back to its
     // original meaning and round 461's compensation is unnecessary.
+    //
+    // r1038 — EXACT, not permissive, and the AND recursion below is why it
+    // can be. A range sitting beside a conjunct that is not one — `IS NOT
+    // NULL AND scheduled_at <= X`, the shape mailrs reported — reaches the
+    // walk through that recursion, which retries each conjunct on its own
+    // and finds a one-sided range there. Taking it HERE instead would mean
+    // `WHERE id = 1 AND created_at > $1` walks a quarter of `created_at`
+    // rather than seeking the one row `id` names: a range that merely
+    // passes the cap would outrank an equality that returns a single row.
     let seek_cap = table.rows().len() / 4;
-    if let Some((col_pos, lo, hi)) = parse_range_bounds(where_expr, schema_cols, table_alias)
-        && let Some(idx) = table.index_on(col_pos)
-        && let Some(locators) =
-            idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap, |l| {
-                match l {
-                    spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
-                    // A cold locator makes the whole seek bail below; keep it
-                    // so that decision is reached rather than silently
-                    // dropping it here.
-                    spg_storage::RowLocator::Cold { .. } => true,
-                }
-            })
+    if let Some((col_pos, lo, hi)) = parse_range_bounds_exact(where_expr, schema_cols, table_alias)
     {
-        let mut out = Vec::with_capacity(locators.len());
-        let mut all_hot = true;
-        for loc in &locators {
-            match *loc {
-                spg_storage::RowLocator::Hot(i) => out.push(i),
-                spg_storage::RowLocator::Cold { .. } => {
-                    all_hot = false;
-                    break;
+        // `break 'range` = this range is not usable; fall through to the
+        // recursion and the equality paths below.
+        'range: {
+            let Some(idx) = table.index_on(col_pos) else {
+                break 'range;
+            };
+            let Some(locators) =
+                idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap, |l| {
+                    match l {
+                        spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                        // A cold locator makes the whole seek bail below; keep
+                        // it so that decision is reached rather than silently
+                        // dropping it here.
+                        spg_storage::RowLocator::Cold { .. } => true,
+                    }
+                })
+            else {
+                break 'range;
+            };
+            let mut out = Vec::with_capacity(locators.len());
+            let mut all_hot = true;
+            for loc in &locators {
+                match *loc {
+                    spg_storage::RowLocator::Hot(i) => out.push(i),
+                    spg_storage::RowLocator::Cold { .. } => {
+                        all_hot = false;
+                        break;
+                    }
                 }
             }
-        }
-        if all_hot {
-            // v7.39 (pg_stat knife B) — one index scan.
-            table.note_index_scan(out.len() as u64);
-            return Some(out);
+            if all_hot {
+                // v7.39 (pg_stat knife B) — one index scan.
+                table.note_index_scan(out.len() as u64);
+                return Some(out);
+            }
         }
     }
     if let Expr::Binary {
@@ -543,25 +561,69 @@ fn parse_one_sided_range(
     Some((col_pos, bounds.0, bounds.1))
 }
 
-/// Parse a two-sided range predicate — `(col >=/> a) AND (col <=/< b)` on the
-/// SAME column (the BETWEEN shape) — into `(col_pos, lo, hi)` with both ends
-/// bounded. Deliberately TWO-sided only: a one-sided `col > x` is usually
-/// non-selective (matches a large fraction), where an index range scan +
-/// per-candidate re-eval loses to a tight seq scan; those stay on the seq
-/// path. A two-sided BETWEEN is typically selective enough to win, and the
-/// cap in `try_range_seek` catches the rare wide one.
-fn parse_range_bounds(
+/// Range bounds this predicate implies, one entry per column it constrains.
+///
+/// Two things changed here in r1035, both because mailrs measured them
+/// (`spg-reactivation-measured-2026-08-16`).
+///
+/// **One-sided ranges are no longer refused.** The rule used to be
+/// two-sided only, on the reasoning that `col > x` alone "is usually
+/// non-selective" and an index walk would lose to a tight scan. That is a
+/// guess about a distribution, and the selectivity cap in the callers is a
+/// MEASUREMENT of the same thing — it refuses any walk returning more than
+/// a quarter of the table. The guess was also wrong in the case that
+/// reached us: `scheduled_at` is NULL for almost every row, NULLs are not
+/// indexed at all (`IndexKey::from_value` has no NULL), so the index holds
+/// fifty entries out of twenty thousand and a one-sided walk is as
+/// selective as a walk gets. Measured before the change: matching rows
+/// held at fifty while the table grew 8x, and the query grew 8.19x with
+/// it — a scan, at every size.
+///
+/// **Conjuncts that are not ranges no longer poison the parse.** The
+/// reported query is `scheduled_at IS NOT NULL AND scheduled_at <= X`, and
+/// the `IS NOT NULL` half made the whole thing unparseable. A residual
+/// conjunct is fine for the SEEK paths, which re-apply the full WHERE to
+/// every candidate, so returning a superset is correct.
+///
+/// It is NOT fine for `try_range_count`, which tallies index entries
+/// without looking at rows. That one uses [`parse_range_bounds_exact`],
+/// which insists the whole predicate is the range.
+fn parse_range_candidates(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table_alias: &str,
+) -> Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
+    let mut out = Vec::new();
+    collect_range_bounds(where_expr, schema_cols, table_alias, &mut out);
+    // v7.39 (enum order knife) — the index orders enum labels
+    // lexicographically but PG's enum order is the catalog member order, so
+    // a range walk would under-select and the caller's WHERE re-eval cannot
+    // restore missing rows. Eq / IN-list seeks stay: label equality is exact.
+    out.retain(|(col, _, _)| {
+        schema_cols
+            .get(*col)
+            .is_some_and(|c| c.user_enum_type.is_none())
+    });
+    out
+}
+
+/// The whole predicate as a range on ONE column, or `None`.
+///
+/// For callers that answer from the index alone and never see the rows, so
+/// a residual conjunct would make the answer wrong rather than wide.
+fn parse_range_bounds_exact(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
-    let bounds = parse_range_bounds_inner(where_expr, schema_cols, table_alias)?;
-    // v7.39 (enum order knife) — the index orders enum labels
-    // lexicographically but PG's enum order is the catalog member order,
-    // so a range walk would under-select (and the caller's WHERE re-eval
-    // cannot restore missing rows). Bail to a seq scan, whose Binary
-    // comparisons are member-order aware. Eq / IN-list seeks stay: label
-    // equality is exact.
+    let mut out = Vec::new();
+    if !collect_range_bounds(where_expr, schema_cols, table_alias, &mut out) {
+        return None; // something in there was not a range on any column
+    }
+    if out.len() != 1 {
+        return None; // no constraint, or constraints on several columns
+    }
+    let bounds = out.pop()?;
     if schema_cols
         .get(bounds.0)
         .is_some_and(|c| c.user_enum_type.is_some())
@@ -571,38 +633,79 @@ fn parse_range_bounds(
     Some(bounds)
 }
 
-fn parse_range_bounds_inner(
-    where_expr: &Expr,
+/// Walk an AND tree, merging every range it finds by column. Returns
+/// whether EVERY leaf was a range — which is what tells an exact caller
+/// that nothing is left over.
+fn collect_range_bounds(
+    e: &Expr,
     schema_cols: &[ColumnSchema],
     table_alias: &str,
-) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
-    let Expr::Binary {
+    out: &mut Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)>,
+) -> bool {
+    if let Expr::Binary {
         lhs,
         op: BinOp::And,
         rhs,
-    } = where_expr
-    else {
-        return None;
-    };
-    let (c1, lo1, hi1) = parse_one_sided_range(lhs, schema_cols, table_alias)?;
-    let (c2, lo2, hi2) = parse_one_sided_range(rhs, schema_cols, table_alias)?;
-    if c1 != c2 {
-        return None;
+    } = e
+    {
+        // Both sides, and both walked: a residual on one does not stop the
+        // other from contributing a usable bound.
+        let l = collect_range_bounds(lhs, schema_cols, table_alias, out);
+        let r = collect_range_bounds(rhs, schema_cols, table_alias, out);
+        return l && r;
     }
-    // One side must supply the lower bound, the other the upper.
-    let lo = match (lo1, lo2) {
-        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
-        _ => return None, // two lower bounds — not a clean [lo, hi]
+    let Some((col, lo, hi)) = parse_one_sided_range(e, schema_cols, table_alias) else {
+        return false;
     };
-    let hi = match (hi1, hi2) {
-        (Bound::Unbounded, b) | (b, Bound::Unbounded) => b,
-        _ => return None,
-    };
-    // Both ends must be bounded (a real BETWEEN), else fall back to seq scan.
-    if matches!(lo, Bound::Unbounded) || matches!(hi, Bound::Unbounded) {
-        return None;
+    if let Some(slot) = out.iter_mut().find(|(c, _, _)| *c == col) {
+        slot.1 = tighter_lo(core::mem::replace(&mut slot.1, Bound::Unbounded), lo);
+        slot.2 = tighter_hi(core::mem::replace(&mut slot.2, Bound::Unbounded), hi);
+    } else {
+        out.push((col, lo, hi));
     }
-    Some((c1, lo, hi))
+    true
+}
+
+/// The higher of two lower bounds; `Excluded` wins a tie, being tighter.
+fn tighter_lo(a: Bound<IndexKey>, b: Bound<IndexKey>) -> Bound<IndexKey> {
+    match (&a, &b) {
+        (Bound::Unbounded, _) => b,
+        (_, Bound::Unbounded) => a,
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match x.cmp(y) {
+                core::cmp::Ordering::Greater => a,
+                core::cmp::Ordering::Less => b,
+                core::cmp::Ordering::Equal => {
+                    if matches!(a, Bound::Excluded(_)) {
+                        a
+                    } else {
+                        b
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The lower of two upper bounds; `Excluded` wins a tie.
+fn tighter_hi(a: Bound<IndexKey>, b: Bound<IndexKey>) -> Bound<IndexKey> {
+    match (&a, &b) {
+        (Bound::Unbounded, _) => b,
+        (_, Bound::Unbounded) => a,
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match x.cmp(y) {
+                core::cmp::Ordering::Less => a,
+                core::cmp::Ordering::Greater => b,
+                core::cmp::Ordering::Equal => {
+                    if matches!(a, Bound::Excluded(_)) {
+                        a
+                    } else {
+                        b
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn bound_as_ref(b: &Bound<IndexKey>) -> Bound<&IndexKey> {
@@ -808,7 +911,9 @@ fn parse_index_only_bounds(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
-    if let Some(r) = parse_range_bounds(where_expr, schema_cols, table_alias) {
+    // Exact, not permissive: this path answers from index keys and never
+    // looks at the row, so a residual conjunct would go unapplied.
+    if let Some(r) = parse_range_bounds_exact(where_expr, schema_cols, table_alias) {
         return Some(r);
     }
     let Expr::Binary {
@@ -850,15 +955,24 @@ fn try_range_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
-    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
-    let idx = table.index_on(col_pos)?;
+    // r1038 — EXACT: see the note in `try_index_seek_positions`. The AND
+    // recursion in `try_index_seek` retries each conjunct alone, so a
+    // one-sided range beside a non-range conjunct still reaches the index
+    // — without letting a merely-cap-passing range outrank an equality.
+    let candidates = parse_range_bounds_exact(where_expr, schema_cols, table_alias);
     // Selectivity cap: the caller still materialises + re-evals every candidate
     // this returns, so the index range scan only pays off when the range is a
     // small fraction of the table. Empirically ~50%-selective ranges regress
     // (index-walk + per-candidate materialise > a tight seq scan); a quarter is
     // a safe margin that keeps the clear wins and falls back (→ None → seq scan)
     // otherwise, so no endpoint regresses.
+    //
+    // r1035 — the cap is also what makes one-sided ranges safe to attempt:
+    // a wide `col > x` returns more than a quarter and is refused here,
+    // which is the measurement the old two-sided-only rule was guessing at.
     let cap = table.rows().len() / 4;
+    let (col_pos, lo, hi) = candidates?;
+    let idx = table.index_on(col_pos)?;
     // v7.39 (round 490) — drop the dead versions inside the walk. This loop
     // already tested `is_row_visible` and skipped; doing it one level down
     // means the cap stops counting them too (see `lookup_range_capped_by`).
@@ -875,15 +989,78 @@ fn try_range_seek<'a>(
                     out.push(Cow::Borrowed(row));
                 }
             }
-            // A range walk flattens locators without their per-key handle, so a
-            // cold-tier row can't be resolved the way the Eq seek does. Bail to
-            // a seq scan (correct — the caller re-applies the WHERE to all rows).
+            // A range walk flattens locators without their per-key handle,
+            // so a cold-tier row can't be resolved the way the Eq seek
+            // does. Bail to a seq scan (correct — the caller re-applies
+            // the WHERE to all rows).
             spg_storage::RowLocator::Cold { .. } => return None,
         }
     }
     // v7.39 (pg_stat knife B) — one index scan.
     table.note_index_scan(out.len() as u64);
     Some(out)
+}
+
+/// Whether the WHOLE predicate is a single indexed range — the BETWEEN
+/// shape, and now a bare `col <= x` too.
+///
+/// For EXPLAIN's conjunct split. It walks the AND chain looking for one
+/// conjunct that seeks on its own, and r1035 made each half of a BETWEEN
+/// seekable by itself, so it started printing `Index Cond: (k <= 12)` with
+/// `Filter: (k >= 10)` under it — half the predicate presented as a
+/// re-check that does not happen. Both halves are one seek, and this is
+/// how the split learns to say so.
+pub(crate) fn whole_predicate_is_one_range(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+) -> bool {
+    parse_range_bounds_exact(where_expr, schema_cols, table_alias)
+        .is_some_and(|(col, _, _)| table.index_on(col).is_some())
+}
+
+/// How many index entries an indexed range in this predicate covers, when
+/// that is cheap enough to ask.
+///
+/// For EXPLAIN. mailrs pointed out (2026-08-16) that a range's `rows=`
+/// figure is `n / 3` whatever the data is: a fixture with 10,000 matching
+/// rows and one with 50 produced byte-identical estimates and costs, and
+/// `ANALYZE` moved neither. The guess is documented in `est_scan_rows`,
+/// but a reader cannot tell a selective predicate from a wide one, which
+/// is most of what the number is for.
+///
+/// The index already knows. Walking it under the same cap the executor
+/// uses means EXPLAIN never costs more than the query would, and returns
+/// `None` — leave the old guess in place — when the range is too wide to
+/// count cheaply, which is exactly the case where the guess is closest to
+/// right anyway.
+///
+/// The count is an UPPER BOUND: conjuncts that are not part of the range
+/// still filter afterwards. That is what an estimate is, and it beats a
+/// constant by the distance between 50 and 6,666.
+pub(crate) fn count_indexed_range_capped(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+) -> Option<u64> {
+    let cap = table.rows().len() / 4;
+    for (col_pos, lo, hi) in parse_range_candidates(where_expr, schema_cols, table_alias) {
+        let Some(idx) = table.index_on(col_pos) else {
+            continue;
+        };
+        if let Some(locators) =
+            idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |l| match l {
+                spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                spg_storage::RowLocator::Cold { .. } => true,
+            })
+        {
+            return Some(locators.len() as u64);
+        }
+    }
+    None
 }
 
 /// v7.38 (perf, exact-range count) — `count(*)` over a WHERE that is EXACTLY a
@@ -901,7 +1078,9 @@ pub(crate) fn try_range_count(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<i64> {
-    let (col_pos, lo, hi) = parse_range_bounds(where_expr, schema_cols, table_alias)?;
+    // Exact: the tally IS the answer, so a residual conjunct would make it
+    // wrong. See `parse_range_bounds_exact`.
+    let (col_pos, lo, hi) = parse_range_bounds_exact(where_expr, schema_cols, table_alias)?;
     let idx = table.index_on(col_pos)?;
     let locators = idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), usize::MAX)?;
     let mut count: i64 = 0;
@@ -931,6 +1110,10 @@ pub(crate) fn try_index_seek<'a>(
     // so a two-sided BETWEEN is caught as one range; a mixed predicate like
     // `id = 1 AND created > $1` isn't a pure range, so this returns None and the
     // Eq path below still seeks on `id`.
+    // r1038 — "isn't a pure range" is now a decision this function makes on
+    // purpose rather than a limit of the parser: one-sided ranges became
+    // seekable, so without the exactness test here the mixed predicate above
+    // would take the range and leave the equality unused.
     if let Some(rows) = try_range_seek(where_expr, schema_cols, table, table_alias, snapshot) {
         return Some(rows);
     }
