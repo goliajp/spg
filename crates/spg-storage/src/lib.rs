@@ -2287,6 +2287,211 @@ pub enum IndexKey {
     /// (RFC 4122 byte order) so PRIMARY KEY UUID lookups land on
     /// the same fast-path as Int / Text.
     Uuid([u8; 16]),
+    /// r1039 — `Value::Bytes` (bytea). PG orders bytea by plain byte
+    /// comparison, shorter-prefix first (`'' < \x00 < \x0000 < \x01ff <
+    /// \xff`, measured on 18.4), which is exactly `Vec<u8>`'s `Ord`.
+    Bytes(Vec<u8>),
+    /// r1039 — exact decimal, in the canonical form described on
+    /// [`NumericKey`].
+    Numeric(NumericKey),
+}
+
+/// r1039 — an exact-decimal index key, canonical so that representation
+/// equality IS value equality.
+///
+/// That property is the whole reason this is a struct rather than the
+/// `(scaled, scale)` pair the value carries. `1.5` and `1.50` are the
+/// same NUMERIC (PG18.4: `1.5::numeric = 1.50::numeric` is true) and
+/// arrive here as `(15, 1)` and `(150, 2)`. A B-tree keyed on the raw
+/// pair would file them apart, so `WHERE n = 1.5` would miss a row stored
+/// as `1.50` — an index changing the answer, which is the one thing an
+/// index may never do. `BigNumeric::cmp` carries the same warning and
+/// declines to implement `Ord` for exactly this reason; a KEY cannot
+/// decline, so it normalizes instead.
+///
+/// Canonical form: significant decimal digits with no leading and no
+/// trailing zeros, most significant first, plus the decimal exponent of
+/// the leading digit. Zero is the empty digit vector with `neg == false`
+/// and `exp == 0`, so there is no `-0`.
+///
+/// Ordering is PG's, measured: `-Infinity < -1 < 0 < 1 < Infinity < NaN`,
+/// and `NaN = NaN`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumericKey {
+    /// 0 = -Infinity, 1 = finite, 2 = +Infinity, 3 = NaN. Ordering the
+    /// classes by this byte is what puts NaN on top, where PG keeps it.
+    class: u8,
+    /// Finite only, and never set for zero.
+    neg: bool,
+    /// Decimal exponent of `digits[0]`; 0 when there are no digits.
+    exp: i32,
+    /// 0..=9 each, most significant first, no leading or trailing zeros.
+    digits: Vec<u8>,
+}
+
+/// The `class` byte of [`NumericKey`], in PG's order.
+const NUM_CLASS_NEG_INF: u8 = 0;
+const NUM_CLASS_FINITE: u8 = 1;
+const NUM_CLASS_POS_INF: u8 = 2;
+const NUM_CLASS_NAN: u8 = 3;
+
+impl NumericKey {
+    /// The wire parts, for the catalog codec.
+    #[must_use]
+    pub fn parts(&self) -> (u8, bool, i32, &[u8]) {
+        (self.class, self.neg, self.exp, &self.digits)
+    }
+
+    /// Rebuild from [`NumericKey::parts`]. Returns `None` on parts that
+    /// are not canonical, so a corrupt catalog cannot smuggle in a key
+    /// whose `Eq` and `Ord` disagree.
+    #[must_use]
+    pub fn from_parts(class: u8, neg: bool, exp: i32, digits: Vec<u8>) -> Option<Self> {
+        if class > NUM_CLASS_NAN || digits.iter().any(|d| *d > 9) {
+            return None;
+        }
+        if class != NUM_CLASS_FINITE && (neg || exp != 0 || !digits.is_empty()) {
+            return None;
+        }
+        if digits.is_empty() && (neg || exp != 0) {
+            return None;
+        }
+        if !digits.is_empty() && (digits[0] == 0 || digits[digits.len() - 1] == 0) {
+            return None;
+        }
+        Some(Self {
+            class,
+            neg,
+            exp,
+            digits,
+        })
+    }
+
+    /// Canonicalize `(-1)^neg · <digits as an integer> · 10^-scale`.
+    ///
+    /// `digits` is most-significant-first and may carry leading and
+    /// trailing zeros; both are stripped, which is what makes `1.5` and
+    /// `1.50` land on the same key.
+    fn finite(neg: bool, mut digits: Vec<u8>, scale: i32) -> Self {
+        let lead = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
+        digits.drain(..lead);
+        if digits.is_empty() {
+            return Self {
+                class: NUM_CLASS_FINITE,
+                neg: false,
+                exp: 0,
+                digits,
+            };
+        }
+        // The leading digit's exponent, taken BEFORE trailing zeros go:
+        // dropping low-order digits does not move the leading one.
+        let exp = i32::try_from(digits.len()).unwrap_or(i32::MAX) - 1 - scale;
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        Self {
+            class: NUM_CLASS_FINITE,
+            neg,
+            exp,
+            digits,
+        }
+    }
+
+    fn special(class: u8) -> Self {
+        Self {
+            class,
+            neg: false,
+            exp: 0,
+            digits: Vec::new(),
+        }
+    }
+
+    /// Decimal digits of `mag`, most significant first. Empty for zero.
+    fn digits_of_u128(mut mag: u128) -> Vec<u8> {
+        if mag == 0 {
+            return Vec::new();
+        }
+        let mut rev = Vec::new();
+        while mag > 0 {
+            rev.push(u8::try_from(mag % 10).unwrap_or(0));
+            mag /= 10;
+        }
+        rev.reverse();
+        rev
+    }
+
+    /// Decimal digits of a base-10^9 little-endian limb vector, most
+    /// significant first. Every limb but the leading one is padded to its
+    /// full nine digits — that padding is the whole point, since a limb
+    /// of 5 in the middle of a number means `000000005`.
+    fn digits_of_limbs(limbs: &[u32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, limb) in limbs.iter().enumerate().rev() {
+            let d = Self::digits_of_u128(u128::from(*limb));
+            if i + 1 == limbs.len() {
+                out.extend_from_slice(&d);
+            } else {
+                out.extend(core::iter::repeat_n(0u8, 9 - d.len()));
+                out.extend_from_slice(&d);
+            }
+        }
+        out
+    }
+}
+
+impl Ord for NumericKey {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        use core::cmp::Ordering;
+        if self.class != other.class {
+            return self.class.cmp(&other.class);
+        }
+        if self.class != NUM_CLASS_FINITE {
+            // Each of the three specials is a single value, and PG holds
+            // `'NaN'::numeric = 'NaN'::numeric` true.
+            return Ordering::Equal;
+        }
+        // Zero first: it is stored with `neg == false` and `exp == 0`, so
+        // the magnitude comparison below would put it above every value
+        // smaller than 1 rather than between the negatives and positives.
+        match (self.digits.is_empty(), other.digits.is_empty()) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => {
+                return if other.neg {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+            (false, true) => {
+                return if self.neg {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            (false, false) => {}
+        }
+        match (self.neg, other.neg) {
+            (false, true) => return Ordering::Greater,
+            (true, false) => return Ordering::Less,
+            _ => {}
+        }
+        // Same sign, both non-zero: more integer digits is bigger, and at
+        // equal exponent the digit sequences compare directly — a prefix
+        // is smaller, which is right, since the longer one has non-zero
+        // digits below it (no trailing zeros survive canonicalization).
+        let mag = self
+            .exp
+            .cmp(&other.exp)
+            .then_with(|| self.digits.cmp(&other.digits));
+        if self.neg { mag.reverse() } else { mag }
+    }
+}
+
+impl PartialOrd for NumericKey {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl IndexKey {
@@ -2298,6 +2503,60 @@ impl IndexKey {
     #[inline]
     pub fn from_i64(n: i64) -> Self {
         Self::Int(n)
+    }
+
+    /// r1039 — the key a value takes when the INDEXED COLUMN is `ty`, or
+    /// `None` when it takes none (→ the caller falls back to a scan).
+    ///
+    /// Every key under one index comes from one column, so they all live
+    /// in one key SPACE. A probe built in a different space finds nothing
+    /// — and "nothing" is indistinguishable from "no matching rows",
+    /// which is how round 564 and r1037 both turned an index into a wrong
+    /// answer (a TEXT key sought against a DATE-keyed and a UUID-keyed
+    /// index).
+    ///
+    /// The two spaces this round adds make that trap reachable again from
+    /// a new direction: `WHERE n = 2` on a NUMERIC column produces
+    /// `Value::Int`, and an integer key would look in a space nothing
+    /// lives in. So NUMERIC columns take integers by converting them
+    /// exactly, and refuse anything they cannot convert; BYTEA columns
+    /// take only `Value::Bytes`; and no other column may be keyed in
+    /// either of the two new spaces.
+    ///
+    /// Use this wherever the key comes from a LITERAL or from another
+    /// table's value. [`IndexKey::from_value`] stays right for building
+    /// the index itself, where the value is the column's own.
+    pub fn from_value_for_column(v: &Value<'_>, ty: DataType) -> Option<Self> {
+        match ty {
+            DataType::Numeric { .. } => match v {
+                Value::SmallInt(n) => Some(Self::exact_int_key(i128::from(*n))),
+                Value::Int(n) => Some(Self::exact_int_key(i128::from(*n))),
+                Value::BigInt(n) => Some(Self::exact_int_key(i128::from(*n))),
+                Value::Numeric { .. } | Value::NumericBig(_) => Self::from_value(v),
+                // Float included: `2.0::float8` and `2.0::numeric` are not
+                // the same value to a B-tree, and rounding one into the
+                // other's space is how a seek reaches the wrong row.
+                _ => None,
+            },
+            DataType::Bytes => match v {
+                Value::Bytes(b) => Some(Self::Bytes(b.to_vec())),
+                _ => None,
+            },
+            _ => match Self::from_value(v) {
+                Some(Self::Numeric(_) | Self::Bytes(_)) => None,
+                other => other,
+            },
+        }
+    }
+
+    /// An integer as a NUMERIC key. Exact by construction — no scale, no
+    /// rounding — which is why the conversion is allowed at all.
+    fn exact_int_key(n: i128) -> Self {
+        Self::Numeric(NumericKey::finite(
+            n < 0,
+            NumericKey::digits_of_u128(n.unsigned_abs()),
+            0,
+        ))
     }
 
     pub fn from_value(v: &Value<'_>) -> Option<Self> {
@@ -2344,7 +2603,33 @@ impl IndexKey {
             // v7.17.0 Phase 3.P0-39: hstore is NOT indexable in
             // v7.17.0 — map columns need GIN with bespoke ops.
             Value::Hstore(_) => None,
-            Value::NumericBig(_) => None,
+            // r1039 — exact decimals index through the canonical
+            // [`NumericKey`], which is what makes `1.5` and `1.50` one key.
+            Value::NumericBig(b) => {
+                let (neg, limbs, scale) = b.parts();
+                Some(Self::Numeric(NumericKey::finite(
+                    neg,
+                    NumericKey::digits_of_limbs(limbs),
+                    i32::from(scale),
+                )))
+            }
+            Value::Numeric {
+                scaled,
+                scale,
+                kind,
+            } => Some(Self::Numeric(match kind {
+                NumericKind::Finite => NumericKey::finite(
+                    *scaled < 0,
+                    NumericKey::digits_of_u128(scaled.unsigned_abs()),
+                    i32::from(*scale),
+                ),
+                NumericKind::NaN => NumericKey::special(NUM_CLASS_NAN),
+                NumericKind::PosInf => NumericKey::special(NUM_CLASS_POS_INF),
+                NumericKind::NegInf => NumericKey::special(NUM_CLASS_NEG_INF),
+            })),
+            // r1039 — bytea orders by plain byte comparison, which is
+            // `Vec<u8>`'s own.
+            Value::Bytes(b) => Some(Self::Bytes(b.to_vec())),
             // v7.17.0 Phase 3.P0-40: 2D arrays aren't indexable.
             Value::IntArray2D(_)
             | Value::BigIntArray2D(_)
@@ -2406,19 +2691,16 @@ impl IndexKey {
             | Value::RegClass(..)
             | Value::RegProc(..)
             | Value::RegType(..) => None,
-            // Numeric isn't (yet) indexable — exact-decimal index keys
-            // would need a stable scale-normalised representation.
-            // Interval isn't index-eligible either (and can't reach this
-            // path through column storage anyway).
+            // Interval isn't index-eligible (and can't reach this path
+            // through column storage anyway). Float / Real stay out
+            // because `f64` is only `PartialOrd`.
             Value::Null
             | Value::Float(_)
             | Value::Vector(_)
             | Value::Sq8Vector(_)
             | Value::HalfVector(_)
-            | Value::Numeric { .. }
             | Value::Interval { .. }
             | Value::Json(_)
-            | Value::Bytes(_)
             | Value::TextArray(_)
             | Value::IntArray(_)
             | Value::BigIntArray(_)
@@ -7544,11 +7826,15 @@ fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
         // and lookup — using cast_unsigned keeps both sides honest
         // and silences clippy::cast_sign_loss.
         IndexKey::Int(n) => Some(n.cast_unsigned()),
-        // Text / Bool / Uuid PKs aren't representable as u64 and so
-        // can't participate in the u64-sorted cold-tier segment
-        // PK layout. Same deferral story as Text — lookup falls
+        // Text / Bool / Uuid / Bytes / Numeric PKs aren't representable
+        // as u64 and so can't participate in the u64-sorted cold-tier
+        // segment PK layout. Same deferral story as Text — lookup falls
         // through the in-memory btree.
-        IndexKey::Text(_) | IndexKey::Bool(_) | IndexKey::Uuid(_) => None,
+        IndexKey::Text(_)
+        | IndexKey::Bool(_)
+        | IndexKey::Uuid(_)
+        | IndexKey::Bytes(_)
+        | IndexKey::Numeric(_) => None,
     }
 }
 
@@ -8039,7 +8325,12 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// the EXCLUDE appendix. A v72 reader stops before it; its columns read
 /// back with no RESTART floor, losing only an un-consumed
 /// `ALTER … RESTART WITH` across a restart.
-const FILE_VERSION: u8 = 89;
+/// r1039 — v90 adds index-key tags 4 (bytea) and 5 (the canonical
+/// numeric key), so BYTEA and NUMERIC columns carry a real B-tree
+/// instead of falling back to a scan. A v89 reader meeting either tag
+/// reports a corrupt catalog rather than mis-reading it, which is the
+/// same forward-compatibility story tag 3 (uuid) had at v36.
+const FILE_VERSION: u8 = 90;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -8068,6 +8359,13 @@ const INDEX_KEY_TAG_BOOL: u8 = 2;
 /// (RFC 4122 byte order). Persisted only in FILE_VERSION 36+
 /// catalogs.
 const INDEX_KEY_TAG_UUID: u8 = 3;
+/// r1039 — `IndexKey::Bytes`. Body = [u32 LE len][raw bytes].
+/// Persisted only in FILE_VERSION 90+ catalogs.
+const INDEX_KEY_TAG_BYTES: u8 = 4;
+/// r1039 — `IndexKey::Numeric`. Body = [u8 class][u8 neg][i32 LE exp]
+/// [u32 LE digit count][one byte per decimal digit, 0..=9, MSD first].
+/// Persisted only in FILE_VERSION 90+ catalogs.
+const INDEX_KEY_TAG_NUMERIC: u8 = 5;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
