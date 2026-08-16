@@ -4746,6 +4746,11 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // v7.39 (read01 round 89) — a missing index is PG's 42704
             // UNDEFINED_OBJECT (DROP INDEX / pg_get_indexdef on a bad name).
             || (msg.contains("index \"") && msg.contains("\" does not exist"))
+            // r1038 — so is an operator class CREATE INDEX names and
+            // pg_opclass does not have. Verified against PG18.4:
+            // `operator class "weird_garbage" does not exist for access
+            // method "gin"`, 42704.
+            || msg.contains("operator class \"")
         {
             "42704"
         // v7.39 (read01 round 89) — a column named twice in an INSERT target

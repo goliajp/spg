@@ -2335,6 +2335,23 @@ impl Engine {
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        // r1038 — an operator class that does not exist is refused here,
+        // with PG's wording and its access method.
+        //
+        // The parser recognises an opclass by its position, so it no longer
+        // rejects an unknown NAME as a syntax error the way its old
+        // eighteen-name whitelist did as a side effect. That whitelist was
+        // the sentori defect (`jsonb_path_ops` is ordinary PG and did not
+        // parse); the refusal it was also doing belongs here, where the
+        // access method is known and the error can carry it.
+        if let Some(op) = &stmt.opclass
+            && !crate::opclass::exists_for_access_method(op, stmt.method_name.as_deref())
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "operator class {op:?} does not exist for access method {:?}",
+                stmt.method_name.as_deref().unwrap_or("btree")
+            )));
+        }
         // v7.39 (round 475) — an expression key a method cannot take is
         // refused BEFORE anything is built.
         //
@@ -3510,6 +3527,7 @@ impl Engine {
                         extra_columns: Vec::new(),
                         is_unique: idx.is_unique,
                         opclass: None,
+                        method_name: None,
                     });
                 }
             }

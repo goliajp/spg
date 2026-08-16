@@ -70,6 +70,7 @@ mod maintenance;
 pub mod memoize;
 mod notify;
 mod numeric;
+mod opclass;
 mod orderby;
 mod partition;
 pub(crate) mod partition_walks;

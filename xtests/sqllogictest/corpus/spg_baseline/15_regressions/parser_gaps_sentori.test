@@ -1,0 +1,139 @@
+# Three parser gaps a real PostgreSQL migration hit (r1038, sentori).
+#
+# Each was accepted in one position and refused in a neighbouring one,
+# which is the shape that makes a migration fail on a line nobody thinks
+# is interesting:
+#
+#   - a string literal continued on the next line (SQL-standard implicit
+#     concatenation) — they hit it in a COMMENT ON
+#   - `USING gin (col jsonb_path_ops)` — `USING gin (col)` already parsed,
+#     only the operator-class name did not
+#   - `RETURNS bigint[]` — an array COLUMN type already parsed; the return
+#     position did not, and this one stopped a migration outright
+
+statement ok
+CREATE TABLE pg_gap (id INT PRIMARY KEY, doc JSONB, tags BIGINT[])
+
+# --- implicit concatenation ---
+#
+# Two literals separated by whitespace containing a NEWLINE are one
+# literal. The newline is required: `'a' 'b'` on one line stays an error,
+# which is what tells a continued literal from a missing comma.
+
+query T
+SELECT 'first part '
+'second part'
+----
+first part second part
+
+statement ok
+COMMENT ON TABLE pg_gap IS 'a comment continued '
+'onto the next line'
+
+query T
+SELECT 'a'
+'b'
+'c'
+----
+abc
+
+# Concatenation only joins string literals; a literal beside a column is
+# still two things.
+query T
+SELECT 'x' || 'y'
+----
+xy
+
+# Same line: still an error. That is the line PG draws, and it is what
+# separates a continued literal from a missing comma.
+statement error
+SELECT 'a' 'b'
+
+# A line comment between them counts, and so does the newline that ends
+# it — PG18.4 answers `ab` here, measured.
+query T
+SELECT 'a' -- a comment in the middle
+'b'
+----
+ab
+
+# A BLOCK comment does not, even when it contains a newline. PG18.4:
+# syntax error for both of these.
+statement error
+SELECT 'a' /* c */ 'b'
+
+# An `E'…'` may LEAD a continued literal…
+query T
+SELECT E'a'
+'b'
+----
+ab
+
+# …but may not continue one: PG rejects `'a' <newline> E'b'`.
+statement error
+SELECT 'a'
+E'b'
+
+# --- operator class on a GIN index key ---
+
+statement ok
+CREATE INDEX pg_gap_doc_path ON pg_gap USING gin (doc jsonb_path_ops)
+
+# The form that already worked, kept as the control.
+statement ok
+CREATE INDEX pg_gap_doc_plain ON pg_gap USING gin (doc)
+
+# The index has to WORK, not merely parse.
+statement ok
+INSERT INTO pg_gap (id, doc, tags) VALUES (1, '{"a": 1}', ARRAY[10, 20])
+
+query I
+SELECT count(*) FROM pg_gap WHERE doc @> '{"a": 1}'
+----
+1
+
+# An operator class on a plain btree key parses by position too.
+statement ok
+CREATE INDEX pg_gap_id_ops ON pg_gap (id int4_ops)
+
+# …including one the old whitelist never held, and with a sort direction
+# after it. `date_ops DESC` is ordinary PG18.4; the first version of the
+# positional rule looked for an identifier spelled "desc", which the lexer
+# never produces, so this shape went on failing.
+statement ok
+CREATE TABLE pg_gap_d (d DATE)
+
+statement ok
+CREATE INDEX pg_gap_d_ops ON pg_gap_d (d date_ops DESC)
+
+statement ok
+CREATE INDEX pg_gap_d_ops2 ON pg_gap_d (d date_ops NULLS FIRST)
+
+# Recognising an opclass by position must not make every identifier one.
+# PG: operator class "weird_garbage" does not exist for access method "btree"
+statement error
+CREATE INDEX pg_gap_bad ON pg_gap_d (d weird_garbage)
+
+# A real class, but not of the access method named. PG refuses this too.
+statement error
+CREATE INDEX pg_gap_bad2 ON pg_gap USING gin (doc int4_ops)
+
+statement ok
+DROP TABLE pg_gap_d
+
+# --- array return type ---
+
+statement ok
+CREATE FUNCTION pg_gap_ids() RETURNS bigint[] LANGUAGE sql AS $$ SELECT ARRAY[1, 2] $$
+
+statement ok
+CREATE FUNCTION pg_gap_texts() RETURNS text[] LANGUAGE sql AS $$ SELECT ARRAY['a'] $$
+
+statement ok
+DROP FUNCTION pg_gap_texts
+
+statement ok
+DROP FUNCTION pg_gap_ids
+
+statement ok
+DROP TABLE pg_gap
