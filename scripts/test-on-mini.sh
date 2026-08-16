@@ -46,6 +46,12 @@ RDIR="${SPG_MINI_DIR:-workspace/goliajp/spg-ci}"
 REMOTE_LOG=/tmp/spg-gate.log
 REMOTE_DONE=/tmp/spg-gate.done
 
+# `--prev` reads the log the run before this one left behind.
+if [[ "$1" == "--prev" ]]; then
+    ssh "$HOST" "tail -40 '$REMOTE_LOG.prev' 2>/dev/null || echo 'no previous log'"
+    exit $?
+fi
+
 if [[ "$1" == "--result" ]]; then
     ssh "$HOST" "
         if [ -f '$REMOTE_DONE' ]; then
