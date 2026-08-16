@@ -42,6 +42,7 @@ mod cancel;
 mod clock;
 mod collate;
 mod collate_derive;
+mod constfold;
 mod constraints;
 mod conversions;
 pub mod copy;

@@ -163,6 +163,7 @@ mod e2e_connective_shortcircuit_round621;
 mod e2e_const_fold_round605;
 mod e2e_constant_answers_round518;
 mod e2e_constant_answers_round520;
+mod e2e_constant_fold_r1042;
 mod e2e_constraintdef_pretty_round311;
 mod e2e_constraintdef_round290;
 mod e2e_convert_from_to;

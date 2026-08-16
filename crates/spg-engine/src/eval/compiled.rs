@@ -1833,7 +1833,7 @@ pub(crate) fn constant_projection_value(e: &Expr, ctx: &EvalContext<'_>) -> Opti
 /// An allowlist of node kinds, for the reason rounds 590 and 596 recorded:
 /// asking "does it mention a column" would admit a node the walk did not
 /// know about, and a function whose volatility SPG cannot look up.
-fn constant_expr(e: &Expr) -> bool {
+pub(crate) fn constant_expr(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) => true,
         Expr::Array(items) => items.iter().all(constant_expr),

@@ -444,6 +444,11 @@ impl Engine {
             self.backslash_escapes,
             now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
         );
+        // r1042 — evaluate the constant parts of every predicate once,
+        // here, instead of once per row. A cast on a literal is the
+        // common case and it was costing an index seek: `WHERE id = 7`
+        // sought and `WHERE id = 7::int` scanned, 23x apart at 400k rows.
+        crate::constfold::fold_statement(&mut stmt);
         if let Statement::Select(s) = &mut stmt {
             // v6.4.1 — expand `GROUP BY ALL` to every non-aggregate
             // SELECT-list item BEFORE position / alias resolution so
