@@ -1682,6 +1682,10 @@ impl Parser {
                     }
                     ty.push_str(&buf);
                 }
+                // r1049 — `PREPARE p(bigint[]) AS …`: the sixth `[]`
+                // position, same family as the parameter list above.
+                let array_suffix = self.consume_array_suffix();
+                ty.push_str(&array_suffix);
                 param_types.push(ty);
                 match self.peek() {
                     Token::Comma => {
@@ -5268,12 +5272,21 @@ impl Parser {
                 // 18.4 — but SPG raised `syntax error at or near "("`,
                 // because the modifier's parens were never consumed.
                 self.skip_type_modifier();
+                // r1049 — `f(v bigint[])`. The array suffix parsed in
+                // the column position, the cast position and (r1038)
+                // the RETURNS position, but not here: the fifth
+                // member of the same family, reported by sentori as
+                // presumably the same code. It is now.
+                let array_suffix = self.consume_array_suffix();
                 let whole = words.join(" ");
-                if words.len() >= 2 && !is_multiword_type_phrase(&whole) {
+                let (name, mut ty_token) = if words.len() >= 2 && !is_multiword_type_phrase(&whole)
+                {
                     (Some(words[0].clone()), words[1..].join(" "))
                 } else {
                     (None, whole)
-                }
+                };
+                ty_token.push_str(&array_suffix);
+                (name, ty_token)
             };
             // Type — try to map to ColumnTypeName, else Raw.
             let ty = match map_type_ident_to_column_type_name(&ty_token) {

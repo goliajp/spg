@@ -3553,15 +3553,156 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value<'sta
             b.copy_from_slice(bytes);
             Ok(Value::Uuid(b))
         }
-        0 => Err(
-            "Bind: binary format requires the parameter OID to be declared in Parse \
-             (got OID=0 meaning unknown)"
-                .into(),
-        ),
-        _ => Err(format!(
-            "Bind: binary format for OID {oid} not supported in v6.3.4"
-        )),
+        // r1049 — json (114) / bpchar (1042): the binary format IS the
+        // UTF-8 text, same as the text family above.
+        114 | 1042 => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| "Bind binary JSON/BPCHAR: invalid UTF-8".to_string())?;
+            Ok(Value::text(s))
+        }
+        // r1049 — jsonb: one version byte (must be 1), then the JSON
+        // text. sqlx encodes every `Json<T>` parameter this way and
+        // binds in binary by default, so a driver-bound jsonb column
+        // was unreachable without this arm — sentori's suite stopped
+        // on its FOURTH step (ingest) for exactly this.
+        3802 => {
+            match bytes.first() {
+                Some(1) => {}
+                v => {
+                    return Err(format!(
+                        "Bind binary JSONB: unsupported jsonb version {v:?} (expected 1)"
+                    ));
+                }
+            }
+            let s = std::str::from_utf8(&bytes[1..])
+                .map_err(|_| "Bind binary JSONB: invalid UTF-8".to_string())?;
+            Ok(Value::text(s))
+        }
+        // r1049 — arrays. Every array whose ELEMENT this decoder
+        // handles is decoded element-by-element and re-rendered as the
+        // `{…}` text literal a text-format driver would have sent, so
+        // both formats funnel into the same coercion boundary and
+        // cannot disagree.
+        _ => match array_element_oid(oid) {
+            Some(elem) => decode_binary_array(elem, bytes),
+            None if oid == 0 => Err(
+                "Bind: binary format requires the parameter OID to be declared in Parse \
+                 (got OID=0 meaning unknown)"
+                    .into(),
+            ),
+            None => Err(format!("Bind: binary format for OID {oid} not supported")),
+        },
     }
+}
+
+/// r1049 — the element OID of a supported array type, `None` for
+/// everything that is not an array this decoder can take element-wise.
+const fn array_element_oid(array_oid: u32) -> Option<u32> {
+    Some(match array_oid {
+        1000 => 16,   // _bool
+        1001 => 17,   // _bytea
+        1005 => 21,   // _int2
+        1007 => 23,   // _int4
+        1016 => 20,   // _int8
+        1009 => 25,   // _text
+        1014 => 1042, // _bpchar
+        1015 => 1043, // _varchar
+        1021 => 700,  // _float4
+        1022 => 701,  // _float8
+        1182 => 1082, // _date
+        1115 => 1114, // _timestamp
+        1185 => 1184, // _timestamptz
+        1231 => 1700, // _numeric
+        1187 => 1186, // _interval
+        2951 => 2950, // _uuid
+        199 => 114,   // _json
+        3807 => 3802, // _jsonb
+        _ => return None,
+    })
+}
+
+/// r1049 — PG array binary format: `i32 ndim; i32 hasnull; u32 elem_oid;
+/// { i32 len; i32 lower_bound } × ndim; { i32 len; bytes } × elements`,
+/// element length -1 meaning NULL, each element in ITS binary format.
+///
+/// The result is the `{…}` TEXT literal for the same array, built with
+/// the engine's own text rendering — the form the engine's coercion
+/// boundary already parses from text-format drivers and psql, so the
+/// binary path cannot mean something the text path does not.
+fn decode_binary_array(elem_oid: u32, bytes: &[u8]) -> Result<spg_storage::Value<'static>, String> {
+    if bytes.len() < 12 {
+        return Err("Bind binary ARRAY: header truncated".into());
+    }
+    let ndim = i32::from_be_bytes(bytes[0..4].try_into().unwrap());
+    let wire_elem = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+    if wire_elem != elem_oid {
+        return Err(format!(
+            "Bind binary ARRAY: payload element OID {wire_elem} does not match \
+             the declared array's element OID {elem_oid}"
+        ));
+    }
+    if ndim == 0 {
+        return Ok(spg_storage::Value::text("{}"));
+    }
+    if ndim != 1 {
+        return Err(format!(
+            "Bind binary ARRAY: {ndim}-dimensional arrays are not supported (1-D only)"
+        ));
+    }
+    if bytes.len() < 20 {
+        return Err("Bind binary ARRAY: dimension header truncated".into());
+    }
+    let count = i32::from_be_bytes(bytes[12..16].try_into().unwrap());
+    // bytes[16..20] is the lower bound; PG keeps custom subscripts, SPG's
+    // value space does not, and the elements are what the value means.
+    let count = usize::try_from(count).map_err(|_| "Bind binary ARRAY: negative element count")?;
+    let mut cur = 20usize;
+    let mut lit = String::from("{");
+    for i in 0..count {
+        if i > 0 {
+            lit.push(',');
+        }
+        if cur + 4 > bytes.len() {
+            return Err("Bind binary ARRAY: element length truncated".into());
+        }
+        let len = i32::from_be_bytes(bytes[cur..cur + 4].try_into().unwrap());
+        cur += 4;
+        if len < 0 {
+            lit.push_str("NULL");
+            continue;
+        }
+        let len = len as usize;
+        if cur + len > bytes.len() {
+            return Err("Bind binary ARRAY: element value truncated".into());
+        }
+        let v = decode_binary_param(elem_oid, &bytes[cur..cur + len])?;
+        cur += len;
+        push_array_element_text(&mut lit, &spg_engine::eval::value_to_text(&v));
+    }
+    lit.push('}');
+    Ok(spg_storage::Value::text(lit))
+}
+
+/// Append one element to a `{…}` literal under PG's quoting rules: an
+/// element is quoted when empty, when it spells NULL, or when it holds
+/// a character the array syntax owns; `"` and `\` escape with `\`.
+fn push_array_element_text(lit: &mut String, s: &str) {
+    let needs_quote = s.is_empty()
+        || s.eq_ignore_ascii_case("null")
+        || s.bytes()
+            .any(|b| matches!(b, b'{' | b'}' | b',' | b'"' | b'\\') || b.is_ascii_whitespace());
+    if !needs_quote {
+        lit.push_str(s);
+        return;
+    }
+    lit.push('"');
+    for ch in s.chars() {
+        if ch == '"' || ch == '\\' {
+            lit.push('\\');
+        }
+        lit.push(ch);
+    }
+    lit.push('"');
 }
 
 /// PG binary NUMERIC: `i16 ndigits; i16 weight; i16 sign; i16 dscale;
@@ -7681,6 +7822,43 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
         Value::UuidArray(items) => put(&binary_array(items, 2950, |v, b| {
             b.extend_from_slice(&v[..]);
         })),
+        // r1049 — the array variants the first cut left to the error
+        // arm. sentori's suite binds jsonb and arrays through sqlx,
+        // which asks for binary RESULTS wherever it binds binary
+        // parameters, so the two sides have to cover the same types.
+        Value::VarcharArray(items) => put(&binary_array(items, 1043, |v, b| {
+            b.extend_from_slice(v.as_bytes());
+        })),
+        Value::CharArray(items) => put(&binary_array(items, 1042, |v, b| {
+            b.extend_from_slice(v.as_bytes());
+        })),
+        Value::JsonArray(items) => put(&binary_array(items, 114, |v, b| {
+            b.extend_from_slice(v.as_bytes());
+        })),
+        Value::JsonbArray(items) => put(&binary_array(items, 3802, |v, b| {
+            b.push(1); // jsonb version byte
+            b.extend_from_slice(v.as_bytes());
+        })),
+        Value::BytesArray(items) => put(&binary_array(items, 17, |v, b| {
+            b.extend_from_slice(v);
+        })),
+        Value::NumericArray(items) => put(&binary_array(items, 1700, |&(scaled, scale), b| {
+            b.extend_from_slice(&numeric_binary(scaled, scale));
+        })),
+        Value::DateArray(items) => put(&binary_array(items, 1082, |v, b| {
+            b.extend_from_slice(&(v - PG_EPOCH_DAYS).to_be_bytes());
+        })),
+        Value::TimestampArray(items) => put(&binary_array(items, 1114, |v, b| {
+            b.extend_from_slice(&(v - PG_EPOCH_MICROS).to_be_bytes());
+        })),
+        Value::TimestamptzArray(items) => put(&binary_array(items, 1184, |v, b| {
+            b.extend_from_slice(&(v - PG_EPOCH_MICROS).to_be_bytes());
+        })),
+        Value::IntervalArray(items) => put(&binary_array(items, 1186, |v, b| {
+            b.extend_from_slice(&v.micros.to_be_bytes());
+            b.extend_from_slice(&v.days.to_be_bytes());
+            b.extend_from_slice(&v.months.to_be_bytes());
+        })),
         other => {
             return Err(format!(
                 "binary result format not implemented for {:?}",
@@ -9120,5 +9298,139 @@ mod tests {
                 "len={len} must reject (INTERVAL binary is 16 bytes)"
             );
         }
+    }
+
+    // ── r1049 — jsonb / json / array binary Bind ──────────────────
+    //
+    // sentori's second report: sqlx binds composite parameters in
+    // binary by default and the decoder refused OIDs 3802, 1009 and
+    // 1016 — their suite stopped on step four of eighty-six. These
+    // pins are the wire-level halves; the driver-level halves live in
+    // xtests/sqlx-pgwire, which the gate now actually runs.
+
+    #[test]
+    fn decode_binary_jsonb_strips_the_version_byte() {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(br#"{"a":1}"#);
+        let v = decode_binary_param(3802, &bytes).expect("jsonb v1 must decode");
+        assert_eq!(v, spg_storage::Value::text(r#"{"a":1}"#));
+    }
+
+    #[test]
+    fn decode_binary_jsonb_rejects_unknown_version() {
+        for head in [vec![], vec![2u8, b'{']] {
+            let r = decode_binary_param(3802, &head);
+            assert!(r.is_err(), "jsonb version {:?} must reject", head.first());
+        }
+    }
+
+    #[test]
+    fn decode_binary_json_is_the_text() {
+        let v = decode_binary_param(114, br#"{"b":2}"#).expect("json must decode");
+        assert_eq!(v, spg_storage::Value::text(r#"{"b":2}"#));
+    }
+
+    /// Build a 1-D binary array payload the way PG's array_send does.
+    fn wire_array(elem_oid: u32, elems: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1i32.to_be_bytes());
+        b.extend_from_slice(&i32::from(elems.iter().any(Option::is_none)).to_be_bytes());
+        b.extend_from_slice(&elem_oid.to_be_bytes());
+        b.extend_from_slice(&(elems.len() as i32).to_be_bytes());
+        b.extend_from_slice(&1i32.to_be_bytes());
+        for e in elems {
+            match e {
+                None => b.extend_from_slice(&(-1i32).to_be_bytes()),
+                Some(p) => {
+                    b.extend_from_slice(&(p.len() as i32).to_be_bytes());
+                    b.extend_from_slice(p);
+                }
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn decode_binary_bigint_array_renders_the_text_literal() {
+        let bytes = wire_array(
+            20,
+            &[
+                Some(1i64.to_be_bytes().to_vec()),
+                None,
+                Some((-7i64).to_be_bytes().to_vec()),
+            ],
+        );
+        let v = decode_binary_param(1016, &bytes).expect("bigint[] must decode");
+        assert_eq!(v, spg_storage::Value::text("{1,NULL,-7}"));
+    }
+
+    /// The quoting rules carry the whole correctness burden: an element
+    /// with a comma, quote, backslash, brace or space — or one spelling
+    /// NULL, or the empty string — must arrive quoted and escaped
+    /// exactly as PG's array literal syntax reads them back.
+    #[test]
+    fn decode_binary_text_array_quotes_what_needs_quoting() {
+        let elems: Vec<Option<Vec<u8>>> = [
+            "plain",
+            "with,comma",
+            "with \"quote\"",
+            "back\\slash",
+            "",
+            "NULL",
+            "curly{brace}",
+            "two words",
+        ]
+        .iter()
+        .map(|s| Some(s.as_bytes().to_vec()))
+        .collect();
+        let v = decode_binary_param(1009, &wire_array(25, &elems)).expect("text[] must decode");
+        assert_eq!(
+            v,
+            spg_storage::Value::text(
+                r#"{plain,"with,comma","with \"quote\"","back\\slash","","NULL","curly{brace}","two words"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn decode_binary_empty_array_is_empty_braces() {
+        // ndim=0: PG sends just the 12-byte header for '{}'.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0i32.to_be_bytes());
+        b.extend_from_slice(&0i32.to_be_bytes());
+        b.extend_from_slice(&25u32.to_be_bytes());
+        let v = decode_binary_param(1009, &b).expect("empty text[] must decode");
+        assert_eq!(v, spg_storage::Value::text("{}"));
+    }
+
+    #[test]
+    fn decode_binary_array_rejects_multidim_and_wrong_element() {
+        // 2-D refuses honestly rather than flattening.
+        let mut b = Vec::new();
+        b.extend_from_slice(&2i32.to_be_bytes());
+        b.extend_from_slice(&0i32.to_be_bytes());
+        b.extend_from_slice(&25u32.to_be_bytes());
+        b.extend_from_slice(&[0u8; 16]);
+        assert!(decode_binary_param(1009, &b).is_err(), "2-D must reject");
+        // A payload claiming int4 elements inside a text[] declaration.
+        let bytes = wire_array(23, &[Some(1i32.to_be_bytes().to_vec())]);
+        assert!(
+            decode_binary_param(1009, &bytes).is_err(),
+            "element OID mismatch must reject"
+        );
+    }
+
+    #[test]
+    fn decode_binary_uuid_array_round_trips_through_text() {
+        let u = [
+            0x11u8, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 0x11, 0x11, 0x11, 0x11,
+            0x11, 0x11,
+        ];
+        let v = decode_binary_param(2951, &wire_array(2950, &[Some(u.to_vec())]))
+            .expect("uuid[] must decode");
+        assert_eq!(
+            v,
+            spg_storage::Value::text("{11111111-1111-4111-8111-111111111111}")
+        );
     }
 }

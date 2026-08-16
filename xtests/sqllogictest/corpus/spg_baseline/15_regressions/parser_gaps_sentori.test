@@ -135,5 +135,28 @@ DROP FUNCTION pg_gap_texts
 statement ok
 DROP FUNCTION pg_gap_ids
 
+# --- r1049: the array suffix in the two remaining positions ---
+#
+# sentori report 2: the parameter list and the PREPARE type list were
+# the fifth and sixth members of the same `[]` family. PG18.4 accepts
+# both, and EXECUTE answers {1,2}.
+
+statement ok
+CREATE FUNCTION pg_gap_arrparam(v bigint[]) RETURNS int LANGUAGE sql AS $$ SELECT 1 $$
+
+statement ok
+PREPARE pg_gap_pp(bigint[]) AS SELECT $1
+
+query T
+EXECUTE pg_gap_pp('{1,2}')
+----
+{1,2}
+
+statement ok
+DEALLOCATE pg_gap_pp
+
+statement ok
+DROP FUNCTION pg_gap_arrparam
+
 statement ok
 DROP TABLE pg_gap
