@@ -9804,7 +9804,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     match v {
         Value::Bytes(b) => return Ok(OrderKey::Bytes(b.as_ref().to_vec())),
         // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC sorts by exact value.
-        Value::NumericBig(b) => return Ok(OrderKey::BigNum((**b).clone())),
+        Value::NumericBig(b) => return Ok(OrderKey::Numeric(spg_storage::NumericKey::from_big(b))),
         Value::Uuid(u) => return Ok(OrderKey::Bytes(u.to_vec())),
         Value::Macaddr(m) => return Ok(OrderKey::Bytes(m.to_vec())),
         Value::Macaddr8(m) => return Ok(OrderKey::Bytes(m.to_vec())),
@@ -9855,11 +9855,18 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                 .map(|o| o.map_or(OrderKey::NullBig, OrderKey::Num))
                 .collect(),
         ),
+        // r1040 — array elements take the same exact key their scalar
+        // form does; an f64 projection here would order `{0.1}` against
+        // `{0.1000000000000000001}` by luck.
         Value::NumericArray(a) => Some(
             a.iter()
                 .map(|o| {
                     o.map_or_else(inf, |(m, s)| {
-                        OrderKey::Num(crate::orderby::numeric_to_f64(m, s))
+                        OrderKey::Numeric(spg_storage::NumericKey::from_numeric(
+                            m,
+                            s,
+                            spg_storage::NumericKind::Finite,
+                        ))
                     })
                 })
                 .collect(),
@@ -9931,38 +9938,24 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                 "ORDER BY of a 2D array is not supported in v7.17.0".into(),
             ));
         }
-        #[allow(clippy::cast_precision_loss)]
+        // r1039/r1040 — the exact canonical key, not an f64 projection.
+        //
+        // r1039 fixed the three specials, which carry a canonical zero in
+        // `scaled` and so all sorted as the number 0. The projection
+        // itself was the rest of the defect: "precision losses here only
+        // matter for tie-breaks well past 15 significant digits" was the
+        // comment, and the measurement disagreed — f64 called
+        // `0.1` and `0.1000000000000000001` Equal, and a stable sort then
+        // returned them in insertion order. Three of ten values came back
+        // in the wrong place against PG18.4.
         Value::Numeric {
             scaled,
             scale,
             kind,
         } => {
-            // r1039 — a NaN or an ±Infinity carries a CANONICAL ZERO in
-            // `scaled`, so reading only those two fields sorted all three
-            // specials as the number 0: `ORDER BY v` over
-            // `0, NaN, Infinity, -Infinity, 1.5` returned them in that
-            // order — the three specials tied with zero and the stable
-            // sort left them where they were. `OrderKey::Num` already
-            // carries PG's float8 total order (NaN greatest, and it
-            // equals itself), which is also PG's NUMERIC order, so the
-            // specials only had to be spelled as the floats they mean.
-            match kind {
-                spg_storage::NumericKind::NaN => f64::NAN,
-                spg_storage::NumericKind::PosInf => f64::INFINITY,
-                spg_storage::NumericKind::NegInf => f64::NEG_INFINITY,
-                spg_storage::NumericKind::Finite => {
-                    // Scaled integer / 10^scale, computed via f64 for sort
-                    // ordering only. Precision losses here only matter for
-                    // ORDER BY tie-breaks well past 15 significant digits.
-                    // `f64::powi` lives in std; we hand-roll the loop so the
-                    // no_std engine crate doesn't need it.
-                    let mut divisor = 1.0_f64;
-                    for _ in 0..*scale {
-                        divisor *= 10.0;
-                    }
-                    (*scaled as f64) / divisor
-                }
-            }
+            return Ok(OrderKey::Numeric(spg_storage::NumericKey::from_numeric(
+                *scaled, *scale, *kind,
+            )));
         }
         Value::Float(x) => *x,
         // v7.37.16 — REAL sorts by its exact f64 widening (it had no

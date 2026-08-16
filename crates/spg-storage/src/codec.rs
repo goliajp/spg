@@ -3481,13 +3481,14 @@ pub(crate) fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
             out.extend_from_slice(b);
         }
         IndexKey::Numeric(n) => {
-            let (class, neg, exp, digits) = n.parts();
+            let (class, neg, exp) = n.parts();
+            let digits = n.digits();
             out.push(INDEX_KEY_TAG_NUMERIC);
             out.push(class);
             out.push(u8::from(neg));
             out.extend_from_slice(&exp.to_le_bytes());
             write_u32(out, u32::try_from(digits.len()).unwrap_or(u32::MAX));
-            out.extend_from_slice(digits);
+            out.extend_from_slice(&digits);
         }
     }
 }
@@ -3674,7 +3675,7 @@ impl<'a> Cursor<'a> {
                 // Rejected rather than trusted: a non-canonical key would
                 // have an `Eq` and an `Ord` that disagree, and a B-tree
                 // built on one cannot be searched.
-                crate::NumericKey::from_parts(class, neg, exp, digits)
+                crate::NumericKey::from_parts(class, neg, exp, &digits)
                     .map(IndexKey::Numeric)
                     .ok_or_else(|| StorageError::Corrupt("non-canonical numeric index key".into()))
             }

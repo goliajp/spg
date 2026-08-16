@@ -222,3 +222,89 @@ SELECT count(*) FROM dk WHERE d IN ('2026-01-02', '2020-01-01')
 
 statement ok
 DROP TABLE dk
+
+# --- the ORDER BY key is exact too (r1040) ---
+#
+# `OrderKey::Num(f64)` was the sort key for every ordinary NUMERIC, so
+# anything past fifteen significant digits compared Equal and the stable
+# sort returned it in insertion order. Not a tie-break — an answer: three
+# of these ten came back in the wrong place. `OrderKey::Int(i128)` was
+# added in round 664 for the same reason on the integer types.
+#
+# The order below is PG18.4's, read off it.
+
+statement ok
+CREATE TABLE np (id INT PRIMARY KEY, v NUMERIC)
+
+statement ok
+INSERT INTO np VALUES
+ (1, 9007199254740993), (2, 9007199254740992), (3, 9007199254740994),
+ (4, 0.1000000000000000001), (5, 0.1000000000000000002), (6, 0.1),
+ (7, 123456789012345678.9), (8, 123456789012345678.8),
+ (9, -9007199254740993), (10, -9007199254740992)
+
+query T
+SELECT v FROM np ORDER BY v
+----
+-9007199254740993
+-9007199254740992
+0.1
+0.1000000000000000001
+0.1000000000000000002
+9007199254740992
+9007199254740993
+9007199254740994
+123456789012345678.8
+123456789012345678.9
+
+# DESC is the same order reversed, not a different set of ties.
+query T
+SELECT v FROM np WHERE v > 0 AND v < 1 ORDER BY v DESC
+----
+0.1000000000000000002
+0.1000000000000000001
+0.1
+
+# An index on the column must not change any of it.
+statement ok
+CREATE INDEX np_v ON np (v)
+
+query T
+SELECT v FROM np ORDER BY v
+----
+-9007199254740993
+-9007199254740992
+0.1
+0.1000000000000000001
+0.1000000000000000002
+9007199254740992
+9007199254740993
+9007199254740994
+123456789012345678.8
+123456789012345678.9
+
+statement ok
+DROP TABLE np
+
+# Array elements take the same exact key. PG18.4:
+#   {0.1} | {0.1,0.2} | {0.1000000000000000001} | {9007199254740992} | {9007199254740993}
+
+statement ok
+CREATE TABLE na (id INT PRIMARY KEY, a NUMERIC[])
+
+statement ok
+INSERT INTO na VALUES
+ (1, ARRAY[0.1]), (2, ARRAY[0.1000000000000000001]), (3, ARRAY[0.1, 0.2]),
+ (4, ARRAY[9007199254740993]), (5, ARRAY[9007199254740992])
+
+query I
+SELECT id FROM na ORDER BY a
+----
+1
+3
+2
+5
+4
+
+statement ok
+DROP TABLE na
