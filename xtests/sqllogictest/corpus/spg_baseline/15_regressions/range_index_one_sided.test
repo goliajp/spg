@@ -1,0 +1,202 @@
+# One-sided range predicates reach an index (r1035, reported by mailrs).
+#
+# `col <= x` on its own used to be refused by the range planner — only a
+# two-sided BETWEEN was accepted — so a sparse indexed column was scanned in
+# full. The measurement is in the perf probe; what is pinned here is that
+# the ANSWERS are right, because the seek returns a superset and the caller
+# re-applies the predicate. If that re-application ever stops happening,
+# these go red rather than merely slow.
+#
+# The NULL cases are the sharp ones: NULLs are not in the index at all, and
+# a range walk must not invent them or drop non-NULL rows.
+
+statement ok
+CREATE TABLE osr (id INT PRIMARY KEY, sched BIGINT, tag TEXT NOT NULL)
+
+statement ok
+CREATE INDEX osr_sched ON osr (sched)
+
+statement ok
+INSERT INTO osr VALUES
+ (1, 100,  'a'),
+ (2, 200,  'b'),
+ (3, NULL, 'c'),
+ (4, 300,  'd'),
+ (5, NULL, 'e'),
+ (6, 400,  'f'),
+ (7, 250,  'g')
+
+# Upper bound alone.
+query I
+SELECT id FROM osr WHERE sched <= 250 ORDER BY id
+----
+1
+2
+7
+
+# Lower bound alone.
+query I
+SELECT id FROM osr WHERE sched > 250 ORDER BY id
+----
+4
+6
+
+# Strict and non-strict differ by exactly the boundary row.
+query I
+SELECT id FROM osr WHERE sched < 200 ORDER BY id
+----
+1
+
+query I
+SELECT id FROM osr WHERE sched >= 400 ORDER BY id
+----
+6
+
+# The reported shape: a residual conjunct beside the range. `IS NOT NULL`
+# used to make the whole predicate unparseable.
+query I
+SELECT id FROM osr WHERE sched IS NOT NULL AND sched <= 300 ORDER BY sched LIMIT 2
+----
+1
+2
+
+# A residual that actually removes rows — the seek returns a superset and
+# the caller must apply this.
+query I
+SELECT id FROM osr WHERE sched <= 400 AND tag <> 'b' ORDER BY id
+----
+1
+4
+6
+7
+
+# Two bounds on the same column, given as separate conjuncts: they tighten
+# rather than one of them being dropped.
+query I
+SELECT id FROM osr WHERE sched >= 200 AND sched <= 300 ORDER BY id
+----
+2
+4
+7
+
+# The same range, written the other way round.
+query I
+SELECT id FROM osr WHERE sched <= 300 AND sched >= 200 ORDER BY id
+----
+2
+4
+7
+
+# Ranges on two different columns at once.
+query I
+SELECT id FROM osr WHERE sched <= 400 AND id >= 4 ORDER BY id
+----
+4
+6
+7
+
+# NULLs are not in the index and must not appear for any range.
+query I
+SELECT count(*) FROM osr WHERE sched <= 999999
+----
+5
+
+query I
+SELECT count(*) FROM osr WHERE sched >= -999999
+----
+5
+
+# A range that matches nothing.
+query I
+SELECT count(*) FROM osr WHERE sched < 100
+----
+0
+
+# count(*) answers from the index alone; a residual conjunct must still be
+# applied rather than tallied away.
+query I
+SELECT count(*) FROM osr WHERE sched <= 400 AND tag <> 'b'
+----
+4
+
+# The mutation path takes the same parse.
+statement ok
+UPDATE osr SET tag = 'moved' WHERE sched <= 200
+
+query IT
+SELECT id, tag FROM osr ORDER BY id
+----
+1
+moved
+2
+moved
+3
+c
+4
+d
+5
+e
+6
+f
+7
+g
+
+statement ok
+DELETE FROM osr WHERE sched > 300
+
+# Only id 6 (sched 400) goes. id 4 is sched 300 and the bound is strict —
+# the first version of this pin expected it deleted, which was a hand-
+# computed answer, not a measured one. PG18.4 on the same sequence:
+# `DELETE 1`, leaving 1 2 3 4 5 7.
+query I
+SELECT id FROM osr ORDER BY id
+----
+1
+2
+3
+4
+5
+7
+
+statement ok
+DROP TABLE osr
+
+# --- an equality beside a range keeps the equality's seek (r1038) ---
+#
+# Making one-sided ranges seekable put the range attempt AHEAD of the AND
+# recursion that finds equalities. A range passing the quarter-of-the-table
+# cap would then outrank a seek returning one row: measured in
+# `probe_mixed_predicate`, `WHERE id = 7 AND ts > <top tenth>` went linear
+# in table size (0.133 ms at 20k -> 1.059 ms at 160k) while the equality
+# alone stayed at 0.001 ms.
+#
+# Witnessed by rows FETCHED THROUGH AN INDEX rather than by a clock: the
+# equality fetches one row, the range walk fetches every row above the
+# bound. A timing assertion would pin nothing on a busy machine.
+
+statement ok
+CREATE TABLE mixp (id INT PRIMARY KEY, sched BIGINT NOT NULL)
+
+statement ok
+CREATE INDEX mixp_sched ON mixp (sched)
+
+statement ok
+INSERT INTO mixp SELECT g, g FROM generate_series(1, 400) g
+
+query I
+SELECT idx_tup_fetch FROM pg_stat_user_tables WHERE relname = 'mixp'
+----
+0
+
+query I
+SELECT id FROM mixp WHERE id = 350 AND sched > 300
+----
+350
+
+query I
+SELECT idx_tup_fetch FROM pg_stat_user_tables WHERE relname = 'mixp'
+----
+1
+
+statement ok
+DROP TABLE mixp
