@@ -233,7 +233,13 @@ fn render_cell(v: &Value, ty: char) -> String {
                 .collect();
             format!("[{}]", cells.join(","))
         }
-        Value::Numeric { scaled, scale, .. } => spg_engine::eval::format_numeric(*scaled, *scale),
+        // r1039 — through the engine's own renderer, which knows the
+        // three NUMERIC specials. Reading `scaled` and `scale` and
+        // dropping `kind` printed a stored `'NaN'::numeric` as `0`,
+        // because a special carries a canonical zero in those fields —
+        // the harness could not express a value the engine stores
+        // correctly, so a corpus file could not pin one.
+        v @ Value::Numeric { .. } => spg_engine::eval::value_to_text(v),
         Value::Date(d) => spg_engine::eval::format_date(*d),
         Value::Timestamp(t) => spg_engine::eval::format_timestamp(*t),
         // v7.17.0 Phase 3.P0-32 — PG TIME canonical text form.

@@ -1,0 +1,224 @@
+# NUMERIC and BYTEA columns carry a real index (r1039).
+#
+# They had no `IndexKey`, so every seek on them declined and the planner
+# scanned. Giving them one is a performance change, but the thing that
+# has to be pinned is that it is ONLY a performance change: an index may
+# never alter an answer.
+#
+# Every expectation below was read off PostgreSQL 18.4, not computed by
+# hand — including the ordering of the three NUMERIC specials, which is
+# the part that is easy to get wrong.
+#
+# The NUMERIC key is canonical: `1.5`, `1.50` and `1.500` are one value in
+# SQL and must be one key, or `WHERE n = 1.5` would miss a row stored as
+# `1.50`.
+
+statement ok
+CREATE TABLE nk (id INT PRIMARY KEY, v NUMERIC)
+
+statement ok
+INSERT INTO nk VALUES
+ (1, 1.5), (2, 1.50), (3, 1.500),
+ (4, 2), (5, 2.0),
+ (6, -1.5), (7, -2),
+ (8, 0), (9, 0.0), (10, 0.001), (11, 1000000),
+ (12, 'NaN'), (13, 'Infinity'), (14, '-Infinity')
+
+statement ok
+CREATE INDEX nk_v ON nk (v)
+
+# One value at three scales is one key.
+query I
+SELECT id FROM nk WHERE v = 1.5 ORDER BY id
+----
+1
+2
+3
+
+# An INTEGER literal against a NUMERIC column: the conversion is exact,
+# so it must find the row rather than seek in the integer key space.
+query I
+SELECT id FROM nk WHERE v = 2 ORDER BY id
+----
+4
+5
+
+query I
+SELECT id FROM nk WHERE v = 0 ORDER BY id
+----
+8
+9
+
+# NaN and +Infinity are both greater than every finite value, so they are
+# in this answer; -Infinity is not.
+query I
+SELECT id FROM nk WHERE v > 1.5 ORDER BY id
+----
+4
+5
+11
+12
+13
+
+query I
+SELECT id FROM nk WHERE v < 0 ORDER BY id
+----
+6
+7
+14
+
+# BETWEEN excludes all three specials.
+query I
+SELECT id FROM nk WHERE v BETWEEN -2 AND 2 ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+query I
+SELECT id FROM nk WHERE v IN (1.5, -2, 0.001) ORDER BY id
+----
+1
+2
+3
+7
+10
+
+# PG18.4's order, verbatim: -Infinity < finite < Infinity < NaN.
+query T
+SELECT v FROM nk ORDER BY v, id
+----
+-Infinity
+-2
+-1.5
+0
+0.0
+0.001
+1.5
+1.50
+1.500
+2
+2.0
+1000000
+Infinity
+NaN
+
+statement ok
+DROP TABLE nk
+
+# --- bytea ---
+#
+# PG orders bytea by plain byte comparison, shorter prefix first.
+
+statement ok
+CREATE TABLE bk (id INT PRIMARY KEY, v BYTEA)
+
+statement ok
+INSERT INTO bk VALUES (1, ''), (2, '\x00'), (3, '\x0000'), (4, '\x01ff'), (5, '\xff'), (6, '\xdead')
+
+statement ok
+CREATE INDEX bk_v ON bk (v)
+
+query I
+SELECT id FROM bk WHERE v = '\x00'::bytea ORDER BY id
+----
+2
+
+query I
+SELECT id FROM bk WHERE v > '\x00'::bytea ORDER BY id
+----
+3
+4
+5
+6
+
+query I
+SELECT id FROM bk WHERE v BETWEEN '\x00'::bytea AND '\x01ff'::bytea ORDER BY id
+----
+2
+3
+4
+
+query I
+SELECT id FROM bk WHERE v IN ('\xff'::bytea, ''::bytea) ORDER BY id
+----
+1
+5
+
+query T
+SELECT encode(v, 'hex') FROM bk ORDER BY v, id
+----
+(empty)
+00
+0000
+01ff
+dead
+ff
+
+statement ok
+DROP TABLE bk
+
+# --- uniqueness uses the same canonical key ---
+#
+# PG18.4 on the same three inserts: the second is
+#   duplicate key value violates unique constraint "uq_v_key"
+#   DETAIL:  Key (v)=(1.50) already exists.
+# and the third is accepted.
+
+statement ok
+CREATE TABLE uq (v NUMERIC UNIQUE)
+
+statement ok
+INSERT INTO uq VALUES (1.5)
+
+statement error
+INSERT INTO uq VALUES (1.50)
+
+statement ok
+INSERT INTO uq VALUES (1.6)
+
+statement ok
+DROP TABLE uq
+
+# --- the IN-list seek reads its literals as the column's type ---
+#
+# The fourth copy of the round-564 decision. Before r1039, one row in the
+# table either way: `WHERE d = '2026-01-02'` answered 1 with or without an
+# index, and `WHERE d IN ('2026-01-02')` answered 1 without and 0 WITH.
+
+statement ok
+CREATE TABLE dk (id INT PRIMARY KEY, d DATE, u UUID)
+
+statement ok
+INSERT INTO dk VALUES (1, '2026-01-02', '11111111-1111-4111-8111-111111111111')
+
+statement ok
+CREATE INDEX dk_d ON dk (d)
+
+statement ok
+CREATE INDEX dk_u ON dk (u)
+
+query I
+SELECT count(*) FROM dk WHERE d IN ('2026-01-02')
+----
+1
+
+query I
+SELECT count(*) FROM dk WHERE u IN ('11111111-1111-4111-8111-111111111111')
+----
+1
+
+query I
+SELECT count(*) FROM dk WHERE d IN ('2026-01-02', '2020-01-01')
+----
+1
+
+statement ok
+DROP TABLE dk
