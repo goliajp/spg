@@ -1661,10 +1661,22 @@ impl Engine {
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
             let mut left_matched = false;
-            if let Some(kv) = tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos0)
-                && !matches!(kv, Value::Null)
-                && let Some(key) = spg_storage::IndexKey::from_value(kv)
-            {
+            // r1036 — a key this index cannot represent is NOT a miss.
+            // `IndexKey` has Int, Text, Bool and Uuid and nothing else, so
+            // a `bytea` or `numeric` join key produced `None` here, fell
+            // past the `if let`, and left the row unmatched: an inner join
+            // silently dropped every row rather than answering. Hand the
+            // whole stage back instead, and let the hash join — which
+            // compares values rather than index keys — take it.
+            let probe_key = match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos0) {
+                Some(Value::Null) => None,
+                Some(kv) => match spg_storage::IndexKey::from_value(kv) {
+                    Some(k) => Some(k),
+                    None => return Ok(false),
+                },
+                None => None,
+            };
+            if let Some(key) = probe_key {
                 for loc in idx.lookup_eq(&key) {
                     let ri = match *loc {
                         spg_storage::RowLocator::Hot(i) => i,

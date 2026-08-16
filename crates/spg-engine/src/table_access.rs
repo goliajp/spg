@@ -358,19 +358,39 @@ impl Engine {
                 rhs,
             } = p
             {
-                let pair = match (lhs.as_ref(), rhs.as_ref()) {
-                    (Expr::Column(c), Expr::Literal(l)) | (Expr::Literal(l), Expr::Column(c)) => {
-                        Some((c, l))
-                    }
-                    _ => None,
-                };
-                if let Some((c, l)) = pair
-                    && c.qualifier
-                        .as_deref()
-                        .is_none_or(|q| q.eq_ignore_ascii_case(alias))
-                    && let Some(pos) = cols.iter().position(|s| s.name == c.name)
+                // r1037 — the literal means whatever the COLUMN says it
+                // means. This used to build the key straight from
+                // `literal_to_value`, so a string literal was always TEXT:
+                // on a `uuid` / `date` / `timestamp` column the seek looked
+                // in a key space nothing lives in, found nothing, and the
+                // JOIN returned no rows at all.
+                //
+                //   FROM s JOIN u ON u.id = s.uid WHERE s.k = '<uuid>'  ->  0
+                //   the same with `::uuid` on the literal              ->  1
+                //   the same predicate written in the ON clause        ->  1
+                //
+                // Round 564 fixed exactly this on the single-table seek and
+                // recorded why it matters: creating an index changed the
+                // answer. The JOIN peer's seek is a second copy of the same
+                // decision that did not get the fix, so it now shares the
+                // resolver instead of repeating it.
+                let resolved = crate::index_access::resolve_col_literal_pair(
+                    lhs.as_ref(),
+                    rhs.as_ref(),
+                    &cols,
+                    alias,
+                )
+                .or_else(|| {
+                    crate::index_access::resolve_col_literal_pair(
+                        rhs.as_ref(),
+                        lhs.as_ref(),
+                        &cols,
+                        alias,
+                    )
+                });
+                if let Some((pos, value)) = resolved
                     && let Some(idx) = table.index_on(pos)
-                    && let Some(key) = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))
+                    && let Some(key) = spg_storage::IndexKey::from_value(&value)
                 {
                     let mut ids = Vec::new();
                     let mut all_hot = true;
@@ -553,24 +573,51 @@ impl Engine {
         // Seek every literal key through the index, collecting hot row
         // indices. Returns None when any key lands a cold locator (the
         // caller then falls back to the full scan rather than miss rows).
-        let seek_keys = |idx: &spg_storage::Index, lits: &[&spg_sql::ast::Literal]| {
-            let mut ids = Vec::new();
-            for l in lits {
-                let key = spg_storage::IndexKey::from_value(&eval::literal_to_value(l))?;
-                for loc in idx.lookup_eq(&key) {
-                    match *loc {
-                        spg_storage::RowLocator::Hot(i) => ids.push(i),
-                        spg_storage::RowLocator::Cold { .. } => return None,
+        // r1037 — `col_pos` so the literal can be read as the COLUMN's
+        // type. Without it a string literal was always TEXT, and on a
+        // `uuid` / `date` / `timestamp` column the seek looked in a key
+        // space nothing lives in: the JOIN driver came back empty and the
+        // whole query answered zero rows with no error. Round 564 fixed
+        // the same decision on the single-table seek; this is the third
+        // copy of it, and the one a JOIN takes.
+        let seek_keys =
+            |col_pos: usize, idx: &spg_storage::Index, lits: &[&spg_sql::ast::Literal]| {
+                let mut ids = Vec::new();
+                let ty = cols.get(col_pos)?.ty;
+                let col_name = cols.get(col_pos)?.name.clone();
+                for l in lits {
+                    let raw = eval::literal_to_value(l);
+                    // Only string literals, and only against a non-text
+                    // column: parsing a string to its column type is exact or
+                    // it raises, so a coercion that succeeds cannot seek to
+                    // the wrong key. Numeric coercions stay out — `i = 1.5`
+                    // on an integer column must not round its way to 2.
+                    let value = if matches!(l, spg_sql::ast::Literal::String(_))
+                        && !matches!(
+                            ty,
+                            spg_storage::DataType::Text
+                                | spg_storage::DataType::Varchar(_)
+                                | spg_storage::DataType::Char(_)
+                        ) {
+                        crate::conversions::coerce_value(raw, ty, &col_name, col_pos).ok()?
+                    } else {
+                        raw
+                    };
+                    let key = spg_storage::IndexKey::from_value(&value)?;
+                    for loc in idx.lookup_eq(&key) {
+                        match *loc {
+                            spg_storage::RowLocator::Hot(i) => ids.push(i),
+                            spg_storage::RowLocator::Cold { .. } => return None,
+                        }
                     }
                 }
-            }
-            // Union order is per-literal; sort+dedup so the filtered set
-            // stays in table order (matches the full-scan path, and keeps
-            // any order-sensitive downstream deterministic).
-            ids.sort_unstable();
-            ids.dedup();
-            Some(ids)
-        };
+                // Union order is per-literal; sort+dedup so the filtered set
+                // stays in table order (matches the full-scan path, and keeps
+                // any order-sensitive downstream deterministic).
+                ids.sort_unstable();
+                ids.dedup();
+                Some(ids)
+            };
         for (i, p) in preds.iter().enumerate() {
             match p {
                 Expr::Binary {
@@ -584,8 +631,8 @@ impl Engine {
                         _ => None,
                     };
                     if let Some((c, l)) = pair
-                        && let Some((_, idx)) = indexed_col(c)
-                        && let Some(ids) = seek_keys(idx, &[l])
+                        && let Some((pos, idx)) = indexed_col(c)
+                        && let Some(ids) = seek_keys(pos, idx, &[l])
                     {
                         seeded = Some(ids);
                         seeded_pred_idx = Some(i);
@@ -605,7 +652,7 @@ impl Engine {
                     negated: false,
                 } => {
                     if let Expr::Column(c) = expr.as_ref()
-                        && let Some((_, idx)) = indexed_col(c)
+                        && let Some((pos, idx)) = indexed_col(c)
                         && let Some(lits) = list
                             .iter()
                             .map(|e| match e {
@@ -613,7 +660,7 @@ impl Engine {
                                 _ => None,
                             })
                             .collect::<Option<Vec<_>>>()
-                        && let Some(ids) = seek_keys(idx, &lits)
+                        && let Some(ids) = seek_keys(pos, idx, &lits)
                     {
                         seeded = Some(ids);
                         seeded_pred_idx = Some(i);
