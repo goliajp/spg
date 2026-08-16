@@ -6287,8 +6287,14 @@ impl Engine {
             let Expr::Literal(l) = lit else {
                 return None;
             };
-            let v = eval::literal_to_value(l);
-            let key = spg_storage::IndexKey::from_value(&v)?;
+            // r1039 — through the shared resolver, so a literal spelled
+            // in another type ('5' against an integer PK) is read as the
+            // column's before it becomes a key. This tally answers from
+            // the index alone, so a key in the wrong space would return a
+            // COUNT of zero rather than fall back to a scan.
+            let col = schema.columns.get(col_pos)?;
+            let v = crate::index_access::literal_as_column_value(l, col, col_pos)?;
+            let key = spg_storage::IndexKey::from_value_for_column(&v, col.ty)?;
             if !idx.lookup_eq(&key).is_empty() {
                 count += 1;
             }
@@ -9926,17 +9932,37 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             ));
         }
         #[allow(clippy::cast_precision_loss)]
-        Value::Numeric { scaled, scale, .. } => {
-            // Scaled integer / 10^scale, computed via f64 for sort
-            // ordering only. Precision losses here only matter for
-            // ORDER BY tie-breaks well past 15 significant digits.
-            // `f64::powi` lives in std; we hand-roll the loop so the
-            // no_std engine crate doesn't need it.
-            let mut divisor = 1.0_f64;
-            for _ in 0..*scale {
-                divisor *= 10.0;
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => {
+            // r1039 — a NaN or an ±Infinity carries a CANONICAL ZERO in
+            // `scaled`, so reading only those two fields sorted all three
+            // specials as the number 0: `ORDER BY v` over
+            // `0, NaN, Infinity, -Infinity, 1.5` returned them in that
+            // order — the three specials tied with zero and the stable
+            // sort left them where they were. `OrderKey::Num` already
+            // carries PG's float8 total order (NaN greatest, and it
+            // equals itself), which is also PG's NUMERIC order, so the
+            // specials only had to be spelled as the floats they mean.
+            match kind {
+                spg_storage::NumericKind::NaN => f64::NAN,
+                spg_storage::NumericKind::PosInf => f64::INFINITY,
+                spg_storage::NumericKind::NegInf => f64::NEG_INFINITY,
+                spg_storage::NumericKind::Finite => {
+                    // Scaled integer / 10^scale, computed via f64 for sort
+                    // ordering only. Precision losses here only matter for
+                    // ORDER BY tie-breaks well past 15 significant digits.
+                    // `f64::powi` lives in std; we hand-roll the loop so the
+                    // no_std engine crate doesn't need it.
+                    let mut divisor = 1.0_f64;
+                    for _ in 0..*scale {
+                        divisor *= 10.0;
+                    }
+                    (*scaled as f64) / divisor
+                }
             }
-            (*scaled as f64) / divisor
         }
         Value::Float(x) => *x,
         // v7.37.16 — REAL sorts by its exact f64 widening (it had no
