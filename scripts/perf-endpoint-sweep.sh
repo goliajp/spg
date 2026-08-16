@@ -33,7 +33,6 @@
 #   SPG_URI     — postgres://... for the SPGS leg (required)
 #   N           — timings per side per cell (default 5; rule 4 wants >= 3,
 #                 and 3 has proved too few to separate 10% at this size)
-#   CORPUS_DIR  — extra .sql endpoints to include (optional)
 #   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
 #
 # Exit 0 when no cell LOSES beyond the run's own resolution; 1 otherwise.
@@ -44,7 +43,6 @@ PG_URI="${PG_URI:-}"
 SPG_URI="${SPG_URI:-}"
 N="${N:-5}"
 SIZES="${SIZES:-1000 10000 50000 400000}"
-CORPUS_DIR="${CORPUS_DIR:-}"
 PSQL="${PSQL:-psql}"
 
 [[ -n "${PG_URI}" ]]  || { echo "fatal: PG_URI must be set" >&2; exit 2; }
@@ -117,6 +115,56 @@ setup_table() { # $1=uri $2=table $3=rows $4=work_mem-setting
   [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
 }
 
+# r1042 — a SECOND fixture, for the types v7.37.26 gave index keys to.
+#
+# It is separate rather than three more columns on the first one because
+# widening that row would move every existing cell's timing, and the
+# panel's value is that a number means the same thing it meant last
+# release.
+#
+# `n` takes a thousand distinct two-decimal values, each repeating
+# `rows/1000` times: two decimals is the shape a money or a rate column
+# has, and the repeats give `DISTINCT` real work instead of handing it a
+# permutation. `b` is the row's id as eight bytes, so byte order and
+# numeric order agree — a wrong comparator then shows up as a wrong
+# ORDER BY rather than as nothing at all.
+setup_typed_table() { # $1=uri $2=table $3=rows
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "DROP TABLE IF EXISTS $2" \
+    -c "CREATE TABLE $2 (id INT PRIMARY KEY, n NUMERIC, b BYTEA, pad TEXT)" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "INSERT INTO $2 SELECT g, (((g::bigint*7919)%1000)::numeric)/100, decode(lpad(to_hex(g), 16, '0'), 'hex'), repeat(chr(97+(g%26)),200) FROM generate_series(1,$3) g" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "CREATE INDEX ${2}_n ON $2 (n)" \
+    -c "CREATE INDEX ${2}_b ON $2 (b)" >/dev/null 2>&1
+  local got
+  got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
+  [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
+}
+
+# Rule 2 again, one level deeper: a row count says the table is there and
+# says nothing about whether the PREDICATES below select anything. A
+# literal that matches no row times an empty answer, and an empty answer
+# is fast on both engines and means nothing.
+#
+# Round 1025 shipped a fixture whose `g*7919` overflowed int4, so three
+# cells timed an error response — three nearly identical numbers that
+# should have been questioned on sight. This asks each typed predicate
+# for its count before anything is timed, and refuses a zero.
+verify_typed_predicates() { # $1=uri $2=table
+  local q c
+  for q in "SELECT count(*) FROM $2 WHERE n = 1.23" \
+           "SELECT count(*) FROM $2 WHERE n BETWEEN 1 AND 2" \
+           "SELECT count(*) FROM $2 WHERE b = decode(lpad(to_hex(7), 16, '0'), 'hex')" \
+           "SELECT count(DISTINCT n) FROM $2"; do
+    c="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "${q}")"
+    [[ "${c}" =~ ^[0-9]+$ && "${c}" -gt 0 ]] || {
+      echo "SETUP FAILED on $1: [${q}] answered '${c}' — refusing to time a predicate that selects nothing" >&2
+      exit 2
+    }
+  done
+}
+
 SPG_WM='SET work_mem = 4096'
 PG_WM="SET work_mem='4MB'"
 
@@ -131,6 +179,23 @@ SHAPES=(
   'filtered then order|SELECT pad FROM @T@ WHERE id % 3 = 0 ORDER BY k'
 )
 
+# r1042 — the NUMERIC / BYTEA panel. v7.37.26 gave both types an index
+# key and rebuilt the NUMERIC sort key, and none of that surface was
+# visible here: the fixture above has neither column, so every one of
+# these shapes was shipped unmeasured against PG18.
+#
+# `@N@` is the typed fixture.
+TYPED_SHAPES=(
+  'numeric key|SELECT id FROM @N@ ORDER BY n'
+  'numeric wide|SELECT pad FROM @N@ ORDER BY n'
+  'numeric distinct|SELECT DISTINCT n FROM @N@ ORDER BY n'
+  'numeric top-N|SELECT pad FROM @N@ ORDER BY n LIMIT 10'
+  'numeric equality|SELECT count(*) FROM @N@ WHERE n = 1.23'
+  'numeric range|SELECT count(*) FROM @N@ WHERE n BETWEEN 1 AND 2'
+  'bytea key|SELECT id FROM @N@ ORDER BY b'
+  'bytea equality|SELECT count(*) FROM @N@ WHERE b = decode(lpad(to_hex(7), 16, chr(48)), chr(104)||chr(101)||chr(120))'
+)
+
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0
 
 printf '\n%-8s %-26s %-16s %-16s %s\n' SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' VERDICT
@@ -138,11 +203,16 @@ printf '%-8s %-26s %-16s %-16s %s\n' -------- -------------------------- -------
 
 for rows in ${SIZES}; do
   T="sweep_${rows}"
+  NT="sweept_${rows}"
   setup_table "${SPG_URI}" "${T}" "${rows}"
   setup_table "${PG_URI}"  "${T}" "${rows}"
+  setup_typed_table "${SPG_URI}" "${NT}" "${rows}"
+  setup_typed_table "${PG_URI}"  "${NT}" "${rows}"
+  verify_typed_predicates "${SPG_URI}" "${NT}"
+  verify_typed_predicates "${PG_URI}"  "${NT}"
 
-  for entry in "${SHAPES[@]}"; do
-    name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"
+  for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
+    name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"
     s=(); g=()
     for ((i = 0; i < N; i++)); do
       # Rule 4: alternate, and flip which side starts each round.
@@ -173,8 +243,9 @@ echo "control — SPGS against itself, same binary (differing cells here are thi
 # did not contain it, and a control that errors on every cell reports a
 # clean noise floor it never measured.
 CT="sweep_$(set -- ${SIZES}; echo "$1")"
-for entry in "${SHAPES[@]}"; do
-  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${CT}}"
+CNT="sweept_$(set -- ${SIZES}; echo "$1")"
+for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
+  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${CT}}"; sql="${sql//@N@/${CNT}}"
   a=(); b=()
   for ((i = 0; i < N; i++)); do
     if (( i % 2 == 0 )); then
