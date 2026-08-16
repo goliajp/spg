@@ -9804,7 +9804,11 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     match v {
         Value::Bytes(b) => return Ok(OrderKey::Bytes(b.as_ref().to_vec())),
         // v7.38 (read01, T3.C3) — arbitrary-precision NUMERIC sorts by exact value.
-        Value::NumericBig(b) => return Ok(OrderKey::Numeric(spg_storage::NumericKey::from_big(b))),
+        Value::NumericBig(b) => {
+            return Ok(OrderKey::Numeric(alloc::boxed::Box::new(
+                spg_storage::NumericKey::from_big(b),
+            )));
+        }
         Value::Uuid(u) => return Ok(OrderKey::Bytes(u.to_vec())),
         Value::Macaddr(m) => return Ok(OrderKey::Bytes(m.to_vec())),
         Value::Macaddr8(m) => return Ok(OrderKey::Bytes(m.to_vec())),
@@ -9862,10 +9866,12 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             a.iter()
                 .map(|o| {
                     o.map_or_else(inf, |(m, s)| {
-                        OrderKey::Numeric(spg_storage::NumericKey::from_numeric(
-                            m,
-                            s,
-                            spg_storage::NumericKind::Finite,
+                        OrderKey::Numeric(alloc::boxed::Box::new(
+                            spg_storage::NumericKey::from_numeric(
+                                m,
+                                s,
+                                spg_storage::NumericKind::Finite,
+                            ),
                         ))
                     })
                 })
@@ -9953,8 +9959,8 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             scale,
             kind,
         } => {
-            return Ok(OrderKey::Numeric(spg_storage::NumericKey::from_numeric(
-                *scaled, *scale, *kind,
+            return Ok(OrderKey::Numeric(alloc::boxed::Box::new(
+                spg_storage::NumericKey::from_numeric(*scaled, *scale, *kind),
             )));
         }
         Value::Float(x) => *x,

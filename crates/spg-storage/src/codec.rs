@@ -3676,7 +3676,7 @@ impl<'a> Cursor<'a> {
                 // have an `Eq` and an `Ord` that disagree, and a B-tree
                 // built on one cannot be searched.
                 crate::NumericKey::from_parts(class, neg, exp, &digits)
-                    .map(IndexKey::Numeric)
+                    .map(|k| IndexKey::Numeric(alloc::boxed::Box::new(k)))
                     .ok_or_else(|| StorageError::Corrupt("non-canonical numeric index key".into()))
             }
             other => Err(StorageError::Corrupt(format!(
