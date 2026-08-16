@@ -142,6 +142,29 @@ run_gates() {
         cargo test --release --locked -p spg-engine --features perf-counters \
             --test "$target"
     done
+    # r1049 — the sqlx suite, against a server this gate starts itself.
+    #
+    # It had sat behind $SPG_PG_URL since v7.9 and nothing in the gate
+    # ever set the variable, so the ONE harness that binds parameters
+    # the way real drivers do — binary format — had never run here.
+    # sentori's second report (jsonb/array binary Bind refused, suite
+    # dead on step four) was sitting in an #[ignore]d test the whole
+    # time. A pin outside the gate that runs is a pin that does not
+    # exist — same words as the counter pins above, same lesson.
+    banner "gates: sqlx-pgwire (binary Bind/results, own server)"
+    cargo build --release --locked -p spg-server
+    rm -rf /tmp/spg-gate-sqlx-db /tmp/spg-gate-sqlx-wal /tmp/spg-gate-sqlx-audit
+    SPG_PG_ADDR=127.0.0.1:25460 ./target/release/spg-server 127.0.0.1:25461 \
+        /tmp/spg-gate-sqlx-db /tmp/spg-gate-sqlx-audit /tmp/spg-gate-sqlx-wal \
+        > /tmp/spg-gate-sqlx.log 2>&1 &
+    local sqlx_srv=$!
+    sleep 1
+    local sqlx_rc=0
+    SPG_PG_URL='postgres://bench:bench@127.0.0.1:25460/bench' \
+        cargo test --release --locked -p spg-sqlx-pgwire -- --ignored \
+        || sqlx_rc=$?
+    kill "$sqlx_srv" 2>/dev/null || true
+    return "$sqlx_rc"
 }
 
 run_biz() {

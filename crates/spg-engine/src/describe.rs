@@ -51,10 +51,25 @@ pub fn describe_prepared(stmt: &Statement, catalog: &Catalog) -> (Vec<u32>, Vec<
 const MAX_DESCRIBE_DEPTH: usize = 16;
 
 fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSchema> {
-    let Statement::Select(s) = stmt else {
+    // r1049 — DML with RETURNING produces a result set, and a driver
+    // sizes its rows by THIS answer. Describing it as NoData made
+    // `INSERT … RETURNING id` through sqlx come back as a zero-column
+    // row (ColumnIndexOutOfBounds), a defect the sqlx suite had pinned
+    // since v7.9 — in a test that had never run.
+    let (table, items) = match stmt {
+        Statement::Select(s) => return describe_select_columns(s, catalog, &[], 0),
+        Statement::Insert(i) => (&i.table, i.returning.as_ref()),
+        Statement::Update(u) => (&u.table, u.returning.as_ref()),
+        Statement::Delete(d) => (&d.table, d.returning.as_ref()),
+        _ => return Vec::new(),
+    };
+    let Some(items) = items else {
         return Vec::new();
     };
-    describe_select_columns(s, catalog, &[], 0)
+    let Some(t) = catalog.get(table) else {
+        return Vec::new();
+    };
+    describe_select_items(items, &t.schema().columns)
 }
 
 /// Output columns of one SELECT, resolved against `catalog` plus any

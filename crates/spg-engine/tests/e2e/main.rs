@@ -65,6 +65,7 @@ mod e2e_array_shuffle_sample;
 mod e2e_array_subquery_round105;
 mod e2e_array_to_json;
 mod e2e_array_to_string;
+mod e2e_array_type_positions_r1049;
 mod e2e_as_of_segment;
 mod e2e_attcollation_round675;
 mod e2e_attgenerated;

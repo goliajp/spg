@@ -375,3 +375,135 @@ async fn transaction_api_commit_persists_its_writes() {
         .unwrap();
     assert_eq!(n, 3, "a committed transaction must keep its rows");
 }
+
+// ── r1049 — binary Bind for composite types (sentori report 2) ──────
+//
+// sqlx binds in binary by default; the decoder refused OIDs 3802
+// (jsonb), 1009 (text[]) and 1016 (bigint[]), so sentori's suite
+// stopped on step four of eighty-six — ingest, the first request that
+// touches a JSON column. These are the driver-level halves of the
+// wire-level pins in spg-server's pgwire tests: the same sqlx code
+// path a real application uses, including binary RESULTS on the way
+// back out.
+
+#[tokio::test]
+#[ignore]
+async fn binary_bind_text_and_bigint_arrays_round_trip() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    sqlx::query("DROP TABLE IF EXISTS sqlx_arr")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_arr (id INT NOT NULL, tags TEXT[], nums BIGINT[])")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Every element shape the array-literal quoting rules own.
+    let tags: Vec<String> = [
+        "alpha",
+        "with,comma",
+        "with \"quote\"",
+        "back\\slash",
+        "",
+        "NULL",
+        "two words",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let nums: Vec<i64> = vec![1, -2, 9_007_199_254_740_993];
+    sqlx::query("INSERT INTO sqlx_arr VALUES ($1, $2, $3)")
+        .bind(7_i32)
+        .bind(&tags)
+        .bind(&nums)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT tags, nums FROM sqlx_arr WHERE id = $1")
+        .bind(7_i32)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let got_tags: Vec<String> = row.try_get("tags").unwrap();
+    let got_nums: Vec<i64> = row.try_get("nums").unwrap();
+    assert_eq!(
+        got_tags, tags,
+        "text[] must round-trip binary-in/binary-out"
+    );
+    assert_eq!(got_nums, nums, "bigint[] must round-trip, above 2^53 too");
+}
+
+#[tokio::test]
+#[ignore]
+async fn binary_bind_array_with_null_elements_and_empty() {
+    let Some(pool) = pool().await else {
+        return;
+    };
+    sqlx::query("DROP TABLE IF EXISTS sqlx_arrn")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_arrn (id INT NOT NULL, tags TEXT[])")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tags: Vec<Option<String>> = vec![Some("a".into()), None, Some("b".into())];
+    sqlx::query("INSERT INTO sqlx_arrn VALUES (1, $1), (2, $2)")
+        .bind(&tags)
+        .bind(Vec::<String>::new())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = sqlx::query("SELECT tags FROM sqlx_arrn WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let got: Vec<Option<String>> = row.try_get("tags").unwrap();
+    assert_eq!(got, tags, "NULL elements survive both directions");
+    let row = sqlx::query("SELECT tags FROM sqlx_arrn WHERE id = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let got: Vec<String> = row.try_get("tags").unwrap();
+    assert!(
+        got.is_empty(),
+        "the empty array is empty, not a parse error"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn binary_bind_jsonb_in_the_ingest_shape() {
+    // The sentori step-four shape: INSERT with a driver-bound jsonb
+    // payload, then read it back through a jsonb column in binary
+    // result format. `jsonb_round_trip_via_serde_json` above already
+    // pins the plain round trip; this one adds a WHERE on the payload
+    // so the value provably reached the ENGINE as jsonb rather than
+    // surviving as an opaque blob.
+    let Some(pool) = pool().await else {
+        return;
+    };
+    sqlx::query("DROP TABLE IF EXISTS sqlx_ingest")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_ingest (id INT NOT NULL, payload JSONB)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let payload = serde_json::json!({"event": "ingest", "attempt": 1, "tags": ["a", "b"]});
+    sqlx::query("INSERT INTO sqlx_ingest VALUES ($1, $2)")
+        .bind(4_i32)
+        .bind(&payload)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let n: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sqlx_ingest WHERE payload->>'event' = 'ingest'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(n, 1, "the bound jsonb must be queryable as jsonb");
+}
