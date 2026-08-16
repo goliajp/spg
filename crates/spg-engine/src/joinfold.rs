@@ -185,6 +185,14 @@ impl Engine {
                 // this fold, keep the JOIN.
                 Err(_) => continue,
             };
+            // r1036 — the fold turns these keys into an IN-list of
+            // LITERALS, and a key type with no literal form cannot make
+            // that trip. Refusing here keeps the JOIN, which is correct
+            // and merely unoptimised; the arm this replaces translated
+            // them to NULL, and `IN (NULL)` silently matched nothing.
+            if pk_values.iter().any(|v| value_to_literal(v).is_none()) {
+                continue;
+            }
             // Eligible. Record the rewrite.
             planned.push(FoldPlan {
                 join_idx: i,
@@ -689,11 +697,14 @@ fn rewrite_where(
             kept.push(Expr::Literal(Literal::Bool(false)));
             continue;
         }
-        let list: Vec<Expr> = p
-            .pk_values
-            .iter()
-            .map(|v| Expr::Literal(value_to_literal(v)))
-            .collect();
+        // Every value was checked for a literal form before the plan was
+        // recorded, so `None` here would be a planning bug rather than a
+        // data shape. Drop the whole rewrite instead of inventing a
+        // literal for it — the caller keeps the unfolded statement.
+        let mut list: Vec<Expr> = Vec::with_capacity(p.pk_values.len());
+        for v in &p.pk_values {
+            list.push(Expr::Literal(value_to_literal(v)?));
+        }
         kept.push(Expr::InList {
             expr: alloc::boxed::Box::new(p.outer_expr.clone()),
             list,
@@ -715,16 +726,36 @@ fn rewrite_where(
     Some(acc)
 }
 
-fn value_to_literal(v: &Value) -> Literal {
-    match v {
+/// The literal that means exactly this value, or `None` when there is
+/// none.
+///
+/// r1036 — the arm this replaces was `_ => Literal::Null`. The fold
+/// rewrites `a JOIN b ON a.fk = b.pk` into `a.fk IN (<b's keys>)`, so a
+/// key type without a literal form became `IN (NULL)`, which is never
+/// true. Every matching row disappeared, silently, with no error: sentori
+/// hit it as a session lookup returning nothing and an application that
+/// signed in and then immediately 401'd.
+///
+/// `Literal` has Integer, Float, Numeric, String, Bool and Null and
+/// nothing else, so `uuid`, `date`, `timestamp`, `bytea` and the rest have
+/// no exact form here. They now REFUSE the fold rather than being
+/// mistranslated — the join runs unfolded, which is correct and merely
+/// unoptimised.
+///
+/// `Value::Null` maps to `Literal::Null` deliberately: a NULL key really
+/// does never match, and that is SQL rather than a representation
+/// failure.
+fn value_to_literal(v: &Value) -> Option<Literal> {
+    Some(match v {
         Value::SmallInt(n) => Literal::Integer(i64::from(*n)),
         Value::Int(n) => Literal::Integer(i64::from(*n)),
         Value::BigInt(n) => Literal::Integer(*n),
         Value::Bool(b) => Literal::Bool(*b),
         Value::Float(x) => Literal::Float(*x),
         Value::Text(s) => Literal::String(s.to_string()),
-        _ => Literal::Null,
-    }
+        Value::Null => Literal::Null,
+        _ => return None,
+    })
 }
 
 impl Engine {

@@ -1,0 +1,196 @@
+# A JOIN must not lose rows because of its key's TYPE (r1036, sentori).
+#
+# Two independent defects, both silent, both found by pointing an
+# unmodified application at SPG:
+#
+#   A. An INNER join folds to `fk IN (<keys>)`, and the value-to-literal
+#      conversion turned every type outside {smallint,int,bigint,bool,
+#      float,text} into NULL. `IN (NULL)` is never true, so every matching
+#      row vanished with no error.
+#   B. The index-nested-loop probe treated a key it could not express as an
+#      `IndexKey` — `bytea`, `numeric` — as a MISS rather than as a reason
+#      to hand the shape to another stage.
+#
+# One row on each side, joined on the key. Every count here is 1 on
+# PostgreSQL 18, and the matrix is by key type because that is the axis
+# the defects moved along: `int` and `text` were correct throughout, which
+# is why an ordinary test suite did not see this.
+
+statement ok
+CREATE TABLE jp_int (id INT PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE TABLE jc_int (id INT PRIMARY KEY, parent_id INT, note TEXT)
+
+statement ok
+INSERT INTO jp_int VALUES (1, 'keep')
+
+statement ok
+INSERT INTO jc_int VALUES (2, 1, 'n')
+
+query I
+SELECT count(*) FROM jc_int c JOIN jp_int p ON p.id = c.parent_id
+----
+1
+
+query I
+SELECT count(*) FROM jc_int c JOIN jp_int p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+1
+
+# --- uuid: the type sentori's schema uses for every primary key ---
+
+statement ok
+CREATE TABLE jp_uuid (id UUID PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE TABLE jc_uuid (id UUID PRIMARY KEY, parent_id UUID, note TEXT)
+
+statement ok
+INSERT INTO jp_uuid VALUES ('11111111-1111-4111-8111-111111111111', 'keep')
+
+statement ok
+INSERT INTO jc_uuid VALUES ('22222222-2222-4222-8222-222222222222', '11111111-1111-4111-8111-111111111111', 'n')
+
+query I
+SELECT count(*) FROM jc_uuid c JOIN jp_uuid p ON p.id = c.parent_id
+----
+1
+
+# The reported cell: predicate on the RIGHT-hand table.
+query I
+SELECT count(*) FROM jc_uuid c JOIN jp_uuid p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+1
+
+# The same predicate in the ON clause, which used to be the only spelling
+# that worked.
+query I
+SELECT count(*) FROM jc_uuid c JOIN jp_uuid p ON p.id = c.parent_id AND p.tag = 'keep'
+----
+1
+
+# Predicate on the left table, and the tables swapped: both were already
+# correct, and stay correct.
+query I
+SELECT count(*) FROM jc_uuid c JOIN jp_uuid p ON p.id = c.parent_id WHERE c.note = 'n'
+----
+1
+
+query I
+SELECT count(*) FROM jp_uuid p JOIN jc_uuid c ON c.parent_id = p.id WHERE p.tag = 'keep'
+----
+1
+
+# The row must come back, not just be counted.
+query T
+SELECT p.tag FROM jc_uuid c JOIN jp_uuid p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+keep
+
+# --- bytea and numeric: defect B, which dropped rows with no predicate ---
+
+statement ok
+CREATE TABLE jp_bytea (id BYTEA PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE TABLE jc_bytea (id BYTEA PRIMARY KEY, parent_id BYTEA, note TEXT)
+
+statement ok
+INSERT INTO jp_bytea VALUES (decode('dead','hex'), 'keep')
+
+statement ok
+INSERT INTO jc_bytea VALUES (decode('beef','hex'), decode('dead','hex'), 'n')
+
+query I
+SELECT count(*) FROM jc_bytea c JOIN jp_bytea p ON p.id = c.parent_id
+----
+1
+
+query I
+SELECT count(*) FROM jc_bytea c JOIN jp_bytea p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+1
+
+statement ok
+CREATE TABLE jp_num (id NUMERIC PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE TABLE jc_num (id NUMERIC PRIMARY KEY, parent_id NUMERIC, note TEXT)
+
+statement ok
+INSERT INTO jp_num VALUES (1.5, 'keep')
+
+statement ok
+INSERT INTO jc_num VALUES (2.5, 1.5, 'n')
+
+query I
+SELECT count(*) FROM jc_num c JOIN jp_num p ON p.id = c.parent_id
+----
+1
+
+query I
+SELECT count(*) FROM jc_num c JOIN jp_num p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+1
+
+# --- date and timestamp keys took the same fold ---
+
+statement ok
+CREATE TABLE jp_date (id DATE PRIMARY KEY, tag TEXT)
+
+statement ok
+CREATE TABLE jc_date (id DATE PRIMARY KEY, parent_id DATE, note TEXT)
+
+statement ok
+INSERT INTO jp_date VALUES (DATE '2020-01-01', 'keep')
+
+statement ok
+INSERT INTO jc_date VALUES (DATE '2021-01-01', DATE '2020-01-01', 'n')
+
+query I
+SELECT count(*) FROM jc_date c JOIN jp_date p ON p.id = c.parent_id WHERE p.tag = 'keep'
+----
+1
+
+# A non-matching key must still produce nothing — the fix must not make
+# the join over-match in the other direction.
+query I
+SELECT count(*) FROM jc_uuid c JOIN jp_uuid p ON p.id = c.id
+----
+0
+
+query I
+SELECT count(*) FROM jc_bytea c JOIN jp_bytea p ON p.id = c.id
+----
+0
+
+statement ok
+DROP TABLE jc_date
+
+statement ok
+DROP TABLE jp_date
+
+statement ok
+DROP TABLE jc_num
+
+statement ok
+DROP TABLE jp_num
+
+statement ok
+DROP TABLE jc_bytea
+
+statement ok
+DROP TABLE jp_bytea
+
+statement ok
+DROP TABLE jc_uuid
+
+statement ok
+DROP TABLE jp_uuid
+
+statement ok
+DROP TABLE jc_int
+
+statement ok
+DROP TABLE jp_int
