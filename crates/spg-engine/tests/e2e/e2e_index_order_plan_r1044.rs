@@ -83,8 +83,9 @@ fn r1044_shapes_outside_the_gate_still_sort() {
         "EXPLAIN SELECT id FROM io ORDER BY m",
         // LIMIT has its own top-N path.
         "EXPLAIN SELECT id FROM io ORDER BY id LIMIT 10",
-        // DISTINCT is not part of the walk.
-        "EXPLAIN SELECT DISTINCT j FROM io ORDER BY j",
+        // r1047 — DISTINCT walks only when the projection IS the order
+        // column; a different column makes it about the whole tuple.
+        "EXPLAIN SELECT DISTINCT id FROM io ORDER BY j",
         // Two keys: the index orders one.
         "EXPLAIN SELECT id FROM io ORDER BY j, id",
     ] {
@@ -92,6 +93,31 @@ fn r1044_shapes_outside_the_gate_still_sort() {
         assert!(
             p.iter().any(|l| l.trim_start().starts_with("Sort")),
             "expected a Sort for a shape outside the gate: {sql}\n{p:?}"
+        );
+    }
+}
+
+/// r1047 — `SELECT DISTINCT <col> ORDER BY <col>` is the walk plus a
+/// `Unique` on top: one key group is one output row, so the plan names
+/// what runs instead of the HashAggregate it no longer is.
+#[test]
+fn r1047_distinct_on_the_order_column_is_unique_over_the_walk() {
+    let mut e = engine();
+    for sql in [
+        "EXPLAIN SELECT DISTINCT j FROM io ORDER BY j",
+        "EXPLAIN SELECT DISTINCT k FROM io ORDER BY k",
+        "EXPLAIN SELECT DISTINCT j FROM io ORDER BY j DESC",
+    ] {
+        let p = plan(&mut e, sql);
+        assert!(p[0].starts_with("Unique"), "{sql}\n{p:?}");
+        assert!(
+            p.iter()
+                .any(|l| l.contains("Index Scan using") && !l.starts_with("Unique")),
+            "the walk under Unique was not named: {sql}\n{p:?}"
+        );
+        assert!(
+            !p.iter().any(|l| l.contains("HashAggregate")),
+            "a HashAggregate the executor does not run: {sql}\n{p:?}"
         );
     }
 }

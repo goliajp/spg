@@ -7543,7 +7543,7 @@ impl Engine {
         from: &FromClause,
     ) -> Option<(String, usize)> {
         if stmt.order_by.len() != 1
-            || stmt.distinct
+            || !stmt.distinct_on.is_empty()
             || stmt.limit_with_ties
             || stmt.limit.is_some()
             || stmt.offset.is_some()
@@ -7594,6 +7594,37 @@ impl Engine {
         let order_pos = cols
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&oc.name))?;
+        // r1047 — DISTINCT joins the walk when the projection IS the
+        // order column, and only then. The index's keys are canonical
+        // (r1039: representation equality is value equality — the
+        // property every seek already depends on), so one key is one
+        // distinct value and the walk can emit the first passing row of
+        // each key group instead of hashing every row. On the release
+        // sweep's `SELECT DISTINCT n FROM t ORDER BY n` — 400,000 rows,
+        // 1,000 distinct values — the hash path priced at 21.3-22.7 ms
+        // with an ablation floor of 14.8, because the hash must
+        // normalize and probe ALL the rows; the walk visits each key
+        // once. A wider projection makes DISTINCT about the whole tuple,
+        // not the key, so anything else still declines.
+        if stmt.distinct {
+            let only_the_order_column = stmt.items.len() == 1
+                && match &stmt.items[0] {
+                    SelectItem::Expr {
+                        expr: Expr::Column(c),
+                        ..
+                    } => {
+                        c.name.eq_ignore_ascii_case(&oc.name)
+                            && match &c.qualifier {
+                                Some(q) => q.eq_ignore_ascii_case(alias),
+                                None => true,
+                            }
+                    }
+                    _ => false,
+                };
+            if !only_the_order_column {
+                return None;
+            }
+        }
         // r1046 — a nullable key no longer refuses the walk; it changes
         // what the walk has to do. A NULL key is not in the btree, so
         // walking alone would silently drop those rows — the r1020
@@ -7705,6 +7736,12 @@ impl Engine {
         // decodes every row, and the walk plus the pass measured 72.0 ms
         // down to about 22 on 400,000 rows.
         let nulls_first = order.nulls_first.unwrap_or(order.desc);
+        // r1047 — under DISTINCT the walk emits the FIRST passing row of
+        // each key group and skips the rest; the gate admits DISTINCT
+        // only when the projection is the order column itself, so one
+        // canonical key is one output row. NULL is one distinct value,
+        // so the NULL pass stops at its first emit too.
+        let distinct = stmt.distinct;
         let mut count = 0usize;
         let mut visited = 0usize;
         let mut emit_null_rows = |emitted_rows: &mut alloc::vec::Vec<bool>,
@@ -7744,6 +7781,9 @@ impl Engine {
                     emit,
                 )? {
                     n += 1;
+                    if distinct {
+                        break;
+                    }
                 }
             }
             Ok(n)
@@ -7797,6 +7837,10 @@ impl Engine {
                     emit,
                 )? {
                     count += 1;
+                    // One row per key group: the rest are the same value.
+                    if distinct {
+                        break;
+                    }
                 }
             }
         }

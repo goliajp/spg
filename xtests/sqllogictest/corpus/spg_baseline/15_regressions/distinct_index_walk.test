@@ -1,0 +1,126 @@
+# r1047 — `SELECT DISTINCT <col> FROM t ORDER BY <col>` walks the index
+# and emits one row per key group, instead of normalizing and hashing
+# every row. The index's keys are canonical (r1039), so one key is one
+# distinct value; the release sweep's 400,000-row cell went 21.3-22.7 ms
+# (losing to PG18's 14.2-16.2) to 2.54-2.62 (winning 6.3x), with the
+# full answer md5-identical to PG's.
+#
+# The shapes below are the WALK shapes — bare `SELECT DISTINCT col …
+# ORDER BY col`, not wrapped in a subquery, which would change the route.
+#
+# NULL is one distinct value: exactly one output row, placed where the
+# ORDER BY puts NULLs. Which REPRESENTATION of a duplicate group is
+# printed (1.5 vs 1.50) is plan-dependent in PG itself; ours is the
+# first surviving row of the group, and the mixed-representation pins
+# below pin that choice, not PG's coin flip.
+
+statement ok
+CREATE TABLE diw (id INT PRIMARY KEY, n NUMERIC, k INT)
+
+statement ok
+INSERT INTO diw VALUES (1,1.50,3),(2,1.5,3),(3,2.0,1),(4,NULL,2),
+ (5,NULL,1),(6,0.5,2),(7,2.00,NULL),(8,3,2)
+
+statement ok
+CREATE INDEX diw_n ON diw (n)
+
+statement ok
+CREATE INDEX diw_k ON diw (k)
+
+# Integer column: unique representations, so this is PG18.4 row for row.
+query T
+SELECT DISTINCT k FROM diw ORDER BY k
+----
+1
+2
+3
+NULL
+
+query T
+SELECT DISTINCT k FROM diw ORDER BY k DESC
+----
+NULL
+3
+2
+1
+
+query T
+SELECT DISTINCT k FROM diw ORDER BY k NULLS FIRST
+----
+NULL
+1
+2
+3
+
+query T
+SELECT DISTINCT k FROM diw ORDER BY k DESC NULLS LAST
+----
+3
+2
+1
+NULL
+
+# Mixed representations: one row per VALUE, represented by the group's
+# first row. 1.50 (id 1) wins over 1.5 (id 2); 2.0 (id 3) over 2.00.
+query T
+SELECT DISTINCT n FROM diw ORDER BY n
+----
+0.5
+1.50
+2.0
+3
+NULL
+
+query T
+SELECT DISTINCT n FROM diw ORDER BY n DESC
+----
+NULL
+3
+2.0
+1.50
+0.5
+
+# A WHERE that knocks out a group's first row: the group survives,
+# represented by its first SURVIVING row — and the all-NULL group
+# disappears when both its rows are filtered out.
+query T
+SELECT DISTINCT n FROM diw WHERE id NOT IN (1, 3) ORDER BY n
+----
+0.5
+1.5
+2.00
+3
+NULL
+
+query T
+SELECT DISTINCT n FROM diw WHERE id NOT IN (4, 5) ORDER BY n
+----
+0.5
+1.50
+2.0
+3
+
+# The control: the same query without the index takes the hash path and
+# must answer the same.
+statement ok
+DROP INDEX diw_n
+
+query T
+SELECT DISTINCT n FROM diw ORDER BY n
+----
+0.5
+1.50
+2.0
+3
+NULL
+
+# DISTINCT over the pair is about the whole tuple, not the key, and
+# stays off the walk. PG18.4 counts 7: 1.50/1.5 collapse (same k),
+# 2.0/2.00 do not (k 1 vs NULL).
+query I
+SELECT count(*) FROM (SELECT DISTINCT n, k FROM diw) s
+----
+7
+
+statement ok
+DROP TABLE diw

@@ -234,6 +234,7 @@ mod e2e_difference;
 mod e2e_distinct_buffer_round485;
 mod e2e_distinct_derived;
 mod e2e_distinct_from_date_diff;
+mod e2e_distinct_index_walk_r1047;
 mod e2e_distinct_on;
 mod e2e_div_erf;
 mod e2e_dml_object_errors_round701;
