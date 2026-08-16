@@ -41,6 +41,91 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.27] — 2026-08-16
+
+The release panel's first zero-loss run: 64 cells against a live
+PostgreSQL 18.4, `losses=0`, with the same-binary control reporting
+zero false differences. The three changes that closed the last losses
+are below; each was measured before and after over the wire, on the
+same harness that blocks the release.
+
+### Fixed — wrong answers avoided
+
+- **A constant folded against an empty context must know what needs a
+  catalog.** The new prepare-time fold evaluates constant predicate
+  subtrees once instead of once per row — and its first version folded
+  `'u'::regclass` to the text `u`, because prepare time has no catalog
+  in hand. Twenty-six catalog tests caught it. The fold now carries an
+  explicit list of context-free cast targets and declines everything
+  else; an expression that RAISES while folding is left exactly where
+  it was, so `WHERE x = 1/0` keeps erroring from the same place.
+
+### Performance
+
+- **A cast on a literal no longer costs the index.** `WHERE id = 7`
+  sought and `WHERE id = 7::int` scanned — 0.08 ms against 1.86 on a
+  400,000-row primary-key lookup, 23x for a no-op cast; `'…'::bytea`
+  was 28x. That is the shape an ORM writes (`$1::int`), the shape
+  `pg_dump` writes, and it had been true for every type since before
+  the types that made it visible. Constant subtrees of WHERE and JOIN
+  ON now fold at prepare time, on all four engine routes (execute,
+  readonly, streaming, prepared), and immutable builtins fold too —
+  `decode(…, 'hex')` spelled via `chr()||chr()` measured 373 ms
+  against 0.143 for the same value spelled plainly. Functions fold
+  only from a positive allowlist checked against PG18.4's own
+  `pg_proc.provolatile`; five candidates failed that check and were
+  left out.
+
+- **A nullable ORDER BY key walks the index.** The index-order walk
+  refused any nullable column — the NULL rows are not in the btree, and
+  walking alone would have dropped them, a defect this project shipped
+  once. But NOT NULL is not the default: the refusal made every plain
+  indexed column pay 3.4x for a sort it did not need (72.0 ms against
+  20.2 on 400,000 rows). The walk now emits the NULL rows itself, at
+  the end SQL puts them — NULLS LAST ascending, NULLS FIRST descending,
+  an explicit clause wins. All four placements match PG18.4 row for
+  row. 21.7 ms, inside the NOT NULL ceiling.
+
+- **`SELECT DISTINCT col … ORDER BY col` walks the index and emits one
+  row per key group.** The hash path normalized and probed 400,000
+  rows to answer with 1,000 values: 21.3-22.7 ms against PG's
+  14.2-16.2, and an ablation floor of 14.8 said no per-row polish
+  could close it. The index's keys are canonical — representation
+  equality is value equality, the property every seek already depends
+  on — so one key IS one distinct value. 2.54-2.62 ms now, a 6.3x win,
+  and the full answer is md5-identical to PG's. NULL is one distinct
+  value, emitted once, where the ORDER BY puts it. DISTINCT ON and
+  wider projections still take the hash path; which representation of
+  a duplicate group is printed (`1.5` vs `1.50`) is plan-dependent in
+  PG itself, and here is pinned to the group's first surviving row.
+
+- **The numeric DISTINCT hash stopped walking digits.** Reducing
+  trailing fractional zeros walked one digit at a time — O(scale) per
+  row, and `n / 100` stores scale 16. Binary search over a power
+  table finds the whole run in at most six probes: 52 ms to 21 on the
+  sweep's cell, before the walk above made the point moot for the
+  indexed case.
+
+### Plans
+
+- **EXPLAIN names the index-order walk.** `SELECT pad FROM t ORDER BY
+  id` planned as `Sort` over `Seq Scan` while the executor walked the
+  primary key. The walk decision now lives in one place asked by both
+  the planner and the executor, so the plan prints `Index Scan using
+  <idx>` with an `Order By:` line exactly when the walk runs — and
+  `Unique` above it for the DISTINCT shape, instead of a HashAggregate
+  the executor no longer runs.
+
+### Testing
+
+- The release sweep gained NUMERIC and BYTEA columns — eight typed
+  shapes per size. The 700x constant-fold loss above was found by the
+  panel within minutes of the fixture landing; the whole v7.37.26
+  numeric/bytea surface had shipped outside the panel's sight.
+- Corpus: distinct-walk pins (16 records), including the
+  mixed-representation and filtered-representative cases, with a
+  dropped-index control pinning walk/hash agreement.
+
 ## [7.37.26] — 2026-08-16
 
 Two customer reports, and the axes in them turned out to be wider than
