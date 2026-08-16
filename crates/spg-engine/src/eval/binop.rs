@@ -2110,6 +2110,38 @@ fn numeric_kind_of(v: &Value) -> Option<spg_storage::NumericKind> {
     }
 }
 
+/// r1039 — PG's total order over the NUMERIC classes: `-Infinity <
+/// finite < +Infinity < NaN`, with `NaN = NaN`. `None` when both sides
+/// are finite (or either is not numeric), i.e. when the ordinary
+/// scaled-integer comparison is the answer.
+///
+/// One definition, called from both comparison paths. `apply_binary`
+/// already had this rule and `compare` — the by-ref path the WHERE filter
+/// takes — did not, so a stored `'NaN'::numeric` compared as its
+/// canonical zero. Measured before the fix, on a five-row table:
+///
+/// ```text
+/// SELECT id, v = 0 FROM t     NaN -> false     (right)
+/// SELECT id FROM t WHERE v=0  NaN -> matched   (wrong)
+/// ```
+///
+/// The projection and the filter answered differently about the same
+/// row, which is what two implementations of one decision look like.
+pub(super) fn numeric_class_cmp(l: &Value<'_>, r: &Value<'_>) -> Option<core::cmp::Ordering> {
+    use spg_storage::NumericKind as NK;
+    let (lk, rk) = (numeric_kind_of(l)?, numeric_kind_of(r)?);
+    if lk == NK::Finite && rk == NK::Finite {
+        return None;
+    }
+    let rank = |k: NK| match k {
+        NK::NegInf => -2i8,
+        NK::Finite => 0,
+        NK::PosInf => 1,
+        NK::NaN => 2,
+    };
+    Some(rank(lk).cmp(&rank(rk)))
+}
+
 fn finite_sign_of(v: &Value) -> i32 {
     match v {
         Value::Numeric { scaled, .. } => (*scaled).signum() as i32,
@@ -2432,20 +2464,11 @@ fn apply_binary_numeric(
         op,
         BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq
     ) {
-        use spg_storage::NumericKind as NK;
-        if let (Some(lk), Some(rk)) = (numeric_kind_of(&l), numeric_kind_of(&r)) {
-            if lk != NK::Finite || rk != NK::Finite {
-                let rank = |k: NK| match k {
-                    NK::NegInf => -2,
-                    NK::Finite => 0,
-                    NK::PosInf => 1,
-                    NK::NaN => 2,
-                };
-                // At least one side is special, so the ranks alone order the pair
-                // (two finites never reach here).
-                let ord = rank(lk).cmp(&rank(rk));
-                return Ok(Value::Bool(cmp_to_bool(op, ord)));
-            }
+        // r1039 — the rank table used to live here; `numeric_class_cmp`
+        // holds it now, because the by-ref comparison path needed the same
+        // rule and had been answering without it.
+        if let Some(ord) = numeric_class_cmp(&l, &r) {
+            return Ok(Value::Bool(cmp_to_bool(op, ord)));
         }
     }
     // Promote integer ↔ numeric to a shared scale (max of both sides).
@@ -5824,6 +5847,11 @@ pub(super) fn compare(
                 && !matches!(a.data_type(), Some(DataType::Float))
                 && !matches!(b.data_type(), Some(DataType::Float)) =>
         {
+            // r1039 — a NaN or an Infinity is not its canonical zero.
+            // Same rule the owning path uses, from the same function.
+            if let Some(ord) = numeric_class_cmp(a, b) {
+                return cmp_result(op, ord);
+            }
             // Inline widen (numeric_or_widen wants `&Value<'static>`; these
             // operands are shorter-lived but only their Copy fields are read).
             let widen = |v: &Value<'_>| -> Option<(i128, u16)> {

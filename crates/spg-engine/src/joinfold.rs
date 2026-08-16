@@ -754,6 +754,17 @@ fn value_to_literal(v: &Value) -> Option<Literal> {
         Value::Float(x) => Literal::Float(*x),
         Value::Text(s) => Literal::String(s.to_string()),
         Value::Null => Literal::Null,
+        // r1039 — `Literal::Numeric` is exact, so a NUMERIC key can make
+        // the trip after all. `NumericBig` cannot: its literal form is
+        // the source text, which this value no longer has.
+        Value::Numeric {
+            scaled,
+            scale,
+            kind: spg_storage::NumericKind::Finite,
+        } => Literal::Numeric {
+            unscaled: *scaled,
+            scale: *scale,
+        },
         _ => return None,
     })
 }

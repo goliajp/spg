@@ -496,7 +496,7 @@ pub(crate) fn try_index_seek_positions(
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
-    let key = IndexKey::from_value(&value)?;
+    let key = probe_key(schema_cols, col_pos, &value)?;
     let locators = idx.lookup_eq(&key);
     let mut out = Vec::with_capacity(locators.len());
     for loc in locators {
@@ -550,7 +550,7 @@ fn parse_one_sided_range(
         } else {
             return None;
         };
-    let key = IndexKey::from_value(&value)?;
+    let key = probe_key(schema_cols, col_pos, &value)?;
     let bounds = match op {
         BinOp::Gt => (Bound::Excluded(key), Bound::Unbounded),
         BinOp::GtEq => (Bound::Included(key), Bound::Unbounded),
@@ -931,7 +931,7 @@ fn parse_index_only_bounds(
     if value.is_null() {
         return None;
     }
-    let key = IndexKey::from_value(&value)?;
+    let key = probe_key(schema_cols, col_pos, &value)?;
     Some((col_pos, Bound::Included(key.clone()), Bound::Included(key)))
 }
 
@@ -1162,7 +1162,7 @@ pub(crate) fn try_index_seek<'a>(
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
-    let key = IndexKey::from_value(&value)?;
+    let key = probe_key(schema_cols, col_pos, &value)?;
     let locators = idx.lookup_eq(&key);
     let table_name = table.schema().name.as_str();
     // v5.1: each locator dispatches to either the hot tier (zero-
@@ -1234,12 +1234,21 @@ fn try_inlist_seek<'a>(
     let col_pos = schema_cols.iter().position(|s| s.name == c.name)?;
     let idx = table.index_on(col_pos)?;
     // Every element must be a literal; bail (full scan) otherwise.
+    //
+    // r1039 — through the SAME resolver the equality seek uses. This
+    // built its key straight from `literal_to_value`, so a string
+    // literal was always TEXT and `d IN ('2026-01-02')` on a DATE column
+    // answered 0 rows with an index and 1 without it. Round 564 fixed
+    // that decision on the equality seek and r1037 on the two JOIN
+    // seeks; this was the fourth copy.
+    let col = schema_cols.get(col_pos)?;
     let mut keys: Vec<IndexKey> = Vec::with_capacity(list.len());
     for e in list {
         let Expr::Literal(l) = e else {
             return None;
         };
-        keys.push(IndexKey::from_value(&eval::literal_to_value(l))?);
+        let v = literal_as_column_value(l, col, col_pos)?;
+        keys.push(IndexKey::from_value_for_column(&v, col.ty)?);
     }
     let table_name = table.schema().name.as_str();
     let mut out: Vec<Cow<'a, Row>> = Vec::new();
@@ -1783,8 +1792,17 @@ pub(crate) fn try_pk_predicate(
     };
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
-    let key = IndexKey::from_value(&value)?;
+    let key = probe_key(schema_cols, col_pos, &value)?;
     Some((col_pos, key))
+}
+
+/// r1039 — the probe key for `col_pos`, built in THAT COLUMN'S key space.
+///
+/// See [`spg_storage::IndexKey::from_value_for_column`]: every key under
+/// one index comes from one column, so a probe built in another space
+/// finds nothing — and nothing reads exactly like "no matching rows".
+fn probe_key(schema_cols: &[ColumnSchema], col_pos: usize, value: &Value<'_>) -> Option<IndexKey> {
+    IndexKey::from_value_for_column(value, schema_cols.get(col_pos)?.ty)
 }
 
 pub(crate) fn resolve_col_literal_pair(
@@ -1805,6 +1823,32 @@ pub(crate) fn resolve_col_literal_pair(
     let Expr::Literal(l) = lit_side else {
         return None;
     };
+    Some((pos, literal_as_column_value(l, &schema_cols[pos], pos)?))
+}
+
+/// What a literal MEANS as a value of column `col` — the one place that
+/// decision is made.
+///
+/// r1039 — there were four copies of it, and they disagreed. Round 564
+/// fixed the single-table equality seek, r1037 fixed the JOIN driver's
+/// and the JOIN peer's, and this one — the IN-list seek — was still
+/// reading every string literal as TEXT. Measured on `develop` before
+/// this change, one row in the table either way:
+///
+/// ```text
+///                        no index   with index
+/// WHERE d = '2026-01-02'     1           1
+/// WHERE d IN ('2026-01-02')  1           0     <- DATE column
+/// WHERE d IN ('<a uuid>')    1           0     <- UUID column
+/// ```
+///
+/// Creating an index changed the answer, silently, which is the one thing
+/// an index may never do.
+pub(crate) fn literal_as_column_value(
+    l: &Literal,
+    col: &ColumnSchema,
+    col_pos: usize,
+) -> Option<Value<'static>> {
     let v = match l {
         Literal::Integer(n) => {
             if let Ok(small) = i32::try_from(*n) {
@@ -1854,7 +1898,7 @@ pub(crate) fn resolve_col_literal_pair(
     // coercions are deliberately NOT done here — `WHERE i = 1.5` on an
     // integer column must not round its way to the rows holding 2.
     // A coercion that fails means the ordinary path re-raises it.
-    let ty = schema_cols[pos].ty;
+    let ty = col.ty;
     if matches!(l, Literal::String(_))
         && !matches!(
             ty,
@@ -1863,10 +1907,7 @@ pub(crate) fn resolve_col_literal_pair(
                 | spg_storage::DataType::Char(_)
         )
     {
-        return Some((
-            pos,
-            crate::conversions::coerce_value(v, ty, &c.name, pos).ok()?,
-        ));
+        return crate::conversions::coerce_value(v, ty, &col.name, col_pos).ok();
     }
-    Some((pos, v))
+    Some(v)
 }

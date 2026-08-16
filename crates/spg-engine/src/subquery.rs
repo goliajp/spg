@@ -3795,7 +3795,15 @@ impl Engine {
         let Some(idx) = inner_table.index_on(plan.inner_pos) else {
             return Value::BigInt(0);
         };
-        let Some(key) = spg_storage::IndexKey::from_value(&Value::BigInt(outer_int)) else {
+        // r1039 — in the inner column's key space, not `BigInt`'s.
+        let Some(key) = inner_table
+            .schema()
+            .columns
+            .get(plan.inner_pos)
+            .and_then(|c| {
+                spg_storage::IndexKey::from_value_for_column(&Value::BigInt(outer_int), c.ty)
+            })
+        else {
             return Value::BigInt(0);
         };
         let hit = !idx.lookup_eq(&key).is_empty();
@@ -4036,7 +4044,10 @@ impl Engine {
         let Some(idx) = inner_table.index_on(inner_pos) else {
             return Ok(None);
         };
-        let Some(key) = spg_storage::IndexKey::from_value(&Value::BigInt(outer_int)) else {
+        // r1039 — in the inner column's key space, not `BigInt`'s.
+        let Some(key) = inner_schema.columns.get(inner_pos).and_then(|c| {
+            spg_storage::IndexKey::from_value_for_column(&Value::BigInt(outer_int), c.ty)
+        }) else {
             return Ok(None);
         };
         SCALARSQ_PK_PROBE_FIRED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

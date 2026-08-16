@@ -390,7 +390,8 @@ impl Engine {
                 });
                 if let Some((pos, value)) = resolved
                     && let Some(idx) = table.index_on(pos)
-                    && let Some(key) = spg_storage::IndexKey::from_value(&value)
+                    && let Some(col) = cols.get(pos)
+                    && let Some(key) = spg_storage::IndexKey::from_value_for_column(&value, col.ty)
                 {
                     let mut ids = Vec::new();
                     let mut all_hot = true;
@@ -580,30 +581,17 @@ impl Engine {
         // whole query answered zero rows with no error. Round 564 fixed
         // the same decision on the single-table seek; this is the third
         // copy of it, and the one a JOIN takes.
+        //
+        // r1039 — it is no longer a copy: both halves (what the literal
+        // MEANS, and which key space it belongs in) come from the
+        // resolver every other seek uses.
         let seek_keys =
             |col_pos: usize, idx: &spg_storage::Index, lits: &[&spg_sql::ast::Literal]| {
                 let mut ids = Vec::new();
-                let ty = cols.get(col_pos)?.ty;
-                let col_name = cols.get(col_pos)?.name.clone();
+                let col = cols.get(col_pos)?;
                 for l in lits {
-                    let raw = eval::literal_to_value(l);
-                    // Only string literals, and only against a non-text
-                    // column: parsing a string to its column type is exact or
-                    // it raises, so a coercion that succeeds cannot seek to
-                    // the wrong key. Numeric coercions stay out — `i = 1.5`
-                    // on an integer column must not round its way to 2.
-                    let value = if matches!(l, spg_sql::ast::Literal::String(_))
-                        && !matches!(
-                            ty,
-                            spg_storage::DataType::Text
-                                | spg_storage::DataType::Varchar(_)
-                                | spg_storage::DataType::Char(_)
-                        ) {
-                        crate::conversions::coerce_value(raw, ty, &col_name, col_pos).ok()?
-                    } else {
-                        raw
-                    };
-                    let key = spg_storage::IndexKey::from_value(&value)?;
+                    let value = crate::index_access::literal_as_column_value(l, col, col_pos)?;
+                    let key = spg_storage::IndexKey::from_value_for_column(&value, col.ty)?;
                     for loc in idx.lookup_eq(&key) {
                         match *loc {
                             spg_storage::RowLocator::Hot(i) => ids.push(i),

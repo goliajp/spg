@@ -1657,23 +1657,40 @@ impl Engine {
         // No-op today: every hot header is frozen/committed-alive.
         let scan_snapshot = self.current_snapshot();
         let (lpos0, _) = eq_pairs[0];
+        // r1039 — the key space is the PEER's column, not the left value's
+        // incidental type. `ON a.n = b.n` between an `int` and a `numeric`
+        // column would otherwise probe an integer key against a
+        // numeric-keyed index and match nothing.
+        let peer_key_ty = table
+            .schema()
+            .columns
+            .get(idx.column_position)
+            .map(|c| c.ty);
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
             let mut left_matched = false;
             // r1036 — a key this index cannot represent is NOT a miss.
-            // `IndexKey` has Int, Text, Bool and Uuid and nothing else, so
+            // `IndexKey` had Int, Text, Bool and Uuid and nothing else, so
             // a `bytea` or `numeric` join key produced `None` here, fell
             // past the `if let`, and left the row unmatched: an inner join
             // silently dropped every row rather than answering. Hand the
             // whole stage back instead, and let the hash join — which
             // compares values rather than index keys — take it.
+            //
+            // r1039 gave those two types their own key spaces, so this
+            // now declines only for what really has none (float, arrays,
+            // geometry) and for a left value that cannot be expressed in
+            // the peer's space at all.
             let probe_key = match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos0) {
                 Some(Value::Null) => None,
-                Some(kv) => match spg_storage::IndexKey::from_value(kv) {
-                    Some(k) => Some(k),
-                    None => return Ok(false),
-                },
+                Some(kv) => {
+                    let ty = peer_key_ty.ok_or(()).ok();
+                    match ty.and_then(|t| spg_storage::IndexKey::from_value_for_column(kv, t)) {
+                        Some(k) => Some(k),
+                        None => return Ok(false),
+                    }
+                }
                 None => None,
             };
             if let Some(key) = probe_key {
