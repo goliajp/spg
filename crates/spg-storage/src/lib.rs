@@ -2323,11 +2323,35 @@ pub struct NumericKey {
     class: u8,
     /// Finite only, and never set for zero.
     neg: bool,
-    /// Decimal exponent of `digits[0]`; 0 when there are no digits.
+    /// Decimal exponent of the leading significant digit; 0 for zero.
     exp: i32,
-    /// 0..=9 each, most significant first, no leading or trailing zeros.
-    digits: Vec<u8>,
+    /// r1040 — the first [`HEAD_DIGITS`] significant digits, LEFT-ALIGNED
+    /// (multiplied up so the leading digit always sits at 10^36). That
+    /// alignment is what makes an integer comparison of two heads the same
+    /// answer as a digit-by-digit one: `12` and `1` become 1.2e36 and
+    /// 1.0e36, which order the way the digit strings do, where the bare
+    /// integers 12 and 1 would not.
+    ///
+    /// Zero for the value zero and for every special.
+    ///
+    /// This started as a `Vec<u8>` of digits, which is correct and cost
+    /// an allocation per key and a slice comparison per sort comparison.
+    /// `ORDER BY <numeric>` builds one key per row and compares n log n
+    /// times: 200,000 rows measured 65.4 ms against 39.6 for the f64
+    /// projection that had been returning rows in the wrong order.
+    head: u128,
+    /// Significant digits past the 37th, one per byte, no trailing zeros.
+    /// Empty for everything an `i128` mantissa can hold with room to
+    /// spare — and an empty `Vec` does not allocate, which is the point.
+    tail: Vec<u8>,
 }
+
+/// Significant digits carried in [`NumericKey::head`]. 37 is the most
+/// that can be left-aligned inside a `u128`: the largest such value is
+/// 9.99…e36, and `u128::MAX` is 3.4e38.
+const HEAD_DIGITS: u32 = 37;
+/// `10^36` — where a left-aligned leading digit sits.
+const HEAD_SCALE: u128 = 1_000_000_000_000_000_000_000_000_000_000_000_000;
 
 /// The `class` byte of [`NumericKey`], in PG's order.
 const NUM_CLASS_NEG_INF: u8 = 0;
@@ -2336,34 +2360,119 @@ const NUM_CLASS_POS_INF: u8 = 2;
 const NUM_CLASS_NAN: u8 = 3;
 
 impl NumericKey {
-    /// The wire parts, for the catalog codec.
+    /// The key for a `Value::Numeric`'s three fields.
+    ///
+    /// Public because the ORDER BY key wants the same canonical form the
+    /// index key uses: two sort keys that disagree about which of two
+    /// NUMERICs is larger is the same class of defect as an index that
+    /// disagrees with a scan, and one definition is how they stay honest.
     #[must_use]
-    pub fn parts(&self) -> (u8, bool, i32, &[u8]) {
-        (self.class, self.neg, self.exp, &self.digits)
+    pub fn from_numeric(scaled: i128, scale: u16, kind: NumericKind) -> Self {
+        match kind {
+            NumericKind::Finite => {
+                let mut buf = [0u8; 40];
+                let n = digits_of_u128(scaled.unsigned_abs(), &mut buf);
+                Self::finite(scaled < 0, &buf[..n], i32::from(scale))
+            }
+            NumericKind::NaN => Self::special(NUM_CLASS_NAN),
+            NumericKind::PosInf => Self::special(NUM_CLASS_POS_INF),
+            NumericKind::NegInf => Self::special(NUM_CLASS_NEG_INF),
+        }
     }
 
-    /// Rebuild from [`NumericKey::parts`]. Returns `None` on parts that
-    /// are not canonical, so a corrupt catalog cannot smuggle in a key
-    /// whose `Eq` and `Ord` disagree.
+    /// The key for an exact integer — no scale, so no rounding.
     #[must_use]
-    pub fn from_parts(class: u8, neg: bool, exp: i32, digits: Vec<u8>) -> Option<Self> {
+    pub fn from_i128(n: i128) -> Self {
+        let mut buf = [0u8; 40];
+        let len = digits_of_u128(n.unsigned_abs(), &mut buf);
+        Self::finite(n < 0, &buf[..len], 0)
+    }
+
+    /// The key for a mantissa that overflowed `i128`. The two
+    /// representations of one value land on one key.
+    #[must_use]
+    pub fn from_big(b: &crate::bignum::BigNumeric) -> Self {
+        let (neg, limbs, scale) = b.parts();
+        Self::finite(neg, &digits_of_limbs(limbs), i32::from(scale))
+    }
+
+    /// The `f64` this key means, for the one comparison PG defines that
+    /// way: `numeric` against `float8` demotes the numeric.
+    ///
+    /// Lossy by construction — that is the point, and it is why nothing
+    /// else uses it.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn to_f64(&self) -> f64 {
+        match self.class {
+            NUM_CLASS_NAN => return f64::NAN,
+            NUM_CLASS_POS_INF => return f64::INFINITY,
+            NUM_CLASS_NEG_INF => return f64::NEG_INFINITY,
+            _ => {}
+        }
+        if self.head == 0 {
+            return 0.0;
+        }
+        // `head` is `d.ddd… × 10^36`; the value is that leading digit and
+        // its followers at `exp`. The tail is below f64's resolution by
+        // construction (it starts at the 38th significant digit).
+        let mantissa = self.head as f64 / HEAD_SCALE as f64;
+        let out = mantissa * pow10_f64(self.exp);
+        if self.neg { -out } else { out }
+    }
+
+    /// The significant decimal digits, most significant first — the form
+    /// the catalog codec writes, and the one `from_parts` reads back.
+    #[must_use]
+    pub fn digits(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.head != 0 {
+            let mut h = self.head;
+            for _ in 0..HEAD_DIGITS {
+                let d = u8::try_from(h / HEAD_SCALE).unwrap_or(0);
+                out.push(d);
+                h = (h % HEAD_SCALE) * 10;
+            }
+            while out.last() == Some(&0) {
+                out.pop();
+            }
+        }
+        out.extend_from_slice(&self.tail);
+        out
+    }
+
+    /// The wire parts, for the catalog codec.
+    #[must_use]
+    pub fn parts(&self) -> (u8, bool, i32) {
+        (self.class, self.neg, self.exp)
+    }
+
+    /// Rebuild from the wire parts. Returns `None` on parts that are not
+    /// canonical, so a corrupt catalog cannot smuggle in a key whose `Eq`
+    /// and `Ord` disagree.
+    #[must_use]
+    pub fn from_parts(class: u8, neg: bool, exp: i32, digits: &[u8]) -> Option<Self> {
         if class > NUM_CLASS_NAN || digits.iter().any(|d| *d > 9) {
             return None;
         }
         if class != NUM_CLASS_FINITE && (neg || exp != 0 || !digits.is_empty()) {
             return None;
         }
-        if digits.is_empty() && (neg || exp != 0) {
-            return None;
+        if digits.is_empty() {
+            if neg || exp != 0 {
+                return None;
+            }
+            return Some(Self::special(class));
         }
-        if !digits.is_empty() && (digits[0] == 0 || digits[digits.len() - 1] == 0) {
+        if digits[0] == 0 || digits[digits.len() - 1] == 0 {
             return None;
         }
         Some(Self {
             class,
             neg,
             exp,
-            digits,
+            head: head_of(digits),
+            tail: digits.iter().skip(HEAD_DIGITS as usize).copied().collect(),
         })
     }
 
@@ -2372,28 +2481,26 @@ impl NumericKey {
     /// `digits` is most-significant-first and may carry leading and
     /// trailing zeros; both are stripped, which is what makes `1.5` and
     /// `1.50` land on the same key.
-    fn finite(neg: bool, mut digits: Vec<u8>, scale: i32) -> Self {
+    fn finite(neg: bool, digits: &[u8], scale: i32) -> Self {
         let lead = digits.iter().position(|d| *d != 0).unwrap_or(digits.len());
-        digits.drain(..lead);
+        let digits = &digits[lead..];
         if digits.is_empty() {
-            return Self {
-                class: NUM_CLASS_FINITE,
-                neg: false,
-                exp: 0,
-                digits,
-            };
+            return Self::special(NUM_CLASS_FINITE);
         }
         // The leading digit's exponent, taken BEFORE trailing zeros go:
         // dropping low-order digits does not move the leading one.
         let exp = i32::try_from(digits.len()).unwrap_or(i32::MAX) - 1 - scale;
-        while digits.last() == Some(&0) {
-            digits.pop();
+        let mut end = digits.len();
+        while end > 0 && digits[end - 1] == 0 {
+            end -= 1;
         }
+        let digits = &digits[..end];
         Self {
             class: NUM_CLASS_FINITE,
             neg,
             exp,
-            digits,
+            head: head_of(digits),
+            tail: digits.iter().skip(HEAD_DIGITS as usize).copied().collect(),
         }
     }
 
@@ -2402,41 +2509,89 @@ impl NumericKey {
             class,
             neg: false,
             exp: 0,
-            digits: Vec::new(),
+            head: 0,
+            tail: Vec::new(),
         }
     }
+}
 
-    /// Decimal digits of `mag`, most significant first. Empty for zero.
-    fn digits_of_u128(mut mag: u128) -> Vec<u8> {
-        if mag == 0 {
-            return Vec::new();
-        }
-        let mut rev = Vec::new();
-        while mag > 0 {
-            rev.push(u8::try_from(mag % 10).unwrap_or(0));
-            mag /= 10;
-        }
-        rev.reverse();
-        rev
+/// The first [`HEAD_DIGITS`] of `digits`, left-aligned so the leading one
+/// sits at `10^36`.
+fn head_of(digits: &[u8]) -> u128 {
+    let mut head: u128 = 0;
+    let take = (HEAD_DIGITS as usize).min(digits.len());
+    for d in &digits[..take] {
+        head = head * 10 + u128::from(*d);
     }
+    for _ in take..HEAD_DIGITS as usize {
+        head *= 10;
+    }
+    head
+}
 
-    /// Decimal digits of a base-10^9 little-endian limb vector, most
-    /// significant first. Every limb but the leading one is padded to its
-    /// full nine digits — that padding is the whole point, since a limb
-    /// of 5 in the middle of a number means `000000005`.
-    fn digits_of_limbs(limbs: &[u32]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (i, limb) in limbs.iter().enumerate().rev() {
-            let d = Self::digits_of_u128(u128::from(*limb));
-            if i + 1 == limbs.len() {
-                out.extend_from_slice(&d);
-            } else {
-                out.extend(core::iter::repeat_n(0u8, 9 - d.len()));
-                out.extend_from_slice(&d);
-            }
-        }
-        out
+/// Decimal digits of `mag` into `buf`, most significant first; returns how
+/// many were written. Zero writes none.
+///
+/// r1040 — split at `u64` on purpose. A `u128` divide is a called routine,
+/// not an instruction, and this loop runs once per digit per key.
+fn digits_of_u128(mag: u128, buf: &mut [u8; 40]) -> usize {
+    if mag == 0 {
+        return 0;
     }
+    let mut rev = [0u8; 40];
+    let mut n = 0usize;
+    let mut big = mag;
+    // Peel nineteen digits at a time — the most a `u64` holds — so the
+    // wide divide runs at most twice.
+    while big > u128::from(u64::MAX) {
+        let mut chunk = u64::try_from(big % 10_000_000_000_000_000_000_u128).unwrap_or(0);
+        big /= 10_000_000_000_000_000_000_u128;
+        for _ in 0..19 {
+            rev[n] = u8::try_from(chunk % 10).unwrap_or(0);
+            chunk /= 10;
+            n += 1;
+        }
+    }
+    let mut small = u64::try_from(big).unwrap_or(0);
+    while small > 0 {
+        rev[n] = u8::try_from(small % 10).unwrap_or(0);
+        small /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        buf[i] = rev[n - 1 - i];
+    }
+    n
+}
+
+/// Decimal digits of a base-10^9 little-endian limb vector, most
+/// significant first. Every limb but the leading one is padded to its
+/// full nine digits — that padding is the whole point, since a limb of 5
+/// in the middle of a number means `000000005`.
+fn digits_of_limbs(limbs: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 40];
+    for (i, limb) in limbs.iter().enumerate().rev() {
+        let n = digits_of_u128(u128::from(*limb), &mut buf);
+        if i + 1 == limbs.len() {
+            out.extend_from_slice(&buf[..n]);
+        } else {
+            out.extend(core::iter::repeat_n(0u8, 9 - n));
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    out
+}
+
+/// `10^e` as an `f64`, for any `e` a canonical key can carry.
+#[allow(clippy::cast_precision_loss)]
+fn pow10_f64(e: i32) -> f64 {
+    let mut out = 1.0_f64;
+    let mag = e.unsigned_abs();
+    for _ in 0..mag {
+        out *= 10.0;
+    }
+    if e < 0 { 1.0 / out } else { out }
 }
 
 impl Ord for NumericKey {
@@ -2453,7 +2608,7 @@ impl Ord for NumericKey {
         // Zero first: it is stored with `neg == false` and `exp == 0`, so
         // the magnitude comparison below would put it above every value
         // smaller than 1 rather than between the negatives and positives.
-        match (self.digits.is_empty(), other.digits.is_empty()) {
+        match (self.head == 0, other.head == 0) {
             (true, true) => return Ordering::Equal,
             (true, false) => {
                 return if other.neg {
@@ -2477,13 +2632,15 @@ impl Ord for NumericKey {
             _ => {}
         }
         // Same sign, both non-zero: more integer digits is bigger, and at
-        // equal exponent the digit sequences compare directly — a prefix
-        // is smaller, which is right, since the longer one has non-zero
-        // digits below it (no trailing zeros survive canonicalization).
+        // equal exponent the left-aligned heads compare as one integer —
+        // the alignment is what makes that the same answer as comparing
+        // the digit strings. The tail only speaks when the first 37
+        // significant digits are identical.
         let mag = self
             .exp
             .cmp(&other.exp)
-            .then_with(|| self.digits.cmp(&other.digits));
+            .then_with(|| self.head.cmp(&other.head))
+            .then_with(|| self.tail.cmp(&other.tail));
         if self.neg { mag.reverse() } else { mag }
     }
 }
@@ -2552,11 +2709,7 @@ impl IndexKey {
     /// An integer as a NUMERIC key. Exact by construction — no scale, no
     /// rounding — which is why the conversion is allowed at all.
     fn exact_int_key(n: i128) -> Self {
-        Self::Numeric(NumericKey::finite(
-            n < 0,
-            NumericKey::digits_of_u128(n.unsigned_abs()),
-            0,
-        ))
+        Self::Numeric(NumericKey::from_i128(n))
     }
 
     pub fn from_value(v: &Value<'_>) -> Option<Self> {
@@ -2605,28 +2758,14 @@ impl IndexKey {
             Value::Hstore(_) => None,
             // r1039 — exact decimals index through the canonical
             // [`NumericKey`], which is what makes `1.5` and `1.50` one key.
-            Value::NumericBig(b) => {
-                let (neg, limbs, scale) = b.parts();
-                Some(Self::Numeric(NumericKey::finite(
-                    neg,
-                    NumericKey::digits_of_limbs(limbs),
-                    i32::from(scale),
-                )))
-            }
+            Value::NumericBig(b) => Some(Self::Numeric(NumericKey::from_big(b))),
             Value::Numeric {
                 scaled,
                 scale,
                 kind,
-            } => Some(Self::Numeric(match kind {
-                NumericKind::Finite => NumericKey::finite(
-                    *scaled < 0,
-                    NumericKey::digits_of_u128(scaled.unsigned_abs()),
-                    i32::from(*scale),
-                ),
-                NumericKind::NaN => NumericKey::special(NUM_CLASS_NAN),
-                NumericKind::PosInf => NumericKey::special(NUM_CLASS_POS_INF),
-                NumericKind::NegInf => NumericKey::special(NUM_CLASS_NEG_INF),
-            })),
+            } => Some(Self::Numeric(NumericKey::from_numeric(
+                *scaled, *scale, *kind,
+            ))),
             // r1039 — bytea orders by plain byte comparison, which is
             // `Vec<u8>`'s own.
             Value::Bytes(b) => Some(Self::Bytes(b.to_vec())),

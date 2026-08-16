@@ -5888,13 +5888,7 @@ mod numeric_index_key {
         // A digit vector with a trailing zero is not canonical: it would
         // be `Eq`-distinct from the same value without it, while `Ord`
         // calls them equal.
-        assert_eq!(
-            crate::NumericKey::from_parts(1, false, 0, alloc::vec![1, 0]),
-            None
-        );
-        assert_eq!(
-            crate::NumericKey::from_parts(1, true, 0, alloc::vec![]),
-            None
-        );
+        assert_eq!(crate::NumericKey::from_parts(1, false, 0, &[1, 0]), None);
+        assert_eq!(crate::NumericKey::from_parts(1, true, 0, &[]), None);
     }
 }

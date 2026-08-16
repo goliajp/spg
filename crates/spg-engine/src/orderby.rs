@@ -1009,10 +1009,31 @@ pub(crate) enum OrderKey {
     /// like PG (`{1} < {1,2} < {2} < {10}`). Elements carry their own OrderKey so
     /// integer arrays sort numerically, not by text.
     Array(alloc::vec::Vec<OrderKey>),
-    /// v7.38 (read01, T3.C3) — a NUMERIC beyond i128, sorted by exact bignum
-    /// value. A big value's magnitude always exceeds i128, so vs a finite Num/Int
-    /// key its sign alone orders it.
-    BigNum(spg_storage::bignum::BigNumeric),
+    /// r1040 — EXACT key for the whole NUMERIC family, in the canonical
+    /// form the index key uses.
+    ///
+    /// This used to be `BigNum`, holding only the values whose mantissa
+    /// overflows `i128`; an ordinary NUMERIC rode `Num(f64)` and so lost
+    /// everything past fifteen significant digits. Measured on ten
+    /// distinct values, `ORDER BY v` returned three pairs in the wrong
+    /// order — not a tie-break, an answer:
+    ///
+    /// ```text
+    ///  us                        PG18.4
+    ///  0.1000000000000000001     0.1
+    ///  0.1000000000000000002     0.1000000000000000001
+    ///  0.1                       0.1000000000000000002
+    ///  9007199254740993          9007199254740992
+    ///  9007199254740992          9007199254740993
+    /// ```
+    ///
+    /// f64 called each pair Equal, and a stable sort then left them in
+    /// insertion order. `Int(i128)` was added in round 664 for exactly
+    /// this reason on the integer types; NUMERIC never got it.
+    ///
+    /// The specials ride here too, so `ORDER BY` and a B-tree walk order
+    /// a NUMERIC column the same way, from one definition.
+    Numeric(spg_storage::NumericKey),
 }
 
 /// Compare two sort-key components (before any per-key DESC reverse).
@@ -1129,46 +1150,42 @@ fn order_key_elem_cmp(a: &OrderKey, b: &OrderKey) -> core::cmp::Ordering {
         (OrderKey::Num(_), OrderKey::Array(_)) => Ordering::Less,
         (OrderKey::Array(_), _) => Ordering::Greater,
         (_, OrderKey::Array(_)) => Ordering::Less,
-        // v7.38 (read01, T3.C3) — bignum keys compare exactly; vs a finite
-        // scalar key a big value's sign orders it (its magnitude always
-        // exceeds i128). A real float ±Inf/NaN still outranks any bignum.
-        (OrderKey::BigNum(x), OrderKey::BigNum(y)) => x.cmp(y),
-        (OrderKey::BigNum(x), OrderKey::Num(y)) => {
-            if y.is_nan() || *y == f64::INFINITY {
-                Ordering::Less
-            } else if *y == f64::NEG_INFINITY {
-                Ordering::Greater
-            } else if x.parts().0 {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (OrderKey::Num(x), OrderKey::BigNum(y)) => {
-            if x.is_nan() || *x == f64::INFINITY {
-                Ordering::Greater
-            } else if *x == f64::NEG_INFINITY {
-                Ordering::Less
-            } else if y.parts().0 {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
-        (OrderKey::BigNum(x), _) => {
-            if x.parts().0 {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            }
-        }
-        (_, OrderKey::BigNum(y)) => {
-            if y.parts().0 {
-                Ordering::Greater
-            } else {
-                Ordering::Less
-            }
-        }
+        // r1040 — two NUMERIC keys compare exactly, specials included:
+        // this is the same canonical key a B-tree on the column is built
+        // from, so a sort and an index walk cannot disagree.
+        (OrderKey::Numeric(x), OrderKey::Numeric(y)) => x.cmp(y),
+        // A NUMERIC against an integer key is exact both ways — an
+        // integer IS a numeric, with no scale and nothing to round. The
+        // old `BigNum` arms answered this from the big value's SIGN
+        // alone, which was sound only while every value in the variant
+        // overflowed `i128`; an ordinary NUMERIC in the same variant
+        // would have made `3.0 > 5` true.
+        (OrderKey::Numeric(x), OrderKey::Int(y)) => x.cmp(&spg_storage::NumericKey::from_i128(*y)),
+        (OrderKey::Int(x), OrderKey::Numeric(y)) => spg_storage::NumericKey::from_i128(*x).cmp(y),
+        // Against a FLOAT key the numeric is demoted, which is how PG
+        // defines `numeric <op> float8` — and it is the only place this
+        // key is allowed to lose precision.
+        (OrderKey::Numeric(x), OrderKey::Num(y)) => float_pg_order(x.to_f64(), *y),
+        (OrderKey::Num(x), OrderKey::Numeric(y)) => float_pg_order(*x, y.to_f64()),
+        // Heterogeneous ORDER BY: a numeric key keeps the place a float
+        // key would have had, so mixing them changes nothing.
+        (OrderKey::Numeric(_), OrderKey::Text(_) | OrderKey::Bytes(_)) => Ordering::Less,
+        (OrderKey::Text(_) | OrderKey::Bytes(_), OrderKey::Numeric(_)) => Ordering::Greater,
+        (OrderKey::Numeric(_), OrderKey::Json(_)) => Ordering::Less,
+        (OrderKey::Json(_), OrderKey::Numeric(_)) => Ordering::Greater,
+    }
+}
+
+/// PG's float8 total order: NaN is the greatest value and equals itself.
+/// The same rule the `Num`/`Num` arm applies, named so the numeric↔float
+/// arms cannot drift from it.
+fn float_pg_order(x: f64, y: f64) -> core::cmp::Ordering {
+    use core::cmp::Ordering;
+    match (x.is_nan(), y.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
     }
 }
 
