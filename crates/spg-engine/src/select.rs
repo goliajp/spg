@@ -7594,11 +7594,17 @@ impl Engine {
         let order_pos = cols
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&oc.name))?;
-        // The r1020 defect's gate: a NULL key is not in the btree, so a
-        // walk would silently drop those rows.
-        if cols[order_pos].nullable {
-            return None;
-        }
+        // r1046 — a nullable key no longer refuses the walk; it changes
+        // what the walk has to do. A NULL key is not in the btree, so
+        // walking alone would silently drop those rows — the r1020
+        // defect, which shipped once. The walk emits them separately, at
+        // the end SQL puts them.
+        //
+        // Refusing was costing every nullable indexed column a 3.4x:
+        // `SELECT id FROM t ORDER BY b` over 400,000 rows measured
+        // 72.0 ms with the column nullable and 20.2 with the same data
+        // under NOT NULL. `NOT NULL` is not the default, so that was the
+        // common case paying for the uncommon one.
         let index = table.index_on(order_pos)?;
         if !matches!(index.kind, spg_storage::IndexKind::BTree(_))
             || index.expression.is_some()
@@ -7684,6 +7690,75 @@ impl Engine {
         // live row that the walk reaches twice, which would otherwise be a
         // duplicated output row rather than a slow one.
         let mut emitted_rows = alloc::vec![false; table.rows().len()];
+
+        // r1046 — the rows the index cannot hold.
+        //
+        // A NULL key is not in the btree, so the walk below never reaches
+        // those rows; they are emitted here, at the end SQL puts them.
+        // PG's default is NULLS LAST ascending and NULLS FIRST
+        // descending, and an explicit `NULLS FIRST` / `NULLS LAST` wins —
+        // the same rule `order_by_value_cmp_raw` applies to the sort this
+        // replaces, so the two orders agree.
+        //
+        // Finding them costs one pass over the column. That pass is why
+        // this is still worth doing: the sort it replaces encodes and
+        // decodes every row, and the walk plus the pass measured 72.0 ms
+        // down to about 22 on 400,000 rows.
+        let nulls_first = order.nulls_first.unwrap_or(order.desc);
+        let mut count = 0usize;
+        let mut visited = 0usize;
+        let mut emit_null_rows = |emitted_rows: &mut alloc::vec::Vec<bool>,
+                                  eval_stack: &mut Vec<Value<'static>>,
+                                  values: &mut Vec<Value<'static>>,
+                                  visited: &mut usize,
+                                  emit: &mut F|
+         -> Result<usize, EngineError> {
+            if !cols[order_pos].nullable {
+                return Ok(0);
+            }
+            let mut n = 0usize;
+            for (ri, row) in table.rows().iter().enumerate() {
+                if !matches!(row.values.get(order_pos), Some(Value::Null)) {
+                    continue;
+                }
+                if emitted_rows.get(ri).copied().unwrap_or(true) {
+                    continue;
+                }
+                if !table.is_row_visible(ri, &snapshot) {
+                    continue;
+                }
+                *visited += 1;
+                if visited.is_multiple_of(256) {
+                    cancel.check()?;
+                }
+                emitted_rows[ri] = true;
+                if Self::stream_project_row(
+                    row,
+                    stmt.where_.as_ref(),
+                    compiled_where.as_ref(),
+                    eval_stack,
+                    &projection,
+                    &bound_pos,
+                    &ctx,
+                    values,
+                    emit,
+                )? {
+                    n += 1;
+                }
+            }
+            Ok(n)
+        };
+
+        if nulls_first {
+            count += emit_null_rows(
+                &mut emitted_rows,
+                &mut eval_stack,
+                &mut values,
+                &mut visited,
+                emit,
+            )?;
+        }
+
         let walker: alloc::boxed::Box<
             dyn Iterator<Item = (&spg_storage::IndexKey, &spg_storage::PostingList)>,
         > = if order.desc {
@@ -7691,8 +7766,6 @@ impl Engine {
         } else {
             alloc::boxed::Box::new(index.iter_asc())
         };
-        let mut count = 0usize;
-        let mut visited = 0usize;
         for (_key, locators) in walker {
             for loc in locators {
                 let spg_storage::RowLocator::Hot(ri) = *loc else {
@@ -7726,6 +7799,16 @@ impl Engine {
                     count += 1;
                 }
             }
+        }
+
+        if !nulls_first {
+            count += emit_null_rows(
+                &mut emitted_rows,
+                &mut eval_stack,
+                &mut values,
+                &mut visited,
+                emit,
+            )?;
         }
         Ok(Some(count))
     }
