@@ -41,6 +41,128 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.25] — 2026-08-16
+
+Two customer reports, and the axes in them turned out to be wider than
+the queries that carried them. Everything below was measured against a
+live PostgreSQL 18.4 rather than reasoned about.
+
+### Fixed — wrong answers
+
+Every item here returned rows rather than an error. A suite that checks
+for errors sees none of it.
+
+- **A JOIN could lose every matching row because of its key's TYPE.**
+  Reported by sentori as two defects with a four-cell matrix; extending
+  the matrix by key type found three independent causes. Counted, one row
+  on each side: `uuid`, `date` and `timestamp` lost the row when the
+  predicate sat on the right-hand table, and `bytea` and `numeric` lost it
+  with no predicate at all. `int`, `bigint`, `smallint` and `text` were
+  correct throughout, which is why an ordinary suite saw nothing.
+
+  1. The inner-JOIN fold rewrites `a JOIN b ON a.fk = b.pk` into
+     `a.fk IN (<keys>)`, and the value-to-literal conversion answered NULL
+     to every type outside {smallint, int, bigint, bool, float, text}.
+     `IN (NULL)` is never true. It refuses a key it cannot express now,
+     and the join runs unfolded.
+  2. The index-nested-loop probe treated a key it could not represent as
+     a MISS rather than as a reason to hand the shape to the hash join.
+  3. A string literal was not read as the column's type before becoming
+     an index key, so `WHERE s.k = '<uuid>'` sought a UUID-keyed index
+     with a TEXT key. Round 564 fixed exactly this on the single-table
+     seek; the JOIN driver's seek and the JOIN peer's were two more copies
+     of the same decision.
+
+- **`WHERE d IN ('<literal>')` answered 0 rows WITH an index and 1
+  without**, on `date` and `uuid` columns — a fourth copy of that same
+  round-564 decision, in the IN-list seek. There is one copy of it now,
+  and every seek reads it.
+
+- **A stored `NaN` matched `WHERE n = 0`.** The projection and the filter
+  took different comparison paths and only one knew that a NUMERIC special
+  is not its canonical zero: `SELECT n = 0` correctly answered false for
+  the same row the filter selected. `WHERE n > 1` dropped `NaN` and
+  `Infinity`, which PostgreSQL returns.
+
+- **`ORDER BY <numeric>` sorted `NaN`, `Infinity` and `-Infinity` as
+  zero**, and lost every distinct value past fifteen significant digits.
+  The sort key was an `f64` projection, so `0.1` and
+  `0.1000000000000000001` compared Equal and a stable sort returned them
+  in insertion order. Three of ten test values came back in the wrong
+  place. NUMERIC now sorts on the same exact key its index is built from.
+
+- **An unknown operator class was accepted.** `CREATE INDEX … (col
+  weird_garbage)` built an index; PostgreSQL raises
+  `operator class "weird_garbage" does not exist for access method "gin"`
+  (42704), and so does SPG now, per access method, from `pg_opclass` as
+  it stands on 18.4.
+
+### Performance
+
+- **A one-sided range reaches the index.** Reported by mailrs from
+  `EXPLAIN`, and the executor agreed: holding the matching rows at fifty
+  and growing the table gave 0.79 / 1.63 / 3.21 / 6.49 ms — a scan at
+  every size. The range parser accepted only a two-sided BETWEEN, on the
+  reasoning that a one-sided range "is usually non-selective", while the
+  selectivity cap two functions away is a MEASUREMENT of the same thing.
+  The guess was also wrong for the reported shape: NULLs are not indexed,
+  so a column that is NULL for almost every row holds fifty index entries
+  out of twenty thousand.
+
+  Their query at 160,000 rows: **6.64 ms → 0.014 ms**. A wide range that
+  matches every row is in the same measurement and still scans.
+
+- **`bytea` and `numeric` columns carry an index.** Neither had an index
+  key, so every seek on them declined. The numeric key is canonical —
+  `1.5`, `1.50` and `1.500` are one value in SQL and must be one key, or
+  `WHERE n = 1.5` would stop finding a row stored as `1.50`.
+
+- **`ORDER BY <int>` got 1.55× faster**, as a side effect of the sort key
+  the NUMERIC fix above needed. Measured with both binaries kept and
+  alternated in one quiet window, three rounds each: the int control went
+  22.0 / 21.9 / 22.0 ms to 14.3 / 13.8 / 15.4 over 200,000 rows, spreads
+  not overlapping, on a path the change does not touch. The likely cause
+  is the comparison losing two catch-all match arms in favour of explicit
+  pairs; that is a guess, and it is recorded as one rather than claimed.
+  `ORDER BY <numeric>` is a wash on the same measurement.
+
+  Recorded and not attacked: `ORDER BY <numeric>` over 200,000 rows is
+  44 ms against PostgreSQL 18.4's 30.2 on the same data, and was 44 ms
+  before this release too. The int control is 14 against PG's 20.
+
+- **`EXPLAIN`'s `rows=` for a range is counted, not guessed.** It was
+  `n / 3` whatever the data was: fixtures with 50 and with 10,000 matching
+  rows produced byte-identical estimates, and `ANALYZE` moved neither.
+  When there is an indexed range EXPLAIN asks the index, under the same
+  cap the executor uses so EXPLAIN never costs more than the query, and
+  keeps the old fraction past it. 20,000 rows: 50 matching now reads
+  `rows=50`, 5,000 reads `rows=5000`.
+
+### Added
+
+- **`USING gin (col jsonb_path_ops)` parses**, and so does every other
+  operator class: one is recognised by its POSITION between a column name
+  and a `,` `)` `ASC` `DESC` `NULLS` or `COLLATE`, rather than by a list
+  of eighteen names that held only the vector ones.
+- **A string literal continued on the next line** is one literal, as in
+  standard SQL. Where PostgreSQL draws that line has corners, and all
+  seven were measured: a line comment between the halves counts, a block
+  comment does not even when it contains a newline, an `E'…'` may lead a
+  continued literal but may not continue one, and same-line `'a' 'b'`
+  stays an error.
+- **`RETURNS bigint[]`**, `SETOF` included. An array column type already
+  parsed; the return position did not, and that one stopped a migration
+  outright.
+
+### Changed — on disk
+
+- **Catalog `FILE_VERSION` 89 → 90**, for the two new index-key tags. A
+  7.37.24 binary reading a 7.37.25 catalog reports it corrupt rather than
+  mis-reading it; the other direction is unaffected. No dump, no wire
+  format and no SQL surface changed.
+
+---
+
 ## [7.37.24] — 2026-08-15
 
 ### Performance
