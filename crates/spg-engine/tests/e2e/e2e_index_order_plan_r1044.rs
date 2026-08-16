@@ -20,13 +20,16 @@ use spg_engine::{Engine, QueryResult};
 
 fn engine() -> Engine {
     let mut e = Engine::new();
-    // `k` is nullable on purpose — it is the control for the NOT NULL
-    // gate, which exists because a NULL key is not in the btree and a
-    // walk would drop those rows (the r1020 defect, shipped once).
-    e.execute("CREATE TABLE io (id INT PRIMARY KEY, k INT, j INT NOT NULL)")
+    // r1046 — `k` is nullable AND carries NULLs. It walks now: the
+    // walk emits the NULL rows itself, at the end SQL puts them.
+    // `m` has no index — the control for a shape that must still sort.
+    e.execute("CREATE TABLE io (id INT PRIMARY KEY, k INT, j INT NOT NULL, m INT)")
         .unwrap();
-    e.execute("INSERT INTO io SELECT g, g % 100, g % 50 FROM generate_series(1, 500) g")
-        .unwrap();
+    e.execute(
+        "INSERT INTO io SELECT g, CASE WHEN g % 7 = 0 THEN NULL ELSE g % 100 END, \
+         g % 50, g % 13 FROM generate_series(1, 500) g",
+    )
+    .unwrap();
     e.execute("CREATE INDEX io_k ON io (k)").unwrap();
     e.execute("CREATE INDEX io_j ON io (j)").unwrap();
     e
@@ -50,6 +53,8 @@ fn r1044_a_walked_order_is_planned_as_an_index_scan() {
         ("EXPLAIN SELECT id FROM io ORDER BY id", "io_pkey"),
         ("EXPLAIN SELECT id FROM io ORDER BY id DESC", "io_pkey"),
         ("EXPLAIN SELECT id FROM io ORDER BY j", "io_j"),
+        // r1046 — nullable, and carrying NULLs.
+        ("EXPLAIN SELECT id FROM io ORDER BY k", "io_k"),
     ] {
         let p = plan(&mut e, sql);
         assert!(
@@ -74,8 +79,8 @@ fn alloc_fmt(idx: &str) -> String {
 fn r1044_shapes_outside_the_gate_still_sort() {
     let mut e = engine();
     for sql in [
-        // `k` is nullable: NULL keys are not in the btree.
-        "EXPLAIN SELECT id FROM io ORDER BY k",
+        // No index on the column at all.
+        "EXPLAIN SELECT id FROM io ORDER BY m",
         // LIMIT has its own top-N path.
         "EXPLAIN SELECT id FROM io ORDER BY id LIMIT 10",
         // DISTINCT is not part of the walk.
@@ -97,7 +102,7 @@ fn r1044_shapes_outside_the_gate_still_sort() {
 fn r1044_the_walk_is_cheaper_than_the_sort_it_replaces() {
     let mut e = engine();
     let walk = plan(&mut e, "EXPLAIN SELECT id FROM io ORDER BY j");
-    let sort = plan(&mut e, "EXPLAIN SELECT id FROM io ORDER BY k");
+    let sort = plan(&mut e, "EXPLAIN SELECT id FROM io ORDER BY m");
     let total = |line: &str| -> f64 {
         line.split("..")
             .nth(1)
