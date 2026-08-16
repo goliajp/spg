@@ -41,11 +41,16 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
-## [7.37.25] — 2026-08-16
+## [7.37.26] — 2026-08-16
 
 Two customer reports, and the axes in them turned out to be wider than
 the queries that carried them. Everything below was measured against a
 live PostgreSQL 18.4 rather than reasoned about.
+
+7.37.25 is a tag on the same work that was never published: the
+release-blocking performance sweep found two regressions in it, both
+described under Performance below, and the train stops before crates.io
+and the registry. Nothing was ever uploaded under that version.
 
 ### Fixed — wrong answers
 
@@ -116,6 +121,21 @@ for errors sees none of it.
   key, so every seek on them declined. The numeric key is canonical —
   `1.5`, `1.50` and `1.500` are one value in SQL and must be one key, or
   `WHERE n = 1.5` would stop finding a row stored as `1.50`.
+
+- **The numeric index key is boxed, so it does not tax every other
+  index.** Adding it made `IndexKey` 48 bytes and 16-aligned where it had
+  been 32 and 8-aligned, because a `NumericKey` is larger than any other
+  variant — and `IndexKey` is the key type of every B-tree node in every
+  index. The sort key grew the same way for the same reason. Two shapes
+  with no numeric anywhere in them paid for the variant's existence, at
+  400,000 rows: `SELECT pad FROM t ORDER BY id` by about 7%, and
+  `SELECT DISTINCT k FROM t ORDER BY k` by about 8%.
+
+  Both measured against 7.37.24 built from its own tag, through the same
+  harness, with the legs in both orders. Boxed, both cells are
+  indistinguishable from 7.37.24 in both orders, and the full sweep
+  against PostgreSQL 18.4 reads **32 cells, 0 losses**, where it read 1
+  before.
 
 - **`ORDER BY <int>` got 1.55× faster**, as a side effect of the sort key
   the NUMERIC fix above needed. Measured with both binaries kept and
