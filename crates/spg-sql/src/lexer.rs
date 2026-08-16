@@ -377,6 +377,51 @@ impl fmt::Display for LexError {
     }
 }
 
+/// r1038 — whether the text between two string literals makes them ONE
+/// literal: SQL's implicit concatenation.
+///
+/// PG18.4, measured rather than read — every one of these was run:
+///
+/// ```text
+/// 'a' 'b'            same line              error
+/// 'a'\n'b'                                  ab
+/// 'a' -- c\n'b'      line comment           ab
+/// 'a' /* c */ 'b'    block comment          error
+/// 'a' /* c\n*/ 'b'   block comment, newline error   <- the newline in a
+///                                                      block comment does
+///                                                      NOT count
+/// ```
+///
+/// So: whitespace and line comments only, with a real newline among them.
+/// The newline is what tells a continued literal from two arguments
+/// someone forgot a comma between, which is why `'a' 'b'` must stay an
+/// error.
+fn gap_continues_a_literal(gap: &str) -> bool {
+    let mut newline = false;
+    let mut rest = gap;
+    loop {
+        let trimmed = rest.trim_start_matches(|c: char| {
+            if c == '\n' {
+                newline = true;
+            }
+            c.is_whitespace()
+        });
+        match trimmed.strip_prefix("--") {
+            // A line comment runs to the newline that ends it, and that
+            // newline is the one PG counts.
+            Some(after) => match after.split_once('\n') {
+                Some((_, tail)) => {
+                    newline = true;
+                    rest = tail;
+                }
+                // Unterminated: nothing follows it, so nothing to join.
+                None => return false,
+            },
+            None => return trimmed.is_empty() && newline,
+        }
+    }
+}
+
 /// Tokenize `input` into a `Vec<Token>` ending in `Token::Eof`,
 /// with PG string semantics (backslash is a literal byte inside
 /// `'…'`; `''` is the only escape).
@@ -408,6 +453,11 @@ pub fn tokenize_with_offsets(
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
+    // r1038 — byte offset just past the last string literal pushed, so a
+    // following one can tell whether only whitespace-with-a-newline
+    // separates them. `None` whenever the previous token was anything
+    // else.
+    let mut last_string_end: Option<usize> = None;
     // Parallel to `out`: the start byte of each token. Filled at the tail of
     // every loop iteration for whatever token(s) that iteration pushed, so no
     // per-push-site bookkeeping is needed. (The only `continue` inside a
@@ -483,8 +533,29 @@ pub fn tokenize_with_offsets(
                 } else {
                     lex_quoted(input, i, b'\'', false)?
                 };
+                // r1038 — SQL's implicit concatenation: two string
+                // literals separated by whitespace CONTAINING A NEWLINE
+                // are one literal. PG requires the newline, and so does
+                // this: `'a' 'b'` on one line stays an error, which is
+                // what distinguishes a continued literal from two
+                // arguments someone forgot a comma between.
+                //
+                // sentori hit it in a `COMMENT ON`, which is how a
+                // migration written for PostgreSQL failed to apply.
+                if let (Token::String(body), Some(prev_end)) = (&tok, last_string_end)
+                    && let Some(gap) = input.get(prev_end..i)
+                    && gap_continues_a_literal(gap)
+                    && let Some(Token::String(head)) = out.last_mut()
+                {
+                    head.push_str(body);
+                    i += consumed;
+                    last_string_end = Some(i);
+                    continue;
+                }
+                let was_string = matches!(tok, Token::String(_));
                 out.push(tok);
                 i += consumed;
+                last_string_end = was_string.then_some(i);
             }
             // v7.18 — PG escape-string literal `E'...'` / `e'...'`.
             // Closes the mailrs D-pre #3 reverse-acceptance gap:
@@ -497,6 +568,12 @@ pub fn tokenize_with_offsets(
                 let (tok, consumed) = lex_escape_string(input, i + 1, false)?;
                 out.push(tok);
                 i += 1 + consumed;
+                // r1038 — an `E'…'` may LEAD a continued literal (PG18.4:
+                // `E'a'\n'b'` is `ab`) though it may not continue one
+                // (`'a'\nE'b'` is a syntax error there, and here, because
+                // this arm never joins). Recording the end is what lets the
+                // plain-string arm above see it as the head.
+                last_string_end = Some(i);
             }
             // v7.38 (read01, T18) — PG `U&'...'` Unicode string literal.
             b'U' | b'u' if peek_eq(bytes, i + 1, b'&') && peek_eq(bytes, i + 2, b'\'') => {

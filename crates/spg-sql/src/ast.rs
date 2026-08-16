@@ -2273,6 +2273,16 @@ pub struct CreateIndexStatement {
     /// keeps the current "accepted and discarded" behaviour for
     /// pg_dump compatibility.
     pub opclass: Option<String>,
+    /// r1038 — the access method as WRITTEN, lower-cased; `None` when
+    /// there was no `USING` clause.
+    ///
+    /// `method` cannot answer this: `gist` / `spgist` / `hash` all become
+    /// `IndexMethod::BTree` so PG schemas naming an AM SPG has no
+    /// implementation for still load. That degradation is deliberate, but
+    /// it loses the name — and the operator-class check needs it, both to
+    /// look the class up under the AM the user actually named and to say
+    /// which AM it was missing from, the way PG's message does.
+    pub method_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

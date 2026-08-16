@@ -429,6 +429,24 @@ fn is_json_to_record_name(s: &str) -> bool {
         || s.eq_ignore_ascii_case("json_to_record")
 }
 
+impl Parser {
+    /// Whether what follows an identifier ends an index key, which is how
+    /// an operator class is told from anything else in that position.
+    fn opclass_position_follows(next: Option<&Token>) -> bool {
+        match next {
+            // `ASC` / `DESC` have their own tokens; matching them as
+            // identifiers named "asc" / "desc" — which the first version of
+            // this did — never fires, and `(c text_pattern_ops DESC)` (which
+            // PG18.4 accepts, verified) went on failing to parse.
+            Some(Token::Comma | Token::RParen | Token::Asc | Token::Desc) => true,
+            Some(Token::Ident(w)) => {
+                w.eq_ignore_ascii_case("nulls") || w.eq_ignore_ascii_case("collate")
+            }
+            _ => false,
+        }
+    }
+}
+
 fn is_vector_opclass_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
     matches!(
@@ -5326,6 +5344,7 @@ impl Parser {
         // v7.39 (read01 round 65) — `RETURNS SETOF <type>`.
         if ident.eq_ignore_ascii_case("setof") {
             let inner = self.expect_ident_like()?;
+            let inner = alloc::format!("{inner}{}", self.consume_array_suffix());
             return Ok(FunctionReturn::Other(alloc::format!("SETOF {inner}")));
         }
         if ident.eq_ignore_ascii_case("trigger") {
@@ -5334,10 +5353,38 @@ impl Parser {
         if ident.eq_ignore_ascii_case("void") {
             return Ok(FunctionReturn::Void);
         }
+        // r1038 — `RETURNS bigint[]`. An array COLUMN type parsed; the
+        // RETURN position did not, so the `[` was a syntax error and the
+        // whole migration stopped. sentori worked around it by returning
+        // zero-padded text.
+        let suffix = self.consume_array_suffix();
+        if !suffix.is_empty() {
+            return Ok(FunctionReturn::Other(alloc::format!("{ident}{suffix}")));
+        }
         match map_type_ident_to_column_type_name(&ident) {
             Some(t) => Ok(FunctionReturn::Type(t)),
             None => Ok(FunctionReturn::Other(ident)),
         }
+    }
+
+    /// Consume any `[]` / `[N]` array markers after a type name and give
+    /// back their text. Empty when there are none.
+    fn consume_array_suffix(&mut self) -> String {
+        let mut out = String::new();
+        while matches!(self.peek(), Token::LBracket) {
+            self.advance();
+            // `[N]` is accepted and, as in PG, the length is not enforced.
+            if let Token::Integer(n) = self.peek().clone() {
+                self.advance();
+                out.push_str(&alloc::format!("[{n}]"));
+            } else {
+                out.push_str("[]");
+            }
+            if matches!(self.peek(), Token::RBracket) {
+                self.advance();
+            }
+        }
+        out
     }
 
     fn parse_optional_language(&mut self) -> Result<Option<String>, ParseError> {
@@ -15583,9 +15630,11 @@ impl Parser {
         // `hnsw` (a single-layer NSW graph for kNN). `USING` is the bare
         // ident `using` (we don't promote it to a reserved keyword
         // because it isn't reserved anywhere else in our SQL surface).
+        let mut method_name: Option<String> = None;
         let method = if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
             self.advance();
             let m = self.expect_ident_like()?;
+            method_name = Some(m.to_ascii_lowercase());
             match m.to_ascii_lowercase().as_str() {
                 "hnsw" => IndexMethod::Hnsw,
                 "btree" => IndexMethod::BTree,
@@ -15687,11 +15736,20 @@ impl Parser {
                 }
                 (s, None)
             }
+            // r1038 — an operator class is recognised by its POSITION, not
+            // by a list of names. It used to be `is_vector_opclass_name`,
+            // so `USING gin (doc jsonb_path_ops)` — ordinary PG, and what
+            // sentori's migration wrote — was a syntax error while
+            // `USING gin (doc)` parsed. Anything sitting between a column
+            // name and a `,` `)` ASC DESC NULLS COLLATE is an opclass;
+            // two bare identifiers in a row are not valid there otherwise.
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(
                     self.tokens.get(self.pos + 1),
                     Some(Token::Ident(op) | Token::QuotedIdent(op))
-                        if is_vector_opclass_name(op)
+                        if is_vector_opclass_name(op) || Self::opclass_position_follows(
+                            self.tokens.get(self.pos + 2)
+                        )
                 ) =>
             {
                 self.advance(); // column name
@@ -15896,6 +15954,7 @@ impl Parser {
             expression,
             is_unique,
             opclass,
+            method_name,
         }))
     }
 
