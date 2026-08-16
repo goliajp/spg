@@ -2618,16 +2618,30 @@ pub(super) const fn pow10_i128(p: u16) -> i128 {
 
 /// `10^p`, or None once it leaves the i128 range.
 const fn pow10_i128_checked(p: u16) -> Option<i128> {
-    let mut acc: i128 = 1;
-    let mut i = 0;
-    while i < p {
-        match acc.checked_mul(10) {
-            Some(v) => acc = v,
-            None => return None,
+    // r1044 — a table, because this runs once per COMPARISON and the
+    // loop it replaces multiplied `i128`s one at a time. Measured on
+    // `SELECT DISTINCT n FROM t ORDER BY n` over 400,000 rows: the same
+    // query on scale-0 values took 13.4 ms and on scale-2 values 50.9,
+    // and the two loops behind that difference were this one and
+    // `numeric_to_f64`'s.
+    //
+    // `i128::MAX` is ~1.7e38, so 10^38 is the last power that fits and
+    // anything above it keeps the `None` the caller already handles by
+    // dropping to `BigNumeric`.
+    const P: [i128; 39] = {
+        let mut t = [1i128; 39];
+        let mut i = 1;
+        while i < 39 {
+            t[i] = t[i - 1] * 10;
+            i += 1;
         }
-        i += 1;
+        t
+    };
+    if (p as usize) < P.len() {
+        Some(P[p as usize])
+    } else {
+        None
     }
-    Some(acc)
 }
 
 const fn cmp_to_bool(op: BinOp, ord: core::cmp::Ordering) -> bool {

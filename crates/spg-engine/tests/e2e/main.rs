@@ -334,6 +334,7 @@ mod e2e_index_maintenance_probes;
 mod e2e_index_only_equality_round566;
 mod e2e_index_only_runs_round562;
 mod e2e_index_only_scan_round560;
+mod e2e_index_order_plan_r1044;
 mod e2e_index_order_round537;
 mod e2e_index_prune_round493;
 mod e2e_index_round52;

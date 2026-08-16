@@ -7522,18 +7522,26 @@ impl Engine {
     /// from a btree, so walking one would silently drop those rows. That is
     /// exactly the defect r1020 fixed on the top-N path, where it had
     /// shipped.
-    fn try_index_order_stream<F>(
+    /// r1044 — the index this statement's ORDER BY can be WALKED on,
+    /// instead of sorted, or `None`.
+    ///
+    /// Extracted so `EXPLAIN` can ask the same question the executor
+    /// answers. It could not, and said so: `SELECT pad FROM t ORDER BY
+    /// id` on a 400,000-row table planned as `Sort` over `Seq Scan`
+    /// while the executor walked the primary key — 34.9 ms against
+    /// 147.0 for the same query ordered by an unindexed column, so the
+    /// walk was plainly running. Round 551 fixed a different case of
+    /// this and wrote the reason down: EXPLAIN is the first thing any
+    /// performance question opens, and an instrument that misnames the
+    /// access path is worse than one that says nothing.
+    ///
+    /// The gate is here once. Two copies of it is how the plan and the
+    /// executor come to disagree again.
+    pub(crate) fn index_order_walk_target(
         &self,
         stmt: &SelectStatement,
         from: &FromClause,
-        cancel: CancelToken<'_>,
-        emit: &mut F,
-    ) -> Result<Option<usize>, EngineError>
-    where
-        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
-    {
-        // The same shape gates the spill sort applies, minus `can_spill`:
-        // this path never spills.
+    ) -> Option<(String, usize)> {
         if stmt.order_by.len() != 1
             || stmt.distinct
             || stmt.limit_with_ties
@@ -7550,66 +7558,90 @@ impl Engine {
             || select_has_window(stmt)
             || aggregate::uses_aggregate(stmt)
         {
-            return Ok(None);
+            return None;
         }
         if stmt
             .items
             .iter()
             .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
         {
-            return Ok(None);
+            return None;
         }
-        crate::orderby::check_order_by_legality(stmt)?;
-        crate::orderby::check_order_by_positions(stmt)?;
-        crate::window::reject_window_in_row_clauses(stmt)?;
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
-            return Ok(None);
-        };
-        // Cold rows are reachable through locators, but the walk would have
-        // to resolve them per key; the ordinary path already covers that.
+        let table = self.active_catalog().get(&from.primary.name)?;
         if table.has_cold_rows_fast() {
-            return Ok(None);
+            return None;
         }
         if !from.primary.only
             && crate::partition::has_children(self.active_catalog(), &from.primary.name)
         {
-            return Ok(None);
+            return None;
         }
         let alias = from
             .primary
             .alias
             .as_deref()
             .unwrap_or(from.primary.name.as_str());
-        let cols = table.schema().columns.clone();
-
+        let cols = &table.schema().columns;
         let order = &stmt.order_by[0];
         let Expr::Column(oc) = &order.expr else {
-            return Ok(None);
+            return None;
         };
         if let Some(q) = &oc.qualifier
             && !q.eq_ignore_ascii_case(alias)
         {
-            return Ok(None);
+            return None;
         }
-        let Some(order_pos) = cols
+        let order_pos = cols
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&oc.name))
-        else {
-            return Ok(None);
-        };
-        // See the NOT NULL note above: this is the r1020 defect's gate.
+            .position(|c| c.name.eq_ignore_ascii_case(&oc.name))?;
+        // The r1020 defect's gate: a NULL key is not in the btree, so a
+        // walk would silently drop those rows.
         if cols[order_pos].nullable {
-            return Ok(None);
+            return None;
         }
-        let Some(index) = table.index_on(order_pos) else {
-            return Ok(None);
-        };
+        let index = table.index_on(order_pos)?;
         if !matches!(index.kind, spg_storage::IndexKind::BTree(_))
             || index.expression.is_some()
             || index.partial_predicate.is_some()
         {
-            return Ok(None);
+            return None;
         }
+        Some((index.name.clone(), order_pos))
+    }
+
+    fn try_index_order_stream<F>(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+        cancel: CancelToken<'_>,
+        emit: &mut F,
+    ) -> Result<Option<usize>, EngineError>
+    where
+        F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        // r1044 — the shape gate lives in `index_order_walk_target`, so
+        // `EXPLAIN` answers the same question. What stays here is the
+        // part that RAISES (an illegal ORDER BY has to keep erroring
+        // from where it did) and the bindings the walk needs.
+        crate::orderby::check_order_by_legality(stmt)?;
+        crate::orderby::check_order_by_positions(stmt)?;
+        crate::window::reject_window_in_row_clauses(stmt)?;
+        let Some((_, order_pos)) = self.index_order_walk_target(stmt, from) else {
+            return Ok(None);
+        };
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return Ok(None);
+        };
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = table.schema().columns.clone();
+        let order = &stmt.order_by[0];
+        let Some(index) = table.index_on(order_pos) else {
+            return Ok(None);
+        };
 
         let sess = self.dml_session();
         let ctx = EvalContext::new(&cols, Some(alias))
@@ -9541,6 +9573,26 @@ fn norm_hash_values(
     h.finish()
 }
 
+/// r1044 — `10^p` as an `i128`, or `None` past what one holds.
+///
+/// `i128::MAX` is about 1.7e38, so 10^38 is the last power that fits.
+const fn pow10_i128(p: u16) -> Option<i128> {
+    const P: [i128; 39] = {
+        let mut t = [1i128; 39];
+        let mut i = 1;
+        while i < 39 {
+            t[i] = t[i - 1] * 10;
+            i += 1;
+        }
+        t
+    };
+    if (p as usize) < P.len() {
+        Some(P[p as usize])
+    } else {
+        None
+    }
+}
+
 fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
     const TAG_NULL: u8 = 0;
     const TAG_BOOL: u8 = 1;
@@ -9613,10 +9665,41 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
                 // representation, then: exact integers fitting i64 go to the
                 // i64 domain; everything else uses numeric_to_f64 — the SAME
                 // formula value_cmp's Numeric↔Float arm compares with.
+                // r1044 — the reduction is required (`1.5` and `1.50` are
+                // one value and must land in one bucket) and it used to
+                // walk one digit at a time. That is O(scale), and scale
+                // is not small in practice: `n / 100` on a NUMERIC
+                // column stores `9.1900000000000000`, scale 16, so the
+                // loop ran fourteen times PER ROW.
+                //
+                // Priced by ablation rather than guessed at — removing
+                // the loop entirely took `SELECT DISTINCT n FROM t ORDER
+                // BY n` over 400,000 rows from 52 ms to 14.8, against
+                // PostgreSQL's 12.2-13.8. Two `pow10` lookup tables
+                // tried first moved it not at all, which is why this one
+                // was measured before it was written.
+                //
+                // Binary search over the same powers finds the whole
+                // run of trailing zeros in at most six tests and one
+                // division, instead of one test and one division per
+                // digit.
                 let (mut s, mut sc) = (*scaled, *scale);
-                while sc > 0 && s % 10 == 0 {
-                    s /= 10;
-                    sc -= 1;
+                if sc > 0 && s != 0 {
+                    let mut lo: u16 = 0;
+                    let mut hi: u16 = sc;
+                    while lo < hi {
+                        let mid = (lo + hi).div_ceil(2);
+                        match pow10_i128(mid) {
+                            Some(p) if s % p == 0 => lo = mid,
+                            _ => hi = mid - 1,
+                        }
+                    }
+                    if lo > 0 {
+                        if let Some(p) = pow10_i128(lo) {
+                            s /= p;
+                            sc -= lo;
+                        }
+                    }
                 }
                 if sc == 0 {
                     if let Ok(n) = i64::try_from(s) {

@@ -1408,7 +1408,49 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         d.cost = Some((ct, ct + cr as f64 * 0.0025, (cr / 10).max(1), cw));
         node = d;
     }
-    if !stmt.order_by.is_empty() {
+    // r1044 — the walk that replaces the sort entirely. `EXPLAIN` used to
+    // print `Sort` over `Seq Scan` for a query the executor served by
+    // walking the index: `SELECT pad FROM t ORDER BY id` on 400,000 rows
+    // took 34.9 ms against 147.0 for the same query ordered by an
+    // unindexed column, so the walk was plainly running and the plan
+    // named the wrong access path. Both now ask
+    // `Engine::index_order_walk_target`.
+    let walk = stmt
+        .from
+        .as_ref()
+        .and_then(|from| engine.index_order_walk_target(stmt, from));
+    if let Some((idx_name, _)) = &walk
+        && let Some(from) = stmt.from.as_ref()
+    {
+        let name = from.primary.name.as_str();
+        let alias_sfx = from
+            .primary
+            .alias
+            .as_deref()
+            .map(|a| alloc::format!(" {a}"))
+            .unwrap_or_default();
+        let mut n = PlanNode::new(alloc::format!(
+            "Index Scan using {idx_name} on {name}{alias_sfx}"
+        ));
+        let desc = if stmt.order_by[0].desc { " DESC" } else { "" };
+        n.attrs
+            .push(alloc::format!("Order By: {}{desc}", stmt.order_by[0].expr));
+        // The walk IS the scan — one node, the way PG renders it — so it
+        // carries the scan's own rows and width, not a child's. Reading
+        // `child_cost` here instead gave `cost=0.15..0.00 rows=1` on a
+        // 2,000-row table: a total below its own startup, which is not a
+        // number anything should print.
+        let (_, ct, cr, cw) = node.cost.unwrap_or((0.0, 0.0, 0, 0));
+        // No sort to pay for: the rows arrive in order.
+        n.cost = Some((0.15, ct, cr, cw));
+        n.children = core::mem::take(&mut node.children);
+        for a in &node.attrs {
+            if a.starts_with("Filter:") {
+                n.attrs.push(a.clone());
+            }
+        }
+        node = n;
+    } else if !stmt.order_by.is_empty() {
         let mut s = PlanNode::new(String::from("Sort"));
         let keys: Vec<String> = stmt
             .order_by
