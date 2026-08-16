@@ -585,7 +585,29 @@ pub(crate) fn cmp_numeric(xs: i128, xsc: u16, ys: i128, ysc: u16) -> core::cmp::
 /// `cmp_numeric`). Used by the mixed NUMERIC↔Float comparison arms.
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn numeric_to_f64(scaled: i128, scale: u16) -> f64 {
-    scaled as f64 / 10f64.powi(i32::from(scale))
+    // r1044 — a table, for the reason `pow10_i128_checked` carries: this
+    // runs once per ROW on the DISTINCT path, and the `powi` it replaces
+    // is a hand-rolled loop in this no_std crate. Beyond the table the
+    // loop still runs; a scale past 38 is not a shape any hot path has.
+    const P: [f64; 39] = {
+        let mut t = [1.0f64; 39];
+        let mut i = 1;
+        while i < 39 {
+            t[i] = t[i - 1] * 10.0;
+            i += 1;
+        }
+        t
+    };
+    let d = if (scale as usize) < P.len() {
+        P[scale as usize]
+    } else {
+        let mut acc = 1.0f64;
+        for _ in 0..scale {
+            acc *= 10.0;
+        }
+        acc
+    };
+    scaled as f64 / d
 }
 
 pub(crate) fn value_to_f64(v: &Value) -> Option<f64> {
