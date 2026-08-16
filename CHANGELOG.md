@@ -41,6 +41,57 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.28] — 2026-08-17
+
+Driven by sentori's second report: their 86-step suite, against
+7.37.27, stopped on step four with `Bind: binary format for OID 3802
+not supported`. Every fix below was verified through the same driver
+they use (sqlx, which binds in binary by default), and the harness
+that does so is now part of the release gate.
+
+### Fixed — protocol
+
+- **Binary-format Bind takes the composite types.** The decoder's list
+  stopped at scalars: jsonb, json and every array type were refused,
+  and a driver that binds in binary has no per-parameter switch, so a
+  JSON column was simply unreachable from sqlx and its relatives.
+  Now: jsonb (version byte checked), json, bpchar, and every
+  one-dimensional array whose element type the decoder handles —
+  seventeen of them, from `_bool` to `_jsonb`. A decoded array is
+  re-rendered as the `{…}` literal a text-format driver would have
+  sent, so both formats pass one coercion boundary and cannot
+  disagree; quoting is pinned byte-for-byte. Multi-dimensional arrays
+  and payloads whose element OID contradicts the declared type refuse
+  with a reason. Binary results grew the matching array coverage,
+  because a driver that binds binary asks for binary back.
+
+- **DML with RETURNING describes its result set.** Describe answered
+  NoData for every INSERT/UPDATE/DELETE, and sqlx sizes rows by
+  Describe: `INSERT … RETURNING id` came back as a zero-column row
+  (`ColumnIndexOutOfBounds`). Text-format clients never saw it — the
+  row stream carries its own description — which is how it survived
+  since v7.9. Confirmed against the released 7.37.27 image before
+  fixing; RETURNING columns now describe with the table's own types.
+
+### Fixed — parser
+
+- **The `[]` array suffix parses in the function parameter list and
+  the PREPARE type list** — the fifth and sixth members of the family
+  whose RETURNS position 7.37.26 fixed. `CREATE FUNCTION f(v
+  bigint[])`, `PREPARE p(bigint[]) AS …`, `EXECUTE p('{1,2}')` →
+  `{1,2}`, all matching live PG 18.4.
+
+### Testing
+
+- **The sqlx suite runs in the gate.** It had existed since v7.9 —
+  including a jsonb binary-bind round trip that pins exactly the
+  refusal above — behind an environment variable no gate ever set.
+  `gate.sh` now starts its own server and runs it on every `all`; its
+  first run is what found the RETURNING defect. Three new
+  sentori-shaped tests: arrays through every quoting case, NULL
+  elements and the empty array, and jsonb in the ingest shape with a
+  WHERE on the payload.
+
 ## [7.37.27] — 2026-08-16
 
 The release panel's first zero-loss run: 64 cells against a live
