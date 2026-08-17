@@ -944,18 +944,35 @@ impl Engine {
             // wholesale install stays correct there.
             let table_merge = self.mvcc_inplace && state.rebase_poisoned;
             if table_merge {
-                let changed: alloc::vec::Vec<String> =
-                    state.catalog.dirty_tables().iter().cloned().collect();
-                let mut fresh = self.catalog.clone();
-                for name in &changed {
-                    match state.catalog.get(name) {
-                        Some(t) => fresh.install_table(name, t.clone()),
-                        None => {
-                            fresh.drop_table(name);
-                        }
+                // r1059 (second cut) — merge FROM the shadow, not from
+                // the base. The first cut built a base clone and copied
+                // the dirty tables over; everything the tx created
+                // OUTSIDE the table map — CREATE SEQUENCE, views —
+                // vanished at its own COMMIT (round-283 pin caught the
+                // sequence). The shadow carries the tx's own DDL of
+                // every kind, so it is the side that must survive;
+                // relations the tx did NOT touch are pulled from the
+                // latest base (or dropped, if a neighbour dropped
+                // them). Non-table DDL committed by a NEIGHBOUR while
+                // this poisoned tx ran is still overwritten — recorded
+                // (MATRIX), strictly narrower than the pre-r1059
+                // wholesale install; live sequence VALUES are restored
+                // right below via `restore_sequence_counters`.
+                let dirty = state.catalog.dirty_tables().clone();
+                let mut merged = state.catalog;
+                for name in self.catalog.table_names() {
+                    if !dirty.contains(&name)
+                        && let Some(t) = self.catalog.get(&name)
+                    {
+                        merged.install_table(&name, t.clone());
                     }
                 }
-                self.catalog = fresh;
+                for name in merged.table_names() {
+                    if !dirty.contains(&name) && self.catalog.get(&name).is_none() {
+                        merged.drop_table(&name);
+                    }
+                }
+                self.catalog = merged;
             } else {
                 self.catalog = state.catalog;
             }
