@@ -51,6 +51,7 @@ mod ddl;
 pub mod describe;
 mod distinct;
 mod dml;
+mod dump;
 mod envelope;
 pub mod eval;
 mod execute;
