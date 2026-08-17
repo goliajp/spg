@@ -11,6 +11,32 @@ fn main() {
         Some("--help" | "-h") | None => {
             print!("{}", usage());
         }
+        // S1.3 — run ONE internal step by name, for debugging and for
+        // negative controls that must red a single step in isolation.
+        Some("step") => {
+            let Some(name) = args.get(1) else {
+                eprintln!("suite-run step <name>");
+                std::process::exit(2);
+            };
+            let root = std::path::Path::new(".");
+            let graph = suitelib::crategraph::CrateGraph::generate(root).expect("graph");
+            let runid = "step-debug".to_string();
+            let out = match name.as_str() {
+                "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
+                "unit-affected" => suitelib::steps::unit_affected(root, &graph),
+                "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
+                "ironrules" => suitelib::steps::ironrules_full(root, &runid),
+                "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
+                other => Err(format!("unknown internal step {other}")),
+            };
+            match out {
+                Ok(note) => println!("ok: {note}"),
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         // S0.8 — regenerate the crate graph and stamp it.
         Some("gen-crate-graph") => {
             let root = std::path::Path::new(".");
@@ -130,12 +156,10 @@ fn main() {
                     _ => match s.name.as_str() {
                         "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
                         "unit-affected" => suitelib::steps::unit_affected(root, &graph),
-                        // v1 of the prerelease `ironrules` step reuses the
-                        // wire smoke; S1.3 extends it (FILE_VERSION
-                        // direct-open + zero-change fixtures).
-                        "ironrule-smoke" | "ironrules" => {
-                            suitelib::steps::ironrule_smoke(root, &runid)
-                        }
+                        "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
+                        // S1.3 — smoke plus the previous release's data
+                        // directory opened by the current binary.
+                        "ironrules" => suitelib::steps::ironrules_full(root, &runid),
                         "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
