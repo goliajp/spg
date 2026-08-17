@@ -181,6 +181,40 @@ impl Drop for Roster {
     }
 }
 
+/// S3.3 — one crash-restart-verify cycle, the TAP-style one-liner:
+/// spawn on `data_dir`, run `write_sql` through the wire, `kill -9`,
+/// respawn on the SAME directory, and hand the caller a connection to
+/// verify with. The kill is `SIGKILL` from outside the process — the
+/// engine gets no goodbye, which is the entire point.
+///
+/// # Errors
+/// Spawn, connect, or SQL transport failures, named.
+pub fn crash_cycle(
+    roster: &mut Roster,
+    binary: &Path,
+    data_dir: &Path,
+    write_sql: &[&str],
+) -> Result<crate::wireclient::Conn, String> {
+    let port = roster.spawn_server("crash-cycle", binary, data_dir, Duration::from_secs(20))?;
+    let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite")?;
+    for sql in write_sql {
+        let r = conn.simple_query(sql)?;
+        if let Some(e) = r.error {
+            return Err(format!("crash_cycle write `{sql}`: {e}"));
+        }
+    }
+    // SIGKILL the newest roster member (ours) from outside.
+    if let Some(p) = roster.procs.last_mut() {
+        let pid = p.child.id();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        let _ = p.child.wait();
+    }
+    roster.procs.clear();
+    // Respawn on the same directory; recovery is the thing under test.
+    let port = roster.spawn_server("crash-verify", binary, data_dir, Duration::from_secs(20))?;
+    crate::wireclient::Conn::connect(port, "suite", "suite")
+}
+
 /// A temp workspace under `/tmp/spg-suite-<runid>/` — the ONLY prefix
 /// the janitor is allowed to collect (D10).
 #[must_use]
@@ -235,6 +269,54 @@ mod tests {
             );
             None
         }
+    }
+
+    /// S3.3 acceptance — three kill -9 cycles, zero committed rows
+    /// lost. Each cycle writes a batch, is SIGKILLed with no goodbye,
+    /// and the respawned server must count every row committed across
+    /// ALL prior cycles.
+    #[test]
+    #[ignore = "needs target/release/spg-server; S3.3 acceptance"]
+    fn three_crash_cycles_lose_nothing() {
+        let Some(bin) = server_bin() else { return };
+        let tmp = run_tmp_dir("s33-crash");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut roster = Roster::new();
+        let mut conn = crash_cycle(
+            &mut roster,
+            &bin,
+            &tmp,
+            &[
+                "CREATE TABLE cc (id INT PRIMARY KEY, batch INT NOT NULL)",
+                "INSERT INTO cc SELECT g, 1 FROM generate_series(1, 100) g",
+            ],
+        )
+        .expect("cycle 1");
+        let n = conn.simple_query("SELECT count(*) FROM cc").unwrap();
+        assert_eq!(n.rows[0][0], "100", "batch 1 must survive kill -9");
+        drop(conn);
+        roster.reap_all();
+        for (i, lo) in [(2u32, 101u32), (3, 201)] {
+            let mut conn = crash_cycle(
+                &mut roster,
+                &bin,
+                &tmp,
+                &[&format!(
+                    "INSERT INTO cc SELECT g, {i} FROM generate_series({lo}, {}) g",
+                    lo + 99
+                )],
+            )
+            .unwrap_or_else(|e| panic!("cycle {i}: {e}"));
+            let n = conn.simple_query("SELECT count(*) FROM cc").unwrap();
+            assert_eq!(
+                n.rows[0][0],
+                (i * 100).to_string(),
+                "all batches through {i} must survive"
+            );
+            drop(conn);
+            roster.reap_all();
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// S0.6 acceptance — 20 consecutive start/stops, no port conflict,
