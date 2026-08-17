@@ -135,13 +135,26 @@ pub fn run_permutation(perm: &Permutation, fixtures: &[PathBuf]) -> PermReport {
             }
         }
         Mode::Server => {
-            // v7.38 day-6 work: spawn an in-process spg-server, dial it
-            // via simple-query or extended protocol, drive the corpus
-            // through the wire. The skeleton parses + dispatches but
-            // returns `SkippedPending` so the CLI shape is correct now.
-            report.status = PermStatus::SkippedPending(
-                "server mode pending v7.38 day-6 ServerRunner work".into(),
-            );
+            // r1056 (S3.5) — the ServerRunner: a REAL spg-server per
+            // fixture (same isolation as the fresh embedded Runner),
+            // driven over pgwire. `server_simple` uses the simple-query
+            // protocol; `server_extended` sends every record through
+            // Parse/Bind/Describe/Execute/Sync — the road actual
+            // drivers ride, which is where three sentori walls lived.
+            apply_env(perm);
+            let extended = perm.name.contains("extended");
+            let bin = std::path::Path::new("target/release/spg-server");
+            if !bin.exists() {
+                report.status = PermStatus::SkippedPending(
+                    "target/release/spg-server not built — run `cargo build --release -p spg-server` first".into(),
+                );
+            } else {
+                for fixture in fixtures {
+                    report
+                        .fixtures
+                        .push(run_one_fixture_server(fixture, extended, bin));
+                }
+            }
         }
     }
 
@@ -199,6 +212,160 @@ fn run_one_fixture_embedded(path: &Path) -> FixtureResult {
     }
     result.duration_ms = started.elapsed().as_millis();
     result
+}
+
+fn run_one_fixture_server(path: &Path, extended: bool, bin: &Path) -> FixtureResult {
+    use sqllogictest::parser::{ExpectedQuery, Record};
+    let started = Instant::now();
+    let mut result = FixtureResult {
+        fixture: path.to_path_buf(),
+        pass: 0,
+        fail: 0,
+        skip: 0,
+        fail_snippets: Vec::new(),
+        duration_ms: 0,
+    };
+    let mut fail = |r: &mut FixtureResult, msg: String| {
+        r.fail += 1;
+        if r.fail_snippets.len() < 3 {
+            r.fail_snippets.push(short(&msg));
+        }
+    };
+    let records = match parser::parse_file(path) {
+        Ok(rs) => rs,
+        Err(e) => {
+            fail(&mut result, format!("parse: {e}"));
+            result.duration_ms = started.elapsed().as_millis();
+            return result;
+        }
+    };
+    // Fresh server per fixture — the wire twin of the fresh Runner.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("fixture");
+    let tmp = suitelib::proclib::run_tmp_dir(&format!("perm-{stem}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut roster = suitelib::proclib::Roster::new();
+    let port = match roster.spawn_server(stem, bin, &tmp, std::time::Duration::from_secs(20)) {
+        Ok(p) => p,
+        Err(e) => {
+            fail(&mut result, format!("server spawn: {e}"));
+            result.duration_ms = started.elapsed().as_millis();
+            return result;
+        }
+    };
+    let mut conn = match suitelib::wireclient::Conn::connect(port, "perm", "perm") {
+        Ok(c) => c,
+        Err(e) => {
+            fail(&mut result, format!("connect: {e}"));
+            result.duration_ms = started.elapsed().as_millis();
+            return result;
+        }
+    };
+    let mut run = |c: &mut suitelib::wireclient::Conn,
+                   sql: &str|
+     -> Result<suitelib::wireclient::QueryResult, String> {
+        if extended {
+            c.extended_query(sql)
+        } else {
+            c.simple_query(sql)
+        }
+    };
+    for rec in &records {
+        match rec {
+            Record::Halt => break,
+            Record::Statement {
+                directive,
+                sql,
+                expect_error,
+            } => {
+                if directive.skip {
+                    result.skip += 1;
+                    continue;
+                }
+                match run(&mut conn, sql) {
+                    Err(e) => fail(&mut result, format!("wire: {e}")),
+                    Ok(r) => match (r.error, expect_error) {
+                        (None, false) | (Some(_), true) => result.pass += 1,
+                        (Some(e), false) => fail(&mut result, format!("{sql}: {e}")),
+                        (None, true) => {
+                            fail(&mut result, format!("expected error, got ok: {sql}"));
+                        }
+                    },
+                }
+            }
+            Record::Query {
+                directive,
+                sql,
+                type_string,
+                sort,
+                expected,
+            } => {
+                if directive.skip {
+                    result.skip += 1;
+                    continue;
+                }
+                let ExpectedQuery::Values(expected) = expected else {
+                    result.skip += 1;
+                    continue;
+                };
+                match run(&mut conn, sql) {
+                    Err(e) => fail(&mut result, format!("wire: {e}")),
+                    Ok(r) => {
+                        if let Some(e) = r.error {
+                            fail(&mut result, format!("{sql}: {e}"));
+                            continue;
+                        }
+                        let mut actual = render_wire_cells(&r.rows, type_string);
+                        sqllogictest::record::apply_sort(&mut actual, type_string, *sort);
+                        if actual == *expected {
+                            result.pass += 1;
+                        } else {
+                            fail(
+                                &mut result,
+                                format!(
+                                    "row mismatch {sql}: expected {expected:?} actual {actual:?}"
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result.duration_ms = started.elapsed().as_millis();
+    result
+}
+
+/// Wire text → the embedded renderer's conventions, cell by cell, so
+/// one corpus judges both roads: `B` prints 0/1, `R` prints three
+/// decimals, an empty `T` prints `(empty)`. NULL already arrives as
+/// the literal `NULL` from the wire client.
+fn render_wire_cells(rows: &[Vec<String>], type_string: &str) -> Vec<String> {
+    let types: Vec<char> = type_string.chars().collect();
+    let mut out = Vec::new();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            let ty = *types.get(i).unwrap_or(&'T');
+            out.push(match ty {
+                _ if cell == "NULL" => cell.clone(),
+                'B' => match cell.as_str() {
+                    "t" | "true" | "1" => "1".to_string(),
+                    "f" | "false" | "0" => "0".to_string(),
+                    other => other.to_string(),
+                },
+                'R' => cell
+                    .parse::<f64>()
+                    .map_or_else(|_| cell.clone(), |x| format!("{x:.3}")),
+                'T' if cell.is_empty() => "(empty)".to_string(),
+                _ => cell.clone(),
+            });
+        }
+    }
+    out
 }
 
 fn short(s: &str) -> String {

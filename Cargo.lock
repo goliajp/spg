@@ -1904,6 +1904,7 @@ dependencies = [
  "spg-engine",
  "spg-storage",
  "sqllogictest",
+ "suitelib",
 ]
 
 [[package]]

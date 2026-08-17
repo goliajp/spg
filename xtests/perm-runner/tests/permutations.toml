@@ -22,7 +22,7 @@
 [default]
 corpus_root        = "xtests/sqllogictest/corpus"
 include_globs      = ["spg_baseline"]
-fast_tier          = ["embedded", "server_simple", "topk_off"]
+fast_tier          = ["embedded", "server_simple", "server_extended", "joinfold_off", "topk_off"]
 fast_tier_sample   = "spg_baseline/01_basic_dml"
 timeout_secs       = 30
 

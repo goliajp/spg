@@ -202,7 +202,9 @@ fn psql_cells(uri: &str, sql: &str) -> Result<Vec<String>, String> {
 /// The runner sorts ACTUAL cells before comparing; a recorded expected
 /// must therefore be sorted the same way or the file fails on its
 /// first replay.
-fn apply_sort(cells: &mut Vec<String>, type_string: &str, sort: SortMode) {
+/// Public for the perm-runner's server modes (S3.5): a wire-rendered
+/// actual must sort exactly as the embedded renderer would.
+pub fn apply_sort(cells: &mut Vec<String>, type_string: &str, sort: SortMode) {
     let ncols = type_string.len().max(1);
     match sort {
         SortMode::NoSort => {}
