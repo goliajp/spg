@@ -396,6 +396,16 @@ impl Engine {
             debug_assert!(leftover.is_empty(), "insert replay must be clean");
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+            // r1059 — the shadow's dirty window must keep meaning
+            // "changed by THIS tx": `fresh` is a base clone carrying
+            // the base's whole never-cleared history (observed live:
+            // every table in the database), which turns the poisoned-
+            // commit dirty-table merge into a wholesale install.
+            let own_dirty = st.catalog.dirty_tables().clone();
+            fresh.clear_dirty_tables();
+            for n in &own_dirty {
+                fresh.mark_table_dirty(n);
+            }
             st.catalog = fresh;
             // r196 — this rebase folded everything up to the current
             // epoch; the next statement skips unless it moves again.
@@ -780,6 +790,13 @@ impl Engine {
                 }
                 None => {
                     if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+                        // r1059 — same dirty-window transfer as the RC
+                        // rebase above; see that comment.
+                        let own_dirty = st.catalog.dirty_tables().clone();
+                        fresh.clear_dirty_tables();
+                        for n in &own_dirty {
+                            fresh.mark_table_dirty(n);
+                        }
                         st.catalog = fresh;
                     }
                 }
@@ -915,8 +932,17 @@ impl Engine {
             // shape DDL-plus-traffic actually takes. Where they DID touch
             // the same table this tx still wins it outright — unchanged
             // from before, and recorded rather than claimed fixed.
-            let table_merge =
-                self.mvcc_inplace && state.cached_snapshot.is_some() && state.rebase_poisoned;
+            // r1059 — poisoned READ COMMITTED txs take this merge too.
+            // The gate required `cached_snapshot.is_some()` (RR/SER),
+            // so an RC tx poisoned by its own DDL skipped BOTH the
+            // rebase (poisoned) and this merge, and the wholesale
+            // install below erased every concurrent commit since its
+            // shadow diverged — the sqlx gate flaked ~1-in-6 with a
+            // neighbour's CREATE TABLE vanishing ("does not exist")
+            // or a DROP resurrecting ("already exists"). An RC tx
+            // that DID rebase is aligned with the latest base, so the
+            // wholesale install stays correct there.
+            let table_merge = self.mvcc_inplace && state.rebase_poisoned;
             if table_merge {
                 let changed: alloc::vec::Vec<String> =
                     state.catalog.dirty_tables().iter().cloned().collect();
