@@ -81,7 +81,7 @@ fn dml_returning_columns(
     let Some(t) = catalog.get(table) else {
         return Vec::new();
     };
-    describe_select_items(items, &t.schema().columns)
+    describe_select_items(items, &t.schema().columns, catalog)
 }
 
 /// Output columns of one SELECT, resolved against `catalog` plus any
@@ -128,7 +128,7 @@ pub(crate) fn describe_select_columns(
     {
         return Vec::new();
     }
-    let out = describe_select_items(&s.items, &ns);
+    let out = describe_select_items(&s.items, &ns, catalog);
     if out.is_empty() {
         return out;
     }
@@ -208,7 +208,11 @@ fn relation_columns(
     None
 }
 
-fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> Vec<ColumnSchema> {
+fn describe_select_items(
+    items: &[SelectItem],
+    schema_cols: &[ColumnSchema],
+    cat: &Catalog,
+) -> Vec<ColumnSchema> {
     let mut out: Vec<ColumnSchema> = Vec::with_capacity(items.len());
     for item in items {
         match item {
@@ -220,7 +224,41 @@ fn describe_select_items(items: &[SelectItem], schema_cols: &[ColumnSchema]) -> 
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                let Some(desc) = describe_expr(expr, schema_cols) else {
+                // r1053 — a subquery in the SELECT list describes.
+                // Any one of these made the WHOLE describe answer
+                // empty, and sqlx sizes rows by Describe:
+                // `SELECT (SELECT 1) AS one` came back as a zero-column
+                // row (sentori report 4, their third Describe wall —
+                // steps 30/86). EXISTS is a non-null boolean; a scalar
+                // subquery carries its inner column's name and type,
+                // nullable because an empty inner answer is NULL.
+                let shape = match expr {
+                    Expr::Exists { .. } => Some(ExprShape {
+                        name: "exists".to_string(),
+                        ty: DataType::Bool,
+                        nullable: false,
+                    }),
+                    Expr::InSubquery { .. }
+                    | Expr::RowInSubquery { .. }
+                    | Expr::RowCmpSubquery { .. } => Some(ExprShape {
+                        name: "?column?".to_string(),
+                        ty: DataType::Bool,
+                        nullable: true,
+                    }),
+                    Expr::ScalarSubquery(inner) => {
+                        let cols = describe_select_columns(inner, cat, &[], 0);
+                        match cols.as_slice() {
+                            [c] => Some(ExprShape {
+                                name: c.name.clone(),
+                                ty: c.ty,
+                                nullable: true,
+                            }),
+                            _ => None,
+                        }
+                    }
+                    _ => describe_expr(expr, schema_cols),
+                };
+                let Some(desc) = shape else {
                     return Vec::new();
                 };
                 let name = alias.clone().unwrap_or(desc.name);

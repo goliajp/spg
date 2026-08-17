@@ -146,7 +146,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// wire smoke below, PLUS the previous release's data directory opened
 /// directly by the CURRENT binary and verified row-for-row.
 ///
-/// The fixture (`xtests/compat-fixtures/v7.37.29/`) was captured by
+/// The fixture (`xtests/compat-datadirs/v7.37.29/`) was captured by
 /// the v7.37.29 tag's own binary: 500 rows across nine types, two
 /// indexes, deletes and updates, statement-level WAL (798 bytes, 7
 /// records — there is no db file; replay IS the open). `expected.txt`
@@ -157,7 +157,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// Any probe or any fixture assertion failing, named.
 pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     let smoke = ironrule_smoke(root, runid)?;
-    let fixture = root.join("xtests/compat-fixtures/v7.37.29");
+    let fixture = root.join("xtests/compat-datadirs/v7.37.29");
     if !fixture.join("expected.txt").exists() {
         return Err(format!("fixture missing: {}", fixture.display()));
     }
