@@ -22,7 +22,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/12_explain` | 9 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 27 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
-| `spg_baseline/15_regressions` | 327 | 0 | 0 | 100.0% |
+| `spg_baseline/15_regressions` | 332 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -363,7 +363,7 @@ Per-corpus pass / fail / skip:
 | `join_predicate_type_seek.test` | 29 | 0 | 0 |
 | `k02_in_list_visitor.test` | 6 | 0 | 0 |
 | `orderby_null_index_walk.test` | 12 | 0 | 0 |
-| `parser_gaps_sentori.test` | 26 | 0 | 0 |
+| `parser_gaps_sentori.test` | 31 | 0 | 0 |
 | `posting_list_blocks.test` | 17 | 0 | 0 |
 | `pred_int_arith_lane.test` | 16 | 0 | 0 |
 | `range_index_one_sided.test` | 28 | 0 | 0 |
