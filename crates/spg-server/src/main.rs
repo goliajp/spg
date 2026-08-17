@@ -3135,7 +3135,34 @@ pub(crate) fn append_audit_pub(state: &ServerState, sql: &str) -> std::io::Resul
     append_audit(state, sql)
 }
 
+/// r1055 (7.38 S3.4) — audit-append fault injection: the K-th audit
+/// append (1-based, process-wide) fails once with EIO. Same family
+/// and same env-knob shape as `SPG_FAIL_FSYNC_AT`; registered in
+/// xtests/sigil/test-mode-gucs.md. The contract under test is
+/// ack ⇒ durable-and-audited: the statement must ERROR to the client
+/// (main.rs already refuses on append failure) and the chain must
+/// verify clean after restart.
+fn audit_fault_fires() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static AUDIT_APPENDS: AtomicU64 = AtomicU64::new(0);
+    static FAIL_AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let fail_at = FAIL_AT.get_or_init(|| {
+        env::var("SPG_FAIL_AUDIT_AT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    match fail_at {
+        Some(k) => AUDIT_APPENDS.fetch_add(1, Ordering::Relaxed) + 1 == *k,
+        None => false,
+    }
+}
+
 fn append_audit(state: &ServerState, sql: &str) -> std::io::Result<()> {
+    if audit_fault_fires() {
+        return Err(std::io::Error::other(
+            "SPG_FAIL_AUDIT_AT injection: audit append refused",
+        ));
+    }
     let ts_ms = u64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
