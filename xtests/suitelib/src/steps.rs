@@ -142,6 +142,69 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     }
 }
 
+/// `ironrules` (S1.3) — the prerelease tier's standing-rule step: the
+/// wire smoke below, PLUS the previous release's data directory opened
+/// directly by the CURRENT binary and verified row-for-row.
+///
+/// The fixture (`xtests/compat-fixtures/v7.37.29/`) was captured by
+/// the v7.37.29 tag's own binary: 500 rows across nine types, two
+/// indexes, deletes and updates, statement-level WAL (798 bytes, 7
+/// records — there is no db file; replay IS the open). `expected.txt`
+/// holds counts and an md5 over an ordered projection, so a silently
+/// thinner replay cannot pass.
+///
+/// # Errors
+/// Any probe or any fixture assertion failing, named.
+pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
+    let smoke = ironrule_smoke(root, runid)?;
+    let fixture = root.join("xtests/compat-fixtures/v7.37.29");
+    if !fixture.join("expected.txt").exists() {
+        return Err(format!("fixture missing: {}", fixture.display()));
+    }
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-fver"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("mkdir: {e}"))?;
+    // The server mutates its dir; always open a COPY.
+    for f in ["audit", "wal", "wal.cluster_id"] {
+        std::fs::copy(fixture.join(f), tmp.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+    }
+    let bin = root.join("target/release/spg-server");
+    let mut roster = Roster::new();
+    let port = roster.spawn_server("fver", &bin, &tmp, Duration::from_secs(15))?;
+    let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite")?;
+    let expected = std::fs::read_to_string(fixture.join("expected.txt"))
+        .map_err(|e| format!("expected.txt: {e}"))?;
+    for line in expected.lines() {
+        let Some((key, want)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let sql = if key == "checksum" {
+            "SELECT md5(string_agg(t, ',' ORDER BY id)) FROM fx_scalars".to_string()
+        } else {
+            format!("SELECT count(*) FROM {key}")
+        };
+        let r = conn.simple_query(&sql)?;
+        if let Some(e) = r.error {
+            return Err(format!("v7.37.29 fixture: {sql}: {e}"));
+        }
+        let got = r
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .cloned()
+            .unwrap_or_default();
+        if got != want {
+            return Err(format!(
+                "v7.37.29 fixture: {key}: want {want}, got {got} — the previous \
+                 release's data did not survive the current binary"
+            ));
+        }
+    }
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(format!("{smoke}; v7.37.29 dir direct-open verified"))
+}
+
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
 ///
 /// 1. `wal_path` is really plumbed (r964's hard lesson): after one
