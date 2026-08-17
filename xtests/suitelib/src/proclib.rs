@@ -75,6 +75,23 @@ impl Roster {
         data_dir: &Path,
         timeout: Duration,
     ) -> Result<u16, String> {
+        self.spawn_server_on(name, binary, data_dir, timeout, "127.0.0.1")
+    }
+
+    /// As [`Self::spawn_server`], with an explicit pgwire bind address —
+    /// `0.0.0.0` when a docker-resident client must reach the host leg
+    /// through `host.docker.internal` (the sweep on mini, S1.2).
+    ///
+    /// # Errors
+    /// As [`Self::spawn_server`].
+    pub fn spawn_server_on(
+        &mut self,
+        name: &str,
+        binary: &Path,
+        data_dir: &Path,
+        timeout: Duration,
+        pg_bind: &str,
+    ) -> Result<u16, String> {
         if !binary.exists() {
             return Err(format!("{}: binary {} missing", name, binary.display()));
         }
@@ -102,7 +119,7 @@ impl Roster {
             .arg(data_dir.join("db"))
             .arg(data_dir.join("audit"))
             .arg(data_dir.join("wal"))
-            .env("SPG_PG_ADDR", format!("127.0.0.1:{pg_port}"))
+            .env("SPG_PG_ADDR", format!("{pg_bind}:{pg_port}"))
             .stdout(Stdio::from(
                 logf.try_clone().map_err(|e| format!("{name}: log: {e}"))?,
             ))

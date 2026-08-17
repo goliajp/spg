@@ -130,10 +130,34 @@ fn main() {
                     _ => match s.name.as_str() {
                         "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
                         "unit-affected" => suitelib::steps::unit_affected(root, &graph),
-                        "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
+                        // v1 of the prerelease `ironrules` step reuses the
+                        // wire smoke; S1.3 extends it (FILE_VERSION
+                        // direct-open + zero-change fixtures).
+                        "ironrule-smoke" | "ironrules" => {
+                            suitelib::steps::ironrule_smoke(root, &runid)
+                        }
+                        "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });
+                // S1.5 — generated-artifact discipline: an ordinary
+                // run restores the tracked harness reports the biz
+                // step refreshes; only the release flow keeps them
+                // (SUITE_KEEP_REPORTS=1) to commit as its chore. A
+                // dirty tree after prerelease is what broke a release
+                // preflight once.
+                if name == "biz" && std::env::var("SUITE_KEEP_REPORTS").is_err() {
+                    let _ = std::process::Command::new("git")
+                        .args([
+                            "checkout",
+                            "--",
+                            "xtests/sqllogictest/report.json",
+                            "xtests/sqllogictest/report.md",
+                            "xtests/data_compat/report.md",
+                            "xtests/dump_compat/report.md",
+                        ])
+                        .status();
+                }
                 match outcome {
                     Ok(note) => println!("  ok    {:<16} {note}", name),
                     Err(e) => {
