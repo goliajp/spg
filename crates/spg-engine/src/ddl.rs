@@ -6079,6 +6079,26 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
             s.replace('\'', "''"),
             crate::system_catalog::pg_data_type_text(col_ty)
         ),
+        // r1054 — an ALREADY-typed string literal re-parses as a Cast
+        // node, and the generic Display arm below rendered it
+        // `('dflt')::text` where the first pass wrote `'dflt'::text`:
+        // two producers of default_text, two spellings, and the dump
+        // round-trip stopped being a fixed point on exactly that line.
+        // Same normalized shape as the bare-literal arm (PG stores a
+        // default through the assignment cast and reports the column's
+        // type, so re-normalizing to `col_ty` matches PG here too).
+        Expr::Cast { expr: inner, .. }
+            if matches!(inner.as_ref(), Expr::Literal(Literal::String(_))) =>
+        {
+            let Expr::Literal(Literal::String(s)) = inner.as_ref() else {
+                unreachable!("guarded by matches!")
+            };
+            alloc::format!(
+                "'{}'::{}",
+                s.replace('\'', "''"),
+                crate::system_catalog::pg_data_type_text(col_ty)
+            )
+        }
         // Boolean literal → PG's lowercase `true` / `false` (SPG's Literal
         // Display emits uppercase `TRUE`).
         Expr::Literal(Literal::Bool(b)) => {

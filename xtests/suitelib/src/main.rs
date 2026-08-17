@@ -134,7 +134,12 @@ fn main() {
                 // step (an engine change widens clippy exactly as it
                 // widens unit), with 1.2x headroom on the banded value.
                 let budget_secs = s.budget_s.map(|b| {
-                    if band > 1 && matches!(s.name.as_str(), "unit-affected" | "clippy-affected") {
+                    if band > 1
+                        && matches!(
+                            s.name.as_str(),
+                            "unit-affected" | "clippy-affected" | "pins-current"
+                        )
+                    {
                         b * band * 12 / 10
                     } else {
                         b
