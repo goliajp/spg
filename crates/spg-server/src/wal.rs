@@ -899,6 +899,7 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                                 "WAL encode failed: {e}"
                             ))),
                             wal_outcome: Err(e),
+                            audited: false,
                         });
                         continue;
                     }
@@ -930,6 +931,7 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                     let _ = task.ack.send(CommitResult {
                         result: exec_res,
                         wal_outcome: Ok(()),
+                        audited: false,
                     });
                     continue;
                 }
@@ -954,6 +956,67 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
             continue;
         }
 
+        // ----- 2.5 Audit barrier (r1055 P1 fix, design D29) -----
+        //
+        // ack ⇒ durable AND audited; error ⇒ NO effect. The audit
+        // entry lands BEFORE any WAL byte: on audit failure the
+        // group rolls back whole (the same pre_image mechanism the
+        // fsync-fail path below uses) and the WAL is untouched, so
+        // the client's error truthfully means "nothing happened".
+        //
+        // The old order appended audit AFTER the durable commit, so
+        // an audit failure produced an error for a statement that
+        // had taken effect — a retrying client double-writes. The
+        // S3.4 fault test's first run caught it.
+        let leader_audits = state.audit_path.is_some();
+        if leader_audits {
+            let mut audit_err: Option<std::io::Error> = None;
+            let mut appended_any = false;
+            for p in &prepared {
+                if !matches!(
+                    p.result,
+                    QueryResult::CommandOk {
+                        modified_catalog: true,
+                        ..
+                    }
+                ) {
+                    continue;
+                }
+                match crate::append_audit_pub(state, &p.task.sql) {
+                    Ok(()) => appended_any = true,
+                    Err(e) => {
+                        audit_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = audit_err {
+                if let Some(pre) = pre_image {
+                    if let Ok(mut engine) = state.engine.write() {
+                        engine.replace_catalog(pre);
+                    }
+                }
+                if appended_any {
+                    // The chain already carries entries for statements
+                    // this rollback annuls. One honest annul note keeps
+                    // the chain verifiable without lying; best-effort —
+                    // a persistently broken audit device cannot take it.
+                    let _ = crate::append_audit_pub(
+                        state,
+                        "-- spg: audit annul — preceding group rolled back                          (audit append failure before WAL)",
+                    );
+                }
+                for p in prepared {
+                    let _ = p.task.ack.send(CommitResult {
+                        result: Ok(p.result),
+                        wal_outcome: Err(clone_io_err(&e)),
+                        audited: true,
+                    });
+                }
+                continue;
+            }
+        }
+
         // ----- 3. Batched fsync barrier -----
         // v7.37.15 (r172) — a group syncs iff any member's session
         // wants synchronous_commit. An all-async group appends
@@ -968,6 +1031,15 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
         if wal_outcome.is_err()
             && let Some(pre) = pre_image
         {
+            // r1055 (D29) — the audit barrier above already recorded
+            // this group's catalog statements; the rollback annuls
+            // them, and the chain says so. Best-effort by nature.
+            if leader_audits {
+                let _ = crate::append_audit_pub(
+                    state,
+                    "-- spg: audit annul — preceding group rolled back (WAL append failure)",
+                );
+            }
             if let Ok(mut engine) = state.engine.write() {
                 engine.replace_catalog(pre);
             } else {
@@ -1007,6 +1079,7 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
             let _ = p.task.ack.send(CommitResult {
                 result: Ok(p.result),
                 wal_outcome: cloned_wal,
+                audited: leader_audits,
             });
         }
         // loop back to pull the next group (rolling drain).

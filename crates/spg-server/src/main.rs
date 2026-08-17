@@ -206,6 +206,11 @@ struct ChaosKnobs {
 struct CommitResult {
     result: Result<QueryResult, EngineError>,
     wal_outcome: std::io::Result<()>,
+    /// r1055 (D29) — true when the leader already ran the audit
+    /// barrier for this task (audit_path configured on the server).
+    /// Post-hoc audit call sites must skip when set, or the entry
+    /// doubles.
+    audited: bool,
 }
 
 /// v4.42 — one entry in the commit-barrier queue. The dispatch thread
@@ -251,7 +256,7 @@ pub(crate) fn commit_queue_execute(
     state: &ServerState,
     sql: String,
     cancel_flag: &Arc<AtomicBool>,
-) -> (Result<QueryResult, EngineError>, std::io::Result<()>) {
+) -> (Result<QueryResult, EngineError>, std::io::Result<()>, bool) {
     let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
     let task = CommitTask {
         sql,
@@ -277,12 +282,14 @@ pub(crate) fn commit_queue_execute(
         Ok(CommitResult {
             result,
             wal_outcome,
-        }) => (result, wal_outcome),
+            audited,
+        }) => (result, wal_outcome, audited),
         Err(_) => (
             Err(EngineError::Unsupported(
                 "commit barrier: ack channel closed before result arrived".into(),
             )),
             Ok(()),
+            false,
         ),
     }
 }
@@ -2964,10 +2971,11 @@ fn handle_query_op(
     // The legacy v2 WAL framing is the right format here
     // (auto-commit framing assumes there's no client TX
     // in flight, which this branch contradicts).
-    let (result, wal_result, snapshot) = if needs_wrap {
+    let (result, wal_result, snapshot, leader_audited) = if needs_wrap {
         // r178 — shared helper (also used by the pgwire plain-DML
         // path); resolves sync_commit from the session GUC itself.
-        let (result, wal_outcome) = commit_queue_execute(state, sql.clone(), &cancel_flag);
+        let (result, wal_outcome, leader_audited) =
+            commit_queue_execute(state, sql.clone(), &cancel_flag);
         // Wrap path always has WAL on (see `needs_wrap`
         // gate above), so the wal-off snapshot branch is
         // unreachable here. Auto-commit wraps never leave
@@ -2979,7 +2987,7 @@ fn handle_query_op(
             .engine
             .read()
             .is_ok_and(|e| e.is_tx_open(spg_engine::IMPLICIT_TX));
-        (result, wal_outcome, None)
+        (result, wal_outcome, None, leader_audited)
     } else {
         let mut engine = state
             .engine
@@ -3050,7 +3058,7 @@ fn handle_query_op(
             None
         };
         drop(engine);
-        (result, wal_result, snapshot)
+        (result, wal_result, snapshot, false)
     };
     watchdog.cancel();
     // Snapshot the catalog first; an audit entry that survives a
@@ -3096,7 +3104,12 @@ fn handle_query_op(
     // file (the SQL text was cloned into the log forever), so a
     // long-running server with no audit configured still leaked
     // a few MB per 10K writes.
-    if state.audit_path.is_some()
+    // r1055 (D29) — the wrap path's audit now happens inside the
+    // leader, BEFORE any WAL byte; this post-hoc site remains only
+    // for the non-wrap branch (explicit-TX writes / no-WAL mode),
+    // whose ordering is examined in its own round (ledger note).
+    if !leader_audited
+        && state.audit_path.is_some()
         && matches!(
             result,
             Ok(QueryResult::CommandOk {
