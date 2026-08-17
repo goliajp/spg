@@ -1122,6 +1122,7 @@ fn apply_function_dispatch(
         "spg_injection_attach" => spg_injection_attach(args),
         "spg_injection_wakeup" => spg_injection_wakeup(args),
         "spg_injection_detach" => spg_injection_detach(args),
+        "spg_injection_notice_count" => spg_injection_notice_count(args),
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {
@@ -20387,6 +20388,35 @@ fn spg_injection_detach(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
     })?;
     store.detach(name);
     Ok(Value::Bool(true))
+}
+
+/// r1055 — the notice tally, SQL-facing like its siblings: a test that
+/// attaches `notice:` needs to READ the count through the same wire it
+/// attached through.
+#[cfg(feature = "injection-points")]
+fn spg_injection_notice_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::TypeMismatch {
+            detail: format!(
+                "spg_injection_notice_count takes (point_name TEXT), got {} args",
+                args.len()
+            ),
+        });
+    }
+    let name = expect_text_arg(args, 0, "spg_injection_notice_count")?;
+    let store = crate::testkit::injection::current().ok_or_else(|| EvalError::TypeMismatch {
+        detail: "spg_injection_notice_count: no engine injection scope active".into(),
+    })?;
+    let n = i64::try_from(store.notice_count(name)).unwrap_or(i64::MAX);
+    Ok(Value::BigInt(n))
+}
+
+#[cfg(not(feature = "injection-points"))]
+fn spg_injection_notice_count(_args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    Err(EvalError::TypeMismatch {
+        detail: "spg_injection_notice_count: injection-points feature not enabled in this build"
+            .into(),
+    })
 }
 
 #[cfg(not(feature = "injection-points"))]

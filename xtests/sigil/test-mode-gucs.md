@@ -63,3 +63,13 @@ the build.
 4. Every acceptor carries an inline comment `v7.38 元机制 D acceptor
    — <GUC_NAME>` so `git grep` lands on the implementation from this
    index.
+
+## Host-side fault knobs (spg-server; S3.4/D28 family)
+
+| Knob | Surface | Site | Acceptance | Status |
+|---|---|---|---|---|
+| `SPG_FAIL_WAL_QUOTA_BYTES=N` | WAL append refuses past N bytes (ENOSPC-shaped) | main.rs ChaosKnobs | e2e_chaos | LANDED (v4.29) |
+| `SPG_FAIL_FSYNC_AT=K` | K-th client-path WAL fsync fails once (EIO) | main.rs ChaosKnobs | e2e_fsync_fail_round190 | LANDED (r190) |
+| `SPG_DISABLE_WAL_PREFLIGHT=1` | skip oversize preflight so append fails in-path | main.rs ChaosKnobs | chaos tests | LANDED (v4.34) |
+| `SPG_FAIL_AUDIT_AT=K` | K-th audit append fails once (EIO) | main.rs audit_fault_fires | suitelib audit_append_fault (pins the discovered error-but-applied ordering defect) | LANDED (r1055) |
+| `SPG_FAULT_RECOVERY_PAUSE_MS=N` | sleep N ms per replayed WAL frame (kill-window widener) | wal.rs replay_wal_bytes | suitelib kill_during_recovery | LANDED (r1055) |

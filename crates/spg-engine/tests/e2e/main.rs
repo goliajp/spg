@@ -367,6 +367,7 @@ mod e2e_infoschema_not_null;
 mod e2e_inherit_alter_truncate_round647;
 mod e2e_inheritance_catalog_round642;
 mod e2e_inheritance_dml_round646;
+mod e2e_injection_attach_r1055;
 mod e2e_input_syntax_wording_round324;
 mod e2e_insert_default_values;
 mod e2e_insert_errors_round88;

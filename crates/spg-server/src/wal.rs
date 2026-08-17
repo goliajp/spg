@@ -1238,6 +1238,15 @@ pub(crate) fn dispatch_v3_record(
 }
 
 pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
+    // r1055 (7.38 S3.4) — widen the kill window deterministically: a
+    // crash-during-recovery test needs recovery to take long enough
+    // to be killed IN, and a sleep per applied frame is the honest
+    // way to get there without racing. Registered in the sigil index;
+    // absent in production environments, zero cost.
+    let pause_ms: u64 = std::env::var("SPG_FAULT_RECOVERY_PAUSE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let mut cur = 0;
     let mut applied = 0usize;
     while cur < bytes.len() {
@@ -1330,6 +1339,9 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
         cur += len;
         if count_as_applied {
             applied += 1;
+            if pause_ms > 0 {
+                std::thread::sleep(core::time::Duration::from_millis(pause_ms));
+            }
         }
     }
     Ok(applied)
