@@ -57,6 +57,9 @@ pub enum Record {
 pub struct Directive {
     pub skip: bool,
     pub only: bool,
+    /// 1-based source line of the record's header — r1052 (S2.3), so a
+    /// failure report can point at the file location pg_regress-style.
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -169,6 +172,7 @@ pub fn parse_str(text: &str) -> Result<Vec<Record>, ParseError> {
                 }
             };
             lines.next();
+            pending_directive.line = _lineno + 1;
             let sql = collect_sql_until_blank(&mut lines);
             out.push(Record::Statement {
                 directive: pending_directive,
@@ -199,6 +203,7 @@ pub fn parse_str(text: &str) -> Result<Vec<Record>, ParseError> {
                 }
             };
             lines.next();
+            pending_directive.line = _lineno + 1;
             let sql = collect_sql_until_separator(&mut lines);
             let expected = collect_expected(&mut lines);
             out.push(Record::Query {

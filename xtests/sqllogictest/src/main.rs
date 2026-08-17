@@ -107,6 +107,7 @@ fn main() -> ExitCode {
     }
 
     let mut groups: Vec<GroupReport> = Vec::new();
+    let mut diffs: Vec<String> = Vec::new();
     for entry in fs::read_dir(&corpus).expect("read corpus") {
         let entry = entry.expect("dir entry");
         let path = entry.path();
@@ -149,10 +150,10 @@ fn main() -> ExitCode {
                     .unwrap_or("?")
                     .to_string();
                 let composite = format!("{group_name}/{sub_name}");
-                groups.push(run_group(&composite, &sub));
+                groups.push(run_group(&composite, &sub, &mut diffs));
             }
         } else {
-            groups.push(run_group(&group_name, &path));
+            groups.push(run_group(&group_name, &path, &mut diffs));
         }
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
@@ -190,6 +191,7 @@ fn main() -> ExitCode {
     let pass: usize = groups.iter().map(|g| g.pass).sum();
     let fail: usize = groups.iter().map(|g| g.fail).sum();
     let skip: usize = groups.iter().map(|g| g.skip).sum();
+    write_diffs(&workspace_root, &diffs);
     println!("\nTOTAL          pass={pass} fail={fail} skip={skip}");
 
     if fail == 0 {
@@ -240,6 +242,7 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
         }
     };
     let mut reports: Vec<FileReport> = Vec::new();
+    let mut diffs: Vec<String> = Vec::new();
     let mut missing = 0usize;
     for line in text.lines() {
         let line = line.trim();
@@ -252,11 +255,12 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
             missing += 1;
             continue;
         }
-        reports.push(run_one_file(&path));
+        reports.push(run_one_file(&path, &mut diffs));
     }
     let pass: usize = reports.iter().map(|f| f.pass).sum();
     let fail: usize = reports.iter().map(|f| f.fail).sum::<usize>() + missing;
     let skip: usize = reports.iter().map(|f| f.skip).sum();
+    write_diffs(workspace_root, &diffs);
     println!("TOTAL          pass={pass} fail={fail} skip={skip} (list: {list_rel})");
     if fail == 0 {
         return ExitCode::SUCCESS;
@@ -270,7 +274,7 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
 
 /// One corpus file → its report. Shared by the directory walk and the
 /// list mode so the two cannot disagree about what "running a file" is.
-fn run_one_file(path: &Path) -> FileReport {
+fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -290,6 +294,9 @@ fn run_one_file(path: &Path) -> FileReport {
     };
     let mut runner = Runner::new();
     let outcome = runner.run(&records);
+    for d in &outcome.diffs {
+        diff_sink.push(format!("=== {}\n{d}", path.display()));
+    }
     let mut fail_reasons = Vec::new();
     for (i, o) in outcome.per_record.iter().enumerate() {
         if let Outcome::Fail(reason) = o {
@@ -307,7 +314,7 @@ fn run_one_file(path: &Path) -> FileReport {
     }
 }
 
-fn run_group(name: &str, dir: &Path) -> GroupReport {
+fn run_group(name: &str, dir: &Path, diff_sink: &mut Vec<String>) -> GroupReport {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .expect("read group dir")
         .filter_map(|e| e.ok())
@@ -325,7 +332,7 @@ fn run_group(name: &str, dir: &Path) -> GroupReport {
     };
 
     for path in files {
-        let report = run_one_file(&path);
+        let report = run_one_file(&path, diff_sink);
         group.pass += report.pass;
         group.fail += report.fail;
         group.skip += report.skip;
@@ -488,4 +495,21 @@ fn workspace_root() -> PathBuf {
         .and_then(|p| p.parent())
         .map(PathBuf::from)
         .unwrap_or_else(|| here.clone())
+}
+
+/// r1052 (S2.3) — pg_regress's `regression.diffs` idea: every failing
+/// query record, as a readable diff with its file and line, in ONE
+/// place. Empty runs remove the file so a stale diff can't outlive its
+/// failure.
+fn write_diffs(workspace_root: &Path, diffs: &[String]) {
+    let dir = workspace_root.join("target/suite");
+    let path = dir.join("slt.diffs");
+    if diffs.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    let _ = fs::create_dir_all(&dir);
+    if fs::write(&path, diffs.join("\n")).is_ok() {
+        println!("diffs -> {}", path.display());
+    }
 }
