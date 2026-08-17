@@ -245,6 +245,17 @@ pub fn run_tmp_dir(runid: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The server-spawning fault tests all probe the same suite port
+    /// range; run in parallel they race the probe (TOCTOU) and pile
+    /// onto one port — full run 1 saw all three claim 25460 at once.
+    /// A shared lock beats runner discipline (--test-threads=1 was a
+    /// doc note, and the full tier didn't read it).
+    fn server_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn free_port_is_inside_the_suite_range() {
         let r = Roster::new();
@@ -297,6 +308,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/release/spg-server; S3.3 acceptance"]
     fn three_crash_cycles_lose_nothing() {
+        let _serial = server_test_guard();
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s33-crash");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -348,6 +360,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/release/spg-server; S3.4 acceptance"]
     fn audit_append_fault_refuses_the_statement() {
+        let _serial = server_test_guard();
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s34-audit");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -408,6 +421,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/release/spg-server; S3.4 acceptance"]
     fn kill_during_recovery_then_clean_restart_recovers_all() {
+        let _serial = server_test_guard();
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s34-reckill");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -467,6 +481,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/release/spg-server; S0.6 acceptance"]
     fn twenty_server_cycles_leave_nothing_behind() {
+        let _serial = server_test_guard();
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s06-cycles");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -503,6 +518,7 @@ mod tests {
     #[test]
     #[ignore = "needs target/release/spg-server; S0.6 acceptance"]
     fn kill_dash_nine_outside_the_roster_still_reaps() {
+        let _serial = server_test_guard();
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s06-kill9");
         let _ = std::fs::remove_dir_all(&tmp);
