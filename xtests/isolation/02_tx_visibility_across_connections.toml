@@ -1,0 +1,38 @@
+# READ COMMITTED across connections: another session sees nothing
+# until COMMIT, everything after.
+[iso]
+name = "tx_visibility_across_connections"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE v (x INT)"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_ins"
+session = 1
+sql = "INSERT INTO v VALUES (1)"
+
+[[step]]
+id = "s2_before"
+session = 2
+sql = "SELECT count(*) FROM v"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s2_after"
+session = 2
+sql = "SELECT count(*) FROM v"
+
+[[permutation]]
+order = "setup s1_begin s1_ins s2_before s1_commit s2_after"

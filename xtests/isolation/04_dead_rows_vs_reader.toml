@@ -1,0 +1,39 @@
+# Bulk delete crosses the autovacuum threshold (dead>=1000 &&
+# dead*4>=live) while another connection reads: counts stay exact
+# before and after the sweep becomes eligible.
+[iso]
+name = "dead_rows_vs_reader"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE av (n INT)"
+
+[[step]]
+id = "fill"
+session = 1
+sql = "INSERT INTO av SELECT g FROM generate_series(1, 2000) g"
+
+[[step]]
+id = "s2_read1"
+session = 2
+sql = "SELECT count(*) FROM av"
+
+[[step]]
+id = "del"
+session = 1
+sql = "DELETE FROM av WHERE n <= 1600"
+
+[[step]]
+id = "s2_read2"
+session = 2
+sql = "SELECT count(*) FROM av"
+
+[[step]]
+id = "s1_read"
+session = 1
+sql = "SELECT min(n), max(n), count(*) FROM av"
+
+[[permutation]]
+order = "setup fill s2_read1 del s2_read2 s1_read"

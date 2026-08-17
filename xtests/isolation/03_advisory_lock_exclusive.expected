@@ -1,0 +1,5 @@
+== permutation s1_take s2_try s1_unlock s2_retry
+s1_take: rows t
+s2_try: rows f
+s1_unlock: rows t
+s2_retry: rows t
