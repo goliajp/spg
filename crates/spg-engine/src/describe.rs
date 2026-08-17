@@ -66,6 +66,18 @@ fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSch
     let Some(items) = items else {
         return Vec::new();
     };
+    dml_returning_columns(table, items, catalog)
+}
+
+/// The output columns of a DML statement's RETURNING list, resolved
+/// against its target table. Shared by the statement standing alone
+/// (r1049) and by a data-modifying CTE inside a SELECT (r1050) — one
+/// answer, wherever the statement sits.
+fn dml_returning_columns(
+    table: &str,
+    items: &[SelectItem],
+    catalog: &Catalog,
+) -> Vec<ColumnSchema> {
     let Some(t) = catalog.get(table) else {
         return Vec::new();
     };
@@ -151,12 +163,31 @@ fn relation_columns(
         return Some(table.schema().columns.clone());
     }
     if let Some(cte) = ctes.iter().find(|c| c.name == t.name) {
-        let spg_sql::ast::CteBody::Select(body) = &cte.body else {
-            // A data-modifying CTE is described by its RETURNING list,
-            // which needs the modifying statement's own describe path.
-            return None;
+        // r1050 — a data-modifying CTE is described by its RETURNING
+        // list, the same answer Describe gives the statement standing
+        // alone. sentori's report 3: the outer SELECT of
+        // `WITH up AS (INSERT … RETURNING id) SELECT up.id, …` came
+        // back undescribed, sqlx sized the row at zero columns, and
+        // their suite stopped on step 16 — the exact family of the
+        // r1049 defect, one level of nesting deeper.
+        let mut cols = match &cte.body {
+            spg_sql::ast::CteBody::Select(body) => {
+                describe_select_columns(body, catalog, &[], depth + 1)
+            }
+            spg_sql::ast::CteBody::Insert(i) => {
+                dml_returning_columns(&i.table, i.returning.as_ref()?, catalog)
+            }
+            spg_sql::ast::CteBody::Update(u) => {
+                dml_returning_columns(&u.table, u.returning.as_ref()?, catalog)
+            }
+            spg_sql::ast::CteBody::Delete(d) => {
+                dml_returning_columns(&d.table, d.returning.as_ref()?, catalog)
+            }
+            // MERGE RETURNING may project merge_action() and both
+            // aliases; that shape has no describe path yet, and a
+            // wrong answer here is worse than NoData.
+            spg_sql::ast::CteBody::Merge(_) => return None,
         };
-        let mut cols = describe_select_columns(body, catalog, &[], depth + 1);
         if cols.is_empty() {
             return None;
         }

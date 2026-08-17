@@ -2064,7 +2064,29 @@ fn run_pg_session(
                                 .engine
                                 .read()
                                 .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
-                            eng.describe_prepared(&stmt.ast)
+                            let (mut oids, cols) = eng.describe_prepared(&stmt.ast);
+                            // r1050 — an OID the client DECLARED in Parse
+                            // fixes that parameter's type (PG semantics),
+                            // and this answer must say so. Reporting a
+                            // fresh inference here let the two halves of
+                            // the protocol disagree about one parameter:
+                            // sqlx declared jsonb (3802) for a json
+                            // column, was told json (114) here, patched
+                            // its payload to the json spelling (leading
+                            // 0x20 instead of the version byte — that is
+                            // where sentori's constant 32 came from),
+                            // and Bind then decoded it as jsonb with the
+                            // stored 3802. One list, the stored one, is
+                            // the answer everywhere.
+                            if oids.len() < stmt.param_type_oids.len() {
+                                oids.resize(stmt.param_type_oids.len(), 0);
+                            }
+                            for (slot, stored) in oids.iter_mut().zip(stmt.param_type_oids.iter()) {
+                                if *stored != 0 {
+                                    *slot = *stored;
+                                }
+                            }
+                            (oids, cols)
                         } else {
                             (Vec::new(), Vec::new())
                         }

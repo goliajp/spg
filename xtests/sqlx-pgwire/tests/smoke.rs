@@ -507,3 +507,94 @@ async fn binary_bind_jsonb_in_the_ingest_shape() {
             .unwrap();
     assert_eq!(n, 1, "the bound jsonb must be queryable as jsonb");
 }
+
+// ── r1050 — sentori report 3: the CTE upload shape, and the json cell ──
+
+#[tokio::test]
+#[ignore]
+async fn data_modifying_cte_describes_and_reads() {
+    // Their step-16 statement: the INSERT is a CTE, the outer SELECT
+    // chooses the columns, and `prev` reads the pre-insert snapshot in
+    // the same statement. Describe answered NoData for it, so sqlx saw
+    // a zero-column row.
+    let Some(pool) = pool().await else {
+        return;
+    };
+    sqlx::query("DROP TABLE IF EXISTS sqlx_cte")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_cte (id UUID PRIMARY KEY, k TEXT, h TEXT)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE UNIQUE INDEX sqlx_cte_k ON sqlx_cte (k)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sqlx_cte VALUES (gen_random_uuid(), 'a', 'old')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "WITH prev AS (SELECT h FROM sqlx_cte WHERE k = 'a'), \
+              up AS (INSERT INTO sqlx_cte (id, k, h) VALUES (gen_random_uuid(), 'a', 'new') \
+                     ON CONFLICT (k) DO UPDATE SET h = EXCLUDED.h RETURNING id) \
+         SELECT up.id, prev.h AS prev_hash FROM up LEFT JOIN prev ON true",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let names: Vec<&str> = {
+        use sqlx::Column;
+        row.columns().iter().map(|c| c.name()).collect()
+    };
+    assert_eq!(names, ["id", "prev_hash"], "Describe must name both");
+    let prev: String = row.try_get("prev_hash").unwrap();
+    assert_eq!(prev, "old", "prev reads the pre-insert snapshot");
+}
+
+#[tokio::test]
+#[ignore]
+async fn json_column_takes_a_driver_bound_value() {
+    // Their §4 cell: binding serde_json::Value into a `json` column
+    // failed with `unsupported jsonb version Some(32)`. The 32 is
+    // sqlx's own json spelling — it patches the jsonb version byte to
+    // a SPACE when the parameter resolves as json — and the mismatch
+    // was ours: Describe re-inferred the parameter as json (114) while
+    // Bind decoded with the Parse-declared jsonb (3802). One list now.
+    let Some(pool) = pool().await else {
+        return;
+    };
+    sqlx::query("DROP TABLE IF EXISTS sqlx_json114")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE sqlx_json114 (id INT NOT NULL, doc JSON)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (id, payload) in [
+        (1, serde_json::json!({"a": 1})),
+        (2, serde_json::json!("Z")),
+        (3, serde_json::json!([1])),
+        (4, serde_json::json!(7)),
+    ] {
+        sqlx::query("INSERT INTO sqlx_json114 VALUES ($1, $2)")
+            .bind(id)
+            .bind(&payload)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("json bind id={id}: {e}"));
+    }
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlx_json114")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 4);
+    let got: serde_json::Value = sqlx::query_scalar("SELECT doc FROM sqlx_json114 WHERE id = 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(got, serde_json::json!({"a": 1}));
+}
