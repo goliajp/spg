@@ -1,0 +1,17 @@
+[package]
+name         = "suitelib"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+description  = "v7.38 suite orchestrator: tiers, process lifecycle, timing ledger."
+publish      = false
+
+[[bin]]
+name = "suite-run"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

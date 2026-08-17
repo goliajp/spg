@@ -40,6 +40,20 @@ use sqllogictest::{Outcome, Runner, parser};
 
 fn main() -> ExitCode {
     let workspace_root = workspace_root();
+    // r1051 (7.38 S0.10/S2.1) — `--list <file>`: run ONLY the corpus
+    // files named in the list (one relative path per line, `#` for
+    // comments). The precommit tier's slt-smoke step runs this way.
+    // A list run writes NO report.json/report.md: those two tracked
+    // files are the FULL run's artifact, and a subset overwriting them
+    // would masquerade as full coverage.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(i) = args.iter().position(|a| a == "--list") {
+        let Some(list_rel) = args.get(i + 1) else {
+            eprintln!("sqllogictest: --list needs a file path");
+            return ExitCode::from(2);
+        };
+        return run_list(&workspace_root, list_rel);
+    }
     let corpus = workspace_root.join("xtests/sqllogictest/corpus");
     let report_json = workspace_root.join("xtests/sqllogictest/report.json");
     let report_md = workspace_root.join("xtests/sqllogictest/report.md");
@@ -170,6 +184,86 @@ struct FileReport {
     fail_reasons: Vec<String>,
 }
 
+/// r1051 — run the files a list names, print the un-scrollable TOTAL
+/// line, return the same exit discipline as the full run (round 664:
+/// a runner that fails politely is a runner nobody hears).
+fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
+    let list_path = workspace_root.join(list_rel);
+    let text = match fs::read_to_string(&list_path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("sqllogictest: {}: {e}", list_path.display());
+            return ExitCode::from(2);
+        }
+    };
+    let mut reports: Vec<FileReport> = Vec::new();
+    let mut missing = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let path = workspace_root.join(line);
+        if !path.is_file() {
+            eprintln!("sqllogictest: listed file missing: {line}");
+            missing += 1;
+            continue;
+        }
+        reports.push(run_one_file(&path));
+    }
+    let pass: usize = reports.iter().map(|f| f.pass).sum();
+    let fail: usize = reports.iter().map(|f| f.fail).sum::<usize>() + missing;
+    let skip: usize = reports.iter().map(|f| f.skip).sum();
+    println!("TOTAL          pass={pass} fail={fail} skip={skip} (list: {list_rel})");
+    if fail == 0 {
+        return ExitCode::SUCCESS;
+    }
+    println!("\nFAILING FILES:");
+    for f in reports.iter().filter(|f| f.fail > 0) {
+        println!("  {} — {}", f.file, f.fail_reasons.join(" | "));
+    }
+    ExitCode::from(1)
+}
+
+/// One corpus file → its report. Shared by the directory walk and the
+/// list mode so the two cannot disagree about what "running a file" is.
+fn run_one_file(path: &Path) -> FileReport {
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    let records = match parser::parse_file(path) {
+        Ok(rs) => rs,
+        Err(e) => {
+            return FileReport {
+                file: file_name,
+                pass: 0,
+                fail: 1,
+                skip: 0,
+                fail_reasons: vec![format!("parse: {e}")],
+            };
+        }
+    };
+    let mut runner = Runner::new();
+    let outcome = runner.run(&records);
+    let mut fail_reasons = Vec::new();
+    for (i, o) in outcome.per_record.iter().enumerate() {
+        if let Outcome::Fail(reason) = o {
+            if fail_reasons.len() < 3 {
+                fail_reasons.push(format!("record {i}: {}", short(reason)));
+            }
+        }
+    }
+    FileReport {
+        file: file_name,
+        pass: outcome.pass,
+        fail: outcome.fail,
+        skip: outcome.skip,
+        fail_reasons,
+    }
+}
+
 fn run_group(name: &str, dir: &Path) -> GroupReport {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .expect("read group dir")
@@ -188,46 +282,11 @@ fn run_group(name: &str, dir: &Path) -> GroupReport {
     };
 
     for path in files {
-        let file_name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("?")
-            .to_string();
-        let records = match parser::parse_file(&path) {
-            Ok(rs) => rs,
-            Err(e) => {
-                // Parse error itself counts as a fail at the file level.
-                group.fail += 1;
-                group.files.push(FileReport {
-                    file: file_name,
-                    pass: 0,
-                    fail: 1,
-                    skip: 0,
-                    fail_reasons: vec![format!("parse: {e}")],
-                });
-                continue;
-            }
-        };
-        let mut runner = Runner::new();
-        let outcome = runner.run(&records);
-        let mut fail_reasons = Vec::new();
-        for (i, o) in outcome.per_record.iter().enumerate() {
-            if let Outcome::Fail(reason) = o {
-                if fail_reasons.len() < 3 {
-                    fail_reasons.push(format!("record {i}: {}", short(reason)));
-                }
-            }
-        }
-        group.pass += outcome.pass;
-        group.fail += outcome.fail;
-        group.skip += outcome.skip;
-        group.files.push(FileReport {
-            file: file_name,
-            pass: outcome.pass,
-            fail: outcome.fail,
-            skip: outcome.skip,
-            fail_reasons,
-        });
+        let report = run_one_file(&path);
+        group.pass += report.pass;
+        group.fail += report.fail;
+        group.skip += report.skip;
+        group.files.push(report);
     }
 
     group

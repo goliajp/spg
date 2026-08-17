@@ -1,0 +1,37 @@
+# PRECOMMIT.list — the slt-smoke subset (design D6).
+# One relative path per line. Every NEW 15_regressions corpus file's
+# commit must also touch this list (the tier warns on strays).
+#
+# All of 15_regressions — regressions are precommit's reason to exist:
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/distinct_index_walk.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/index_order_stream.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/indexkey_numeric_bytea.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/int_key_order_lane.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/join_key_type_matrix.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/join_predicate_type_seek.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/k02_in_list_visitor.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/orderby_null_index_walk.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/parser_gaps_sentori.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/posting_list_blocks.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/pred_int_arith_lane.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/range_index_one_sided.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_14_text_jumbo.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_20_typed_agg_columns.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_25_in_list_flat.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_27_returning_type.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_28_update_correlated.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/round_29_filter_clause.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/text_concat_real.test
+#
+# One representative per cluster:
+xtests/sqllogictest/corpus/spg_baseline/01_basic_dml/case_when.test
+xtests/sqllogictest/corpus/spg_baseline/02_data_types/array_ops.test
+xtests/sqllogictest/corpus/spg_baseline/04_joins/cross_join.test
+xtests/sqllogictest/corpus/spg_baseline/05_aggregates/agg_empty.test
+xtests/sqllogictest/corpus/spg_baseline/06_subqueries/any_all.test
+xtests/sqllogictest/corpus/spg_baseline/07_cte/basic_cte.test
+xtests/sqllogictest/corpus/spg_baseline/09_indexes/btree_basic.test
+xtests/sqllogictest/corpus/spg_baseline/10_constraints/check_constraint.test
+xtests/sqllogictest/corpus/spg_baseline/11_dialect/pg_array_ops.test
+xtests/sqllogictest/corpus/spg_baseline/12_explain/explain_analyze.test
+xtests/sqllogictest/corpus/spg_baseline/16_isolation/set_transaction_isolation_level.test

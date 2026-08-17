@@ -28,7 +28,11 @@ use crate::{
 /// common payload shapes (`&str` / `String`, and the injection framework's
 /// typed `InjectedError`) so the wire layer sends a clean message; falls
 /// back to a generic string when the payload type is opaque.
-#[cfg(feature = "std")]
+// r1051 — a stray `#[cfg(feature = "std")]` sat here (misattached
+// between two doc comments) and gated this core/alloc-only function
+// out of the no_std build while its two call sites stayed: no_std had
+// not compiled since the GUC round, and nothing in the gate builds
+// no_std, so nothing said so. The suite's first no_std probe did.
 /// v7.38 (read01 P3.17) — reject a clearly-invalid value for a handful of
 /// well-known typed GUCs (boolean / memory-size / duration), so a typo
 /// like `SET work_mem = 'bogus'` errors like PG instead of silently
