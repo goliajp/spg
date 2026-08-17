@@ -6294,6 +6294,14 @@ impl Catalog {
         &self.dirty_tables
     }
 
+    /// r1059 — mark one table dirty without taking its handle. The
+    /// rebase/merge paths replace a tx's shadow with a fresh base
+    /// clone and must carry the tx's OWN dirty window across (the
+    /// base's set is an ever-growing history, never cleared).
+    pub fn mark_table_dirty(&mut self, name: &str) {
+        self.dirty_tables.insert(name.into());
+    }
+
     /// v7.39 (round 496) — start a fresh recording window. A transaction's
     /// shadow calls this at BEGIN so the set means "changed by this tx".
     pub fn clear_dirty_tables(&mut self) {

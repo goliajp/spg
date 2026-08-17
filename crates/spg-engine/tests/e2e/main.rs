@@ -1196,6 +1196,7 @@ mod e2e_projection_bind_once_round957;
 mod e2e_query_clause_pg_differential;
 mod e2e_quoted_type_cast_round894;
 mod e2e_random;
+mod e2e_rc_poisoned_commit_r1059;
 mod e2e_recursive_cte_values;
 mod e2e_recursive_cte_wellformed_round145;
 mod e2e_redo_capture;

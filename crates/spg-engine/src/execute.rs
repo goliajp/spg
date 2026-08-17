@@ -1176,6 +1176,23 @@ impl Engine {
         // unwind into a normal `Result` return.
         let result = self.execute_stmt_catching(stmt, cancel);
         self.current_tx = saved;
+        // r1059 — the r196 per-slot epoch witness, on THIS entry path
+        // too. The bump lived only in `execute_in_with_cancel`, so an
+        // autocommit write arriving over the extended protocol's
+        // direct route moved the committed base with the epoch
+        // unchanged; a concurrent RC transaction whose last rebase
+        // matched the stale epoch then skipped its commit-time rebase
+        // and installed its whole shadow — erasing the write. The
+        // sqlx gate flaked ~1-in-6 on exactly this: DROP/CREATE
+        // vanishing under a neighbouring transaction's COMMIT. Same
+        // over-approximation as r196 (an extra rebase is only slower,
+        // never wrong); large-object descriptors die at the same
+        // boundary for the same per-slot reason (round 306).
+        if !self.tx_catalogs.contains_key(&tx_id) {
+            self.commit_epoch = self.commit_epoch.wrapping_add(1);
+            self.lo_descriptors.clear();
+            self.lo_next_fd = 0;
+        }
         result
     }
 
