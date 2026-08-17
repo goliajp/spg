@@ -41,6 +41,36 @@ perf 四层(micro / simple e2e / stress / scale)
 
 ---
 
+## [7.37.29] — 2026-08-17
+
+sentori's third report, same day: their suite moved from step 4 to
+step 16 of 86 on 7.37.28 and stopped on a Describe answer again. Both
+items below were verified through sqlx — the driver they use — in the
+suite the release gate runs.
+
+### Fixed — protocol
+
+- **A data-modifying CTE describes its result set.** `WITH up AS
+  (INSERT … RETURNING id) SELECT up.id, prev.h AS prev_hash …`
+  described as NoData; sqlx sizes rows by Describe, so the row had
+  zero columns. The statement standing alone was fixed in 7.37.28 —
+  this is the same family one level of nesting deeper, and the two
+  now share one resolver: a data-modifying CTE is described by its
+  RETURNING list against its target table. `WITH name(cols)`
+  positional renames apply; a RETURNING-less CTE stays NoData; MERGE
+  as a CTE body still declines rather than half-answering.
+
+- **One OID list rules Bind and Describe.** Binding a JSON value into
+  a `json` column failed with `unsupported jsonb version Some(32)` —
+  a constant 32 regardless of payload. The 32 is sqlx's json
+  spelling: it patches the jsonb version byte to a space (legal JSON
+  whitespace) when a parameter resolves as json. The mismatch was
+  ours: Bind decoded with the OID the client declared in Parse
+  (jsonb), while Describe re-inferred from the column and reported
+  json. PG's rule — a declared OID fixes the parameter's type, and
+  Describe reports it — now holds: one stored list,
+  declared-over-inferred, on both sides of the protocol.
+
 ## [7.37.28] — 2026-08-17
 
 Driven by sentori's second report: their 86-step suite, against
