@@ -1,0 +1,20 @@
+[package]
+name         = "spg-gendiff"
+version      = { workspace = true }
+edition      = { workspace = true }
+authors      = { workspace = true }
+license      = { workspace = true }
+publish      = false
+description  = "v7.38 S4.2 generative differ — random ASTs pretty-printed by spg-sql, run on the embedded engine and both wire protocols, any divergence shrunk and drafted as a regression fixture."
+
+[[bin]]
+name = "spg-gendiff"
+path = "src/main.rs"
+
+[dependencies]
+spg-sql    = { path = "../../crates/spg-sql", version = "7.34" }
+spg-engine = { path = "../../crates/spg-engine", version = "7.34" }
+suitelib   = { path = "../suitelib" }
+
+[lints]
+workspace = true

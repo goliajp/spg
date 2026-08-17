@@ -140,3 +140,9 @@ tier = "full"
 name = "isolation"
 impl = "internal"
 budget_s = 600
+
+[[step]]
+tier = "full"
+name = "generative"
+impl = "internal"
+budget_s = 1200

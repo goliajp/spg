@@ -20,6 +20,7 @@ members = [
     "xtests/oracle",
     "xtests/perm-runner",
     "xtests/suitelib",
+    "xtests/generative",
     "xbench/competitor",
 ]
 
