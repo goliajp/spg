@@ -1514,9 +1514,16 @@ fn run(
     let mut cold_segment_paths: BTreeMap<u32, PathBuf> = BTreeMap::new();
     let (base_engine, manifest_wal_baseline) =
         restore_engine(db_path.as_deref(), &mut cold_segment_paths)?;
+    // r1058 — the server host reads the test-mode GUC snapshot too.
+    // Found by the perm-runner's wire permutations: every SPG_TEST_*
+    // knob was embedded-only before this line, so the server legs
+    // could not pin nondeterminism (clock, seed, plan gates).
+    // `with_env_cfg` comes AFTER `with_clock` so a fixed test clock
+    // overrides the wall clock. Production default is a no-op.
     let mut engine = base_engine
         .with_clock(wall_clock_micros)
-        .with_salt_fn(urandom_salt_or_panic);
+        .with_salt_fn(urandom_salt_or_panic)
+        .with_env_cfg(spg_engine::testkit::EnvConfig::from_env());
 
     if let Some(n) = limits.max_query_rows {
         engine = engine.with_max_query_rows(n);

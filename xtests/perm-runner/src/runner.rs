@@ -247,7 +247,18 @@ fn run_one_fixture_server(path: &Path, extended: bool, bin: &Path) -> FixtureRes
     let tmp = suitelib::proclib::run_tmp_dir(&format!("perm-{stem}"));
     let _ = std::fs::remove_dir_all(&tmp);
     let mut roster = suitelib::proclib::Roster::new();
-    let port = match roster.spawn_server(stem, bin, &tmp, std::time::Duration::from_secs(20)) {
+    // Same deterministic instant as the embedded runner's
+    // `fixed_test_clock` (2025-06-15T12:00:00Z) — one corpus, one
+    // clock, whichever road executes it. Rides the r1058 GUC.
+    let clock_env = [("SPG_TEST_FIXED_CLOCK_MICROS", "1749988800000000")];
+    let port = match roster.spawn_server_env(
+        stem,
+        bin,
+        &tmp,
+        std::time::Duration::from_secs(20),
+        "127.0.0.1",
+        &clock_env,
+    ) {
         Ok(p) => p,
         Err(e) => {
             fail(&mut result, format!("server spawn: {e}"));
@@ -357,9 +368,10 @@ fn render_wire_cells(rows: &[Vec<String>], type_string: &str) -> Vec<String> {
                     "f" | "false" | "0" => "0".to_string(),
                     other => other.to_string(),
                 },
-                'R' => cell
-                    .parse::<f64>()
-                    .map_or_else(|_| cell.clone(), |x| format!("{x:.3}")),
+                // R/I pass through: the wire's float8out shortest form
+                // is the same text `render_cell`'s `format_real` emits
+                // (first full-corpus run proved reformatting wrong:
+                // "2.5000000000000000" is NUMERIC text, not a float).
                 'T' if cell.is_empty() => "(empty)".to_string(),
                 _ => cell.clone(),
             });

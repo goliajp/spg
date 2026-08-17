@@ -6,7 +6,12 @@ SELECT CURRENT_DATE
 ----
 2025-06-15
 
+# ::timestamp keeps this a pure clock-determinism pin: bare
+# CURRENT_TIMESTAMP is timestamptz, which the wire renders with the
+# PG offset suffix (+00) and the embedded renderer without — that
+# render divergence is ledgered separately (MATRIX); this fixture
+# asserts the CLOCK, one canonical answer on every road.
 query T rowsort
-SELECT CURRENT_TIMESTAMP
+SELECT CURRENT_TIMESTAMP::timestamp
 ----
 2025-06-15 12:00:00

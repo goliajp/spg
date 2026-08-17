@@ -277,3 +277,53 @@ pub fn ironrule_smoke(root: &Path, runid: &str) -> Result<String, String> {
         answer as char, wal_len
     ))
 }
+
+/// full-tier `perm-matrix` — the whole permutation matrix, whole
+/// corpus (no --fast, no sampling). Builds the release server first:
+/// the two wire permutations refuse to guess at a stale binary.
+///
+/// # Errors
+/// Build failure or any permutation reporting failures.
+pub fn perm_matrix(root: &Path) -> Result<String, String> {
+    sh(
+        root,
+        "cargo build -q --release -p spg-server -p spg-perm-runner",
+    )?;
+    sh(root, "cargo run -q --release -p spg-perm-runner -- all").map(|out| tail_lines(&out, 10))
+}
+
+/// full-tier `oracle-three` — bring up the D13-pinned compose stack,
+/// run all three differential legs, and ALWAYS tear the stack down
+/// (zombie discipline): the teardown runs whether the legs pass or
+/// not, and a teardown failure surfaces even on a green run.
+///
+/// # Errors
+/// Stack startup, any leg's unexplained diff, or teardown failure.
+pub fn oracle_three(root: &Path) -> Result<String, String> {
+    // OrbStack keeps docker off the default PATH on the runners.
+    let orb = "/Applications/OrbStack.app/Contents/MacOS/xbin";
+    let path = std::env::var("PATH").unwrap_or_default();
+    if !path.split(':').any(|p| p == orb) && std::path::Path::new(orb).exists() {
+        // Safety: the suite runner is effectively single-threaded at
+        // this point (steps run sequentially).
+        unsafe { std::env::set_var("PATH", format!("{path}:{orb}")) };
+    }
+    sh(root, "cargo build -q --release -p spg-oracle-runner")?;
+    sh(
+        root,
+        "docker compose -f xtests/oracle/docker-compose.yml up -d --wait",
+    )?;
+    let legs = sh(root, "cargo run -q --release -p spg-oracle-runner -- all");
+    let down = sh(
+        root,
+        "docker compose -f xtests/oracle/docker-compose.yml down -v",
+    );
+    let summary = legs?;
+    down?;
+    Ok(tail_lines(&summary, 4))
+}
+
+fn tail_lines(out: &str, n: usize) -> String {
+    let lines: Vec<&str> = out.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
+}

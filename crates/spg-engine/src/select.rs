@@ -2653,6 +2653,17 @@ impl Engine {
         let Some((table, alias_name, pos, out_name)) = self.index_only_shape(stmt) else {
             return Ok(None);
         };
+        // r1058 — same declines as `try_exec_joined_streaming`: CTEs
+        // are not materialised here, and a partition parent's own
+        // heap/indexes are empty (its rows live in the children).
+        if !stmt.ctes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(from) = &stmt.from
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
         let where_ = stmt.where_.as_ref().expect("shape checked it");
         let cols = &table.schema().columns;
         let Some(values) = crate::index_access::try_index_only_range(
@@ -2703,6 +2714,17 @@ impl Engine {
         let Some((table, alias_name, pos, out_name)) = self.index_only_shape(stmt) else {
             return Ok(None);
         };
+        // r1058 — same declines as `try_exec_joined_streaming`: CTEs
+        // are not materialised here, and a partition parent's own
+        // heap/indexes are empty (its rows live in the children).
+        if !stmt.ctes.is_empty() {
+            return Ok(None);
+        }
+        if let Some(from) = &stmt.from
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+        {
+            return Ok(None);
+        }
         let where_ = stmt.where_.as_ref().expect("shape checked it");
         let cols = &table.schema().columns;
         let schema = alloc::vec![ColumnSchema::new(
@@ -8607,6 +8629,43 @@ impl Engine {
         // correctness fix should carry, and the fall-back is exactly as
         // correct, only slower.
         if self.select_reads_policy_subject_table(stmt) {
+            return Ok(None);
+        }
+        // r1058 — a WITH list this path never materialises: the CTE
+        // name would be resolved as a physical relation and error
+        // ("relation \"big\" does not exist" over the extended
+        // protocol, caught by the perm-runner's wire legs). The
+        // materialising fallback owns CTE execution.
+        if !stmt.ctes.is_empty() {
+            return Ok(None);
+        }
+        // r1058 — rewritten system catalogs (`__spg_pg_stat_user_
+        // tables` and kin) exist only as synth arms on the
+        // materialising path; claiming one here errored "relation
+        // does not exist" over the extended protocol for a query the
+        // simple protocol answered. Prefix test only — a genuinely
+        // missing relation must keep erroring in-path.
+        if from.primary.name.starts_with("__spg_")
+            || from
+                .joins
+                .iter()
+                .any(|j| j.table.name.starts_with("__spg_"))
+        {
+            return Ok(None);
+        }
+        // r1058 — decline partitioned / inheritance parents, same
+        // shape of bug as the RLS decline above: this path scans the
+        // named table's own (empty) heap, so `SELECT id, region FROM
+        // cust` on a partition parent streamed ZERO rows over the wire
+        // while COUNT(*) — an aggregate, materialised below — said 3.
+        // Caught by the perm-runner's server permutations; the
+        // materialising fallback expands children correctly.
+        if crate::partition::has_children(self.active_catalog(), &from.primary.name)
+            || from
+                .joins
+                .iter()
+                .any(|j| crate::partition::has_children(self.active_catalog(), &j.table.name))
+        {
             return Ok(None);
         }
         // v7.39 (round 790) — single-table SELECTs stream too. This
