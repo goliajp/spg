@@ -198,6 +198,8 @@ fn main() {
                             std::path::Path::new("xtests/isolation"),
                             false,
                         ),
+                        // S4.2 — generative differ.
+                        "generative" => suitelib::steps::generative(root, &runid),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });

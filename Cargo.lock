@@ -1879,6 +1879,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spg-gendiff"
+version = "7.37.29"
+dependencies = [
+ "spg-engine",
+ "spg-sql",
+ "suitelib",
+]
+
+[[package]]
 name = "spg-manifest"
 version = "7.37.29"
 dependencies = [

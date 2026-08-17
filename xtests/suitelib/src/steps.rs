@@ -327,3 +327,25 @@ fn tail_lines(out: &str, n: usize) -> String {
     let lines: Vec<&str> = out.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
+
+/// full-tier `generative` — the S4.2 differ: 10^4 seeded statements,
+/// three legs (embedded / simple / extended), zero divergence. The
+/// seed derives from the runid's git sha so a red night replays
+/// exactly (`spg-gendiff --seed <printed>`).
+///
+/// # Errors
+/// Build failure, or any divergence (drafts land in 15_regressions).
+pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
+    sh(
+        root,
+        "cargo build -q --release -p spg-server -p spg-gendiff",
+    )?;
+    let seed = runid
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
+    sh(
+        root,
+        &format!("cargo run -q --release -p spg-gendiff -- --seed {seed} --count 10000"),
+    )
+    .map(|out| tail_lines(&out, 2))
+}
