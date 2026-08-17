@@ -146,3 +146,9 @@ tier = "full"
 name = "generative"
 impl = "internal"
 budget_s = 1200
+
+[[step]]
+tier = "full"
+name = "sql2016"
+impl = "internal"
+budget_s = 10

@@ -349,3 +349,60 @@ pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
     )
     .map(|out| tail_lines(&out, 2))
 }
+
+/// full-tier `sql2016` — the D16 coverage ledger's machine check: no
+/// empty cells, every named corpus path exists, and the uncovered
+/// count prints as the ledger that must shrink release over release.
+///
+/// # Errors
+/// Malformed rows, unknown statuses, or a named corpus path that
+/// doesn't exist (a moved file must move its ledger row with it).
+pub fn sql2016(root: &Path) -> Result<String, String> {
+    let path = root.join("xtests/sqllogictest/SQL2016-COVERAGE.tsv");
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let corpus = root.join("xtests/sqllogictest/corpus");
+    let (mut covered, mut partial, mut uncovered) = (0usize, 0usize, 0usize);
+    for (ln, line) in text.lines().enumerate() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let cells: Vec<&str> = line.split('\t').collect();
+        if cells.len() != 5 || cells.iter().any(|c| c.trim().is_empty()) {
+            return Err(format!(
+                "SQL2016-COVERAGE.tsv:{}: need 5 non-empty cells",
+                ln + 1
+            ));
+        }
+        match cells[3] {
+            "covered" => covered += 1,
+            "partial" => partial += 1,
+            "uncovered" => {
+                uncovered += 1;
+                if cells[4] != "-" {
+                    return Err(format!(
+                        "SQL2016-COVERAGE.tsv:{}: uncovered row must carry `-`",
+                        ln + 1
+                    ));
+                }
+                continue;
+            }
+            other => {
+                return Err(format!(
+                    "SQL2016-COVERAGE.tsv:{}: unknown status {other}",
+                    ln + 1
+                ));
+            }
+        }
+        if !corpus.join(cells[4]).exists() {
+            return Err(format!(
+                "SQL2016-COVERAGE.tsv:{}: corpus path {} does not exist",
+                ln + 1,
+                cells[4]
+            ));
+        }
+    }
+    Ok(format!(
+        "sql2016 ledger: covered={covered} partial={partial} uncovered={uncovered}"
+    ))
+}
