@@ -33,11 +33,16 @@ pub struct RunOutcome {
     pub fail: usize,
     pub skip: usize,
     pub per_record: Vec<Outcome>,
+    /// r1052 (S2.3) — pg_regress-style unified diff blocks, one per
+    /// failing query record, ready to concatenate into `slt.diffs`.
+    pub diffs: Vec<String>,
 }
 
 #[derive(Debug)]
 pub struct Runner {
     pub engine: Engine,
+    /// Set by a failing query in `run_one`, collected by `run`.
+    pending_diff: Option<String>,
 }
 
 impl Default for Runner {
@@ -68,7 +73,10 @@ impl Runner {
             }
             _ => {}
         }
-        Self { engine }
+        Self {
+            engine,
+            pending_diff: None,
+        }
     }
 
     /// Run a parsed `.test` file's records against a fresh engine and tally.
@@ -81,6 +89,9 @@ impl Runner {
                 Outcome::Pass => out.pass += 1,
                 Outcome::Fail(_) => out.fail += 1,
                 Outcome::Skip(_) => out.skip += 1,
+            }
+            if let Some(d) = self.pending_diff.take() {
+                out.diffs.push(d);
             }
             out.per_record.push(outcome);
             if matches!(record, Record::Halt) {
@@ -172,6 +183,7 @@ impl Runner {
                 if actual == *expected {
                     Outcome::Pass
                 } else {
+                    self.pending_diff = Some(unified_diff(directive.line, sql, expected, &actual));
                     Outcome::Fail(format!(
                         "row mismatch\n  expected: {expected:?}\n  actual:   {actual:?}"
                     ))
@@ -416,4 +428,30 @@ mod tests {
         );
         assert_eq!(out.pass, 4, "outcomes: {:#?}", out.per_record);
     }
+}
+
+/// r1052 (S2.3) — a pg_regress-shaped block: header with the source
+/// line, the query, then `-expected` / `+actual` lines. Readable in a
+/// terminal and in a review, which is the entire job.
+fn unified_diff(line: usize, sql: &str, expected: &[String], actual: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("@ line {line}\n"));
+    for l in sql.lines() {
+        out.push_str(&format!("  {l}\n"));
+    }
+    out.push_str("  ----\n");
+    let n = expected.len().max(actual.len());
+    for i in 0..n {
+        match (expected.get(i), actual.get(i)) {
+            (Some(e), Some(a)) if e == a => out.push_str(&format!("  {e}\n")),
+            (Some(e), Some(a)) => {
+                out.push_str(&format!("- {e}\n"));
+                out.push_str(&format!("+ {a}\n"));
+            }
+            (Some(e), None) => out.push_str(&format!("- {e}\n")),
+            (None, Some(a)) => out.push_str(&format!("+ {a}\n")),
+            (None, None) => {}
+        }
+    }
+    out
 }
