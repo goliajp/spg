@@ -195,6 +195,7 @@ mod e2e_create_wider_pg_dump_compat;
 mod e2e_crypt;
 mod e2e_ctas;
 mod e2e_cte_cycle;
+mod e2e_cte_dml_describe_r1050;
 mod e2e_cte_no_returning_ref_round150;
 mod e2e_cte_search;
 mod e2e_cte_shadows_table_round156;
