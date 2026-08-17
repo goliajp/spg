@@ -152,6 +152,83 @@ impl Conn {
     }
 }
 
+impl Conn {
+    /// Extended-protocol round: Parse("") → Bind (no params, text
+    /// results) → Describe(portal) → Execute → Sync. The perm-runner's
+    /// `server_extended` permutation drives every corpus record this
+    /// way (S3.5); parameters are out of scope here — corpus records
+    /// carry literal SQL.
+    ///
+    /// # Errors
+    /// Transport only — server-side SQL errors land in `.error`.
+    pub fn extended_query(&mut self, sql: &str) -> Result<QueryResult, String> {
+        let mut msg: Vec<u8> = Vec::new();
+        // Parse: unnamed statement, no declared param types.
+        let mut body = Vec::new();
+        body.push(0); // empty statement name
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0u16.to_be_bytes());
+        push_msg(&mut msg, b'P', &body);
+        // Bind: unnamed portal, unnamed statement, no formats/params,
+        // all-text results.
+        let bind = [0u8, 0, 0, 0, 0, 0, 0, 0];
+        push_msg(&mut msg, b'B', &bind);
+        // Describe portal, Execute (no row cap), Sync.
+        push_msg(&mut msg, b'D', &[b'P', 0]);
+        let mut exec = vec![0u8];
+        exec.extend_from_slice(&0u32.to_be_bytes());
+        push_msg(&mut msg, b'E', &exec);
+        push_msg(&mut msg, b'S', &[]);
+        self.stream
+            .write_all(&msg)
+            .map_err(|e| format!("extended: {e}"))?;
+        let mut out = QueryResult::default();
+        loop {
+            let (kind, body) = read_msg(&mut self.stream)?;
+            match kind {
+                b'T' => out.n_columns = u16::from_be_bytes([body[0], body[1]]) as usize,
+                b'D' => {
+                    let n = u16::from_be_bytes([body[0], body[1]]) as usize;
+                    let mut row = Vec::with_capacity(n);
+                    let mut cur = 2usize;
+                    for _ in 0..n {
+                        let len = i32::from_be_bytes([
+                            body[cur],
+                            body[cur + 1],
+                            body[cur + 2],
+                            body[cur + 3],
+                        ]);
+                        cur += 4;
+                        if len < 0 {
+                            row.push(String::from("NULL"));
+                        } else {
+                            let end = cur + len as usize;
+                            row.push(String::from_utf8_lossy(&body[cur..end]).into_owned());
+                            cur = end;
+                        }
+                    }
+                    out.rows.push(row);
+                }
+                b'C' => out.command_tags.push(
+                    String::from_utf8_lossy(&body)
+                        .trim_end_matches('\0')
+                        .to_string(),
+                ),
+                b'E' => out.error = Some(err_text(&body)),
+                b'Z' => return Ok(out),
+                _ => {} // ParseComplete/BindComplete/NoData/notices
+            }
+        }
+    }
+}
+
+fn push_msg(out: &mut Vec<u8>, kind: u8, body: &[u8]) {
+    out.push(kind);
+    out.extend_from_slice(&(u32::try_from(body.len() + 4).unwrap()).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
 fn err_text(body: &[u8]) -> String {
     // Severity/message fields: take the 'M' field.
     let mut cur = 0usize;
