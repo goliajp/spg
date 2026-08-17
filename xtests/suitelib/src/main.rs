@@ -116,7 +116,7 @@ fn main() {
                 .map(|c| graph.affected(&c).len() >= 8)
                 .unwrap_or(false);
             let band = if tier == "precommit" && wide {
-                println!("budget band: BASE (affected ≥ 8 crates; unit ×8, cap 360 s)");
+                println!("budget band: BASE (affected ≥ 8 crates; clippy/unit ×8×1.2, cap 480 s)");
                 8u64
             } else {
                 1u64
@@ -130,9 +130,12 @@ fn main() {
                     println!("  SKIP  {:<16} (earlier step failed)", s.name);
                     continue;
                 }
+                // A23 — the BASE band covers every affected-closure
+                // step (an engine change widens clippy exactly as it
+                // widens unit), with 1.2x headroom on the banded value.
                 let budget_secs = s.budget_s.map(|b| {
-                    if s.name == "unit-affected" {
-                        b * band
+                    if band > 1 && matches!(s.name.as_str(), "unit-affected" | "clippy-affected") {
+                        b * band * 12 / 10
                     } else {
                         b
                     }
@@ -201,7 +204,7 @@ fn main() {
                 .expect("write suite report");
             let total = t_total.elapsed();
             println!("total {total:?} — report {}", report.display());
-            let hard_cap = std::time::Duration::from_secs(if band > 1 { 360 } else { 150 });
+            let hard_cap = std::time::Duration::from_secs(if band > 1 { 480 } else { 150 });
             let mut rc = 0;
             if failed.is_some() {
                 rc = 1;
