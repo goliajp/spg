@@ -74,6 +74,33 @@ cargo build --workspace --release
 ./target/release/spg version
 ```
 
+### SQL taste
+
+The block below is executable documentation — the test suite's
+doc-as-corpus step runs every ```sql fence in this repo against the
+embedded engine, so if it stops working, CI turns red:
+
+```sql
+CREATE TABLE msg (id INT NOT NULL PRIMARY KEY, sender TEXT NOT NULL,
+                  body JSONB, sent TIMESTAMP);
+INSERT INTO msg VALUES
+  (1, 'alice', '{"tags": ["intro", "hello"]}', '2026-01-05 09:00:00'),
+  (2, 'bob',   '{"tags": ["hello"]}',          '2026-01-05 09:05:00'),
+  (3, 'alice', NULL,                           '2026-01-06 10:00:00');
+
+-- JSONB containment, PG spelling.
+SELECT id FROM msg WHERE body @> '{"tags": ["hello"]}';
+
+-- Window functions over a CTE.
+WITH by_sender AS (
+  SELECT sender, count(*) AS n FROM msg GROUP BY sender
+)
+SELECT sender, n, rank() OVER (ORDER BY n DESC) FROM by_sender;
+
+-- expect-error
+SELECT no_such_column FROM msg;
+```
+
 ### sqlx embed (in-process, no daemon)
 
 Drop-in for `sqlx::PgPool`. Stock sqlx code — `Pool` +

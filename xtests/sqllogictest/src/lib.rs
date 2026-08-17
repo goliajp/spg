@@ -30,6 +30,7 @@
 //! drives an in-process `spg_engine::Engine` — fast (no socket) and removes
 //! the daemon as a moving part during conformance work.
 
+pub mod docs;
 pub mod parser;
 pub mod record;
 pub mod runner;

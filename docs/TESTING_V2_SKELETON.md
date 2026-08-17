@@ -41,7 +41,7 @@
 injection_point!("aggregate_pre_topk", &group_count);
 ```
 
-```sql
+```sql no-run
 -- 测试侧:
 SELECT spg_injection_attach('aggregate_pre_topk', 'wait');
 -- ... 触发引擎到此点 ...
