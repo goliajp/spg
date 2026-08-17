@@ -9,6 +9,11 @@
 current_pin_prefix = "pin_v738_"
 port_lo = 25460
 port_hi = 25479
+# D20 — peak-RSS ceiling (MB) for suite-owned server legs; enforced at
+# reap in the sweep step. Basis: v7.37 sweep legs peak well under 1 GB
+# on the 400k-row shapes; 4x headroom keeps this a tripwire for
+# runaway residency (the r30-era 12 GB inbox class), not a flake.
+rss_ceiling_mb = 4096
 
 # ── precommit ─────────────────────────────────────────────────────────
 

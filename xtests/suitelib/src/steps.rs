@@ -126,7 +126,18 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
             "PSQL='{psql}' PG_URI='{pg_uri}' SPG_URI='{spg_uri}' bash scripts/perf-endpoint-sweep.sh"
         ),
     );
-    roster.reap_all();
+    // D20 — the sweep leg's peak RSS goes into the account, and the
+    // manifest ceiling has teeth at reap.
+    let ceiling = std::fs::read_to_string(root.join("xtests/suite.toml"))
+        .ok()
+        .and_then(|t| crate::config::Manifest::parse(&t).ok())
+        .map(|m| m.meta.rss_ceiling_mb)
+        .filter(|&mb| mb > 0);
+    let peaks = roster.reap_all_checked(ceiling)?;
+    let peak_note: Vec<String> = peaks
+        .iter()
+        .map(|(n, kb)| format!("{n}={} MB", kb / 1024))
+        .collect();
     let _ = std::fs::remove_dir_all(&tmp);
     let text = out?;
     let verdict = text
@@ -136,7 +147,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         .unwrap_or("(no verdict line)")
         .to_string();
     if verdict.contains("losses=0") {
-        Ok(verdict)
+        Ok(format!("{verdict}; peak rss: {}", peak_note.join(", ")))
     } else {
         Err(format!("sweep verdict: {verdict}"))
     }

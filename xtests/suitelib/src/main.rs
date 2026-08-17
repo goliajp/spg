@@ -143,6 +143,14 @@ fn main() {
                 1u64
             };
             println!("tier {tier} — {} steps, run {runid}", m.tier(tier).len());
+            // S4.4 — /tmp leak assertion (the S2.4 half deferred here):
+            // full tier snapshots /tmp/spg-* before its steps and any
+            // NEW survivor at the end is a red, not a shrug.
+            let tmp_before: std::collections::BTreeSet<String> = if tier == "full" {
+                tmp_spg_entries()
+            } else {
+                std::collections::BTreeSet::new()
+            };
             let mut failed: Option<String> = None;
             let t_total = std::time::Instant::now();
             for s in m.tier(tier) {
@@ -241,6 +249,14 @@ fn main() {
             let report = ledger
                 .write(&root.join("target"))
                 .expect("write suite report");
+            if tier == "full" && failed.is_none() {
+                let leaked: Vec<String> =
+                    tmp_spg_entries().difference(&tmp_before).cloned().collect();
+                if !leaked.is_empty() {
+                    println!("  FAIL  tmp-leak         new /tmp survivors: {leaked:?}");
+                    failed = Some(format!("tmp-leak: {leaked:?}"));
+                }
+            }
             let total = t_total.elapsed();
             println!("total {total:?} — report {}", report.display());
             let hard_cap = std::time::Duration::from_secs(if band > 1 { 480 } else { 150 });
@@ -289,4 +305,17 @@ fn usage() -> &'static str {
        full         find problems: no blind spots                (nightly)\n\
      \n\
      Canonical design: .claude/testsuite/ (CHECKLIST.md is the build plan).\n"
+}
+
+/// `/tmp` entries with the suite's own prefixes — the leak surface
+/// the janitor sweeps and the full tier now asserts on.
+fn tmp_spg_entries() -> std::collections::BTreeSet<String> {
+    std::fs::read_dir("/tmp")
+        .map(|rd| {
+            rd.filter_map(Result::ok)
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| n.starts_with("spg-suite-") || n.starts_with("spg-gate-"))
+                .collect()
+        })
+        .unwrap_or_default()
 }

@@ -12,6 +12,8 @@ pub struct SuiteMeta {
     pub current_pin_prefix: String,
     pub port_lo: u16,
     pub port_hi: u16,
+    /// D20 — peak-RSS ceiling (MB) for suite-owned server processes.
+    pub rss_ceiling_mb: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -93,6 +95,9 @@ impl Manifest {
                 (Sect::Suite, "port_hi") => {
                     out.meta.port_hi = u16::try_from(as_int()?)
                         .map_err(|_| format!("suite.toml:{}: port_hi out of range", ln + 1))?;
+                }
+                (Sect::Suite, "rss_ceiling_mb") => {
+                    out.meta.rss_ceiling_mb = as_int()?;
                 }
                 (Sect::Step, k) => {
                     let step = out
