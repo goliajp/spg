@@ -136,6 +136,34 @@ impl Runner {
         }
     }
 
+    /// r1052 (S2.4, MTR check-testcase idea) — objects a corpus file
+    /// left behind. Each file runs on a fresh engine, so anything
+    /// still present when it ends is a cleanup the author forgot; a
+    /// leak is a WARNING, not a failure (checklist S2.4), but it is
+    /// named so it gets fixed instead of compounding.
+    pub fn leftover_objects(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (kind, sql) in [
+            (
+                "table",
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+            ),
+            (
+                "view",
+                "SELECT viewname FROM pg_views WHERE schemaname = 'public'",
+            ),
+        ] {
+            if let Ok(QueryResult::Rows { rows, .. }) = self.engine.execute(sql) {
+                for r in rows {
+                    if let Some(v) = r.values.first() {
+                        out.push(format!("{kind} {}", spg_engine::eval::value_to_text(v)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     fn run_one(&mut self, record: &Record) -> Outcome {
         match record {
             Record::Halt => Outcome::Pass,
