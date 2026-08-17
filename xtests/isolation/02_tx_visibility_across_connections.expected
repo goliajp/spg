@@ -1,0 +1,7 @@
+== permutation setup s1_begin s1_ins s2_before s1_commit s2_after
+setup: ok CREATE TABLE
+s1_begin: ok BEGIN
+s1_ins: ok INSERT 0 1
+s2_before: rows 0
+s1_commit: ok COMMIT
+s2_after: rows 1

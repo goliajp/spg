@@ -39,6 +39,18 @@ fn main() {
                 }
             }
         }
+        // S4.1 — the isolation battery: `suite-run iso [--bless]`.
+        Some("iso") => {
+            let bless = args.get(1).map(String::as_str) == Some("--bless");
+            let root = std::path::Path::new(".");
+            match suitelib::isolib::run_all(root, std::path::Path::new("xtests/isolation"), bless) {
+                Ok(note) => println!("ok: {note}"),
+                Err(e) => {
+                    eprintln!("FAIL: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         // S0.8 — regenerate the crate graph and stamp it.
         Some("gen-crate-graph") => {
             let root = std::path::Path::new(".");
@@ -180,6 +192,12 @@ fn main() {
                         // full tier (CP3) — the two 元机制 carriers.
                         "perm-matrix" => suitelib::steps::perm_matrix(root),
                         "oracle-three" => suitelib::steps::oracle_three(root),
+                        // S4.1 — isolation battery.
+                        "isolation" => suitelib::isolib::run_all(
+                            root,
+                            std::path::Path::new("xtests/isolation"),
+                            false,
+                        ),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });

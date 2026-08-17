@@ -1,0 +1,7 @@
+== permutation setup fill s2_read1 del s2_read2 s1_read
+setup: ok CREATE TABLE
+fill: ok INSERT 0 2000
+s2_read1: rows 2000
+del: ok DELETE 1600
+s2_read2: rows 400
+s1_read: rows 1601|2000|400

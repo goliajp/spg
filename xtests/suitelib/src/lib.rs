@@ -25,6 +25,7 @@ pub mod reportlib;
 pub mod steps;
 pub mod wireclient;
 
+pub mod isolib;
 pub mod normlib;
 
 pub mod snapdiff {

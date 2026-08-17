@@ -1,0 +1,56 @@
+# The r1059 scenario, over the wire: a poisoned transaction's COMMIT
+# must not erase a neighbour's DDL, and its own DDL must survive.
+[iso]
+name = "concurrent_ddl_vs_tx_commit"
+sessions = 2
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_setup"
+session = 1
+sql = "CREATE TABLE base (a INT)"
+
+[[step]]
+id = "s1_ins"
+session = 1
+sql = "INSERT INTO base VALUES (1)"
+
+[[step]]
+id = "s1_poison"
+session = 1
+sql = "CREATE INDEX base_a ON base (a)"
+
+[[step]]
+id = "s2_create"
+session = 2
+sql = "CREATE TABLE conc (b INT)"
+
+[[step]]
+id = "s2_ins"
+session = 2
+sql = "INSERT INTO conc VALUES (7)"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s2_read"
+session = 2
+sql = "SELECT count(*) FROM conc"
+
+[[step]]
+id = "s2_read_base"
+session = 2
+sql = "SELECT count(*) FROM base"
+
+[[permutation]]
+order = "s1_begin s1_setup s1_ins s1_poison s2_create s2_ins s1_commit s2_read s2_read_base"
+
+[[permutation]]
+order = "s2_create s1_begin s1_setup s1_ins s1_poison s2_ins s1_commit s2_read s2_read_base"

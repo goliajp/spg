@@ -134,3 +134,9 @@ tier = "full"
 name = "oracle-three"
 impl = "internal"
 budget_s = 3600
+
+[[step]]
+tier = "full"
+name = "isolation"
+impl = "internal"
+budget_s = 600

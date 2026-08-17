@@ -1,0 +1,27 @@
+# Advisory locks are exclusive ACROSS connections (round 498's wall).
+[iso]
+name = "advisory_lock_exclusive"
+sessions = 2
+
+[[step]]
+id = "s1_take"
+session = 1
+sql = "SELECT pg_try_advisory_lock(4981)"
+
+[[step]]
+id = "s2_try"
+session = 2
+sql = "SELECT pg_try_advisory_lock(4981)"
+
+[[step]]
+id = "s1_unlock"
+session = 1
+sql = "SELECT pg_advisory_unlock(4981)"
+
+[[step]]
+id = "s2_retry"
+session = 2
+sql = "SELECT pg_try_advisory_lock(4981)"
+
+[[permutation]]
+order = "s1_take s2_try s1_unlock s2_retry"

@@ -1,0 +1,20 @@
+== permutation s1_begin s1_setup s1_ins s1_poison s2_create s2_ins s1_commit s2_read s2_read_base
+s1_begin: ok BEGIN
+s1_setup: ok CREATE TABLE
+s1_ins: ok INSERT 0 1
+s1_poison: ok CREATE INDEX
+s2_create: ok CREATE TABLE
+s2_ins: ok INSERT 0 1
+s1_commit: ok COMMIT
+s2_read: rows 1
+s2_read_base: rows 1
+== permutation s2_create s1_begin s1_setup s1_ins s1_poison s2_ins s1_commit s2_read s2_read_base
+s2_create: ok CREATE TABLE
+s1_begin: ok BEGIN
+s1_setup: ok CREATE TABLE
+s1_ins: ok INSERT 0 1
+s1_poison: ok CREATE INDEX
+s2_ins: ok INSERT 0 1
+s1_commit: ok COMMIT
+s2_read: rows 1
+s2_read_base: rows 1
