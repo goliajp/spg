@@ -4,7 +4,9 @@
 # initdb hooks. Init scripts only run on first start of an empty data
 # dir; with `tmpfs:/var/lib/postgresql/data` that means every
 # container boot.
-FROM postgres:18-alpine
+# D13: major pinned at 18 (differential base does not chase majors);
+# minor filled mechanically on landing day (2026-08-17): 18.6.
+FROM postgres:18.6-alpine
 COPY initdb/*.sql /docker-entrypoint-initdb.d/
 COPY postgresql.conf /etc/postgresql/postgresql.conf
 CMD ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]

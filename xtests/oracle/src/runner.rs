@@ -22,12 +22,16 @@ use crate::dialect::Oracle;
 use crate::naming::{self, Kind};
 use crate::normalise::AdjustPipeline;
 
-/// Entry point used by `Cmd::Run` and `Cmd::All`.
-pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle) -> Result<()> {
+/// Entry point used by `Cmd::Run` and `Cmd::All`. With `bless`, the
+/// oracle side is executed live (docker) and its raw output written
+/// as the `expected/<stem>.<suffix>.out` baseline instead of compared.
+pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle, bless: bool) -> Result<()> {
     let grouped = naming::list(corpus)?;
+    let partition = load_partition(corpus, oracle)?;
     let pipeline = AdjustPipeline::standard();
     let mut total = 0usize;
     let mut failed = 0usize;
+    let mut skipped = 0usize;
 
     for (kind, fixtures) in &grouped {
         if *kind == Kind::Depd {
@@ -35,8 +39,21 @@ pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle) -> Result<()> {
             continue;
         }
         for fixture in fixtures {
+            let name = fixture
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if !partition.contains(name) {
+                skipped += 1;
+                continue;
+            }
             total += 1;
-            match run_one(fixture, expected, oracle, &pipeline) {
+            let outcome = if bless {
+                bless_one(fixture, expected, oracle)
+            } else {
+                run_one(fixture, expected, oracle, &pipeline)
+            };
+            match outcome {
                 Ok(()) => {}
                 Err(e) => {
                     eprintln!("FAIL {}: {e:#}", fixture.display());
@@ -47,16 +64,53 @@ pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle) -> Result<()> {
     }
 
     println!(
-        "oracle={oracle:?} fixtures={total} failed={failed} ({:.1}% pass)",
-        if total == 0 {
-            100.0
-        } else {
-            100.0 * (total - failed) as f64 / total as f64
-        }
+        "oracle={oracle:?} fixtures={total} failed={failed} skipped_by_partition={skipped}{}",
+        if bless { " [BLESS]" } else { "" }
     );
     if failed > 0 {
         bail!("{failed}/{total} fixtures failed on oracle {oracle:?}");
     }
+    Ok(())
+}
+
+/// A10 — dialect partition sidecar `ORACLE-<SUFFIX>.list` next to the
+/// corpus dir: one fixture filename per line, `#` comments. A listed
+/// name that doesn't exist in the corpus is a loud error (a stale
+/// list silently narrows coverage otherwise). A fixture NOT listed is
+/// skipped for that leg — dialect gating is explicit, never inferred.
+fn load_partition(corpus: &Path, oracle: Oracle) -> Result<std::collections::BTreeSet<String>> {
+    let list_path = corpus
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("ORACLE-{}.list", oracle.suffix().to_uppercase()));
+    let text = std::fs::read_to_string(&list_path)
+        .with_context(|| format!("read partition list {}", list_path.display()))?;
+    let mut set = std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if !corpus.join(t).exists() {
+            bail!(
+                "{}: `{t}` not found in corpus {} — stale entry narrows coverage silently, fix the list",
+                list_path.display(),
+                corpus.display()
+            );
+        }
+        set.insert(t.to_string());
+    }
+    Ok(set)
+}
+
+/// Capture the live oracle's output as the baseline of record.
+fn bless_one(fixture: &Path, expected_root: &Path, oracle: Oracle) -> Result<()> {
+    let pair = naming::expected_paths(fixture, expected_root, oracle);
+    let raw = run_on_oracle(fixture, oracle)
+        .with_context(|| format!("oracle-side execution of {}", fixture.display()))?;
+    std::fs::write(&pair.oracle, &raw)
+        .with_context(|| format!("write baseline {}", pair.oracle.display()))?;
+    println!("BLESS {} <- {} bytes", pair.oracle.display(), raw.len());
     Ok(())
 }
 
@@ -378,14 +432,117 @@ fn spg_value_to_psql_text(v: &spg_storage::Value<'_>) -> String {
     }
 }
 
-/// Execute a fixture on a reference master via sqlx.
-///
-/// **Stub.** v7.38 C ships the call shape; P1 wires sqlx
-/// `query.execute` + dialect-specific result serialiser.
-#[allow(dead_code)]
-fn run_on_oracle(_fixture: &Path, _oracle: Oracle) -> Result<String> {
-    Err(anyhow!(
-        "run_on_oracle: stub — wire sqlx adapter (PG/MySQL/MariaDB) \
-         during v7.38 P1 fill"
-    ))
+/// Execute a fixture on a reference master, live, via `docker exec`
+/// into the compose stack's container — the engine's own CLI client
+/// is the serialiser (psql aligned / mysql --batch), so what lands in
+/// `expected/` is the real engine's own words, never a re-rendering.
+/// Each fixture gets a schema wipe first: fixtures own their objects.
+fn run_on_oracle(fixture: &Path, oracle: Oracle) -> Result<String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let body = std::fs::read_to_string(fixture)
+        .with_context(|| format!("read fixture {}", fixture.display()))?;
+    let corpus_dir = fixture
+        .parent()
+        .ok_or_else(|| anyhow!("fixture {} has no parent dir", fixture.display()))?;
+    let mut sql = String::new();
+    for depd in scan_depd_directives(&body) {
+        let depd_path = corpus_dir.join(format!("{depd}.sql"));
+        sql.push_str(
+            &std::fs::read_to_string(&depd_path)
+                .with_context(|| format!("read depd {}", depd_path.display()))?,
+        );
+        sql.push('\n');
+    }
+    sql.push_str(&body);
+
+    let (container, reset, client): (&str, &str, Vec<&str>) = match oracle {
+        Oracle::Pg18 => (
+            "spg-oracle-pg18",
+            "DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+            vec![
+                "psql",
+                "-X",
+                "-q",
+                "-U",
+                "testuser",
+                "-d",
+                "testdb",
+                "-P",
+                "footer=off",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-f",
+                "-",
+            ],
+        ),
+        Oracle::Mysql => (
+            "spg-oracle-mysql",
+            "DROP DATABASE IF EXISTS testdb; CREATE DATABASE testdb;",
+            vec!["mysql", "-uroot", "-ptestpass", "testdb", "--batch"],
+        ),
+        Oracle::Mariadb => (
+            "spg-oracle-mariadb",
+            "DROP DATABASE IF EXISTS testdb; CREATE DATABASE testdb;",
+            vec!["mariadb", "-uroot", "-ptestpass", "testdb", "--batch"],
+        ),
+    };
+
+    let exec = |stdin_sql: &str, use_db: bool| -> Result<String> {
+        let mut cmd = Command::new("docker");
+        cmd.arg("exec").arg("-i").arg(container);
+        if use_db {
+            cmd.args(&client);
+        } else {
+            // Reset runs without selecting testdb (mysql family drops it).
+            match oracle {
+                Oracle::Pg18 => {
+                    cmd.args([
+                        "psql",
+                        "-X",
+                        "-q",
+                        "-U",
+                        "testuser",
+                        "-d",
+                        "testdb",
+                        "-v",
+                        "ON_ERROR_STOP=1",
+                        "-f",
+                        "-",
+                    ]);
+                }
+                Oracle::Mysql => {
+                    cmd.args(["mysql", "-uroot", "-ptestpass", "--batch"]);
+                }
+                Oracle::Mariadb => {
+                    cmd.args(["mariadb", "-uroot", "-ptestpass", "--batch"]);
+                }
+            }
+        }
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn docker exec (stack up? `spg-oracle-runner docker up`)")?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin_sql.as_bytes())
+            .context("feed SQL to oracle client")?;
+        let out = child.wait_with_output().context("await oracle client")?;
+        if !out.status.success() {
+            bail!(
+                "oracle client exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+
+    exec(reset, false).context("per-fixture schema reset")?;
+    exec(&sql, true)
 }

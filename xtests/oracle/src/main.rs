@@ -54,9 +54,17 @@ enum Cmd {
         /// Which oracle to differential against.
         #[arg(long, value_enum)]
         oracle: dialect::Oracle,
+        /// Capture the live oracle's output as the expected baseline
+        /// instead of comparing (writes `expected/<stem>.<suffix>.out`).
+        #[arg(long)]
+        bless: bool,
     },
     /// Run the corpus against all three oracles.
-    All,
+    All {
+        /// Capture baselines on every leg instead of comparing.
+        #[arg(long)]
+        bless: bool,
+    },
     /// fast-tier replacement: SPG-self differential, no docker.
     ///
     /// Same fixtures, run on embedded / server_simple / server_extended
@@ -99,14 +107,14 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Run { oracle } => runner::run_all(&cli.corpus, &cli.expected, oracle),
-        Cmd::All => {
+        Cmd::Run { oracle, bless } => runner::run_all(&cli.corpus, &cli.expected, oracle, bless),
+        Cmd::All { bless } => {
             for oracle in [
                 dialect::Oracle::Pg18,
                 dialect::Oracle::Mysql,
                 dialect::Oracle::Mariadb,
             ] {
-                runner::run_all(&cli.corpus, &cli.expected, oracle)
+                runner::run_all(&cli.corpus, &cli.expected, oracle, bless)
                     .with_context(|| format!("oracle {oracle:?}"))?;
             }
             Ok(())

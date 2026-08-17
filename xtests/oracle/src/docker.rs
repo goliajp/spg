@@ -1,30 +1,35 @@
 //! docker-compose orchestration for the three reference masters.
 //!
-//! v7.38 C scaffolding: only the CLI surface is wired. Real
-//! `docker compose up --wait` shell-out + healthcheck polling lands
-//! during P1 fill alongside the corpus that actually drives the
-//! oracles.
-//!
-//! Kept as a small surface area on purpose — production CI shells
-//! out to `docker compose` directly (gate.sh) and only loops back
-//! here for ad-hoc developer runs.
+//! Shells out to `docker compose` with the harness's compose file —
+//! the same file gate.sh uses directly. Kept thin on purpose: the
+//! compose file is the single source of truth for images (D13 pins),
+//! ports, and healthchecks; this module only starts/stops it.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, bail};
+use std::process::Command;
+
+const COMPOSE_FILE: &str = "xtests/oracle/docker-compose.yml";
+
+fn compose(args: &[&str]) -> Result<()> {
+    let status = Command::new("docker")
+        .arg("compose")
+        .arg("-f")
+        .arg(COMPOSE_FILE)
+        .args(args)
+        .status()
+        .context("spawn docker compose (is docker on PATH? OrbStack: /Applications/OrbStack.app/Contents/MacOS/xbin)")?;
+    if !status.success() {
+        bail!("docker compose {args:?} exited {status}");
+    }
+    Ok(())
+}
 
 /// Bring up all three oracle services and wait for healthy.
 pub fn up() -> Result<()> {
-    Err(anyhow!(
-        "docker up: not implemented in v7.38 C scaffolding — wire to \
-         `docker compose -f xtests/oracle/docker-compose.yml up -d --wait` \
-         during P1 fill (see design §11)"
-    ))
+    compose(&["up", "-d", "--wait"])
 }
 
 /// Tear down the docker-compose stack.
 pub fn down() -> Result<()> {
-    Err(anyhow!(
-        "docker down: not implemented in v7.38 C scaffolding — wire to \
-         `docker compose -f xtests/oracle/docker-compose.yml down -v` \
-         during P1 fill"
-    ))
+    compose(&["down", "-v"])
 }

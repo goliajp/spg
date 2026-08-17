@@ -1894,6 +1894,7 @@ dependencies = [
  "spg-engine",
  "spg-perm-runner",
  "spg-storage",
+ "suitelib",
  "walkdir",
 ]
 

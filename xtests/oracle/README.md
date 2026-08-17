@@ -1,9 +1,16 @@
 # `xtests/oracle/` — v7.38 元机制 C 三主差分 oracle
 
-> **Status:** v7.38 C **scaffolding shipped**. Framework / CLI /
-> normalisation pipeline / R32 EXPECTED FAILURE anchor are in
-> place; the two execution hooks (`run_on_spg`, `run_on_oracle`)
-> are stubs that land during v7.38 P1 corpus fill.
+> **Status:** v7.38 S3.6 **live**. Both execution hooks are real:
+> `run_on_spg` drives the embedded engine, `run_on_oracle` drives
+> the docker stack via each engine's own CLI client (psql aligned /
+> mysql --batch — baselines are the engine's own words). `--bless`
+> captures baselines; `ORACLE-{PG,MYSQL,MARIADB}.list` sidecars
+> partition the corpus per leg (A10); normalisation routes
+> rule-as-data replacements through `suitelib::normlib`
+> (`norm-rules.toml`). Images pinned per D13 on 2026-08-17:
+> postgres:18.6-alpine / mysql:9.7.2 (lts) / mariadb:12.3.2.
+> R32's EXPECTED FAILURE lock never had to be written — the
+> correlated-agg fixture passes against live PG18 directly.
 >
 > See `.claude/notes/v7.38-differential-oracle-design.md` for the
 > full design and the P1 day-by-day fill plan.

@@ -40,11 +40,21 @@ impl AdjustPipeline {
     pub fn standard() -> Self {
         Self {
             steps: vec![
+                // Rule-as-data replacements from norm-rules.toml via
+                // suitelib::normlib (S3.6). Runs FIRST so literal
+                // pairs see the raw engine output.
+                Box::new(AdjustNormlibRules::load()),
                 Box::new(AdjustTimestamps),
                 Box::new(AdjustSeqs),
                 Box::new(AdjustDollarQuoted),
                 Box::new(AdjustExplainCosts),
                 Box::new(AdjustFloatRepr),
+                // Strip table decoration BEFORE whitespace collapse:
+                // psql-aligned (` 1 | alice ` + `----+----` rules) and
+                // `mysql --batch` (tab-separated) both converge on
+                // bare space-separated cells, so one baseline format
+                // per leg still yields one canonical compare form.
+                Box::new(AdjustTableDecoration),
                 Box::new(AdjustWhitespace),
                 Box::new(AdjustNullDisplay),
                 // Final step: lexical sort. Differential compare is
@@ -74,8 +84,66 @@ impl AdjustPipeline {
 }
 
 // =========================================================================
-// adjust_*() stubs — bodies filled during v7.38 P1 fill.
+// adjust_*() steps.
 // =========================================================================
+
+/// suitelib::normlib rules loaded from `xtests/oracle/norm-rules.toml`
+/// (or `norm-rules.toml` next to the cwd when run from the harness
+/// dir). Missing file = empty rules = no-op; a malformed file is a
+/// loud failure — a shrugged-off rule is a diff that flaps later.
+pub struct AdjustNormlibRules {
+    rules: suitelib::normlib::Rules,
+}
+
+impl AdjustNormlibRules {
+    pub fn load() -> Self {
+        let path = ["xtests/oracle/norm-rules.toml", "norm-rules.toml"]
+            .iter()
+            .map(std::path::Path::new)
+            .find(|p| p.exists());
+        let rules = match path {
+            Some(p) => {
+                let text = std::fs::read_to_string(p)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+                suitelib::normlib::Rules::parse(&text)
+                    .unwrap_or_else(|e| panic!("parse {}: {e}", p.display()))
+            }
+            None => suitelib::normlib::Rules::default(),
+        };
+        Self { rules }
+    }
+}
+
+impl AdjustStep for AdjustNormlibRules {
+    fn name(&self) -> &'static str {
+        "normlib-rules"
+    }
+    fn apply(&self, lines: &mut Vec<String>) {
+        for line in lines.iter_mut() {
+            *line = self.rules.apply(line);
+        }
+    }
+}
+
+/// Drop psql/mysql table decoration so the two families' native
+/// output formats converge: `|` column separators vanish, and lines
+/// made only of `-`, `+`, and spaces (psql's header rule) vanish
+/// entirely. `mysql --batch` output is tab-separated and untouched
+/// here; the following whitespace collapse aligns both.
+pub struct AdjustTableDecoration;
+impl AdjustStep for AdjustTableDecoration {
+    fn name(&self) -> &'static str {
+        "table-decoration"
+    }
+    fn apply(&self, lines: &mut Vec<String>) {
+        lines.retain(|l| !(l.chars().all(|c| matches!(c, '-' | '+' | ' ')) && l.contains('-')));
+        for line in lines.iter_mut() {
+            if line.contains('|') {
+                *line = line.replace('|', " ");
+            }
+        }
+    }
+}
 
 /// PG returns `2026-06-22 12:34:56.789012`, MySQL strips trailing
 /// `.0`, MariaDB sometimes drops sub-second entirely. Replace any
@@ -245,6 +313,10 @@ impl AdjustStep for AdjustWhitespace {
             let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
             *line = collapsed;
         }
+        // Blank lines never gate equality: psql prints one after every
+        // table, mysql --batch prints none, SPG's renderer joins
+        // blocks with exactly one — all legal.
+        lines.retain(|l| !l.is_empty());
     }
 }
 
@@ -376,7 +448,11 @@ mod tests {
     #[test]
     fn whitespace_collapses_runs() {
         let step = AdjustWhitespace;
-        let mut lines = vec!["a    b\tc".to_string(), "  x  y  ".to_string()];
+        let mut lines = vec![
+            "a    b\tc".to_string(),
+            "  x  y  ".to_string(),
+            "   ".to_string(),
+        ];
         step.apply(&mut lines);
         assert_eq!(lines, vec!["a b c".to_string(), "x y".to_string()]);
     }
@@ -399,11 +475,13 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "normlib-rules",
                 "timestamps",
                 "seqs",
                 "dollar-quoted",
                 "explain-costs",
                 "float-repr",
+                "table-decoration",
                 "whitespace",
                 "null-display",
                 "ordering-via-sort",

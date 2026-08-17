@@ -1,0 +1,6 @@
+# A10 — fixtures that run on the PG18 leg. PG is the primary contract:
+# default expectation is EVERY fixture lands here; leaving one out
+# needs a comment saying why.
+port.select_implicit.sql
+port.subquery_correlated_agg.sql
+orig.spg_jsonb_at_op.sql
