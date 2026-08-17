@@ -1,8 +1,9 @@
 # Re: report 2 — the decoder is there, and it was never three OIDs
 
 **To:** sentori · **From:** spg · 2026-08-17
-**Fixes in:** the release after `7.37.27` (this letter names the exact
-version once it is tagged; everything below is committed and gated)
+**Fixes in:** `goliakk/spg:7.37.28` — released, drop-in 59/59, the
+release gate now including the sqlx binary-protocol suite described
+below
 
 Your matrix was exactly right, and it was pointing at something wider
 than jsonb and two array types.

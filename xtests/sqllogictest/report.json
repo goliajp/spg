@@ -523,7 +523,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 327, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 332, "fail": 0, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -541,7 +541,7 @@
           "fail_reasons": [] },
         { "file": "orderby_null_index_walk.test", "pass": 12, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "parser_gaps_sentori.test", "pass": 26, "fail": 0, "skip": 0,
+        { "file": "parser_gaps_sentori.test", "pass": 31, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "posting_list_blocks.test", "pass": 17, "fail": 0, "skip": 0,
           "fail_reasons": [] },
