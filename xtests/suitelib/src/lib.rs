@@ -25,13 +25,12 @@ pub mod reportlib;
 pub mod steps;
 pub mod wireclient;
 
-pub mod normlib {
-    //! S2.5 — normalization rules as data. Intentionally empty until
-    //! the corpus-engineering segment; the module exists so the layer
-    //! map above is real from day one.
-}
+pub mod normlib;
 
 pub mod snapdiff {
-    //! S2.4 — per-file before/after snapshots. Same status as
-    //! [`normlib`].
+    //! S2.4 landed in the slt runner itself (`Runner::leftover_objects`
+    //! + the per-file leak warning in main.rs): the check needs the
+    //! engine in hand, so the corpus harness is its natural home. The
+    //! /tmp snapshot half arrives with the full tier (S4.4). This
+    //! module stays as the layer-map anchor.
 }

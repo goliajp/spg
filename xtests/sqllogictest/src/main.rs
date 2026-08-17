@@ -294,6 +294,15 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
     };
     let mut runner = Runner::new();
     let outcome = runner.run(&records);
+    // r1052 (S2.4) — cleanup discipline: name what the file left behind.
+    let leaks = runner.leftover_objects();
+    if !leaks.is_empty() {
+        println!(
+            "leak warning: {} left {}",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
+            leaks.join(", ")
+        );
+    }
     for d in &outcome.diffs {
         diff_sink.push(format!("=== {}\n{d}", path.display()));
     }
