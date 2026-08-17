@@ -157,3 +157,10 @@ tier = "full"
 name = "sql2016"
 impl = "internal"
 budget_s = 10
+
+[[step]]
+tier = "full"
+name = "doc-corpus"
+impl = "external"
+cmd = "cargo run -q --release -p sqllogictest -- --docs"
+budget_s = 120

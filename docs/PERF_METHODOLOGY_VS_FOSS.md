@@ -153,7 +153,7 @@ Attack agent 接 ground truth 后 atomically 实施 3 个 fast paths:
 
 Shape:
 
-```sql
+```sql no-run
 SELECT m.thread_id, MAX(m.subject),
        string_agg(DISTINCT m.sender, ','),
        COUNT(DISTINCT m.id),

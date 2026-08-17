@@ -52,6 +52,17 @@ fn main() -> ExitCode {
     // files only (design D7): a recorder that can sweep a directory
     // turns bugs into "known differences" wholesale, which is exactly
     // what the r1020 baseline did.
+    // r1064 (S4.5) — `--docs [files…]`: execute every ```sql fence in
+    // the public docs on the embedded engine (design D17).
+    if let Some(i) = args.iter().position(|a| a == "--docs") {
+        let files: Vec<String> = args[i + 1..].to_vec();
+        let code = sqllogictest::docs::run(&files);
+        return if code == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
     if let Some(i) = args.iter().position(|a| a == "--record") {
         let oracle_pos = args.iter().position(|a| a == "--oracle");
         let oracle: Option<String> = oracle_pos.and_then(|p| args.get(p + 1).cloned());

@@ -39,7 +39,7 @@ Multiple attaches to the same point clobber the previous one
 
 The SPG-side API is a small set of scalar functions:
 
-```sql
+```sql no-run
 -- Attach a behavior to a point. NULL behavior detaches.
 SELECT spg_injection_attach('aggregate_spill_trigger', 'wait');
 SELECT spg_injection_attach('planner_first_row_fetch', 'notice:select_seen');

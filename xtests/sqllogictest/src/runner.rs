@@ -259,7 +259,8 @@ fn render_rows(rows: &[spg_storage::Row], type_string: &str, sort: SortMode) -> 
 /// Fixed at 2025-06-15T12:00:00.000000Z.
 const TEST_CLOCK_MICROS: i64 = 1_749_988_800_000_000;
 
-fn fixed_test_clock() -> i64 {
+/// Public for the docs corpus (S4.5) — one clock for every road.
+pub fn fixed_test_clock() -> i64 {
     TEST_CLOCK_MICROS
 }
 
