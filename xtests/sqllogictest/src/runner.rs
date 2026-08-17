@@ -90,6 +90,41 @@ impl Runner {
         out
     }
 
+    /// r1052 (S2.2 `--record`) — execute a statement for its state
+    /// effect only.
+    ///
+    /// # Errors
+    /// The engine's error text.
+    pub fn exec_statement(&mut self, sql: &str) -> Result<(), String> {
+        self.engine
+            .execute(sql)
+            .map(|_| ())
+            .map_err(|e| format!("{e}"))
+    }
+
+    /// r1052 (S2.2 `--record`) — the rendered actual cells for a query,
+    /// exactly as `run_one` would compare them (same renderer, same
+    /// sort), so a recorded expectation cannot disagree with a later
+    /// run by construction.
+    ///
+    /// # Errors
+    /// Engine error, or a query record that ran DDL/DML.
+    pub fn query_actual(
+        &mut self,
+        sql: &str,
+        type_string: &str,
+        sort: SortMode,
+    ) -> Result<Vec<String>, String> {
+        match self.engine.execute(sql) {
+            Ok(QueryResult::Rows { rows, .. }) => Ok(render_rows(&rows, type_string, sort)),
+            Ok(QueryResult::CommandOk { .. }) => {
+                Err(format!("query record but ran DDL/DML: {sql}"))
+            }
+            Ok(_) => Err(format!("unexpected QueryResult variant: {sql}")),
+            Err(e) => Err(format!("{e}")),
+        }
+    }
+
     fn run_one(&mut self, record: &Record) -> Outcome {
         match record {
             Record::Halt => Outcome::Pass,

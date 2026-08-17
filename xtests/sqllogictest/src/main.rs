@@ -47,6 +47,49 @@ fn main() -> ExitCode {
     // files are the FULL run's artifact, and a subset overwriting them
     // would masquerade as full coverage.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // r1052 (S2.2) — `--record <file…> [--oracle <PG_URI>]`: rewrite the
+    // expected blocks of the NAMED files from actual output. Explicit
+    // files only (design D7): a recorder that can sweep a directory
+    // turns bugs into "known differences" wholesale, which is exactly
+    // what the r1020 baseline did.
+    if let Some(i) = args.iter().position(|a| a == "--record") {
+        let oracle_pos = args.iter().position(|a| a == "--oracle");
+        let oracle: Option<String> = oracle_pos.and_then(|p| args.get(p + 1).cloned());
+        let files: Vec<&String> = args
+            .iter()
+            .enumerate()
+            .filter(|(j, a)| {
+                *j != i
+                    && Some(*j) != oracle_pos
+                    && Some(*j) != oracle_pos.map(|p| p + 1)
+                    && !a.starts_with("--")
+            })
+            .map(|(_, a)| a)
+            .collect();
+        if files.is_empty() {
+            eprintln!(
+                "sqllogictest: --record refuses to run without explicit file paths \
+                 (no directory sweeps — record what you mean to record)"
+            );
+            return ExitCode::from(2);
+        }
+        let mut failed = false;
+        for f in files {
+            let path = workspace_root.join(f);
+            match sqllogictest::record::record_file(&path, oracle.as_deref()) {
+                Ok((_, summary)) => println!("recorded {f}: {summary}"),
+                Err(e) => {
+                    eprintln!("record {f}: {e}");
+                    failed = true;
+                }
+            }
+        }
+        return if failed {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
+    }
     if let Some(i) = args.iter().position(|a| a == "--list") {
         let Some(list_rel) = args.get(i + 1) else {
             eprintln!("sqllogictest: --list needs a file path");

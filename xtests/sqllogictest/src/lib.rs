@@ -31,6 +31,7 @@
 //! the daemon as a moving part during conformance work.
 
 pub mod parser;
+pub mod record;
 pub mod runner;
 
 pub use parser::{Directive, ExpectedQuery, Record, parse_file};
