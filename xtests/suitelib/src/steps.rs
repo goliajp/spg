@@ -77,6 +77,71 @@ pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> 
     Ok(format!("unit green over {} crates", affected.len()))
 }
 
+/// `perf-sweep` (S1.2) — the release-blocking endpoint sweep with its
+/// legs configured HERE, never from operator env: PERF blocked two
+/// release trains for missing URIs before this step existed.
+///
+/// Environment detection is by artifact, not hostname: the mini
+/// testbed carries `~/spgbench/bin/psql` (a docker-exec wrapper whose
+/// container reaches the host as `host.docker.internal`); anywhere
+/// else uses local psql and 127.0.0.1 for both legs. Both configs keep
+/// the two legs on ONE host string — r1022's symmetry rule.
+///
+/// # Errors
+/// Missing PG leg, server failure, or `losses>0` — the verdict line is
+/// quoted either way.
+pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
+    let bin = root.join("target/release/spg-server");
+    if !bin.exists() {
+        sh(root, "cargo build --release -q -p spg-server")?;
+    }
+    let home = std::env::var("HOME").map_err(|_| "no $HOME")?;
+    let wrapper = Path::new(&home).join("spgbench/bin/psql");
+    let (psql, host, bind) = if wrapper.exists() {
+        (
+            wrapper.display().to_string(),
+            "host.docker.internal",
+            "0.0.0.0",
+        )
+    } else {
+        ("psql".to_string(), "127.0.0.1", "127.0.0.1")
+    };
+    let pg_uri = format!("postgres://bench:bench@{host}:25432/bench");
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sweep"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut roster = Roster::new();
+    let port = roster.spawn_server_on("sweep-leg", &bin, &tmp, Duration::from_secs(20), bind)?;
+    let spg_uri = format!("postgres://bench:bench@{host}:{port}/bench");
+    // Both legs must answer before anything is timed (r1041).
+    for uri in [&pg_uri, &spg_uri] {
+        sh(
+            root,
+            &format!("{psql} --no-psqlrc -X -q -tA '{uri}' -c 'SELECT 1'"),
+        )
+        .map_err(|e| format!("leg {uri} not answering: {e}"))?;
+    }
+    let out = sh(
+        root,
+        &format!(
+            "PSQL='{psql}' PG_URI='{pg_uri}' SPG_URI='{spg_uri}' bash scripts/perf-endpoint-sweep.sh"
+        ),
+    );
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    let text = out?;
+    let verdict = text
+        .lines()
+        .rev()
+        .find(|l| l.contains("losses="))
+        .unwrap_or("(no verdict line)")
+        .to_string();
+    if verdict.contains("losses=0") {
+        Ok(verdict)
+    } else {
+        Err(format!("sweep verdict: {verdict}"))
+    }
+}
+
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
 ///
 /// 1. `wal_path` is really plumbed (r964's hard lesson): after one
