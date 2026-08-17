@@ -380,22 +380,18 @@ mod tests {
             .expect("restart");
         let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite").unwrap();
         let n = conn.simple_query("SELECT count(*) FROM af").unwrap();
-        // ── PINNED AS OBSERVED, NOT AS WANTED (the r1038 discipline) ──
-        // The refused INSERT's row SURVIVES: audit append runs AFTER
-        // the commit is durable, so on audit failure the client gets
-        // an ERROR for a statement that took effect — a client that
-        // retries double-writes. This is a real ordering defect this
-        // test DISCOVERED (2026-08-17, S3.4 first run); the fix is a
-        // durability-ordering change (audit joins the pre-ack
-        // sequence) big enough to deserve its own round with chaos
-        // pins. When that lands, this count flips to "1" and the
-        // assertion below is the message telling you to finish the
-        // flip.
+        // r1055 (D29) — the pin flipped: audit now runs inside the
+        // commit leader BEFORE any WAL byte, so the un-auditable
+        // statement's error truthfully means "no effect". The first
+        // version of this test pinned the opposite as-observed — the
+        // error-but-applied ordering defect it discovered on its
+        // first run.
         assert_eq!(
-            n.rows[0][0], "2",
-            "count changed — the audit-ordering fix landed; flip this pin to \
-             assert 1 and delete the defect note"
+            n.rows[0][0], "1",
+            "the refused INSERT must leave no row (ack ⇒ durable AND audited)"
         );
+        let vals = conn.simple_query("SELECT a FROM af").unwrap();
+        assert_eq!(vals.rows[0][0], "2", "the surviving row is the audited one");
         roster.reap_all();
         let log = std::fs::read_to_string(tmp.join("server.log")).unwrap_or_default();
         assert!(

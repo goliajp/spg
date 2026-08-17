@@ -2271,22 +2271,21 @@ fn try_queue_plain_dml(
     // excluded above); a CancelRequest racing a sub-ms queued DML
     // completing is within PG's cancel contract. Pass a fresh flag.
     let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (result, wal_outcome) = crate::commit_queue_execute(state, sql.to_string(), &queue_flag);
+    let (result, wal_outcome, leader_audited) =
+        crate::commit_queue_execute(state, sql.to_string(), &queue_flag);
     if let Err(e) = wal_outcome {
         return Some(Err(EngineError::Unsupported(format!(
             "durability append failed: {e}"
         ))));
     }
-    // Audit parity with persist_wire_write (the WAL append itself
-    // already happened inside the leader's group).
-    if matches!(&result, Ok(QueryResult::CommandOk { .. }))
-        && state.audit_path.is_some()
-        && let Err(e) = crate::append_audit_pub(state, sql)
-    {
-        return Some(Err(EngineError::Unsupported(format!(
-            "audit append failed: {e}"
-        ))));
-    }
+    // r1055 (D29) — audit happens inside the leader now, BEFORE any
+    // WAL byte; the old post-hoc append here was the error-but-applied
+    // site the S3.4 fault test caught. The assert keeps the invariant
+    // loud: this path always has WAL on, so the leader always ran.
+    debug_assert!(
+        leader_audited || state.audit_path.is_none(),
+        "queued DML skipped the leader audit barrier"
+    );
     Some(result)
 }
 
@@ -2583,6 +2582,12 @@ pub(crate) fn persist_wire_write(
         // synchronous_commit=on. (Same global-vs-slot confusion r298
         // fixed for the aborted flag and pgwire's streaming gate.)
         let in_tx = state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
+        // r1055 (D29) — audit BEFORE the durable append, so an audit
+        // failure means nothing persisted and the client's error
+        // tells the truth.
+        if *modified_catalog && state.audit_path.is_some() {
+            crate::append_audit_pub(state, sql)?;
+        }
         crate::append_wal(state, sql, crate::session_sync_commit(state) && !in_tx)?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
@@ -2591,11 +2596,15 @@ pub(crate) fn persist_wire_write(
             .read()
             .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?
             .snapshot();
+        if *modified_catalog && state.audit_path.is_some() {
+            crate::append_audit_pub(state, sql)?;
+        }
         if let Some(path) = state.db_path.as_deref() {
             crate::write_atomic(path, &bytes)?;
         }
-    }
-    if *modified_catalog && state.audit_path.is_some() {
+    } else if *modified_catalog && state.audit_path.is_some() {
+        // Audit-only server (no WAL, no db snapshot): nothing durable
+        // to order against; the entry still lands.
         crate::append_audit_pub(state, sql)?;
     }
     Ok(())
@@ -4037,17 +4046,18 @@ fn handle_execute(
             // Fresh per-task flag — same reasoning as the simple-query
             // route (no watchdog on this path; timeout sessions excluded).
             let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (result, wal_outcome) =
+            let (result, wal_outcome, leader_audited) =
                 crate::commit_queue_execute(state, bind_sql.clone(), &queue_flag);
             if let Err(e) = wal_outcome {
                 return Err(proto(format!("Execute: durability append failed: {e}")));
             }
-            if matches!(&result, Ok(QueryResult::CommandOk { .. }))
-                && state.audit_path.is_some()
-                && let Err(e) = crate::append_audit_pub(state, &bind_sql)
-            {
-                return Err(proto(format!("Execute: audit append failed: {e}")));
-            }
+            // r1055 (D29) — audit ran inside the leader, before any
+            // WAL byte; the post-hoc append that lived here was the
+            // extended-protocol copy of the error-but-applied defect.
+            debug_assert!(
+                leader_audited || state.audit_path.is_none(),
+                "queued Execute skipped the leader audit barrier"
+            );
             (result, true)
         } else {
             let result = {

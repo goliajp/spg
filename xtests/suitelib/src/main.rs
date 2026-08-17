@@ -112,8 +112,14 @@ fn main() {
             // D26 — budget banding: a base/engine-level change honestly
             // costs an engine rebuild; judging it by the cement-level
             // budget makes every deep commit a false red (A19).
+            // A24 — cost, not count: one heavy crate is a heavy
+            // rebuild all by itself.
+            const HEAVY: [&str; 4] = ["spg-engine", "spg-server", "spg-storage", "spg-sql"];
             let wide = suitelib::steps::changed_crates(root, &graph)
-                .map(|c| graph.affected(&c).len() >= 8)
+                .map(|c| {
+                    let a = graph.affected(&c);
+                    a.len() >= 8 || a.iter().any(|x| HEAVY.contains(&x.as_str()))
+                })
                 .unwrap_or(false);
             let band = if tier == "precommit" && wide {
                 println!("budget band: BASE (affected ≥ 8 crates; clippy/unit ×8×1.2, cap 480 s)");
@@ -137,7 +143,7 @@ fn main() {
                     if band > 1
                         && matches!(
                             s.name.as_str(),
-                            "unit-affected" | "clippy-affected" | "pins-current"
+                            "unit-affected" | "clippy-affected" | "pins-current" | "slt-smoke"
                         )
                     {
                         b * band * 12 / 10
