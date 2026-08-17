@@ -29,6 +29,9 @@ pub struct Proc {
     pub name: String,
     pub child: Child,
     pub port: u16,
+    /// D20 — peak resident set in KB, written by the sampler thread
+    /// (`ps -o rss=` every 500 ms). Zero until the first sample.
+    pub peak_rss_kb: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// All processes this run owns. Dropping the roster reaps.
@@ -145,10 +148,33 @@ impl Roster {
             .stderr(Stdio::from(logf))
             .spawn()
             .map_err(|e| format!("{name}: spawn {}: {e}", binary.display()))?;
+        // D20 — RSS sampler: 500 ms `ps -o rss=` polls, peak kept in
+        // a shared cell the roster reads at reap. The thread exits on
+        // its own when the pid disappears; it holds no other handles.
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let peak = std::sync::Arc::clone(&peak);
+            let pid = child.id();
+            std::thread::spawn(move || {
+                loop {
+                    let out = Command::new("ps")
+                        .args(["-o", "rss=", "-p", &pid.to_string()])
+                        .output();
+                    let Ok(out) = out else { break };
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    let Ok(kb) = text.trim().parse::<u64>() else {
+                        break; // pid gone — sampler retires
+                    };
+                    peak.fetch_max(kb, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        }
         self.procs.push(Proc {
             name: name.to_string(),
             child,
             port: pg_port,
+            peak_rss_kb: peak,
         });
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -170,27 +196,57 @@ impl Roster {
     /// Kill everything still running and print the roster. Never
     /// silent: the printed list is the audit trail.
     pub fn reap_all(&mut self) {
+        let _ = self.reap_all_checked(None);
+    }
+
+    /// As [`Self::reap_all`], returning each process's peak RSS and —
+    /// when a ceiling (MB) is given — erring on any breach (D20:
+    /// ceilings have teeth, not commentary).
+    ///
+    /// # Errors
+    /// A process whose sampled peak exceeded `ceiling_mb`.
+    pub fn reap_all_checked(
+        &mut self,
+        ceiling_mb: Option<u64>,
+    ) -> Result<Vec<(String, u64)>, String> {
+        let mut peaks: Vec<(String, u64)> = Vec::new();
         for p in &mut self.procs {
+            let peak_kb = p.peak_rss_kb.load(std::sync::atomic::Ordering::Relaxed);
             match p.child.try_wait() {
                 Ok(Some(status)) => {
                     println!(
-                        "proclib: {} (port {}) already exited: {status}",
-                        p.name, p.port
+                        "proclib: {} (port {}) already exited: {status} (peak rss {} MB)",
+                        p.name,
+                        p.port,
+                        peak_kb / 1024
                     );
                 }
                 _ => {
                     println!(
-                        "proclib: killing {} (port {}, pid {})",
+                        "proclib: killing {} (port {}, pid {}, peak rss {} MB)",
                         p.name,
                         p.port,
-                        p.child.id()
+                        p.child.id(),
+                        peak_kb / 1024
                     );
                     let _ = p.child.kill();
                     let _ = p.child.wait();
                 }
             }
+            peaks.push((p.name.clone(), peak_kb));
         }
         self.procs.clear();
+        if let Some(mb) = ceiling_mb {
+            for (name, kb) in &peaks {
+                if kb / 1024 > mb {
+                    return Err(format!(
+                        "rss ceiling breached: {name} peaked at {} MB (> {mb} MB)",
+                        kb / 1024
+                    ));
+                }
+            }
+        }
+        Ok(peaks)
     }
 }
 
@@ -275,6 +331,7 @@ mod tests {
             name: "sleeper".into(),
             child,
             port: PORT_RANGE.start,
+            peak_rss_kb: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
         r.reap_all();
         assert!(r.procs.is_empty());
