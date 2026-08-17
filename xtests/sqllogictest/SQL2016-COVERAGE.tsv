@@ -1,0 +1,150 @@
+# SQL:2016 feature coverage ledger (7.38 S4.3, design D16).
+# Columns: feature_id <TAB> name <TAB> pg <TAB> spg_status <TAB> corpus
+# - feature list learned from ISO 9075-2 Core + PG's SQL Conformance
+#   appendix (the LIST, not the text — clean-room rule applies).
+# - spg_status ∈ {covered, partial, uncovered} and must be evidence-
+#   backed: `covered`/`partial` rows name the corpus file or dir that
+#   exercises the feature; `uncovered` rows carry `-` and their count
+#   is the ledger that must shrink release over release.
+# - The `sql2016` suite step machine-checks this file: no empty cells,
+#   every named corpus path exists.
+E011	Numeric data types	yes	covered	spg_baseline/02_data_types/integer_types.test
+E011-01	INTEGER and SMALLINT	yes	covered	spg_baseline/02_data_types/integer_types.test
+E011-02	REAL, DOUBLE PRECISION, FLOAT	yes	covered	spg_baseline/02_data_types/float_types.test
+E011-03	DECIMAL and NUMERIC	yes	covered	spg_baseline/02_data_types/decimal_numeric.test
+E011-04	Arithmetic operators	yes	covered	spg_baseline/02_data_types/integer_arith.test
+E011-05	Numeric comparison	yes	covered	spg_baseline/02_data_types/integer_arith.test
+E011-06	Implicit casting among numeric types	yes	covered	spg_baseline/02_data_types/decimal_numeric.test
+E021	Character string types	yes	covered	spg_baseline/02_data_types/text_varchar_char.test
+E021-01	CHARACTER	yes	covered	spg_baseline/02_data_types/bpchar.test
+E021-02	CHARACTER VARYING	yes	covered	spg_baseline/02_data_types/text_varchar_char.test
+E021-03	Character literals	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-04	CHARACTER_LENGTH	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-05	OCTET_LENGTH	yes	partial	spg_baseline/02_data_types/text_funcs.test
+E021-06	SUBSTRING	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-07	Character concatenation	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-08	UPPER and LOWER	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-09	TRIM	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-10	Implicit casting among string types	yes	covered	spg_baseline/02_data_types/text_varchar_char.test
+E021-11	POSITION	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E021-12	Character comparison	yes	covered	spg_baseline/02_data_types/text_varchar_char.test
+E031	Identifiers	yes	covered	spg_baseline/01_basic_dml
+E031-01	Delimited identifiers	yes	covered	spg_baseline/11_dialect
+E031-02	Lower case identifiers	yes	covered	spg_baseline/01_basic_dml
+E031-03	Trailing underscore	yes	covered	spg_baseline/01_basic_dml
+E051	Basic query specification	yes	covered	spg_baseline/01_basic_dml
+E051-01	SELECT DISTINCT	yes	covered	spg_baseline/05_aggregates
+E051-02	GROUP BY clause	yes	covered	spg_baseline/05_aggregates
+E051-04	GROUP BY can contain columns not in select list	yes	covered	spg_baseline/05_aggregates
+E051-05	Select items can be renamed	yes	covered	spg_baseline/01_basic_dml
+E051-06	HAVING clause	yes	covered	spg_baseline/05_aggregates
+E051-07	Qualified * in select list	yes	covered	spg_baseline/04_joins
+E051-08	Correlation names in FROM	yes	covered	spg_baseline/04_joins
+E051-09	Rename columns in FROM clause	yes	partial	spg_baseline/04_joins
+E061	Basic predicates and search conditions	yes	covered	spg_baseline/01_basic_dml
+E061-01	Comparison predicate	yes	covered	spg_baseline/01_basic_dml
+E061-02	BETWEEN predicate	yes	covered	spg_baseline/01_basic_dml
+E061-03	IN predicate with list of values	yes	covered	spg_baseline/01_basic_dml
+E061-04	LIKE predicate	yes	covered	spg_baseline/02_data_types/text_funcs.test
+E061-05	LIKE ESCAPE	yes	partial	spg_baseline/02_data_types/text_funcs.test
+E061-06	NULL predicate	yes	covered	spg_baseline/01_basic_dml
+E061-07	Quantified comparison (ANY/ALL/SOME)	yes	covered	spg_baseline/06_subqueries
+E061-08	EXISTS predicate	yes	covered	spg_baseline/06_subqueries
+E061-09	Subqueries in comparison predicate	yes	covered	spg_baseline/06_subqueries
+E061-11	Subqueries in IN predicate	yes	covered	spg_baseline/06_subqueries
+E061-12	Subqueries in quantified comparison	yes	covered	spg_baseline/06_subqueries
+E061-13	Correlated subqueries	yes	covered	spg_baseline/06_subqueries
+E061-14	Search condition	yes	covered	spg_baseline/01_basic_dml
+E071	Basic query expressions	yes	covered	spg_baseline/06_subqueries
+E071-01	UNION DISTINCT	yes	covered	spg_baseline/06_subqueries
+E071-02	UNION ALL	yes	covered	spg_baseline/06_subqueries
+E071-03	EXCEPT DISTINCT	yes	covered	spg_baseline/06_subqueries
+E071-05	Columns combined need not have same type	yes	partial	spg_baseline/06_subqueries
+E071-06	Table operators in subqueries	yes	covered	spg_baseline/06_subqueries
+E081	Basic privileges	yes	partial	spg_baseline/11_dialect
+E091	Set functions	yes	covered	spg_baseline/05_aggregates
+E091-01	AVG	yes	covered	spg_baseline/05_aggregates
+E091-02	COUNT	yes	covered	spg_baseline/05_aggregates
+E091-03	MAX	yes	covered	spg_baseline/05_aggregates
+E091-04	MIN	yes	covered	spg_baseline/05_aggregates
+E091-05	SUM	yes	covered	spg_baseline/05_aggregates
+E091-06	ALL quantifier	yes	covered	spg_baseline/05_aggregates
+E091-07	DISTINCT quantifier	yes	covered	spg_baseline/05_aggregates
+E101	Basic data manipulation	yes	covered	spg_baseline/01_basic_dml
+E101-01	INSERT statement	yes	covered	spg_baseline/01_basic_dml
+E101-03	Searched UPDATE	yes	covered	spg_baseline/01_basic_dml
+E101-04	Searched DELETE	yes	covered	spg_baseline/01_basic_dml
+E111	Single row SELECT	yes	covered	spg_baseline/01_basic_dml
+E121	Basic cursor support	yes	partial	spg_baseline/11_dialect
+E131	Null value support	yes	covered	spg_baseline/01_basic_dml
+E141	Basic integrity constraints	yes	covered	spg_baseline/10_constraints
+E141-01	NOT NULL	yes	covered	spg_baseline/10_constraints
+E141-02	UNIQUE of NOT NULL columns	yes	covered	spg_baseline/10_constraints
+E141-03	PRIMARY KEY	yes	covered	spg_baseline/10_constraints
+E141-04	FOREIGN KEY with NO ACTION default	yes	covered	spg_baseline/10_constraints
+E141-06	CHECK constraint	yes	covered	spg_baseline/10_constraints
+E141-07	Column defaults	yes	covered	spg_baseline/10_constraints
+E141-08	NOT NULL inferred on PRIMARY KEY	yes	covered	spg_baseline/10_constraints
+E141-10	FK referenced columns in any order	yes	partial	spg_baseline/10_constraints
+E151	Transaction support	yes	covered	spg_baseline/16_isolation
+E151-01	COMMIT	yes	covered	spg_baseline/13_recovery/tx_visibility.test
+E151-02	ROLLBACK	yes	covered	spg_baseline/16_isolation
+E152	Basic SET TRANSACTION	yes	covered	spg_baseline/16_isolation
+E153	Updatable queries with subqueries	yes	partial	spg_baseline/06_subqueries
+E161	SQL comments (double minus)	yes	covered	spg_baseline/01_basic_dml
+E171	SQLSTATE support	yes	covered	spg_baseline/15_regressions
+E182	Host language binding	yes	covered	spg_baseline/11_dialect
+F031	Basic schema manipulation	yes	covered	spg_baseline/01_basic_dml
+F031-01	CREATE TABLE	yes	covered	spg_baseline/01_basic_dml
+F031-02	CREATE VIEW	yes	covered	spg_baseline/03_composite_domain
+F031-03	GRANT	yes	partial	spg_baseline/11_dialect
+F031-04	ALTER TABLE ADD COLUMN	yes	covered	spg_baseline/01_basic_dml
+F031-16	DROP TABLE RESTRICT	yes	partial	spg_baseline/01_basic_dml
+F031-18	DROP VIEW RESTRICT	yes	partial	spg_baseline/03_composite_domain
+F031-19	REVOKE RESTRICT	yes	partial	spg_baseline/11_dialect
+F041	Basic joined table	yes	covered	spg_baseline/04_joins
+F041-01	Inner join	yes	covered	spg_baseline/04_joins
+F041-02	INNER keyword	yes	covered	spg_baseline/04_joins
+F041-03	LEFT OUTER JOIN	yes	covered	spg_baseline/04_joins
+F041-04	RIGHT OUTER JOIN	yes	covered	spg_baseline/04_joins
+F041-05	Nested outer joins	yes	covered	spg_baseline/04_joins
+F041-07	Inner table in outer join can also be inner join	yes	covered	spg_baseline/04_joins
+F041-08	All comparison operators supported in ON	yes	covered	spg_baseline/04_joins
+F051	Basic date and time	yes	covered	spg_baseline/02_data_types/date_time.test
+F051-01	DATE type	yes	covered	spg_baseline/02_data_types/date_time.test
+F051-02	TIME type	yes	covered	spg_baseline/02_data_types/date_time.test
+F051-03	TIMESTAMP type	yes	covered	spg_baseline/02_data_types/date_time.test
+F051-04	Comparison on datetime types	yes	covered	spg_baseline/02_data_types/date_time.test
+F051-05	Explicit CAST between datetime and string	yes	covered	spg_baseline/02_data_types/date_functions.test
+F051-06	CURRENT_DATE	yes	covered	spg_baseline/02_data_types/now_current.test
+F051-07	LOCALTIME	yes	partial	spg_baseline/02_data_types/now_current.test
+F051-08	LOCALTIMESTAMP	yes	partial	spg_baseline/02_data_types/now_current.test
+F081	UNION and EXCEPT in views	yes	covered	spg_baseline/03_composite_domain
+F131	Grouped operations	yes	covered	spg_baseline/05_aggregates
+F181	Multiple module support	no	uncovered	-
+F201	CAST function	yes	covered	spg_baseline/02_data_types
+F221	Explicit defaults	yes	covered	spg_baseline/10_constraints
+F261	CASE expression	yes	covered	spg_baseline/01_basic_dml
+F311	Schema definition statement	partial	partial	spg_baseline/11_dialect
+F401	Extended joined table (FULL/CROSS)	yes	covered	spg_baseline/04_joins
+F471	Scalar subquery values	yes	covered	spg_baseline/06_subqueries
+F481	Expanded NULL predicate	yes	covered	spg_baseline/01_basic_dml
+F501	Features and conformance views	yes	uncovered	-
+F812	Basic flagging	no	uncovered	-
+S011	Distinct data types	no	uncovered	-
+T071	BIGINT data type	yes	covered	spg_baseline/02_data_types/integer_types.test
+T121	WITH (excluding RECURSIVE) in query	yes	covered	spg_baseline/07_cte
+T131	Recursive query	yes	partial	spg_baseline/07_cte
+T141	SIMILAR predicate	yes	partial	spg_baseline/02_data_types/text_funcs.test
+T151	DISTINCT predicate	yes	covered	spg_baseline/01_basic_dml
+T171	LIKE clause in table definition	yes	partial	spg_baseline/01_basic_dml
+T201	Comparable data types for FK	yes	covered	spg_baseline/10_constraints
+T241	START TRANSACTION	yes	covered	spg_baseline/16_isolation
+T271	Savepoints	yes	covered	spg_baseline/16_isolation
+T321	Basic SQL-invoked routines	partial	partial	spg_baseline/11_dialect
+T441	ABS and MOD	yes	covered	spg_baseline/02_data_types/integer_arith.test
+T501	Enhanced EXISTS predicate	yes	covered	spg_baseline/06_subqueries
+T591	UNIQUE constraints of possibly null columns	yes	covered	spg_baseline/10_constraints
+T611	Elementary OLAP (window functions)	yes	covered	spg_baseline/05_aggregates
+T621	Enhanced numeric functions	yes	covered	spg_baseline/02_data_types/integer_arith.test
+T631	IN predicate with one list element	yes	covered	spg_baseline/01_basic_dml

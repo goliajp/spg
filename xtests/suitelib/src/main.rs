@@ -29,6 +29,7 @@ fn main() {
                 "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
                 "perm-matrix" => suitelib::steps::perm_matrix(root),
                 "oracle-three" => suitelib::steps::oracle_three(root),
+                "sql2016" => suitelib::steps::sql2016(root),
                 other => Err(format!("unknown internal step {other}")),
             };
             match out {
@@ -200,6 +201,8 @@ fn main() {
                         ),
                         // S4.2 — generative differ.
                         "generative" => suitelib::steps::generative(root, &runid),
+                        // S4.3 — SQL:2016 coverage ledger check.
+                        "sql2016" => suitelib::steps::sql2016(root),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });
