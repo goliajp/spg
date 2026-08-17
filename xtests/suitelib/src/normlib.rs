@@ -121,7 +121,7 @@ fn scrub_timestamps(s: &str) -> String {
                 continue;
             }
             out.push_str("<DATE>");
-            i = i + 10;
+            i += 10;
             continue;
         }
         out.push(b[i] as char);

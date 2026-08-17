@@ -28,9 +28,10 @@ pub mod wireclient;
 pub mod normlib;
 
 pub mod snapdiff {
-    //! S2.4 landed in the slt runner itself (`Runner::leftover_objects`
-    //! + the per-file leak warning in main.rs): the check needs the
-    //! engine in hand, so the corpus harness is its natural home. The
-    //! /tmp snapshot half arrives with the full tier (S4.4). This
-    //! module stays as the layer-map anchor.
+    //! The check-testcase half landed in the slt runner itself
+    //! (`Runner::leftover_objects` plus the per-file leak warning in
+    //! its main.rs) because the check needs the engine in hand — the
+    //! corpus harness is its natural home. The tmp-snapshot half
+    //! arrives with the full tier. This module stays as the layer-map
+    //! anchor.
 }
