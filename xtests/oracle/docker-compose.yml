@@ -22,7 +22,9 @@ services:
     ports:
       - "55432:5432"
     tmpfs:
-      - /var/lib/postgresql/data
+      # 18+ image convention: mount the PARENT dir; the entrypoint
+      # places data in a subdirectory (docker-library/postgres#37).
+      - /var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
       interval: 1s

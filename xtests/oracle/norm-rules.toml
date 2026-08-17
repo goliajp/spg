@@ -1,0 +1,12 @@
+# S3.6 — rule-as-data normalisation (suitelib::normlib), applied as the
+# FIRST AdjustPipeline step to both legs of every differential compare.
+#
+# Conservative by design: timestamps stay OFF here (the pipeline's own
+# narrower `timestamps` step scrubs full datetimes without also hiding
+# deterministic DATE literals); versions ON (version() banners legally
+# differ across engines). Add [[replace]] pairs for corpus-specific
+# quirks — every entry is an explicit allowance and must argue why the
+# divergence is legal.
+timestamps = 0
+paths = 0
+versions = 1

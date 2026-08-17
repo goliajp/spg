@@ -1,0 +1,5 @@
+# A10 — fixtures that run on the MySQL leg (cross-dialect SQL only).
+# orig.spg_jsonb_at_op excluded: JSONB type + `@>` are PG surface;
+# MySQL spells it JSON + JSON_CONTAINS() (dialect fixture pending).
+port.select_implicit.sql
+port.subquery_correlated_agg.sql
