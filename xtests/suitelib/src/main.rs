@@ -27,6 +27,8 @@ fn main() {
                 "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                 "ironrules" => suitelib::steps::ironrules_full(root, &runid),
                 "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
+                "perm-matrix" => suitelib::steps::perm_matrix(root),
+                "oracle-three" => suitelib::steps::oracle_three(root),
                 other => Err(format!("unknown internal step {other}")),
             };
             match out {
@@ -175,6 +177,9 @@ fn main() {
                         // directory opened by the current binary.
                         "ironrules" => suitelib::steps::ironrules_full(root, &runid),
                         "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
+                        // full tier (CP3) — the two 元机制 carriers.
+                        "perm-matrix" => suitelib::steps::perm_matrix(root),
+                        "oracle-three" => suitelib::steps::oracle_three(root),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });

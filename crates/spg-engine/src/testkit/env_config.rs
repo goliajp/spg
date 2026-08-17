@@ -51,6 +51,13 @@ pub struct EnvConfig {
     /// (hash maps that need a seed, randomised tie-breakers, …) to a
     /// deterministic value. `None` means "production: derive from clock".
     pub random_seed: Option<u64>,
+
+    /// `SPG_TEST_FIXED_CLOCK_MICROS=N` — pin the engine clock to a
+    /// fixed instant (microseconds since the Unix epoch). Makes
+    /// `now()` / `CURRENT_DATE` / `CURRENT_TIMESTAMP` deterministic in
+    /// hosts that can't inject `with_clock` programmatically (the
+    /// server permutations of the corpus runner). `None` = wall clock.
+    pub fixed_clock_micros: Option<i64>,
 }
 
 /// Semantics of the `compute_query_id` knob.
@@ -74,6 +81,7 @@ impl Default for EnvConfig {
             disable_topk: false,
             disable_joinfold: false,
             random_seed: None,
+            fixed_clock_micros: None,
         }
     }
 }
@@ -115,6 +123,9 @@ impl EnvConfig {
         }
         if let Ok(v) = env::var("SPG_TEST_RANDOM_SEED") {
             cfg.random_seed = v.parse().ok();
+        }
+        if let Ok(v) = env::var("SPG_TEST_FIXED_CLOCK_MICROS") {
+            cfg.fixed_clock_micros = v.parse().ok();
         }
         cfg
     }
@@ -166,6 +177,10 @@ impl EnvConfigBuilder {
     }
     pub fn disable_joinfold(mut self, v: bool) -> Self {
         self.cfg.disable_joinfold = v;
+        self
+    }
+    pub fn fixed_clock_micros(mut self, v: i64) -> Self {
+        self.cfg.fixed_clock_micros = Some(v);
         self
     }
     pub fn random_seed(mut self, v: u64) -> Self {

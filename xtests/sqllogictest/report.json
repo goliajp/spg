@@ -523,7 +523,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 332, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 351, "fail": 0, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -562,6 +562,8 @@
         { "file": "round_29_filter_clause.test", "pass": 5, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "text_concat_real.test", "pass": 11, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "wire_streaming_declines.test", "pass": 19, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "spg_baseline/16_isolation", "pass": 18, "fail": 0, "skip": 0,

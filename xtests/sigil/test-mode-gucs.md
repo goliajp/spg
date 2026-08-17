@@ -17,6 +17,7 @@
 | `SPG_TEST_COMPUTE_QUERY_ID=regress` | Query-identifier annotation stripped from EXPLAIN output | TBD: `crates/spg-engine/src/lib.rs` (annotate_explain_lines) | TBD: `crates/spg-engine/tests/e2e/e2e_env_cfg_compute_query_id.rs` | TBD (P1) |
 | `SPG_TEST_STATS_FROZEN=1` | `ANALYZE` returns a no-op `CommandOk { modified_catalog: false }`; stat version stays unchanged so plan-cache entries remain valid | `crates/spg-engine/src/maintenance.rs::Engine::exec_analyze` (head) | `crates/spg-engine/tests/e2e/e2e_env_cfg_stats_frozen.rs` | LANDED |
 | `SPG_TEST_PLAN_DETERMINISTIC=1` | Cost-based JOIN reorder skipped — INNER-join chain stays in declared order regardless of per-table statistics | `crates/spg-engine/src/reorder.rs::reorder_joins_with` (head gate) + 4 read-path callsites in `execute.rs` (line 113) and `readonly.rs` (lines 210 / 361 / 415) | `crates/spg-engine/tests/e2e/e2e_env_cfg_plan_deterministic.rs` | LANDED |
+| `SPG_TEST_FIXED_CLOCK_MICROS=N` | Engine clock pinned to a fixed instant — `now()` / `CURRENT_DATE` / `CURRENT_TIMESTAMP` deterministic in env-configured hosts (the server permutations) | `crates/spg-engine/src/lib.rs` (`with_env_cfg` clock install) | `crates/spg-engine/tests/e2e/e2e_env_cfg_fixed_clock.rs` | LANDED |
 | `SPG_TEST_DISABLE_JOINFOLD=1` | v7.32 joinfold rewrite suppressed; planner sees the raw join tree | `crates/spg-engine/src/select.rs:1873` (`try_fold_inner_joins` gate) | `crates/spg-engine/tests/e2e/e2e_env_cfg_disable_joinfold.rs` | LANDED |
 
 ## Conventions

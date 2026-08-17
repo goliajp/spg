@@ -112,7 +112,8 @@ budget_s = 120
 [[step]]
 tier = "full"
 name = "prerelease-all"
-impl = "internal"
+impl = "external"
+cmd = "scripts/suite.sh prerelease"
 budget_s = 1500
 
 [[step]]

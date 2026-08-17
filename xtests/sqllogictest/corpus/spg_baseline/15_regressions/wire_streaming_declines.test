@@ -1,0 +1,96 @@
+# r1058 — the wire-leg harvest, pinned. First full-corpus run of the
+# perm-runner's server permutations (S3.5) surfaced five server-path
+# divergences; every one traced to a streaming/canned fast path
+# claiming a statement whose semantics it did not implement. Fixed by
+# declining to the materialising / engine path. This file rides every
+# permutation, so the wire legs re-litigate each claim nightly.
+
+# 1. Partition parent: the streaming scan read the parent's own empty
+#    heap — zero rows over the wire while COUNT(*) said three.
+statement ok
+CREATE TABLE wsd_cust (id BIGINT NOT NULL, region TEXT NOT NULL) PARTITION BY LIST (region)
+
+statement ok
+CREATE TABLE wsd_cust_apac PARTITION OF wsd_cust FOR VALUES IN ('jp', 'kr')
+
+statement ok
+CREATE TABLE wsd_cust_default PARTITION OF wsd_cust DEFAULT
+
+statement ok
+INSERT INTO wsd_cust VALUES (1, 'jp'), (2, 'us')
+
+query IT rowsort
+SELECT id, region FROM wsd_cust
+----
+1
+jp
+2
+us
+
+query IT rowsort
+SELECT id, region FROM wsd_cust WHERE region = 'jp'
+----
+1
+jp
+
+# 2. CTE: the streaming path resolved the CTE name as a physical
+#    relation — "relation \"big\" does not exist" over extended.
+statement ok
+CREATE TABLE wsd_t (id INT NOT NULL, v INT NOT NULL)
+
+statement ok
+INSERT INTO wsd_t VALUES (1, 10), (2, 20), (3, 30)
+
+query I rowsort
+WITH big AS (SELECT id, v FROM wsd_t WHERE v >= 20) SELECT id FROM big
+----
+2
+3
+
+# 3. Read-your-own-writes inside an open transaction: the extended
+#    streaming lane hardcoded IMPLICIT_TX and saw nothing.
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO wsd_t VALUES (9, 90)
+
+query II rowsort
+SELECT id, v FROM wsd_t WHERE id = 9
+----
+9
+90
+
+statement ok
+COMMIT
+
+# 4. Sequence mutator: nextval() over extended hit the read-only
+#    executor ("requires a sequence resolver").
+statement ok
+CREATE SEQUENCE wsd_s
+
+query I
+SELECT nextval('wsd_s')
+----
+1
+
+query I
+SELECT nextval('wsd_s')
+----
+2
+
+# 5. SHOW: the wire's canned inventory answered is_superuser with a
+#    blank and an unknown parameter with success; both now fall
+#    through to the engine.
+query T
+SHOW is_superuser
+----
+on
+
+statement error
+SHOW wsd_spam_setting_that_does_not_exist
+
+query T
+SHOW server_version
+----
+18.4 (spg)

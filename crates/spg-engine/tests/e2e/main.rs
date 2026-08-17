@@ -1004,6 +1004,7 @@ mod e2e_encode_bytea;
 mod e2e_env_cfg_disable_joinfold;
 mod e2e_env_cfg_disable_topk;
 mod e2e_env_cfg_explain_no_costs;
+mod e2e_env_cfg_fixed_clock;
 mod e2e_env_cfg_plan_deterministic;
 mod e2e_env_cfg_random_seed;
 mod e2e_env_cfg_stats_frozen;

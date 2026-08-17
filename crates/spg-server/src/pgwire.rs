@@ -545,17 +545,21 @@ fn handle_pg_simple_query(
             None
         };
         let resp = match engine_val {
-            Some(v) => CannedResponse::Rows {
+            Some(v) => Some(CannedResponse::Rows {
                 columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
                 rows: vec![Row::new(vec![Value::text(v)])],
-            },
+            }),
             None => render_show(&name, settings),
         };
-        send_canned(wbuf, &resp)?;
-        send_ready_for_query(wbuf, *tx_state)?;
-        stream.write_all(wbuf)?;
-        wbuf.clear();
-        return Ok(());
+        // r1058 — None: nothing here knows the name; fall through to
+        // the engine dispatch below, which answers or errors properly.
+        if let Some(resp) = resp {
+            send_canned(wbuf, &resp)?;
+            send_ready_for_query(wbuf, *tx_state)?;
+            stream.write_all(wbuf)?;
+            wbuf.clear();
+            return Ok(());
+        }
     }
     // v7.39 (round 343, V40) — `lo_import` / `lo_export` are the only
     // lo_* calls that touch a server file, and the engine is `no_std`.
@@ -1333,14 +1337,18 @@ fn handle_pg_simple_query_one_into_wbuf(
             None
         };
         let resp = match engine_val {
-            Some(v) => CannedResponse::Rows {
+            Some(v) => Some(CannedResponse::Rows {
                 columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
                 rows: vec![Row::new(vec![Value::text(v)])],
-            },
+            }),
             None => render_show(&name, settings),
         };
-        send_canned(wbuf, &resp)?;
-        return Ok(());
+        // r1058 — None falls through to the engine dispatch (see the
+        // simple-path twin).
+        if let Some(resp) = resp {
+            send_canned(wbuf, &resp)?;
+            return Ok(());
+        }
     }
     if parse_copy_intent(sql).is_some() {
         send_error(
@@ -1864,7 +1872,7 @@ fn run_pg_session(
     send_msg(stream, b'R', &0u32.to_be_bytes())?;
     // ParameterStatus pairs — keep the set minimal but include the
     // ones psql / driver libraries check first.
-    send_parameter_status(stream, "server_version", "18.4 (spg-4.3)")?;
+    send_parameter_status(stream, "server_version", "18.4 (spg)")?;
     send_parameter_status(stream, "client_encoding", "UTF8")?;
     send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
     send_parameter_status(stream, "integer_datetimes", "on")?;
@@ -3212,7 +3220,18 @@ fn handle_parse(
     } else {
         Some(encode_row_description_body(&columns))
     };
-    let placeholder_count = count_placeholders(&sql);
+    // r1058 — a PREPARE statement's `$n` belong to the INNER
+    // statement, not to this Parse message: live PG18 accepts
+    // `Parse("PREPARE p(int) AS SELECT $1")` + a zero-parameter Bind
+    // and answers the PREPARE tag (verified over \bind). The textual
+    // count made the server demand Bind parameters the client
+    // rightly never sends — every corpus PREPARE broke over the
+    // extended protocol (perm-runner server_extended leg).
+    let placeholder_count = if matches!(ast, spg_sql::ast::Statement::Prepare { .. }) {
+        0
+    } else {
+        count_placeholders(&sql)
+    };
     // v7.39 (binary results) — clients like tokio-postgres declare no
     // param OIDs in Parse and rely on Describe's inference; fill the
     // undeclared slots from the same inference so binary Bind values
@@ -3955,9 +3974,32 @@ fn handle_execute(
     // straight out of the source tables.
     let cached_row_desc = stmt.row_desc_body.clone();
     let wants_binary = portal.result_formats.iter().any(|&f| f == 1);
-    if let (spg_sql::ast::Statement::Select(s), true, 0, false) =
-        (&stmt.ast, portal.params.is_empty(), max_rows, wants_binary)
-    {
+    // r1058 — same gate as the simple path (pgwire.rs `!conn_in_tx`,
+    // read01 round 84): inside an open transaction the streaming fast
+    // path must stand down. `execute_prepared_select_streaming`
+    // hardcodes IMPLICIT_TX, so a SELECT here could not see the
+    // connection's own uncommitted INSERT/UPDATE — the perm-runner's
+    // server_extended leg measured read-your-own-writes returning
+    // zero rows while the simple leg returned them. The fall-through
+    // branch binds to the connection's slot (round 443).
+    let ext_conn_in_tx = state
+        .engine
+        .read()
+        .is_ok_and(|e| e.is_tx_open(conn_state.tx_id));
+    // r1058 — same outermost routing as the simple path: a SELECT
+    // carrying a state-mutating call (nextval / advisory locks / …)
+    // must not take the streaming lane, whose executor never runs
+    // the `&mut` pre-resolve pass ("requires a sequence resolver"
+    // over the extended protocol, caught by the perm-runner). One
+    // needle list serves both protocols.
+    let ext_mutating_call = sql_has_sequence_mutator(stmt.sql.as_bytes());
+    if let (spg_sql::ast::Statement::Select(s), true, 0, false, false) = (
+        &stmt.ast,
+        portal.params.is_empty(),
+        max_rows,
+        wants_binary,
+        ext_conn_in_tx || ext_mutating_call,
+    ) {
         let mut eng = state
             .engine
             .write()
@@ -4363,7 +4405,10 @@ fn parse_show_statement(sql: &str) -> Option<String> {
 
 /// Render a SHOW result: the value from `settings` first, else a
 /// known default. SHOW ALL emits one row per known setting.
-fn render_show(name: &str, settings: &std::collections::HashMap<String, String>) -> CannedResponse {
+fn render_show(
+    name: &str,
+    settings: &std::collections::HashMap<String, String>,
+) -> Option<CannedResponse> {
     if name == "all" {
         let mut entries: Vec<(String, String)> = known_defaults()
             .iter()
@@ -4387,7 +4432,7 @@ fn render_show(name: &str, settings: &std::collections::HashMap<String, String>)
             .into_iter()
             .map(|(n, v)| Row::new(vec![Value::text(n), Value::text(v), Value::Null]))
             .collect();
-        return CannedResponse::Rows { columns, rows };
+        return Some(CannedResponse::Rows { columns, rows });
     }
     let value = settings
         .get(name)
@@ -4404,13 +4449,20 @@ fn render_show(name: &str, settings: &std::collections::HashMap<String, String>)
         // everything else into an EMPTY ROW, so `SHOW fsync` over the
         // wire returned a blank where PG returns `on` — and where the
         // engine, asked the same question, now answers too.
-        .or_else(|| spg_engine::pg_guc_boot_value(name).map(str::to_string))
-        .unwrap_or_default();
+        // r1058 — no more `unwrap_or_default()`: a name NOBODY here
+        // recognises is not an empty row, it is the engine's problem.
+        // Returning None lets the statement fall through to the full
+        // dispatch, where the engine answers `is_superuser`, the
+        // isolation level, and errors on unrecognised parameters the
+        // way PG does. The wire's inventory answered `SHOW
+        // is_superuser` with a blank and `SHOW spam_x` with success —
+        // both caught by the perm-runner's wire legs.
+        .or_else(|| spg_engine::pg_guc_boot_value(name).map(str::to_string))?;
     let columns = vec![ColumnSchema::new(name.to_string(), DataType::Text, false)];
-    CannedResponse::Rows {
+    Some(CannedResponse::Rows {
         columns,
         rows: vec![Row::new(vec![Value::text(value)])],
-    }
+    })
 }
 
 /// Built-in PG GUCs we report sane defaults for so clients
@@ -4436,7 +4488,7 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("intervalstyle", "postgres"),
         ("search_path", "\"$user\", public"),
         ("server_encoding", "UTF8"),
-        ("server_version", "18.4 (spg-4.19)"),
+        ("server_version", "18.4 (spg)"),
         ("server_version_num", "180004"),
         ("standard_conforming_strings", "on"),
         ("statement_timeout", "0"),

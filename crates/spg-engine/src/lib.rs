@@ -384,6 +384,15 @@ impl From<EvalError> for EngineError {
 /// `Unsupported`.
 pub type ClockFn = fn() -> i64;
 
+/// Backing store for `SPG_TEST_FIXED_CLOCK_MICROS` (test-mode GUC).
+/// Only ever written when that GUC is set; production engines never
+/// touch it.
+static FIXED_CLOCK_MICROS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+fn fixed_clock_from_env() -> i64 {
+    FIXED_CLOCK_MICROS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// v7.39 (pg_stat knife A) — host-provided live connection count for
 /// `pg_stat_database.numbackends`.
 pub type BackendCountFn = fn() -> u32;
@@ -2535,6 +2544,14 @@ impl Engine {
         // the PRNG state here.
         if let Some(seed) = env_cfg.random_seed {
             crate::eval::math::prng_install_seed(seed);
+        }
+        // r1058 — `SPG_TEST_FIXED_CLOCK_MICROS` pins the clock for
+        // hosts that read GUCs from env instead of calling
+        // `with_clock` (the server). Process-global by necessity: a
+        // `ClockFn` is a plain fn pointer and cannot capture.
+        if let Some(micros) = env_cfg.fixed_clock_micros {
+            FIXED_CLOCK_MICROS.store(micros, core::sync::atomic::Ordering::Relaxed);
+            self = self.with_clock(fixed_clock_from_env);
         }
         self.env_cfg = env_cfg;
         self

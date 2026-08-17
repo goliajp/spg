@@ -452,6 +452,11 @@ impl Engine {
             Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
+            // r1058 — the wire routes `SHOW <name>` down the read path;
+            // without this arm the canned-inventory fallthrough hit
+            // `WriteRequired` ("statement requires a write lock") for
+            // `SHOW is_superuser` and friends.
+            Statement::ShowParameter(name) => self.exec_show_parameter(name),
             Statement::ShowPublications => Ok(self.exec_show_publications()),
             Statement::ShowSubscriptions => Ok(self.exec_show_subscriptions()),
             Statement::WaitForWalPosition { .. } => Err(EngineError::Unsupported(

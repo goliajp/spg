@@ -681,6 +681,103 @@ impl Engine {
         result
     }
 
+    /// v7.37.17 — `SHOW <name>` / `SHOW ALL`. Extracted (r1058) so the
+    /// READ-ONLY dispatcher can serve it too: the wire routes SHOW as a
+    /// read, and its fallthrough (unknown-to-the-wire names) landed on
+    /// `WriteRequired` instead of this answer.
+    pub(crate) fn exec_show_parameter(
+        &self,
+        name: alloc::string::String,
+    ) -> Result<QueryResult, EngineError> {
+        use spg_storage::{ColumnSchema, DataType, Row, Value};
+        // v7.37.17 (17.6 sibling) — `SHOW ALL` returns a
+        // (name, setting, description) triple for every
+        // parameter SPG knows about. PG's shape is the same.
+        // Emitting a fixed curated inventory here keeps the
+        // client shape stable without wire-tapping every
+        // per-session parameter.
+        // v7.38 (read01 P3.20/P3.23) — SHOW reads the same canonical
+        // GUC inventory as pg_settings, so `SHOW <name>` / `SHOW ALL`
+        // and pg_settings never disagree on which params exist.
+        let canon = crate::system_catalog::canonical_gucs();
+        let effective = |n: &str, boot: &str| -> alloc::string::String {
+            self.session_params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(n))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| boot.into())
+        };
+        if name.eq_ignore_ascii_case("all") {
+            let cols = alloc::vec![
+                ColumnSchema::new("name", DataType::Text, false),
+                ColumnSchema::new("setting", DataType::Text, false),
+                ColumnSchema::new("description", DataType::Text, false),
+            ];
+            let mut rows: Vec<Row> = Vec::new();
+            // Dynamic params outside the static canonical table.
+            rows.push(Row::new(alloc::vec![
+                Value::text(alloc::string::String::from("transaction_isolation")),
+                Value::text(alloc::string::String::from(
+                    self.current_isolation_level.as_pg_str(),
+                )),
+                Value::text(alloc::string::String::from(
+                    "Shows the current transaction's isolation level.",
+                )),
+            ]));
+            rows.push(Row::new(alloc::vec![
+                Value::text(alloc::string::String::from("is_superuser")),
+                Value::text(alloc::string::String::from("on")),
+                Value::text(alloc::string::String::from("Reports superuser status.")),
+            ]));
+            for (n, boot, cat, _, _) in canon {
+                rows.push(Row::new(alloc::vec![
+                    Value::text(alloc::string::String::from(*n)),
+                    Value::text(effective(n, boot)),
+                    Value::text(alloc::string::String::from(*cat)),
+                ]));
+            }
+            return Ok(QueryResult::Rows {
+                columns: cols,
+                rows,
+            });
+        }
+        let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
+            "transaction_isolation" => {
+                alloc::string::String::from(self.current_isolation_level.as_pg_str())
+            }
+            "is_superuser" => alloc::string::String::from("on"),
+            _ => {
+                // Canonical GUC? report the session override or its
+                // boot default. Otherwise a user-set custom GUC, or a
+                // recognised-name error pointing at pg_settings.
+                if let Some((_, boot, ..)) =
+                    canon.iter().find(|(n, ..)| n.eq_ignore_ascii_case(&name))
+                {
+                    effective(&name, boot)
+                } else if let Some(v) = self.session_param(&name) {
+                    alloc::string::String::from(v)
+                } else if let Some(boot) = crate::guc_catalog::guc_boot_value(&name) {
+                    // v7.39 (round 534) — a parameter PG18 knows but
+                    // SPG does not model reports its compiled-in
+                    // default. `SHOW random_page_cost` printed
+                    // nothing at all before, and `SHOW fsync` with
+                    // it.
+                    alloc::string::String::from(boot)
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "SHOW {name:?}: parameter not recognised; \
+                             see `SELECT name, setting FROM pg_settings` for \
+                             the full inventory"
+                    )));
+                }
+            }
+        };
+        Ok(QueryResult::Rows {
+            columns: alloc::vec![ColumnSchema::new(name, DataType::Text, false)],
+            rows: alloc::vec![Row::new(alloc::vec![Value::text(value)])],
+        })
+    }
+
     /// v7.37 — streaming SELECT for the pgwire `Execute` hot path.
     /// Emits one `StreamItem::Header(cols)` then one
     /// `StreamItem::Row(&[&Value])` per surviving row. Returns the
@@ -2418,95 +2515,7 @@ impl Engine {
             //    SET-tracked override on self.session_params wins.
             // 3. Anything else — error with a list-pointer to
             //    pg_settings (which lists every recognised name).
-            Statement::ShowParameter(name) => {
-                use spg_storage::{ColumnSchema, DataType, Row, Value};
-                // v7.37.17 (17.6 sibling) — `SHOW ALL` returns a
-                // (name, setting, description) triple for every
-                // parameter SPG knows about. PG's shape is the same.
-                // Emitting a fixed curated inventory here keeps the
-                // client shape stable without wire-tapping every
-                // per-session parameter.
-                // v7.38 (read01 P3.20/P3.23) — SHOW reads the same canonical
-                // GUC inventory as pg_settings, so `SHOW <name>` / `SHOW ALL`
-                // and pg_settings never disagree on which params exist.
-                let canon = crate::system_catalog::canonical_gucs();
-                let effective = |n: &str, boot: &str| -> alloc::string::String {
-                    self.session_params
-                        .iter()
-                        .find(|(k, _)| k.eq_ignore_ascii_case(n))
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_else(|| boot.into())
-                };
-                if name.eq_ignore_ascii_case("all") {
-                    let cols = alloc::vec![
-                        ColumnSchema::new("name", DataType::Text, false),
-                        ColumnSchema::new("setting", DataType::Text, false),
-                        ColumnSchema::new("description", DataType::Text, false),
-                    ];
-                    let mut rows: Vec<Row> = Vec::new();
-                    // Dynamic params outside the static canonical table.
-                    rows.push(Row::new(alloc::vec![
-                        Value::text(alloc::string::String::from("transaction_isolation")),
-                        Value::text(alloc::string::String::from(
-                            self.current_isolation_level.as_pg_str(),
-                        )),
-                        Value::text(alloc::string::String::from(
-                            "Shows the current transaction's isolation level.",
-                        )),
-                    ]));
-                    rows.push(Row::new(alloc::vec![
-                        Value::text(alloc::string::String::from("is_superuser")),
-                        Value::text(alloc::string::String::from("on")),
-                        Value::text(alloc::string::String::from("Reports superuser status.")),
-                    ]));
-                    for (n, boot, cat, _, _) in canon {
-                        rows.push(Row::new(alloc::vec![
-                            Value::text(alloc::string::String::from(*n)),
-                            Value::text(effective(n, boot)),
-                            Value::text(alloc::string::String::from(*cat)),
-                        ]));
-                    }
-                    return Ok(QueryResult::Rows {
-                        columns: cols,
-                        rows,
-                    });
-                }
-                let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
-                    "transaction_isolation" => {
-                        alloc::string::String::from(self.current_isolation_level.as_pg_str())
-                    }
-                    "is_superuser" => alloc::string::String::from("on"),
-                    _ => {
-                        // Canonical GUC? report the session override or its
-                        // boot default. Otherwise a user-set custom GUC, or a
-                        // recognised-name error pointing at pg_settings.
-                        if let Some((_, boot, ..)) =
-                            canon.iter().find(|(n, ..)| n.eq_ignore_ascii_case(&name))
-                        {
-                            effective(&name, boot)
-                        } else if let Some(v) = self.session_param(&name) {
-                            alloc::string::String::from(v)
-                        } else if let Some(boot) = crate::guc_catalog::guc_boot_value(&name) {
-                            // v7.39 (round 534) — a parameter PG18 knows but
-                            // SPG does not model reports its compiled-in
-                            // default. `SHOW random_page_cost` printed
-                            // nothing at all before, and `SHOW fsync` with
-                            // it.
-                            alloc::string::String::from(boot)
-                        } else {
-                            return Err(EngineError::Unsupported(alloc::format!(
-                                "SHOW {name:?}: parameter not recognised; \
-                                 see `SELECT name, setting FROM pg_settings` for \
-                                 the full inventory"
-                            )));
-                        }
-                    }
-                };
-                Ok(QueryResult::Rows {
-                    columns: alloc::vec![ColumnSchema::new(name, DataType::Text, false)],
-                    rows: alloc::vec![Row::new(alloc::vec![Value::text(value)])],
-                })
-            }
+            Statement::ShowParameter(name) => self.exec_show_parameter(name),
             // v7.14.0 — MySQL multi-assignment SET. Each pair runs
             // through `set_session_param` so engine-known params
             // (FOREIGN_KEY_CHECKS, session_replication_role, …) take
