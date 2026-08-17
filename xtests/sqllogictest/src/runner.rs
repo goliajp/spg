@@ -373,6 +373,32 @@ fn format_real(x: f64) -> String {
     spg_engine::eval::format_float(x)
 }
 
+/// r1052 (S2.3) — a pg_regress-shaped block: header with the source
+/// line, the query, then `-expected` / `+actual` lines. Readable in a
+/// terminal and in a review, which is the entire job.
+fn unified_diff(line: usize, sql: &str, expected: &[String], actual: &[String]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("@ line {line}\n"));
+    for l in sql.lines() {
+        out.push_str(&format!("  {l}\n"));
+    }
+    out.push_str("  ----\n");
+    let n = expected.len().max(actual.len());
+    for i in 0..n {
+        match (expected.get(i), actual.get(i)) {
+            (Some(e), Some(a)) if e == a => out.push_str(&format!("  {e}\n")),
+            (Some(e), Some(a)) => {
+                out.push_str(&format!("- {e}\n"));
+                out.push_str(&format!("+ {a}\n"));
+            }
+            (Some(e), None) => out.push_str(&format!("- {e}\n")),
+            (None, Some(a)) => out.push_str(&format!("+ {a}\n")),
+            (None, None) => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,30 +482,4 @@ mod tests {
         );
         assert_eq!(out.pass, 4, "outcomes: {:#?}", out.per_record);
     }
-}
-
-/// r1052 (S2.3) — a pg_regress-shaped block: header with the source
-/// line, the query, then `-expected` / `+actual` lines. Readable in a
-/// terminal and in a review, which is the entire job.
-fn unified_diff(line: usize, sql: &str, expected: &[String], actual: &[String]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("@ line {line}\n"));
-    for l in sql.lines() {
-        out.push_str(&format!("  {l}\n"));
-    }
-    out.push_str("  ----\n");
-    let n = expected.len().max(actual.len());
-    for i in 0..n {
-        match (expected.get(i), actual.get(i)) {
-            (Some(e), Some(a)) if e == a => out.push_str(&format!("  {e}\n")),
-            (Some(e), Some(a)) => {
-                out.push_str(&format!("- {e}\n"));
-                out.push_str(&format!("+ {a}\n"));
-            }
-            (Some(e), None) => out.push_str(&format!("- {e}\n")),
-            (None, Some(a)) => out.push_str(&format!("+ {a}\n")),
-            (None, None) => {}
-        }
-    }
-    out
 }

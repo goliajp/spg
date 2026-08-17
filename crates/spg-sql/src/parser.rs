@@ -11956,7 +11956,7 @@ impl Parser {
     /// Used by `parse_table_ref` to bypass the
     /// `expect_ident_like` schema-strip for these specific PG
     /// meta schemas (mailrs round-10 A.3).
-    fn try_peek_meta_qualified(&mut self) -> Option<String> {
+    fn try_peek_meta_qualified(&mut self) -> Option<(String, String)> {
         // Extract the schema name. Must be a plain ident token.
         let schema = match self.tokens.get(self.pos) {
             Some(Token::Ident(s) | Token::QuotedIdent(s)) => s.clone(),
@@ -11994,7 +11994,7 @@ impl Parser {
                 self.advance(); // schema
                 self.advance(); // dot
                 self.advance(); // tbl
-                return Some(lowered);
+                return Some((lowered.clone(), lowered));
             }
             let bare = lowered
                 .strip_prefix("pg_")
@@ -12012,7 +12012,10 @@ impl Parser {
         self.advance(); // schema
         self.advance(); // dot
         self.advance(); // tbl
-        Some(alloc::format!("{prefix}{normalised}"))
+        Some((
+            alloc::format!("{prefix}{normalised}"),
+            tbl.to_ascii_lowercase(),
+        ))
     }
 
     /// Unqualified PG meta-table names (`FROM pg_extension`, `FROM
@@ -12021,7 +12024,7 @@ impl Parser {
     /// known catalog table always means the catalog table. Only the
     /// names the engine actually synthesises are recognised — any
     /// other `pg_*` ident stays a user table (mailrs embed round-12).
-    fn try_peek_meta_bare(&mut self) -> Option<String> {
+    fn try_peek_meta_bare(&mut self) -> Option<(String, String)> {
         // v7.38 (read01 P3.21) — every catalog view SPG synthesises
         // (`__spg_pg_*`) is bare-resolvable, matching PG's implicit
         // `pg_catalog` at the front of every search_path. (pg_stat_activity
@@ -12044,7 +12047,7 @@ impl Parser {
         }
         self.advance();
         let bare = name.strip_prefix("pg_").unwrap_or(&name);
-        Some(alloc::format!("__spg_pg_{bare}"))
+        Some((alloc::format!("__spg_pg_{bare}"), name.clone()))
     }
 
     /// Consume a bare ident if its lowercase matches `kw`, else err.
@@ -19328,12 +19331,12 @@ impl Parser {
         // synthetic name (`__spg_info_columns` etc.) so the
         // engine's SELECT-side router can dispatch without
         // clashing with any user-defined `columns` table.
-        let name = if let Some(synth) = self.try_peek_meta_qualified() {
-            synth
-        } else if let Some(synth) = self.try_peek_meta_bare() {
-            synth
+        let (name, meta_original) = if let Some((synth, orig)) = self.try_peek_meta_qualified() {
+            (synth, Some(orig))
+        } else if let Some((synth, orig)) = self.try_peek_meta_bare() {
+            (synth, Some(orig))
         } else {
-            self.expect_ident_like()?
+            (self.expect_ident_like()?, None)
         };
         // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
         // time-travel clause. Parse BEFORE the alias so the
@@ -19382,6 +19385,18 @@ impl Parser {
             None
         } else {
             self.parse_optional_alias()?
+        };
+        // r1052 — a catalog name rewritten to its synthetic form keeps
+        // the WRITTEN name as the relation's alias, so `pg_cast.oid`
+        // still binds after `pg_cast` became `__spg_pg_cast`. PG
+        // semantics: the visible name of `pg_catalog.pg_cast` IS
+        // `pg_cast`. Without this, every table-name-qualified column
+        // on a synthesised catalog answered "missing FROM-clause
+        // entry" — which is the wall pg_dump hit on its first
+        // pg_proc/pg_cast query.
+        let alias = match (&alias, &meta_original) {
+            (None, Some(orig)) if *orig != name => Some(orig.clone()),
+            _ => alias,
         };
         // `TABLESAMPLE BERNOULLI(p) | SYSTEM(p)` follows the alias
         // (PG grammar). BERNOULLI lowers to a per-row
@@ -22030,6 +22045,16 @@ impl Parser {
     }
 
     fn parse_cast_target(&mut self) -> Result<CastTarget, ParseError> {
+        // r1052 — `::pg_catalog.regproc` and friends: pg_dump
+        // schema-qualifies every cast target, and `pg_catalog.X` names
+        // exactly the builtin type X. Consume the qualifier and let
+        // the ordinary target parse decide.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("pg_catalog"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+        {
+            self.advance();
+            self.advance();
+        }
         let target = match self.advance() {
             Token::Ident(s) => match s.to_ascii_lowercase().as_str() {
                 "int" | "integer" | "int4" => {
