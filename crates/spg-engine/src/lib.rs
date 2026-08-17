@@ -2527,6 +2527,14 @@ impl Engine {
     /// behaviour flows through `self.env_cfg()`.
     #[must_use]
     pub fn with_env_cfg(mut self, env_cfg: testkit::EnvConfig) -> Self {
+        // r1051 — a configured seed reaches `random()` too, not only
+        // the `rng_seed()` accessor: the D-mechanism's "single seed
+        // source" claim, made true at the SQL level (first pin_v738_
+        // catch). Production engines carry no seed and never touch
+        // the PRNG state here.
+        if let Some(seed) = env_cfg.random_seed {
+            crate::eval::math::prng_install_seed(seed);
+        }
         self.env_cfg = env_cfg;
         self
     }

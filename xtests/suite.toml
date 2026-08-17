@@ -1,0 +1,135 @@
+# v7.38 suite manifest — the tiers as DATA (design D2).
+#
+# Flat [[step]] list; file order IS execution order within a tier.
+# `impl = "external"` runs `cmd` as a shell command; "internal" names a
+# suite-run built-in (errors "not wired" until its checklist item).
+# Budgets are provisional until CP0 calibrates them from BASELINE.
+
+[suite]
+current_pin_prefix = "pin_v738_"
+port_lo = 25460
+port_hi = 25479
+
+# ── precommit ─────────────────────────────────────────────────────────
+
+[[step]]
+tier = "precommit"
+name = "fmt"
+impl = "external"
+cmd = "cargo fmt --all -- --check"
+budget_s = 5
+
+[[step]]
+tier = "precommit"
+name = "clippy-affected"
+impl = "internal"
+budget_s = 45
+
+[[step]]
+tier = "precommit"
+name = "unit-affected"
+impl = "internal"
+budget_s = 35
+
+[[step]]
+tier = "precommit"
+name = "pins-current"
+impl = "external"
+cmd = "cargo test -q -p spg-engine --test e2e pin_v738_"
+budget_s = 10
+
+[[step]]
+tier = "precommit"
+name = "slt-smoke"
+impl = "external"
+cmd = "cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+budget_s = 15
+
+[[step]]
+tier = "precommit"
+name = "ironrule-smoke"
+impl = "internal"
+budget_s = 10
+
+# ── prerelease ────────────────────────────────────────────────────────
+
+[[step]]
+tier = "prerelease"
+name = "lint"
+impl = "external"
+cmd = "scripts/gate.sh lint"
+budget_s = 240
+
+[[step]]
+tier = "prerelease"
+name = "unit"
+impl = "external"
+cmd = "scripts/gate.sh unit"
+budget_s = 300
+
+[[step]]
+tier = "prerelease"
+name = "e2e"
+impl = "external"
+cmd = "scripts/gate.sh e2e"
+budget_s = 360
+
+[[step]]
+tier = "prerelease"
+name = "gates"
+impl = "external"
+cmd = "scripts/gate.sh gates"
+budget_s = 480
+
+[[step]]
+tier = "prerelease"
+name = "biz"
+impl = "external"
+cmd = "scripts/gate.sh biz"
+budget_s = 300
+
+[[step]]
+tier = "prerelease"
+name = "dogfood"
+impl = "external"
+cmd = "scripts/gate.sh dogfood"
+budget_s = 240
+
+[[step]]
+tier = "prerelease"
+name = "perf-sweep"
+impl = "internal"
+budget_s = 900
+
+[[step]]
+tier = "prerelease"
+name = "ironrules"
+impl = "internal"
+budget_s = 120
+
+# ── full ──────────────────────────────────────────────────────────────
+
+[[step]]
+tier = "full"
+name = "prerelease-all"
+impl = "internal"
+budget_s = 1500
+
+[[step]]
+tier = "full"
+name = "deep-tier"
+impl = "external"
+cmd = "scripts/gate.sh all --full"
+budget_s = 7200
+
+[[step]]
+tier = "full"
+name = "perm-matrix"
+impl = "internal"
+budget_s = 3600
+
+[[step]]
+tier = "full"
+name = "oracle-three"
+impl = "internal"
+budget_s = 3600

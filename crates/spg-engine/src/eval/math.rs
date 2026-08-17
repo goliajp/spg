@@ -21,33 +21,93 @@ pub(super) fn f64_trunc(x: f64) -> f64 {
     (x as i64) as f64
 }
 
-/// xorshift64* PRNG state — process-static seed advanced on
-/// every `random()` call. Not cryptographically secure; use
-/// `gen_random_uuid` / future crypto-RNG functions when
-/// security matters.
-static PRNG_STATE: core::sync::atomic::AtomicU64 =
-    core::sync::atomic::AtomicU64::new(0x2545_F491_4F6C_DD1D);
+/// xorshift64* PRNG behind `random()` / `gen_random_uuid()`. Not
+/// cryptographically secure.
+///
+/// r1051 — the state is THREAD-LOCAL under `std`, matching PG's
+/// per-backend `random()` semantics: `setseed()` and the test-mode
+/// seed affect the calling session's stream and no one else's. The
+/// first process-static version made `SPG_TEST_RANDOM_SEED` a
+/// cross-test hazard the moment the merged e2e binary ran in
+/// parallel (a seeded engine reset the stream under a concurrently
+/// running uuid-uniqueness test), which is the same defect PG's
+/// per-backend design exists to prevent. Streams on distinct threads
+/// start from distinct golden-ratio-salted states, so
+/// `gen_random_uuid` keeps its cross-thread collision freedom.
+///
+/// Under `no_std` there are no threads to separate; the process
+/// static remains.
+const PRNG_SENTINEL: u64 = 0x2545_F491_4F6C_DD1D;
 
-/// Advance the PRNG and return the raw next 64-bit state.
-/// Shared between `random()` and `gen_random_uuid()`. The CAS
-/// loop guarantees concurrent callers each see a distinct value
-/// — important for `gen_random_uuid` collision freedom under
-/// concurrent INSERTs.
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(not(feature = "std"))]
+static PRNG_STATE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(PRNG_SENTINEL);
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// 0 = not yet initialised; first use salts it per thread.
+    static PRNG_TL: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// Per-thread distinct starting states: golden-ratio steps of a
+/// process counter, so two threads never begin on the same stream.
+#[cfg(feature = "std")]
+static PRNG_THREAD_SALT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+
+fn xorshift(mut x: u64) -> u64 {
+    if x == 0 {
+        x = PRNG_SENTINEL;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    if x == 0 { PRNG_SENTINEL } else { x }
+}
+
+/// Advance the PRNG and return the raw next 64-bit state. Shared
+/// between `random()` and `gen_random_uuid()`.
 pub(super) fn prng_next_u64() -> u64 {
-    use core::sync::atomic::Ordering;
-    let mut x = PRNG_STATE.load(Ordering::Relaxed);
-    loop {
-        if x == 0 {
-            x = 0x2545_F491_4F6C_DD1D;
+    #[cfg(feature = "std")]
+    {
+        PRNG_TL.with(|c| {
+            let mut x = c.get();
+            if x == 0 {
+                use core::sync::atomic::Ordering;
+                x = PRNG_SENTINEL
+                    ^ PRNG_THREAD_SALT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+            }
+            let next = xorshift(x);
+            c.set(next);
+            next
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        use core::sync::atomic::Ordering;
+        let mut x = PRNG_STATE.load(Ordering::Relaxed);
+        loop {
+            let next = xorshift(x);
+            match PRNG_STATE.compare_exchange_weak(x, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return next,
+                Err(seen) => x = seen,
+            }
         }
-        let mut next = x;
-        next ^= next << 13;
-        next ^= next >> 7;
-        next ^= next << 17;
-        match PRNG_STATE.compare_exchange_weak(x, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return next,
-            Err(seen) => x = seen,
-        }
+    }
+}
+
+/// Set the calling session's PRNG state (setseed / test-mode seed).
+fn prng_set_state(state: u64) {
+    let state = if state == 0 { PRNG_SENTINEL } else { state };
+    #[cfg(feature = "std")]
+    PRNG_TL.with(|c| c.set(state));
+    #[cfg(not(feature = "std"))]
+    {
+        use core::sync::atomic::Ordering;
+        PRNG_STATE.store(state, Ordering::Relaxed);
     }
 }
 
@@ -85,17 +145,23 @@ pub(super) fn uuidv7_monotonic(base_ms: u64) -> (u64, u16) {
 /// accepts a value in [-1, 1] and uses it as the seed source.
 /// We map that range into 64 bits deterministically.
 pub(super) fn prng_seed(seed: f64) {
-    use core::sync::atomic::Ordering;
-    // Map [-1, 1] → u64. Use the raw f64 bit pattern so any
-    // value in the range produces a distinct state. Force
-    // non-zero so the xorshift doesn't get stuck.
-    let bits = seed.to_bits();
-    let state = if bits == 0 {
-        0x2545_F491_4F6C_DD1D
-    } else {
-        bits
-    };
-    PRNG_STATE.store(state, Ordering::Relaxed);
+    // Map [-1, 1] → u64 via the raw bit pattern so any value in the
+    // range produces a distinct state. Per-session under std (PG's
+    // setseed scope), r1051.
+    prng_set_state(seed.to_bits());
+}
+
+/// v7.38 元机制 D (r1051) — install a test-mode seed into the process
+/// PRNG. `SPG_TEST_RANDOM_SEED` claimed to be "the single seed source
+/// for every nondeterministic engine subsystem" while `random()` drew
+/// from this process-static state untouched — the first `pin_v738_`
+/// test caught the claim being false at the SQL level. Called from
+/// `Engine::with_env_cfg` when (and only when) a seed is configured,
+/// so production engines never pass through here; two seeded engines
+/// interleaving draws still share one process state, which is the
+/// documented test-mode caveat.
+pub(crate) fn prng_install_seed(seed: u64) {
+    prng_set_state(seed);
 }
 
 /// Advance the PRNG and return a uniform double in [0, 1).

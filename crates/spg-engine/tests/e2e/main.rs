@@ -689,6 +689,7 @@ mod e2e_pgcrypto_hmac;
 mod e2e_pgcrypto_random;
 mod e2e_pglsn_partition_srf;
 mod e2e_pgstat_round24;
+mod e2e_pin_v738;
 mod e2e_plain_cast_round613;
 mod e2e_plpgsql_assert;
 mod e2e_plpgsql_continue;

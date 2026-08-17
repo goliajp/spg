@@ -19,6 +19,7 @@ members = [
     "xtests/dogfood_replay",
     "xtests/oracle",
     "xtests/perm-runner",
+    "xtests/suitelib",
     "xbench/competitor",
 ]
 
