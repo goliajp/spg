@@ -192,14 +192,20 @@ operator playbook.
 
 ### Tests
 
-The surface is split into five categories — lint / unit / e2e / gates /
-biz — with a fast and a `--full` tier; see [`docs/TESTING.md`](docs/TESTING.md).
+Since v7.38 the suite runs as three data-driven tiers with hard time
+budgets — `precommit` (≤150 s, wired into the git pre-commit hook),
+`prerelease` (≤25 min, **every release must pass it**), and `full`
+(the nightly find-problems tier: permutation matrix over both wire
+protocols, three-master differential oracle, isolation interleavings,
+a generative differ, SQL:2016 coverage, doc-as-corpus, pgbench /
+sysbench scoreboards). `gate.sh`'s categories survive as components;
+see [`docs/TESTING.md`](docs/TESTING.md).
 
 ```sh
-scripts/gate.sh all              # full battery (fast tier)
-scripts/gate.sh e2e              # one category
-scripts/gate.sh gates --full     # long-running perf tiers
-scripts/test-on-mini.sh e2e      # offload a category to the LAN testbed
+scripts/suite.sh precommit       # the commit gate (also runs from the hook)
+scripts/suite.sh prerelease --on-mini   # the release gate, on the LAN testbed
+scripts/suite.sh full            # nightly battery
+scripts/gate.sh e2e              # one legacy category, directly
 ```
 
 ## Status

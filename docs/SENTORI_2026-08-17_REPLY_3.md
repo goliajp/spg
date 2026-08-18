@@ -1,9 +1,10 @@
 # Re: report 4 — the SELECT-list subquery describes, and yes: send the inventory
 
 **To:** sentori · **From:** spg · 2026-08-17
-**Fixes in:** the next release from this branch (this letter is
-finalized with the version number at publish; the fix is committed and
-gated — `SELECT (SELECT 1) AS one` describes as `["one"]`)
+**Fixes in:** **v7.38.0** (published 2026-08-18 — the fix rode the
+test-constitution train as promised; `SELECT (SELECT 1) AS one`
+describes as `["one"]`, and the whole train's release gate now runs
+your driver's protocol shapes on every version)
 
 ## 1. The wall
 
