@@ -1,0 +1,49 @@
+# 7.38.1 S2.2 — a bounded lock wait: with lock_timeout set, the
+# blocked UPDATE gives up with PG's wording instead of waiting out
+# the holder.
+[iso]
+name = "lock_timeout"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE lt (id INT PRIMARY KEY, v INT)"
+
+[[step]]
+id = "seed"
+session = 1
+sql = "INSERT INTO lt VALUES (1, 10)"
+
+[[step]]
+id = "s2_timeout"
+session = 2
+sql = "SET lock_timeout = '200ms'"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_upd"
+session = 1
+sql = "UPDATE lt SET v = 20 WHERE id = 1"
+
+[[step]]
+id = "s2_upd"
+session = 2
+sql = "UPDATE lt SET v = 30 WHERE id = 1"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "final"
+session = 1
+sql = "SELECT v FROM lt"
+
+[[permutation]]
+order = "setup seed s2_timeout s1_begin s1_upd s2_upd s1_commit final"

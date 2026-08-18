@@ -106,3 +106,41 @@ fn pin_v7381_sequential_autocommit_locks_do_not_linger() {
     assert_eq!(one_cell(&mut e, "SELECT v FROM ub4"), "5");
     assert_eq!(e.locked_row_count(), 0, "no lock may outlive its statement");
 }
+
+/// 7.38.1 S2.3 — opposite-order writers close a wait-for cycle; the
+/// detector names the YOUNGEST as victim (40P01) and the survivor
+/// retries through. No spin, no hang.
+#[test]
+fn pin_v7381_deadlock_names_the_youngest_victim() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE dl (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    e.execute("INSERT INTO dl VALUES (1, 10), (2, 20)").unwrap();
+    let t1 = e.alloc_tx_id();
+    let t2 = e.alloc_tx_id();
+    e.execute_in("BEGIN", t1).unwrap();
+    e.execute_in("BEGIN", t2).unwrap();
+    e.execute_in("UPDATE dl SET v = 11 WHERE id = 1", t1)
+        .unwrap();
+    e.execute_in("UPDATE dl SET v = 22 WHERE id = 2", t2)
+        .unwrap();
+    // t1 wants t2's row: would-block, wait edge recorded.
+    let e1 = e
+        .execute_in("UPDATE dl SET v = 12 WHERE id = 2", t1)
+        .unwrap_err();
+    assert!(matches!(e1, EngineError::LockWouldBlock), "{e1:?}");
+    // t2 wants t1's row: the cycle closes; the younger writer dies.
+    let e2 = e
+        .execute_in("UPDATE dl SET v = 21 WHERE id = 1", t2)
+        .unwrap_err();
+    assert!(
+        matches!(e2, EngineError::LockDeadlock),
+        "cycle must abort the youngest with 40P01, got {e2:?}"
+    );
+    e.execute_in("ROLLBACK", t2).unwrap();
+    // The survivor's retry now goes through.
+    e.execute_in("UPDATE dl SET v = 12 WHERE id = 2", t1)
+        .unwrap();
+    e.execute_in("COMMIT", t1).unwrap();
+    assert_eq!(one_cell(&mut e, "SELECT v FROM dl WHERE id = 2"), "12");
+}
