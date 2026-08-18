@@ -442,10 +442,16 @@ mod tests {
     /// onto one port — full run 1 saw all three claim 25460 at once.
     /// A shared lock beats runner discipline (--test-threads=1 was a
     /// doc note, and the full tier didn't read it).
+    ///
+    /// 7.38.1 CP — this MUST be the same mutex every server-spawning
+    /// test module locks. A second static in this module let these
+    /// tests interleave with `wireclient_split_tests` (which locks
+    /// `tests_support::guard`): both fulls of 2026-08-19 went red on
+    /// one box each with the same signature — a freshly spawned server
+    /// with an empty data dir while the client talked to a sibling
+    /// test's server that had won the port race.
     fn server_test_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::tests_support::guard()
     }
 
     #[test]
