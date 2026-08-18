@@ -17,7 +17,7 @@ impl Table {
             rows: PersistentVec::new(),
             headers: PersistentVec::new(),
             rowids: PersistentVec::new(),
-            next_rowid: 1,
+            next_rowid: alloc::sync::Arc::new(core::sync::atomic::AtomicU64::new(1)),
             dead_rows: 0,
             stat_tup_ins: 0,
             stat_tup_upd: 0,
@@ -40,8 +40,15 @@ impl Table {
     /// returned id onto `rowids` in lock-step with the `rows` /
     /// `headers` append so `rowids[i]` names the row at slot `i`.
     fn alloc_rowid(&mut self) -> crate::row_header::RowId {
-        let id = crate::row_header::RowId(self.next_rowid);
-        self.next_rowid += 1;
+        // fetch_add on the lineage-shared counter: clones (transaction
+        // shadows, snapshots) mint from the SAME sequence, so ids stay
+        // unique across concurrent shadows. Relaxed suffices — all
+        // minting happens under the engine's single writer guard; the
+        // atomic is for clone-shared identity, not for racing threads.
+        let id = crate::row_header::RowId(
+            self.next_rowid
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+        );
         id
     }
 
@@ -82,7 +89,8 @@ impl Table {
             fresh.push_mut(crate::row_header::RowId((i + 1) as u64));
         }
         self.rowids = fresh;
-        self.next_rowid = (n as u64) + 1;
+        self.next_rowid
+            .store((n as u64) + 1, core::sync::atomic::Ordering::Relaxed);
         debug_assert_eq!(
             self.rows.len(),
             self.rowids.len(),
@@ -189,7 +197,7 @@ impl Table {
     /// id) without a public accessor on the hot path.
     #[cfg(test)]
     pub(crate) fn next_rowid_for_test(&self) -> u64 {
-        self.next_rowid
+        self.next_rowid.load(core::sync::atomic::Ordering::Relaxed)
     }
 
     /// v7.37.15 (Phase C) — engine writer path. Same as [`insert`]
@@ -1242,7 +1250,8 @@ impl Table {
         // exactly the one the row ends up with. `writer_version` (xmin)
         // is 0: the writing TxId is not threaded to this layer yet (the
         // header pushed below is `RowHeader::frozen()`).
-        let redo_rowid = crate::row_header::RowId(self.next_rowid);
+        let redo_rowid =
+            crate::row_header::RowId(self.next_rowid.load(core::sync::atomic::Ordering::Relaxed));
         self.record_redo(|table| RowChange::Insert {
             table,
             row: row.clone(),
@@ -2284,8 +2293,10 @@ impl Table {
                     // Should not happen once C.1 is wired everywhere;
                     // allocate a fresh id as a defensive fallback so
                     // the lock-step invariant survives a legacy path.
-                    let rid = crate::row_header::RowId(self.next_rowid);
-                    self.next_rowid += 1;
+                    let rid = crate::row_header::RowId(
+                        self.next_rowid
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                    );
                     new_rowids.push_mut(rid);
                 }
             }
@@ -2348,13 +2359,13 @@ impl Table {
             }
             new_headers.push_mut(*h);
             let rid = if *rid == crate::row_header::RowId::UNASSIGNED {
-                let fresh = crate::row_header::RowId(self.next_rowid);
-                self.next_rowid += 1;
-                fresh
+                crate::row_header::RowId(
+                    self.next_rowid
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+                )
             } else {
-                if rid.0 >= self.next_rowid {
-                    self.next_rowid = rid.0 + 1;
-                }
+                self.next_rowid
+                    .fetch_max(rid.0 + 1, core::sync::atomic::Ordering::Relaxed);
                 *rid
             };
             new_rowids.push_mut(rid);
@@ -2387,8 +2398,10 @@ impl Table {
         let mut new_rowids: PersistentVec<crate::row_header::RowId> = PersistentVec::new();
         for _ in 0..new_rows.len() {
             new_headers.push_mut(crate::row_header::RowHeader::frozen());
-            let rid = crate::row_header::RowId(self.next_rowid);
-            self.next_rowid += 1;
+            let rid = crate::row_header::RowId(
+                self.next_rowid
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            );
             new_rowids.push_mut(rid);
         }
         self.rows = new_rows;
