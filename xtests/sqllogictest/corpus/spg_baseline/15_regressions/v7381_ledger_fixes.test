@@ -1,0 +1,131 @@
+# 7.38.1 — the ledger train's SQL-expressible fixes, pinned as corpus.
+# Each block names the ledger item it holds down.
+
+# 1. ORDER BY position edges (S6-adjacent): a negative position is an
+#    error, and position 1 on a constant-only projection is accepted —
+#    both PG 18 exact.
+statement ok
+CREATE TABLE v81_ord (a INT, b INT)
+
+statement ok
+INSERT INTO v81_ord VALUES (2, 20), (1, 10), (3, 30)
+
+statement error
+SELECT a FROM v81_ord ORDER BY -2
+
+query I
+SELECT 10 FROM v81_ord ORDER BY 1 LIMIT 1
+----
+10
+
+# 2. L12 composite-keyed B-tree: full-tuple and prefix equalities answer
+#    exactly what a scan answers, including the row whose trailing
+#    component is NULL (the first draft dropped it from prefix probes —
+#    the seq-scan-oracle pin that caught it lives in engine e2e; this
+#    corpus twin rides every permutation nightly).
+statement ok
+CREATE TABLE v81_c (w BIGINT, d BIGINT, id BIGINT, pad TEXT, PRIMARY KEY (w, d, id))
+
+statement ok
+INSERT INTO v81_c VALUES (1,1,1,'a'), (1,1,2,'b'), (1,2,1,'c'), (2,1,1,'d')
+
+statement ok
+CREATE TABLE v81_cn (w BIGINT, d BIGINT, id BIGINT, pad TEXT)
+
+statement ok
+INSERT INTO v81_cn VALUES (2,3,1,'x'), (2,3,NULL,'null-id'), (2,4,1,'y')
+
+statement ok
+CREATE INDEX v81_cn_wdi ON v81_cn (w, d, id)
+
+query T
+SELECT pad FROM v81_c WHERE w = 1 AND d = 1 AND id = 2
+----
+b
+
+query T rowsort
+SELECT pad FROM v81_c WHERE w = 1 AND d = 1
+----
+a
+b
+
+query T rowsort
+SELECT pad FROM v81_cn WHERE w = 2 AND d = 3
+----
+null-id
+x
+
+query T
+SELECT pad FROM v81_cn WHERE w = 2 AND d = 3 AND id IS NULL
+----
+null-id
+
+statement error
+INSERT INTO v81_c VALUES (1, 1, 1, 'dup')
+
+# 3. UPDATE moves the composite key; DELETE drops it.
+statement ok
+UPDATE v81_c SET id = 99 WHERE w = 1 AND d = 1 AND id = 1
+
+query T
+SELECT pad FROM v81_c WHERE w = 1 AND d = 1 AND id = 99
+----
+a
+
+query I
+SELECT COUNT(*) FROM v81_c WHERE w = 1 AND d = 1 AND id = 1
+----
+0
+
+statement ok
+DELETE FROM v81_c WHERE w = 1 AND d = 1 AND id = 99
+
+query I
+SELECT COUNT(*) FROM v81_c WHERE w = 1 AND d = 1 AND id = 99
+----
+0
+
+# 4. drop_column and dependent indexes: dropping a column an index's
+#    extra names drops that index; survivors keep answering on their
+#    shifted positions.
+statement ok
+CREATE TABLE v81_dc (a INT, b INT, k INT, v INT)
+
+statement ok
+INSERT INTO v81_dc VALUES (1, 2, 30, 400), (5, 6, 70, 800)
+
+statement ok
+CREATE INDEX v81_dc_kv ON v81_dc (k, v)
+
+statement ok
+ALTER TABLE v81_dc DROP COLUMN b
+
+query I
+SELECT a FROM v81_dc WHERE k = 70 AND v = 800
+----
+5
+
+statement ok
+ALTER TABLE v81_dc DROP COLUMN v
+
+query I
+SELECT COUNT(*) FROM pg_indexes WHERE indexname = 'v81_dc_kv'
+----
+0
+
+query I
+SELECT a FROM v81_dc WHERE k = 30
+----
+1
+
+statement ok
+DROP TABLE v81_ord
+
+statement ok
+DROP TABLE v81_c
+
+statement ok
+DROP TABLE v81_cn
+
+statement ok
+DROP TABLE v81_dc
