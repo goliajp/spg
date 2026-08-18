@@ -894,6 +894,23 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                             }
                             continue;
                         }
+                        // 7.38.1 S6.1 (gendiff fourth leg) — an item
+                        // that is itself an integer LITERAL cannot be
+                        // substituted textually: `SELECT 10 … ORDER BY
+                        // 1` would turn into `ORDER BY 10`, which the
+                        // position check then reads as an out-of-range
+                        // ordinal — where PG returns the rows (ordering
+                        // by a constant orders nothing). Leave the
+                        // ordinal in place; every executor sorts a
+                        // constant key into a no-op anyway.
+                        let is_const_int = matches!(expr, Expr::Literal(Literal::Integer(_)))
+                            || matches!(expr, Expr::Unary {
+                                op: spg_sql::ast::UnOp::Neg,
+                                expr: inner,
+                            } if matches!(inner.as_ref(), Expr::Literal(Literal::Integer(_))));
+                        if is_const_int {
+                            continue;
+                        }
                         order.expr = match (has_unions, alias) {
                             (true, Some(a)) => Expr::Column(ColumnName {
                                 qualifier: None,
@@ -1889,6 +1906,20 @@ pub(crate) fn check_order_by_positions(
         {
             return Err(crate::EngineError::Unsupported(alloc::format!(
                 "ORDER BY position {n} is not in select list"
+            )));
+        }
+        // 7.38.1 S6.1 (gendiff fourth leg, day one) — `ORDER BY -2`
+        // parses as unary minus over a literal, so the bare-literal
+        // arm above never saw it and SPG silently accepted what PG
+        // refuses: `ORDER BY position -2 is not in select list`.
+        if let Expr::Unary {
+            op: spg_sql::ast::UnOp::Neg,
+            expr: inner,
+        } = &ob.expr
+            && let Expr::Literal(Literal::Integer(n)) = inner.as_ref()
+        {
+            return Err(crate::EngineError::Unsupported(alloc::format!(
+                "ORDER BY position -{n} is not in select list"
             )));
         }
     }

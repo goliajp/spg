@@ -4,6 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
+| `15_regressions` | 0 | 0 | 0 | 0.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
 | `mysql` | 170 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
@@ -26,6 +27,11 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Per-file detail
+
+### `15_regressions/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
 
 ### `duckdb/`
 

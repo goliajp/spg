@@ -354,9 +354,22 @@ pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
     let seed = runid
         .bytes()
         .fold(0u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
+    // 7.38.1 S6.1 (D8) — the live-PG fourth leg rides whenever the
+    // oracle container is reachable (mini: docker wrapper; local:
+    // the 25432 bench container). 10^4 is the CP judgement; 10^5 is
+    // the nightly parameter (SPG_GENDIFF_COUNT overrides).
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pg_host = if Path::new(&home).join("spgbench/bin/psql").exists() {
+        "host.docker.internal"
+    } else {
+        "127.0.0.1"
+    };
+    let count = std::env::var("SPG_GENDIFF_COUNT").unwrap_or_else(|_| String::from("10000"));
     sh(
         root,
-        &format!("cargo run -q --release -p spg-gendiff -- --seed {seed} --count 10000"),
+        &format!(
+            "SPG_GENDIFF_PG='{pg_host}:25432:bench:bench'              cargo run -q --release -p spg-gendiff -- --seed {seed} --count {count}"
+        ),
     )
     .map(|out| tail_lines(&out, 2))
 }
