@@ -119,6 +119,14 @@ impl Roster {
         if !binary.exists() {
             return Err(format!("{}: binary {} missing", name, binary.display()));
         }
+        // 7.38.1 (S2.2 rider) — Gatekeeper warm-up: the FIRST exec of a
+        // freshly built binary on macOS goes through an XProtect scan
+        // that can take seconds on a busy box — every chronic
+        // "spawned but printed nothing for 10-40s" flake this train
+        // and the 7.38.0 release hit had a rebuild right before it. A
+        // fast failing exec (bad addr) pays the scan once, outside any
+        // deadline.
+        warm_binary_once(binary);
         let pg_port = self.free_port()?;
         let native_port = {
             // Reserve pg_port by pushing a placeholder before the second probe.
@@ -275,6 +283,27 @@ fn dir_size_kb(dir: &Path) -> u64 {
     let mut bytes = 0u64;
     walk(dir, &mut bytes);
     bytes / 1024
+}
+
+/// One fast throwaway exec per binary path per process — see the
+/// Gatekeeper note at the call site.
+fn warm_binary_once(binary: &Path) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static WARMED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+    let mut g = WARMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let set = g.get_or_insert_with(HashSet::new);
+    if !set.insert(binary.to_path_buf()) {
+        return;
+    }
+    drop(g);
+    let _ = Command::new(binary)
+        .arg("warmup-invalid-addr")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 impl Drop for Roster {

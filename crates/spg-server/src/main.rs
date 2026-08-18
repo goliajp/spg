@@ -256,41 +256,68 @@ pub(crate) fn commit_queue_execute(
     state: &ServerState,
     sql: String,
     cancel_flag: &Arc<AtomicBool>,
+    lock_deadline: Option<std::time::Instant>,
 ) -> (Result<QueryResult, EngineError>, std::io::Result<()>, bool) {
-    let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
-    let task = CommitTask {
-        sql,
-        cancel_flag: Arc::clone(cancel_flag),
-        ack: ack_tx,
-        sync_commit: session_sync_commit(state),
-    };
-    if std::env::var("SPG_COMMIT_TRACE").is_ok() {
-        use std::sync::atomic::Ordering;
-        eprintln!(
-            "spg-server: commit-trace solo={} coalesced_groups={} coalesced_tasks={} window_us={}",
-            crate::wal::COMMIT_GROUPS_SOLO.load(Ordering::Relaxed),
-            crate::wal::COMMIT_GROUPS_COALESCED.load(Ordering::Relaxed),
-            crate::wal::COMMIT_TASKS_COALESCED.load(Ordering::Relaxed),
-            crate::wal::ADAPTIVE_COMMIT_WINDOW_US.load(Ordering::Relaxed),
-        );
-    }
-    let became_leader = enqueue_commit_task(state, task);
-    if became_leader {
-        run_leader_commit_round(state);
-    }
-    match ack_rx.recv() {
-        Ok(CommitResult {
-            result,
-            wal_outcome,
-            audited,
-        }) => (result, wal_outcome, audited),
-        Err(_) => (
-            Err(EngineError::Unsupported(
-                "commit barrier: ack channel closed before result arrived".into(),
-            )),
-            Ok(()),
-            false,
-        ),
+    // 7.38.1 S2.2 — the whole enqueue/ack cycle sits in a retry loop:
+    // an autocommit writer that hit another transaction's tuple lock
+    // waits here, outside every engine guard, and re-enqueues (PG
+    // waits forever at lock_timeout=0; a wait-for cycle terminates
+    // via the engine's deadlock detector, which answers the victim).
+    loop {
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
+        let task = CommitTask {
+            sql: sql.clone(),
+            cancel_flag: Arc::clone(cancel_flag),
+            ack: ack_tx,
+            sync_commit: session_sync_commit(state),
+        };
+        if std::env::var("SPG_COMMIT_TRACE").is_ok() {
+            use std::sync::atomic::Ordering;
+            eprintln!(
+                "spg-server: commit-trace solo={} coalesced_groups={} coalesced_tasks={} window_us={}",
+                crate::wal::COMMIT_GROUPS_SOLO.load(Ordering::Relaxed),
+                crate::wal::COMMIT_GROUPS_COALESCED.load(Ordering::Relaxed),
+                crate::wal::COMMIT_TASKS_COALESCED.load(Ordering::Relaxed),
+                crate::wal::ADAPTIVE_COMMIT_WINDOW_US.load(Ordering::Relaxed),
+            );
+        }
+        let became_leader = enqueue_commit_task(state, task);
+        if became_leader {
+            run_leader_commit_round(state);
+        }
+        match ack_rx.recv() {
+            Ok(CommitResult {
+                result,
+                wal_outcome,
+                audited,
+            }) => {
+                if matches!(result, Err(EngineError::LockWouldBlock)) {
+                    if let Some(d) = lock_deadline
+                        && std::time::Instant::now() >= d
+                    {
+                        return (
+                            Err(EngineError::Unsupported(
+                                "canceling statement due to lock timeout".into(),
+                            )),
+                            Ok(()),
+                            false,
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                return (result, wal_outcome, audited);
+            }
+            Err(_) => {
+                return (
+                    Err(EngineError::Unsupported(
+                        "commit barrier: ack channel closed before result arrived".into(),
+                    )),
+                    Ok(()),
+                    false,
+                );
+            }
+        }
     }
 }
 
@@ -2981,8 +3008,16 @@ fn handle_query_op(
     let (result, wal_result, snapshot, leader_audited) = if needs_wrap {
         // r178 — shared helper (also used by the pgwire plain-DML
         // path); resolves sync_commit from the session GUC itself.
+        let native_lock_deadline = state
+            .engine
+            .read()
+            .ok()
+            .and_then(|e| e.session_param("lock_timeout").map(str::to_string))
+            .and_then(|v| crate::pgwire::parse_timeout_ms_pub(&v))
+            .filter(|&ms| ms > 0)
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
         let (result, wal_outcome, leader_audited) =
-            commit_queue_execute(state, sql.clone(), &cancel_flag);
+            commit_queue_execute(state, sql.clone(), &cancel_flag, native_lock_deadline);
         // Wrap path always has WAL on (see `needs_wrap`
         // gate above), so the wal-off snapshot branch is
         // unreachable here. Auto-commit wraps never leave
@@ -2996,21 +3031,33 @@ fn handle_query_op(
             .is_ok_and(|e| e.is_tx_open(spg_engine::IMPLICIT_TX));
         (result, wal_outcome, None, leader_audited)
     } else {
-        let mut engine = state
-            .engine
-            .write()
-            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-        let budget = usize::try_from(
-            state
-                .limits
-                .max_query_bytes
-                .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
-        )
-        .unwrap_or(usize::MAX);
-        alloc_budget::reset_query_budget(budget, &cancel_flag);
-        let result =
-            engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
-        alloc_budget::clear_query_budget();
+        // 7.38.1 S2.2 — the row-lock wait loop, native edition: a
+        // statement that would-blocks retries after the guard drops
+        // (the holder needs the engine to COMMIT).
+        let (mut engine, result) = loop {
+            let mut engine = state
+                .engine
+                .write()
+                .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+            let budget = usize::try_from(
+                state
+                    .limits
+                    .max_query_bytes
+                    .unwrap_or(DEFAULT_MAX_QUERY_BYTES),
+            )
+            .unwrap_or(usize::MAX);
+            alloc_budget::reset_query_budget(budget, &cancel_flag);
+            let result =
+                engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
+            alloc_budget::clear_query_budget();
+            if matches!(result, Err(spg_engine::EngineError::LockWouldBlock)) {
+                drop(engine);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                continue;
+            }
+            break (engine, result);
+        };
+        let _ = &mut engine;
         // r178 — RETURNING DML answers Rows, not CommandOk; inside an
         // explicit tx those must reach the WAL too (the pre-r178 gate
         // silently dropped them from replay).
