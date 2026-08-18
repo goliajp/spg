@@ -619,3 +619,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
+
+#[cfg(test)]
+mod wireclient_split_tests {
+    use super::tests_support::*;
+
+    /// 7.38.1 S1.1 — the send/read halves compose back into
+    /// simple_query, and poll_pending sees the difference between an
+    /// idle connection and one with an answer waiting.
+    #[test]
+    #[ignore = "needs target/release/spg-server; S1.1 acceptance"]
+    fn split_halves_and_pending_probe() {
+        let _serial = guard();
+        let Some(bin) = bin() else { return };
+        let tmp = crate::proclib::run_tmp_dir("s11-split");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut roster = crate::proclib::Roster::new();
+        let port = roster
+            .spawn_server("s11", &bin, &tmp, std::time::Duration::from_secs(20))
+            .expect("server");
+        let mut c = crate::wireclient::Conn::connect(port, "s11", "s11").expect("connect");
+        // Idle connection: nothing pending.
+        assert!(!c.poll_pending(150).expect("idle poll"));
+        // Send half, then the answer becomes observable, then read.
+        c.send_query_nowait("SELECT 41 + 1").expect("send");
+        // Give the server a beat; the probe must flip to true.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(c.poll_pending(500).expect("armed poll"));
+        let r = c.read_result().expect("read");
+        assert_eq!(r.rows, vec![vec!["42".to_string()]]);
+        // The composed path still works on the same connection.
+        let r2 = c.simple_query("SELECT 7").expect("composed");
+        assert_eq!(r2.rows, vec![vec!["7".to_string()]]);
+        // Deadline-bounded read on a fresh in-flight query.
+        c.send_query_nowait("SELECT 8").expect("send2");
+        let r3 = c
+            .read_result_deadline(std::time::Duration::from_secs(5))
+            .expect("deadline read");
+        assert_eq!(r3.rows, vec![vec!["8".to_string()]]);
+        roster.reap_all();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    /// Shared server-test plumbing for sibling test modules.
+    pub(crate) fn guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub(crate) fn bin() -> Option<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .ok()?;
+        let p = root.join("target/release/spg-server");
+        if p.exists() {
+            Some(p)
+        } else {
+            eprintln!("SKIPPED loudly: target/release/spg-server not built");
+            None
+        }
+    }
+}

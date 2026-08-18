@@ -1,0 +1,88 @@
+# 7.38.1 L1 (MATRIX #20) — the row-lock wait PG performs on a
+# concurrent same-row UPDATE. Behavioural baseline captured from live
+# PG18 (see 05_update_blocking.pg-reference); the checked-in
+# .expected transcribes SPG's CURRENT behaviour and flips to the PG
+# shape when S2.2 lands.
+[iso]
+name = "update_blocking"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE ub (id INT PRIMARY KEY, v INT)"
+
+[[step]]
+id = "seed"
+session = 1
+sql = "INSERT INTO ub VALUES (1, 10)"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_upd"
+session = 1
+sql = "UPDATE ub SET v = 20 WHERE id = 1"
+
+[[step]]
+id = "s2_send"
+session = 2
+sql = "UPDATE ub SET v = 30 WHERE id = 1"
+async = 1
+
+[[step]]
+id = "probe"
+session = 2
+pending = "s2_send"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s2_get"
+session = 2
+wait = "s2_send"
+
+[[step]]
+id = "final"
+session = 1
+sql = "SELECT v FROM ub"
+
+[[step]]
+id = "s2_begin"
+session = 2
+sql = "BEGIN"
+
+[[step]]
+id = "s2_send_tx"
+session = 2
+sql = "UPDATE ub SET v = 40 WHERE id = 1"
+async = 1
+
+[[step]]
+id = "probe_tx"
+session = 2
+pending = "s2_send_tx"
+
+[[step]]
+id = "s2_get_tx"
+session = 2
+wait = "s2_send_tx"
+
+[[step]]
+id = "s2_commit"
+session = 2
+sql = "COMMIT"
+
+# Autocommit challenger blocks until the holder commits, then applies.
+[[permutation]]
+order = "setup seed s1_begin s1_upd s2_send probe s1_commit s2_get final"
+
+# Transaction challenger: same wait at the UPDATE, commit after.
+[[permutation]]
+order = "setup seed s1_begin s1_upd s2_begin s2_send_tx probe_tx s1_commit s2_get_tx s2_commit final"

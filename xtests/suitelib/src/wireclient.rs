@@ -44,8 +44,17 @@ impl Conn {
     /// Connection, protocol, or an auth method this client does not
     /// speak — each named.
     pub fn connect(port: u16, user: &str, db: &str) -> Result<Self, String> {
-        let mut stream = TcpStream::connect(("127.0.0.1", port))
-            .map_err(|e| format!("connect 127.0.0.1:{port}: {e}"))?;
+        Self::connect_host("127.0.0.1", port, user, db)
+    }
+
+    /// As [`Self::connect`], with an explicit host — the isolation
+    /// harness dials external oracle containers (7.38.1 S1.2).
+    ///
+    /// # Errors
+    /// As [`Self::connect`].
+    pub fn connect_host(host: &str, port: u16, user: &str, db: &str) -> Result<Self, String> {
+        let mut stream =
+            TcpStream::connect((host, port)).map_err(|e| format!("connect {host}:{port}: {e}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| format!("timeout: {e}"))?;
@@ -103,13 +112,82 @@ impl Conn {
     /// # Errors
     /// Transport only — a server-side SQL error lands in `.error`.
     pub fn simple_query(&mut self, sql: &str) -> Result<QueryResult, String> {
+        self.send_query_nowait(sql)?;
+        self.read_result()
+    }
+
+    /// 7.38.1 S1.1 — the SEND half: fire the `Q` message and return
+    /// without reading. The isolation harness uses this for steps
+    /// that are expected to BLOCK server-side (a row-lock wait);
+    /// [`Self::read_result`] harvests later, [`Self::poll_pending`]
+    /// probes without consuming.
+    ///
+    /// # Errors
+    /// Transport only.
+    pub fn send_query_nowait(&mut self, sql: &str) -> Result<(), String> {
         let mut msg = vec![b'Q'];
         msg.extend_from_slice(&(u32::try_from(sql.len() + 5).unwrap()).to_be_bytes());
         msg.extend_from_slice(sql.as_bytes());
         msg.push(0);
         self.stream
             .write_all(&msg)
-            .map_err(|e| format!("query: {e}"))?;
+            .map_err(|e| format!("query: {e}"))
+    }
+
+    /// 7.38.1 S1.1 — non-consuming liveness probe: has the server
+    /// started answering the in-flight query? Uses `TcpStream::peek`
+    /// (MSG_PEEK — nothing is consumed, framing stays intact) under a
+    /// short timeout. `Ok(true)` = bytes waiting; `Ok(false)` = still
+    /// blocked after `timeout_ms`.
+    ///
+    /// # Errors
+    /// Transport errors other than the timeout itself.
+    pub fn poll_pending(&mut self, timeout_ms: u64) -> Result<bool, String> {
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(timeout_ms.max(1))))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let mut one = [0u8; 1];
+        let r = match self.stream.peek(&mut one) {
+            Ok(0) => Err("peer closed while query in flight".to_string()),
+            Ok(_) => Ok(true),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(format!("peek: {e}")),
+        };
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        r
+    }
+
+    /// 7.38.1 S1.1 — the READ half: collect the in-flight query's
+    /// answer until ReadyForQuery. A blocked statement blocks HERE,
+    /// bounded by the given deadline (the iso harness passes the
+    /// spec's harvest budget; a genuine server-side hang is a loud
+    /// transport error, never a silent pass).
+    ///
+    /// # Errors
+    /// Transport only — server-side SQL errors land in `.error`.
+    pub fn read_result_deadline(&mut self, deadline: Duration) -> Result<QueryResult, String> {
+        self.stream
+            .set_read_timeout(Some(deadline))
+            .map_err(|e| format!("timeout: {e}"))?;
+        let r = self.read_result();
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|e| format!("timeout: {e}"))?;
+        r
+    }
+
+    /// The blocking read loop shared by all of the above.
+    ///
+    /// # Errors
+    /// Transport only.
+    pub fn read_result(&mut self) -> Result<QueryResult, String> {
         let mut out = QueryResult::default();
         loop {
             let (kind, body) = read_msg(&mut self.stream)?;
