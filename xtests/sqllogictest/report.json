@@ -1,5 +1,9 @@
 {
   "groups": [
+    { "name": "15_regressions", "pass": 0, "fail": 0, "skip": 0,
+      "files": [
+
+      ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 8, "fail": 0, "skip": 0,
@@ -523,7 +527,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 371, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 402, "fail": 0, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -562,6 +566,8 @@
         { "file": "round_29_filter_clause.test", "pass": 6, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "text_concat_real.test", "pass": 12, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "v7381_ledger_fixes.test", "pass": 31, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "wire_streaming_declines.test", "pass": 23, "fail": 0, "skip": 0,
           "fail_reasons": [] }
