@@ -12884,7 +12884,7 @@ fn resolve_positional_order_by(
 ) -> alloc::vec::Vec<spg_sql::ast::OrderBy> {
     order_by
         .iter()
-        .map(|o| {
+        .filter_map(|o| {
             let mut o = o.clone();
             if let Expr::Literal(spg_sql::ast::Literal::Integer(n)) = &o.expr
                 && *n >= 1
@@ -12892,9 +12892,19 @@ fn resolve_positional_order_by(
                 && let Some(item) = projection.get(idx)
                 && !expr_contains_builtin_srf(&item.expr)
             {
+                // 7.38.1 S6.1 (gendiff fourth leg) — an ordinal whose
+                // item is itself an integer LITERAL must not be
+                // substituted textually: the literal would read as an
+                // ordinal again downstream, and `SELECT 10 … ORDER BY
+                // 1` died with "position 10 is not in select list"
+                // where PG happily returns the rows. Ordering by a
+                // constant orders nothing, so the key drops.
+                if matches!(item.expr, Expr::Literal(spg_sql::ast::Literal::Integer(_))) {
+                    return None;
+                }
                 o.expr = item.expr.clone();
             }
-            o
+            Some(o)
         })
         .collect()
 }

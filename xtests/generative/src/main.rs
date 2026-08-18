@@ -214,9 +214,34 @@ fn gen_select(
         s.where_ = Some(gen_predicate(rng, use_join, 2));
     }
     if rng.chance(30) {
-        s.limit = Some(spg_sql::ast::LimitExpr::Literal(
-            u32::try_from(1 + rng.below(20)).expect("small"),
-        ));
+        // 7.38.1 S6.1 (D8 exclusion, justified): LIMIT without a TOTAL
+        // order is nondeterministic by SQL semantics — PG's own docs
+        // say "unpredictable subset" — so a cross-IMPLEMENTATION
+        // comparison of the picked rows compares two legal answers.
+        // The four-leg differ therefore only emits LIMIT when it can
+        // pin a total order: no DISTINCT (its LIMIT subset is drawn
+        // from an unordered set even with ORDER BY on a tied key), and
+        // the ORDER BY chain ends with the unique key t1.a as a
+        // tiebreak. The three SPG legs never tripped on this — one
+        // engine picks one answer — which is exactly why the live-PG
+        // leg exists.
+        if s.distinct {
+            s.limit = None;
+        } else {
+            if !grouped {
+                // Grouped shape already orders by the (unique) group
+                // key; appending t1.a there would be a GROUP BY error.
+                s.order_by.push(OrderBy {
+                    expr: col("t1", "a"),
+                    desc: false,
+                    nulls_first: None,
+                    collation: None,
+                });
+            }
+            s.limit = Some(spg_sql::ast::LimitExpr::Literal(
+                u32::try_from(1 + rng.below(20)).expect("small"),
+            ));
+        }
     }
     s
 }
@@ -278,6 +303,14 @@ struct Legs {
     engine: spg_engine::Engine,
     simple: suitelib::wireclient::Conn,
     extended: suitelib::wireclient::Conn,
+    /// 7.38.1 S6.1 (D8, ledger L8) — the FOURTH leg: a live PG18,
+    /// connected when `SPG_GENDIFF_PG=host:port:user:db` is set. The
+    /// generator's surface is the dialect-compatible SELECT subset,
+    /// errors collapse to the ERROR token on every leg (both sides
+    /// erroring is agreement — PG words its errors differently), so
+    /// the comparison is value-for-value against the reference
+    /// implementation itself, not just SPG against SPG.
+    pg: Option<suitelib::wireclient::Conn>,
 }
 
 impl Legs {
@@ -285,13 +318,18 @@ impl Legs {
         let a = canon(embedded_rows(&mut self.engine, sql));
         let b = canon(wire_rows(self.simple.simple_query(sql)));
         let c = canon(wire_rows(self.extended.extended_query(sql)));
-        if a == b && b == c {
-            None
-        } else {
-            Some(format!(
+        if !(a == b && b == c) {
+            return Some(format!(
                 "embedded:\n{a}\n-- simple:\n{b}\n-- extended:\n{c}"
-            ))
+            ));
         }
+        if let Some(pg) = &mut self.pg {
+            let d = canon(wire_rows(pg.simple_query(sql)));
+            if a != d {
+                return Some(format!("spg (all three legs):\n{a}\n-- live pg:\n{d}"));
+            }
+        }
+        None
     }
 }
 
@@ -402,10 +440,35 @@ fn main() {
         let r = setup_conn.simple_query(sql).expect("setup on wire");
         assert!(r.error.is_none(), "setup on wire: {:?}", r.error);
     }
+    // 7.38.1 S6.1 — optional live-PG fourth leg.
+    let pg = std::env::var("SPG_GENDIFF_PG").ok().map(|spec| {
+        let parts: Vec<&str> = spec.split(':').collect();
+        assert!(
+            parts.len() == 4,
+            "SPG_GENDIFF_PG=host:port:user:db, got {spec:?}"
+        );
+        let mut conn = suitelib::wireclient::Conn::connect_host(
+            parts[0],
+            parts[1].parse().expect("port"),
+            parts[2],
+            parts[3],
+        )
+        .expect("connect live PG leg");
+        // Wipe + rebuild the generator's schema on the reference side.
+        for t in ["t1", "t2"] {
+            let _ = conn.simple_query(&format!("DROP TABLE IF EXISTS {t} CASCADE"));
+        }
+        for sql in SETUP {
+            let r = conn.simple_query(sql).expect("setup on live PG");
+            assert!(r.error.is_none(), "setup on live PG: {:?}", r.error);
+        }
+        conn
+    });
     let mut legs = Legs {
         engine,
         simple: setup_conn,
         extended: suitelib::wireclient::Conn::connect(port, "gen", "gen").expect("connect"),
+        pg,
     };
 
     let mut rng = Rng(seed);
