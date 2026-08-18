@@ -63,7 +63,6 @@ fn drain_result(stream: &mut TcpStream) -> Op {
 
 /// error ⇒ no effect, on the explicit-TX native path too.
 #[test]
-#[ignore = "7.38.1 L3 red (D29 residual) — un-ignore in S3.2"]
 fn l3_failed_audit_in_explicit_tx_must_not_apply() {
     let dir = unique_tmpdir();
     let (raw, addrs) = common::ServerBuilder::new()
@@ -84,19 +83,20 @@ fn l3_failed_audit_in_explicit_tx_must_not_apply() {
     send_query(&mut stream, "CREATE TABLE l3t (v INT)");
     assert_eq!(drain_result(&mut stream), Op::CommandComplete, "CREATE");
     send_query(&mut stream, "COMMIT");
-    // Today the server tears the CONNECTION down on the audit
-    // failure (the handler returns Err) — an ErrorResponse may or
-    // may not arrive first. Either way the client saw a failure;
-    // both shapes are "the COMMIT errored". (PG keeps the session
-    // alive on a statement error — the teardown itself is part of
-    // this pin's fix scope.)
-    let commit_failed =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drain_result(&mut stream)))
-            .map(|op| op == Op::ErrorResponse)
-            .unwrap_or(true); // EOF/reset while reading = failed COMMIT too
-    assert!(
-        commit_failed,
-        "the COMMIT's audit append must surface as a failure"
+    // 7.38.1 S3.2 — with the audit barrier inside the guard, the
+    // failure is a CLEAN statement error: an ErrorResponse, and the
+    // session survives it (PG keeps the session on a statement
+    // error; the pre-fix behaviour tore the connection down).
+    assert_eq!(
+        drain_result(&mut stream),
+        Op::ErrorResponse,
+        "the COMMIT's audit append must surface as a clean error"
+    );
+    send_query(&mut stream, "SELECT 1");
+    assert_eq!(
+        drain_result(&mut stream),
+        Op::CommandComplete,
+        "the session must survive the failed COMMIT"
     );
     // A COMMIT the client was told FAILED must not have committed:
     // on a FRESH connection the table must be gone. Today it
