@@ -707,7 +707,10 @@ fn read_mvcc_header_appendix(cur: &mut Cursor<'_>, t: &mut Table) -> Result<(), 
     // can never collide with a restored row. Trust the persisted cursor,
     // but clamp up defensively: a corrupt image that under-states it must
     // not hand out a colliding id.
-    t.next_rowid = persisted_next_rowid.max(max_id + 1);
+    t.next_rowid.store(
+        persisted_next_rowid.max(max_id + 1),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     debug_assert_eq!(
         t.rows.len(),
         t.headers.len(),

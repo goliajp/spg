@@ -4277,7 +4277,16 @@ pub struct Table {
     /// even after the row is deleted / vacuumed, so a stale lock /
     /// redo reference can be detected rather than silently aliasing a
     /// later row that reused the slot.
-    next_rowid: u64,
+    ///
+    /// 7.38.1 (S2.4, MATRIX #20 root cause) — the allocator is SHARED
+    /// across every `clone()` of the relation (`Arc`), because the
+    /// monotonic-never-reused promise is a LINEAGE invariant: each
+    /// open transaction's shadow catalog is a clone, and when clones
+    /// carried private counters two concurrent shadows minted the
+    /// same id — duplicate rids in the base after both committed,
+    /// aliasing every rid-addressed mechanism (locks, tombstones,
+    /// redo, the rebase unique pre-check).
+    next_rowid: alloc::sync::Arc<core::sync::atomic::AtomicU64>,
     /// v7.37.16 (autovacuum) — live count of tombstoned-but-present hot
     /// rows (`headers[i].xmax != XMAX_ALIVE`). Maintained incrementally:
     /// `mark_row_deleted` / `mark_rows_deleted` increment (the only
@@ -9157,7 +9166,11 @@ impl Catalog {
                 out.push(h.flags);
                 out.extend_from_slice(&rid.0.to_le_bytes());
             }
-            out.extend_from_slice(&t.next_rowid.to_le_bytes());
+            out.extend_from_slice(
+                &t.next_rowid
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .to_le_bytes(),
+            );
             // v7.39 (read01 round 48) — constraint-name appendix
             // (FILE_VERSION 60+). Index-aligned to the CHECK and
             // uniqueness-constraint appendices written above, so the
