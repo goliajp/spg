@@ -1291,7 +1291,7 @@ pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// 1:1 with the pg_opclass synthesis above (`opcfamily == oid`), same
 /// oid band, so pg_dump's family cache joins cleanly against the
 /// classes.
-pub(crate) fn synth_pg_opfamily(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_opfamily(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("opfmethod", DataType::BigInt, false),
@@ -1299,7 +1299,7 @@ pub(crate) fn synth_pg_opfamily(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("opfnamespace", DataType::BigInt, false),
         ColumnSchema::new("opfowner", DataType::BigInt, false),
     ];
-    let (oc_schema, oc_rows) = synth_pg_opclass(_cat);
+    let (oc_schema, oc_rows) = synth_pg_opclass(cat);
     let _ = oc_schema;
     let mut rows: Vec<Row<'static>> = Vec::new();
     for r in oc_rows {
