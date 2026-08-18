@@ -20,7 +20,6 @@ fn one_cell(e: &mut Engine, sql: &str) -> String {
 /// shadow-based merge carries tables across; sequence EXISTENCE lives
 /// outside the table map and is overwritten today.
 #[test]
-#[ignore = "7.38.1 L2 red (MATRIX #19) — un-ignore in S3.1"]
 fn l2_neighbour_sequence_survives_poisoned_commit() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE base (a INT)").unwrap();
@@ -42,7 +41,6 @@ fn l2_neighbour_sequence_survives_poisoned_commit() {
 
 /// L2 sibling — a neighbour's VIEW, same window.
 #[test]
-#[ignore = "7.38.1 L2 red (MATRIX #19) — un-ignore in S3.1"]
 fn l2_neighbour_view_survives_poisoned_commit() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE base2 (a INT)").unwrap();
@@ -63,15 +61,64 @@ fn l2_neighbour_view_survives_poisoned_commit() {
     );
 }
 
-/// L4 (MATRIX #18) — embedded text for timestamptz must carry the PG
-/// offset suffix, exactly what the wire already sends (live PG18:
-/// `2026-01-05 09:00:00+00`). Today `value_to_text` drops it.
+/// S3.1 breadth — the remaining D4 families (enum, domain, composite
+/// type, materialized view), same window: a neighbour's CREATE while
+/// a poisoned tx is open must survive that tx's COMMIT.
 #[test]
-#[ignore = "7.38.1 L4 red (MATRIX #18) — un-ignore in S4.1"]
-fn l4_timestamptz_text_carries_the_pg_offset() {
-    let mut e = Engine::new().with_clock(|| 0);
-    assert_eq!(
-        one_cell(&mut e, "SELECT '2026-01-05 09:00:00+00'::timestamptz"),
-        "2026-01-05 09:00:00+00",
+fn l2_neighbour_type_family_survives_poisoned_commit() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE base3 (a INT)").unwrap();
+    e.execute("CREATE TABLE mv_src (x INT)").unwrap();
+    e.execute("INSERT INTO mv_src VALUES (5)").unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO base3 VALUES (1)", tx).unwrap();
+    e.execute_in("CREATE INDEX base3_a ON base3 (a)", tx)
+        .unwrap();
+    e.execute_in("CREATE TYPE conc_mood AS ENUM ('a','b')", IMPLICIT_TX)
+        .unwrap();
+    e.execute_in(
+        "CREATE DOMAIN conc_dom AS INT CHECK (VALUE > 0)",
+        IMPLICIT_TX,
+    )
+    .unwrap();
+    e.execute_in("CREATE TYPE conc_pair AS (l INT, r INT)", IMPLICIT_TX)
+        .unwrap();
+    e.execute_in(
+        "CREATE MATERIALIZED VIEW conc_mv AS SELECT x FROM mv_src",
+        IMPLICIT_TX,
+    )
+    .unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    assert_eq!(one_cell(&mut e, "SELECT 'a'::conc_mood"), "a");
+    assert_eq!(one_cell(&mut e, "SELECT 3::conc_dom"), "3");
+    assert_eq!(one_cell(&mut e, "SELECT (ROW(1,2)::conc_pair).l"), "1");
+    assert_eq!(one_cell(&mut e, "SELECT count(*) FROM conc_mv"), "1");
+}
+
+/// S3.1 breadth — the drop direction: a neighbour's DROP of a view
+/// and a sequence must not be resurrected by the poisoned COMMIT.
+#[test]
+fn l2_neighbour_drops_stay_dropped_after_poisoned_commit() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE base4 (a INT)").unwrap();
+    e.execute("CREATE SEQUENCE dead_seq").unwrap();
+    e.execute("CREATE VIEW dead_view AS SELECT a FROM base4")
+        .unwrap();
+    let tx = e.alloc_tx_id();
+    e.execute_in("BEGIN", tx).unwrap();
+    e.execute_in("INSERT INTO base4 VALUES (1)", tx).unwrap();
+    e.execute_in("CREATE INDEX base4_a ON base4 (a)", tx)
+        .unwrap();
+    e.execute_in("DROP SEQUENCE dead_seq", IMPLICIT_TX).unwrap();
+    e.execute_in("DROP VIEW dead_view", IMPLICIT_TX).unwrap();
+    e.execute_in("COMMIT", tx).unwrap();
+    assert!(
+        e.execute("SELECT nextval('dead_seq')").is_err(),
+        "the neighbour's DROP SEQUENCE must survive the poisoned COMMIT"
+    );
+    assert!(
+        e.execute("SELECT * FROM dead_view").is_err(),
+        "the neighbour's DROP VIEW must survive the poisoned COMMIT"
     );
 }

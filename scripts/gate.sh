@@ -62,7 +62,7 @@ done
 TIER_ARGS=()
 if [[ "$FULL" == 1 ]]; then
     TIER_ARGS+=(--include-ignored)
-    TIER_ARGS+=(--skip e2e_ledger_reds_v7381 --skip e2e_ledger_red_l3_v7381)
+    TIER_ARGS+=(--skip e2e_ledger_red_l4_v7381 --skip e2e_ledger_red_l3_v7381)
 fi
 
 # Crates with a release-only perf_gate integration target.
