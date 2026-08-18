@@ -1161,6 +1161,27 @@ impl Engine {
                         crate::system_catalog::synth_pg_depend(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // 7.38.1 S5.1 — pg_catalog.pg_opclass (pg_dump wall #1).
+                "__spg_pg_opclass" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_opclass(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_opfamily" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_opfamily(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_amop" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_amop(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                "__spg_pg_amproc" => {
+                    let (schema, rows) =
+                        crate::system_catalog::synth_pg_amproc(self.active_catalog());
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.38 (read01) — pg_catalog.pg_attrdef (column defaults;
                 // ORM reflection + pg_dump read the deparsed default text).
                 "__spg_pg_attrdef" => {
@@ -3076,6 +3097,7 @@ impl Engine {
         // output columns; a position past their count is PG's 42P10.
         crate::orderby::check_order_by_positions(stmt_ref)?;
         let mut head_unknown = branch_unknown_mask(stmt_ref);
+        let head_regcast = branch_regcast_mask(stmt_ref);
         let mut head = stmt_ref.clone();
         head.unions = Vec::new();
         head.order_by = Vec::new();
@@ -3127,14 +3149,17 @@ impl Engine {
             // (`SELECT 1 UNION SELECT 'a'` is an input-syntax error on the
             // literal, `SELECT 1 UNION SELECT 'a'::text` is a type mismatch).
             let peer_unknown = branch_unknown_mask(peer);
+            let peer_regcast = branch_regcast_mask(peer);
             for i in 0..columns.len() {
                 let hu = head_unknown.get(i).copied().unwrap_or(false);
                 let pu = peer_unknown.get(i).copied().unwrap_or(false);
                 let (ht, pt) = (columns[i].ty, peer_cols[i].ty);
+                let reg_dual = peer_regcast.get(i).copied().unwrap_or(false)
+                    || head_regcast.get(i).copied().unwrap_or(false);
                 match (hu, pu) {
                     // Both sides carry a real type: they must share a category.
                     (false, false) => {
-                        if !crate::conversions::types_unify(ht, pt) {
+                        if !reg_dual && !crate::conversions::types_unify(ht, pt) {
                             return Err(EngineError::Unsupported(alloc::format!(
                                 "{} types {} and {} cannot be matched",
                                 set_op_name(*kind),
@@ -5098,6 +5123,60 @@ impl Engine {
                     rows.push(Row::new(vals));
                 }
                 Ok((rows, cols))
+            }
+            // 7.38.1 S5.1 (pg_dump wall #3) — pg_options_to_table:
+            // a text[] of 'name=value' reloptions/fdw options → one
+            // (option_name, option_value) row per element. NULL or an
+            // empty array yields zero rows (PG); an element without
+            // '=' carries a NULL option_value, matching PG's split.
+            "pg_options_to_table" => {
+                let schema = alloc::vec![
+                    ColumnSchema::new("option_name", DataType::Text, true),
+                    ColumnSchema::new("option_value", DataType::Text, true),
+                ];
+                let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+                if let Some(Value::TextArray(items)) = arg0 {
+                    for item in items.into_iter().flatten() {
+                        let (name, value) = match item.split_once('=') {
+                            Some((n, v)) => (Value::text(n), Value::text(v)),
+                            None => (Value::text(item.as_str()), Value::Null),
+                        };
+                        rows.push(Row::new(alloc::vec![name, value]));
+                    }
+                }
+                Ok((rows, schema))
+            }
+            // 7.38.1 S5.1 (pg_dump wall) — pg_get_sequence_data(oid):
+            // PG18's per-sequence state SRF, (last_value, is_called).
+            // pg_dump reads it joined to pg_sequence for every dumped
+            // sequence's setval line. The oid resolves through the
+            // same relation_oid mapping seqrelid publishes.
+            "pg_get_sequence_data" => {
+                let schema = alloc::vec![
+                    ColumnSchema::new("last_value", DataType::BigInt, false),
+                    ColumnSchema::new("is_called", DataType::Bool, false),
+                ];
+                let want = match arg0 {
+                    Some(Value::Int(n)) => i64::from(n),
+                    Some(Value::BigInt(n)) => n,
+                    _ => {
+                        return Err(EngineError::Unsupported(
+                            "pg_get_sequence_data(): argument must be a sequence oid".into(),
+                        ));
+                    }
+                };
+                let cat = self.active_catalog();
+                let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
+                for (name, def) in cat.sequences_all() {
+                    if crate::system_catalog::relation_oid(cat, name) == Some(want) {
+                        rows.push(Row::new(alloc::vec![
+                            Value::BigInt(def.last_value),
+                            Value::Bool(def.is_called),
+                        ]));
+                        break;
+                    }
+                }
+                Ok((rows, schema))
             }
             "pg_partition_tree" => {
                 let cols = alloc::vec![
@@ -13570,6 +13649,30 @@ fn set_op_name(kind: UnionKind) -> &'static str {
 /// type: a bare string or NULL literal that no context has typed yet. SPG
 /// has no `Unknown` DataType (both describe as TEXT), so the witness has to
 /// be the syntax. A wildcard or a non-literal expression is never unknown.
+/// 7.38.1 S5.1 — is this branch item a reg* cast? Its result column
+/// LABELS as text (the wire render) but the value is an oid-carrying
+/// dual, so a UNION with a numeric column must not be refused on the
+/// label (pg_dump: `SELECT classid … UNION ALL SELECT
+/// 'pg_opfamily'::regclass …`).
+fn branch_regcast_mask(stmt: &SelectStatement) -> Vec<bool> {
+    fn is_regcast(e: &Expr) -> bool {
+        matches!(
+            e,
+            Expr::Cast {
+                target: spg_sql::ast::CastTarget::RegType | spg_sql::ast::CastTarget::RegClass,
+                ..
+            }
+        )
+    }
+    stmt.items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, .. } => is_regcast(expr),
+            _ => false,
+        })
+        .collect()
+}
+
 fn branch_unknown_mask(stmt: &SelectStatement) -> Vec<bool> {
     stmt.items
         .iter()

@@ -16123,10 +16123,24 @@ fn apply_function_dispatch(
             // documentation and pg_dump use; only the bare name worked.
             // `regclass_name_of` already carries the name through the cast,
             // the way obj_description reads it.
-            let Some(name_arg) = args.first().and_then(regclass_name_of) else {
+            let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
-            let Some(cat) = ctx.catalog else {
+            // 7.38.1 S5.1 — the numeric-oid form maps now: pg_class
+            // oids are deterministic (relation_name_for_oid is the
+            // synths' own reverse), and pg_dump reads views through
+            // `pg_get_viewdef(oid)` — a NULL here made every dumped
+            // view "appear to be empty".
+            let name_arg = match args.first() {
+                Some(Value::Int(n)) => {
+                    crate::system_catalog::relation_name_for_oid(cat, i64::from(*n))
+                }
+                Some(Value::BigInt(n)) => {
+                    crate::system_catalog::relation_name_for_oid(cat, *n)
+                }
+                other => other.and_then(|v| regclass_name_of(v)),
+            };
+            let Some(name_arg) = name_arg else {
                 return Ok(Value::Null);
             };
             let bare = name_arg

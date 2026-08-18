@@ -1233,6 +1233,119 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 ///   * refobjsubid (Int)
 ///   * deptype (Text) — single char: 'n' normal / 'a' auto /
 ///     'i' internal / 'e' extension / 'p' pin
+/// 7.38.1 S5.1 (pg_dump wall #1) — `pg_catalog.pg_opclass`. pg_dump's
+/// first catalog sweep reads every operator class up front
+/// (`SELECT tableoid, oid, opcmethod, opcname, opcnamespace, opcowner
+/// FROM pg_opclass`) to build its opclass cache. Rows come from
+/// SPG's clean-room opclass inventory (opclass.rs, behaviour-aligned
+/// against PG18.4 per access method); oids are synthetic and stable
+/// (20000 + position — `pg_index.indclass` currently reports 0s, so
+/// nothing joins against these yet), `opcmethod` is the real PG am
+/// oid via the pg_am mapping, namespace is pg_catalog (11), owner 10.
+pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("opcmethod", DataType::BigInt, false),
+        ColumnSchema::new("opcname", DataType::Text, false),
+        ColumnSchema::new("opcnamespace", DataType::BigInt, false),
+        ColumnSchema::new("opcowner", DataType::BigInt, false),
+        ColumnSchema::new("opcfamily", DataType::BigInt, false),
+        ColumnSchema::new("opcintype", DataType::BigInt, false),
+        ColumnSchema::new("opcdefault", DataType::Bool, false),
+        ColumnSchema::new("opckeytype", DataType::BigInt, false),
+    ];
+    let am_oid = |am: &str| -> i64 {
+        match am {
+            "btree" => 403,
+            "hash" => 405,
+            "gist" => 783,
+            "gin" => 2742,
+            "spgist" => 4000,
+            "brin" => 3580,
+            // pgvector AMs carry extension-local oids in PG; a stable
+            // synthetic pair keeps the join surface consistent.
+            "hnsw" => 20403,
+            "ivfflat" => 20404,
+            _ => 0,
+        }
+    };
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for (i, (am, name)) in crate::opclass::all_opclasses().enumerate() {
+        let oid = 20000 + i as i64;
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::BigInt(am_oid(am)),
+            Value::text(name),
+            Value::BigInt(11),
+            Value::BigInt(10),
+            Value::BigInt(oid),
+            Value::BigInt(0),
+            Value::Bool(false),
+            Value::BigInt(0),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// 7.38.1 S5.1 (pg_dump wall #2) — `pg_catalog.pg_opfamily`. Paired
+/// 1:1 with the pg_opclass synthesis above (`opcfamily == oid`), same
+/// oid band, so pg_dump's family cache joins cleanly against the
+/// classes.
+pub(crate) fn synth_pg_opfamily(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("opfmethod", DataType::BigInt, false),
+        ColumnSchema::new("opfname", DataType::Text, false),
+        ColumnSchema::new("opfnamespace", DataType::BigInt, false),
+        ColumnSchema::new("opfowner", DataType::BigInt, false),
+    ];
+    let (oc_schema, oc_rows) = synth_pg_opclass(_cat);
+    let _ = oc_schema;
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for r in oc_rows {
+        // oid, opcmethod, opcname mirror into the family row.
+        rows.push(Row::new(alloc::vec![
+            r.values[0].clone(),
+            r.values[1].clone(),
+            r.values[2].clone(),
+            Value::BigInt(11),
+            Value::BigInt(10),
+        ]));
+    }
+    (schema, rows)
+}
+
+/// 7.38.1 S5.1 (pg_dump walls) — `pg_amop` / `pg_amproc`: the
+/// operator-class member catalogs. Shape-stable EMPTY: SPG's operator
+/// resolution is engine-internal, and pg_dump only joins these against
+/// pg_depend (also empty) to find extension-owned members.
+pub(crate) fn synth_pg_amop(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("amopfamily", DataType::BigInt, false),
+        ColumnSchema::new("amoplefttype", DataType::BigInt, false),
+        ColumnSchema::new("amoprighttype", DataType::BigInt, false),
+        ColumnSchema::new("amopstrategy", DataType::SmallInt, false),
+        ColumnSchema::new("amoppurpose", DataType::Text, false),
+        ColumnSchema::new("amopopr", DataType::BigInt, false),
+        ColumnSchema::new("amopmethod", DataType::BigInt, false),
+        ColumnSchema::new("amopsortfamily", DataType::BigInt, false),
+    ];
+    (schema, Vec::new())
+}
+
+pub(crate) fn synth_pg_amproc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("amprocfamily", DataType::BigInt, false),
+        ColumnSchema::new("amproclefttype", DataType::BigInt, false),
+        ColumnSchema::new("amprocrighttype", DataType::BigInt, false),
+        ColumnSchema::new("amprocnum", DataType::SmallInt, false),
+        ColumnSchema::new("amproc", DataType::BigInt, false),
+    ];
+    (schema, Vec::new())
+}
+
 pub(crate) fn synth_pg_depend(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("classid", DataType::BigInt, false),
@@ -2832,7 +2945,13 @@ pub(crate) const OID_VIEW_BASE: i64 = 32768;
 pub(crate) const OID_INDEX_BASE: i64 = 100_000;
 /// v7.39 (round 635) — pg_cast rows need an oid of their own. Above the
 /// index range so it cannot collide with a relation's.
-pub(crate) const OID_CAST_BASE: i64 = 200_000;
+// 7.38.1 S5.1 — pg_cast rows are BUILTIN casts, and pg_dump decides
+// "user-defined, dump it" by `oid >= 16384` (FirstNormalObjectId).
+// The old 200_000 band exported every one of them as a CREATE CAST
+// statement (with bogus-value warnings for the method fields) that a
+// real PG would refuse to restore. 10_000 sits inside PG's reserved
+// band and clear of every real builtin-cast oid.
+pub(crate) const OID_CAST_BASE: i64 = 10_000;
 pub(crate) const OID_SEQ_BASE: i64 = 300_000;
 /// v7.39 (round 342, V65) — user functions, keyed by signature the way
 /// `pg_proc` iterates them.
@@ -4579,8 +4698,13 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
-            Value::BigInt(2200), // typnamespace
-            Value::BigInt(10),   // typowner (postgres superuser OID)
+            // 7.38.1 S5.1 — builtin types live in pg_catalog (11).
+            // Claiming 'public' made pg_dump treat all ~100 of them as
+            // USER-DEFINED base types and try to dump each (first
+            // casualty: dumpBaseType on _aclitem, whose '-' regproc
+            // fields do not survive an oid cast).
+            Value::BigInt(11), // typnamespace
+            Value::BigInt(10), // typowner (postgres superuser OID)
             Value::SmallInt(len),
             Value::Bool(typbyval),
             Value::text::<String>(ty.into()),
@@ -4677,11 +4801,18 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     // client the domain is over an integer; a composite's `typrelid` stays 0
     // because SPG does not give one a backing relation.
     let (enum_oids, composite_oids, domain_oids) = user_type_oids(cat);
+    // 7.38.1 S5.1 — build_row stamps pg_catalog (11) for the builtin
+    // types above; USER types live in public (2200) so pg_dump keeps
+    // dumping them (CREATE TYPE / CREATE DOMAIN survive the roundtrip).
+    let into_public = |mut r: Row<'static>| -> Row<'static> {
+        r.values[2] = Value::BigInt(2200);
+        r
+    };
     for (name, oid) in enum_oids {
-        rows.push(build_row(oid, &name, 4, "e", "E", 0, 0, "-"));
+        rows.push(into_public(build_row(oid, &name, 4, "e", "E", 0, 0, "-")));
     }
     for (name, oid) in composite_oids {
-        rows.push(build_row(oid, &name, -1, "c", "C", 0, 0, "-"));
+        rows.push(into_public(build_row(oid, &name, -1, "c", "C", 0, 0, "-")));
     }
     for (name, oid) in domain_oids {
         let base = cat
@@ -4698,7 +4829,7 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         {
             *slot = Value::BigInt(base);
         }
-        rows.push(r);
+        rows.push(into_public(r));
     }
 
     (schema, rows)
@@ -4908,7 +5039,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
             // v7.39 (round 661) — `pg_catalog` only for what PG18 really
-            // has; SPG's own surface goes to `spg_catalog`.
+            // has; SPG's own surface goes to `pg_spg`.
             Value::BigInt(if SPG_ONLY_PROCS.contains(&name) {
                 13500
             } else {
@@ -5011,7 +5142,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
 /// pg_proc synthesises.
 /// v7.39 (round 661) — the names the engine answers that PG18 does not have.
 /// They keep their rows (all 86 are callable — measured) but sit in
-/// `spg_catalog`, so a client asking "does PostgreSQL provide this?" gets
+/// `pg_spg`, so a client asking "does PostgreSQL provide this?" gets
 /// the right answer while a client asking "can I call this?" still finds it.
 pub(crate) const SPG_ONLY_PROCS: &[&str] = &[
     "benchmark",
@@ -6696,8 +6827,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         // v7.39 (round 543) — WITHOUT OVERLAPS; SPG has no temporal
         // constraints.
         ColumnSchema::new("conperiod", DataType::Bool, false),
-        ColumnSchema::new("conkey", DataType::Text, false),
-        ColumnSchema::new("confkey", DataType::Text, false),
+        ColumnSchema::new("conkey", DataType::SmallIntArray, false),
+        ColumnSchema::new("confkey", DataType::SmallIntArray, true),
         // The three operator arrays a foreign key records, the ON DELETE
         // SET column list and the exclusion operators — NULL here; SPG
         // has no pg_operator to name oids from.
@@ -6740,16 +6871,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         };
         // PG's `conkey` / `confkey` are smallint[] — render the array
         // literal form psql shows (`{1,2}`, 1-based attnums).
-        let conkey_vec = |positions: &[usize]| -> String {
-            let mut s = String::from("{");
-            for (i, p) in positions.iter().enumerate() {
-                if i > 0 {
-                    s.push(',');
-                }
-                s.push_str(&alloc::format!("{}", p + 1));
-            }
-            s.push('}');
-            s
+        // 7.38.1 S5.1 — conkey/confkey are REAL smallint[] now (they
+        // were `{1,2}` text): pg_dump's not-null pass joins on
+        // `co.conkey = array[a.attnum]`, and text never equals an
+        // integer array. The rendered form is unchanged (`{1,2}`).
+        let conkey_vec = |positions: &[usize]| -> Value<'static> {
+            Value::SmallIntArray(positions.iter().map(|p| Some(*p as i16 + 1)).collect())
         };
         // Uniqueness constraints.
         for uc in t.schema().uniqueness_constraints.iter() {
@@ -6779,8 +6906,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
                 // connoinherit
-                Value::text(conkey_display),
-                Value::text(String::new()),
+                conkey_display.clone(),
+                Value::Null, /* confkey: non-FK */
                 Value::Null, /* conpfeqop */
                 Value::Null, /* conppeqop */
                 Value::Null, /* conffeqop */
@@ -6829,8 +6956,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Int(0),
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
-                Value::text(conkey_display),
-                Value::text(String::new()),
+                conkey_display.clone(),
+                Value::Null, /* confkey: non-FK */
                 Value::Null, /* conpfeqop */
                 Value::Null, /* conppeqop */
                 Value::Null, /* conffeqop */
@@ -6874,8 +7001,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Int(0),
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
-                Value::text(conkey),
-                Value::text(confkey),
+                conkey.clone(),
+                confkey.clone(),
                 Value::Null, /* conpfeqop */
                 Value::Null, /* conppeqop */
                 Value::Null, /* conffeqop */
@@ -6953,8 +7080,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Int(0),
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
-                Value::text(conkey_display),
-                Value::text(String::new()),
+                conkey_display.clone(),
+                Value::Null, /* confkey: non-FK */
                 Value::Null, /* conpfeqop */
                 Value::Null, /* conppeqop */
                 Value::Null, /* conffeqop */
@@ -6979,7 +7106,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 continue;
             }
             let conname = alloc::format!("{tname}_{}_not_null", col.name);
-            let conkey_display = alloc::format!("{} [{}]", i + 1, col.name);
+            let conkey_display = conkey_vec(&[i]);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
@@ -7001,8 +7128,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Int(0),
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
-                Value::text(conkey_display),
-                Value::text(String::new()),
+                conkey_display.clone(),
+                Value::Null, /* confkey: non-FK */
                 Value::Null, /* conpfeqop */
                 Value::Null, /* conppeqop */
                 Value::Null, /* conffeqop */
@@ -7967,7 +8094,7 @@ pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("partnatts", DataType::SmallInt, false),
         ColumnSchema::new("partdefid", DataType::BigInt, false),
         ColumnSchema::new("partattrs", DataType::Text, false),
-        ColumnSchema::new("partclass", DataType::Text, false),
+        ColumnSchema::new("partclass", DataType::BigIntArray, false),
         ColumnSchema::new("partcollation", DataType::Text, false),
         ColumnSchema::new("partexprs", DataType::Text, true),
     ];
@@ -8000,13 +8127,18 @@ pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, V
             .map(|_| alloc::string::String::from("0"))
             .collect::<Vec<_>>()
             .join(" ");
+        // 7.38.1 S5.1 — partclass is a REAL oid array now (pg_dump
+        // probes `<opclass oid> = ANY(partclass)`); default opclass
+        // everywhere = zeros, matching the old rendered form.
+        let partclass_arr: Value<'static> =
+            Value::BigIntArray(key_column_positions.iter().map(|_| Some(0i64)).collect());
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text(strat),
             Value::SmallInt(i16::try_from(key_column_positions.len()).unwrap_or(1)),
             Value::BigInt(0), // partdefid — no DEFAULT partition recorded
             Value::text(attrs),
-            Value::text(zeros.clone()),
+            partclass_arr,
             Value::text(zeros),
             Value::Null, // partexprs — SPG partitions on columns, not expressions
         ]));
@@ -9856,7 +9988,7 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         // so that is what these get.
         Row::new(alloc::vec![
             Value::BigInt(13500),
-            Value::text("spg_catalog"),
+            Value::text("pg_spg"),
             Value::BigInt(10),
             Value::Null,
         ]),
@@ -10087,6 +10219,8 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
 /// build, so there is nothing there to match.
 pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_am", 2601),
+    ("pg_amop", 2602),
+    ("pg_amproc", 2603),
     ("pg_attrdef", 2604),
     ("pg_attribute", 1249),
     ("pg_cast", 2605),
@@ -10105,6 +10239,8 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_largeobject", 2613),
     ("pg_largeobject_metadata", 2995),
     ("pg_namespace", 2615),
+    ("pg_opclass", 2616),
+    ("pg_opfamily", 2753),
     ("pg_operator", 2617),
     ("pg_policy", 3256),
     ("pg_proc", 1255),
@@ -10139,6 +10275,8 @@ pub(crate) fn is_synthesised_catalog(name: &str, cat: &Catalog) -> bool {
 fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchema>> {
     Some(match name {
         "pg_am" => synth_pg_am(cat).0,
+        "pg_amop" => synth_pg_amop(cat).0,
+        "pg_amproc" => synth_pg_amproc(cat).0,
         "pg_attrdef" => synth_pg_attrdef(cat).0,
         "pg_attribute" => pg_attribute_schema(),
         "pg_cast" => synth_pg_cast().0,
@@ -10161,6 +10299,8 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_largeobject" => synth_pg_largeobject(cat).0,
         "pg_largeobject_metadata" => synth_pg_largeobject_metadata(cat).0,
         "pg_namespace" => synth_pg_namespace(cat).0,
+        "pg_opclass" => synth_pg_opclass(cat).0,
+        "pg_opfamily" => synth_pg_opfamily(cat).0,
         "pg_operator" => synth_pg_operator(cat).0,
         "pg_policy" => synth_pg_policy(cat).0,
         "pg_proc" => synth_pg_proc(cat).0,

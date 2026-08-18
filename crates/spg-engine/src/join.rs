@@ -2992,6 +2992,23 @@ impl Engine {
                     && matches!(inner.items.as_slice(), [SelectItem::Wildcard])
                     && let Some((fn_name, _)) = from.primary.table_fn_call.as_deref()
                 {
+                    // 7.38.1 S5.1 — the BUILTIN table functions with a
+                    // fixed shape declare it here, so a correlated
+                    // `FROM pg_sequence, pg_get_sequence_data(seqrelid)`
+                    // (pg_dump's sequence pass) probes the real
+                    // two-column schema instead of one text column.
+                    if fn_name.eq_ignore_ascii_case("pg_get_sequence_data") {
+                        return Ok(alloc::vec![
+                            ColumnSchema::new("last_value", DataType::BigInt, false),
+                            ColumnSchema::new("is_called", DataType::Bool, false),
+                        ]);
+                    }
+                    if fn_name.eq_ignore_ascii_case("pg_options_to_table") {
+                        return Ok(alloc::vec![
+                            ColumnSchema::new("option_name", DataType::Text, true),
+                            ColumnSchema::new("option_value", DataType::Text, true),
+                        ]);
+                    }
                     let cat = self.active_catalog();
                     let overloads = cat.functions_named(fn_name);
                     if let Some(def) = overloads.first() {

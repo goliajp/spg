@@ -2514,8 +2514,20 @@ fn eval_cast_arm(
             && let Value::Text(t) = &v
         {
             let want = t.trim().trim_matches('"');
+            // 7.38.1 S5.1 — the name direction answers the schema's
+            // OID for the three catalog schemas: regnamespace IS an
+            // oid in PG, and pg_dump compares it against numeric
+            // namespace columns (`opcnamespace = 'pg_catalog'::
+            // regnamespace`). A user schema without a published oid
+            // keeps the round-513 textual contract (nothing numeric
+            // exists to compare it with).
             return if spg_storage::is_builtin_schema(want) || cat.schema_exists(want) {
-                Ok(Value::text(want.to_string()))
+                Ok(match want {
+                    "pg_catalog" => Value::BigInt(11),
+                    "public" => Value::BigInt(2200),
+                    "information_schema" => Value::BigInt(13000),
+                    _ => Value::text(want.to_string()),
+                })
             } else {
                 Err(EvalError::TypeMismatch {
                     detail: alloc::format!("schema \"{want}\" does not exist"),
@@ -6155,6 +6167,21 @@ pub(crate) fn unify_branch_types_static<'e>(
         // a plain column reference.
         let known = matches!(e, Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_));
         if !known {
+            continue;
+        }
+        // 7.38.1 S5.1 — a reg* cast is an OID wearing a name: describe
+        // says Text (the wire render), but it compares and unions with
+        // numeric catalog columns (pg_dump: `SELECT classid … UNION
+        // ALL SELECT 'pg_opfamily'::regclass …`). Its static claim is
+        // not genuinely known here, so it sits the check out — the
+        // dual RegClass value reconciles at runtime.
+        if matches!(
+            e,
+            Expr::Cast {
+                target: spg_sql::ast::CastTarget::RegType | spg_sql::ast::CastTarget::RegClass,
+                ..
+            }
+        ) {
             continue;
         }
         let Some(ty) = crate::describe::describe_expr_type(e, ctx.columns) else {

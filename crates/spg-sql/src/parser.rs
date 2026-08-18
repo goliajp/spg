@@ -783,6 +783,10 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
     "pg_constraint",
     "pg_database",
     "pg_depend",
+    "pg_amop",
+    "pg_amproc",
+    "pg_opclass",
+    "pg_opfamily",
     // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
     "pg_description",
     "pg_enum",
@@ -19288,6 +19292,22 @@ impl Parser {
         // ordering. Anything else that is an ident followed by `(` is a table
         // function; the engine executor decides whether it is a builtin, a
         // set-returning user function, or an error.
+        // 7.38.1 S5.1 — pg_dump spells its table functions
+        // schema-qualified (`pg_catalog.pg_options_to_table(...)`);
+        // strip the pg_catalog prefix here so the same head-detection
+        // fires. Only pg_catalog: a user schema's `s.f(x)` keeps its
+        // meaning.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("pg_catalog"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+            && matches!(
+                self.tokens.get(self.pos + 2),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+            && matches!(self.tokens.get(self.pos + 3), Some(Token::LParen))
+        {
+            self.advance(); // pg_catalog
+            self.advance(); // .
+        }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if !s.eq_ignore_ascii_case("generate_series")
                     && !s.eq_ignore_ascii_case("unnest")
