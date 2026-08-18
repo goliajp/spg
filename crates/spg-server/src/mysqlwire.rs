@@ -1101,28 +1101,36 @@ fn handle_com_query(
     // query) path: dispatched into this connection's own transaction
     // slot so `BEGIN` / `COMMIT` / `ROLLBACK` bracket the connection's
     // statements and never collide with another connection (V22).
-    let outcome = {
-        let Ok(mut engine) = state.engine.write() else {
-            return write_packet(
-                stream,
-                start_seqno,
-                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
-            );
+    // 7.38.1 S2.2 — the row-lock wait loop, mysql-wire edition.
+    let outcome = loop {
+        let attempt = {
+            let Ok(mut engine) = state.engine.write() else {
+                return write_packet(
+                    stream,
+                    start_seqno,
+                    &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+                );
+            };
+            // Re-install this connection's session on the shared engine: a
+            // concurrent pgwire statement may have swapped current_session
+            // to its own pid. Without this the mysql query would run under
+            // another connection's dialect / params (V15).
+            engine.set_current_session(session_id);
+            // v7.39 (round 331, V50) — with autocommit off MySQL runs inside an
+            // implicit transaction: the first statement after a COMMIT /
+            // ROLLBACK opens one, and nothing is durable until the client says
+            // so. Measured on MariaDB 11: the session sees its own write,
+            // ROLLBACK discards it, and a disconnect without COMMIT loses it.
+            if !*autocommit && !is_tx_control(sql) && !engine.is_tx_open(conn_tx_id) {
+                let _ = engine.execute_in("BEGIN", conn_tx_id);
+            }
+            engine.execute_in(sql, conn_tx_id)
         };
-        // Re-install this connection's session on the shared engine: a
-        // concurrent pgwire statement may have swapped current_session
-        // to its own pid. Without this the mysql query would run under
-        // another connection's dialect / params (V15).
-        engine.set_current_session(session_id);
-        // v7.39 (round 331, V50) — with autocommit off MySQL runs inside an
-        // implicit transaction: the first statement after a COMMIT /
-        // ROLLBACK opens one, and nothing is durable until the client says
-        // so. Measured on MariaDB 11: the session sees its own write,
-        // ROLLBACK discards it, and a disconnect without COMMIT loses it.
-        if !*autocommit && !is_tx_control(sql) && !engine.is_tx_open(conn_tx_id) {
-            let _ = engine.execute_in("BEGIN", conn_tx_id);
+        if matches!(attempt, Err(spg_engine::EngineError::LockWouldBlock)) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
         }
-        engine.execute_in(sql, conn_tx_id)
+        break attempt;
     };
     // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
     // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
@@ -1422,38 +1430,50 @@ fn handle_com_stmt_execute(
     };
 
     // Bind + execute via engine.
-    let (outcome, render) = {
-        let Ok(mut engine) = state.engine.write() else {
-            return write_packet(
-                stream,
-                start_seqno,
-                &encode_err_packet(1815, "HY000", "engine lock poisoned"),
-            );
+    // 7.38.1 S2.2 — row-lock wait loop (see handle_com_query).
+    let (outcome, render) = loop {
+        let attempt = {
+            let Ok(mut engine) = state.engine.write() else {
+                return write_packet(
+                    stream,
+                    start_seqno,
+                    &encode_err_packet(1815, "HY000", "engine lock poisoned"),
+                );
+            };
+            // See handle_com_query — re-install this connection's session (V15).
+            engine.set_current_session(session_id);
+            let stmt = match engine.prepare(&entry.sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = format!("{e:?}");
+                    return write_packet(
+                        stream,
+                        start_seqno,
+                        &encode_err_packet(1064, "42000", &msg),
+                    );
+                }
+            };
+            // v7.33 (A1) — render the bind-final SQL for the WAL before
+            // execute_prepared consumes the statement (writes only; a
+            // substitute failure leaves render None and execute reports it).
+            let render = if matches!(&stmt, spg_sql::ast::Statement::Select(_)) {
+                None
+            } else {
+                let mut bind = stmt.clone();
+                spg_engine::substitute_placeholders(&mut bind, &params)
+                    .ok()
+                    .map(|()| bind.to_string())
+            };
+            (
+                engine.execute_prepared_in(stmt, &params, conn_tx_id),
+                render,
+            )
         };
-        // See handle_com_query — re-install this connection's session (V15).
-        engine.set_current_session(session_id);
-        let stmt = match engine.prepare(&entry.sql) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = format!("{e:?}");
-                return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
-            }
-        };
-        // v7.33 (A1) — render the bind-final SQL for the WAL before
-        // execute_prepared consumes the statement (writes only; a
-        // substitute failure leaves render None and execute reports it).
-        let render = if matches!(&stmt, spg_sql::ast::Statement::Select(_)) {
-            None
-        } else {
-            let mut bind = stmt.clone();
-            spg_engine::substitute_placeholders(&mut bind, &params)
-                .ok()
-                .map(|()| bind.to_string())
-        };
-        (
-            engine.execute_prepared_in(stmt, &params, conn_tx_id),
-            render,
-        )
+        if matches!(attempt.0, Err(spg_engine::EngineError::LockWouldBlock)) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
+        break attempt;
     };
     let status = tx_status(state, conn_tx_id, autocommit);
     conn_state.in_transaction.store(

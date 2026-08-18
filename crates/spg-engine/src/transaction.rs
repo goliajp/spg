@@ -236,7 +236,14 @@ impl Engine {
         let Some(state) = self.tx_catalogs.get(&tx_id) else {
             return Ok(());
         };
-        if state.cached_snapshot.is_some() || state.rebase_poisoned || state.stmts_run == 0 {
+        // 7.38.1 S2.1 — the old `stmts_run == 0` early-out assumed a
+        // fresh shadow has nothing to fold; false once the base moved
+        // between BEGIN and the first statement (the row-lock wait
+        // makes that window ROUTINE: the first statement retries after
+        // the holder's COMMIT). The epoch gate below already answers
+        // "did the base move" exactly, and costs nothing when it
+        // did not.
+        if state.cached_snapshot.is_some() || state.rebase_poisoned {
             return Ok(());
         }
         // r196 — epoch gate: nothing committed to the base since this

@@ -420,6 +420,48 @@ impl crate::Engine {
         self.lock_skip_rows = Some((tname, skipped));
         Ok(())
     }
+
+    /// 7.38.1 S2.1 (MATRIX #20) — row locks for UPDATE / DELETE
+    /// targets, the write-side twin of the FOR UPDATE walk above.
+    /// PG's READ COMMITTED serialises same-row writers through tuple
+    /// locks: the first updater holds, later ones wait. The engine
+    /// never parks (that would wedge every connection, including the
+    /// holder's COMMIT) — `WouldBlock` maps to
+    /// [`crate::EngineError::LockWouldBlock`] and the SERVER retries
+    /// outside the engine guard, exactly the round-299 shape.
+    ///
+    /// Outcome mapping mirrors the SELECT walk: a named deadlock
+    /// victim dies with 40P01, a non-victim keeps waiting.
+    pub(crate) fn lock_dml_rows(
+        &mut self,
+        rel: RelId,
+        rids: &[spg_storage::row_header::RowId],
+        mode: LockMode,
+        version: u64,
+    ) -> Result<(), crate::EngineError> {
+        for rid in rids {
+            match self
+                .locks
+                .acquire(rel, *rid, mode, version, WaitPolicy::Wait)
+            {
+                LockOutcome::Granted => {}
+                LockOutcome::WouldBlock { .. } => {
+                    return Err(crate::EngineError::LockWouldBlock);
+                }
+                LockOutcome::Deadlock { victim } if victim == version => {
+                    return Err(crate::EngineError::LockDeadlock);
+                }
+                LockOutcome::Deadlock { .. } => {
+                    return Err(crate::EngineError::LockWouldBlock);
+                }
+                // Wait policy never yields Skip / NotAvailable.
+                LockOutcome::Skip | LockOutcome::NotAvailable => {
+                    return Err(crate::EngineError::LockWouldBlock);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How PG spells the clause in diagnostics.
