@@ -2419,6 +2419,7 @@ fn execute_with_role(
         // lets the lock manager's cycle detector fire: two transactions
         // waiting on each other resolve to 40P01 instead of spinning.
         let deadline = lock_wait_deadline(settings);
+        let mut waits = 0u32;
         loop {
             let attempt = {
                 let mut engine = state
@@ -2449,7 +2450,8 @@ fn execute_with_role(
                             "canceling statement due to lock timeout".into(),
                         ));
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    crate::lock_wait_backoff(waits);
+                    waits += 1;
                 }
                 other => return other,
             }
@@ -4157,6 +4159,7 @@ fn handle_execute(
             // engine's detector on each re-registered wait edge).
             let mut result = result;
             let lock_deadline = lock_wait_deadline(settings);
+            let mut waits = 0u32;
             while matches!(result, Err(spg_engine::EngineError::LockWouldBlock)) {
                 if let Some(d) = lock_deadline
                     && std::time::Instant::now() >= d
@@ -4166,7 +4169,8 @@ fn handle_execute(
                     ));
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                crate::lock_wait_backoff(waits);
+                waits += 1;
                 let mut eng = state
                     .engine
                     .write()

@@ -1102,6 +1102,7 @@ fn handle_com_query(
     // slot so `BEGIN` / `COMMIT` / `ROLLBACK` bracket the connection's
     // statements and never collide with another connection (V22).
     // 7.38.1 S2.2 — the row-lock wait loop, mysql-wire edition.
+    let mut waits = 0u32;
     let outcome = loop {
         let attempt = {
             let Ok(mut engine) = state.engine.write() else {
@@ -1127,7 +1128,8 @@ fn handle_com_query(
             engine.execute_in(sql, conn_tx_id)
         };
         if matches!(attempt, Err(spg_engine::EngineError::LockWouldBlock)) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::lock_wait_backoff(waits);
+            waits += 1;
             continue;
         }
         break attempt;
@@ -1431,6 +1433,7 @@ fn handle_com_stmt_execute(
 
     // Bind + execute via engine.
     // 7.38.1 S2.2 — row-lock wait loop (see handle_com_query).
+    let mut waits = 0u32;
     let (outcome, render) = loop {
         let attempt = {
             let Ok(mut engine) = state.engine.write() else {
@@ -1470,7 +1473,8 @@ fn handle_com_stmt_execute(
             )
         };
         if matches!(attempt.0, Err(spg_engine::EngineError::LockWouldBlock)) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::lock_wait_backoff(waits);
+            waits += 1;
             continue;
         }
         break attempt;
