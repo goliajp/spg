@@ -21,3 +21,7 @@ SELECT a, b, val FROM t ORDER BY a, b
 2
 1
 20
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

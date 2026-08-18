@@ -13,3 +13,7 @@ query I rowsort
 SELECT id FROM t WHERE active AND v = 30
 ----
 3
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

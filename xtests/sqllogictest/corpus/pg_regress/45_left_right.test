@@ -137,3 +137,10 @@ SELECT a.id, left(COALESCE(b.label, 'none'), 3) FROM a LEFT JOIN b ON a.id = b.i
 hel
 2
 non
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE

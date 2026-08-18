@@ -42,3 +42,7 @@ SELECT id, current_database() AS db FROM t ORDER BY id
 spg
 2
 spg
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

@@ -25,3 +25,7 @@ SELECT length(c) FROM t
 # VARCHAR(8) rejects overflow.
 statement error
 INSERT INTO t VALUES ('x', '123456789', 'z')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

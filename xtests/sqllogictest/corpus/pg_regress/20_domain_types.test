@@ -108,3 +108,19 @@ CREATE TABLE foo (id INT NOT NULL)
 
 statement error
 CREATE DOMAIN foo AS INT
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS u CASCADE
+
+statement ok
+DROP TABLE IF EXISTS v CASCADE
+
+statement ok
+DROP TABLE IF EXISTS w CASCADE
+
+statement ok
+DROP TABLE IF EXISTS foo CASCADE

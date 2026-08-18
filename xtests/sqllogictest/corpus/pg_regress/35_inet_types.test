@@ -77,3 +77,13 @@ query I
 SELECT masklen('10.0.0.0')
 ----
 32
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS peers CASCADE
+
+statement ok
+DROP TABLE IF EXISTS nets CASCADE
+
+statement ok
+DROP TABLE IF EXISTS hw CASCADE

@@ -47,3 +47,7 @@ SELECT id FROM items ORDER BY 1 LIMIT 2 OFFSET 1
 ----
 2
 3
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS items CASCADE

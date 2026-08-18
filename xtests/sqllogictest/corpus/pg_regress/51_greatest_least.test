@@ -101,3 +101,7 @@ SELECT id, greatest(n, 10) FROM u ORDER BY id
 15
 3
 25
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE

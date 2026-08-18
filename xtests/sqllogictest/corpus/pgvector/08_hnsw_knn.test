@@ -48,3 +48,7 @@ query I nosort
 SELECT id FROM docs ORDER BY embedding <-> '[0.12, 0.22, 0.32]'::vector LIMIT 1
 ----
 6
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS docs CASCADE

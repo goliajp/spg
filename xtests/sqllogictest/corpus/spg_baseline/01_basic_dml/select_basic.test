@@ -55,3 +55,7 @@ SELECT a * 2 FROM t
 2
 4
 6
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

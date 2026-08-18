@@ -90,3 +90,25 @@ query I
 SELECT id FROM t_nocase WHERE name = 'MIXED'
 ----
 1
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t_bin CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_ci CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_mysql CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_default CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_pg CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_bin_suffix CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t_nocase CASCADE

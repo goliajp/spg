@@ -127,3 +127,10 @@ query T
 SELECT path FROM log
 ----
 api/v1/users
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS p CASCADE
+
+statement ok
+DROP TABLE IF EXISTS log CASCADE

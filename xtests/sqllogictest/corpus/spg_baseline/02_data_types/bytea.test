@@ -8,3 +8,7 @@ INSERT INTO t VALUES (1, E'\\x0102')
 
 statement ok
 INSERT INTO t VALUES (2, E'\\xdeadbeef')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

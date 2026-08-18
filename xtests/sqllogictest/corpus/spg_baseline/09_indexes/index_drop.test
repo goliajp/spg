@@ -14,3 +14,7 @@ DROP INDEX IF EXISTS not_there
 
 statement error
 DROP INDEX not_there
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

@@ -58,3 +58,13 @@ query T
 SELECT db FROM mysql.db WHERE db = 'postgres'
 ----
 postgres
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS parents CASCADE
+
+statement ok
+DROP TABLE IF EXISTS children CASCADE
+
+statement ok
+DROP TABLE IF EXISTS idxtbl CASCADE

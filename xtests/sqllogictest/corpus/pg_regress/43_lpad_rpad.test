@@ -119,3 +119,7 @@ SELECT lpad(n::TEXT, 6, '0') FROM invoices ORDER BY n
 000001
 000042
 001234
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS invoices CASCADE

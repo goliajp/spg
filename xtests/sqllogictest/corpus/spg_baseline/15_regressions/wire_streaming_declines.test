@@ -94,3 +94,16 @@ query T
 SHOW server_version
 ----
 18.4 (spg)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS wsd_cust CASCADE
+
+statement ok
+DROP TABLE IF EXISTS wsd_cust_apac CASCADE
+
+statement ok
+DROP TABLE IF EXISTS wsd_cust_default CASCADE
+
+statement ok
+DROP TABLE IF EXISTS wsd_t CASCADE

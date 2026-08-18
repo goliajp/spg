@@ -306,10 +306,14 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
     let mut runner = Runner::new();
     let outcome = runner.run(&records);
     // r1052 (S2.4) — cleanup discipline: name what the file left behind.
+    // 7.38.1 S4.2 — the ratchet: the corpus reached zero leftovers, so
+    // a leak is now a RED, not a shrug. A yellow warning that survives
+    // 210 files is how the pile grew in the first place (the r1020
+    // lesson: an unclassified diff line is a bug report nobody read).
     let leaks = runner.leftover_objects();
     if !leaks.is_empty() {
         println!(
-            "leak warning: {} left {}",
+            "leak: {} left {}",
             path.file_name().and_then(|s| s.to_str()).unwrap_or("?"),
             leaks.join(", ")
         );
@@ -325,10 +329,16 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
             }
         }
     }
+    // 7.38.1 S4.2 — a leftover object fails the FILE (ratchet).
+    let mut fail = outcome.fail;
+    if !leaks.is_empty() {
+        fail += 1;
+        fail_reasons.push(format!("leak: left {}", leaks.join(", ")));
+    }
     FileReport {
         file: file_name,
         pass: outcome.pass,
-        fail: outcome.fail,
+        fail,
         skip: outcome.skip,
         fail_reasons,
     }

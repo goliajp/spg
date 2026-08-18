@@ -8,3 +8,7 @@ query I rowsort
 SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 't'
 ----
 1
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

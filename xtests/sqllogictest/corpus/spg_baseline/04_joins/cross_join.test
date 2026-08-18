@@ -23,3 +23,10 @@ SELECT a.x, b.y FROM a CROSS JOIN b
 10
 2
 20
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE
