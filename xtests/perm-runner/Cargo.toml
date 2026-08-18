@@ -18,8 +18,8 @@ path = "src/main.rs"
 [dependencies]
 spg-engine  = { path = "../../crates/spg-engine", version = "7.34" }
 spg-storage = { path = "../../crates/spg-storage", version = "7.34" }
-sqllogictest = { path = "../sqllogictest" }
-suitelib = { path = "../suitelib" }
+sqllogictest = { path = "../sqllogictest", version = "7.38" }
+suitelib = { path = "../suitelib", version = "7.38" }
 
 [lints]
 workspace = true

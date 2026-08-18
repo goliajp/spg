@@ -25,10 +25,10 @@ spg-storage = { path = "../../crates/spg-storage", version = "7.34" }
 # the permutation runner in-process to execute the same corpus on
 # embedded / server_simple / server_extended and assert byte-equal.
 # Bin-stage perm-runner exposes a lib surface as of v7.38 P1.
-spg-perm-runner = { path = "../perm-runner" }
+spg-perm-runner = { path = "../perm-runner", version = "7.38" }
 # S3.6 — the normalisation pipeline routes rule-as-data replacements
 # through suitelib::normlib (norm-rules.toml sidecar).
-suitelib = { path = "../suitelib" }
+suitelib = { path = "../suitelib", version = "7.38" }
 anyhow     = "1"
 clap       = { version = "4", features = ["derive"] }
 walkdir    = "2"
