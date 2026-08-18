@@ -65,3 +65,7 @@ $1,234,567.89
 # Malformed text → hard error.
 statement error
 INSERT INTO invoices VALUES (99, 'not money')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS invoices CASCADE

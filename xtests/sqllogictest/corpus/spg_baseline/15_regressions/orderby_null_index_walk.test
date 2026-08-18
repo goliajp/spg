@@ -83,3 +83,10 @@ SELECT k FROM onw2 ORDER BY k DESC LIMIT 3
 50
 40
 30
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS onw CASCADE
+
+statement ok
+DROP TABLE IF EXISTS onw2 CASCADE

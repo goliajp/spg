@@ -7754,6 +7754,36 @@ impl fmt::Display for TableRef {
             }
             return Ok(());
         }
+        // 7.38.1 S5.1 — a FROM-position table function must re-render
+        // as the CALL, not its bare name: ARRAY(subquery) desugars by
+        // re-parsing the subquery's canonical text, and a dropped
+        // argument list turned `pg_options_to_table(x)` into a
+        // relation lookup that does not exist.
+        if let Some(call) = &self.table_fn_call {
+            let (fn_name, args) = call.as_ref();
+            write!(f, "{fn_name}(")?;
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{a}")?;
+            }
+            f.write_str(")")?;
+            if let Some(a) = &self.alias {
+                write!(f, " AS {}", quote_ident(a))?;
+                if !self.unnest_column_aliases.is_empty() {
+                    f.write_str("(")?;
+                    for (i, c) in self.unnest_column_aliases.iter().enumerate() {
+                        if i > 0 {
+                            f.write_str(", ")?;
+                        }
+                        write!(f, "{}", quote_ident(c))?;
+                    }
+                    f.write_str(")")?;
+                }
+            }
+            return Ok(());
+        }
         if let Some(args) = &self.generate_series_args {
             f.write_str("generate_series(")?;
             for (i, a) in args.iter().enumerate() {

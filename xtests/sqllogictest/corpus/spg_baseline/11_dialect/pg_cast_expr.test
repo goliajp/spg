@@ -21,3 +21,7 @@ SELECT id, CAST(s AS INT) FROM t ORDER BY id
 42
 2
 99
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

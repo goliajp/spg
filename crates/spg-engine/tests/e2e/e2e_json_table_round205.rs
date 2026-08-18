@@ -20,6 +20,9 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
                         spg_storage::Value::Int(n) => n.to_string(),
                         spg_storage::Value::BigInt(n) => n.to_string(),
                         spg_storage::Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+                        v @ spg_storage::Value::SmallIntArray(_) => {
+                            spg_engine::eval::value_to_text(v)
+                        }
                         other => format!("{other:?}"),
                     })
                     .collect()

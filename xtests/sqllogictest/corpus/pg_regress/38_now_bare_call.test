@@ -70,3 +70,10 @@ query I
 SELECT CASE WHEN now() = now() THEN 1 ELSE 0 END
 ----
 1
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS evt CASCADE
+
+statement ok
+DROP TABLE IF EXISTS future_evt CASCADE

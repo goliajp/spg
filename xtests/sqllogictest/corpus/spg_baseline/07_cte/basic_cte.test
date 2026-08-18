@@ -11,3 +11,7 @@ WITH big AS (SELECT id, v FROM t WHERE v >= 20) SELECT id FROM big
 ----
 2
 3
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

@@ -242,3 +242,10 @@ ALTER SEQUENCE pgdump_id_seq OWNED BY pgdump_t.id
 # Re-attach to NONE.
 statement ok
 ALTER SEQUENCE pgdump_id_seq OWNED BY NONE
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS foo CASCADE
+
+statement ok
+DROP TABLE IF EXISTS pgdump_t CASCADE

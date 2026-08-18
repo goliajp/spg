@@ -19,3 +19,10 @@ query I rowsort
 SELECT id FROM child ORDER BY id
 ----
 12
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS parent CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child CASCADE

@@ -783,6 +783,10 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
     "pg_constraint",
     "pg_database",
     "pg_depend",
+    "pg_amop",
+    "pg_amproc",
+    "pg_opclass",
+    "pg_opfamily",
     // v7.39 (read01 round 50) — COMMENT ON store, PG's pg_description.
     "pg_description",
     "pg_enum",
@@ -3848,6 +3852,28 @@ impl Parser {
                         self.advance();
                     }
                 }
+                // 7.38.1 S5.2 — PG `SET [SESSION] AUTHORIZATION
+                // { DEFAULT | <role> }`. pg_dump's ACL section switches
+                // to the object owner with it. SPG maps it onto the
+                // session-role machinery (recorded delta: PG moves
+                // session_user too; SPG moves the effective role).
+                if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                    if s.eq_ignore_ascii_case("authorization"))
+                {
+                    self.advance(); // AUTHORIZATION
+                    let role = match self.peek().clone() {
+                        Token::Default => {
+                            self.advance();
+                            None
+                        }
+                        Token::String(s) | Token::Ident(s) | Token::QuotedIdent(s) => {
+                            self.advance();
+                            Some(s)
+                        }
+                        _ => None,
+                    };
+                    return Ok(Statement::SetRole(role));
+                }
                 // v7.14.0 — MySQL `SET NAMES <charset> [COLLATE
                 // <collation>]` — change the connection client
                 // charset. SPG stores UTF-8 always and orders
@@ -4180,6 +4206,20 @@ impl Parser {
                     // v7.39 (RLS) — `RESET ROLE` clears the session role.
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("role") => {
                         self.advance();
+                        Ok(Statement::SetRole(None))
+                    }
+                    // 7.38.1 S5.2 — `RESET SESSION AUTHORIZATION`
+                    // (pg_dump's return from the owner switch).
+                    Token::Ident(s) | Token::QuotedIdent(s)
+                        if s.eq_ignore_ascii_case("session")
+                            && matches!(
+                                self.tokens.get(self.pos + 1),
+                                Some(Token::Ident(a) | Token::QuotedIdent(a))
+                                    if a.eq_ignore_ascii_case("authorization")
+                            ) =>
+                    {
+                        self.advance(); // SESSION
+                        self.advance(); // AUTHORIZATION
                         Ok(Statement::SetRole(None))
                     }
                     _ => {
@@ -19288,6 +19328,22 @@ impl Parser {
         // ordering. Anything else that is an ident followed by `(` is a table
         // function; the engine executor decides whether it is a builtin, a
         // set-returning user function, or an error.
+        // 7.38.1 S5.1 — pg_dump spells its table functions
+        // schema-qualified (`pg_catalog.pg_options_to_table(...)`);
+        // strip the pg_catalog prefix here so the same head-detection
+        // fires. Only pg_catalog: a user schema's `s.f(x)` keeps its
+        // meaning.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("pg_catalog"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+            && matches!(
+                self.tokens.get(self.pos + 2),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+            && matches!(self.tokens.get(self.pos + 3), Some(Token::LParen))
+        {
+            self.advance(); // pg_catalog
+            self.advance(); // .
+        }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                 if !s.eq_ignore_ascii_case("generate_series")
                     && !s.eq_ignore_ascii_case("unnest")

@@ -59,3 +59,16 @@ us
 # Duplicate LIST value across siblings is rejected.
 statement error
 CREATE TABLE cust_dup PARTITION OF cust FOR VALUES IN ('jp')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS cust CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_apac CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_emea CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_default CASCADE

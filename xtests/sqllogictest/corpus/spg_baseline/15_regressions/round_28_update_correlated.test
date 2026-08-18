@@ -59,3 +59,10 @@ SELECT id, score FROM r28_users ORDER BY id
 -1
 4
 0
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS r28_users CASCADE
+
+statement ok
+DROP TABLE IF EXISTS r28_actions CASCADE

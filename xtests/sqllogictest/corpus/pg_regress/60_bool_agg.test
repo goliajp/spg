@@ -78,3 +78,7 @@ NULL
 5
 0
 0
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE

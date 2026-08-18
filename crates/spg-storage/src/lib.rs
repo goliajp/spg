@@ -4391,6 +4391,19 @@ impl Clone for ColdReadStats {
     }
 }
 
+/// 7.38.1 S3.1 (D4) — the non-table catalog families that carry a
+/// per-transaction dirty window (see `Catalog::dirty_nontable`). One
+/// entry class per side-map the poisoned-commit merge reconciles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum NonTableKind {
+    Sequence,
+    View,
+    MaterializedView,
+    EnumType,
+    DomainType,
+    CompositeType,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     /// v7.39 (pg_stat blks knife) — see [`ColdReadStats`].
@@ -4423,6 +4436,15 @@ pub struct Catalog {
     /// classifier: round 494 tried classification for a correctness gate
     /// and it was wrong, because `SELECT lo_write(…)` reads as read-only.
     dirty_tables: alloc::collections::BTreeSet<String>,
+    /// 7.38.1 S3.1 (D4) — the non-table twin of `dirty_tables`: which
+    /// sequences / views / matviews / enum / domain / composite types
+    /// THIS window created, altered, renamed or dropped. Counter
+    /// advances (`nextval`) deliberately do NOT record — counter
+    /// values merge via `sequence_counters` / `restore_sequence_
+    /// counters`, and a tx that only consumed ids must not shadow a
+    /// neighbour's ALTER SEQUENCE. Cleared by `clear_dirty_tables`
+    /// (one window, both records).
+    dirty_nontable: alloc::collections::BTreeSet<(NonTableKind, String)>,
     /// v7.37.15 (Phase C.1) — monotonic allocator for stable
     /// [`RelId`](row_header::RelId)s. Pre-incremented on each
     /// `create_table` so real ids start at 1 (0 is `UNASSIGNED`);
@@ -5190,6 +5212,7 @@ impl Catalog {
             by_name: BTreeMap::new(),
             temp_prefix: None,
             dirty_tables: alloc::collections::BTreeSet::new(),
+            dirty_nontable: alloc::collections::BTreeSet::new(),
             next_rel_id: 0,
             cold_segments: Vec::new(),
             functions: BTreeMap::new(),
@@ -5378,6 +5401,7 @@ impl Catalog {
                 def.name
             )));
         }
+        self.mark_nontable_dirty(NonTableKind::Sequence, &def.name);
         self.sequences.insert(def.name.clone(), def);
         Ok(())
     }
@@ -5399,6 +5423,8 @@ impl Catalog {
                 "relation {new:?} already exists"
             )));
         }
+        self.mark_nontable_dirty(NonTableKind::Sequence, old);
+        self.mark_nontable_dirty(NonTableKind::Sequence, new);
         if let Some(mut def) = self.sequences.remove(old) {
             def.name = new.to_string();
             self.sequences.insert(new.to_string(), def);
@@ -5407,6 +5433,7 @@ impl Catalog {
     }
 
     pub fn drop_sequence(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::Sequence, name);
         self.sequences.remove(name).is_some()
     }
 
@@ -5587,6 +5614,8 @@ impl Catalog {
     ) -> Result<(), StorageError> {
         if self.views.contains_key(&def.name) {
             if or_replace {
+                self.mark_nontable_dirty(NonTableKind::View, &def.name);
+                self.mark_nontable_dirty(NonTableKind::View, &def.name);
                 self.views.insert(def.name.clone(), def);
                 return Ok(());
             }
@@ -5620,6 +5649,7 @@ impl Catalog {
     /// v7.17.0 Phase 1.2 — remove a view by name. Returns true if
     /// a view was removed.
     pub fn drop_view(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::View, name);
         self.views.remove(name).is_some()
     }
 
@@ -5633,6 +5663,7 @@ impl Catalog {
     /// v7.17.0 Phase 1.3 — register a source for a materialised
     /// view. Caller has already created the backing table.
     pub fn register_materialized_view(&mut self, name: String, body: String) {
+        self.mark_nontable_dirty(NonTableKind::MaterializedView, &name);
         self.materialized_views.insert(name, body);
     }
 
@@ -5640,6 +5671,7 @@ impl Catalog {
     /// true if a source was unregistered. Caller separately drops
     /// the backing table.
     pub fn drop_materialized_view_source(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::MaterializedView, name);
         self.materialized_views.remove(name).is_some()
     }
 
@@ -5659,6 +5691,7 @@ impl Catalog {
                 def.name
             )));
         }
+        self.mark_nontable_dirty(NonTableKind::EnumType, &def.name);
         self.enum_types.insert(def.name.clone(), def);
         Ok(())
     }
@@ -5818,6 +5851,7 @@ impl Catalog {
         if_not_exists: bool,
         position: Option<(bool, String)>,
     ) -> Result<bool, StorageError> {
+        self.mark_nontable_dirty(NonTableKind::EnumType, type_name);
         let def = self
             .enum_types
             .get_mut(type_name)
@@ -5851,6 +5885,7 @@ impl Catalog {
     }
 
     pub fn drop_enum_type(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::EnumType, name);
         self.enum_types.remove(name).is_some()
     }
 
@@ -5868,12 +5903,14 @@ impl Catalog {
                 def.name
             )));
         }
+        self.mark_nontable_dirty(NonTableKind::DomainType, &def.name);
         self.domain_types.insert(def.name.clone(), def);
         Ok(())
     }
 
     /// v7.17.0 Phase 1.5 — drop a DOMAIN by name.
     pub fn drop_domain_type(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::DomainType, name);
         self.domain_types.remove(name).is_some()
     }
 
@@ -5896,6 +5933,7 @@ impl Catalog {
                 def.name
             )));
         }
+        self.mark_nontable_dirty(NonTableKind::CompositeType, &def.name);
         self.composite_types.insert(def.name.clone(), def);
         Ok(())
     }
@@ -5903,6 +5941,7 @@ impl Catalog {
     /// v7.37.42-T2 ζ-B — drop a COMPOSITE type by name. Returns
     /// true if a type was removed.
     pub fn drop_composite_type(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::CompositeType, name);
         self.composite_types.remove(name).is_some()
     }
 
@@ -5980,6 +6019,7 @@ impl Catalog {
         cycle: Option<bool>,
         owned_by: Option<Option<(String, String)>>,
     ) -> Result<(), StorageError> {
+        self.mark_nontable_dirty(NonTableKind::Sequence, name);
         let Some(seq) = self.sequences.get_mut(name) else {
             return Err(StorageError::TableNotFound { name: name.into() });
         };
@@ -6313,8 +6353,74 @@ impl Catalog {
 
     /// v7.39 (round 496) — start a fresh recording window. A transaction's
     /// shadow calls this at BEGIN so the set means "changed by this tx".
+    /// 7.38.1 S3.1 — one window covers both records (tables and the
+    /// non-table families).
     pub fn clear_dirty_tables(&mut self) {
         self.dirty_tables.clear();
+        self.dirty_nontable.clear();
+    }
+
+    /// 7.38.1 S3.1 (D4) — record a non-table object as changed by this
+    /// window. Called from every create/alter/rename/drop of the six
+    /// [`NonTableKind`] families; a rename records BOTH names.
+    fn mark_nontable_dirty(&mut self, kind: NonTableKind, name: &str) {
+        self.dirty_nontable.insert((kind, name.into()));
+    }
+
+    /// 7.38.1 S3.1 (D4) — reconcile the six non-table families with
+    /// `base` (the latest committed catalog): every entry this window
+    /// did NOT touch is taken from base — existence, definition and
+    /// absence alike — so a neighbour's CREATE / ALTER / DROP of a
+    /// sequence, view, matview, enum, domain or composite type
+    /// survives a poisoned transaction's COMMIT. Entries this window
+    /// DID touch keep the shadow's version (the tx's own DDL wins its
+    /// own objects, exactly like the dirty-table merge above it).
+    pub fn merge_nontable_objects_from(&mut self, base: &Catalog) {
+        use NonTableKind as K;
+        fn merge_map<V: Clone>(
+            kind: NonTableKind,
+            dirty: &alloc::collections::BTreeSet<(NonTableKind, String)>,
+            mine: &mut BTreeMap<String, V>,
+            theirs: &BTreeMap<String, V>,
+        ) {
+            let names: alloc::vec::Vec<String> =
+                mine.keys().chain(theirs.keys()).cloned().collect();
+            for n in names {
+                if dirty.contains(&(kind, n.clone())) {
+                    continue;
+                }
+                match theirs.get(&n) {
+                    Some(v) => {
+                        mine.insert(n, v.clone());
+                    }
+                    None => {
+                        mine.remove(&n);
+                    }
+                }
+            }
+        }
+        let dirty = self.dirty_nontable.clone();
+        merge_map(K::Sequence, &dirty, &mut self.sequences, &base.sequences);
+        merge_map(K::View, &dirty, &mut self.views, &base.views);
+        merge_map(
+            K::MaterializedView,
+            &dirty,
+            &mut self.materialized_views,
+            &base.materialized_views,
+        );
+        merge_map(K::EnumType, &dirty, &mut self.enum_types, &base.enum_types);
+        merge_map(
+            K::DomainType,
+            &dirty,
+            &mut self.domain_types,
+            &base.domain_types,
+        );
+        merge_map(
+            K::CompositeType,
+            &dirty,
+            &mut self.composite_types,
+            &base.composite_types,
+        );
     }
 
     /// v7.39 (round 496) — put `table` in at `name`, replacing any table

@@ -56,3 +56,13 @@ CREATE INDEX IF NOT EXISTS by_id ON counters (id)
 
 statement ok
 CREATE INDEX IF NOT EXISTS by_id ON counters (id)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS `Users` CASCADE
+
+statement ok
+DROP TABLE IF EXISTS notes CASCADE
+
+statement ok
+DROP TABLE IF EXISTS counters CASCADE

@@ -110,3 +110,28 @@ SELECT id, val FROM nm_target
 100
 2
 222
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS upsert_target CASCADE
+
+statement ok
+DROP TABLE IF EXISTS upsert_source CASCADE
+
+statement ok
+DROP TABLE IF EXISTS del_target CASCADE
+
+statement ok
+DROP TABLE IF EXISTS del_source CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cond_target CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cond_source CASCADE
+
+statement ok
+DROP TABLE IF EXISTS nm_target CASCADE
+
+statement ok
+DROP TABLE IF EXISTS nm_source CASCADE

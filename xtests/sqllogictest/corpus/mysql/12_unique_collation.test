@@ -54,3 +54,16 @@ CREATE TABLE batch (s TEXT COLLATE "case_insensitive" NOT NULL UNIQUE)
 
 statement error
 INSERT INTO batch VALUES ('Foo'), ('foo')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS names CASCADE
+
+statement ok
+DROP TABLE IF EXISTS bin_names CASCADE
+
+statement ok
+DROP TABLE IF EXISTS composite CASCADE
+
+statement ok
+DROP TABLE IF EXISTS batch CASCADE

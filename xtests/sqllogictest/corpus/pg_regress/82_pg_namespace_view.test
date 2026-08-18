@@ -15,7 +15,7 @@ SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'information_schema'
 ----
 13000
 
-# Names, not a count. r661 added spg_catalog and this line kept asserting 3
+# Names, not a count. r661 added pg_spg and this line kept asserting 3
 # for three rounds without anyone noticing — a count breaks whenever a
 # namespace is added for an unrelated reason and says nothing about which
 # one, which is exactly how it failed. The same count-shaped assertion was
@@ -29,10 +29,10 @@ SELECT nspname FROM pg_catalog.pg_namespace ORDER BY nspname
 ----
 information_schema
 pg_catalog
+pg_spg
 public
-spg_catalog
 
 query I
-SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'spg_catalog'
+SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_spg'
 ----
 13500

@@ -16,3 +16,7 @@ SELECT id FROM t WHERE name = 'b'
 
 statement ok
 DROP INDEX t_name_idx
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

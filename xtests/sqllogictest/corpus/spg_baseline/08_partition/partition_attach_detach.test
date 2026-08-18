@@ -68,3 +68,10 @@ ALTER TABLE p ATTACH PARTITION c_apac FOR VALUES IN ('jp', 'kr')
 # replication lag, which doesn't apply here).
 statement ok
 ALTER TABLE p DETACH PARTITION c_apac CONCURRENTLY FINALIZE
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS p CASCADE
+
+statement ok
+DROP TABLE IF EXISTS c_apac CASCADE

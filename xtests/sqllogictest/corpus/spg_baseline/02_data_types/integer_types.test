@@ -28,3 +28,7 @@ SELECT s, i, b FROM t
 # SMALLINT overflow rejected.
 statement error
 INSERT INTO t VALUES (40000, 1, 1)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

@@ -108,6 +108,8 @@ pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
 
 pub use values::value_to_text;
 pub use values::value_to_text_styled;
+pub use values::value_to_text_typed;
+pub use values::value_to_text_typed_styled;
 pub use values::value_to_text_with_fsp;
 use values::{
     array_2d_dims, array_element_at, array_len, array_rebuild, value_cmp_for_min_max, value_to_f64,
@@ -1584,7 +1586,15 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
         "pg_ts_dict" => 3600,
         "pg_ts_parser" => 3601,
         "pg_ts_template" => 3764,
-        _ => return None,
+        // 7.38.1 S5.1 — stop hand-copying: anything CATALOG_RELATIONS
+        // publishes resolves here too (pg_dump's dependency pass casts
+        // 'pg_extension' / 'pg_amop' / 'pg_opfamily'::regclass).
+        other => {
+            return crate::system_catalog::CATALOG_RELATIONS
+                .iter()
+                .find(|(n, _)| other.eq_ignore_ascii_case(n))
+                .map(|(_, oid)| *oid);
+        }
     })
 }
 
@@ -2512,8 +2522,21 @@ fn eval_cast_arm(
             && let Value::Text(t) = &v
         {
             let want = t.trim().trim_matches('"');
+            // 7.38.1 S5.1 — the name direction answers the DUAL
+            // (oid, name) value for the schemas with a published oid:
+            // regnamespace IS an oid in PG, and pg_dump compares it
+            // against numeric namespace columns (`opcnamespace =
+            // 'pg_catalog'::regnamespace`) — while the wire render
+            // stays the NAME, as PG's does (the round-513 contract).
+            // The RegClass dual carries exactly that pair. A user
+            // schema without a published oid keeps plain text.
             return if spg_storage::is_builtin_schema(want) || cat.schema_exists(want) {
-                Ok(Value::text(want.to_string()))
+                Ok(match want {
+                    "pg_catalog" => Value::RegClass(11, "pg_catalog".into()),
+                    "public" => Value::RegClass(2200, "public".into()),
+                    "information_schema" => Value::RegClass(13000, "information_schema".into()),
+                    _ => Value::text(want.to_string()),
+                })
             } else {
                 Err(EvalError::TypeMismatch {
                     detail: alloc::format!("schema \"{want}\" does not exist"),
@@ -6153,6 +6176,21 @@ pub(crate) fn unify_branch_types_static<'e>(
         // a plain column reference.
         let known = matches!(e, Expr::Cast { .. } | Expr::Literal(_) | Expr::Column(_));
         if !known {
+            continue;
+        }
+        // 7.38.1 S5.1 — a reg* cast is an OID wearing a name: describe
+        // says Text (the wire render), but it compares and unions with
+        // numeric catalog columns (pg_dump: `SELECT classid … UNION
+        // ALL SELECT 'pg_opfamily'::regclass …`). Its static claim is
+        // not genuinely known here, so it sits the check out — the
+        // dual RegClass value reconciles at runtime.
+        if matches!(
+            e,
+            Expr::Cast {
+                target: spg_sql::ast::CastTarget::RegType | spg_sql::ast::CastTarget::RegClass,
+                ..
+            }
+        ) {
             continue;
         }
         let Some(ty) = crate::describe::describe_expr_type(e, ctx.columns) else {

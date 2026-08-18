@@ -52,3 +52,7 @@ NULL
 # Ragged literal → hard error.
 statement error
 INSERT INTO grid VALUES (99, '{{1,2},{3,4,5}}', NULL, NULL)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS grid CASCADE

@@ -50,3 +50,16 @@ SELECT id FROM signed_t ORDER BY id
 ----
 -100
 -1
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS s CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE
+
+statement ok
+DROP TABLE IF EXISTS signed_t CASCADE

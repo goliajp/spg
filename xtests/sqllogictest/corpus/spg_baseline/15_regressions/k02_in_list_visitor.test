@@ -59,3 +59,10 @@ ORDER BY id
 ----
 2
 4
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS k02_outer_t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS k02_inner_t CASCADE

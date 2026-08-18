@@ -22,3 +22,7 @@ query T rowsort
 SELECT name FROM t WHERE id = '11111111-1111-1111-1111-111111111111'
 ----
 a
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

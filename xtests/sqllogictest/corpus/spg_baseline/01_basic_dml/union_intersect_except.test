@@ -29,3 +29,10 @@ SELECT id FROM a UNION ALL SELECT id FROM b
 3
 3
 4
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE

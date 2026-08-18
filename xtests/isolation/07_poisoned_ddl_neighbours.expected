@@ -1,0 +1,11 @@
+== permutation setup s1_begin s1_ins s1_ddl s2_seq s2_view s2_next1 s1_commit s2_next2 s2_view_q
+setup: ok CREATE TABLE
+s1_begin: ok BEGIN
+s1_ins: ok INSERT 0 1
+s1_ddl: ok CREATE INDEX
+s2_seq: ok CREATE SEQUENCE
+s2_view: ok CREATE VIEW
+s2_next1: rows 1
+s1_commit: ok COMMIT
+s2_next2: rows 2
+s2_view_q: rows 1

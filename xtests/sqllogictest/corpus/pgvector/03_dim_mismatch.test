@@ -11,3 +11,7 @@ INSERT INTO emb VALUES ([1.0, 2.0, 3.0, 4.0])
 
 statement ok
 INSERT INTO emb VALUES ([0.5, 0.5, 0.5])
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS emb CASCADE

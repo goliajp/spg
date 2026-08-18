@@ -92,3 +92,13 @@ query I
 SELECT length(uuid_generate_v4()::text)
 ----
 36
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE
+
+statement ok
+DROP TABLE IF EXISTS optu CASCADE
+
+statement ok
+DROP TABLE IF EXISTS g CASCADE

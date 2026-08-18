@@ -19,3 +19,7 @@ SELECT doc->>'b' FROM t ORDER BY id
 ----
 x
 y
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

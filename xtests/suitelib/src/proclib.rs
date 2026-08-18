@@ -704,6 +704,7 @@ mod tests {
         let Some(bin) = server_bin() else { return };
         let tmp = run_tmp_dir("s06-cycles");
         let _ = std::fs::remove_dir_all(&tmp);
+        let mut spawned_pids: Vec<u32> = Vec::new();
         for i in 0..20 {
             let mut r = Roster::new();
             let port = r
@@ -715,20 +716,24 @@ mod tests {
                 )
                 .expect("server up");
             assert!(PORT_RANGE.contains(&port));
+            spawned_pids.extend(r.procs.iter().map(|p| p.child.id()));
             r.reap_all();
             // The port must be re-bindable immediately after reaping.
             // (SO_REUSEADDR semantics make the bind probe pass even in
             // TIME_WAIT; what matters is no living process owns it.)
         }
-        let leaks = Command::new("pgrep")
-            .args(["-f", "release/spg-server 127.0.0.1:254"])
-            .output()
-            .expect("pgrep");
-        assert!(
-            leaks.stdout.is_empty(),
-            "leaked servers: {}",
-            String::from_utf8_lossy(&leaks.stdout)
-        );
+        // 7.38.1 CP note — assert on the pids THIS test spawned, not a
+        // global pgrep: the old pattern-match caught any unrelated
+        // spg-server on the box (a dev server, a concurrent suite) and
+        // failed the run for someone else's process.
+        for pid in &spawned_pids {
+            let alive = Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|st| st.success())
+                .unwrap_or(false);
+            assert!(!alive, "leaked server pid {pid}");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

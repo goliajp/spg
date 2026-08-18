@@ -33,3 +33,7 @@ query I nosort
 SELECT id FROM emb
 ----
 10
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS emb CASCADE

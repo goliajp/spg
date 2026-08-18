@@ -18,3 +18,7 @@ INSERT INTO t VALUES (100000000.00)
 
 statement ok
 INSERT INTO t VALUES (99999999.99)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

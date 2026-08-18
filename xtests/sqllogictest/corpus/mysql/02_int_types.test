@@ -62,3 +62,7 @@ SELECT tiny_v + mid_v FROM mixed
 # we widen to SMALLINT, so 200 is fine.
 statement ok
 INSERT INTO mixed VALUES (100, 0, 0, 0, NULL, NULL, NULL)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS mixed CASCADE

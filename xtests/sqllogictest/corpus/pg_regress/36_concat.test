@@ -130,3 +130,13 @@ query I
 SELECT id FROM u2 WHERE concat(n, '!') = 'b!'
 ----
 2
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE
+
+statement ok
+DROP TABLE IF EXISTS labeled CASCADE
+
+statement ok
+DROP TABLE IF EXISTS u2 CASCADE
