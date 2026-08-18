@@ -2514,18 +2514,19 @@ fn eval_cast_arm(
             && let Value::Text(t) = &v
         {
             let want = t.trim().trim_matches('"');
-            // 7.38.1 S5.1 — the name direction answers the schema's
-            // OID for the three catalog schemas: regnamespace IS an
-            // oid in PG, and pg_dump compares it against numeric
-            // namespace columns (`opcnamespace = 'pg_catalog'::
-            // regnamespace`). A user schema without a published oid
-            // keeps the round-513 textual contract (nothing numeric
-            // exists to compare it with).
+            // 7.38.1 S5.1 — the name direction answers the DUAL
+            // (oid, name) value for the schemas with a published oid:
+            // regnamespace IS an oid in PG, and pg_dump compares it
+            // against numeric namespace columns (`opcnamespace =
+            // 'pg_catalog'::regnamespace`) — while the wire render
+            // stays the NAME, as PG's does (the round-513 contract).
+            // The RegClass dual carries exactly that pair. A user
+            // schema without a published oid keeps plain text.
             return if spg_storage::is_builtin_schema(want) || cat.schema_exists(want) {
                 Ok(match want {
-                    "pg_catalog" => Value::BigInt(11),
-                    "public" => Value::BigInt(2200),
-                    "information_schema" => Value::BigInt(13000),
+                    "pg_catalog" => Value::RegClass(11, "pg_catalog".into()),
+                    "public" => Value::RegClass(2200, "public".into()),
+                    "information_schema" => Value::RegClass(13000, "information_schema".into()),
                     _ => Value::text(want.to_string()),
                 })
             } else {

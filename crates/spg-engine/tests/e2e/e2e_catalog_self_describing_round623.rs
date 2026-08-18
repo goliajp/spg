@@ -163,7 +163,9 @@ fn round623_pg_attribute_describes_the_catalogs() {
         // without being self-described. Registering a catalog takes four
         // separate lists, and this pin is the one that notices when the
         // `pg_attribute` half was missed.
-        vec!["27"]
+        // 7.38.1 S5.1 — 27 to 31: pg_opclass, pg_opfamily, pg_amop and
+        // pg_amproc joined the wall (the pg_dump campaign).
+        vec!["31"]
     );
 }
 

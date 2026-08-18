@@ -29,8 +29,8 @@ SELECT nspname FROM pg_catalog.pg_namespace ORDER BY nspname
 ----
 information_schema
 pg_catalog
-public
 pg_spg
+public
 
 query I
 SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = 'pg_spg'
