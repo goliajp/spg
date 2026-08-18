@@ -355,15 +355,15 @@ pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
         .bytes()
         .fold(0u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
     // 7.38.1 S6.1 (D8) — the live-PG fourth leg rides whenever the
-    // oracle container is reachable (mini: docker wrapper; local:
-    // the 25432 bench container). 10^4 is the CP judgement; 10^5 is
+    // oracle container is reachable. 10^4 is the CP judgement; 10^5 is
     // the nightly parameter (SPG_GENDIFF_COUNT overrides).
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pg_host = if Path::new(&home).join("spgbench/bin/psql").exists() {
-        "host.docker.internal"
-    } else {
-        "127.0.0.1"
-    };
+    //
+    // gendiff is a HOST binary dialing the oracle's published port, so
+    // the leg is always 127.0.0.1 — `host.docker.internal` is a name
+    // only resolvable INSIDE containers (the perf sweep uses it because
+    // its psql wrapper runs in one; the first mini full to reach this
+    // step aborted on that borrowed detection, 2026-08-19).
+    let pg_host = "127.0.0.1";
     let count = std::env::var("SPG_GENDIFF_COUNT").unwrap_or_else(|_| String::from("10000"));
     sh(
         root,
