@@ -194,10 +194,22 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     let col_pos = schema_cols
         .iter()
         .position(|s| s.name.eq_ignore_ascii_case(&col.name))?;
-    let index = table.index_on(col_pos)?;
-    if !matches!(index.kind, spg_storage::IndexKind::BTree(_)) {
-        return None;
-    }
+    // v7.38.1 (L12) — a composite B-tree leading on the ORDER BY column
+    // walks it too: keys sort by the whole tuple, so the leading
+    // component comes out in order (see `Index::iter_asc`). This keeps
+    // the walk on tables whose only index on the column IS the
+    // converted composite (a multi-column PK's leading column).
+    let index = table
+        .index_on(col_pos)
+        .filter(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+        .or_else(|| {
+            table.indices().iter().find(|i| {
+                matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
+                    && i.column_position == col_pos
+                    && i.expression.is_none()
+                    && i.partial_predicate.is_none()
+            })
+        })?;
     // r1020 — a NULL key is not in the btree, so walking the btree cannot
     // see the rows that carry one. That is a silent wrong answer, in both
     // directions, and it shipped:
@@ -499,6 +511,9 @@ pub(crate) fn try_index_seek_positions(
         flatten_and(where_expr, &mut conjuncts);
         let mut best: Option<(usize, &Expr)> = None;
         let mut eq_cols: Vec<usize> = Vec::new();
+        // v7.38.1 (L12) — keep every equality's probe key so composite
+        // indexes can compose them below.
+        let mut eq_keys: Vec<(usize, IndexKey)> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -508,14 +523,71 @@ pub(crate) fn try_index_seek_positions(
                 && let Some((col_pos, value)) =
                     resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
                         .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
-                && let Some(idx) = table.index_on(col_pos)
                 && let Some(key) = probe_key(schema_cols, col_pos, &value)
             {
-                eq_cols.push(col_pos);
-                let n = idx.lookup_eq(&key).len();
-                if best.is_none_or(|(bn, _)| n < bn) {
-                    best = Some((n, c));
+                if !eq_cols.contains(&col_pos) {
+                    eq_keys.push((col_pos, key.clone()));
                 }
+                eq_cols.push(col_pos);
+                if let Some(idx) = table.index_on(col_pos) {
+                    let n = idx.lookup_eq(&key).len();
+                    if best.is_none_or(|(bn, _)| n < bn) {
+                        best = Some((n, c));
+                    }
+                }
+            }
+        }
+        // v7.38.1 (L12) — composite candidates: for each multi-column
+        // B-tree, compose the longest prefix of its column tuple out of
+        // the equality keys. A full cover is a point lookup; a partial
+        // cover is one descent plus a bounded prefix walk. Either
+        // competes on materialised row count like everything else, and
+        // the winner is still only a CANDIDATE set — the caller
+        // re-evaluates the whole WHERE per row.
+        let mut best_multi: Option<(usize, Vec<spg_storage::RowLocator>)> = None;
+        for idx in table.indices() {
+            if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
+                || idx.partial_predicate.is_some()
+                || idx.expression.is_some()
+            {
+                continue;
+            }
+            let mut prefix: Vec<IndexKey> = Vec::new();
+            for pos in core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+            {
+                match eq_keys.iter().find(|(c, _)| *c == pos) {
+                    Some((_, k)) => prefix.push(k.clone()),
+                    None => break,
+                }
+            }
+            if prefix.is_empty() {
+                continue;
+            }
+            // A full-tuple equality is the same contract as a plain
+            // `lookup_eq` — precise, so it takes no cap. The prefix walk
+            // caps like the range walk (never materialise more than the
+            // competition or a quarter of the table), with a small floor
+            // so tiny tables still seek (rows/4 of a 1-row table is 0).
+            let locs = if prefix.len() == 1 + idx.extra_column_positions.len() {
+                Some(idx.lookup_eq_multi(&prefix).to_vec())
+            } else {
+                let multi_cap = best
+                    .map(|(n, _)| n)
+                    .unwrap_or(table.rows().len() / 4)
+                    .min(table.rows().len() / 4)
+                    .min(
+                        best_multi
+                            .as_ref()
+                            .map_or(usize::MAX, |(n, _)| n.saturating_sub(1)),
+                    )
+                    .max(64);
+                idx.lookup_prefix_capped_by(&prefix, multi_cap, |_| true)
+            };
+            if let Some(locs) = locs
+                && best_multi.as_ref().is_none_or(|(bn, _)| locs.len() < *bn)
+            {
+                best_multi = Some((locs.len(), locs));
             }
         }
         // 7.38.1 S7 (round two) — RANGE candidates compete too: merge
@@ -559,6 +631,35 @@ pub(crate) fn try_index_seek_positions(
                 && best_range.as_ref().is_none_or(|(bn, ..)| n < *bn)
             {
                 best_range = Some((n, col_pos, lo, hi));
+            }
+        }
+        // v7.38.1 (L12) — the composite wins when it names the fewest
+        // rows. `<=` on purpose: at equal counts one descent over the
+        // whole tuple beats a single-column lookup that the caller
+        // then has to re-filter.
+        if let Some((n, locs)) = &best_multi
+            && best.is_none_or(|(bn, _)| *n <= bn)
+            && best_range.as_ref().is_none_or(|(bn, ..)| *n <= *bn)
+        {
+            let mut out = Vec::with_capacity(locs.len());
+            let mut all_hot = true;
+            for loc in locs {
+                match *loc {
+                    spg_storage::RowLocator::Hot(i) => {
+                        if table.is_row_visible(i, snapshot) {
+                            out.push(i);
+                        }
+                    }
+                    spg_storage::RowLocator::Cold { .. } => {
+                        all_hot = false;
+                        break;
+                    }
+                }
+            }
+            if all_hot {
+                out.sort_unstable();
+                table.note_index_scan(out.len() as u64);
+                return Some(out);
             }
         }
         if let Some((_, col_pos, lo, hi)) = best_range {
@@ -1269,6 +1370,9 @@ pub(crate) fn try_index_seek<'a>(
         flatten_and(where_expr, &mut conjuncts);
         let mut best: Option<(usize, &Expr)> = None;
         let mut eq_cols: Vec<usize> = Vec::new();
+        // v7.38.1 (L12) — keep every equality's probe key so composite
+        // indexes can compose them below.
+        let mut eq_keys: Vec<(usize, IndexKey)> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -1278,14 +1382,71 @@ pub(crate) fn try_index_seek<'a>(
                 && let Some((col_pos, value)) =
                     resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
                         .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
-                && let Some(idx) = table.index_on(col_pos)
                 && let Some(key) = probe_key(schema_cols, col_pos, &value)
             {
-                eq_cols.push(col_pos);
-                let n = idx.lookup_eq(&key).len();
-                if best.is_none_or(|(bn, _)| n < bn) {
-                    best = Some((n, c));
+                if !eq_cols.contains(&col_pos) {
+                    eq_keys.push((col_pos, key.clone()));
                 }
+                eq_cols.push(col_pos);
+                if let Some(idx) = table.index_on(col_pos) {
+                    let n = idx.lookup_eq(&key).len();
+                    if best.is_none_or(|(bn, _)| n < bn) {
+                        best = Some((n, c));
+                    }
+                }
+            }
+        }
+        // v7.38.1 (L12) — composite candidates: for each multi-column
+        // B-tree, compose the longest prefix of its column tuple out of
+        // the equality keys. A full cover is a point lookup; a partial
+        // cover is one descent plus a bounded prefix walk. Either
+        // competes on materialised row count like everything else, and
+        // the winner is still only a CANDIDATE set — the caller
+        // re-evaluates the whole WHERE per row.
+        let mut best_multi: Option<(usize, Vec<spg_storage::RowLocator>)> = None;
+        for idx in table.indices() {
+            if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
+                || idx.partial_predicate.is_some()
+                || idx.expression.is_some()
+            {
+                continue;
+            }
+            let mut prefix: Vec<IndexKey> = Vec::new();
+            for pos in core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+            {
+                match eq_keys.iter().find(|(c, _)| *c == pos) {
+                    Some((_, k)) => prefix.push(k.clone()),
+                    None => break,
+                }
+            }
+            if prefix.is_empty() {
+                continue;
+            }
+            // A full-tuple equality is the same contract as a plain
+            // `lookup_eq` — precise, so it takes no cap. The prefix walk
+            // caps like the range walk (never materialise more than the
+            // competition or a quarter of the table), with a small floor
+            // so tiny tables still seek (rows/4 of a 1-row table is 0).
+            let locs = if prefix.len() == 1 + idx.extra_column_positions.len() {
+                Some(idx.lookup_eq_multi(&prefix).to_vec())
+            } else {
+                let multi_cap = best
+                    .map(|(n, _)| n)
+                    .unwrap_or(table.rows().len() / 4)
+                    .min(table.rows().len() / 4)
+                    .min(
+                        best_multi
+                            .as_ref()
+                            .map_or(usize::MAX, |(n, _)| n.saturating_sub(1)),
+                    )
+                    .max(64);
+                idx.lookup_prefix_capped_by(&prefix, multi_cap, |_| true)
+            };
+            if let Some(locs) = locs
+                && best_multi.as_ref().is_none_or(|(bn, _)| locs.len() < *bn)
+            {
+                best_multi = Some((locs.len(), locs));
             }
         }
         // 7.38.1 S7 (round two) — RANGE candidates compete with the
@@ -1323,6 +1484,35 @@ pub(crate) fn try_index_seek<'a>(
                 && best_range.as_ref().is_none_or(|(bn, ..)| n < *bn)
             {
                 best_range = Some((n, col_pos, lo, hi));
+            }
+        }
+        // v7.38.1 (L12) — the composite wins when it names the fewest
+        // rows (see the positions variant for the `<=` rationale).
+        if let Some((n, locs)) = &best_multi
+            && best.is_none_or(|(bn, _)| *n <= bn)
+            && best_range.as_ref().is_none_or(|(bn, ..)| *n <= *bn)
+        {
+            let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locs.len());
+            let mut all_hot = true;
+            for loc in locs {
+                match *loc {
+                    spg_storage::RowLocator::Hot(i) => {
+                        if !table.is_row_visible(i, snapshot) {
+                            continue;
+                        }
+                        if let Some(row) = table.rows().get(i) {
+                            out.push(Cow::Borrowed(row));
+                        }
+                    }
+                    spg_storage::RowLocator::Cold { .. } => {
+                        all_hot = false;
+                        break;
+                    }
+                }
+            }
+            if all_hot {
+                table.note_index_scan(out.len() as u64);
+                return Some(out);
             }
         }
         if let Some((_, col_pos, lo, hi)) = best_range

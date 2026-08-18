@@ -1129,6 +1129,32 @@ impl Table {
                         map.insert_mut(key, entries);
                     }
                 }
+                // v7.38.1 (L12) — multi-column key: every component must
+                // key, or the row is not entered (a `=` probe can never
+                // select the NULL it would stand for). The take/prune/
+                // push dance is the BTree arm's, for the same churn
+                // reasons.
+                IndexKind::BTreeMulti(map) => {
+                    if let Some(key) = crate::compose_multi_key(
+                        &row.values,
+                        idx.column_position,
+                        &idx.extra_column_positions,
+                    ) {
+                        let mut entries = map
+                            .insert_mut(key.clone(), crate::posting::PostingList::new())
+                            .unwrap_or_default();
+                        if horizon > 0 && entries.len() > 1 && entries.len().is_power_of_two() {
+                            entries.retain(|loc| match loc {
+                                RowLocator::Hot(i) => headers.get(i).is_none_or(|h| {
+                                    !crate::vacuum::is_reclaimable(h.xmax, horizon)
+                                }),
+                                RowLocator::Cold { .. } => true,
+                            });
+                        }
+                        entries.push(RowLocator::Hot(new_row_idx));
+                        map.insert_mut(key, entries);
+                    }
+                }
                 IndexKind::Gin(map) => {
                     // v7.12.3 — extend posting list per lexeme word.
                     // NULL or non-TsVector cell → no-op (cell carries
@@ -1471,7 +1497,8 @@ impl Table {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => {
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => {
                 return Err(StorageError::Unsupported(format!(
                     "ALTER INDEX REBUILD on non-NSW index {name:?} — only NSW indexes can rebuild"
                 )));
@@ -1562,6 +1589,147 @@ impl Table {
             collation: None,
             extra_column_positions: Vec::new(),
         });
+        Ok(())
+    }
+
+    /// v7.38.1 (L12) — snapshot-restore counterpart for a tag-7
+    /// multi-column B-tree. The extras arrive via the per-index
+    /// appendix, which `Catalog::deserialize` applies after this call —
+    /// exactly as it does for every other restored kind.
+    pub fn restore_btree_multi_index(
+        &mut self,
+        name: String,
+        column_name: &str,
+        map: PersistentBTreeMap<alloc::boxed::Box<[IndexKey]>, crate::posting::PostingList>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(column_name).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: column_name.into(),
+            }
+        })?;
+        self.indices.push(Index {
+            kind: IndexKind::BTreeMulti(map),
+            ..Index::new_btree(name, column_position)
+        });
+        Ok(())
+    }
+
+    /// v7.38.1 (L12) — upgrade a leading-column B-tree that carries
+    /// `extra_column_positions` into a real multi-column B-tree, in
+    /// place, keeping every piece of index metadata. Returns `false`
+    /// (untouched) when the index is not a plain BTree, has no extras,
+    /// or keys on an expression (whose value is not a column's own).
+    ///
+    /// Cold locators block the conversion too: a composite key cannot
+    /// be derived for a row whose body lives in a cold segment, and
+    /// silently dropping the entry would drop the row from every seek.
+    pub fn convert_index_to_multi(&mut self, name: &str) -> Result<bool, StorageError> {
+        let Some(pos) = self.indices.iter().position(|i| i.name == name) else {
+            return Ok(false);
+        };
+        {
+            let idx = &self.indices[pos];
+            if idx.extra_column_positions.is_empty()
+                || idx.expression.is_some()
+                || idx.partial_predicate.is_some()
+            {
+                return Ok(false);
+            }
+            match &idx.kind {
+                IndexKind::BTree(map) => {
+                    if map.iter().any(|(_, locs)| locs.iter().any(|l| l.is_cold())) {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        let column_position = self.indices[pos].column_position;
+        let extras = self.indices[pos].extra_column_positions.clone();
+        // Component-type gate: every non-null value of every component
+        // must key, or rows could silently vanish from the index.
+        for p in core::iter::once(column_position).chain(extras.iter().copied()) {
+            match self.schema.columns.get(p) {
+                Some(col) if crate::multi_component_type_ok(col.ty) => {}
+                _ => return Ok(false),
+            }
+        }
+        let mut pairs: Vec<(alloc::boxed::Box<[IndexKey]>, usize)> =
+            Vec::with_capacity(self.rows.len());
+        for (i, row) in self.rows.iter().enumerate() {
+            if let Some(key) = crate::compose_multi_key(&row.values, column_position, &extras) {
+                pairs.push((key, i));
+            }
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut grouped: Vec<(alloc::boxed::Box<[IndexKey]>, crate::posting::PostingList)> =
+            Vec::new();
+        for (key, i) in pairs {
+            match grouped.last_mut() {
+                Some((k, locs)) if *k == key => locs.push(RowLocator::Hot(i)),
+                _ => grouped.push((key, crate::posting::PostingList::single(RowLocator::Hot(i)))),
+            }
+        }
+        self.indices[pos].kind = IndexKind::BTreeMulti(PersistentBTreeMap::from_sorted(grouped));
+        Ok(true)
+    }
+
+    /// v7.38.1 (L12) — build a real multi-column B-tree over
+    /// `[leading, extras…]` from the current rows. The caller supplies
+    /// resolved column positions; uniqueness and the rest of the
+    /// index's metadata are applied by the caller afterwards, exactly
+    /// as `add_index` callers do today.
+    pub fn add_multi_index(
+        &mut self,
+        name: &str,
+        column_position: usize,
+        extra_column_positions: Vec<usize>,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name: name.into() });
+        }
+        if extra_column_positions.is_empty() {
+            return Err(StorageError::Unsupported(
+                "add_multi_index: needs at least two columns; use add_index for one".into(),
+            ));
+        }
+        for pos in core::iter::once(column_position).chain(extra_column_positions.iter().copied()) {
+            match self.schema.columns.get(pos) {
+                Some(col) if crate::multi_component_type_ok(col.ty) => {}
+                _ => {
+                    return Err(StorageError::Unsupported(format!(
+                        "add_multi_index: component column {pos} has no total key form"
+                    )));
+                }
+            }
+        }
+        let mut idx = Index {
+            extra_column_positions: extra_column_positions.clone(),
+            ..Index::new_btree_multi(String::from(name), column_position)
+        };
+        let mut pairs: Vec<(alloc::boxed::Box<[IndexKey]>, usize)> =
+            Vec::with_capacity(self.rows.len());
+        for (i, row) in self.rows.iter().enumerate() {
+            if let Some(key) =
+                crate::compose_multi_key(&row.values, column_position, &extra_column_positions)
+            {
+                pairs.push((key, i));
+            }
+        }
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut grouped: Vec<(alloc::boxed::Box<[IndexKey]>, crate::posting::PostingList)> =
+            Vec::new();
+        for (key, i) in pairs {
+            match grouped.last_mut() {
+                Some((k, locs)) if *k == key => locs.push(RowLocator::Hot(i)),
+                _ => grouped.push((key, crate::posting::PostingList::single(RowLocator::Hot(i)))),
+            }
+        }
+        idx.kind = IndexKind::BTreeMulti(PersistentBTreeMap::from_sorted(grouped));
+        self.indices.push(idx);
         Ok(())
     }
 
@@ -1927,7 +2095,8 @@ impl Table {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => {
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "index {index_name:?} is not BTree; cold locators apply only to BTree indices"
                 )));
@@ -1974,7 +2143,10 @@ impl Table {
             | IndexKind::GinTrgm(map)
             | IndexKind::GinFulltext(map)
             | IndexKind::GinJsonb(map) => map,
-            IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => {
+            IndexKind::BTree(_)
+            | IndexKind::Nsw(_)
+            | IndexKind::Brin { .. }
+            | IndexKind::BTreeMulti(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "register_gin_cold_locators: index {index_name:?} is not GIN"
                 )));
@@ -2022,7 +2194,8 @@ impl Table {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => {
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "remove_cold_locators_for_key: index {index_name:?} is not BTree; \
                      cold locators apply only to BTree indices"
@@ -2123,7 +2296,14 @@ impl Table {
         }
         self.rows = new_rows;
         // Drop indices on the column outright; shift the rest.
-        self.indices.retain(|idx| idx.column_position != col_pos);
+        // v7.38.1 (L12) — an index whose EXTRA columns name the dropped
+        // one goes too (PG drops dependent indexes with the column).
+        // Before this, `extra_column_positions` was neither dropped nor
+        // shifted, so a composite UNIQUE's enforcement silently read
+        // the wrong columns after any earlier column was dropped.
+        self.indices.retain(|idx| {
+            idx.column_position != col_pos && !idx.extra_column_positions.contains(&col_pos)
+        });
         for idx in &mut self.indices {
             if idx.column_position > col_pos {
                 idx.column_position -= 1;
@@ -2132,6 +2312,11 @@ impl Table {
             for inc in &mut idx.included_columns {
                 if *inc > col_pos {
                     *inc -= 1;
+                }
+            }
+            for extra in &mut idx.extra_column_positions {
+                if *extra > col_pos {
+                    *extra -= 1;
                 }
             }
         }
@@ -2596,11 +2781,42 @@ impl Table {
                 old_key: Option<IndexKey>,
                 new_key: Option<IndexKey>,
             },
+            // v7.38.1 (L12) — composite-key move. `None` = the row is
+            // not in the index on that side (some component unkeyable).
+            MultiMove {
+                idx_pos: usize,
+                old_key: Option<alloc::boxed::Box<[IndexKey]>>,
+                new_key: Option<alloc::boxed::Box<[IndexKey]>>,
+            },
             FullRebuild,
         }
         let mut fixes: Vec<IdxFix> = Vec::new();
         for (idx_pos, idx) in self.indices.iter().enumerate() {
             let col = idx.column_position;
+            // v7.38.1 (L12) — a multi index moves when ANY component
+            // changes, so it must be judged on the whole tuple BEFORE
+            // the leading-column short-circuit below can skip it.
+            if matches!(idx.kind, IndexKind::BTreeMulti(_)) {
+                // Cheap pre-check on the raw values — composing two
+                // boxed key tuples per index per UPDATE is real money
+                // on write-heavy loads, and most updates touch no key
+                // component at all.
+                let component_changed = core::iter::once(col)
+                    .chain(idx.extra_column_positions.iter().copied())
+                    .any(|p| old_row.values.get(p) != new_row.values.get(p));
+                if component_changed {
+                    let old_key = idx.multi_key_for_row(&old_row.values);
+                    let new_key = idx.multi_key_for_row(&new_row.values);
+                    if old_key != new_key {
+                        fixes.push(IdxFix::MultiMove {
+                            idx_pos,
+                            old_key,
+                            new_key,
+                        });
+                    }
+                }
+                continue;
+            }
             let old_v = &old_row.values[col];
             let new_v = &new_row.values[col];
             if old_v == new_v {
@@ -2617,7 +2833,8 @@ impl Table {
                 | IndexKind::Gin(_)
                 | IndexKind::GinTrgm(_)
                 | IndexKind::GinFulltext(_)
-                | IndexKind::GinJsonb(_) => {
+                | IndexKind::GinJsonb(_)
+                | IndexKind::BTreeMulti(_) => {
                     fixes.clear();
                     fixes.push(IdxFix::FullRebuild);
                     break;
@@ -2720,6 +2937,34 @@ impl Table {
                         }
                     }
                 }
+                // v7.38.1 (L12) — same drop-old/append-new dance over the
+                // composite key space.
+                IdxFix::MultiMove {
+                    idx_pos,
+                    old_key,
+                    new_key,
+                } => {
+                    let IndexKind::BTreeMulti(map) = &mut self.indices[idx_pos].kind else {
+                        unreachable!("IdxFix::MultiMove built from a BTreeMulti index");
+                    };
+                    if let Some(k) = old_key
+                        && let Some(locs) = map.get(&k)
+                    {
+                        let mut locs = locs.clone();
+                        locs.retain(|l| l != RowLocator::Hot(position));
+                        map.insert_mut(k, locs);
+                    }
+                    if let Some(k) = new_key {
+                        if let Some(entries) = map.get_mut(&k) {
+                            entries.push(RowLocator::Hot(position));
+                        } else {
+                            map.insert_mut(
+                                k,
+                                crate::posting::PostingList::single(RowLocator::Hot(position)),
+                            );
+                        }
+                    }
+                }
             }
         }
         // v7.39 (round 215) — apply the range-exclusion key moves captured
@@ -2792,12 +3037,15 @@ impl Table {
                 }
                 // BRIN / NSW carry no key→locator map. GIN handles
                 // its own cold preservation below in `preserved_gin_cold`.
+                // BTreeMulti never receives Cold locators (the freezer
+                // refuses tables carrying one — see freeze site note).
                 IndexKind::Nsw(_)
                 | IndexKind::Brin { .. }
                 | IndexKind::Gin(_)
                 | IndexKind::GinTrgm(_)
                 | IndexKind::GinFulltext(_)
-                | IndexKind::GinJsonb(_) => None,
+                | IndexKind::GinJsonb(_)
+                | IndexKind::BTreeMulti(_) => None,
             })
             .collect();
 
@@ -2835,7 +3083,10 @@ impl Table {
                         Some((idx.name.clone(), cold))
                     }
                 }
-                IndexKind::BTree(_) | IndexKind::Nsw(_) | IndexKind::Brin { .. } => None,
+                IndexKind::BTree(_)
+                | IndexKind::Nsw(_)
+                | IndexKind::Brin { .. }
+                | IndexKind::BTreeMulti(_) => None,
             })
             .collect();
 
@@ -2846,6 +3097,9 @@ impl Table {
         #[derive(Clone)]
         enum RebuildKind {
             BTree,
+            // v7.38.1 (L12) — rebuilt from rows over the full column
+            // tuple, exactly like BTree but with composite keys.
+            BTreeMulti,
             Nsw(usize),
             Brin(DataType),
             Gin,
@@ -2884,6 +3138,7 @@ impl Table {
                     IndexKind::Nsw(g) => RebuildKind::Nsw(g.m),
                     IndexKind::Brin { column_type } => RebuildKind::Brin(*column_type),
                     IndexKind::BTree(_) => RebuildKind::BTree,
+                    IndexKind::BTreeMulti(_) => RebuildKind::BTreeMulti,
                     IndexKind::Gin(_) => RebuildKind::Gin,
                     IndexKind::GinTrgm(_) => RebuildKind::GinTrgm,
                     IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
@@ -2962,6 +3217,41 @@ impl Table {
                         }
                     }
                     idx.kind = IndexKind::BTree(
+                        crate::persistent_btree::PersistentBTreeMap::from_sorted(grouped),
+                    );
+                    self.indices.push(idx);
+                }
+                // v7.38.1 (L12) — bulk build over the full column tuple.
+                // Same collect + sort + group + from_sorted shape as the
+                // BTree arm; a row with any unkeyable component stays out.
+                RebuildKind::BTreeMulti => {
+                    let mut idx = Index::new_btree_multi(name, column_position);
+                    let mut pairs: Vec<(alloc::boxed::Box<[IndexKey]>, usize)> =
+                        Vec::with_capacity(self.rows.len());
+                    for (i, row) in self.rows.iter().enumerate() {
+                        if let Some(key) = crate::compose_multi_key(
+                            &row.values,
+                            column_position,
+                            &extra_column_positions,
+                        ) {
+                            pairs.push((key, i));
+                        }
+                    }
+                    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut grouped: Vec<(
+                        alloc::boxed::Box<[IndexKey]>,
+                        crate::posting::PostingList,
+                    )> = Vec::new();
+                    for (key, i) in pairs {
+                        match grouped.last_mut() {
+                            Some((k, locs)) if *k == key => locs.push(RowLocator::Hot(i)),
+                            _ => grouped.push((
+                                key,
+                                crate::posting::PostingList::single(RowLocator::Hot(i)),
+                            )),
+                        }
+                    }
+                    idx.kind = IndexKind::BTreeMulti(
                         crate::persistent_btree::PersistentBTreeMap::from_sorted(grouped),
                     );
                     self.indices.push(idx);

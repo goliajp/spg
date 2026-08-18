@@ -33,8 +33,12 @@ fn multi_column_create_index_parses_and_builds_leading_index() {
         .iter()
         .find(|i| i.name == "idx_messages_date")
         .expect("index built");
-    // The leading column drives the storage; extras are AST-only.
-    assert!(matches!(idx.kind, spg_storage::IndexKind::BTree(_)));
+    // v7.38.1 (L12) — the flip this pin used to hold DOWN: a
+    // multi-column CREATE INDEX now builds a REAL composite B-tree
+    // (the key is the whole tuple), and it survives a snapshot
+    // round-trip as one.
+    assert!(matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_)));
+    assert_eq!(idx.extra_column_positions.len(), 1);
 }
 
 #[test]

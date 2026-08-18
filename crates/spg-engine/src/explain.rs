@@ -74,8 +74,10 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
         // Skip if any BTree index already covers this column as
         // its key.
         let already_indexed = tbl.indices().iter().any(|i| {
-            matches!(i.kind, spg_storage::IndexKind::BTree(_))
-                && i.column_position == col_pos
+            matches!(
+                i.kind,
+                spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+            ) && i.column_position == col_pos
                 && i.expression.is_none()
                 && i.partial_predicate.is_none()
         });
@@ -123,7 +125,10 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
         if let Some(tbl) = cat.get(&owner) {
             let pos_to_name = |pos: usize| tbl.schema().columns.get(pos).map(|c| c.name.clone());
             let already_in_index = tbl.indices().iter().any(|i| {
-                if !matches!(i.kind, spg_storage::IndexKind::BTree(_)) {
+                if !matches!(
+                    i.kind,
+                    spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+                ) {
                     return false;
                 }
                 let mut all_cols: alloc::collections::BTreeSet<String> =
@@ -574,7 +579,13 @@ fn index_name_for_cond(engine: &Engine, table: &str, alias: &str, cond: &Expr) -
             continue;
         };
         if let Some(idx) = t.indices().iter().find(|i| {
-            i.column_position == pos && matches!(i.kind, spg_storage::IndexKind::BTree(_))
+            // v7.38.1 (L12) — a composite B-tree leading on the column
+            // seeks it too (prefix descent), so the mirror must say so.
+            i.column_position == pos
+                && matches!(
+                    i.kind,
+                    spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+                )
         }) {
             return Some(idx.name.clone());
         }
@@ -696,7 +707,13 @@ fn scan_node(
                 engine.active_catalog().get(name).and_then(|t| {
                     t.indices()
                         .iter()
-                        .find(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+                        .find(|i| {
+                            matches!(
+                                i.kind,
+                                spg_storage::IndexKind::BTree(_)
+                                    | spg_storage::IndexKind::BTreeMulti(_)
+                            )
+                        })
                         .map(|i| i.name.clone())
                 })
             })
