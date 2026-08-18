@@ -498,6 +498,7 @@ pub(crate) fn try_index_seek_positions(
         }
         flatten_and(where_expr, &mut conjuncts);
         let mut best: Option<(usize, &Expr)> = None;
+        let mut eq_cols: Vec<usize> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -510,9 +511,83 @@ pub(crate) fn try_index_seek_positions(
                 && let Some(idx) = table.index_on(col_pos)
                 && let Some(key) = probe_key(schema_cols, col_pos, &value)
             {
+                eq_cols.push(col_pos);
                 let n = idx.lookup_eq(&key).len();
                 if best.is_none_or(|(bn, _)| n < bn) {
                     best = Some((n, c));
+                }
+            }
+        }
+        // 7.38.1 S7 (round two) — RANGE candidates compete too: merge
+        // one-sided bounds per column across the conjuncts (a non-range
+        // leaf simply contributes nothing) and count each through the
+        // capped range walk. TPC-C's stock_level / delivery shapes are
+        // `w_id = 1 AND d_id = ? AND o_id BETWEEN a AND b`: the o_id
+        // range names ~200 rows while the best equality (d_id) names
+        // 30k — exact-only range parsing never saw it next to the
+        // equalities.
+        let mut range_bounds: Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> = Vec::new();
+        for c in &conjuncts {
+            let _ = collect_range_bounds(c, schema_cols, table_alias, &mut range_bounds);
+        }
+        let cap = best
+            .map(|(n, _)| n)
+            .unwrap_or(table.rows().len() / 4)
+            .min(table.rows().len() / 4);
+        let mut best_range: Option<(usize, usize, Bound<IndexKey>, Bound<IndexKey>)> = None;
+        for (col_pos, lo, hi) in range_bounds {
+            if matches!((&lo, &hi), (Bound::Unbounded, Bound::Unbounded)) {
+                continue;
+            }
+            // An equality on the same column already competed with its
+            // O(1) lookup_eq count; counting its degenerate range twin
+            // would WALK up to `cap` locators per query — measured as a
+            // 34.5 -> 27.6 tps tpcc regression before this guard.
+            if eq_cols.contains(&col_pos) {
+                continue;
+            }
+            let Some(idx) = table.index_on(col_pos) else {
+                continue;
+            };
+            let Some(locs) =
+                idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |_| true)
+            else {
+                continue;
+            };
+            let n = locs.len();
+            if best.is_none_or(|(bn, _)| n < bn)
+                && best_range.as_ref().is_none_or(|(bn, ..)| n < *bn)
+            {
+                best_range = Some((n, col_pos, lo, hi));
+            }
+        }
+        if let Some((_, col_pos, lo, hi)) = best_range {
+            if let Some(idx) = table.index_on(col_pos)
+                && let Some(locators) = idx.lookup_range_capped_by(
+                    bound_as_ref(&lo),
+                    bound_as_ref(&hi),
+                    table.rows().len() / 4,
+                    |l| match l {
+                        spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                        spg_storage::RowLocator::Cold { .. } => true,
+                    },
+                )
+            {
+                let mut out = Vec::with_capacity(locators.len());
+                let mut all_hot = true;
+                for loc in &locators {
+                    match *loc {
+                        spg_storage::RowLocator::Hot(i) => out.push(i),
+                        spg_storage::RowLocator::Cold { .. } => {
+                            all_hot = false;
+                            break;
+                        }
+                    }
+                }
+                if all_hot {
+                    out.sort_unstable();
+                    table.note_index_scan(out.len() as u64);
+                    return Some(out);
                 }
             }
         }
@@ -1193,6 +1268,7 @@ pub(crate) fn try_index_seek<'a>(
         }
         flatten_and(where_expr, &mut conjuncts);
         let mut best: Option<(usize, &Expr)> = None;
+        let mut eq_cols: Vec<usize> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -1205,10 +1281,80 @@ pub(crate) fn try_index_seek<'a>(
                 && let Some(idx) = table.index_on(col_pos)
                 && let Some(key) = probe_key(schema_cols, col_pos, &value)
             {
+                eq_cols.push(col_pos);
                 let n = idx.lookup_eq(&key).len();
                 if best.is_none_or(|(bn, _)| n < bn) {
                     best = Some((n, c));
                 }
+            }
+        }
+        // 7.38.1 S7 (round two) — RANGE candidates compete with the
+        // equalities on the same count (see the positions variant).
+        let mut range_bounds: Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> = Vec::new();
+        for c in &conjuncts {
+            let _ = collect_range_bounds(c, schema_cols, table_alias, &mut range_bounds);
+        }
+        let cap = best
+            .map(|(n, _)| n)
+            .unwrap_or(table.rows().len() / 4)
+            .min(table.rows().len() / 4);
+        let mut best_range: Option<(usize, usize, Bound<IndexKey>, Bound<IndexKey>)> = None;
+        for (col_pos, lo, hi) in range_bounds {
+            if matches!((&lo, &hi), (Bound::Unbounded, Bound::Unbounded)) {
+                continue;
+            }
+            // An equality on the same column already competed with its
+            // O(1) lookup_eq count; counting its degenerate range twin
+            // would WALK up to `cap` locators per query — measured as a
+            // 34.5 -> 27.6 tps tpcc regression before this guard.
+            if eq_cols.contains(&col_pos) {
+                continue;
+            }
+            let Some(idx) = table.index_on(col_pos) else {
+                continue;
+            };
+            let Some(locs) =
+                idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |_| true)
+            else {
+                continue;
+            };
+            let n = locs.len();
+            if best.is_none_or(|(bn, _)| n < bn)
+                && best_range.as_ref().is_none_or(|(bn, ..)| n < *bn)
+            {
+                best_range = Some((n, col_pos, lo, hi));
+            }
+        }
+        if let Some((_, col_pos, lo, hi)) = best_range
+            && let Some(idx) = table.index_on(col_pos)
+            && let Some(locators) = idx.lookup_range_capped_by(
+                bound_as_ref(&lo),
+                bound_as_ref(&hi),
+                table.rows().len() / 4,
+                |l| match l {
+                    spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                    spg_storage::RowLocator::Cold { .. } => true,
+                },
+            )
+        {
+            let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
+            let mut all_hot = true;
+            for loc in &locators {
+                match *loc {
+                    spg_storage::RowLocator::Hot(i) => {
+                        if let Some(row) = table.rows().get(i) {
+                            out.push(Cow::Borrowed(row));
+                        }
+                    }
+                    spg_storage::RowLocator::Cold { .. } => {
+                        all_hot = false;
+                        break;
+                    }
+                }
+            }
+            if all_hot {
+                table.note_index_scan(out.len() as u64);
+                return Some(out);
             }
         }
         if let Some((_, c)) = best {
