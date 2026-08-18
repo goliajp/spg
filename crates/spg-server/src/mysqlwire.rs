@@ -601,6 +601,10 @@ struct PreparedState {
 }
 
 struct PreparedEntry {
+    /// r1067 — the (type, flags) byte pairs from the last EXECUTE with
+    /// new_params_bound_flag=1. MySQL clients (sysbench, connectors)
+    /// send types once and set the flag to 0 on every later EXECUTE.
+    last_param_types: Vec<(u8, u8)>,
     sql: String,
     /// Output column schemas captured at PREPARE so EXECUTE
     /// returns the same column shape without re-describing.
@@ -1180,6 +1184,73 @@ fn handle_com_query(
 
 // ---- COM_STMT_PREPARE / EXECUTE ----------------------------
 
+/// r1067 (7.38 S5.2) — MySQL prepared statements use bare `?`
+/// placeholders; the engine's lexer reads a bare `?` as PG's jsonb
+/// key-exists operator, so `WHERE id=?` failed COM_STMT_PREPARE with
+/// a syntax error (sysbench's very first statement). Rewrite `?` to
+/// `$1..$n` at the wire boundary — quote-, backtick-, and comment-
+/// aware — so the engine sees its own placeholder spelling. Dialect
+/// adaptation lives HERE, not in the shared parser.
+fn rewrite_question_placeholders(sql: &str) -> String {
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0u16;
+    let mut i = 0usize;
+    while i < b.len() {
+        match b[i] {
+            b'\'' | b'"' | b'`' => {
+                let q = b[i];
+                out.push(b[i] as char);
+                i += 1;
+                while i < b.len() {
+                    out.push(b[i] as char);
+                    if b[i] == q {
+                        // '' style escape inside same-quote strings.
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            out.push(b[i + 1] as char);
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                while i < b.len() && b[i] != b'\n' {
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                out.push_str("/*");
+                i += 2;
+                while i < b.len() {
+                    if b[i] == b'*' && i + 1 < b.len() && b[i + 1] == b'/' {
+                        out.push_str("*/");
+                        i += 2;
+                        break;
+                    }
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+            }
+            b'?' => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+                i += 1;
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 fn handle_com_stmt_prepare(
     stream: &mut (dyn ReadWrite + '_),
     state: &Arc<ServerState>,
@@ -1192,6 +1263,9 @@ fn handle_com_stmt_prepare(
     caps: ClientCaps,
 ) -> std::io::Result<()> {
     let status = tx_status(state, conn_tx_id, autocommit);
+    // r1067 — `?` → `$N` before the engine ever sees the text.
+    let sql_owned = rewrite_question_placeholders(sql);
+    let sql = sql_owned.as_str();
     let (param_count, columns) = {
         let Ok(mut engine) = state.engine.write() else {
             return write_packet(
@@ -1218,6 +1292,7 @@ fn handle_com_stmt_prepare(
     prepared.next_id = id;
     let num_columns = columns.len() as u16;
     let entry = PreparedEntry {
+        last_param_types: Vec::new(),
         sql: sql.to_string(),
         columns: columns.clone(),
         param_count,
@@ -1314,7 +1389,7 @@ fn handle_com_stmt_execute(
     let _flags = payload[4];
     let _iteration = u32::from_le_bytes(payload[5..9].try_into().unwrap());
 
-    let entry = match prepared.by_id.get(&stmt_id) {
+    let mut entry = match prepared.by_id.get(&stmt_id) {
         Some(e) => e.clone_for_exec(),
         None => {
             return write_packet(
@@ -1332,7 +1407,14 @@ fn handle_com_stmt_execute(
     let _scope = StatementScope::begin(conn_state, &entry.sql);
 
     // Parse parameters per the binary protocol.
-    let params = match parse_execute_params(&entry, &payload[9..]) {
+    let parse_res = parse_execute_params(&mut entry, &payload[9..]);
+    // r1067 — persist the cached types into the ROSTER entry (the
+    // local `entry` is a per-execute clone): the next EXECUTE with
+    // flag 0 must find them.
+    if let Some(orig) = prepared.by_id.get_mut(&stmt_id) {
+        orig.last_param_types = entry.last_param_types.clone();
+    }
+    let params = match parse_res {
         Ok(p) => p,
         Err(msg) => {
             return write_packet(stream, start_seqno, &encode_err_packet(1064, "42000", &msg));
@@ -1593,6 +1675,7 @@ fn ymd_from_days_since_epoch(days: i32) -> (u16, u8, u8) {
 impl PreparedEntry {
     fn clone_for_exec(&self) -> Self {
         Self {
+            last_param_types: self.last_param_types.clone(),
             sql: self.sql.clone(),
             columns: self.columns.clone(),
             param_count: self.param_count,
@@ -1610,7 +1693,7 @@ impl PreparedEntry {
 ///     * == 0: reuse last bound types (we don't cache, so this
 ///       surfaces as an error)
 fn parse_execute_params(
-    entry: &PreparedEntry,
+    entry: &mut PreparedEntry,
     payload: &[u8],
 ) -> Result<Vec<Value<'static>>, String> {
     let n = entry.param_count as usize;
@@ -1625,18 +1708,30 @@ fn parse_execute_params(
     let mut pos = null_bitmap_len;
     let new_params_bound = payload[pos];
     pos += 1;
-    if new_params_bound != 1 {
-        return Err(
-            "EXECUTE without re-bound types (new_params_bound_flag = 0) is not yet supported"
-                .to_string(),
-        );
-    }
-    if payload.len() < pos + 2 * n {
-        return Err("EXECUTE payload truncated (param types)".to_string());
-    }
-    let types_start = pos;
-    let mut values_pos = types_start + 2 * n;
-    pos += 2 * n;
+    // r1067 — flag 0 means "same types as last time": MySQL clients
+    // send the type block once per statement lifetime. sysbench's
+    // whole run EXECUTEs with flag 0 after the first iteration, and
+    // this used to be a hard error.
+    let types: Vec<(u8, u8)> = if new_params_bound == 1 {
+        if payload.len() < pos + 2 * n {
+            return Err("EXECUTE payload truncated (param types)".to_string());
+        }
+        let t: Vec<(u8, u8)> = (0..n)
+            .map(|i| (payload[pos + 2 * i], payload[pos + 2 * i + 1]))
+            .collect();
+        entry.last_param_types = t.clone();
+        pos += 2 * n;
+        t
+    } else {
+        if entry.last_param_types.len() != n {
+            return Err(
+                "EXECUTE with new_params_bound_flag = 0 but no cached types for this statement"
+                    .to_string(),
+            );
+        }
+        entry.last_param_types.clone()
+    };
+    let mut values_pos = pos;
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
@@ -1644,8 +1739,8 @@ fn parse_execute_params(
             out.push(Value::Null);
             continue;
         }
-        let ty_byte = payload[types_start + 2 * i];
-        let unsigned_flag = payload[types_start + 2 * i + 1] & 0x80 != 0;
+        let ty_byte = types[i].0;
+        let unsigned_flag = types[i].1 & 0x80 != 0;
         let (value, consumed) = decode_binary_param(ty_byte, unsigned_flag, &payload[values_pos..])
             .map_err(|e| format!("param {i}: {e}"))?;
         out.push(value);

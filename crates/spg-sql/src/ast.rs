@@ -521,6 +521,9 @@ pub enum Statement {
     ShowStatus,
     /// v7.17.0 Phase 3.P0-61 — MySQL `SHOW VARIABLES`.
     ShowVariables,
+    /// r1067 — MySQL `SHOW VARIABLES LIKE 'pattern'` (sysbench-tpcc
+    /// probes isolation with it at connect).
+    ShowVariablesLike(String),
     /// v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
     ShowProcesslist,
     /// v7.39 (round 320, V53) — `DISCARD { ALL | PLANS | SEQUENCES | TEMP }`.
@@ -5008,6 +5011,7 @@ impl Statement {
             | Statement::ShowIndexes(_)
             | Statement::ShowStatus
             | Statement::ShowVariables
+            | Statement::ShowVariablesLike(_)
             | Statement::ShowProcesslist
             | Statement::ShowColumns(_)
             | Statement::ShowUsers
@@ -5666,6 +5670,9 @@ impl fmt::Display for Statement {
             Self::ShowIndexes(t) => write!(f, "SHOW INDEXES FROM {}", quote_ident(t)),
             Self::ShowStatus => f.write_str("SHOW STATUS"),
             Self::ShowVariables => f.write_str("SHOW VARIABLES"),
+            Self::ShowVariablesLike(p) => {
+                write!(f, "SHOW VARIABLES LIKE '{}'", p.replace('\'', "''"))
+            }
             Self::ShowProcesslist => f.write_str("SHOW PROCESSLIST"),
             Self::Discard(t) => write!(f, "DISCARD {t}"),
             Self::Kill { query_only, id } => {

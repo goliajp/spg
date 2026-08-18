@@ -496,3 +496,128 @@ pub fn pgbench(root: &Path, runid: &str) -> Result<String, String> {
         "tpcb s=1: SPG c1 [{solo_tps}] vs PG18 c1 [{pg_tps}]; SPG c4 [{cont_tps}, {cont_failed} — MATRIX #20]"
     ))
 }
+
+/// full-tier `sysbench` (7.38 S5.2, D21) — the MySQL-dialect leg:
+/// sysbench oltp_read_write over SPG's mysql wire (zero ignored
+/// errors required), a same-machine MySQL control leg via the D13
+/// oracle image, and — when the Percona tpcc scripts are present at
+/// /tmp/sysbench-tpcc — a tpcc leg too (absence is a loud note, not
+/// a silent skip). Needs a native `sysbench` on the runner.
+///
+/// # Errors
+/// Missing sysbench, server failure, or any leg with errors.
+pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
+    let sysbench = ["/opt/homebrew/bin/sysbench", "/usr/local/bin/sysbench"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|p| (*p).to_string())
+        .ok_or("sysbench not installed on this runner (brew install sysbench)")?;
+    let bin = root.join("target/release/spg-server");
+    if !bin.exists() {
+        sh(root, "cargo build --release -q -p spg-server")?;
+    }
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sb"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    // The mysql wire rides an env var, so spawn with it set.
+    let mut roster = Roster::new();
+    let my_port = 25459; // one below the suite pg range; probed by bind
+    if std::net::TcpListener::bind(("127.0.0.1", my_port)).is_err() {
+        return Err("port 25459 (mysql-wire leg) is taken — janitor time".into());
+    }
+    let _pg = roster.spawn_server_env(
+        "sysbench-leg",
+        &bin,
+        &tmp,
+        Duration::from_secs(20),
+        "127.0.0.1",
+        &[("SPG_MYSQLWIRE_ADDR", "127.0.0.1:25459")],
+    )?;
+    let uri = format!(
+        "--mysql-host=127.0.0.1 --mysql-port={my_port} --mysql-user=bench --mysql-password=bench --mysql-db=bench"
+    );
+    sh(
+        root,
+        &format!("{sysbench} oltp_read_write {uri} --tables=2 --table-size=1000 prepare"),
+    )?;
+    let run = sh(
+        root,
+        &format!(
+            "{sysbench} oltp_read_write {uri} --tables=2 --table-size=1000 --threads=1 --time=10 run"
+        ),
+    )?;
+    let pick = |out: &str, pat: &str| {
+        out.lines()
+            .find(|l| l.trim_start().starts_with(pat))
+            .unwrap_or("(missing)")
+            .trim()
+            .to_string()
+    };
+    let spg_tx = pick(&run, "transactions:");
+    let spg_err = pick(&run, "ignored errors:");
+    if !spg_err.contains("0      (0.00 per sec.)")
+        && !spg_err.contains("ignored errors:                      0")
+    {
+        return Err(format!("sysbench SPG leg had errors: {spg_err}"));
+    }
+    // tpcc leg — only when the Percona scripts are on the runner.
+    let tpcc_note = if std::path::Path::new("/tmp/sysbench-tpcc/tpcc.lua").exists() {
+        sh(
+            root,
+            &format!(
+                "cd /tmp/sysbench-tpcc && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 prepare"
+            ),
+        )?;
+        let t = sh(
+            root,
+            &format!(
+                "cd /tmp/sysbench-tpcc && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 --threads=1 --time=10 run"
+            ),
+        )?;
+        format!("; tpcc [{}]", pick(&t, "transactions:"))
+    } else {
+        "; tpcc SKIPPED (clone Percona-Lab/sysbench-tpcc to /tmp/sysbench-tpcc)".to_string()
+    };
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    // Control leg — the D13 mysql oracle image, same client, same
+    // shape. Best-effort: a control that can't start is a note, not
+    // a red (the SPG leg above is the gate).
+    let orb = "/Applications/OrbStack.app/Contents/MacOS/xbin";
+    let docker = if std::path::Path::new(orb).exists() {
+        format!("PATH=\"$PATH:{orb}\" docker")
+    } else {
+        "docker".to_string()
+    };
+    let control = (|| -> Result<String, String> {
+        sh(
+            root,
+            &format!("{docker} compose -f xtests/oracle/docker-compose.yml up -d --wait mysql"),
+        )?;
+        let curi = "--mysql-host=127.0.0.1 --mysql-port=53306 --mysql-user=root --mysql-password=testpass --mysql-db=testdb";
+        sh(
+            root,
+            &format!("{sysbench} oltp_read_write {curi} --tables=2 --table-size=1000 prepare"),
+        )?;
+        let r = sh(
+            root,
+            &format!(
+                "{sysbench} oltp_read_write {curi} --tables=2 --table-size=1000 --threads=1 --time=10 run"
+            ),
+        );
+        let _ = sh(
+            root,
+            &format!("{docker} compose -f xtests/oracle/docker-compose.yml down -v"),
+        );
+        r.map(|out| pick(&out, "transactions:"))
+    })();
+    let control_note = match control {
+        Ok(tx) => format!("; MySQL control [{tx}]"),
+        Err(e) => format!(
+            "; MySQL control UNAVAILABLE ({})",
+            e.lines().next().unwrap_or("")
+        ),
+    };
+    Ok(format!(
+        "oltp_read_write SPG [{spg_tx}]{tpcc_note}{control_note}"
+    ))
+}

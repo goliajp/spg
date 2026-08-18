@@ -449,6 +449,7 @@ impl Engine {
             Statement::ShowIndexes(name) => self.exec_show_indexes(&name),
             Statement::ShowStatus => Ok(self.exec_show_status()),
             Statement::ShowVariables => Ok(self.exec_show_variables()),
+            Statement::ShowVariablesLike(p) => Ok(self.exec_show_variables_like(&p)),
             Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::ShowColumns(table) => self.exec_show_columns(&table),
             Statement::ShowUsers => Ok(self.exec_show_users()),
