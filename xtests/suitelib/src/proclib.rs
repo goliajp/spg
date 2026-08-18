@@ -32,6 +32,9 @@ pub struct Proc {
     /// D20 — peak resident set in KB, written by the sampler thread
     /// (`ps -o rss=` every 500 ms). Zero until the first sample.
     pub peak_rss_kb: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// S4.4/CP4 (disk face) — the server's data directory, sized at
+    /// reap so every suite server leaves a disk account too.
+    pub data_dir: PathBuf,
 }
 
 /// All processes this run owns. Dropping the roster reaps.
@@ -175,6 +178,7 @@ impl Roster {
             child,
             port: pg_port,
             peak_rss_kb: peak,
+            data_dir: data_dir.to_path_buf(),
         });
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -212,22 +216,25 @@ impl Roster {
         let mut peaks: Vec<(String, u64)> = Vec::new();
         for p in &mut self.procs {
             let peak_kb = p.peak_rss_kb.load(std::sync::atomic::Ordering::Relaxed);
+            let disk_kb = dir_size_kb(&p.data_dir);
             match p.child.try_wait() {
                 Ok(Some(status)) => {
                     println!(
-                        "proclib: {} (port {}) already exited: {status} (peak rss {} MB)",
+                        "proclib: {} (port {}) already exited: {status} (peak rss {} MB, disk {} KB)",
                         p.name,
                         p.port,
-                        peak_kb / 1024
+                        peak_kb / 1024,
+                        disk_kb
                     );
                 }
                 _ => {
                     println!(
-                        "proclib: killing {} (port {}, pid {}, peak rss {} MB)",
+                        "proclib: killing {} (port {}, pid {}, peak rss {} MB, disk {} KB)",
                         p.name,
                         p.port,
                         p.child.id(),
-                        peak_kb / 1024
+                        peak_kb / 1024,
+                        disk_kb
                     );
                     let _ = p.child.kill();
                     let _ = p.child.wait();
@@ -248,6 +255,26 @@ impl Roster {
         }
         Ok(peaks)
     }
+}
+
+/// Recursive on-disk size of a directory in KB — the disk account
+/// every reap prints (WAL + audit + db growth is visible per run).
+fn dir_size_kb(dir: &Path) -> u64 {
+    fn walk(d: &Path, acc: &mut u64) {
+        if let Ok(rd) = std::fs::read_dir(d) {
+            for e in rd.filter_map(Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, acc);
+                } else if let Ok(m) = e.metadata() {
+                    *acc += m.len();
+                }
+            }
+        }
+    }
+    let mut bytes = 0u64;
+    walk(dir, &mut bytes);
+    bytes / 1024
 }
 
 impl Drop for Roster {
@@ -332,6 +359,7 @@ mod tests {
             child,
             port: PORT_RANGE.start,
             peak_rss_kb: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            data_dir: std::env::temp_dir(),
         });
         r.reap_all();
         assert!(r.procs.is_empty());
