@@ -108,6 +108,8 @@ pub(crate) fn datetime_resolve_zone_offset(z: &str) -> Option<i64> {
 
 pub use values::value_to_text;
 pub use values::value_to_text_styled;
+pub use values::value_to_text_typed;
+pub use values::value_to_text_typed_styled;
 pub use values::value_to_text_with_fsp;
 use values::{
     array_2d_dims, array_element_at, array_len, array_rebuild, value_cmp_for_min_max, value_to_f64,

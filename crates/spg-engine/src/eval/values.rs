@@ -265,6 +265,34 @@ pub fn value_to_text(v: &Value) -> String {
     value_to_text_styled(v, &crate::eval::RenderStyle::default())
 }
 
+/// 7.38.1 S4.1 (D5, MATRIX #18) — the COLUMN-AWARE canonical renderer.
+/// `timestamptz` stores the same i64 UTC microseconds as `timestamp`,
+/// so tz-ness lives only in the column type; a renderer that sees the
+/// value alone cannot append PG's offset suffix, and embedded output
+/// silently disagreed with the wire (`2026-01-05 09:00:00` vs
+/// `…09:00:00+00`). Callers that hold the result's `ColumnSchema` —
+/// the embedded surface, the sqllogictest runner, the diff/oracle
+/// harnesses — render through HERE so embedded and wire speak the
+/// same text. PG's own out-functions are type-addressed; this is the
+/// same shape.
+pub fn value_to_text_typed(v: &Value, dt: &spg_storage::DataType) -> String {
+    value_to_text_typed_styled(v, dt, &crate::eval::RenderStyle::default())
+}
+
+/// As [`value_to_text_typed`], under a session [`RenderStyle`].
+pub fn value_to_text_typed_styled(
+    v: &Value,
+    dt: &spg_storage::DataType,
+    style: &crate::eval::RenderStyle,
+) -> String {
+    match (dt, v) {
+        (spg_storage::DataType::Timestamptz, Value::Timestamp(us)) => {
+            crate::eval::format_timestamptz_styled(*us, style)
+        }
+        _ => value_to_text_styled(v, style),
+    }
+}
+
 /// v7.39 (GUC knife 3) — the canonical renderer under a session
 /// `RenderStyle` (DateStyle / IntervalStyle / extra_float_digits).
 /// `value_to_text` is the default-style shorthand.

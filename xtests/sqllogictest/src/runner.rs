@@ -127,7 +127,9 @@ impl Runner {
         sort: SortMode,
     ) -> Result<Vec<String>, String> {
         match self.engine.execute(sql) {
-            Ok(QueryResult::Rows { rows, .. }) => Ok(render_rows(&rows, type_string, sort)),
+            Ok(QueryResult::Rows { columns, rows }) => {
+                Ok(render_rows(&rows, &columns, type_string, sort))
+            }
             Ok(QueryResult::CommandOk { .. }) => {
                 Err(format!("query record but ran DDL/DML: {sql}"))
             }
@@ -196,8 +198,8 @@ impl Runner {
                 let ExpectedQuery::Values(expected) = expected else {
                     return Outcome::Skip("hashed expected — runner doesn't hash yet".into());
                 };
-                let result = match self.engine.execute(sql) {
-                    Ok(QueryResult::Rows { rows, .. }) => rows,
+                let (result, cols) = match self.engine.execute(sql) {
+                    Ok(QueryResult::Rows { columns, rows }) => (rows, columns),
                     Ok(QueryResult::CommandOk { .. }) => {
                         return Outcome::Fail(format!("query record but ran DDL/DML: {sql}"));
                     }
@@ -207,7 +209,7 @@ impl Runner {
                     }
                     Err(e) => return Outcome::Fail(format!("{e}")),
                 };
-                let actual = render_rows(&result, type_string, *sort);
+                let actual = render_rows(&result, &cols, type_string, *sort);
                 if actual == *expected {
                     Outcome::Pass
                 } else {
@@ -223,7 +225,12 @@ impl Runner {
 
 /// Flatten result rows into the cell-per-string list sqllogictest compares
 /// against, formatted by `type_string` and sorted by `sort`.
-fn render_rows(rows: &[spg_storage::Row], type_string: &str, sort: SortMode) -> Vec<String> {
+fn render_rows(
+    rows: &[spg_storage::Row],
+    columns: &[spg_storage::ColumnSchema],
+    type_string: &str,
+    sort: SortMode,
+) -> Vec<String> {
     let types: Vec<char> = type_string.chars().collect();
     let mut rendered_rows: Vec<Vec<String>> = rows
         .iter()
@@ -231,7 +238,17 @@ fn render_rows(rows: &[spg_storage::Row], type_string: &str, sort: SortMode) -> 
             row.values
                 .iter()
                 .enumerate()
-                .map(|(i, v)| render_cell(v, *types.get(i).unwrap_or(&'T')))
+                .map(|(i, v)| {
+                    // 7.38.1 S4.1 (D5) — tz-ness lives in the COLUMN,
+                    // not the value; the column-aware branch keeps the
+                    // runner's text identical to the wire's.
+                    if let Some(c) = columns.get(i)
+                        && matches!(c.ty, spg_storage::DataType::Timestamptz)
+                    {
+                        return spg_engine::eval::value_to_text_typed(v, &c.ty);
+                    }
+                    render_cell(v, *types.get(i).unwrap_or(&'T'))
+                })
                 .collect()
         })
         .collect();

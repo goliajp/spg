@@ -53,16 +53,9 @@ done
 
 # libtest args appended after `--` on full-tier runs.
 #
-# The `--skip` names are the 7.38.1 LEDGER RED PINS: red-first tests
-# committed BEFORE their fix (train rule), each `#[ignore]`d until its
-# stage lands. `--include-ignored` would drag them in and make every
-# full-tier run red by design, so the full tier skips exactly these
-# files. Un-ignoring a pin at fix time MUST come with removing its
-# entry here — S3.1/S3.2/S4.1 acceptance says so.
 TIER_ARGS=()
 if [[ "$FULL" == 1 ]]; then
     TIER_ARGS+=(--include-ignored)
-    TIER_ARGS+=(--skip e2e_ledger_red_l4_v7381)
 fi
 
 # Crates with a release-only perf_gate integration target.
