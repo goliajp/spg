@@ -730,7 +730,7 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
     sh(
         root,
         &format!(
-            "{psql} --no-psqlrc -X -q '{src_uri}' -f {}",
+            "{psql} --no-psqlrc -X -q '{src_uri}' -f - < {}",
             schema_file.display()
         ),
     )?;
@@ -744,7 +744,7 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
     let restore = sh(
         root,
         &format!(
-            "{psql} --no-psqlrc -X -q '{dst_uri}' -f {} 2>&1 | grep -c ERROR || true",
+            "{psql} --no-psqlrc -X -q '{dst_uri}' -f - < {} 2>&1 | grep -c ERROR || true",
             dump_file.display()
         ),
     )?;
@@ -779,7 +779,7 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
         &format!(
             "{psql} --no-psqlrc -X -q -tA '{pg_admin}' -c 'DROP DATABASE IF EXISTS spgdumprt' \
              -c 'CREATE DATABASE spgdumprt' && \
-             {psql} --no-psqlrc -X -q '{pg_rt}' -f {} >/dev/null 2>&1; \
+             {psql} --no-psqlrc -X -q '{pg_rt}' -f - < {} >/dev/null 2>&1; \
              {psql} --no-psqlrc -X -q -tA '{pg_rt}' -c \"{CANARY}\"",
             dump_file.display()
         ),
