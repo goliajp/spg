@@ -480,6 +480,45 @@ pub(crate) fn try_index_seek_positions(
         rhs,
     } = where_expr
     {
+        // 7.38.1 S7 — same best-equality choice as try_index_seek:
+        // probe every indexable Eq conjunct, seek the narrowest.
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        fn flatten_and<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::And,
+                rhs,
+            } = e
+            {
+                flatten_and(lhs, out);
+                flatten_and(rhs, out);
+            } else {
+                out.push(e);
+            }
+        }
+        flatten_and(where_expr, &mut conjuncts);
+        let mut best: Option<(usize, &Expr)> = None;
+        for c in &conjuncts {
+            if let Expr::Binary {
+                lhs: cl,
+                op: BinOp::Eq,
+                rhs: cr,
+            } = c
+                && let Some((col_pos, value)) =
+                    resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
+                        .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
+                && let Some(idx) = table.index_on(col_pos)
+                && let Some(key) = probe_key(schema_cols, col_pos, &value)
+            {
+                let n = idx.lookup_eq(&key).len();
+                if best.is_none_or(|(bn, _)| n < bn) {
+                    best = Some((n, c));
+                }
+            }
+        }
+        if let Some((_, c)) = best {
+            return try_index_seek_positions(c, schema_cols, table, table_alias, snapshot);
+        }
         if let Some(p) = try_index_seek_positions(lhs, schema_cols, table, table_alias, snapshot) {
             return Some(p);
         }
@@ -1129,8 +1168,54 @@ pub(crate) fn try_index_seek<'a>(
         rhs,
     } = where_expr
     {
-        // Try LHS first (typical convention: leading equality on
-        // the indexed column comes first in user-written SQL).
+        // 7.38.1 S7 (tpcc decomposition) — among ALL indexable
+        // equality conjuncts of the AND chain, seek through the one
+        // with the FEWEST index entries, not the first one found.
+        // First-hit-wins took TPC-C's leading key (c_w_id = 1 —
+        // every row at scale 1, a 19.9 ms "index scan" of 30k rows)
+        // when the c_id conjunct two spots over matched ten. The
+        // probe is one lookup_eq per candidate — map reads, no row
+        // materialisation — and the winner re-enters the ordinary
+        // single-equality path below.
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        fn flatten_and<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+            if let Expr::Binary {
+                lhs,
+                op: BinOp::And,
+                rhs,
+            } = e
+            {
+                flatten_and(lhs, out);
+                flatten_and(rhs, out);
+            } else {
+                out.push(e);
+            }
+        }
+        flatten_and(where_expr, &mut conjuncts);
+        let mut best: Option<(usize, &Expr)> = None;
+        for c in &conjuncts {
+            if let Expr::Binary {
+                lhs: cl,
+                op: BinOp::Eq,
+                rhs: cr,
+            } = c
+                && let Some((col_pos, value)) =
+                    resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
+                        .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
+                && let Some(idx) = table.index_on(col_pos)
+                && let Some(key) = probe_key(schema_cols, col_pos, &value)
+            {
+                let n = idx.lookup_eq(&key).len();
+                if best.is_none_or(|(bn, _)| n < bn) {
+                    best = Some((n, c));
+                }
+            }
+        }
+        if let Some((_, c)) = best {
+            return try_index_seek(c, schema_cols, catalog, table, table_alias, snapshot);
+        }
+        // No equality conjunct is indexable — keep the old recursion
+        // for the range / IN-list shapes hiding inside the AND.
         if let Some(rows) = try_index_seek(lhs, schema_cols, catalog, table, table_alias, snapshot)
         {
             return Some(rows);

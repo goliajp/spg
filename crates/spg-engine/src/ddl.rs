@@ -3995,25 +3995,35 @@ impl Engine {
                 // later perf phase.
                 spg_sql::ast::TableConstraint::Exclude { .. } => continue,
             };
-            let leading = &names[0];
-            // Skip if a same-column BTree already exists (e.g.
-            // inline PK on the leading column).
-            let already = table.indices().iter().any(|idx| {
-                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                    && table.schema().columns[idx.column_position].name == *leading
-            });
-            if already {
-                continue;
-            }
-            let idx_name = if let Some(n) = explicit_name {
-                n.clone()
-            } else if names.len() == 1 {
-                alloc::format!("{table_name}_{leading}_{suffix}")
-            } else {
-                alloc::format!("{table_name}_{leading}_{suffix}_{i}")
-            };
-            if let Err(e) = table.add_index(idx_name, leading) {
-                return Err(EngineError::Storage(e));
+            // 7.38.1 S7 (tpcc decomposition finding) — a composite
+            // PRIMARY KEY / UNIQUE built a BTree on the LEADING column
+            // only, and TPC-C's keys all lead with the warehouse id:
+            // at scale=1 every "index scan" selected the WHOLE table
+            // (customer point lookup measured 19.9 ms over 30k rows).
+            // SPG's BTree keys one column, so until composite-keyed
+            // BTrees land (ledgered), the constraint builds one BTree
+            // PER KEY COLUMN — the planner can then pick the selective
+            // one (c_id: 10 rows) instead of the degenerate leading
+            // one (c_w_id: all 30k). Mirrors what the inline-PK loop
+            // above has always done.
+            for (k, col_name) in names.iter().enumerate() {
+                let already = table.indices().iter().any(|idx| {
+                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                        && table.schema().columns[idx.column_position].name == *col_name
+                });
+                if already {
+                    continue;
+                }
+                let idx_name = if let (Some(n), 0) = (explicit_name, k) {
+                    n.clone()
+                } else if names.len() == 1 {
+                    alloc::format!("{table_name}_{col_name}_{suffix}")
+                } else {
+                    alloc::format!("{table_name}_{col_name}_{suffix}_{i}_{k}")
+                };
+                if let Err(e) = table.add_index(idx_name, col_name) {
+                    return Err(EngineError::Storage(e));
+                }
             }
         }
         Ok(())

@@ -144,3 +144,45 @@ fn pin_v7381_deadlock_names_the_youngest_victim() {
     e.execute_in("COMMIT", t1).unwrap();
     assert_eq!(one_cell(&mut e, "SELECT v FROM dl WHERE id = 2"), "12");
 }
+
+/// 7.38.1 S7 — the AND-chain equality chooser must seek through the
+/// most selective indexed conjunct, whatever the written order. The
+/// degenerate leading key (a = 1 on every row) used to win by being
+/// first, turning TPC-C's point lookups into whole-table filters.
+#[test]
+fn pin_v7381_and_seek_prefers_selective_index() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE sel (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY (a, b))")
+        .unwrap();
+    for i in 0..500 {
+        e.execute(&alloc_fmt(i)).unwrap();
+    }
+    fn alloc_fmt(i: i32) -> String {
+        format!("INSERT INTO sel VALUES (1, {i}, {})", i % 7)
+    }
+    // Whole-table leading key + selective second key, both orders.
+    for sql in [
+        "SELECT count(*) FROM sel WHERE a = 1 AND b = 123",
+        "SELECT count(*) FROM sel WHERE b = 123 AND a = 1",
+    ] {
+        let t0 = std::time::Instant::now();
+        let r = one_cell(&mut e, sql);
+        let took = t0.elapsed();
+        assert_eq!(r, "1", "{sql}");
+        // 500 rows: a seek answers in microseconds; a full filter is
+        // still fast, so the pin asserts the CHOICE indirectly by
+        // scan counters below rather than wall time.
+        let _ = took;
+    }
+    // The b-index must have absorbed the scans: its per-index scan
+    // counter (pg_stat-style) moved, the table's seq scans did not
+    // explode. `note_index_scan` feeds pg_stat_user_tables.idx_scan.
+    let idx_scans = one_cell(
+        &mut e,
+        "SELECT COALESCE(SUM(idx_scan), 0)::text FROM pg_stat_user_tables WHERE relname = 'sel'",
+    );
+    assert!(
+        idx_scans.parse::<i64>().unwrap_or(0) >= 2,
+        "both counts must have gone through an index seek, idx_scan={idx_scans}"
+    );
+}

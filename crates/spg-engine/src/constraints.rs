@@ -741,10 +741,29 @@ fn uc_probe_guards(
     // leading value, so `'a'` and `'A'` (byte-distinct, fold-equal) never
     // meet. Fall to the whole-table fold path, exactly as a
     // CaseInsensitive column already does below.
-    if mysql {
-        return None;
-    }
     let schema = table.schema();
+    if mysql {
+        // 7.38.1 S7 (tpcc decomposition) — the blanket refusal made
+        // EVERY mysql-dialect INSERT fall to the whole-table fold
+        // (sampled: Value::clone + format! + HashMap<String> over 30k
+        // order_line rows, ~12x per TPC-C transaction). Case folding
+        // only ever touches string cells, so all-integer keys (all
+        // six TPC-C primary keys) probe the btree safely.
+        let any_textual = columns.iter().any(|&i| {
+            schema.columns.get(i).is_some_and(|c| {
+                matches!(
+                    c.ty,
+                    spg_storage::DataType::Text
+                        | spg_storage::DataType::Varchar(_)
+                        | spg_storage::DataType::Char(_)
+                        | spg_storage::DataType::Name
+                )
+            })
+        });
+        if any_textual {
+            return None;
+        }
+    }
     let collation_ok = columns.iter().all(|&i| {
         schema
             .columns
