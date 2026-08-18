@@ -54,6 +54,19 @@ use std::time::{Duration, Instant};
 /// instead of going through the defaults.
 pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 7.38.1 S1.3 (D10) — the spawn deadline, env-tunable. Under a
+/// loaded machine (parallel cargo from a neighbouring session) the
+/// 10 s default produced 13 spurious "didn't publish listen addr"
+/// reds in one gate run; the runner may widen it via
+/// `SPG_TEST_SPAWN_DEADLINE_SECS` without touching code. A genuinely
+/// dead server still fails — later and honestly.
+pub fn startup_timeout() -> Duration {
+    std::env::var("SPG_TEST_SPAWN_DEADLINE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(STARTUP_TIMEOUT, Duration::from_secs)
+}
+
 /// All listener addresses the spg-server child can publish on its
 /// stderr. `native` is always present (it's the mandatory CLI arg);
 /// the rest are populated only when the matching env opt-in is set.
@@ -93,7 +106,7 @@ impl Default for ServerBuilder {
             want_pgwire: false,
             want_mysqlwire: false,
             want_repl: false,
-            startup_timeout: STARTUP_TIMEOUT,
+            startup_timeout: startup_timeout(),
             inherit_stderr_echo: false,
         }
     }
@@ -423,7 +436,7 @@ pub fn rss_kib_of(pid: u32) -> u64 {
 /// listener is up by the time stderr printed `listening on …`, but
 /// the OS may need a tick to register the bind in the accept queue.
 pub fn connect_to(addr: &str) -> TcpStream {
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let deadline = Instant::now() + startup_timeout();
     loop {
         match TcpStream::connect(addr) {
             Ok(s) => return s,
