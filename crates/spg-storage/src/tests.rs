@@ -5892,3 +5892,48 @@ mod numeric_index_key {
         assert_eq!(crate::NumericKey::from_parts(1, true, 0, &[]), None);
     }
 }
+
+/// 7.38.1 S2.4 (MATRIX #20 root cause) — RowId allocation is a
+/// LINEAGE invariant, not a per-clone one. Every open transaction's
+/// shadow is a `clone()` of the committed table; when each clone
+/// minted ids from its own copied counter, two concurrent shadows
+/// handed out the SAME RowId, and both versions landed in the base at
+/// COMMIT. Measured under pgbench c2: the tellers table accumulated
+/// dozens of duplicate rids, and every rid-addressed mechanism (row
+/// locks, tombstones, redo, the rebase unique pre-check) aliased —
+/// surfacing as 1.7% spurious 40001 "duplicate key" failures.
+#[test]
+fn concurrent_clones_mint_disjoint_rowids() {
+    let mut base = Table::new(make_users_schema());
+    base.insert(Row::new(alloc::vec![
+        Value::Int(1),
+        Value::text("a"),
+        Value::Null
+    ]))
+    .unwrap();
+
+    // Two transaction shadows cloned from the same committed base.
+    let mut shadow1 = base.clone();
+    let mut shadow2 = base.clone();
+    shadow1
+        .insert(Row::new(alloc::vec![
+            Value::Int(2),
+            Value::text("s1"),
+            Value::Null
+        ]))
+        .unwrap();
+    shadow2
+        .insert(Row::new(alloc::vec![
+            Value::Int(3),
+            Value::text("s2"),
+            Value::Null
+        ]))
+        .unwrap();
+
+    let r1 = *shadow1.rowids().iter().last().expect("s1 minted");
+    let r2 = *shadow2.rowids().iter().last().expect("s2 minted");
+    assert_ne!(
+        r1, r2,
+        "two shadows of one lineage must never mint the same RowId"
+    );
+}
