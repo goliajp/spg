@@ -2770,7 +2770,22 @@ impl Parser {
                     // set listing server-side state; clients probe
                     // them at connect time.
                     "status" => Ok(Statement::ShowStatus),
-                    "variables" => Ok(Statement::ShowVariables),
+                    "variables" => {
+                        // r1067 — `SHOW VARIABLES LIKE 'pat'`.
+                        if matches!(self.peek(), Token::Like) {
+                            self.advance();
+                            let pat = match self.advance() {
+                                Token::String(p) => p,
+                                other => {
+                                    return Err(self.err(format!(
+                                        "SHOW VARIABLES LIKE expects a quoted pattern, got {other:?}"
+                                    )));
+                                }
+                            };
+                            return Ok(Statement::ShowVariablesLike(pat));
+                        }
+                        Ok(Statement::ShowVariables)
+                    }
                     // v7.17.0 Phase 3.P0-62 — MySQL `SHOW PROCESSLIST`.
                     "processlist" => Ok(Statement::ShowProcesslist),
                     "create" => {

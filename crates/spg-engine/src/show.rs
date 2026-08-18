@@ -297,6 +297,24 @@ impl Engine {
         QueryResult::Rows { columns, rows }
     }
 
+    /// r1067 — `SHOW VARIABLES LIKE 'pattern'`: the full listing
+    /// filtered by MySQL LIKE semantics on Variable_name (`%` any run,
+    /// `_` any one char, case-insensitive — MySQL system variable
+    /// names compare caselessly).
+    pub(crate) fn exec_show_variables_like(&self, pattern: &str) -> QueryResult {
+        let QueryResult::Rows { columns, rows } = self.exec_show_variables() else {
+            unreachable!("exec_show_variables always answers Rows");
+        };
+        let rows = rows
+            .into_iter()
+            .filter(|r| match r.values.first() {
+                Some(Value::Text(name)) => mysql_like_ci(name, pattern),
+                _ => false,
+            })
+            .collect();
+        QueryResult::Rows { columns, rows }
+    }
+
     /// v7.17.0 Phase 3.P0-62 — `SHOW PROCESSLIST`.
     ///
     /// v7.39 (round 317, V36) — the LIVE connections, read through the
@@ -694,4 +712,18 @@ fn render_data_type(ty: DataType) -> String {
             spg_storage::RangeKind::Date => "DATEMULTIRANGE".into(),
         },
     }
+}
+
+/// Case-insensitive MySQL LIKE for variable-name filtering: `%` any
+/// sequence, `_` exactly one character, everything else literal.
+fn mysql_like_ci(text: &str, pattern: &str) -> bool {
+    fn rec(t: &[u8], p: &[u8]) -> bool {
+        match p.first() {
+            None => t.is_empty(),
+            Some(b'%') => (0..=t.len()).any(|k| rec(&t[k..], &p[1..])),
+            Some(b'_') => !t.is_empty() && rec(&t[1..], &p[1..]),
+            Some(&c) => !t.is_empty() && t[0].eq_ignore_ascii_case(&c) && rec(&t[1..], &p[1..]),
+        }
+    }
+    rec(text.as_bytes(), pattern.as_bytes())
 }

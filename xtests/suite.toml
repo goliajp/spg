@@ -170,6 +170,12 @@ budget_s = 300
 
 [[step]]
 tier = "full"
+name = "sysbench"
+impl = "internal"
+budget_s = 1200
+
+[[step]]
+tier = "full"
 name = "doc-corpus"
 impl = "external"
 cmd = "cargo run -q --release -p sqllogictest -- --docs"

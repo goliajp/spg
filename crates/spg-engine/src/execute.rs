@@ -2181,6 +2181,7 @@ impl Engine {
             Statement::ShowIndexes(name) => self.exec_show_indexes(&name),
             Statement::ShowStatus => Ok(self.exec_show_status()),
             Statement::ShowVariables => Ok(self.exec_show_variables()),
+            Statement::ShowVariablesLike(p) => Ok(self.exec_show_variables_like(&p)),
             Statement::ShowProcesslist => Ok(self.exec_show_processlist()),
             Statement::Kill { query_only, id } => self.exec_kill(query_only, &id),
             Statement::Discard(target) => self.exec_discard(target),
