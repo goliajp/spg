@@ -37,6 +37,19 @@ pub struct Proc {
     pub data_dir: PathBuf,
 }
 
+/// One spawn attempt's failure: a cross-process port-claim race is
+/// retryable with fresh ports; everything else is not.
+enum SpawnAttempt {
+    Fatal(String),
+    PortRace(String),
+}
+
+impl SpawnAttempt {
+    fn fatal(e: String) -> Self {
+        Self::Fatal(e)
+    }
+}
+
 /// All processes this run owns. Dropping the roster reaps.
 #[derive(Default)]
 pub struct Roster {
@@ -55,7 +68,13 @@ impl Roster {
     /// When every port in the range is taken — which means earlier runs
     /// leaked, and the caller should say so rather than hunt elsewhere.
     pub fn free_port(&self) -> Result<u16, String> {
-        for p in PORT_RANGE {
+        // Rotate the scan start by pid so concurrent test PROCESSES
+        // spread across the range instead of all courting the first
+        // port — full runs saw three suites claim 25460 at once.
+        let len = PORT_RANGE.end - PORT_RANGE.start;
+        let off = (std::process::id() as u16) % len;
+        for i in 0..len {
+            let p = PORT_RANGE.start + (off + i) % len;
             if self.procs.iter().any(|x| x.port == p) {
                 continue;
             }
@@ -127,12 +146,47 @@ impl Roster {
         // fast failing exec (bad addr) pays the scan once, outside any
         // deadline.
         warm_binary_once(binary);
-        let pg_port = self.free_port()?;
+        // Port-claim race (7.38.1 CP1): two test PROCESSES can probe
+        // the same port as free, spawn, and the loser exits at bind
+        // with the pgwire side already answering — the client then
+        // sees "peer closed" mid-flight. The probe can't reserve, so
+        // the spawn retries with fresh ports when the child dies young.
+        let mut last_err = String::new();
+        for _attempt in 0..3 {
+            match self.spawn_server_attempt(name, binary, data_dir, timeout, pg_bind, envs) {
+                Ok(port) => return Ok(port),
+                Err(SpawnAttempt::Fatal(e)) => return Err(e),
+                Err(SpawnAttempt::PortRace(e)) => {
+                    println!("proclib: {name}: {e}; retrying with fresh ports");
+                    last_err = e;
+                    std::thread::sleep(Duration::from_millis(
+                        50 + u64::from(std::process::id() % 7) * 30,
+                    ));
+                }
+            }
+        }
+        Err(format!("{name}: {last_err} (after 3 port-race retries)"))
+    }
+
+    fn spawn_server_attempt(
+        &mut self,
+        name: &str,
+        binary: &Path,
+        data_dir: &Path,
+        timeout: Duration,
+        pg_bind: &str,
+        envs: &[(&str, &str)],
+    ) -> Result<u16, SpawnAttempt> {
+        let fatal = SpawnAttempt::fatal;
+        let pg_port = self.free_port().map_err(SpawnAttempt::Fatal)?;
         let native_port = {
             // Reserve pg_port by pushing a placeholder before the second probe.
             let held = pg_port;
+            let len = PORT_RANGE.end - PORT_RANGE.start;
+            let off = (std::process::id() as u16) % len;
             let mut np = None;
-            for p in PORT_RANGE {
+            for i in 0..len {
+                let p = PORT_RANGE.start + (off + i) % len;
                 if p != held
                     && !self.procs.iter().any(|x| x.port == p)
                     && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
@@ -141,11 +195,12 @@ impl Roster {
                     break;
                 }
             }
-            np.ok_or("no second free port for the native listener")?
+            np.ok_or_else(|| fatal("no second free port for the native listener".into()))?
         };
-        std::fs::create_dir_all(data_dir).map_err(|e| format!("{name}: mkdir data dir: {e}"))?;
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| fatal(format!("{name}: mkdir data dir: {e}")))?;
         let log = data_dir.join("server.log");
-        let logf = std::fs::File::create(&log).map_err(|e| format!("{name}: log: {e}"))?;
+        let logf = std::fs::File::create(&log).map_err(|e| fatal(format!("{name}: log: {e}")))?;
         let child = Command::new(binary)
             .arg(format!("127.0.0.1:{native_port}"))
             .arg(data_dir.join("db"))
@@ -154,11 +209,12 @@ impl Roster {
             .env("SPG_PG_ADDR", format!("{pg_bind}:{pg_port}"))
             .envs(envs.iter().map(|(k, v)| (*k, *v)))
             .stdout(Stdio::from(
-                logf.try_clone().map_err(|e| format!("{name}: log: {e}"))?,
+                logf.try_clone()
+                    .map_err(|e| fatal(format!("{name}: log: {e}")))?,
             ))
             .stderr(Stdio::from(logf))
             .spawn()
-            .map_err(|e| format!("{name}: spawn {}: {e}", binary.display()))?;
+            .map_err(|e| fatal(format!("{name}: spawn {}: {e}", binary.display())))?;
         // D20 — RSS sampler: 500 ms `ps -o rss=` polls, peak kept in
         // a shared cell the roster reads at reap. The thread exits on
         // its own when the pid disappears; it holds no other handles.
@@ -189,9 +245,33 @@ impl Roster {
             data_dir: data_dir.to_path_buf(),
         });
         let deadline = Instant::now() + timeout;
+        let mut answered = false;
         while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", pg_port)).is_ok() {
+            // A young death is the port race's signature: the loser of
+            // a cross-process bind claim exits(1) — even after its
+            // pgwire side briefly answered. Confirm the child is still
+            // alive AFTER the port answers before handing it out.
+            let died = matches!(
+                self.procs.last_mut().and_then(|p| p.child.try_wait().ok()),
+                Some(Some(_))
+            );
+            if died {
+                let p = self.procs.pop().expect("just spawned");
+                let _ = std::fs::remove_dir_all(&p.data_dir);
+                return Err(SpawnAttempt::PortRace(format!(
+                    "exited during startup on port {pg_port} (bind race)"
+                )));
+            }
+            if answered {
                 return Ok(pg_port);
+            }
+            if TcpStream::connect(("127.0.0.1", pg_port)).is_ok() {
+                answered = true;
+                // Grace beat: a bind-race loser answers on pgwire,
+                // then exits when the native bind fails — give it
+                // time to die visibly before trusting the port.
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -200,9 +280,9 @@ impl Roster {
             let _ = f.read_to_string(&mut tail);
         }
         let tail: String = tail.lines().rev().take(5).collect::<Vec<_>>().join(" | ");
-        Err(format!(
+        Err(fatal(format!(
             "{name}: port {pg_port} not answering after {timeout:?}; log tail: {tail}"
-        ))
+        )))
     }
 
     /// Kill everything still running and print the roster. Never
@@ -373,6 +453,31 @@ mod tests {
         let r = Roster::new();
         let p = r.free_port().expect("a free port");
         assert!(PORT_RANGE.contains(&p), "{p}");
+    }
+
+    /// 7.38.1 CP1 — a child that dies during startup (the bind-race
+    /// signature) is retried with fresh ports, and the final error
+    /// names the retries instead of hanging out the full timeout.
+    #[test]
+    fn early_exit_spawn_retries_then_reports_the_race() {
+        let _serial = server_test_guard();
+        let tmp = run_tmp_dir("port-race");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mut r = Roster::new();
+        let err = r
+            .spawn_server(
+                "racer",
+                Path::new("/usr/bin/false"),
+                &tmp,
+                Duration::from_secs(10),
+            )
+            .expect_err("a startup death must not hand out the port");
+        assert!(
+            err.contains("port-race retries"),
+            "want the retry trail in the error, got: {err}"
+        );
+        assert!(r.procs.is_empty(), "dead attempts must not linger");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
