@@ -8,38 +8,88 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.0] — Unreleased (test constitution train, in progress)
+## [7.38.0] — 2026-08-18
 
-v7.38 is a minor version doing one thing: **establish the SPG test
-suite as professional / high-perf / complete / daily-runnable**. Once
-landed, all future versions must pass v7.38's gate.
+The test constitution. v7.38 does one thing: it **establishes the SPG
+test suite as professional, fast, complete, and daily-runnable** — and
+makes it law: **from this version on, every release must pass
+`scripts/suite.sh prerelease` before it ships.** The gate found and
+fixed real defects while it was being built; they ship here too.
 
-Vision lock (2026-06-22): SPG is to be ≥ PG on every angle. Vision-
-level feature roadmap (RLS, schema isolation, multi-DB, triggers/PL,
-inheritance/partitioning, full-text, replication, extensions) is
-anchored in `memory/vision-spg-ge-pg-everywhere.md`. v7.38 builds the
-gate that lets all of that ship without regressions.
+### Added — the suite (`xtests/suitelib` + friends)
 
-**4 元机制(P0,必须先建)**:
-- A. injection_points framework — Rust macro, compile-time no-op in
-  release, attach/wakeup surface in test
-- B. permutation matrix runner — `xtests/perm-runner/` + 5 perm
-  (embedded / server_simple / server_extended / joinfold_off / topk_off)
-- C. 三主差分 oracle — `xtests/oracle/{pg18,mysql,mariadb}/` docker
-  + sort-then-compare + adjust_*() normalization
-- D. 测试模式 GUC framework — 7 旋钮接 engine surface
+- **Three tiers as data** (`xtests/suite.toml`): `precommit` (≤150 s
+  hard, budget-gated, wired into the git pre-commit hook), `prerelease`
+  (≤25 min on the mini runner, the release gate), `full` (nightly
+  find-problems tier, eleven panels). Budgets are gates, not wishes;
+  reports are JSON, diffable run to run; adjacent external steps can
+  run in parallel groups with a deterministic ledger.
+- **Permutation matrix runner completed**: the two server permutations
+  drive every corpus record over REAL pgwire — `server_simple` on the
+  simple protocol, `server_extended` through Parse/Bind/Describe/
+  Execute/Sync. Five permutations × full corpus.
+- **Three-master differential oracle, live**: the same fixtures run on
+  SPG and on postgres:18.6 / mysql:9.7.2 / mariadb:12.3.2 containers
+  (D13-pinned), captured in each engine's own words, normalised, and
+  byte-compared; per-dialect partition lists; `--bless` capture.
+- **Isolation harness**: spec-file permutations over multiple real
+  connections against a real server, transcripts blessed and compared.
+- **Generative differ** (`spg-gendiff`): seeded structural AST
+  mutation printed by the parser's own Display, run on three legs
+  (embedded + both wire protocols); divergences shrink automatically
+  into draft regression fixtures. 10^4 statements, zero divergence.
+- **SQL:2016 coverage ledger** (140 features, machine-checked),
+  **doc-as-corpus** (every ```sql fence in README/docs executes; lying
+  documentation turns CI red), **test-mode GUCs** (8 knobs including
+  the new `SPG_TEST_FIXED_CLOCK_MICROS`), **RSS/disk accounting with
+  ceilings**, `/tmp` leak assertions, and a checked-in release skill.
+- **Classic workloads**: pgbench tpcb-like and sysbench
+  oltp_read_write / tpcc run against SPG in the full tier with
+  same-machine control legs and scoreboards.
 
-**8 轴**:SQL conformance / 三方言 specifics / pool stress /
-isolation+并发 / 事务一致性+崩溃原子性 / dump+import / 灾难恢复 /
-perf 四层(micro / simple e2e / stress / scale)
+### Fixed — found by the suite while it was being built
 
-**速度预算**:`gate.sh` fast tier ≤ 5 min on mini;`bench --fast`
-≤ 30 s;dev cargo cycle 不退化
+- **A transaction's COMMIT stopped erasing its neighbours' DDL.** The
+  sqlx gate flaked ~1-in-6: `DROP`/`CREATE TABLE` on one pool
+  connection vanished under a concurrent transaction's COMMIT. Three
+  holes, one story: the extended protocol's direct route never bumped
+  the rebase epoch; a poisoned READ COMMITTED transaction skipped both
+  the rebase and the dirty-table merge and installed its whole shadow;
+  and the merge's dirty-window was polluted by the base catalog's
+  never-cleared history. All three pinned red-first; 60/60 clean
+  stress rounds after.
+- **Seven server-path defects from the wire twin's first full-corpus
+  run**: partitioned parents answered zero rows on the streaming path
+  while COUNT(*) said three; CTEs errored "relation does not exist"
+  over the extended protocol; in-transaction SELECTs over the extended
+  protocol could not see the transaction's own writes; `nextval()`
+  over the extended protocol hit the read-only executor; rewritten
+  system catalogs errored on the streaming path; `SHOW is_superuser`
+  answered blank and unknown parameters answered success; extended-
+  protocol `PREPARE … $1` demanded Bind parameters that belong to the
+  inner statement (verified against live PG18).
+- **The server now reads the test-mode GUC snapshot** — every
+  `SPG_TEST_*` knob had been embedded-only.
+- **pgbench and sysbench walk in**: `COPY … WITH (FREEZE ON)` accepted
+  as a faithful no-op (pgbench 14+ loads with it); `END [WORK |
+  TRANSACTION]` parses as COMMIT; MySQL `?` placeholders rewrite to
+  `$N` at the wire boundary; `COM_STMT_EXECUTE` with
+  `new_params_bound_flag = 0` reuses cached types; `SHOW VARIABLES
+  LIKE 'pattern'` answers filtered.
+- **`server_version` unified** to `18.4 (spg)` across the parameter
+  status, SHOW, and catalog surfaces (two stale spellings removed).
 
-详 `.claude/notes/v7.38-plan.md` + `docs/TESTING_V2_SKELETON.md` +
-`docs/PERF_METHODOLOGY_VS_FOSS.md`(横向 perf doctrine,入立法引用).
+### Scoreboards (mini, same machine)
 
----
+- pgbench tpcb-like c=1: SPG 1289–1575 tps vs PG18 605–1215 tps, both
+  zero-failed (SPG pays an extra docker bridge hop).
+- sysbench oltp_read_write: SPG 552 tps vs MySQL 9.7.2 630 tps
+  (control rides tmpfs; ledgered as perf-campaign material), tpcc
+  clean at scale 1.
+- Known residual, ledgered loudly: under write contention (pgbench
+  c=4) ~9% of transactions fail with 40001 where PG blocks on row
+  locks — the READ COMMITTED concurrent-UPDATE blocking gap, its own
+  engine round.
 
 ## [7.37.29] — 2026-08-17
 
