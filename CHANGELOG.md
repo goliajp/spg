@@ -8,6 +8,110 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.1] — 2026-08-19
+
+The ledger clears. v7.38.0 shipped with an honest list of residuals —
+four reds, a MATRIX of open rows, and a perf ledger. 7.38.1 works that
+list to zero, and the last item on it turned out to be the biggest
+storage change of the train: a real composite-keyed B-tree.
+
+### Added
+
+- **Composite-keyed B-tree** (`IndexKind::BTreeMulti`): a multi-column
+  PRIMARY KEY / UNIQUE / CREATE INDEX now keys the whole column tuple.
+  Lexicographic slice order makes a full-tuple equality one descent and
+  any leading prefix one descent plus a bounded walk; the seek chooser
+  lets composite candidates compete with single-column and range
+  candidates on materialised row count. NULL components key as an
+  explicit NULLS-LAST component so prefix probes still find the row,
+  and the ORDER BY + LIMIT walker accepts a composite leading on the
+  sort column. Nothing catalog-visible changes — `indexdef` printed the
+  full column list before and still does. Persisted as the tag-7 index
+  payload, catalog FILE_VERSION 91. TPC-C's customer point lookup and
+  the `c_last` group land sub-millisecond (from multi-millisecond
+  candidate floods).
+- **AND-chain seek competition** (three rounds of the TPC-C
+  decomposition): every equality in an AND chain now bids its index
+  with an O(1) `lookup_eq` count and the narrowest wins; range
+  conjuncts (`BETWEEN`, one-sided bounds) bid through a capped range
+  walk beside them; composite PKs build one B-tree per key column so
+  the planner can pick the selective one. TPC-C at scale=1 went
+  2.6 → ~33 tps on the mini testbed across the campaign.
+- **Server-side lock-wait backoff**: the six wire-layer wait loops
+  retry with 100 µs exponential backoff (capped 5 ms) instead of a
+  flat 5 ms sleep.
+- **Generative differ, live-PG fourth leg**: `spg-gendiff` runs its
+  three SPG legs AND a live PostgreSQL 18 leg when the oracle
+  container is reachable (`SPG_GENDIFF_PG`); the full tier runs 10^4
+  statements per night at zero divergence, with LIMIT determinism
+  (total-order tiebreak) and agreeing-error collapse rules.
+- **pg_dump round-trip panel** (`pgdump-roundtrip`, full tier): a rich
+  schema — composites, enums, domains, partitions, matviews, casts,
+  extensions — dumped by real `pg_dump` 18, restored into a second SPG
+  server with zero errors, counts verified, and the same dump loaded
+  into live PG 18. Closing the campaign taught SPG synthetic
+  `pg_opclass` / `pg_opfamily` / `pg_amop` / `pg_amproc` /
+  `pg_extension` rows, composite types as relations, `pg_get_partkeydef`
+  by string-literal OID, matview definitions by OID, correct
+  `connoinherit`, and `SmallIntArray` `conkey`/`confkey`.
+- **Corpus leak ratchet**: a corpus file that leaves objects behind now
+  fails red instead of polluting its neighbours.
+
+### Fixed
+
+- **RC row-lock blocking** (7.38.0 ledger L1, MATRIX #20): UPDATE /
+  DELETE take tuple locks at statement time; a concurrent same-row
+  writer gets a would-block retry outside the engine guard instead of
+  racing to a spurious 40001 — pgbench tpcb at c4 runs with **zero
+  failed transactions** on both testbeds.
+- **RowId lineage** (the real root of the 40001 storm): the allocator
+  is one `Arc<AtomicU64>` shared across catalog shadows, so two clones
+  of one lineage can never mint the same RowId. Pinned by a concurrent
+  mint test and the pgbench panel.
+- **Native-path audit barrier** (ledger L2/L3): the audit record is
+  written inside the engine guard before the WAL byte, with the
+  pre-image restored and the session kept alive when the append is
+  refused — an unauditable statement now errors without applying, in
+  explicit transactions too.
+- **Column-aware rendering** (ledger L4): `value_to_text_typed` renders
+  by declared column type, closing the Timestamptz-vs-Timestamp
+  display drift the sqllogictest runner used to normalise away.
+- **drop_column and index extras**: dropping a column now shifts
+  `extra_column_positions` and drops indexes whose extras name the
+  dropped column (PG's dependent-index rule). Before this, a composite
+  UNIQUE silently enforced the wrong columns after any earlier column
+  was dropped.
+- **MySQL-dialect uniqueness probes**: the blanket probe refusal (which
+  sent every mysql-dialect INSERT to a whole-table fold) is narrowed to
+  textual key columns — all-integer keys probe the B-tree.
+- **ORDER BY position edge cases**: `ORDER BY -2` is rejected and
+  `ORDER BY 1` on a constant-only projection is accepted, both matching
+  PG 18 exactly.
+- **Suite harness**: one shared mutex for every server-spawning test
+  module (two independent statics let sibling tests interleave onto one
+  port — both nightly boxes flaked on the same signature); spawn
+  retries with fresh ports on the bind-race signature; gendiff's PG leg
+  always dials 127.0.0.1 (`host.docker.internal` resolves only inside
+  containers).
+
+### Performance
+
+- Endpoint sweep: 64 cells, **zero losses** against PostgreSQL 18 on
+  both testbeds, self-control clean.
+- pgbench tpcb s=1: SPG c1 ~1450-1600 tps vs PG18 ~580-615; c4 at
+  parity with zero failed transactions (MATRIX #20 closed).
+- sysbench oltp_read_write: within ~7% of the MySQL 9 in-container
+  control (durability-aligned; the gap is genuine engine work, measured
+  and ledgered, not sync posture — `SPG_SYNCHRONOUS_COMMIT=off` claws
+  back only +3.6%).
+- TPC-C: 2.6 → ~33 tps over the campaign; the composite B-tree lands
+  its shapes sub-millisecond and is throughput-neutral in interleaved
+  A/B; the residual against the in-container MySQL control is broad
+  per-query overhead (~1.2 ms/query vs 0.18), ledgered as the next
+  campaign with its decomposition coordinates.
+
+---
+
 ## [7.38.0] — 2026-08-18
 
 The test constitution. v7.38 does one thing: it **establishes the SPG
