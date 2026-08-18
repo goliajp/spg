@@ -22,3 +22,7 @@ query T rowsort
 SELECT d - INTERVAL '1 day' FROM t
 ----
 2024-01-14 00:00:00
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

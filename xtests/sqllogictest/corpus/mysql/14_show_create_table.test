@@ -9,3 +9,7 @@ CREATE TABLE users (id INT NOT NULL, name TEXT NOT NULL, PRIMARY KEY (id))
 # at execute time.
 statement ok
 SHOW CREATE TABLE users
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS users CASCADE

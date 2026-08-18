@@ -52,3 +52,7 @@ SELECT props::text FROM config WHERE id = 6
 # Malformed → hard error.
 statement error
 INSERT INTO config VALUES (99, 'junk-no-arrow')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS config CASCADE

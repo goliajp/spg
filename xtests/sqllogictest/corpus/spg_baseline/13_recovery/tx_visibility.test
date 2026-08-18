@@ -27,3 +27,7 @@ SELECT id, v FROM t
 
 statement ok
 COMMIT
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

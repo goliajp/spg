@@ -83,3 +83,37 @@ SELECT id FROM v_perm
 1
 2
 3
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP VIEW IF EXISTS v_def_u CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_def_uh CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_def_uw CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_full CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_merge CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_perm CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_sec_d CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_sec_i CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_temp CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_undef CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t CASCADE

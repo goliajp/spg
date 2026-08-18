@@ -99,3 +99,34 @@ SELECT id FROM child_b
 ----
 1
 2
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS parent CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_b CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_c CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_d CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_e CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_f CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_g CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_h CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child_i CASCADE

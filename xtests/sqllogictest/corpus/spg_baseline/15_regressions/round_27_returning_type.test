@@ -46,3 +46,7 @@ UPDATE r27_t SET n = n + 1000 WHERE id = 1 RETURNING id, n
 ----
 1
 1100
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS r27_t CASCADE

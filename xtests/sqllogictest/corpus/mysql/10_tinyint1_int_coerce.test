@@ -85,3 +85,19 @@ SELECT id, active::INT FROM legacy
 1
 2
 0
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS flags CASCADE
+
+statement ok
+DROP TABLE IF EXISTS truthy CASCADE
+
+statement ok
+DROP TABLE IF EXISTS toggles CASCADE
+
+statement ok
+DROP TABLE IF EXISTS maybe CASCADE
+
+statement ok
+DROP TABLE IF EXISTS legacy CASCADE

@@ -63,3 +63,7 @@ INSERT INTO schedule VALUES (99, 'not a time')
 
 statement error
 INSERT INTO schedule VALUES (99, '25:00:00')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS schedule CASCADE

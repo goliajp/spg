@@ -135,3 +135,28 @@ query I
 SELECT count(*) FROM big_customers
 ----
 2
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP VIEW IF EXISTS big_customers CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v2 CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v3 CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_high CASCADE
+
+statement ok
+DROP VIEW IF EXISTS v_highest CASCADE
+
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders CASCADE

@@ -26,3 +26,7 @@ SELECT u.id, u.name FROM users AS u ORDER BY u.id
 alice
 2
 bob
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS users CASCADE

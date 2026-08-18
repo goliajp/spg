@@ -11,3 +11,7 @@ query I rowsort
 SELECT COUNT(*) FROM t
 ----
 3
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

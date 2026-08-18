@@ -15,3 +15,19 @@ CREATE TABLE mixed_dim (a VECTOR(3) NOT NULL, b VECTOR(5))
 
 statement ok
 CREATE TABLE typed_row (id INT NOT NULL, name TEXT NOT NULL, embedding VECTOR(4))
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS small_emb CASCADE
+
+statement ok
+DROP TABLE IF EXISTS medium_emb CASCADE
+
+statement ok
+DROP TABLE IF EXISTS pair CASCADE
+
+statement ok
+DROP TABLE IF EXISTS mixed_dim CASCADE
+
+statement ok
+DROP TABLE IF EXISTS typed_row CASCADE

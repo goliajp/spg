@@ -17,3 +17,7 @@ query T rowsort
 SELECT d + INTERVAL '5 days' FROM anchor
 ----
 2024-01-20 00:00:00
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS anchor CASCADE

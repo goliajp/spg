@@ -66,3 +66,7 @@ query I rowsort
 SELECT id FROM articles WHERE MATCH(body) AGAINST ('fox') AND id = 4
 ----
 4
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS articles CASCADE

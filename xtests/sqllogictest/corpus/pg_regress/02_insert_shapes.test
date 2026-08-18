@@ -38,3 +38,7 @@ SELECT a FROM t ORDER BY a
 # Omitting a NOT NULL column without default must still fail.
 statement error
 INSERT INTO t (b) VALUES ('no-a')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

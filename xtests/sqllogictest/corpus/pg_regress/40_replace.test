@@ -89,3 +89,7 @@ query T
 SELECT replace(replace('a-b_c', '-', '+'), '_', '=')
 ----
 a+b=c
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE

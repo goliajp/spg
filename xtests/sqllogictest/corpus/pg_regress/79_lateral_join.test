@@ -75,3 +75,10 @@ bob
 50
 bob
 80
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS users CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders CASCADE

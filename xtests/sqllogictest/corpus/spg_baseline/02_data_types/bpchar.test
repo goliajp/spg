@@ -96,3 +96,13 @@ query T
 SELECT 'xyz'::char
 ----
 x
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS c CASCADE
+
+statement ok
+DROP TABLE IF EXISTS o CASCADE
+
+statement ok
+DROP TABLE IF EXISTS d CASCADE

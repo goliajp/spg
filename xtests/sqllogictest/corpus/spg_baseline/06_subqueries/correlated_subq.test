@@ -21,3 +21,10 @@ SELECT id, (SELECT SUM(w) FROM inner_t WHERE inner_t.oid = outer_t.id) FROM oute
 500
 3
 NULL
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS outer_t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS inner_t CASCADE
