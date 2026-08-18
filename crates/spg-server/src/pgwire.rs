@@ -5853,6 +5853,11 @@ fn parse_copy_options_checked(sql: &str) -> Result<CopyOptions, String> {
                     opts.null_string = Some(t.to_string());
                 }
             }
+            // r1066 (7.38 S5.1) — pgbench 14+ loads with
+            // `COPY … WITH (FREEZE ON)`; the hint is vacuum
+            // bookkeeping PG-side and a faithful no-op here, and
+            // rejecting it aborted `pgbench -i` against the drop-in.
+            "freeze" => {}
             other => {
                 return Err(other.to_ascii_lowercase());
             }

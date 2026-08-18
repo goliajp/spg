@@ -2655,6 +2655,26 @@ impl Parser {
             }
             Token::Commit => {
                 self.advance();
+                // PG: `COMMIT [WORK | TRANSACTION]`.
+                if let Token::Ident(w) = self.peek()
+                    && (w.eq_ignore_ascii_case("work") || w.eq_ignore_ascii_case("transaction"))
+                {
+                    self.advance();
+                }
+                Ok(Statement::Commit)
+            }
+            // r1066 (7.38 S5.1) — `END [WORK | TRANSACTION]` is PG's
+            // COMMIT synonym; pgbench's builtin tpcb-like script closes
+            // every transaction with `END;` and the drop-in aborted on
+            // it. Only reachable at statement start (CASE … END lives
+            // inside expressions), so no ambiguity.
+            Token::Ident(s) if s.eq_ignore_ascii_case("end") => {
+                self.advance();
+                if let Token::Ident(w) = self.peek()
+                    && (w.eq_ignore_ascii_case("work") || w.eq_ignore_ascii_case("transaction"))
+                {
+                    self.advance();
+                }
                 Ok(Statement::Commit)
             }
             Token::Rollback => {
@@ -11674,6 +11694,23 @@ impl Parser {
                     _ => true,
                 };
             }
+            // r1066 (7.38 S5.1) — pgbench 14+ loads with
+            // `COPY … WITH (FREEZE ON)`. The hint's PG effect is
+            // vacuum bookkeeping on a freshly created/truncated
+            // table; SPG's per-statement visibility makes it a
+            // faithful no-op, and rejecting it aborted `pgbench -i`
+            // against the drop-in. Accept ON/OFF/bare, change nothing.
+            "FREEZE" => match self.peek() {
+                Token::True | Token::False => {
+                    self.advance();
+                }
+                Token::Ident(s)
+                    if s.eq_ignore_ascii_case("on") || s.eq_ignore_ascii_case("off") =>
+                {
+                    self.advance();
+                }
+                _ => {}
+            },
             "DELIMITER" | "QUOTE" | "ESCAPE" => {
                 let s = match self.advance() {
                     Token::String(s) => s,
@@ -28105,6 +28142,10 @@ mod tests {
     fn begin_commit_rollback_parse_as_unit_variants() {
         assert_eq!(parse("BEGIN"), Statement::Begin(None));
         assert_eq!(parse("COMMIT"), Statement::Commit);
+        // r1066 — PG synonyms pgbench's tpcb script relies on.
+        assert_eq!(parse("END"), Statement::Commit);
+        assert_eq!(parse("END TRANSACTION"), Statement::Commit);
+        assert_eq!(parse("COMMIT WORK"), Statement::Commit);
         assert_eq!(parse("ROLLBACK"), Statement::Rollback);
         // Trailing semicolons accepted too.
         assert_eq!(parse("BEGIN;"), Statement::Begin(None));

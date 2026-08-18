@@ -30,6 +30,7 @@ fn main() {
                 "perm-matrix" => suitelib::steps::perm_matrix(root),
                 "oracle-three" => suitelib::steps::oracle_three(root),
                 "sql2016" => suitelib::steps::sql2016(root),
+                "pgbench" => suitelib::steps::pgbench(root, &runid),
                 other => Err(format!("unknown internal step {other}")),
             };
             match out {
@@ -307,6 +308,8 @@ fn main() {
                         "generative" => suitelib::steps::generative(root, &runid),
                         // S4.3 — SQL:2016 coverage ledger check.
                         "sql2016" => suitelib::steps::sql2016(root),
+                        // S5.1 — pgbench tpcb-like scoreboard.
+                        "pgbench" => suitelib::steps::pgbench(root, &runid),
                         other => Err(format!("internal step `{other}` not wired yet")),
                     },
                 });
