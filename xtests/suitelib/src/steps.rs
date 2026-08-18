@@ -417,3 +417,82 @@ pub fn sql2016(root: &Path) -> Result<String, String> {
         "sql2016 ledger: covered={covered} partial={partial} uncovered={uncovered}"
     ))
 }
+
+/// full-tier `pgbench` (7.38 S5.1, D21) — pgbench's builtin tpcb-like
+/// against SPGS over the wire, with a same-machine PG18 control leg
+/// (the bench container runs both client and control server). The
+/// drop-in bar: `pgbench -i` + the run COMPLETE, and the single-client
+/// leg finishes with ZERO failed transactions. The contended leg's
+/// failure rate prints into the account — the RC concurrent-UPDATE
+/// blocking gap is ledgered (MATRIX #20), not hidden by this step.
+///
+/// # Errors
+/// Server/build failure, init failure, or a single-client failure
+/// count above zero.
+pub fn pgbench(root: &Path, runid: &str) -> Result<String, String> {
+    let bin = root.join("target/release/spg-server");
+    if !bin.exists() {
+        sh(root, "cargo build --release -q -p spg-server")?;
+    }
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-pgb"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut roster = Roster::new();
+    let port = roster.spawn_server_on(
+        "pgbench-leg",
+        &bin,
+        &tmp,
+        Duration::from_secs(20),
+        "0.0.0.0",
+    )?;
+    let orb = "/Applications/OrbStack.app/Contents/MacOS/xbin";
+    let docker = if std::path::Path::new(orb).exists() {
+        format!("PATH=\"$PATH:{orb}\" docker")
+    } else {
+        "docker".to_string()
+    };
+    let spg_uri = format!("postgres://bench:bench@host.docker.internal:{port}/bench");
+    let grade = |out: &str| -> (String, String) {
+        let pick = |pat: &str| {
+            out.lines()
+                .find(|l| l.contains(pat))
+                .unwrap_or("(missing)")
+                .trim()
+                .to_string()
+        };
+        (pick("tps ="), pick("failed transactions"))
+    };
+    sh(
+        root,
+        &format!("{docker} exec spg-bench-postgres pgbench -i -s 1 -q '{spg_uri}'"),
+    )?;
+    let solo = sh(
+        root,
+        &format!("{docker} exec spg-bench-postgres pgbench -c 1 -T 10 '{spg_uri}'"),
+    )?;
+    let (solo_tps, solo_failed) = grade(&solo);
+    let cont = sh(
+        root,
+        &format!("{docker} exec spg-bench-postgres pgbench -c 4 -j 2 -T 10 '{spg_uri}'"),
+    )?;
+    let (cont_tps, cont_failed) = grade(&cont);
+    // Control leg: PG18 inside the same container (its own server).
+    sh(
+        root,
+        &format!("{docker} exec spg-bench-postgres pgbench -i -s 1 -q -U bench bench"),
+    )?;
+    let pg = sh(
+        root,
+        &format!("{docker} exec spg-bench-postgres pgbench -c 1 -T 10 -U bench bench"),
+    )?;
+    let (pg_tps, _) = grade(&pg);
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    if !solo_failed.contains("0 (0.000%)") {
+        return Err(format!(
+            "pgbench single-client leg had failures: {solo_failed}"
+        ));
+    }
+    Ok(format!(
+        "tpcb s=1: SPG c1 [{solo_tps}] vs PG18 c1 [{pg_tps}]; SPG c4 [{cont_tps}, {cont_failed} — MATRIX #20]"
+    ))
+}
