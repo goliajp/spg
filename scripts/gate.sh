@@ -95,6 +95,11 @@ run_unit() {
 
 run_e2e() {
     banner e2e
+    # 7.38.1 S1.3 (D10) — server-spawning e2e binaries under load:
+    # bound the spawn storm and widen the child-startup deadline.
+    # Overridable from the environment; a dead server still reds.
+    export RUST_TEST_THREADS="${RUST_TEST_THREADS:-6}"
+    export SPG_TEST_SPAWN_DEADLINE_SECS="${SPG_TEST_SPAWN_DEADLINE_SECS:-30}"
     # --tests = every test target (the merged e2e binaries, plus
     # in-crate unittests, plus the perf/SLO targets — which compile
     # empty under debug, so this stays a functional sweep).

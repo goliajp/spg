@@ -559,23 +559,51 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
     {
         return Err(format!("sysbench SPG leg had errors: {spg_err}"));
     }
-    // tpcc leg — only when the Percona scripts are on the runner.
-    let tpcc_note = if std::path::Path::new("/tmp/sysbench-tpcc/tpcc.lua").exists() {
+    // tpcc leg — the Percona scripts self-fetch to a pinned commit in
+    // the user cache (7.38.1 S1.4, D10②): no /tmp inheritance, no
+    // floating upstream. Offline runners without the cache get a loud
+    // note, never a silent skip.
+    const TPCC_PIN: &str = "f110afa8023c7924b1ba00177232a9090624acb5";
+    let tpcc_dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".cache/spg-suite/sysbench-tpcc"))
+        .map_err(|_| "no $HOME")?;
+    if !tpcc_dir.join("tpcc.lua").exists() {
+        let _ = sh(
+            root,
+            &format!(
+                "git clone -q https://github.com/Percona-Lab/sysbench-tpcc {} && git -C {} checkout -q {TPCC_PIN}",
+                tpcc_dir.display(),
+                tpcc_dir.display()
+            ),
+        );
+    } else {
+        // Present but drifted? Pin it back — the corpus is a contract.
+        let _ = sh(
+            root,
+            &format!("git -C {} checkout -q {TPCC_PIN}", tpcc_dir.display()),
+        );
+    }
+    let tpcc_note = if tpcc_dir.join("tpcc.lua").exists() {
         sh(
             root,
             &format!(
-                "cd /tmp/sysbench-tpcc && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 prepare"
+                "cd {} && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 prepare",
+                tpcc_dir.display()
             ),
         )?;
         let t = sh(
             root,
             &format!(
-                "cd /tmp/sysbench-tpcc && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 --threads=1 --time=10 run"
+                "cd {} && {sysbench} ./tpcc.lua {uri} --tables=1 --scale=1 --use_fk=0 --threads=1 --time=10 run",
+                tpcc_dir.display()
             ),
         )?;
         format!("; tpcc [{}]", pick(&t, "transactions:"))
     } else {
-        "; tpcc SKIPPED (clone Percona-Lab/sysbench-tpcc to /tmp/sysbench-tpcc)".to_string()
+        format!(
+            "; tpcc UNAVAILABLE (clone failed and no cache at {})",
+            tpcc_dir.display()
+        )
     };
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);

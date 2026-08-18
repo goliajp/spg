@@ -94,3 +94,25 @@ pkill -f "spg-server 127.0.0.1:7002"; scripts/janitor.sh   # 清点上报,永不
 
 tag 丢 v 前缀 / preflight 脏树 / PERF URI 缺失硬红 / crates 429 /
 半失败列车重入 / 已 push tag 不动 / 发布后僵尸腿 —— 各步已内建对策。
+
+## 附:本机邻载红的证据通道(7.38.0 实战成文,7.38.1 S1.4 固化)
+
+症状:preflight `gate.sh all` 在 server e2e 报成批
+`server didn't publish native listen addr within Ns` —— 且同测试
+**单跑绿**、mini 上绿。这是 spawn 风暴 × 本机邻载(并行 cargo /
+其他会话)挤爆启动窗,不是代码红。
+
+处置顺序(不许直接 SKIP):
+1. 先复核:单跑失败测试 + `uptime`(load>10 即嫌疑成立);
+   已内建缓解:`gate.sh e2e` 缺省 `RUST_TEST_THREADS=6` +
+   `SPG_TEST_SPAWN_DEADLINE_SECS=30`,可再调大。
+2. 仍红 → 在 mini 对**同一 tag** 跑全类:
+   `git checkout v<X.Y.Z>` + `PERF_REQUIRED=1 gate.sh all`
+   (perf 段需 `PSQL=$HOME/spgbench/bin/psql` docker 包装器 +
+   host.docker.internal 路由 + 0.0.0.0 腿)。
+3. mini 全绿(逐类推进到 perf 即前六类绿;perf PASS 单独确认)
+   → 本地 `SKIP_FULL=1 scripts/release.sh <ver>` 续列车,
+   commit/日志里**引用 mini 报告路径**。
+4. mini 也红 → 是真红,停列车修。
+
+SKIP_FULL 只能走这条带证据的路;裸 SKIP = r1041 裁定禁止。
