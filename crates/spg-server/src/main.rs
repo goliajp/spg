@@ -3049,7 +3049,7 @@ fn handle_query_op(
         // statement that would-blocks retries after the guard drops
         // (the holder needs the engine to COMMIT).
         let mut waits = 0u32;
-        let (mut engine, result) = loop {
+        let (mut engine, result, pre_image) = loop {
             let mut engine = state
                 .engine
                 .write()
@@ -3062,6 +3062,16 @@ fn handle_query_op(
             )
             .unwrap_or(usize::MAX);
             alloc_budget::reset_query_budget(budget, &cancel_flag);
+            // 7.38.1 S3.2 (D29 residual, ledger L3) — pre-image for the
+            // audit barrier below: with an audit chain configured, this
+            // path must be able to say "error ⇒ no effect" like the
+            // leader does, and that needs the catalog as it stood
+            // before this statement. Cloned only when auditing.
+            let pre_image = if state.audit_path.is_some() {
+                Some(engine.catalog().clone())
+            } else {
+                None
+            };
             let result =
                 engine.execute_with_cancel(&sql, spg_engine::CancelToken::from_flag(&cancel_flag));
             alloc_budget::clear_query_budget();
@@ -3071,9 +3081,52 @@ fn handle_query_op(
                 waits += 1;
                 continue;
             }
-            break (engine, result);
+            break (engine, result, pre_image);
         };
         let _ = &mut engine;
+        // 7.38.1 S3.2 — the audit barrier, native edition, INSIDE the
+        // guard and BEFORE this statement's WAL byte (mirroring the
+        // leader's r1055 ordering). Only the statements that change
+        // durable state audit; on this path that is the terminal
+        // COMMIT of an explicit tx, or a standalone write. On append
+        // failure the pre-image rolls the engine back and the WAL is
+        // never touched for THIS statement — an open tx's earlier
+        // text lines replay as an uncommitted (discarded) tx — so the
+        // client's error truthfully means "nothing happened", and the
+        // session stays alive (PG keeps the session on a statement
+        // error; the old post-hoc site tore the connection down).
+        let mut audit_failure: Option<std::io::Error> = None;
+        let audited_here = if state.audit_path.is_some()
+            && matches!(
+                result,
+                Ok(QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                })
+            ) {
+            match append_audit(state, &sql) {
+                Ok(()) => true,
+                Err(e) => {
+                    if let Some(pre) = pre_image {
+                        engine.replace_catalog(pre);
+                    }
+                    audit_failure = Some(e);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if let Some(e) = audit_failure {
+            *in_tx = engine.is_tx_open(spg_engine::IMPLICIT_TX);
+            drop(engine);
+            watchdog.cancel();
+            write_frame(
+                stream,
+                &build_error_response(&format!("audit append failed: {e}")),
+            )?;
+            return Ok(());
+        }
         // r178 — RETURNING DML answers Rows, not CommandOk; inside an
         // explicit tx those must reach the WAL too (the pre-r178 gate
         // silently dropped them from replay).
@@ -3128,7 +3181,7 @@ fn handle_query_op(
             None
         };
         drop(engine);
-        (result, wal_result, snapshot, false)
+        (result, wal_result, snapshot, audited_here)
     };
     watchdog.cancel();
     // Snapshot the catalog first; an audit entry that survives a
