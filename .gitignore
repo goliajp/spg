@@ -8,6 +8,11 @@
 /scratch
 /.claude/handoff.md
 .claude/
+# The release skill is part of the shipped engineering system (S5.4),
+# not session-local state — carve it back in.
+!.claude/skills/
+!.claude/skills/release/
+!.claude/skills/release/SKILL.md
 /dist/
 /references/
 
