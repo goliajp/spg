@@ -7040,8 +7040,10 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Int(0),
                 Value::Bool(true),
                 Value::Bool(false), /* conperiod */
-                Value::text(String::new()),
-                Value::text(String::new()),
+                // conkey: a table CHECK constrains no single column
+                // here — empty smallint[]; confkey NULL (non-FK).
+                Value::SmallIntArray(alloc::vec::Vec::new()),
+                Value::Null,
                 Value::Null,                         /* conpfeqop */
                 Value::Null,                         /* conppeqop */
                 Value::Null,                         /* conffeqop */

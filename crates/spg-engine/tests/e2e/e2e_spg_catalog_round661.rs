@@ -21,7 +21,7 @@
 //!     (`nullif`, `current_catalog`, `user`, …), and four `spg_*`.
 //!
 //! PG's own answer for what core does not provide is a different namespace —
-//! that is where extension functions live — so they move to `spg_catalog`.
+//! that is where extension functions live — so they move to `pg_spg`.
 //! A client asking "does PostgreSQL provide this?" now gets the right
 //! answer; one asking "can I call it?" still finds it.
 
@@ -64,7 +64,7 @@ fn round661_pg_catalog_claims_only_what_pg_has() {
         one(
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-             WHERE n.nspname = 'spg_catalog' AND p.proname IN \
+             WHERE n.nspname = 'pg_spg' AND p.proname IN \
              ('ifnull','unix_timestamp','benchmark','pg_stat_get_idx_scan','pg_start_backup',\
               'spg_version','uuid_generate_v4','similarity','nullif','current_catalog')"
         ),
@@ -84,14 +84,14 @@ fn round661_the_moved_functions_still_answer() {
     assert_eq!(one(&mut e, "SELECT length(uuid_generate_v4()::text)"), "36");
 }
 
-/// `spg_catalog` is a registered namespace, so the join resolves rather
+/// `pg_spg` is a registered namespace, so the join resolves rather
 /// than dangling — the failure mode round 638's pin was built for.
 #[test]
 fn round661_the_namespace_is_registered() {
     let mut e = Engine::new();
     assert_eq!(
         one(&mut e, "SELECT nspname FROM pg_namespace ORDER BY oid"),
-        "pg_catalog,public,information_schema,spg_catalog"
+        "pg_catalog,public,information_schema,pg_spg"
     );
     assert_eq!(
         one(
