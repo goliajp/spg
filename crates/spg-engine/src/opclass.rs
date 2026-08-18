@@ -279,3 +279,25 @@ const VECTOR: &[&str] = &[
     "sq8_l2_ops",
     "sq8_ip_ops",
 ];
+
+/// 7.38.1 S5.1 (pg_dump wall: pg_opclass) — every (access method,
+/// opclass name) pair SPG answers for, for the `pg_opclass` catalog
+/// synthesis. The vector list rides under both pgvector AM names,
+/// exactly as `exists_for_access_method` resolves them.
+pub(crate) fn all_opclasses() -> impl Iterator<Item = (&'static str, &'static str)> {
+    let families: &[(&str, &[&str])] = &[
+        ("btree", BTREE),
+        ("gin", GIN),
+        ("brin", BRIN),
+        ("gist", GIST),
+        ("spgist", SPGIST),
+        ("hash", HASH),
+        ("hnsw", VECTOR),
+        ("ivfflat", VECTOR),
+    ];
+    families
+        .iter()
+        .flat_map(|(am, list)| list.iter().map(move |n| (*am, *n)))
+        .collect::<alloc::vec::Vec<_>>()
+        .into_iter()
+}

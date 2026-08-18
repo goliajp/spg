@@ -4190,6 +4190,25 @@ fn inner_scope_column_names(
             }
             return true;
         }
+        // 7.38.1 S5.1 — a FROM-position table function's output
+        // columns ARE knowable: the explicit alias column list wins,
+        // and the builtins with a fixed shape publish it (pg_dump's
+        // per-attribute pass needs `option_name` recognised as INNER
+        // so the bare outer `attfdwoptions` next to it gets spliced).
+        if let Some(call) = &t.table_fn_call {
+            if !t.unnest_column_aliases.is_empty() {
+                for c in &t.unnest_column_aliases {
+                    names.insert(c.to_ascii_lowercase());
+                }
+                return true;
+            }
+            if call.0.eq_ignore_ascii_case("pg_options_to_table") {
+                names.insert("option_name".into());
+                names.insert("option_value".into());
+                return true;
+            }
+            return false;
+        }
         if t.unnest_expr.is_some() || t.generate_series_args.is_some() || t.name.is_empty() {
             return false;
         }
@@ -5048,12 +5067,27 @@ fn substitute_in_select(
         if let Some(body) = &mut from.primary.lateral_subquery {
             substitute_in_select(body, row, ctx, outer_alias, cat);
         }
+        // 7.38.1 S5.1 — a FROM-position table function's ARGUMENTS can
+        // reference the outer row too: pg_dump's per-attribute pass
+        // runs `ARRAY(SELECT … FROM pg_options_to_table(attfdwoptions))`,
+        // where `attfdwoptions` belongs to the OUTER pg_attribute row.
+        // Same walk rule as the lateral bodies above.
+        if let Some(call) = &mut from.primary.table_fn_call {
+            for a in &mut call.1 {
+                substitute_in_expr(a, row, ctx, outer_alias, cat, visible.as_ref());
+            }
+        }
         for j in &mut from.joins {
             if let Some(on) = &mut j.on {
                 substitute_in_expr(on, row, ctx, outer_alias, cat, visible.as_ref());
             }
             if let Some(body) = &mut j.table.lateral_subquery {
                 substitute_in_select(body, row, ctx, outer_alias, cat);
+            }
+            if let Some(call) = &mut j.table.table_fn_call {
+                for a in &mut call.1 {
+                    substitute_in_expr(a, row, ctx, outer_alias, cat, visible.as_ref());
+                }
             }
         }
     }
@@ -5093,15 +5127,35 @@ fn substitute_in_expr(
         && c.name != "*"
         && !is_synthetic_column_name(&c.name.to_ascii_lowercase())
         && visible.is_some_and(|v| !v.contains(&c.name.to_ascii_lowercase()))
-        && let Some(idx) = ctx
+    {
+        // 7.38.1 S5.1 — a JOINED outer publishes composite
+        // "alias.column" names, so a bare outer reference must also
+        // try the suffix — but only an UNAMBIGUOUS one (two joined
+        // relations sharing the name would be PG's "ambiguous
+        // column"). pg_dump's per-attribute pass hits this: bare
+        // `attfdwoptions` under `FROM unnest(...) JOIN pg_attribute a`.
+        let idx = ctx
             .columns
             .iter()
             .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
-    {
-        let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
-        if let Ok(lit) = value_to_literal_expr(v) {
-            *e = lit;
-            return;
+            .or_else(|| {
+                let suffix = alloc::format!(".{}", c.name.to_ascii_lowercase());
+                let mut hits = ctx
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, sc)| sc.name.to_ascii_lowercase().ends_with(&suffix));
+                match (hits.next(), hits.next()) {
+                    (Some((i, _)), None) => Some(i),
+                    _ => None,
+                }
+            });
+        if let Some(idx) = idx {
+            let v = row.values.get(idx).cloned().unwrap_or(Value::Null);
+            if let Ok(lit) = value_to_literal_expr(v) {
+                *e = lit;
+                return;
+            }
         }
     }
     if let Expr::Column(c) = e
