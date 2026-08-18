@@ -1,8 +1,12 @@
 # Testing
 
-The test surface is split into five categories. `scripts/gate.sh` is the
-single entry point for all of them; CI runs the same categories as separate
-jobs.
+**Since v7.38 the canonical entry point is `scripts/suite.sh
+<precommit|prerelease|full>`** — three tiers as data
+(`xtests/suite.toml`), each step time-budgeted and accounted to a
+JSON report, with `precommit` wired into the git pre-commit hook and
+`prerelease` required for every release. The five `gate.sh`
+categories below survive as components the tiers call; they can still
+be run directly.
 
 | Category | What runs | Build | Entry point |
 |---|---|---|---|
