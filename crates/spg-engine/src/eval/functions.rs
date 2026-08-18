@@ -16148,10 +16148,16 @@ fn apply_function_dispatch(
                 .unwrap_or(&name_arg)
                 .trim_matches('"');
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
-            match cat.view(bare) {
-                Some(def) => Ok(Value::text(pg_viewdef_render(&def.body, pretty))),
-                None => Ok(Value::Null),
+            if let Some(def) = cat.view(bare) {
+                return Ok(Value::text(pg_viewdef_render(&def.body, pretty)));
             }
+            // 7.38.1 S5.1 — materialized views answer too: pg_dump
+            // reads BOTH through pg_get_viewdef, and an empty answer
+            // made the dumped matview "appear to be empty".
+            if let Some(body) = cat.materialized_views().get(bare) {
+                return Ok(Value::text(pg_viewdef_render(body, pretty)));
+            }
+            Ok(Value::Null)
         }
         // v7.38 (read01) — pg_get_expr(adbin, adrelid) deparses a stored node
         // tree to source text. SPG's pg_attrdef.adbin already holds the
@@ -16226,7 +16232,28 @@ fn apply_function_dispatch(
                 Some(cat),
             )))
         }
-        "pg_get_triggerdef" | "pg_get_partkeydef" | "pg_get_statisticsobjdef" => Ok(Value::Null),
+        "pg_get_triggerdef" | "pg_get_statisticsobjdef" => Ok(Value::Null),
+        // 7.38.1 S5.2 — the partition-key deparse: pg_dump composes
+        // `PARTITION BY <this>` from it, and NULL printed
+        // `PARTITION BY ;` — unrestorable anywhere.
+        "pg_get_partkeydef" => {
+            let (Some(cat), Some(oid)) = (
+                ctx.catalog,
+                args.first().and_then(|v| match v {
+                    Value::Int(n) => Some(i64::from(*n)),
+                    Value::BigInt(n) => Some(*n),
+                    Value::RegClass(o, _) => Some(*o),
+                    // pg_dump spells it as a quoted literal:
+                    // `SELECT pg_get_partkeydef('16388')`.
+                    Value::Text(t) => t.trim().parse::<i64>().ok(),
+                    _ => None,
+                }),
+            ) else {
+                return Ok(Value::Null);
+            };
+            Ok(crate::system_catalog::partkey_def_text(cat, oid)
+                .map_or(Value::Null, Value::text))
+        }
         // pg_get_userbyid always returns "admin" — SPG's single-user
         // model; matches CURRENT_USER default.
         // v7.39 (read01 round 51) — SPG has one login identity per session, so
