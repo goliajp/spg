@@ -1346,7 +1346,7 @@ pub(crate) fn synth_pg_amproc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     (schema, Vec::new())
 }
 
-pub(crate) fn synth_pg_depend(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("classid", DataType::BigInt, false),
         ColumnSchema::new("objid", DataType::BigInt, false),
@@ -1356,7 +1356,48 @@ pub(crate) fn synth_pg_depend(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("refobjsubid", DataType::Int, false),
         ColumnSchema::new("deptype", DataType::Text, false),
     ];
-    let rows: Vec<Row<'static>> = Vec::new();
+    // 7.38.1 S5.2 — views and materialized views DEPEND on the
+    // relations their body reads, and pg_dump orders its output by
+    // walking exactly these edges: with an empty pg_depend it sorted
+    // mv1 before the table it selects from and the restore died on
+    // "relation does not exist". classid/refclassid are pg_class
+    // (1259), deptype 'n' (normal), one edge per body relation whose
+    // name resolves. The body is SPG's own stored SQL; the FROM list
+    // comes from the parser, not from guessing at text.
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    let mut push_edges = |body: &str, self_oid: i64, rows: &mut Vec<Row<'static>>| {
+        let Ok(spg_sql::ast::Statement::Select(sel)) =
+            spg_sql::parser::parse_statement_with(body, false)
+        else {
+            return;
+        };
+        for tname in crate::transaction::read_tables_of(&spg_sql::ast::Statement::Select(sel)) {
+            if let Some(ref_oid) = relation_oid(cat, &tname) {
+                rows.push(Row::new(alloc::vec![
+                    Value::BigInt(1259),
+                    Value::BigInt(self_oid),
+                    Value::Int(0),
+                    Value::BigInt(1259),
+                    Value::BigInt(ref_oid),
+                    Value::Int(0),
+                    Value::text("n"),
+                ]));
+            }
+        }
+    };
+    for (vname, def) in cat.views_all() {
+        let Some(listed) = cat.listed_name(vname) else {
+            continue;
+        };
+        if let Some(self_oid) = relation_oid(cat, listed) {
+            push_edges(&def.body, self_oid, &mut rows);
+        }
+    }
+    for (mname, body) in cat.materialized_views() {
+        if let Some(self_oid) = relation_oid(cat, mname) {
+            push_edges(body, self_oid, &mut rows);
+        }
+    }
     (schema, rows)
 }
 
@@ -3383,6 +3424,47 @@ pub(crate) fn synth_pg_class(
             Value::Null,        // relacl
         ]));
     }
+    // 7.38.1 S5.2 — a row PER COMPOSITE TYPE (relkind 'c'): PG models
+    // a composite as a field-only relation, and pg_dump reads the
+    // type's FIELDS from pg_attribute via pg_type.typrelid. Without
+    // these rows every composite dumped as `CREATE TYPE x AS ()` and
+    // its column data refused to restore anywhere. Oid band 56_001+,
+    // in composite_types() order (typrelid in synth_pg_type and
+    // attrelid in synth_pg_attribute follow the same sequence).
+    for (ci, (cname, def)) in cat.composite_types().iter().enumerate() {
+        let comp_oid = 56_001 + ci as i64;
+        let relnatts = i16::try_from(def.fields.len()).unwrap_or(0);
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(comp_oid),
+            Value::text(cname.clone()),
+            Value::BigInt(2200),               // relnamespace — public
+            Value::BigInt(54_001 + ci as i64), // reltype — the pg_type row
+            Value::BigInt(0),                  // reloftype
+            Value::BigInt(10),                 // relowner
+            Value::BigInt(0),                  // relam
+            Value::BigInt(0),                  // relfilenode
+            Value::BigInt(0),
+            Value::Int(0),      // relpages
+            Value::Float(-1.0), // reltuples
+            Value::Int(0),
+            Value::BigInt(0),
+            Value::Bool(false), // relhasindex
+            Value::Bool(false),
+            Value::text("p"),
+            Value::text("c"), // relkind — composite type
+            Value::SmallInt(relnatts),
+            Value::SmallInt(0),
+            Value::Bool(false), // relhasrules
+            Value::Bool(false), // relhastriggers
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true), // relispopulated
+            Value::text("n"),
+            Value::Bool(false), // relispartition
+            Value::Null,        // relacl
+        ]));
+    }
     // v7.39 (read01 round 53) — pg_class also holds a row PER INDEX
     // (relkind 'i'), which is what makes PG's canonical
     // `pg_class JOIN pg_index ON indexrelid = oid JOIN pg_am ON relam = am.oid`
@@ -3520,7 +3602,7 @@ pub(crate) fn synth_pg_class(
         ]));
     }
     for row in &mut rows {
-        splice_pg_class_v18_row(row, frozen_xid, &view_reloptions);
+        splice_pg_class_v18_row(row, frozen_xid, &view_reloptions, cat);
     }
     (schema, rows)
 }
@@ -3627,6 +3709,7 @@ fn splice_pg_class_v18_row(
     row: &mut Row<'static>,
     frozen_xid: i64,
     view_reloptions: &alloc::collections::BTreeMap<alloc::string::String, &'static str>,
+    cat: &Catalog,
 ) {
     let relkind = match row.values.get(PG_CLASS_RELKIND) {
         Some(Value::Text(k)) => k.to_string(),
@@ -3649,7 +3732,14 @@ fn splice_pg_class_v18_row(
             Value::TextArray(alloc::vec![Some(alloc::string::String::from(*o))])
         });
     row.values.push(reloptions);
-    row.values.push(Value::Null); // relpartbound
+    // 7.38.1 S5.2 — a partition child's bound deparses here; pg_dump
+    // reads it through pg_get_expr and replays ATTACH PARTITION.
+    row.values.push(
+        cat.get(&relname)
+            .and_then(|t| t.schema().partition_role.as_ref())
+            .and_then(relpartbound_text)
+            .map_or(Value::Null, Value::text),
+    );
     row.values
         .insert(PG_CLASS_RELISPARTITION + 1, Value::BigInt(minmxid));
     // v7.39 (round 640) — relfrozenxid is an `xid`, and now says so.
@@ -3818,7 +3908,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(attrelid),
                 Value::text(col.name.clone()),
-                Value::BigInt(pg_type_oid(col.ty)),
+                Value::BigInt(attr_type_oid(cat, col)),
                 Value::Int(-1), // attstattarget — -1 = use system default
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
@@ -3880,7 +3970,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(view_oid),
                 Value::text(col.name.clone()),
-                Value::BigInt(pg_type_oid(col.ty)),
+                Value::BigInt(attr_type_oid(cat, col)),
                 Value::Int(-1),
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
@@ -3916,6 +4006,65 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             ]));
         }
     }
+    // 7.38.1 S5.2 — the fields of each COMPOSITE TYPE, keyed to the
+    // relkind-'c' pg_class rows (oid band 56_001+): pg_dump reads
+    // `CREATE TYPE x AS (…)` field lists from here via typrelid.
+    for (ci, (_cname, def)) in cat.composite_types().iter().enumerate() {
+        let comp_oid = 56_001 + ci as i64;
+        for (i, (fname, fty)) in def.fields.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let attnum = (i + 1) as i16;
+            let typlen: i16 = pg_type_len(*fty);
+            // A field that is itself a named user type carries that
+            // type's oid, same rule as attr_type_oid for columns.
+            let type_oid = def
+                .field_user_types
+                .get(i)
+                .and_then(|u| u.as_ref())
+                .and_then(|uname| {
+                    let (enums, composites, domains) = user_type_oids(cat);
+                    enums
+                        .iter()
+                        .chain(composites.iter())
+                        .chain(domains.iter())
+                        .find(|(n, _)| n == uname)
+                        .map(|(_, o)| *o)
+                })
+                .unwrap_or_else(|| pg_type_oid(*fty));
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(comp_oid),
+                Value::text(fname.clone()),
+                Value::BigInt(type_oid),
+                Value::Int(-1),
+                Value::SmallInt(typlen),
+                Value::SmallInt(attnum),
+                Value::Int(0),
+                Value::Int(pg_atttypmod(*fty)),
+                Value::Bool(typlen > 0 && typlen <= 8),
+                Value::text(if typlen > 0 { "p" } else { "x" }),
+                Value::text(match typlen {
+                    1 => "c",
+                    2 => "s",
+                    4 => "i",
+                    _ => "d",
+                }),
+                Value::Bool(false), // attnotnull
+                Value::Bool(false), // atthasdef
+                Value::text(""),    // attidentity
+                Value::text(""),    // attgenerated
+                Value::Bool(false), // attisdropped
+                Value::Bool(true),  // attislocal
+                Value::Int(0),      // attinhcount
+                Value::BigInt(0),   // attcollation
+                Value::Null,        // attacl
+                Value::Text(alloc::borrow::Cow::Borrowed("")),
+                Value::Bool(false), // atthasmissing
+                Value::Null,        // attoptions
+                Value::Null,        // attfdwoptions
+                Value::Null,        // attmissingval
+            ]));
+        }
+    }
     // v7.39 (round 623, S05b) — the catalogs' OWN columns.
     //
     // This loop walked the user's relations only, so `pg_attribute` could
@@ -3937,7 +4086,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(*oid),
                 Value::text(col.name.clone()),
-                Value::BigInt(pg_type_oid(col.ty)),
+                Value::BigInt(attr_type_oid(cat, col)),
                 Value::Int(-1),
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
@@ -4003,6 +4152,33 @@ fn pg_atttypmod(ty: DataType) -> i32 {
         }
         _ => -1,
     }
+}
+
+/// 7.38.1 S5.2 — a column's `pg_attribute.atttypid`, honouring USER
+/// types: a composite / enum / domain column carries the user type's
+/// own oid (the bands `user_type_oids` publishes), not the storage
+/// representation's builtin oid. `format_type` then names `addr`
+/// instead of `jsonb`, which is what pg_dump writes back into
+/// CREATE TABLE — a composite column restored as jsonb refuses its
+/// own COPY data.
+pub(crate) fn attr_type_oid(cat: &Catalog, col: &ColumnSchema) -> i64 {
+    let (enums, composites, domains) = user_type_oids(cat);
+    if let Some(n) = &col.user_composite_type
+        && let Some((_, oid)) = composites.iter().find(|(name, _)| name == n)
+    {
+        return *oid;
+    }
+    if let Some(n) = &col.user_enum_type
+        && let Some((_, oid)) = enums.iter().find(|(name, _)| name == n)
+    {
+        return *oid;
+    }
+    if let Some(n) = &col.user_domain_type
+        && let Some((_, oid)) = domains.iter().find(|(name, _)| name == n)
+    {
+        return *oid;
+    }
+    pg_type_oid(col.ty)
 }
 
 pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
@@ -4811,8 +4987,13 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     for (name, oid) in enum_oids {
         rows.push(into_public(build_row(oid, &name, 4, "e", "E", 0, 0, "-")));
     }
-    for (name, oid) in composite_oids {
-        rows.push(into_public(build_row(oid, &name, -1, "c", "C", 0, 0, "-")));
+    for (ci, (name, oid)) in composite_oids.into_iter().enumerate() {
+        let mut r = into_public(build_row(oid, &name, -1, "c", "C", 0, 0, "-"));
+        // 7.38.1 S5.2 — typrelid points at the relkind-'c' pg_class
+        // row (56_001+ band) whose pg_attribute rows carry the fields;
+        // pg_dump reads `CREATE TYPE x AS (…)` from exactly that join.
+        r.values[11] = Value::BigInt(56_001 + ci as i64);
+        rows.push(r);
     }
     for (name, oid) in domain_oids {
         let base = cat
@@ -7038,7 +7219,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(" "),
                 Value::Bool(true),
                 Value::Int(0),
-                Value::Bool(true),
+                // connoinherit: FALSE for CHECK (PG18 differential).
+                Value::Bool(false),
                 Value::Bool(false), /* conperiod */
                 // conkey: a table CHECK constrains no single column
                 // here — empty smallint[]; confkey NULL (non-FK).
@@ -7128,7 +7310,11 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::text(" "),
                 Value::Bool(true),
                 Value::Int(0),
-                Value::Bool(true),
+                // connoinherit: FALSE for NOT NULL (PG18 differential:
+                // c=f, n=f, p=t, u=t). Claiming true printed
+                // `NOT NULL NO INHERIT` on every dumped column, which
+                // SPG's own restore refused (7.38.1 S5.2).
+                Value::Bool(false),
                 Value::Bool(false), /* conperiod */
                 conkey_display.clone(),
                 Value::Null, /* confkey: non-FK */
@@ -10231,6 +10417,7 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_constraint", 2606),
     ("pg_depend", 2608),
     ("pg_enum", 3501),
+    ("pg_extension", 3079),
     ("pg_index", 2610),
     ("pg_inherits", 2611),
     ("pg_ts_config", 3602),
@@ -10291,6 +10478,7 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_constraint" => synth_pg_constraint(cat).0,
         "pg_depend" => synth_pg_depend(cat).0,
         "pg_enum" => synth_pg_enum(cat).0,
+        "pg_extension" => synth_pg_extension().0,
         "pg_index" => synth_pg_index_raw(cat).0,
         "pg_inherits" => synth_pg_inherits(cat).0,
         "pg_ts_config" => synth_pg_ts_config(cat).0,
@@ -10544,4 +10732,70 @@ pub(crate) fn collect_meta_view_names(
             collect_meta_view_names(s, into);
         }
     }
+}
+
+/// 7.38.1 S5.2 — a partition bound in PG's SQL literal form (what
+/// `pg_get_expr(relpartbound, oid)` prints and pg_dump replays).
+pub(crate) fn partition_bound_sql(b: &spg_storage::PartitionBound) -> String {
+    use spg_storage::PartitionBound as B;
+    match b {
+        B::MinValue => String::from("MINVALUE"),
+        B::MaxValue => String::from("MAXVALUE"),
+        B::TimestampTz(us) => alloc::format!("'{}'", crate::eval::format_timestamptz(*us)),
+        B::BigInt(n) => alloc::format!("'{n}'"),
+        B::Int(n) => alloc::format!("'{n}'"),
+        B::SmallInt(n) => alloc::format!("'{n}'"),
+        B::Date(d) => alloc::format!("'{}'", crate::eval::format_date(*d)),
+        B::Text(s) => alloc::format!("'{}'", s.replace('\'', "''")),
+    }
+}
+
+/// 7.38.1 S5.2 — `pg_class.relpartbound` deparse for a partition
+/// child, PG's exact clause shape. `None` for parents / plain tables.
+pub(crate) fn relpartbound_text(role: &spg_storage::PartitionRole) -> Option<String> {
+    use spg_storage::PartitionRole as R;
+    Some(match role {
+        R::Parent { .. } => return None,
+        R::Range { lower, upper, .. } => alloc::format!(
+            "FOR VALUES FROM ({}) TO ({})",
+            partition_bound_sql(lower),
+            partition_bound_sql(upper)
+        ),
+        R::List { values, .. } => {
+            let items: Vec<String> = values.iter().map(partition_bound_sql).collect();
+            alloc::format!("FOR VALUES IN ({})", items.join(", "))
+        }
+        R::Hash {
+            modulus, remainder, ..
+        } => alloc::format!("FOR VALUES WITH (modulus {modulus}, remainder {remainder})"),
+        R::Default { .. } => String::from("DEFAULT"),
+        // Inheritance children are not partitions; no bound clause.
+        R::Inherits { .. } => return None,
+    })
+}
+
+/// 7.38.1 S5.2 — `pg_get_partkeydef(oid)`: "RANGE (ts)" and friends,
+/// from the parent's own partition metadata. `None` when the oid does
+/// not name a partitioned parent.
+pub(crate) fn partkey_def_text(cat: &Catalog, oid: i64) -> Option<String> {
+    let name = relation_name_for_oid(cat, oid)?;
+    let t = cat.get(&name)?;
+    let spg_storage::PartitionRole::Parent {
+        kind,
+        key_column_positions,
+        ..
+    } = t.schema().partition_role.as_ref()?
+    else {
+        return None;
+    };
+    let strat = match kind {
+        spg_storage::PartitionKind::Range => "RANGE",
+        spg_storage::PartitionKind::List => "LIST",
+        spg_storage::PartitionKind::Hash => "HASH",
+    };
+    let cols: Vec<String> = key_column_positions
+        .iter()
+        .filter_map(|p| t.schema().columns.get(*p).map(|c| c.name.clone()))
+        .collect();
+    Some(alloc::format!("{strat} ({})", cols.join(", ")))
 }

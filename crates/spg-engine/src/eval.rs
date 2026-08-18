@@ -1586,7 +1586,15 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
         "pg_ts_dict" => 3600,
         "pg_ts_parser" => 3601,
         "pg_ts_template" => 3764,
-        _ => return None,
+        // 7.38.1 S5.1 — stop hand-copying: anything CATALOG_RELATIONS
+        // publishes resolves here too (pg_dump's dependency pass casts
+        // 'pg_extension' / 'pg_amop' / 'pg_opfamily'::regclass).
+        other => {
+            return crate::system_catalog::CATALOG_RELATIONS
+                .iter()
+                .find(|(n, _)| other.eq_ignore_ascii_case(n))
+                .map(|(_, oid)| *oid);
+        }
     })
 }
 

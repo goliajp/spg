@@ -1661,6 +1661,24 @@ impl Engine {
         self.effective_users().contains(name)
             || name.eq_ignore_ascii_case("admin")
             || name.eq_ignore_ascii_case("postgres")
+            // 7.38.1 S5.2 — PG's predefined pg_* roles exist without
+            // anyone creating them, and pg_dump's ACL section GRANTs
+            // to `pg_database_owner` on every dump of `public`.
+            || matches!(
+                name.to_ascii_lowercase().as_str(),
+                "pg_database_owner"
+                    | "pg_read_all_data"
+                    | "pg_write_all_data"
+                    | "pg_monitor"
+                    | "pg_read_all_settings"
+                    | "pg_read_all_stats"
+                    | "pg_stat_scan_tables"
+                    | "pg_signal_backend"
+                    | "pg_checkpoint"
+                    | "pg_maintain"
+                    | "pg_use_reserved_connections"
+                    | "pg_create_subscription"
+            )
     }
 
     /// v7.39 (round 520) — the role an oid names, as `pg_get_userbyid`
