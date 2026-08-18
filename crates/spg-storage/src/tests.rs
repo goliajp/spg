@@ -2220,7 +2220,8 @@ fn nsw_clone_is_o1() {
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => {
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => {
             panic!("expected NSW")
         }
     };
@@ -2587,7 +2588,8 @@ fn nsw_index_topology_persists_through_round_trip() {
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => {
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => {
             panic!("expected NSW")
         }
     };
@@ -2600,7 +2602,8 @@ fn nsw_index_topology_persists_through_round_trip() {
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => {
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => {
             panic!("expected NSW")
         }
     };
@@ -3449,6 +3452,10 @@ fn encode_as_v8(cat: &Catalog) -> Vec<u8> {
                 IndexKind::GinJsonb(_) => panic!(
                     "v8 catalog writer cannot serialise JSONB-GIN — \
                      tests with JSONB-GIN must use the current writer"
+                ),
+                IndexKind::BTreeMulti(_) => panic!(
+                    "v8 catalog writer cannot serialise a multi-column B-tree — \
+                     tests with one must use the current writer"
                 ),
             }
         }
@@ -5936,4 +5943,181 @@ fn concurrent_clones_mint_disjoint_rowids() {
         r1, r2,
         "two shadows of one lineage must never mint the same RowId"
     );
+}
+
+/// 7.38.1 L12 — the composite B-tree answers full-tuple and prefix
+/// probes with exactly the rows a scan finds, across insert, in-place
+/// update, delete-rebuild, and a snapshot round-trip. Rows with a NULL
+/// component stay out of the map (an `=` probe can never want them).
+#[test]
+fn composite_btree_tracks_every_mutation_and_survives_a_snapshot() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("w", DataType::BigInt, false),
+            ColumnSchema::new("d", DataType::BigInt, false),
+            ColumnSchema::new("id", DataType::BigInt, true),
+            ColumnSchema::new("pad", DataType::Text, true),
+        ],
+    ))
+    .unwrap();
+    let t = c.get_mut("t").unwrap();
+    t.add_multi_index("t_wdi", 0, alloc::vec![1, 2]).unwrap();
+    for w in 1..=2i64 {
+        for d in 1..=3i64 {
+            for id in 1..=4i64 {
+                t.insert(Row::new(alloc::vec![
+                    Value::BigInt(w),
+                    Value::BigInt(d),
+                    Value::BigInt(id),
+                    Value::text("x"),
+                ]))
+                .unwrap();
+            }
+        }
+    }
+    // A NULL component keys as IndexKey::Null — the row must stay
+    // findable by prefix probes on the columns before it.
+    t.insert(Row::new(alloc::vec![
+        Value::BigInt(1),
+        Value::BigInt(1),
+        Value::Null,
+        Value::text("null-id"),
+    ]))
+    .unwrap();
+    let key = |w: i64, d: i64, id: i64| {
+        alloc::vec![IndexKey::Int(w), IndexKey::Int(d), IndexKey::Int(id)]
+    };
+    let idx = t.indices().iter().find(|i| i.name == "t_wdi").unwrap();
+    assert_eq!(idx.lookup_eq_multi(&key(1, 2, 3)).len(), 1);
+    assert_eq!(idx.lookup_eq_multi(&key(2, 3, 4)).len(), 1);
+    assert_eq!(idx.lookup_eq_multi(&key(9, 9, 9)).len(), 0);
+    // Prefix probes: (w) names 12 rows, (w, d) names 4.
+    let p1 = idx
+        .lookup_prefix_capped_by(&[IndexKey::Int(1)], 1000, |_| true)
+        .unwrap();
+    assert_eq!(
+        p1.len(),
+        13,
+        "leading prefix must include the NULL-id row (12 keyed + 1 NULL-component)"
+    );
+    let p2 = idx
+        .lookup_prefix_capped_by(&[IndexKey::Int(2), IndexKey::Int(2)], 1000, |_| true)
+        .unwrap();
+    assert_eq!(p2.len(), 4);
+    // Cap contract: too-wide prefix → None (fall back to scan).
+    assert!(
+        idx.lookup_prefix_capped_by(&[IndexKey::Int(1)], 3, |_| true)
+            .is_none()
+    );
+
+    // In-place update moves the key: (1,2,3) → (1,2,99).
+    let pos = t
+        .rows()
+        .iter()
+        .position(|r| {
+            r.values[0] == Value::BigInt(1)
+                && r.values[1] == Value::BigInt(2)
+                && r.values[2] == Value::BigInt(3)
+        })
+        .unwrap();
+    let mut moved = t.rows().get(pos).unwrap().values.clone();
+    moved[2] = Value::BigInt(99);
+    t.update_row(pos, moved).unwrap();
+    let idx = t.indices().iter().find(|i| i.name == "t_wdi").unwrap();
+    assert_eq!(idx.lookup_eq_multi(&key(1, 2, 99)).len(), 1);
+    assert!(idx.lookup_eq_multi(&key(1, 2, 3)).iter().next().is_none());
+    // An update of a NON-component column must not move anything.
+    let mut pad_only = t.rows().get(pos).unwrap().values.clone();
+    pad_only[3] = Value::text("y");
+    t.update_row(pos, pad_only).unwrap();
+    let idx = t.indices().iter().find(|i| i.name == "t_wdi").unwrap();
+    assert_eq!(idx.lookup_eq_multi(&key(1, 2, 99)).len(), 1);
+
+    // Delete forces the rebuild path.
+    let del = t
+        .rows()
+        .iter()
+        .position(|r| r.values[2] == Value::BigInt(99))
+        .unwrap();
+    t.delete_rows(&[del]);
+    let idx = t.indices().iter().find(|i| i.name == "t_wdi").unwrap();
+    assert_eq!(idx.lookup_eq_multi(&key(1, 2, 99)).len(), 0);
+    assert_eq!(idx.lookup_eq_multi(&key(2, 1, 1)).len(), 1);
+
+    // Snapshot round-trip carries the tag-7 payload.
+    let bytes = c.serialize();
+    let c2 = Catalog::deserialize(&bytes).unwrap();
+    let t2 = c2.get("t").unwrap();
+    let idx2 = t2.indices().iter().find(|i| i.name == "t_wdi").unwrap();
+    assert!(matches!(idx2.kind, IndexKind::BTreeMulti(_)));
+    assert_eq!(idx2.lookup_eq_multi(&key(2, 3, 4)).len(), 1);
+    // 12, not 13: the (1,2,99) row was deleted above.
+    assert_eq!(
+        idx2.lookup_prefix_capped_by(&[IndexKey::Int(1)], 1000, |_| true)
+            .unwrap()
+            .len(),
+        12
+    );
+}
+
+/// 7.38.1 L12 — `convert_index_to_multi` upgrades a leading-column
+/// B-tree carrying extras in place, and `drop_column` both shifts the
+/// surviving extras and drops indexes whose extras name the dropped
+/// column (the shift half was missing for ALL indexes before L12).
+#[test]
+fn composite_conversion_and_drop_column_extras_shift() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("a", DataType::BigInt, false),
+            ColumnSchema::new("b", DataType::BigInt, false),
+            ColumnSchema::new("k", DataType::BigInt, false),
+            ColumnSchema::new("v", DataType::BigInt, false),
+        ],
+    ))
+    .unwrap();
+    let t = c.get_mut("t").unwrap();
+    for i in 0..6i64 {
+        t.insert(Row::new(alloc::vec![
+            Value::BigInt(i % 2),
+            Value::BigInt(i),
+            Value::BigInt(i * 10),
+            Value::BigInt(i * 100),
+        ]))
+        .unwrap();
+    }
+    t.add_index(alloc::string::String::from("t_kv"), "k")
+        .unwrap();
+    {
+        let idx = t
+            .indices_mut()
+            .iter_mut()
+            .find(|i| i.name == "t_kv")
+            .unwrap();
+        idx.extra_column_positions = alloc::vec![3];
+    }
+    assert!(t.convert_index_to_multi("t_kv").unwrap());
+    let idx = t.indices().iter().find(|i| i.name == "t_kv").unwrap();
+    assert!(matches!(idx.kind, IndexKind::BTreeMulti(_)));
+    assert_eq!(
+        idx.lookup_eq_multi(&[IndexKey::Int(20), IndexKey::Int(200)])
+            .len(),
+        1
+    );
+    // Dropping column b (pos 1) shifts k,v from (2,3) to (1,2).
+    t.drop_column(1);
+    let idx = t.indices().iter().find(|i| i.name == "t_kv").unwrap();
+    assert_eq!(idx.column_position, 1);
+    assert_eq!(idx.extra_column_positions, alloc::vec![2]);
+    assert_eq!(
+        idx.lookup_eq_multi(&[IndexKey::Int(20), IndexKey::Int(200)])
+            .len(),
+        1
+    );
+    // Dropping a column an extra names drops the whole index.
+    t.drop_column(2);
+    assert!(t.indices().iter().all(|i| i.name != "t_kv"));
 }

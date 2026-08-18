@@ -998,6 +998,7 @@ mod e2e_cardinality_modulo;
 mod e2e_cast_pg_differential;
 mod e2e_cast_time_arith;
 mod e2e_composite_field;
+mod e2e_composite_index_v7381;
 mod e2e_date_trunc_units;
 mod e2e_default_expr_text;
 mod e2e_dml_row_locks_v7381;

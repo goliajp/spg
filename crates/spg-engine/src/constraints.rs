@@ -136,8 +136,13 @@ pub(crate) fn resolve_foreign_key(
             .get(primary_parent_col)
             .is_some()
             && parent_table.indices().iter().any(|idx| {
-                matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                    && idx.column_position == primary_parent_col
+                // v7.38.1 (L12) — a composite B-tree leading on the
+                // parent column covers it too (a prefix probe descends
+                // on the leading component alone).
+                matches!(
+                    idx.kind,
+                    spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+                ) && idx.column_position == primary_parent_col
                     && idx.partial_predicate.is_none()
             });
         if !has_btree {

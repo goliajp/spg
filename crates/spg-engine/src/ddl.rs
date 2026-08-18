@@ -2563,6 +2563,16 @@ impl Engine {
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.extra_column_positions = extra_positions;
             }
+            // v7.38.1 (L12) — a multi-column CREATE INDEX becomes a REAL
+            // composite B-tree: the key is the whole column tuple, so an
+            // equality on any prefix seeks instead of filtering a
+            // leading-column candidate flood. Expression / partial /
+            // GIN-shaped indexes are declined inside and stay as built;
+            // the indexdef already printed the full column list either
+            // way, so nothing catalog-visible changes.
+            table
+                .convert_index_to_multi(&stmt.name)
+                .map_err(EngineError::Storage)?;
         }
         // v7.39 (round 537) — the key column's ordering clause, as
         // written. It changes no lookup; `indexdef` reproduces the DDL,
@@ -3939,14 +3949,46 @@ impl Engine {
             .active_catalog_mut()
             .get_mut(table_name)
             .expect("just created");
+        let mut inline_lead_added: Option<alloc::string::String> = None;
         for (i, col_name) in inline_pk_columns.iter().enumerate() {
             let idx_name = if inline_pk_columns.len() == 1 {
                 alloc::format!("{table_name}_pkey")
             } else {
                 alloc::format!("{table_name}_pkey_{i}")
             };
-            if let Err(e) = table.add_index(idx_name, col_name) {
+            if let Err(e) = table.add_index(idx_name.clone(), col_name) {
                 return Err(EngineError::Storage(e));
+            }
+            if i == 0 {
+                inline_lead_added = Some(idx_name);
+            }
+        }
+        // v7.38.1 (L12) — a multi-column PRIMARY KEY's leading index
+        // becomes a REAL composite B-tree over the whole key, exactly
+        // like PG's one `t_pkey` index. The k≥1 per-column B-trees
+        // stay: they serve probes on non-leading columns, which a
+        // composite cannot (a prefix must start at the front).
+        if inline_pk_columns.len() >= 2
+            && let Some(lead_name) = inline_lead_added
+        {
+            let mut extras: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+            for col_name in &inline_pk_columns[1..] {
+                if let Some(p) = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
+                    extras.push(p);
+                }
+            }
+            if extras.len() == inline_pk_columns.len() - 1 {
+                if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == lead_name) {
+                    idx.extra_column_positions = extras;
+                }
+                table
+                    .convert_index_to_multi(&lead_name)
+                    .map_err(EngineError::Storage)?;
             }
         }
         for (i, tc) in table_constraints.iter().enumerate() {
@@ -4006,6 +4048,7 @@ impl Engine {
             // one (c_id: 10 rows) instead of the degenerate leading
             // one (c_w_id: all 30k). Mirrors what the inline-PK loop
             // above has always done.
+            let mut lead_added: Option<alloc::string::String> = None;
             for (k, col_name) in names.iter().enumerate() {
                 let already = table.indices().iter().any(|idx| {
                     matches!(idx.kind, spg_storage::IndexKind::BTree(_))
@@ -4021,8 +4064,38 @@ impl Engine {
                 } else {
                     alloc::format!("{table_name}_{col_name}_{suffix}_{i}_{k}")
                 };
-                if let Err(e) = table.add_index(idx_name, col_name) {
+                if let Err(e) = table.add_index(idx_name.clone(), col_name) {
                     return Err(EngineError::Storage(e));
+                }
+                if k == 0 {
+                    lead_added = Some(idx_name);
+                }
+            }
+            // v7.38.1 (L12) — same upgrade as the inline-PK path: the
+            // leading index of a composite PK / UNIQUE / KEY becomes a
+            // real multi-column B-tree over the whole declared tuple.
+            if names.len() >= 2
+                && let Some(lead_name) = lead_added
+            {
+                let mut extras: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                for col_name in &names[1..] {
+                    if let Some(p) = table
+                        .schema()
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        extras.push(p);
+                    }
+                }
+                if extras.len() == names.len() - 1 {
+                    if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == lead_name)
+                    {
+                        idx.extra_column_positions = extras;
+                    }
+                    table
+                        .convert_index_to_multi(&lead_name)
+                        .map_err(EngineError::Storage)?;
                 }
             }
         }

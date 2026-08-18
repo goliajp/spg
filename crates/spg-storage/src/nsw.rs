@@ -39,7 +39,8 @@ pub(crate) fn nsw_insert_at(table: &mut Table, idx_pos: usize, new_row_idx: usiz
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => {
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => {
             unreachable!("nsw_insert_at on a non-NSW index")
         }
     };
@@ -160,7 +161,8 @@ fn greedy_layer_walk(
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => {
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => {
             return (current, current_d);
         }
     };
@@ -218,7 +220,8 @@ fn layer_beam_search(
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => return Vec::new(),
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => return Vec::new(),
     };
     let col_pos = table.indices[idx_pos].column_position;
     let d0 = if matches!(metric, NswMetric::L2) {
@@ -404,7 +407,8 @@ fn connect_at_layer(
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => return,
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => return,
     };
     // v6.1.x: NSW adjacency stores neighbour row indices as u32 (4 B
     // each) rather than usize (8 B on 64-bit). Boundary casts here
@@ -449,7 +453,8 @@ fn connect_at_layer(
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => false,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => false,
         };
         if needs_trim {
             let current_peers: Vec<usize> = match &table.indices[idx_pos].kind {
@@ -462,7 +467,8 @@ fn connect_at_layer(
                 | IndexKind::Gin(_)
                 | IndexKind::GinTrgm(_)
                 | IndexKind::GinFulltext(_)
-                | IndexKind::GinJsonb(_) => continue,
+                | IndexKind::GinJsonb(_)
+                | IndexKind::BTreeMulti(_) => continue,
             };
             // Sort by distance from `peer`'s cell ascending so the
             // heuristic receives candidates closest-first. `cell_l2_sq`
@@ -604,7 +610,8 @@ pub(crate) fn nsw_search(
         | IndexKind::Gin(_)
         | IndexKind::GinTrgm(_)
         | IndexKind::GinFulltext(_)
-        | IndexKind::GinJsonb(_) => return Vec::new(),
+        | IndexKind::GinJsonb(_)
+        | IndexKind::BTreeMulti(_) => return Vec::new(),
     };
     let Some(entry) = entry else {
         return Vec::new();

@@ -871,6 +871,44 @@ fn deserialize_indices(
                 let map = read_gin_map(cur)?;
                 t.restore_gin_jsonb_index(idx_name, &column_name, map)?;
             }
+            7 => {
+                // v7.38.1 (L12) — multi-column B-tree tag. Payload
+                // mirrors tag 0 with `[u16 arity]`-prefixed composite
+                // keys. Only emitted by FILE_VERSION 91+ writers.
+                if version < 91 {
+                    return Err(StorageError::Corrupt(format!(
+                        "multi-column B-tree index tag 7 found in catalog FILE_VERSION {version}; \
+                         FILE_VERSION 91+ required (v7.38.1 introduced this tag)"
+                    )));
+                }
+                let entry_count = cur.read_u32()? as usize;
+                let mut map: PersistentBTreeMap<
+                    alloc::boxed::Box<[IndexKey]>,
+                    crate::posting::PostingList,
+                > = PersistentBTreeMap::new();
+                for _ in 0..entry_count {
+                    let arity = cur.read_u16()? as usize;
+                    let mut comps: Vec<IndexKey> = Vec::with_capacity(arity);
+                    for _ in 0..arity {
+                        comps.push(cur.read_index_key()?);
+                    }
+                    let locator_count = cur.read_u32()? as usize;
+                    let mut locators = crate::posting::PostingList::new();
+                    for _ in 0..locator_count {
+                        let tail = &cur.buf[cur.pos..];
+                        let (loc, consumed) = RowLocator::read_le(tail).map_err(|e| {
+                            StorageError::Corrupt(format!(
+                                "row_locator decode at offset {}: {e}",
+                                cur.pos
+                            ))
+                        })?;
+                        cur.pos += consumed;
+                        locators.push(loc);
+                    }
+                    map.insert_mut(comps.into_boxed_slice(), locators);
+                }
+                t.restore_btree_multi_index(idx_name, &column_name, map)?;
+            }
             other => {
                 return Err(StorageError::Corrupt(format!(
                     "unknown index kind tag: {other}"
@@ -3483,6 +3521,9 @@ pub(crate) fn write_index_key(out: &mut Vec<u8>, key: &IndexKey) {
             write_u32(out, u32::try_from(b.len()).unwrap_or(u32::MAX));
             out.extend_from_slice(b);
         }
+        IndexKey::Null => {
+            out.push(INDEX_KEY_TAG_NULL);
+        }
         IndexKey::Numeric(n) => {
             let (class, neg, exp) = n.parts();
             let digits = n.digits();
@@ -3682,6 +3723,7 @@ impl<'a> Cursor<'a> {
                     .map(|k| IndexKey::Numeric(alloc::boxed::Box::new(k)))
                     .ok_or_else(|| StorageError::Corrupt("non-canonical numeric index key".into()))
             }
+            INDEX_KEY_TAG_NULL => Ok(IndexKey::Null),
             other => Err(StorageError::Corrupt(format!(
                 "unknown index key tag: {other}"
             ))),

@@ -2304,6 +2304,16 @@ pub enum IndexKey {
     /// charged to numeric keys, which are new, instead of to every index
     /// that existed already.
     Numeric(alloc::boxed::Box<NumericKey>),
+    /// v7.38.1 (L12) — a NULL component INSIDE a composite key, and
+    /// nothing else. `IndexKey::from_value(Value::Null)` still returns
+    /// `None`, so single-column B-trees never hold one, and no probe
+    /// path ever BUILDS one (`col = NULL` is not a match in SQL) — the
+    /// variant is only reachable through a composite key's component
+    /// list, where it exists so that a row like `(2, 3, NULL)` stays
+    /// findable by a PREFIX probe on `(w, d)`. Declared last: slice
+    /// `Ord` then sorts NULL components after every value, PG's
+    /// NULLS LAST.
+    Null,
 }
 
 /// r1039 — an exact-decimal index key, canonical so that representation
@@ -3104,6 +3114,26 @@ pub enum IndexKind {
     /// without query-time acceleration. Persisted via tag-6 index
     /// payload in `FILE_VERSION` 51+.
     GinJsonb(PersistentBTreeMap<alloc::string::String, crate::posting::PostingList>),
+    /// v7.38.1 (L12) — a REAL multi-column B-tree: the key is the whole
+    /// column tuple, `[leading, extras…]`, ordered lexicographically by
+    /// slice `Ord`. That ordering is the entire design: every key
+    /// sharing a prefix is contiguous, so an equality on a PREFIX of
+    /// the columns is one `O(log N)` descent plus a bounded walk, and a
+    /// full-tuple equality is a point `get`. The single-column `BTree`
+    /// kind used to stand in for multi-column DDL by keying on the
+    /// leading column only and carrying the rest as metadata — TPC-C's
+    /// `customer (c_w_id, c_d_id, c_last, c_first)` then answered a
+    /// three-column equality with every row of one warehouse and a
+    /// per-row filter over 30 000 candidates.
+    ///
+    /// Rows where any component column is NULL (or of an unkeyable
+    /// type) are NOT entered: this index serves `=` probes, and in SQL
+    /// `col = v` never selects a NULL. Uniqueness keeps its own
+    /// full-tuple walk with NULLS-DISTINCT semantics on the
+    /// enforcement path, exactly as before.
+    ///
+    /// Persisted via tag-7 index payload in `FILE_VERSION` 91+.
+    BTreeMulti(PersistentBTreeMap<alloc::boxed::Box<[IndexKey]>, crate::posting::PostingList>),
 }
 
 impl IndexKind {
@@ -3129,6 +3159,13 @@ impl IndexKind {
                 let key = core::mem::size_of::<IndexKey>();
                 map.iter()
                     .map(|(_, locs)| (key + HEADER + locs.len() * loc) as u64)
+                    .sum()
+            }
+            // v7.38.1 (L12) — multi keys own a boxed slice of components.
+            IndexKind::BTreeMulti(map) => {
+                let key = core::mem::size_of::<IndexKey>();
+                map.iter()
+                    .map(|(k, locs)| (HEADER + k.len() * key + HEADER + locs.len() * loc) as u64)
                     .sum()
             }
             IndexKind::Nsw(g) => {
@@ -3251,6 +3288,51 @@ pub fn nsw_assign_level(row_idx: usize) -> u8 {
     level
 }
 
+/// v7.38.1 (L12) — the composite key `values` takes in a multi-column
+/// B-tree over `[lead, extras…]`. A NULL component keys as
+/// [`IndexKey::Null`] (declared to sort last, PG's NULLS LAST) so the
+/// row stays findable by prefix probes on the columns before it. `None`
+/// = some non-null component has no key form; the row is then not
+/// entered, which is why creation gates every component column's type
+/// through [`multi_component_type_ok`].
+pub(crate) fn compose_multi_key(
+    values: &[Value<'_>],
+    lead: usize,
+    extras: &[usize],
+) -> Option<alloc::boxed::Box<[IndexKey]>> {
+    let mut comps: Vec<IndexKey> = Vec::with_capacity(1 + extras.len());
+    for pos in core::iter::once(lead).chain(extras.iter().copied()) {
+        let v = values.get(pos)?;
+        if matches!(v, Value::Null) {
+            comps.push(IndexKey::Null);
+        } else {
+            comps.push(IndexKey::from_value(v)?);
+        }
+    }
+    Some(comps.into_boxed_slice())
+}
+
+/// v7.38.1 (L12) — component-type gate for multi-column B-trees: every
+/// NON-NULL value of these types keys through `IndexKey::from_value`,
+/// so a row can only be absent from the index when creation raced a
+/// type this list does not name. Deliberately conservative — a type
+/// outside the list simply keeps its index on the leading-column path.
+pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
+    matches!(
+        ty,
+        DataType::SmallInt
+            | DataType::Int
+            | DataType::BigInt
+            | DataType::Text
+            | DataType::Varchar(_)
+            | DataType::Char(_)
+            | DataType::Bool
+            | DataType::Uuid
+            | DataType::Date
+            | DataType::Timestamp
+    )
+}
+
 impl Index {
     fn new_btree(name: String, column_position: usize) -> Self {
         Self {
@@ -3267,6 +3349,25 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
         }
+    }
+
+    /// v7.38.1 (L12) — a real multi-column B-tree shell. The caller
+    /// sets `extra_column_positions` before the first row enters; the
+    /// key arity is `1 + extras` from then on.
+    fn new_btree_multi(name: String, column_position: usize) -> Self {
+        Self {
+            kind: IndexKind::BTreeMulti(PersistentBTreeMap::new()),
+            ..Self::new_btree(name, column_position)
+        }
+    }
+
+    /// v7.38.1 (L12) — the composite key this row takes in a
+    /// [`IndexKind::BTreeMulti`] index. NULL components key as
+    /// [`IndexKey::Null`] so prefix probes still find the row; `None`
+    /// only when a non-null component produces no key, which creation's
+    /// component-type gate makes unreachable for well-formed indexes.
+    pub fn multi_key_for_row(&self, values: &[Value<'_>]) -> Option<alloc::boxed::Box<[IndexKey]>> {
+        compose_multi_key(values, self.column_position, &self.extra_column_positions)
     }
 
     fn new_nsw(name: String, column_position: usize, m: usize) -> Self {
@@ -3407,6 +3508,14 @@ impl Index {
     {
         match &self.kind {
             IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter_rev()),
+            // v7.38.1 (L12) — projecting the leading component of a
+            // composite key preserves order: keys sort by the whole
+            // tuple, so the leading component is non-increasing here
+            // (non-decreasing in iter_asc), exactly what an ORDER BY
+            // on the leading column needs.
+            IndexKind::BTreeMulti(m) => {
+                alloc::boxed::Box::new(m.iter_rev().map(|(k, l)| (&k[0], l)))
+            }
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
@@ -3424,6 +3533,9 @@ impl Index {
     {
         match &self.kind {
             IndexKind::BTree(m) => alloc::boxed::Box::new(m.iter()),
+            // v7.38.1 (L12) — see iter_desc: the leading component of
+            // a tuple-sorted walk is itself in order.
+            IndexKind::BTreeMulti(m) => alloc::boxed::Box::new(m.iter().map(|(k, l)| (&k[0], l))),
             IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
@@ -3452,7 +3564,8 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3470,7 +3583,8 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3529,8 +3643,56 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => None,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => None,
         }
+    }
+
+    /// v7.38.1 (L12) — full-tuple point lookup on a [`IndexKind::BTreeMulti`]
+    /// index. `key` must carry exactly as many components as the index
+    /// has columns; anything else (including a probe against a
+    /// non-multi index) finds nothing, and "nothing" here is safe
+    /// because the caller falls back to a scan, never to an answer.
+    pub fn lookup_eq_multi(&self, key: &[IndexKey]) -> &crate::posting::PostingList {
+        match &self.kind {
+            IndexKind::BTreeMulti(m) if key.len() == 1 + self.extra_column_positions.len() => {
+                m.get_by(key).map_or(&EMPTY_POSTINGS, |l| l)
+            }
+            _ => &EMPTY_POSTINGS,
+        }
+    }
+
+    /// v7.38.1 (L12) — locators for every key whose leading components
+    /// equal `prefix`, on a [`IndexKind::BTreeMulti`] index. Slice
+    /// ordering keeps a prefix's keys contiguous, so this is one
+    /// descent to `[prefix]` and a walk that stops at the first key
+    /// leaving the prefix. Same cap/keep contract as
+    /// [`Index::lookup_range_capped_by`]: `None` = not selective
+    /// enough (or not a multi index), fall back.
+    pub fn lookup_prefix_capped_by(
+        &self,
+        prefix: &[IndexKey],
+        cap: usize,
+        keep: impl Fn(RowLocator) -> bool,
+    ) -> Option<Vec<RowLocator>> {
+        let IndexKind::BTreeMulti(m) = &self.kind else {
+            return None;
+        };
+        if prefix.is_empty() || prefix.len() > 1 + self.extra_column_positions.len() {
+            return None;
+        }
+        let lo: alloc::boxed::Box<[IndexKey]> = prefix.to_vec().into_boxed_slice();
+        let mut out: Vec<RowLocator> = Vec::new();
+        for (k, locs) in m.range(core::ops::Bound::Included(&lo), core::ops::Bound::Unbounded) {
+            if k.len() < prefix.len() || k[..prefix.len()] != *prefix {
+                break;
+            }
+            out.extend(locs.iter().copied().filter(|l| keep(*l)));
+            if out.len() > cap {
+                return None;
+            }
+        }
+        Some(out)
     }
 
     /// v7.39 (round 560) — the index range as (key, locator) pairs.
@@ -3567,7 +3729,8 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => None,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => None,
         }
     }
 
@@ -3586,7 +3749,8 @@ impl Index {
             | IndexKind::Nsw(_)
             | IndexKind::Brin { .. }
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3602,7 +3766,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => &EMPTY_POSTINGS,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3619,7 +3784,8 @@ impl Index {
             | IndexKind::Brin { .. }
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
-            | IndexKind::GinFulltext(_) => &EMPTY_POSTINGS,
+            | IndexKind::GinFulltext(_)
+            | IndexKind::BTreeMulti(_) => &EMPTY_POSTINGS,
         }
     }
 
@@ -3633,7 +3799,8 @@ impl Index {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => None,
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => None,
         }
     }
 
@@ -7869,7 +8036,8 @@ impl Catalog {
             | IndexKind::Gin(_)
             | IndexKind::GinTrgm(_)
             | IndexKind::GinFulltext(_)
-            | IndexKind::GinJsonb(_) => {
+            | IndexKind::GinJsonb(_)
+            | IndexKind::BTreeMulti(_) => {
                 return Err(StorageError::Corrupt(format!(
                     "compact_cold_segments: index {index_name:?} is not BTree; \
                      compaction applies only to BTree cold-tier indices"
@@ -8106,7 +8274,8 @@ fn index_key_as_u64(key: &IndexKey) -> Option<u64> {
         | IndexKey::Bool(_)
         | IndexKey::Uuid(_)
         | IndexKey::Bytes(_)
-        | IndexKey::Numeric(_) => None,
+        | IndexKey::Numeric(_)
+        | IndexKey::Null => None,
     }
 }
 
@@ -8602,7 +8771,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 90;
+const FILE_VERSION: u8 = 91;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -8638,6 +8807,10 @@ const INDEX_KEY_TAG_BYTES: u8 = 4;
 /// [u32 LE digit count][one byte per decimal digit, 0..=9, MSD first].
 /// Persisted only in FILE_VERSION 90+ catalogs.
 const INDEX_KEY_TAG_NUMERIC: u8 = 5;
+/// v7.38.1 (L12) — `IndexKey::Null`, a NULL component inside a
+/// composite key. No body. Persisted only inside tag-7 multi-index
+/// payloads, FILE_VERSION 91+.
+const INDEX_KEY_TAG_NULL: u8 = 6;
 
 impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
@@ -8712,6 +8885,35 @@ impl Catalog {
                         );
                         for (key, locators) in map {
                             write_index_key(&mut out, key);
+                            write_u32(
+                                &mut out,
+                                u32::try_from(locators.len()).expect("≤ 4G locators/key"),
+                            );
+                            for loc in locators {
+                                loc.write_le(&mut out);
+                            }
+                        }
+                    }
+                    // v7.38.1 (L12) — tag byte 7 = BTreeMulti. Payload
+                    // mirrors the tag-0 BTree encoding, with each key
+                    // written as `[u16 arity]` followed by that many
+                    // `write_index_key` components. FILE_VERSION 91+;
+                    // older catalogs never carried a multi index, so no
+                    // migration shim is needed.
+                    IndexKind::BTreeMulti(map) => {
+                        out.push(7);
+                        write_u32(
+                            &mut out,
+                            u32::try_from(map.len()).expect("≤ 4G index entries/index"),
+                        );
+                        for (key, locators) in map {
+                            write_u16(
+                                &mut out,
+                                u16::try_from(key.len()).expect("≤ 65k key components"),
+                            );
+                            for component in key.iter() {
+                                write_index_key(&mut out, component);
+                            }
                             write_u32(
                                 &mut out,
                                 u32::try_from(locators.len()).expect("≤ 4G locators/key"),

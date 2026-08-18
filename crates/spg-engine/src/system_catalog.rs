@@ -9952,7 +9952,10 @@ pub(crate) fn render_indexdef(
         | spg_storage::IndexKind::GinJsonb(_) => "gin",
         spg_storage::IndexKind::Brin { .. } => "brin",
         spg_storage::IndexKind::Nsw(_) => "hnsw",
-        spg_storage::IndexKind::BTree(_) => "btree",
+        // v7.38.1 (L12) — a multi-column B-tree IS a btree to every
+        // catalog surface; the composite key is an implementation
+        // detail the dump must not see.
+        spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_) => "btree",
     };
     match &idx.partial_predicate {
         Some(pred) => {
