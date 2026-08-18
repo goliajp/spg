@@ -2279,8 +2279,12 @@ fn try_queue_plain_dml(
     // excluded above); a CancelRequest racing a sub-ms queued DML
     // completing is within PG's cancel contract. Pass a fresh flag.
     let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (result, wal_outcome, leader_audited) =
-        crate::commit_queue_execute(state, sql.to_string(), &queue_flag);
+    let (result, wal_outcome, leader_audited) = crate::commit_queue_execute(
+        state,
+        sql.to_string(),
+        &queue_flag,
+        lock_wait_deadline(settings),
+    );
     if let Err(e) = wal_outcome {
         return Some(Err(EngineError::Unsupported(format!(
             "durability append failed: {e}"
@@ -4088,8 +4092,12 @@ fn handle_execute(
             // Fresh per-task flag — same reasoning as the simple-query
             // route (no watchdog on this path; timeout sessions excluded).
             let queue_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let (result, wal_outcome, leader_audited) =
-                crate::commit_queue_execute(state, bind_sql.clone(), &queue_flag);
+            let (result, wal_outcome, leader_audited) = crate::commit_queue_execute(
+                state,
+                bind_sql.clone(),
+                &queue_flag,
+                lock_wait_deadline(settings),
+            );
             if let Err(e) = wal_outcome {
                 return Err(proto(format!("Execute: durability append failed: {e}")));
             }
@@ -4143,6 +4151,33 @@ fn handle_execute(
                     cancel,
                 )
             };
+            // 7.38.1 S2.2 — the row-lock wait loop, extended-protocol
+            // edition: retry outside the guard until the holder's
+            // COMMIT frees the row (deadlocks resolve via the
+            // engine's detector on each re-registered wait edge).
+            let mut result = result;
+            let lock_deadline = lock_wait_deadline(settings);
+            while matches!(result, Err(spg_engine::EngineError::LockWouldBlock)) {
+                if let Some(d) = lock_deadline
+                    && std::time::Instant::now() >= d
+                {
+                    result = Err(spg_engine::EngineError::Unsupported(
+                        "canceling statement due to lock timeout".into(),
+                    ));
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                let mut eng = state
+                    .engine
+                    .write()
+                    .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
+                result = eng.execute_prepared_in_with_cancel(
+                    stmt.ast.clone(),
+                    &portal.params,
+                    conn_state.tx_id,
+                    cancel,
+                );
+            }
             (result, false)
         };
     // v7.33 (A1) — persist the write to the WAL (or the no-WAL snapshot)
@@ -4545,6 +4580,10 @@ fn wallclock_unix_micros() -> i64 {
 /// bare integer (ms), or `<n>` followed by a unit suffix
 /// (`us` / `ms` / `s` / `min` / `h` / `d`). `0` is valid and
 /// disables the timeout. Returns `None` on garbage.
+pub(crate) fn parse_timeout_ms_pub(s: &str) -> Option<u64> {
+    parse_timeout_ms(s)
+}
+
 fn parse_timeout_ms(s: &str) -> Option<u64> {
     let t = s.trim();
     if t.is_empty() {

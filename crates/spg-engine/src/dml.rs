@@ -821,8 +821,14 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         let table = stmt.table.clone();
         self.bump_table_change(&table);
-        self.exec_update_cancel_inner(stmt, None, cancel)
-            .map_err(|e| enrich_not_null(e, &table))
+        let r = self
+            .exec_update_cancel_inner(stmt, None, cancel)
+            .map_err(|e| enrich_not_null(e, &table));
+        // 7.38.1 S2.1 — an AUTOCOMMIT writer's tuple locks live only
+        // as long as its statement (its implicit tx commits with it);
+        // in-tx locks stay held until COMMIT/ROLLBACK releases them.
+        self.release_autocommit_stmt_locks();
+        r
     }
 
     /// v7.39 (round 533) — resolve the UNQUALIFIED assignment leaves that
@@ -1949,6 +1955,43 @@ impl Engine {
         // v7.39 (round 426) — read the dialect BEFORE the table mut-borrow
         // opens; the affected-count rule below needs it.
         let mysql_changed_count = self.backslash_escapes;
+        // 7.38.1 S2.1 (MATRIX #20) — tuple locks on the UPDATE targets
+        // BEFORE anything mutates. PG's RC serialises same-row writers
+        // here; a conflict surfaces as LockWouldBlock and the server
+        // retries outside the engine guard, so no partial apply ever
+        // happens. Skip-gate: an autocommit writer with an empty lock
+        // table has nobody to conflict with — zero cost on the
+        // uncontended hot path.
+        let dml_in_tx = self
+            .current_tx
+            .is_some_and(|tx| self.tx_catalogs.contains_key(&tx));
+        if (dml_in_tx || self.locks.locked_row_count() > 0) && !planned.is_empty() {
+            let (rel, rids): (
+                spg_storage::row_header::RelId,
+                Vec<spg_storage::row_header::RowId>,
+            ) = {
+                let t = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?;
+                (
+                    t.rel_id(),
+                    planned
+                        .iter()
+                        .filter_map(|(pos, _)| t.rowids().get(*pos).copied())
+                        .collect(),
+                )
+            };
+            if let Err(e) = self.lock_dml_rows(rel, &rids, crate::locks::LockMode::NoKeyUpdate, v) {
+                // A failed AUTOCOMMIT statement is a failed implicit tx:
+                // drop everything it acquired (and its wait edges).
+                if !dml_in_tx {
+                    self.locks.release_all(v);
+                }
+                return Err(e);
+            }
+        }
         // Stage 3b — apply the original UPDATE.
         let table = self
             .active_catalog_mut()
@@ -3153,6 +3196,18 @@ impl Engine {
         stmt: &spg_sql::ast::DeleteStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        let r = self.exec_delete_cancel_inner(stmt, cancel);
+        // 7.38.1 S2.1 — see exec_update_cancel: autocommit tuple locks
+        // end with their statement.
+        self.release_autocommit_stmt_locks();
+        r
+    }
+
+    fn exec_delete_cancel_inner(
+        &mut self,
+        stmt: &spg_sql::ast::DeleteStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
         // v7.37.43-T4.4 — writable CTE outer body (DELETE).
         if !stmt.ctes.is_empty() {
             return self.exec_delete_with_ctes(stmt.clone(), cancel);
@@ -3821,6 +3876,38 @@ impl Engine {
         // semantics so a re-insert of a tombstoned key succeeds; (8)
         // cold-tier tombstoning via the cold overlay (step 6).
         let inplace = self.mvcc_inplace();
+        // 7.38.1 S2.1 (MATRIX #20) — tuple locks on the DELETE targets
+        // before anything mutates; same seam and same skip-gate as the
+        // UPDATE side (see exec_update_cancel_inner).
+        let dml_in_tx = self
+            .current_tx
+            .is_some_and(|tx| self.tx_catalogs.contains_key(&tx));
+        if (dml_in_tx || self.locks.locked_row_count() > 0) && !positions.is_empty() {
+            let (rel, rids): (
+                spg_storage::row_header::RelId,
+                Vec<spg_storage::row_header::RowId>,
+            ) = {
+                let t = self.active_catalog().get(&stmt.table).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?;
+                (
+                    t.rel_id(),
+                    positions
+                        .iter()
+                        .filter_map(|pos| t.rowids().get(*pos).copied())
+                        .collect(),
+                )
+            };
+            if let Err(e) = self.lock_dml_rows(rel, &rids, crate::locks::LockMode::Exclusive, xmax)
+            {
+                if !dml_in_tx {
+                    self.locks.release_all(xmax);
+                }
+                return Err(e);
+            }
+        }
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)

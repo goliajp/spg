@@ -99,19 +99,31 @@ fn rc_rebase_stands_down_after_ddl() {
 
 #[test]
 fn rc_delete_conflict_is_skipped_like_pg() {
-    // tx deletes a row; a concurrent autocommit delete removes it
-    // first (commits immediately). PG RC: the tx's delete simply
-    // applies to nothing; COMMIT succeeds; the row stays gone.
+    // 7.38.1 S2.1 rewrite — with tuple locks the concurrent autocommit
+    // DELETE now WAITS for the holder (PG RC), and after the holder's
+    // COMMIT its retry matches nothing: the row was already deleted.
+    // Same end state as PG's blocked-then-chain-followed DELETE.
     let mut e = boot();
     e.execute("INSERT INTO t VALUES (5)").unwrap();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
-    e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
-        .unwrap();
-    // Next statement rebases; the conflicting tombstone is skipped.
-    assert_eq!(count(&mut e, tx), if e.mvcc_inplace() { 1 } else { 1 });
+    let err = e
+        .execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
+        .unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::LockWouldBlock),
+        "concurrent same-row DELETE must wait, got {err:?}"
+    );
     e.execute_in("COMMIT", tx).unwrap();
+    // The server's retry loop re-runs the statement after the wait.
+    let QueryResult::CommandOk { affected, .. } = e
+        .execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("CommandOk")
+    };
+    assert_eq!(affected, 0, "the retried DELETE finds the row already gone");
     assert_eq!(count(&mut e, IMPLICIT_TX), 1, "row deleted exactly once");
 }
 
@@ -145,16 +157,19 @@ fn rr_commit_conflict_raises_serialization_failure() {
     if !Engine::new().mvcc_inplace() {
         return;
     }
+    // 7.38.1 S2.1 rewrite — frozen-snapshot ordering (see the
+    // update-update RR test): the autocommit delete commits first,
+    // then the RR tx deletes from its stale view and loses at COMMIT.
     let mut e = boot();
     e.execute("INSERT INTO t VALUES (5)").unwrap();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
-    e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
-    // A concurrent committed delete wins (first-committer-wins).
+    let _ = e.execute_in("SELECT count(*) FROM t", tx).unwrap();
     e.execute_in("DELETE FROM t WHERE x = 5", IMPLICIT_TX)
         .unwrap();
+    e.execute_in("DELETE FROM t WHERE x = 5", tx).unwrap();
     let err = e.execute_in("COMMIT", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
@@ -206,13 +221,11 @@ fn set_transaction_after_first_query_errors() {
 
 #[test]
 fn rc_concurrent_update_update_keeps_one_row() {
-    // E4 matrix catch: the tx's UPDATE write-set is tombstone(old) +
-    // insert(new); before the pairing fix a conflicting tombstone was
-    // skipped while the paired insert still replayed — DUPLICATING the
-    // row. SPG resolves update-update as first-committer-wins (the
-    // tx's UPDATE ends up matching zero rows). Recorded delta: PG's
-    // EvalPlanQual re-applies the loser's update to the winner's row
-    // (one row, x=10); SPG keeps the winner (one row, x=20).
+    // 7.38.1 S2.1 rewrite — the delta this test used to RECORD is now
+    // CLOSED: the concurrent updater waits on the tuple lock, and its
+    // post-commit retry re-evaluates WHERE against the winner's row.
+    // `SET x = 20 WHERE x = 1` matches nothing once x became 10 —
+    // exactly PG's EvalPlanQual end state (one row, x = 10).
     if !Engine::new().mvcc_inplace() {
         return;
     }
@@ -220,10 +233,21 @@ fn rc_concurrent_update_update_keeps_one_row() {
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("UPDATE t SET x = 10 WHERE x = 1", tx).unwrap();
-    e.execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
-        .unwrap();
-    assert_eq!(count(&mut e, tx), 1, "no duplicated row after rebase");
+    let err = e
+        .execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
+        .unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::LockWouldBlock),
+        "{err:?}"
+    );
     e.execute_in("COMMIT", tx).unwrap();
+    let QueryResult::CommandOk { affected, .. } = e
+        .execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("CommandOk")
+    };
+    assert_eq!(affected, 0, "predicate no longer matches the winner's row");
     let QueryResult::Rows { rows, .. } = e
         .execute_in("SELECT x FROM t ORDER BY x", IMPLICIT_TX)
         .unwrap()
@@ -231,7 +255,11 @@ fn rc_concurrent_update_update_keeps_one_row() {
         panic!("rows")
     };
     assert_eq!(rows.len(), 1, "exactly one surviving version");
-    assert_eq!(rows[0].values[0], spg_storage::Value::Int(20));
+    assert_eq!(
+        rows[0].values[0],
+        spg_storage::Value::Int(10),
+        "PG's EvalPlanQual outcome — the recorded delta is closed"
+    );
 }
 
 #[test]
@@ -239,14 +267,23 @@ fn rr_concurrent_update_update_raises_serialization_failure() {
     if !Engine::new().mvcc_inplace() {
         return;
     }
+    // 7.38.1 S2.1 rewrite — same-order writers now serialise through
+    // the tuple lock, so the 40001 face needs the frozen-snapshot
+    // ordering: the RR tx freezes its view FIRST (a read), the
+    // autocommit writer lands and commits (no lock conflict — the tx
+    // holds nothing yet), and the tx's own UPDATE then works on a row
+    // the base has already replaced. First-committer-wins: 40001 at
+    // COMMIT, exactly PG's RR contract.
     let mut e = boot();
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
-    e.execute_in("UPDATE t SET x = 10 WHERE x = 1", tx).unwrap();
+    // Freeze the snapshot before anyone else moves.
+    let _ = e.execute_in("SELECT count(*) FROM t", tx).unwrap();
     e.execute_in("UPDATE t SET x = 20 WHERE x = 1", IMPLICIT_TX)
         .unwrap();
+    e.execute_in("UPDATE t SET x = 10 WHERE x = 1", tx).unwrap();
     let err = e.execute_in("COMMIT", tx).unwrap_err();
     assert!(
         matches!(err, spg_engine::EngineError::SerializationFailure(_)),
@@ -354,6 +391,14 @@ fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
     if !Engine::new().mvcc_inplace() {
         return;
     }
+    // 7.38.1 S2.1 rewrite — the concurrent DELETE now waits on the
+    // tuple lock and retries after the COMMIT. Recorded delta: PG's
+    // blocked DELETE follows the locked tuple's UPDATE CHAIN, and a
+    // delete+reinsert is not a chain, so PG's retry affects 0 rows and
+    // the reinserted row SURVIVES; SPG's server-level retry re-runs
+    // the whole statement against the fresh base, so the reinserted
+    // row matches and is deleted. Statement-retry vs EvalPlanQual
+    // chain-following — ledgered in the 7.38.1 checklist (S2 notes).
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT NOT NULL)")
         .unwrap();
@@ -362,15 +407,31 @@ fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("DELETE FROM t WHERE id = 1", tx).unwrap();
     e.execute_in("INSERT INTO t VALUES (1, 11)", tx).unwrap();
-    e.execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX)
-        .unwrap();
+    let err = e
+        .execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX)
+        .unwrap_err();
+    assert!(
+        matches!(err, spg_engine::EngineError::LockWouldBlock),
+        "{err:?}"
+    );
     e.execute_in("COMMIT", tx).unwrap();
+    // Retry after the wait: the fresh statement sees the reinserted
+    // row (the recorded delta vs PG's chain-following).
+    let QueryResult::CommandOk { affected, .. } = e
+        .execute_in("DELETE FROM t WHERE id = 1", IMPLICIT_TX)
+        .unwrap()
+    else {
+        panic!("CommandOk")
+    };
+    assert_eq!(affected, 1, "statement retry matches the reinserted row");
     let QueryResult::Rows { rows, .. } = e.execute_in("SELECT id, v FROM t", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
-    assert_eq!(rows.len(), 1, "reinserted row survives");
-    assert_eq!(rows[0].values[1], spg_storage::Value::Int(11));
+    assert!(
+        rows.is_empty(),
+        "SPG statement-retry deletes it (delta noted)"
+    );
 }
 
 // ── v7.37.17 Phase E4 round 3 — unique-key collisions under rebase ──

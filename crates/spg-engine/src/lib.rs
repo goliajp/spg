@@ -1845,6 +1845,22 @@ impl Engine {
         self.locks.release_all(version);
     }
 
+    /// 7.38.1 S2.1 — drop the tuple locks an AUTOCOMMIT statement took
+    /// (its implicit transaction ends with it). A no-op inside an open
+    /// transaction (those release at COMMIT/ROLLBACK) and when the
+    /// statement allocated no writer version.
+    pub(crate) fn release_autocommit_stmt_locks(&mut self) {
+        let in_tx = self
+            .current_tx
+            .is_some_and(|tx| self.tx_writer_versions.contains_key(&tx));
+        if in_tx {
+            return;
+        }
+        if let Some(v) = self.stmt_writer_version {
+            self.locks.release_all(v);
+        }
+    }
+
     /// v7.37.15 (Phase C.4) — number of rows currently locked, for the
     /// `pg_locks` enumeration and tests.
     #[must_use]

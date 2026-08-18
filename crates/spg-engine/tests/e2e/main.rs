@@ -1000,6 +1000,7 @@ mod e2e_cast_time_arith;
 mod e2e_composite_field;
 mod e2e_date_trunc_units;
 mod e2e_default_expr_text;
+mod e2e_dml_row_locks_v7381;
 mod e2e_encode_bytea;
 mod e2e_env_cfg_disable_joinfold;
 mod e2e_env_cfg_disable_topk;

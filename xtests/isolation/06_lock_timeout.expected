@@ -1,0 +1,9 @@
+== permutation setup seed s2_timeout s1_begin s1_upd s2_upd s1_commit final
+setup: ok CREATE TABLE
+seed: ok INSERT 0 1
+s2_timeout: ok SET
+s1_begin: ok BEGIN
+s1_upd: ok UPDATE 1
+s2_upd: error canceling statement due to lock timeout
+s1_commit: ok COMMIT
+final: rows 20
