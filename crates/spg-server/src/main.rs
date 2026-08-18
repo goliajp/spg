@@ -252,6 +252,18 @@ struct CommitQueueState {
 /// the pgwire plain-DML path (r178) so both fan into the same group
 /// fsync. `sync_commit` is resolved here from the session GUC —
 /// callers must NOT hold the engine lock.
+/// 7.38.1 (S2.4 rider) — the lock-wait loops' pacing. A flat 5 ms nap
+/// per retry taxed every conflicted statement half a commit's worth of
+/// idle time; measured on pgbench tellers c4/c8 the flat nap held SPG
+/// to ~350-580 tps against PG18's 1000+. Exponential from 100 µs
+/// (most conflicts resolve within the holder's current statement) up
+/// to a 5 ms ceiling keeps the retry cheap when the wait is short and
+/// polite when it is long.
+pub(crate) fn lock_wait_backoff(attempt: u32) {
+    let us = 100u64.saturating_mul(1u64 << attempt.min(6)); // 100µs..6.4ms
+    std::thread::sleep(std::time::Duration::from_micros(us.min(5_000)));
+}
+
 pub(crate) fn commit_queue_execute(
     state: &ServerState,
     sql: String,
@@ -263,6 +275,7 @@ pub(crate) fn commit_queue_execute(
     // waits here, outside every engine guard, and re-enqueues (PG
     // waits forever at lock_timeout=0; a wait-for cycle terminates
     // via the engine's deadlock detector, which answers the victim).
+    let mut waits = 0u32;
     loop {
         let (ack_tx, ack_rx) = mpsc::sync_channel::<CommitResult>(1);
         let task = CommitTask {
@@ -303,7 +316,8 @@ pub(crate) fn commit_queue_execute(
                             false,
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    lock_wait_backoff(waits);
+                    waits += 1;
                     continue;
                 }
                 return (result, wal_outcome, audited);
@@ -3034,6 +3048,7 @@ fn handle_query_op(
         // 7.38.1 S2.2 — the row-lock wait loop, native edition: a
         // statement that would-blocks retries after the guard drops
         // (the holder needs the engine to COMMIT).
+        let mut waits = 0u32;
         let (mut engine, result) = loop {
             let mut engine = state
                 .engine
@@ -3052,7 +3067,8 @@ fn handle_query_op(
             alloc_budget::clear_query_budget();
             if matches!(result, Err(spg_engine::EngineError::LockWouldBlock)) {
                 drop(engine);
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                lock_wait_backoff(waits);
+                waits += 1;
                 continue;
             }
             break (engine, result);
