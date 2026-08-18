@@ -1,0 +1,22 @@
+== permutation setup seed s1_begin s1_upd s2_send probe s1_commit s2_get final
+setup: ok CREATE TABLE
+seed: ok INSERT 0 1
+s1_begin: ok BEGIN
+s1_upd: ok UPDATE 1
+s2_send: sent
+probe: pending
+s1_commit: ok COMMIT
+s2_get: ok UPDATE 1
+final: rows 30
+== permutation setup seed s1_begin s1_upd s2_begin s2_send_tx probe_tx s1_commit s2_get_tx s2_commit final
+setup: ok CREATE TABLE
+seed: ok INSERT 0 1
+s1_begin: ok BEGIN
+s1_upd: ok UPDATE 1
+s2_begin: ok BEGIN
+s2_send_tx: sent
+probe_tx: pending
+s1_commit: ok COMMIT
+s2_get_tx: ok UPDATE 1
+s2_commit: ok COMMIT
+final: rows 40

@@ -27,6 +27,16 @@ pub struct IsoStep {
     pub id: String,
     pub session: usize,
     pub sql: String,
+    /// 7.38.1 S1.2 (D9) — send without reading: the statement is
+    /// EXPECTED to block server-side; a later `wait` step harvests.
+    pub async_send: bool,
+    /// Harvest step: read the answer of the named async step's
+    /// session. Mutually exclusive with `sql`.
+    pub wait_for: Option<String>,
+    /// Probe step: assert the named async step has NOT answered yet
+    /// (200 ms MSG_PEEK). Transcript records `pending` or `answered`
+    /// — a lock that fails to hold shows up as a diff, not a shrug.
+    pub pending_of: Option<String>,
 }
 
 impl IsoSpec {
@@ -91,6 +101,15 @@ impl IsoSpec {
                 (Sect::Step, "sql") => {
                     out.steps.last_mut().expect("in [[step]]").sql = unq;
                 }
+                (Sect::Step, "async") => {
+                    out.steps.last_mut().expect("in [[step]]").async_send = v == "1";
+                }
+                (Sect::Step, "wait") => {
+                    out.steps.last_mut().expect("in [[step]]").wait_for = Some(unq);
+                }
+                (Sect::Step, "pending") => {
+                    out.steps.last_mut().expect("in [[step]]").pending_of = Some(unq);
+                }
                 (Sect::Perm, "order") => {
                     *out.permutations.last_mut().expect("in [[permutation]]") =
                         unq.split_whitespace().map(str::to_string).collect();
@@ -106,6 +125,16 @@ impl IsoSpec {
             return Err(format!("iso spec {}: no [[permutation]]", out.name));
         }
         for s in &out.steps {
+            // wait/pending steps borrow their target's session.
+            if let Some(t) = s.wait_for.as_ref().or(s.pending_of.as_ref()) {
+                if !out.steps.iter().any(|x| &x.id == t && x.async_send) {
+                    return Err(format!(
+                        "iso spec {}: step {} references async step {t} which does not exist",
+                        out.name, s.id
+                    ));
+                }
+                continue;
+            }
             if s.session == 0 || s.session > out.sessions {
                 return Err(format!(
                     "iso spec {}: step {} session {} out of range 1..={}",
@@ -214,36 +243,110 @@ pub fn run_all(root: &Path, specs_dir: &Path, bless: bool) -> Result<String, Str
 }
 
 fn run_spec(bin: &Path, spec: &IsoSpec) -> Result<String, String> {
+    // 7.38.1 S1.2 — `SPG_ISO_TARGET=host:port:user:db` runs the specs
+    // against an EXTERNAL server (the PG oracle container) instead of
+    // spawning spg-server: the blocking specs take their behavioural
+    // baseline from PG itself, clean-room style. External targets get
+    // a per-permutation schema wipe instead of a fresh process.
+    let target = std::env::var("SPG_ISO_TARGET").ok();
     let mut out = String::new();
     for (pi, perm) in spec.permutations.iter().enumerate() {
-        // A REAL server per permutation — schedules must not see each
-        // other's state (pg_isolationtester re-runs setup; a fresh
-        // engine is SPG's cheaper equivalent of the same guarantee).
-        let tmp = crate::proclib::run_tmp_dir(&format!("iso-{}-{pi}", spec.name));
-        let _ = std::fs::remove_dir_all(&tmp);
         let mut roster = crate::proclib::Roster::new();
-        let port = roster.spawn_server(&spec.name, bin, &tmp, Duration::from_secs(20))?;
-        let mut conns: Vec<crate::wireclient::Conn> = Vec::new();
-        for s in 0..spec.sessions {
-            conns.push(crate::wireclient::Conn::connect(
+        let mut tmp = PathBuf::new();
+        let (host, port, user, db) = if let Some(t) = &target {
+            let p: Vec<&str> = t.split(':').collect();
+            if p.len() != 4 {
+                return Err("SPG_ISO_TARGET wants host:port:user:db".into());
+            }
+            (
+                p[0].to_string(),
+                p[1].parse::<u16>()
+                    .map_err(|e| format!("target port: {e}"))?,
+                p[2].to_string(),
+                p[3].to_string(),
+            )
+        } else {
+            // A REAL server per permutation — schedules must not see
+            // each other's state.
+            tmp = crate::proclib::run_tmp_dir(&format!("iso-{}-{pi}", spec.name));
+            let _ = std::fs::remove_dir_all(&tmp);
+            let port = roster.spawn_server(&spec.name, bin, &tmp, Duration::from_secs(20))?;
+            (
+                "127.0.0.1".to_string(),
                 port,
-                &format!("iso{s}"),
-                "iso",
+                "iso0".to_string(),
+                "iso".to_string(),
+            )
+        };
+        let mut conns: Vec<crate::wireclient::Conn> = Vec::new();
+        for _ in 0..spec.sessions {
+            conns.push(crate::wireclient::Conn::connect_host(
+                &host, port, &user, &db,
             )?);
         }
+        if target.is_some() {
+            let r = conns[0].simple_query("DROP SCHEMA public CASCADE; CREATE SCHEMA public;")?;
+            if let Some(e) = r.error {
+                return Err(format!("external target schema wipe: {e}"));
+            }
+        }
         out.push_str(&format!("== permutation {}\n", perm.join(" ")));
+        // Which async step's answer is in flight on each session.
+        let mut in_flight: Vec<Option<String>> = vec![None; spec.sessions];
         for id in perm {
             let step = spec
                 .steps
                 .iter()
                 .find(|s| &s.id == id)
                 .expect("validated by parse");
-            let r = conns[step.session - 1].simple_query(&step.sql);
+            let session_of = |sid: &str| -> usize {
+                spec.steps
+                    .iter()
+                    .find(|s| s.id == sid)
+                    .expect("validated")
+                    .session
+                    - 1
+            };
+            if let Some(t) = &step.pending_of {
+                let si = session_of(t);
+                let line = match conns[si].poll_pending(200) {
+                    Err(e) => format!("{id}: wire-error {e}"),
+                    Ok(true) => format!("{id}: answered"),
+                    Ok(false) => format!("{id}: pending"),
+                };
+                out.push_str(&line);
+                out.push('\n');
+                continue;
+            }
+            if let Some(t) = &step.wait_for {
+                let si = session_of(t);
+                let r = conns[si].read_result_deadline(Duration::from_secs(15));
+                in_flight[si] = None;
+                out.push_str(&render_step(id, &r));
+                out.push('\n');
+                continue;
+            }
+            let si = step.session - 1;
+            if step.async_send {
+                let line = match conns[si].send_query_nowait(&step.sql) {
+                    Ok(()) => {
+                        in_flight[si] = Some(step.id.clone());
+                        format!("{id}: sent")
+                    }
+                    Err(e) => format!("{id}: wire-error {e}"),
+                };
+                out.push_str(&line);
+                out.push('\n');
+                continue;
+            }
+            let r = conns[si].simple_query(&step.sql);
             out.push_str(&render_step(id, &r));
             out.push('\n');
         }
         roster.reap_all();
-        let _ = std::fs::remove_dir_all(&tmp);
+        if target.is_none() {
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
     }
     Ok(out)
 }
