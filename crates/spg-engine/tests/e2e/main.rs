@@ -1094,6 +1094,7 @@ mod e2e_lateral_generate_series;
 mod e2e_lateral_join;
 mod e2e_lateral_jsonb_each_text;
 mod e2e_lateral_unnest;
+mod e2e_ledger_reds_v7381;
 mod e2e_left_right;
 mod e2e_limit_placeholder;
 mod e2e_lpad_rpad;
