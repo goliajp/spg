@@ -979,6 +979,14 @@ impl Engine {
                         merged.drop_table(&name);
                     }
                 }
+                // 7.38.1 S3.1 (D4, MATRIX #19) — the same reconciliation
+                // for the non-table families: a neighbour's CREATE /
+                // ALTER / DROP of a sequence, view, matview, enum,
+                // domain or composite type used to vanish under this
+                // poisoned COMMIT because those live outside the table
+                // map. The shadow's per-window dirty record decides,
+                // name by name, which side survives.
+                merged.merge_nontable_objects_from(&self.catalog);
                 self.catalog = merged;
             } else {
                 self.catalog = state.catalog;

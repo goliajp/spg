@@ -42,3 +42,13 @@ SELECT id, lvl FROM level
 ----
 1
 5
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS small CASCADE
+
+statement ok
+DROP TABLE IF EXISTS level CASCADE

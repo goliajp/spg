@@ -25,3 +25,7 @@ query I rowsort
 SELECT EXTRACT(YEAR FROM d) FROM t
 ----
 2024
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

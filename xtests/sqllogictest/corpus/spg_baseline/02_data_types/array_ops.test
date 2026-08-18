@@ -14,3 +14,7 @@ SELECT id, tags FROM t ORDER BY id
 {x,y,z}
 2
 {p}
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

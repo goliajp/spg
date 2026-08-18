@@ -24,3 +24,7 @@ SELECT (count(*) BETWEEN 0 AND 10)::INT FROM t WHERE random() < 1.0
 # random() takes no args.
 statement error
 SELECT random(1)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE

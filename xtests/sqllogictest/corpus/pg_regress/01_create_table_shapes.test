@@ -30,3 +30,19 @@ CREATE TABLE dup (id INT)
 
 statement error
 CREATE TABLE dup (id INT)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE
+
+statement ok
+DROP TABLE IF EXISTS c CASCADE
+
+statement ok
+DROP TABLE IF EXISTS empty CASCADE
+
+statement ok
+DROP TABLE IF EXISTS dup CASCADE

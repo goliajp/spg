@@ -134,3 +134,16 @@ DROP MATERIALIZED VIEW IF EXISTS does_not_exist
 
 statement error
 DROP MATERIALIZED VIEW does_not_exist
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS mv CASCADE
+
+statement ok
+DROP TABLE IF EXISTS mv2 CASCADE
+
+statement ok
+DROP TABLE IF EXISTS mv3 CASCADE

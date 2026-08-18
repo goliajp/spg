@@ -65,3 +65,7 @@ DELETE FROM meetings WHERE id = 99
 
 statement error
 INSERT INTO meetings VALUES (99, '14:30:45+15')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS meetings CASCADE

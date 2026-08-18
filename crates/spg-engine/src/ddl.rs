@@ -6074,10 +6074,14 @@ fn pg_parenless_keyword(name: &str) -> Option<&'static str> {
 fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
     match expr {
         // Bare string literal → PG's typed-literal form `'…'::<coltype>`.
+        // 7.38.1 S5.2 — the typed-literal cast must name the SQL type
+        // (`text[]`), not information_schema's category word (`ARRAY`):
+        // pg_dump copies this text into the dumped DEFAULT, and
+        // `'{}'::ARRAY` parses nowhere — not even back into SPG.
         Expr::Literal(Literal::String(s)) => alloc::format!(
             "'{}'::{}",
             s.replace('\'', "''"),
-            crate::system_catalog::pg_data_type_text(col_ty)
+            crate::conversions::pg_type_name_for_error(col_ty)
         ),
         // r1054 — an ALREADY-typed string literal re-parses as a Cast
         // node, and the generic Display arm below rendered it
@@ -6096,7 +6100,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
             alloc::format!(
                 "'{}'::{}",
                 s.replace('\'', "''"),
-                crate::system_catalog::pg_data_type_text(col_ty)
+                crate::conversions::pg_type_name_for_error(col_ty)
             )
         }
         // Boolean literal → PG's lowercase `true` / `false` (SPG's Literal

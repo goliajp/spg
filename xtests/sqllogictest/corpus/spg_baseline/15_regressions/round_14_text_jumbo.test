@@ -51,3 +51,7 @@ SELECT id, LENGTH(body) FROM r14_msg WHERE id = 2
 ----
 2
 80000
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS r14_msg CASCADE

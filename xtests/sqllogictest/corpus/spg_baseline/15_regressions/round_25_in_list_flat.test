@@ -62,3 +62,10 @@ SELECT id, val FROM r25_outer WHERE val NOT IN (10, 30, 50) ORDER BY id
 20
 4
 40
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS r25_outer CASCADE
+
+statement ok
+DROP TABLE IF EXISTS r25_inner CASCADE

@@ -99,3 +99,19 @@ SELECT id, n FROM with_default
 0
 2
 99
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS small_ints CASCADE
+
+statement ok
+DROP TABLE IF EXISTS money CASCADE
+
+statement ok
+DROP TABLE IF EXISTS bounded CASCADE
+
+statement ok
+DROP TABLE IF EXISTS fixed CASCADE
+
+statement ok
+DROP TABLE IF EXISTS with_default CASCADE

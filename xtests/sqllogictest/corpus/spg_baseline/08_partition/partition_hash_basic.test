@@ -35,3 +35,19 @@ CREATE TABLE orders_dup PARTITION OF orders FOR VALUES WITH (MODULUS 4, REMAINDE
 # Mixed MODULUS within one parent rejected (16.2 single-modulus invariant).
 statement error
 CREATE TABLE orders_mix PARTITION OF orders FOR VALUES WITH (MODULUS 8, REMAINDER 0)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS orders CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders_0 CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders_1 CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders_2 CASCADE
+
+statement ok
+DROP TABLE IF EXISTS orders_3 CASCADE

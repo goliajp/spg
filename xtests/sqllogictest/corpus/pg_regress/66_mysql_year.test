@@ -79,3 +79,7 @@ INSERT INTO music VALUES (99, 2156)
 
 statement error
 INSERT INTO music VALUES (99, 'not a year')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS music CASCADE

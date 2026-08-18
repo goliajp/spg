@@ -75,3 +75,10 @@ CREATE TABLE color (id INT NOT NULL)
 
 statement error
 CREATE TYPE color AS ENUM ('red')
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS person CASCADE
+
+statement ok
+DROP TABLE IF EXISTS color CASCADE

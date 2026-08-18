@@ -25,3 +25,10 @@ SELECT id, name FROM t WHERE id NOT IN (SELECT id FROM allow)
 ----
 2
 b
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS t CASCADE
+
+statement ok
+DROP TABLE IF EXISTS allow CASCADE

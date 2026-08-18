@@ -43,3 +43,10 @@ SELECT * FROM dst WHERE id = 99
 ----
 99
 x
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS src CASCADE
+
+statement ok
+DROP TABLE IF EXISTS dst CASCADE

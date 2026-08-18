@@ -53,3 +53,7 @@ SELECT no_such_column FROM r20_t
 
 statement error
 SELECT g, SUM(no_such_column) FROM r20_t GROUP BY g
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS r20_t CASCADE

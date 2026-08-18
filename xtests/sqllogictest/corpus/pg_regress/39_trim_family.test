@@ -131,3 +131,7 @@ query T
 SELECT trim(trim('   hello   '), 'h')
 ----
 ello
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS entries CASCADE

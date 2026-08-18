@@ -134,6 +134,15 @@ budget_s = 7200
 
 [[step]]
 tier = "full"
+name = "pgdump-roundtrip"
+impl = "internal"
+budget_s = 600
+# 7.38.1 S5.2 (D6) — official PG18 pg_dump against live SPG must exit
+# 0 and the dump must restore into fresh SPG + fresh PG18 with
+# identical canary counts (three-way reconciliation).
+
+[[step]]
+tier = "full"
 name = "perm-matrix"
 impl = "internal"
 budget_s = 3600

@@ -30,3 +30,10 @@ SELECT a.id, b.v FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id <= 3
 20
 3
 NULL
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS a CASCADE
+
+statement ok
+DROP TABLE IF EXISTS b CASCADE

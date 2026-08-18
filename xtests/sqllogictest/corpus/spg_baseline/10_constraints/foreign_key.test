@@ -14,3 +14,10 @@ INSERT INTO child VALUES (10, 1)
 
 statement error
 INSERT INTO child VALUES (11, 99)
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS parent CASCADE
+
+statement ok
+DROP TABLE IF EXISTS child CASCADE

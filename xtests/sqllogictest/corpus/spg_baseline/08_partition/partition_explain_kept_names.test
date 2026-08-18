@@ -27,3 +27,16 @@ EXPLAIN SELECT * FROM cust WHERE region = 'us'
 
 statement ok
 EXPLAIN SELECT * FROM cust
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS cust CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_apac CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_emea CASCADE
+
+statement ok
+DROP TABLE IF EXISTS cust_default CASCADE

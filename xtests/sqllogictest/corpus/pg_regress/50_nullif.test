@@ -80,3 +80,10 @@ SELECT id, nullif(name, '') FROM form ORDER BY id
 NULL
 2
 alice
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS rate CASCADE
+
+statement ok
+DROP TABLE IF EXISTS form CASCADE

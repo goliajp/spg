@@ -665,6 +665,17 @@ pub fn cast_value_ref_in(
                         }),
                     };
                 }
+                // 7.38.1 S5.1 — a CATALOG relation name folds to the
+                // dual (oid, name) value, so `'pg_amop'::regclass`
+                // compares with pg_depend's numeric classid and still
+                // renders as the name (PG's regclass IS an oid). User
+                // relations keep the textual round-trip contract.
+                if let Some((_, oid)) = crate::system_catalog::CATALOG_RELATIONS
+                    .iter()
+                    .find(|(n, _)| bare.eq_ignore_ascii_case(n))
+                {
+                    return Ok(Value::RegClass(*oid, bare.into_boxed_str()));
+                }
                 Ok(Value::text(bare))
             }
             // A numeric OID → its type name for `::regtype` (the common

@@ -5990,6 +5990,28 @@ pub(super) fn compare(
         (Value::IntArray(a), Value::IntArray(b)) => cmp_array(a, b),
         (Value::BigIntArray(a), Value::BigIntArray(b)) => cmp_array(a, b),
         (Value::SmallIntArray(a), Value::SmallIntArray(b)) => cmp_array(a, b),
+        // 7.38.1 S5.1 — cross-width integer array comparison, as PG
+        // coerces int2[]/int4[]/int8[] to a common type before
+        // array_cmp. pg_dump's not-null pass compares pg_constraint's
+        // conkey (int2[]) against `array[a.attnum]` (int4[]).
+        (Value::SmallIntArray(a), Value::IntArray(b)) => {
+            let aw: alloc::vec::Vec<Option<i64>> = a.iter().map(|x| x.map(i64::from)).collect();
+            let bw: alloc::vec::Vec<Option<i64>> = b.iter().map(|x| x.map(i64::from)).collect();
+            cmp_array(&aw, &bw)
+        }
+        (Value::IntArray(a), Value::SmallIntArray(b)) => {
+            let aw: alloc::vec::Vec<Option<i64>> = a.iter().map(|x| x.map(i64::from)).collect();
+            let bw: alloc::vec::Vec<Option<i64>> = b.iter().map(|x| x.map(i64::from)).collect();
+            cmp_array(&aw, &bw)
+        }
+        (Value::SmallIntArray(a), Value::BigIntArray(b)) => {
+            let aw: alloc::vec::Vec<Option<i64>> = a.iter().map(|x| x.map(i64::from)).collect();
+            cmp_array(&aw, b)
+        }
+        (Value::BigIntArray(a), Value::SmallIntArray(b)) => {
+            let bw: alloc::vec::Vec<Option<i64>> = b.iter().map(|x| x.map(i64::from)).collect();
+            cmp_array(a, &bw)
+        }
         (Value::TextArray(a), Value::TextArray(b)) => cmp_array(a, b),
         (Value::VarcharArray(a), Value::VarcharArray(b)) => cmp_array(a, b),
         (Value::BoolArray(a), Value::BoolArray(b)) => cmp_array(a, b),

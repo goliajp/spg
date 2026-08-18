@@ -131,3 +131,7 @@ query I
 SELECT id FROM u WHERE split_part(csv, ',', 1) = 'alice'
 ----
 1
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE

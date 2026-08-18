@@ -85,3 +85,13 @@ CREATE TABLE shapes (
     geom TEXT,
     SPATIAL KEY geom_sp (geom)
 )
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS posts CASCADE
+
+statement ok
+DROP TABLE IF EXISTS articles CASCADE
+
+statement ok
+DROP TABLE IF EXISTS shapes CASCADE

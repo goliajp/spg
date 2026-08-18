@@ -1,0 +1,59 @@
+# 7.38.1 S3.1 (D4, MATRIX #19) — non-table DDL committed by a
+# neighbour while another session's DDL-carrying ("poisoned")
+# transaction is open must survive that transaction's COMMIT.
+[iso]
+name = "poisoned_ddl_neighbours"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE pn (a INT)"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_ins"
+session = 1
+sql = "INSERT INTO pn VALUES (1)"
+
+[[step]]
+id = "s1_ddl"
+session = 1
+sql = "CREATE INDEX pn_a ON pn (a)"
+
+[[step]]
+id = "s2_seq"
+session = 2
+sql = "CREATE SEQUENCE conc_seq"
+
+[[step]]
+id = "s2_view"
+session = 2
+sql = "CREATE VIEW conc_view AS SELECT a FROM pn"
+
+[[step]]
+id = "s2_next1"
+session = 2
+sql = "SELECT nextval('conc_seq')"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s2_next2"
+session = 2
+sql = "SELECT nextval('conc_seq')"
+
+[[step]]
+id = "s2_view_q"
+session = 2
+sql = "SELECT count(*) FROM conc_view"
+
+[[permutation]]
+order = "setup s1_begin s1_ins s1_ddl s2_seq s2_view s2_next1 s1_commit s2_next2 s2_view_q"

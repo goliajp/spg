@@ -70,3 +70,7 @@ query I
 SELECT mod(1000000007, 7)
 ----
 6
+
+# 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
+statement ok
+DROP TABLE IF EXISTS u CASCADE

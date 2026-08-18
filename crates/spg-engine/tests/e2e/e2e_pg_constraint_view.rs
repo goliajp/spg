@@ -27,8 +27,9 @@ fn pg_constraint_lists_primary_key() {
     );
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::text("p"));
-    // conkey renders PG's smallint[] literal form (1-based attnums).
-    assert_eq!(r[0][1], Value::text("{1}"));
+    // 7.38.1 S5.1 — conkey is a REAL smallint[] now (still renders
+    // `{1}`); the value compares as the array.
+    assert_eq!(r[0][1], Value::SmallIntArray(vec![Some(1)]));
 }
 
 #[test]
@@ -67,14 +68,10 @@ fn pg_constraint_lists_foreign_key() {
     };
     assert_eq!(r[0][1], Value::BigInt(oid_of("children")));
     assert_eq!(r[0][2], Value::BigInt(oid_of("parents")));
-    // conkey / confkey — PG smallint[] literal form.
-    for (idx, want) in [(3, "{2}"), (4, "{1}")].iter() {
-        if let Value::Text(s) = &r[0][*idx] {
-            assert_eq!(s.as_ref(), *want, "col {idx}");
-        } else {
-            panic!("col {idx} wrong type");
-        }
-    }
+    // conkey / confkey — REAL smallint[] as of 7.38.1 S5.1 (still
+    // rendering PG's `{2}` / `{1}` literal form on the wire).
+    assert_eq!(r[0][3], Value::SmallIntArray(vec![Some(2)]));
+    assert_eq!(r[0][4], Value::SmallIntArray(vec![Some(1)]));
 }
 
 #[test]
@@ -92,7 +89,7 @@ fn pg_constraint_lists_composite_unique() {
     assert!(!r.is_empty());
     assert_eq!(r[0][0], Value::text("u"));
     // Two columns: PG array literal `{1,2}`.
-    assert_eq!(r[0][1], Value::text("{1,2}"));
+    assert_eq!(r[0][1], Value::SmallIntArray(vec![Some(1), Some(2)]));
 }
 
 #[test]

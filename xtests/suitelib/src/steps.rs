@@ -649,3 +649,155 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
         "oltp_read_write SPG [{spg_tx}]{tpcc_note}{control_note}"
     ))
 }
+
+/// full-tier `pgdump-roundtrip` (7.38.1 S5.2, D6) — the official
+/// PG18 pg_dump runs against a live SPG carrying the rich shape set,
+/// must EXIT 0, and the dump must restore into a FRESH SPG and into a
+/// FRESH PG18 database with the same row counts on a canary query.
+/// pg_dump comes from the oracle container (mini) or the host
+/// toolchain (local), same detection the sweep uses for psql.
+///
+/// # Errors
+/// pg_dump non-zero, any restore error on the SPG leg, or a count
+/// mismatch across the three sides.
+pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
+    let bin = root.join("target/release/spg-server");
+    if !bin.exists() {
+        sh(root, "cargo build --release -q -p spg-server")?;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let wrapper = Path::new(&home).join("spgbench/bin/psql");
+    let orb = "/Applications/OrbStack.app/Contents/MacOS/xbin";
+    let docker = if std::path::Path::new(orb).exists() {
+        format!("PATH=\"$PATH:{orb}\" docker")
+    } else {
+        "docker".to_string()
+    };
+    let (psql, pg_dump, host, bind) = if wrapper.exists() {
+        (
+            wrapper.display().to_string(),
+            format!("{docker} exec spg-bench-postgres pg_dump"),
+            "host.docker.internal",
+            "0.0.0.0",
+        )
+    } else {
+        (
+            "psql".to_string(),
+            "pg_dump".to_string(),
+            "127.0.0.1",
+            "127.0.0.1",
+        )
+    };
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-pgdumprt"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut roster = Roster::new();
+    let src = roster.spawn_server_on(
+        "dump-src",
+        &bin,
+        &tmp.join("src"),
+        Duration::from_secs(30),
+        bind,
+    )?;
+    let dst = roster.spawn_server_on(
+        "dump-dst",
+        &bin,
+        &tmp.join("dst"),
+        Duration::from_secs(30),
+        bind,
+    )?;
+    let src_uri = format!("postgres://bench:bench@{host}:{src}/bench");
+    let dst_uri = format!("postgres://bench:bench@{host}:{dst}/bench");
+    const RICH: &str = "CREATE TABLE rich1 (id BIGSERIAL PRIMARY KEY, tag TEXT[] DEFAULT '{}', \
+         amt NUMERIC(12,3), payload JSONB, blob BYTEA, flag BOOLEAN DEFAULT false, \
+         created TIMESTAMPTZ DEFAULT now()); \
+         CREATE TABLE rich2 (id INT PRIMARY KEY, r1 BIGINT REFERENCES rich1(id) ON DELETE CASCADE, \
+         uq TEXT UNIQUE, CHECK (id > 0)); \
+         CREATE TYPE addr AS (street TEXT, zip INT); \
+         CREATE TABLE rich3 (id INT PRIMARY KEY, home addr, mood_col TEXT); \
+         CREATE MATERIALIZED VIEW mv1 AS SELECT count(*) AS n FROM rich1; \
+         CREATE TABLE part_parent (id INT, ts DATE) PARTITION BY RANGE (ts); \
+         CREATE TABLE part_a PARTITION OF part_parent FOR VALUES FROM ('2026-01-01') TO ('2026-06-01'); \
+         CREATE INDEX rich1_gin ON rich1 USING gin (payload); \
+         INSERT INTO rich1 (tag, amt, payload, blob) VALUES ('{a,b}', 12.345, '{\"k\":1}', '\\xdeadbeef'); \
+         INSERT INTO rich2 VALUES (1, 1, 'x'); \
+         INSERT INTO rich3 VALUES (1, ROW('main st', 12345), 'ok'); \
+         INSERT INTO part_parent VALUES (1, '2026-02-01');";
+    const CANARY: &str = "SELECT (SELECT count(*) FROM rich1) || '|' || \
+         (SELECT count(*) FROM rich2) || '|' || (SELECT count(*) FROM rich3) || '|' || \
+         (SELECT count(*) FROM part_parent) || '|' || (SELECT (home).zip FROM rich3)";
+    let schema_file = tmp.join("rich-schema.sql");
+    std::fs::write(&schema_file, RICH).map_err(|e| format!("write schema: {e}"))?;
+    sh(
+        root,
+        &format!(
+            "{psql} --no-psqlrc -X -q '{src_uri}' -f - < {}",
+            schema_file.display()
+        ),
+    )?;
+    let dump_file = tmp.join("rich-dump.sql");
+    sh(
+        root,
+        &format!("{pg_dump} '{src_uri}' > {}", dump_file.display()),
+    )
+    .map_err(|e| format!("pg_dump must exit 0 against SPG: {e}"))?;
+    // Leg 1 — fresh SPG. Any ERROR line is a red.
+    let restore = sh(
+        root,
+        &format!(
+            "{psql} --no-psqlrc -X -q '{dst_uri}' -f - < {} 2>&1 | grep -c ERROR || true",
+            dump_file.display()
+        ),
+    )?;
+    if restore.trim() != "0" {
+        return Err(format!(
+            "SPG restore leg had {} error line(s)",
+            restore.trim()
+        ));
+    }
+    let src_counts = sh(
+        root,
+        &format!("{psql} --no-psqlrc -X -q -tA '{src_uri}' -c \"{CANARY}\""),
+    )?;
+    let dst_counts = sh(
+        root,
+        &format!("{psql} --no-psqlrc -X -q -tA '{dst_uri}' -c \"{CANARY}\""),
+    )?;
+    if src_counts.trim() != dst_counts.trim() {
+        return Err(format!(
+            "SPG roundtrip counts diverge: src={} dst={}",
+            src_counts.trim(),
+            dst_counts.trim()
+        ));
+    }
+    // Leg 2 — fresh PG18 in the oracle container (skipped, loudly,
+    // when no oracle container is reachable — the LOCAL box drives
+    // its docker PG through the same 25432 bench container).
+    let pg_admin = format!("postgres://bench:bench@{host}:25432/postgres");
+    let pg_rt = format!("postgres://bench:bench@{host}:25432/spgdumprt");
+    let pg_leg = sh(
+        root,
+        &format!(
+            "{psql} --no-psqlrc -X -q -tA '{pg_admin}' -c 'DROP DATABASE IF EXISTS spgdumprt' \
+             -c 'CREATE DATABASE spgdumprt' && \
+             {psql} --no-psqlrc -X -q '{pg_rt}' -f - < {} >/dev/null 2>&1; \
+             {psql} --no-psqlrc -X -q -tA '{pg_rt}' -c \"{CANARY}\"",
+            dump_file.display()
+        ),
+    );
+    let verdict = match pg_leg {
+        Ok(pg_counts) if pg_counts.trim() == src_counts.trim() => {
+            format!("three-way OK counts={}", src_counts.trim())
+        }
+        Ok(pg_counts) => {
+            return Err(format!(
+                "PG18 leg counts diverge: src={} pg={}",
+                src_counts.trim(),
+                pg_counts.trim()
+            ));
+        }
+        Err(e) => return Err(format!("PG18 leg failed: {e}")),
+    };
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(verdict)
+}
