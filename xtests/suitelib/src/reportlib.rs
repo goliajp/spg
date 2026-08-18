@@ -81,6 +81,29 @@ impl Ledger {
         out
     }
 
+    /// S4.6 — record a step that was executed OUT OF BAND (a parallel
+    /// group runs steps on threads and records them here in FILE
+    /// order, so the ledger stays deterministic however the threads
+    /// finished).
+    pub fn record_result(
+        &mut self,
+        name: &str,
+        budget: Option<Duration>,
+        duration: Duration,
+        ok: bool,
+    ) {
+        self.steps.push(StepRecord {
+            name: name.to_string(),
+            status: if ok {
+                StepStatus::Pass
+            } else {
+                StepStatus::Fail
+            },
+            duration,
+            budget,
+        });
+    }
+
     pub fn record_skip(&mut self, name: &str) {
         self.steps.push(StepRecord {
             name: name.to_string(),

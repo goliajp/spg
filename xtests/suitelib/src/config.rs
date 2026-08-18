@@ -23,6 +23,9 @@ pub struct Step {
     pub implementation: String,
     pub cmd: Option<String>,
     pub budget_s: Option<u64>,
+    /// D23/S4.6 — adjacent steps sharing a group value run
+    /// concurrently; the ledger still records them in file order.
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +113,7 @@ impl Manifest {
                         "impl" => step.implementation = as_str()?,
                         "cmd" => step.cmd = Some(as_str()?),
                         "budget_s" => step.budget_s = Some(as_int()?),
+                        "group" => step.group = Some(as_str()?),
                         other => {
                             return Err(format!("suite.toml:{}: unknown step key {other}", ln + 1));
                         }

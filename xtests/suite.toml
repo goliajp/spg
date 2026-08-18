@@ -92,6 +92,9 @@ name = "biz"
 impl = "external"
 cmd = "scripts/gate.sh biz"
 budget_s = 300
+# S4.6 — biz (embedded corpus + compat, no suite ports) and dogfood
+# (embedded replay, no ports) overlap safely; ~real CPU overlap.
+group = "corpus"
 
 [[step]]
 tier = "prerelease"
@@ -99,6 +102,7 @@ name = "dogfood"
 impl = "external"
 cmd = "scripts/gate.sh dogfood"
 budget_s = 240
+group = "corpus"
 
 [[step]]
 tier = "prerelease"

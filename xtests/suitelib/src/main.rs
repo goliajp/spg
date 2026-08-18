@@ -129,7 +129,17 @@ fn main() {
             // budget makes every deep commit a false red (A19).
             // A24 — cost, not count: one heavy crate is a heavy
             // rebuild all by itself.
-            const HEAVY: [&str; 4] = ["spg-engine", "spg-server", "spg-storage", "spg-sql"];
+            // A24 addendum (r1065): suitelib joined the heavy list on
+            // evidence — its test binary (proclib+wireclient+dev deps)
+            // measured 48-74 s cold on the local runner, biting the
+            // 35 s unit budget three commits running.
+            const HEAVY: [&str; 5] = [
+                "spg-engine",
+                "spg-server",
+                "spg-storage",
+                "spg-sql",
+                "suitelib",
+            ];
             let wide = suitelib::steps::changed_crates(root, &graph)
                 .map(|c| {
                     let a = graph.affected(&c);
@@ -153,11 +163,97 @@ fn main() {
             };
             let mut failed: Option<String> = None;
             let t_total = std::time::Instant::now();
-            for s in m.tier(tier) {
+            let tier_steps = m.tier(tier);
+            let mut idx = 0usize;
+            while idx < tier_steps.len() {
+                let s = tier_steps[idx];
                 if failed.is_some() {
                     ledger.record_skip(&s.name);
                     println!("  SKIP  {:<16} (earlier step failed)", s.name);
+                    idx += 1;
                     continue;
+                }
+                // S4.6 (D23 解禁) — adjacent EXTERNAL steps sharing a
+                // `group` run concurrently on threads; the ledger
+                // records them in FILE order whatever the finish
+                // order, so reports stay byte-diffable run to run.
+                if s.group.is_some() {
+                    let mut batch = vec![s];
+                    while idx + batch.len() < tier_steps.len()
+                        && tier_steps[idx + batch.len()].group == s.group
+                    {
+                        batch.push(tier_steps[idx + batch.len()]);
+                    }
+                    if batch.len() > 1 {
+                        if let Some(bad) = batch.iter().find(|b| b.implementation != "external") {
+                            eprintln!(
+                                "suite-run: step {} is internal — parallel groups take external steps only",
+                                bad.name
+                            );
+                            std::process::exit(2);
+                        }
+                        println!(
+                            "  ∥ group {:?}: {:?}",
+                            s.group.as_deref().unwrap_or(""),
+                            batch.iter().map(|b| b.name.as_str()).collect::<Vec<_>>()
+                        );
+                        let results: Vec<(
+                            String,
+                            Option<std::time::Duration>,
+                            std::time::Duration,
+                            bool,
+                        )> = std::thread::scope(|scope| {
+                            let handles: Vec<_> = batch
+                                .iter()
+                                .map(|b| {
+                                    let cmd = b.cmd.clone().expect("checked by parse");
+                                    let name = b.name.clone();
+                                    let budget = b.budget_s.map(std::time::Duration::from_secs);
+                                    scope.spawn(move || {
+                                        let t0 = std::time::Instant::now();
+                                        let ok = std::process::Command::new("sh")
+                                            .arg("-c")
+                                            .arg(&cmd)
+                                            .status()
+                                            .map(|st| st.success())
+                                            .unwrap_or(false);
+                                        (name, budget, t0.elapsed(), ok)
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().expect("group thread"))
+                                .collect()
+                        });
+                        for (name, budget, dur, ok) in &results {
+                            ledger.record_result(name, *budget, *dur, *ok);
+                            println!(
+                                "  {}  {:<16} ({:.1}s)",
+                                if *ok { "ok  " } else { "FAIL" },
+                                name,
+                                dur.as_secs_f64()
+                            );
+                            if !ok && failed.is_none() {
+                                failed = Some(format!("step {name} failed"));
+                            }
+                        }
+                        if results.iter().any(|(n, ..)| n == "biz")
+                            && std::env::var("SUITE_KEEP_REPORTS").is_err()
+                        {
+                            let _ = std::process::Command::new("git")
+                                .args([
+                                    "checkout",
+                                    "--",
+                                    "xtests/sqllogictest/report.json",
+                                    "xtests/sqllogictest/report.md",
+                                    "xtests/data_compat/report.md",
+                                ])
+                                .status();
+                        }
+                        idx += batch.len();
+                        continue;
+                    }
                 }
                 // A23 — the BASE band covers every affected-closure
                 // step (an engine change widens clippy exactly as it
@@ -240,6 +336,7 @@ fn main() {
                         failed = Some(name);
                     }
                 }
+                idx += 1;
             }
             let over: Vec<String> = ledger
                 .over_budget()
