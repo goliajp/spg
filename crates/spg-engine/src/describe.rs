@@ -203,8 +203,62 @@ fn relation_columns(
         let cols = describe_view_columns_depth(catalog, &t.name, depth + 1);
         return (!cols.is_empty()).then_some(cols);
     }
-    // UNNEST / VALUES / anything else the executor synthesises has no
-    // catalog shape to read here.
+    // v7.38.3 — a set-returning function in FROM. The parser lowers
+    // `jsonb_object_keys(x) AS key`, `unnest(a)`, `string_to_table(...)`
+    // and the rest onto `unnest_expr` and already resolved the column
+    // NAMES into `unnest_column_aliases` (PG's rules for which live
+    // there). Only the types were missing here, so any statement with
+    // one of these in FROM described NOTHING — sentori's project
+    // context-keys page, one step past where their suite stands.
+    //
+    // The element type is the array expression's type with one level
+    // peeled; anything this build cannot name that way is TEXT, which
+    // is what the SRFs in question actually return.
+    if let Some(arr) = &t.unnest_expr {
+        let elem = describe_expr_type(arr, &[]).map_or(DataType::Text, |ty| match ty {
+            DataType::IntArray => DataType::Int,
+            DataType::SmallIntArray => DataType::SmallInt,
+            DataType::BigIntArray => DataType::BigInt,
+            DataType::BoolArray => DataType::Bool,
+            DataType::UuidArray => DataType::Uuid,
+            DataType::FloatArray => DataType::Float,
+            DataType::NumericArray => DataType::Numeric {
+                precision: 0,
+                scale: 0,
+            },
+            DataType::DateArray => DataType::Date,
+            DataType::TimestampArray => DataType::Timestamp,
+            DataType::TimestamptzArray => DataType::Timestamptz,
+            DataType::JsonArray => DataType::Json,
+            DataType::JsonbArray => DataType::Jsonb,
+            DataType::BytesArray => DataType::Bytes,
+            DataType::IntervalArray => DataType::Interval,
+            _ => DataType::Text,
+        });
+        // The FROM-SRF rewrite resolves the column name into the alias
+        // list; a bare `unnest(a) AS v` leaves it empty and carries the
+        // name on the item itself, which is also what the executor
+        // projects.
+        let first = t
+            .unnest_column_aliases
+            .first()
+            .cloned()
+            .unwrap_or_else(|| t.name.clone());
+        let mut cols = alloc::vec![ColumnSchema::new(first, elem, true)];
+        // WITH ORDINALITY appends a BIGINT counter, named by the second
+        // alias when the caller gave one.
+        if t.with_ordinality {
+            let name = t
+                .unnest_column_aliases
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "ordinality".to_string());
+            cols.push(ColumnSchema::new(name, DataType::BigInt, false));
+        }
+        return Some(cols);
+    }
+    // VALUES / anything else the executor synthesises has no catalog
+    // shape to read here.
     None
 }
 
@@ -618,10 +672,69 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
         // back to `Text` for every non-trivial expression, which
         // breaks `sqlx::query_as::<_, (chrono::NaiveDateTime,)>(
         // "SELECT now()")` and every similar typed-decode pattern.
-        Expr::FunctionCall { name, args } => function_return_shape(name, args, schema_cols),
+        // v7.38.3 — PG names an unaliased function call after the
+        // FUNCTION, not `?column?`: `SELECT count(*)` describes a column
+        // called `count`, `max(a)` one called `max` (measured on PG18's
+        // own view columns). SPG's execute path already did this, so
+        // Describe and the RowDescription that arrived on Execute
+        // disagreed with each other — a client that reads names from
+        // Describe looked for `count` and was told `?column?`. Only the
+        // NAME is taken here; the type still comes from the map below.
+        Expr::FunctionCall { name, args } => {
+            function_return_shape(name, args, schema_cols).map(|mut sh| {
+                if sh.name == "?column?" {
+                    // `COUNT(*)` parses to the internal name `count_star`;
+                    // PG calls the column `count`, which is what the user
+                    // wrote. Never let an internal spelling reach the wire.
+                    sh.name = if name.eq_ignore_ascii_case("count_star") {
+                        "count".to_string()
+                    } else {
+                        name.to_ascii_lowercase()
+                    };
+                }
+                sh
+            })
+        }
         // v7.26 (round-20 C) — aggregate modifiers delegate to the
         // inner call (DISTINCT / internal ORDER BY don't change the
         // output type).
+        // v7.38.3 — the ordered-set aggregates. Delegating to the inner
+        // call asked `function_return_shape` about `percentile_cont`,
+        // which it did not know, and a None here empties the WHOLE
+        // statement's Describe. PG's rule, measured: percentile_cont is
+        // double precision (double precision[] when its direct argument
+        // is an array of fractions), while percentile_disc and mode take
+        // the type of the column being ordered by — which is why the
+        // sort spec has to be read rather than dropped.
+        Expr::AggregateOrdered { call, order_by, .. }
+            if matches!(call.as_ref(), Expr::FunctionCall { name, .. }
+            if matches!(name.to_ascii_lowercase().as_str(),
+                        "percentile_cont" | "percentile_disc" | "mode")) =>
+        {
+            let Expr::FunctionCall { name, args } = call.as_ref() else {
+                return None;
+            };
+            let lower = name.to_ascii_lowercase();
+            let ty = if lower == "percentile_cont" {
+                let fractions_are_array = args.first().is_some_and(|a| matches!(a, Expr::Array(_)));
+                if fractions_are_array {
+                    DataType::FloatArray
+                } else {
+                    DataType::Float
+                }
+            } else {
+                // percentile_disc / mode return a value FROM the ordered
+                // column, so they carry its type.
+                order_by
+                    .first()
+                    .and_then(|o| describe_expr_type(&o.expr, schema_cols))?
+            };
+            Some(ExprShape {
+                name: lower,
+                ty,
+                nullable: true,
+            })
+        }
         Expr::AggregateOrdered { call, .. } => describe_expr(call, schema_cols),
         // v7.39 (round 268) — a window call. The pure window functions
         // have fixed result types (measured on PG 18.4); everything else
@@ -694,6 +807,28 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                         nullable: true,
                     })
                 }
+                // v7.38.3 — the JSON operators that do NOT return JSON.
+                // The fallback below takes the LEFT operand's type, so
+                // `payload->'context'->>'k'` described as JSONB when PG
+                // says TEXT (measured). A typed decode into String then
+                // met a jsonb OID and failed at the client, with nothing
+                // wrong on the wire to point at.
+                B::JsonGetText | B::JsonGetPathText => Some(ExprShape {
+                    name: "?column?".to_string(),
+                    ty: DataType::Text,
+                    nullable: true,
+                }),
+                // The predicate forms are BOOLEAN, same measurement.
+                B::JsonContains
+                | B::JsonContainedBy
+                | B::JsonPathExists
+                | B::JsonKeyExists
+                | B::JsonKeysAny
+                | B::JsonKeysAll => Some(ExprShape {
+                    name: "?column?".to_string(),
+                    ty: DataType::Bool,
+                    nullable: true,
+                }),
                 _ => {
                     let inner = describe_expr(lhs, schema_cols)?;
                     // v7.38 (read01 A-bitcat) — PG's `||` on bit strings is
@@ -965,9 +1100,27 @@ fn function_return_shape(
                 .first()
                 .and_then(|a| describe_expr(a, schema_cols))
                 .map(|s| s.ty);
+            // v7.38.3 — every element type this build has an array type
+            // for, not just the two integer widths. `array_agg(uuid_col)`
+            // described as TEXT[] where PG says UUID[] (measured), so a
+            // typed decode into Vec<Uuid> met the wrong OID and failed at
+            // the client. TEXT[] stays the answer only for element types
+            // with no array of their own here.
             let ty = match elem {
-                Some(DataType::Int | DataType::SmallInt) => DataType::IntArray,
+                Some(DataType::Int) => DataType::IntArray,
+                Some(DataType::SmallInt) => DataType::SmallIntArray,
                 Some(DataType::BigInt) => DataType::BigIntArray,
+                Some(DataType::Bool) => DataType::BoolArray,
+                Some(DataType::Uuid) => DataType::UuidArray,
+                Some(DataType::Numeric { .. }) => DataType::NumericArray,
+                Some(DataType::Float | DataType::Real) => DataType::FloatArray,
+                Some(DataType::Date) => DataType::DateArray,
+                Some(DataType::Timestamp) => DataType::TimestampArray,
+                Some(DataType::Timestamptz) => DataType::TimestamptzArray,
+                Some(DataType::Json) => DataType::JsonArray,
+                Some(DataType::Jsonb) => DataType::JsonbArray,
+                Some(DataType::Bytes) => DataType::BytesArray,
+                Some(DataType::Interval) => DataType::IntervalArray,
                 _ => DataType::TextArray,
             };
             (ty, true)
