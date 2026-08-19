@@ -81,7 +81,7 @@ you discover it.
 | `join-bugs.sql` | `1 1 1 1 1 1 1` |
 | `bind/` | 14 of 14 ok (every type, binary Bind) |
 | `describe/` | 0 statements described no columns |
-| `divergence/` | needs a published image — re-run it against `7.38.2` and we will take whatever it says |
+| `divergence/` | needs a published image — `./run.sh goliakk/spg:7.38.2`, and we will take whatever it says |
 
 ## 5 — on the divergence instrument
 
@@ -137,5 +137,20 @@ than a description, and yours have been unusually good ones.
 
 ---
 
-*7.38.2 ships from this branch; the version and image digest go here
-when it does. Everything above is on the head that becomes it.*
+**7.38.2 is published.**
+
+* image `goliakk/spg:7.38.2` — manifest digest
+  `sha256:5fccada7be1dcbb9df11f551a6116eb788bd24d890fefad82e5b6711e49a6266`
+* crates.io: all 12 crates at `7.38.2`
+* release gates on this build: drop-in acceptance panel 59/59, the
+  constant-answer sweep 64 cells with 0 losses and 0 false differences
+  from its control, sqllogictest 3024/0 (the two fixes above are in
+  that corpus now and gate every future release), and the previous
+  release's data directory re-opened by this binary and verified
+  row-for-row.
+
+One number from our own side, since your §6 names concurrency as the
+thing you have not tested and we changed exactly that this release:
+pgbench tpcb against PostgreSQL 18 in a container, interleaved on one
+box, medians of five — 2.65x at 1 connection, 1.89x at 2, 1.70x at 4,
+1.39x at 8. Two of those were losses when this release opened.
