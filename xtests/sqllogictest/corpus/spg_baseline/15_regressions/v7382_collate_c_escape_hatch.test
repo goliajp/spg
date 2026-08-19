@@ -1,0 +1,44 @@
+# 7.38.2 (sentori drop-in status, §5) — `COLLATE "C"` is the escape
+# hatch, so it has to keep working exactly.
+#
+# Sentori's divergence instrument found that `postgres:18` (glibc,
+# en_US.utf8) and `postgres:18-alpine` (musl, declares en_US.utf8 and
+# behaves as C) disagree on the SAME eight probes that separate SPG
+# from glibc PG — the divergence is between two builds of PostgreSQL
+# itself, not something SPG introduced. Their 3.3.1 fix leans on
+# `COLLATE "C"` for everything a machine reads, because it answers
+# identically on both. That makes it load-bearing for a real
+# deployment, so it is pinned here: this ordering is byte-identical to
+# PG18's answer for the same input (differential 2026-08-19).
+
+statement ok
+CREATE TABLE clc (s TEXT)
+
+statement ok
+INSERT INTO clc VALUES ('a'), ('B'), ('b'), ('A'), ('_z'), ('Z')
+
+query T
+SELECT string_agg(s, ',' ORDER BY s COLLATE "C") FROM clc
+----
+A,B,Z,_z,a,b
+
+# The same order through a plain ORDER BY, one row per line.
+query T
+SELECT s FROM clc ORDER BY s COLLATE "C"
+----
+A
+B
+Z
+_z
+a
+b
+
+# A range over a text column, the probe whose divergence changes WHICH
+# ROWS come back rather than only their order.
+query T
+SELECT string_agg(s, ',' ORDER BY s COLLATE "C") FROM clc WHERE s COLLATE "C" BETWEEN 'B' AND 'b'
+----
+B,Z,_z,a,b
+
+statement ok
+DROP TABLE clc

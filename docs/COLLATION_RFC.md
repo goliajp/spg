@@ -495,3 +495,59 @@ until a database declares otherwise → survey which locales `compiled_data`
 covers → index rebuild path.
 
 Step one is worth doing on its own merits whatever happens to the rest.
+
+---
+
+## 6. Field data — the divergence is between two PostgreSQL builds too
+
+*Added 2026-08-19, from sentori's drop-in status doc. Their measurement,
+their instrument; recorded here because it changes what §5 is for.*
+
+Sentori built an instrument for exactly the class this RFC is about: same
+schema, same rows, same 18 questions over ordering, dedup, grouping, text
+ranges, case folding, numeric precision, interval arithmetic, `date_trunc`,
+jsonb, NULL semantics, empty aggregates, pagination — and a byte-for-byte
+diff of the answers.
+
+| comparison | probes disagreeing |
+|---|---|
+| SPG 7.38.1 vs `postgres:18` (debian/glibc, real `en_US.utf8`) | 8 / 18 |
+| SPG 7.38.1 vs `postgres:18-alpine` | 0 / 18 |
+| `postgres:18` vs `postgres:18-alpine` | 8 / 18 |
+
+The third row is the one to keep. `postgres:18-alpine` is musl: it
+DECLARES `en_US.utf8` and behaves as C. So the eight shapes this RFC
+enumerates separate two builds of PostgreSQL from each other by exactly the
+same amount they separate SPG from glibc PostgreSQL. A product shipping the
+alpine image and a customer running their own debian Postgres already had
+this divergence between them, and nobody had noticed.
+
+That does not make our §4 gap acceptable — a drop-in that declares
+`en_US.utf8` and sorts by bytes is still accepting a declaration it then
+ignores, and §5 stands. What it changes is the framing: this is a
+PostgreSQL-ecosystem divergence that our default happens to sit on one side
+of, not an SPG-specific defect, and the remedy that works today works on
+both sides of it.
+
+**`COLLATE "C"` is that remedy, and it is now pinned.** It answers
+identically on SPG and on glibc PG18 (measured 2026-08-19: the same
+ordering, the same rows out of a text `BETWEEN`), which is what lets it
+serve as a probe and as an escape hatch for anything a machine reads.
+`xtests/…/15_regressions/v7382_collate_c_escape_hatch.test` fails the
+release gate if that ever stops being true.
+
+Two instrument lessons from the same doc, both of which the instrument
+committed against itself before catching them, and both of which are
+failure modes our own perf work keeps hitting:
+
+* Its first oracle was the alpine image — so it compared C to C, reported
+  that every probe agreed, and was blind in precisely the way it existed to
+  prevent. It now reads `datcollate` *and* measures `'a' < 'A'`, and
+  refuses to grade if they disagree.
+* Its corpus then carried `2026-02-29`, which is not a date. The INSERT
+  failed, both sides answered every probe with nothing, and "byte for byte"
+  became agreement on emptiness. `count(*)` is now the first probe, and a
+  corpus that did not load exits before any comparison prints.
+
+An instrument that cannot express the defect, and an empty result read as a
+measurement. Same two, every time.
