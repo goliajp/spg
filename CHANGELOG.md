@@ -8,7 +8,13 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.2] — 2026-08-19
+
+Two customer-blocking defects and the concurrent-write campaign's real
+root cause. The residual this train opened with — pgbench tpcb losing
+to PostgreSQL 18 from four connections up — turned out to be one
+defect class in three places; with all three closed the ladder wins at
+every concurrency level tested.
 
 ### Added
 
@@ -18,6 +24,16 @@ the current build; this file is a release-organized view.
   DELETE's old tuple nonzero — all four shapes differential-anchored
   against PG18. A user column actually named `xmax` still wins, same
   rule as the scan path.
+- **`COLLATE "C"` is gated**: it answers identically on SPG and on
+  glibc PostgreSQL 18 — same ordering, same rows out of a text
+  `BETWEEN` — which is what lets a deployment use it as the escape
+  hatch for anything a machine reads. A release-gating corpus case
+  fails if that ever stops being true. `docs/COLLATION_RFC.md` gains
+  the field data behind it: sentori's divergence instrument found that
+  `postgres:18` and `postgres:18-alpine` disagree on the same eight
+  probes that separate SPG from glibc PostgreSQL, so the divergence is
+  between two builds of PostgreSQL itself, not something SPG
+  introduced.
 
 ### Fixed
 
