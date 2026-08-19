@@ -281,9 +281,26 @@ fn mailrs_content_worker_100k_join_under_budget() {
     let mean = run_query(&mut eng, SQL_CONTENT_WORKER, 3);
     // mailrs prod budget: 200 ms (the user-visible UX line). With the
     // walker fast path + indexed NOT EXISTS this should sit at ≤ 50 ms
-    // at 100k. Budget 100 ms gives CI noise headroom while still
-    // catching the catastrophic ~3-5 s prod-shape regression.
-    let budget = 0.100;
+    // at 100k, and the regression it exists to catch is the ~3-5 s
+    // prod shape — a hundredfold, not a percentage.
+    //
+    // v7.38.2 — 100 ms was calibrated on a developer box and assumed
+    // ~2x of headroom. The GitHub runner is 3.3x slower than that box
+    // (measured: 32 ms here, 105 ms there, on the SAME commit), so the
+    // budget was really gating the runner's speed and went red on
+    // v7.38.2's release commit. An interleaved A/B against v7.38.1 in
+    // its own worktree put both versions at ~32 ms with fully
+    // overlapping spread — no regression, just a slower machine. At
+    // 500 ms this still catches the 3-5 s shape with 6-10x of margin
+    // and sits 15x above the measured value — which is the ~10x this
+    // crate's BUDGETS.md asks of every gate, and which 100 ms (3x) had
+    // never actually met.
+    //
+    // The instrument this really wants is a ratio against a reference
+    // query timed on the same box, which no amount of hardware drift
+    // can move. That needs its own cross-machine calibration before it
+    // can gate anything, so it is not smuggled in here.
+    let budget = 0.500;
     assert!(
         mean < budget,
         "mailrs content_worker 100k JOIN+NOT EXISTS+ORDER BY pk DESC LIMIT \
@@ -362,7 +379,10 @@ fn mailrs_content_worker_100k_no_analyze_under_budget() {
     let _lock = crate::perf_lock();
     let mut eng = build_no_analyze();
     let mean = run_query(&mut eng, SQL_CONTENT_WORKER, 3);
-    let budget = 0.100;
+    // Same calibration story as the JOIN gate above (v7.38.2): 32 ms
+    // measured here, 105 ms on the CI runner, ~3-5 s is the shape being
+    // caught.
+    let budget = 0.500;
     assert!(
         mean < budget,
         "mailrs content_worker 100k no-ANALYZE mean {mean:.4}s exceeds budget \
