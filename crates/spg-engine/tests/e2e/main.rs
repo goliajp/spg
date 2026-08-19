@@ -233,6 +233,7 @@ mod e2e_delimiter;
 mod e2e_derived_join_round572;
 mod e2e_derived_table;
 mod e2e_describe_matches_execute_round462;
+mod e2e_describe_predicates_v7383;
 mod e2e_describe_select_subquery_r1053;
 mod e2e_difference;
 mod e2e_distinct_buffer_round485;
