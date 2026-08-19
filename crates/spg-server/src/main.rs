@@ -259,9 +259,23 @@ struct CommitQueueState {
 /// (most conflicts resolve within the holder's current statement) up
 /// to a 5 ms ceiling keeps the retry cheap when the wait is short and
 /// polite when it is long.
+/// v7.38.2 (R2 S3.1) — always-on lock-wait retry counter, round-438
+/// style: two relaxed adds on a path that is about to SLEEP cost
+/// nothing, and a counter you must remember to enable is a counter
+/// you do not have when you need it. `RETRIES` counts backoff sleeps
+/// (= statement re-executions); `RETRY_SLEEP_US` accumulates the time
+/// spent asleep, so a bench can price the poll-vs-wake gap exactly.
+pub(crate) static LOCK_WAIT_RETRIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LOCK_WAIT_SLEEP_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn lock_wait_backoff(attempt: u32) {
     let us = 100u64.saturating_mul(1u64 << attempt.min(6)); // 100µs..6.4ms
-    std::thread::sleep(std::time::Duration::from_micros(us.min(5_000)));
+    let us = us.min(5_000);
+    LOCK_WAIT_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LOCK_WAIT_SLEEP_US.fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_micros(us));
 }
 
 pub(crate) fn commit_queue_execute(

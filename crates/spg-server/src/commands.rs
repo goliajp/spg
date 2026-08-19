@@ -72,6 +72,45 @@ pub(crate) fn render_stats(state: &ServerState) -> std::io::Result<String> {
             .map_or("<disabled>".to_string(), |p| p.display().to_string())
     )
     .unwrap();
+    // v7.38.2 (R2 S3.1) — the always-on perf counters, queryable over
+    // the native STATS op so a bench window can snapshot them without
+    // env-gated traces (which go silent exactly when fsync is off).
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (appends, fsyncs) = crate::wal::wal_counters();
+        writeln!(out, "wal_appends={appends}").unwrap();
+        writeln!(out, "wal_fsyncs={fsyncs}").unwrap();
+        writeln!(
+            out,
+            "lock_wait_retries={}",
+            crate::LOCK_WAIT_RETRIES.load(Relaxed)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "lock_wait_sleep_us={}",
+            crate::LOCK_WAIT_SLEEP_US.load(Relaxed)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "commit_groups_solo={}",
+            crate::wal::COMMIT_GROUPS_SOLO.load(Relaxed)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "commit_groups_coalesced={}",
+            crate::wal::COMMIT_GROUPS_COALESCED.load(Relaxed)
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "commit_tasks_coalesced={}",
+            crate::wal::COMMIT_TASKS_COALESCED.load(Relaxed)
+        )
+        .unwrap();
+    }
     Ok(out)
 }
 
