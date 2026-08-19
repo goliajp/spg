@@ -521,6 +521,38 @@ impl Table {
         }
     }
 
+    /// v7.38.2 (R2 round 4) — the slot a RowId lives in, in O(log n).
+    ///
+    /// RowIds are allocated monotonically and pushed in lock-step with
+    /// rows, so `rowids` is ascending everywhere except the handful of
+    /// slots the rebase replay rewrote with a restored original id.
+    /// Binary search answers the ascending majority and only ever
+    /// returns a slot it has just VERIFIED names `rid`; anything it
+    /// cannot answer falls through to the linear scan, so the fast path
+    /// can only be slow, never wrong. The slot naming `rid` is THE slot:
+    /// `next_rowid` is a lineage-shared `Arc<AtomicU64>`, so a shadow
+    /// and the live table it rebases onto mint from ONE sequence and
+    /// cannot collide.
+    ///
+    /// What it replaces: both rebase-path lookups walked every row per
+    /// tombstone. At pgbench scale 5 (500k accounts) that alone cost
+    /// 2.4x throughput at c=4 while PG18 got FASTER on the same widening
+    /// — the O(rows) signature that named this attack.
+    fn rowid_position(&self, rid: crate::row_header::RowId) -> Option<usize> {
+        let n = self.rowids.len();
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.rowids.get(mid) {
+                Some(m) if *m == rid => return Some(mid),
+                Some(m) if *m < rid => lo = mid + 1,
+                Some(_) => hi = mid,
+                None => break,
+            }
+        }
+        (0..n).find(|&i| self.rowids.get(i) == Some(&rid))
+    }
+
     /// v7.37.17 (Phase E4 fix) — read-only conflict probe for a
     /// write-set's tombstones against THIS (fresher) relation: a target
     /// RowId that is gone, or already tombstoned by a DIFFERENT
@@ -534,15 +566,13 @@ impl Table {
         v: u64,
     ) -> alloc::vec::Vec<crate::row_header::RowId> {
         rids.iter()
-            .filter(
-                |rid| match (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid)) {
-                    Some(i) => self
-                        .headers
-                        .get(i)
-                        .is_some_and(|h| h.xmax != crate::row_header::XMAX_ALIVE && h.xmax != v),
-                    None => true,
-                },
-            )
+            .filter(|rid| match self.rowid_position(**rid) {
+                Some(i) => self
+                    .headers
+                    .get(i)
+                    .is_some_and(|h| h.xmax != crate::row_header::XMAX_ALIVE && h.xmax != v),
+                None => true,
+            })
             .copied()
             .collect()
     }
@@ -589,7 +619,7 @@ impl Table {
         }
         let mut conflicts: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
         for rid in &ws.tombstoned {
-            let pos = (0..self.rowids.len()).find(|&i| self.rowids.get(i) == Some(rid));
+            let pos = self.rowid_position(*rid);
             match pos {
                 Some(i) => match self.headers.get_mut(i) {
                     Some(h) if h.xmax == crate::row_header::XMAX_ALIVE => {

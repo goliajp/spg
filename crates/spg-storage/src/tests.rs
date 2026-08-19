@@ -5376,6 +5376,50 @@ mod tx_writeset {
     }
 
     #[test]
+    fn rowid_lookup_survives_out_of_order_tail() {
+        // v7.38.2 (R2 round 4) — the rebase-path RowId lookup went from a
+        // full scan to a binary search over the ascending rowids. A replay
+        // restores an ORIGINAL (older) id into the newest slot, which is
+        // exactly the case the search cannot answer: the fallback must.
+        // Built in the engine's real shape — a shadow forked from a base
+        // and a live table that committed rows meanwhile — so the ids come
+        // from the ONE lineage-shared counter and stay unique.
+        let mut base = table();
+        base.insert(row(1)).unwrap();
+        base.insert(row(2)).unwrap();
+
+        let mut old = base.clone();
+        old.insert_with_xmin(row(3), 61).unwrap();
+        let rid3 = old.rowids().get(2).copied().unwrap();
+        let ws_ins = old.extract_tx_writeset(61);
+
+        let mut fresh = base.clone();
+        for x in [7, 8, 9] {
+            fresh.insert(row(x)).unwrap();
+        }
+        assert!(fresh.replay_tx_writeset(&ws_ins, 61).is_empty());
+        let tail = fresh.rowids().len() - 1;
+        assert_eq!(fresh.rowids().get(tail).copied(), Some(rid3));
+        assert!(
+            fresh.rowids().get(tail - 1).copied().unwrap() > rid3,
+            "the tail must actually be out of order for this test to bite"
+        );
+
+        // A later write-set tombstones that very row: the lookup has to
+        // find the out-of-order slot, not report a phantom conflict.
+        let ws_del = crate::TxWriteSet {
+            inserted: alloc::vec::Vec::new(),
+            tombstoned: alloc::vec![rid3],
+        };
+        assert!(
+            fresh.tombstone_conflicts(&[rid3], 62).is_empty(),
+            "an out-of-order RowId read as missing"
+        );
+        assert!(fresh.replay_tx_writeset(&ws_del, 62).is_empty());
+        assert_eq!(fresh.headers().get(tail).unwrap().xmax, 62);
+    }
+
+    #[test]
     fn replay_reports_conflicts_and_is_idempotent() {
         let mut old = table();
         old.insert(row(1)).unwrap();
