@@ -52,6 +52,15 @@ the current build; this file is a release-organized view.
   that falls back to the full scan on any mismatch, so the fast path
   can only be slow, never wrong. pgbench tpcb c4 +53% on the mini
   testbed.
+- **The rebase stops walking the table to find a row**: resolving a
+  tombstoned RowId linear-scanned the whole relation, twice per rebase
+  (conflict probe and replay) — the same defect the write-set
+  extraction had, in the two places the first fix did not reach. The
+  signature: widening pgbench from scale 1 to scale 5 collapsed c=4
+  throughput 2.4x while PG18 got faster on the same widening. Lookups
+  now binary-search the ascending RowId column, verify the slot they
+  name, and keep the old scan as the fallback. c=4 went from 0.73x of
+  PG18 to 1.32x at scale 1 and 1.56x at scale 5.
 
 ---
 
