@@ -8,6 +8,32 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Describe answers for the predicate shapes** (sentori step 41): a
+  select item whose top-level expression was `IS NULL` / `IS NOT NULL`
+  / `NOT (…)` made Describe report NO COLUMNS for the whole statement —
+  the type walker had no arm for them and its "cannot type this" answer
+  abandons the entire column list, not just the one item. Nested inside
+  another operator the same subexpression described fine, which is why
+  `(a IS NOT NULL AND b IS NOT NULL)` worked and `a IS NOT NULL` did
+  not. Measuring the class found the same hole under `IS TRUE` /
+  `IS NOT TRUE`, `LIKE` / `NOT LIKE`, `IN (…)` and unary `~` / `+`;
+  all of them are closed. Types verified against PG18's own view
+  columns — every predicate BOOLEAN, the unary operators keeping their
+  operand's type, an unaliased one named `?column?`.
+- **`ALTER TABLE … ADD COLUMN … CHECK (…)` registers the constraint**
+  (sentori 2.2): the inline form was accepted and stored nothing —
+  `pg_constraint` empty, a violating INSERT allowed. The predicate was
+  on the parsed column all along and this path never read it. It now
+  lands as `<table>_<column>_check` and is validated against the rows
+  already present, matching PG: the statement is refused when the
+  backfill violates it, and the column does not stay behind.
+
+---
+
 ## [7.38.2] — 2026-08-19
 
 Two customer-blocking defects and the concurrent-write campaign's real
