@@ -8,6 +8,33 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A SQL function declared to return an array returns its value**
+  (sentori step 54). `def.returns` holds the type as the user wrote it
+  — `bigint[]` — while a `Named` cast target spells the same type
+  `bigint_array`, so coercing a body's value to its declared return
+  type could not resolve the bracket spelling, and the `or_else(NULL)`
+  underneath turned "I could not coerce this" into a NULL answer. The
+  body computed `{1,2}`, nothing errored, the caller got nothing. Their
+  version keys compare through one of these, so every version-targeted
+  push reached zero devices while reporting success. The same line
+  existed at both coercion sites — the pure-expression body and the one
+  with its own FROM — and is now one shared helper.
+- **`PREPARE` refuses a parameter it cannot deduce consistently**, at
+  sentori's request. A `$N` used both as a `bigint` column value and
+  inside `CASE WHEN $N > 0`, where the literal is `integer`, is what PG
+  reports as "inconsistent types deduced for parameter $N"; SPG let the
+  last context win silently. Only the DEDUCED form is refused — a
+  declared `PREPARE p (…, bigint, …)` is accepted and runs, as in PG,
+  which is the shape every driver that declares its types actually
+  sends. Inference and conflict detection now share one walk over the
+  typing contexts so they cannot disagree about which ones count.
+
+---
+
 ## [7.38.3] — 2026-08-19
 
 Everything sentori's drop-in status listed as open, and four more found
