@@ -1259,7 +1259,67 @@ impl Engine {
         needed: Option<&alloc::collections::BTreeSet<(String, String)>>,
         budget: &mut ByteBudget,
     ) -> Result<DeferredJoin<'_>, EngineError> {
-        let (swapped_from, primary_preds, peer_preds) = analyze_join_pushdown(from, where_);
+        // v7.38.2 (R1) — resolve UNQUALIFIED column names to their
+        // owning relation so bare-name predicates push down too.
+        // `analyze_join_pushdown` used to skip any conjunct with a bare
+        // column ("can't be attributed safely"), which is true without
+        // schema knowledge — but the schemas are right here. TPC-C
+        // writes every predicate bare (`ol_w_id = 1`), so its primary
+        // was never filtered and stock_level crossed 300k×100k rows:
+        // 190 ms a query, 14 ms once attributed (13×). The map only
+        // exists when EVERY relation in the FROM is a plain stored
+        // table — one derived/lateral/function source and no bare name
+        // resolves, keeping the old conservative behaviour, because a
+        // bare name might belong to the relation whose columns we
+        // cannot see. A name owned by two relations resolves to None
+        // (the query would be ambiguous anyway; the residual evaluator
+        // keeps the answer right).
+        let bare_owner: Option<hashbrown::HashMap<String, Option<String>>> = (|| {
+            let mut rels: alloc::vec::Vec<(&str, &str)> = alloc::vec::Vec::new();
+            let p = &from.primary;
+            if p.lateral_subquery.is_some()
+                || p.unnest_expr.is_some()
+                || p.generate_series_args.is_some()
+                || p.table_fn_call.is_some()
+            {
+                return None;
+            }
+            rels.push((
+                p.name.as_str(),
+                p.alias.as_deref().unwrap_or(p.name.as_str()),
+            ));
+            for j in &from.joins {
+                let t = &j.table;
+                if t.lateral_subquery.is_some()
+                    || t.unnest_expr.is_some()
+                    || t.generate_series_args.is_some()
+                    || t.table_fn_call.is_some()
+                {
+                    return None;
+                }
+                rels.push((
+                    t.name.as_str(),
+                    t.alias.as_deref().unwrap_or(t.name.as_str()),
+                ));
+            }
+            let mut map: hashbrown::HashMap<String, Option<String>> = hashbrown::HashMap::new();
+            for (name, alias) in rels {
+                let t = self.active_catalog().get(name)?;
+                for c in &t.schema().columns {
+                    map.entry(c.name.to_ascii_lowercase())
+                        .and_modify(|v| *v = None)
+                        .or_insert_with(|| Some(alias.to_string()));
+                }
+            }
+            Some(map)
+        })();
+        let resolve_bare = |n: &str| -> Option<String> {
+            bare_owner
+                .as_ref()
+                .and_then(|m| m.get(&n.to_ascii_lowercase()).cloned().flatten())
+        };
+        let (swapped_from, primary_preds, peer_preds) =
+            analyze_join_pushdown(from, where_, &resolve_bare);
         // v7.37.x (mailrs Track A perf — SPGE ≫ PG18) — pushed conjuncts
         // are enforced AT the primary `filter_table_indices` (or eager
         // peer `materialise_table_ref_filtered`) AND/OR as a join-stage
@@ -4430,6 +4490,7 @@ fn substitute_outer_in_expr(
 fn analyze_join_pushdown<'w>(
     from: &FromClause,
     where_: Option<&'w Expr>,
+    resolve_bare: &dyn Fn(&str) -> Option<String>,
 ) -> (Option<FromClause>, Vec<&'w Expr>, Vec<Vec<&'w Expr>>) {
     let primary_alias = from
         .primary
@@ -4455,16 +4516,49 @@ fn analyze_join_pushdown<'w>(
             if expr_has_subquery(sub) || aggregate::contains_aggregate(sub) {
                 continue;
             }
-            let mut quals: Vec<&str> = Vec::new();
-            let mut all_qualified = true;
-            collect_column_qualifiers(sub, &mut quals, &mut all_qualified);
-            if !all_qualified || quals.is_empty() {
-                continue;
+            // v7.38.2 (R1) — attribute every column reference, bare
+            // ones through the schema-backed resolver (see the caller's
+            // note). One unattributable reference — an exotic node's
+            // bail marker included — keeps the conjunct in the residual
+            // WHERE, exactly the old conservative behaviour.
+            let mut owner: Option<String> = None;
+            let attributable = core::cell::Cell::new(true);
+            {
+                let mut on_col = |c: &spg_sql::ast::ColumnName| {
+                    if !attributable.get() {
+                        return;
+                    }
+                    let q: Option<String> =
+                        c.qualifier.as_deref().map(String::from).or_else(|| {
+                            if c.name.is_empty() {
+                                None
+                            } else {
+                                resolve_bare(&c.name)
+                            }
+                        });
+                    match (q, owner.as_deref()) {
+                        (None, _) => attributable.set(false),
+                        (Some(q), None) => owner = Some(q),
+                        (Some(q), Some(o)) => {
+                            if !o.eq_ignore_ascii_case(&q) {
+                                attributable.set(false);
+                            }
+                        }
+                    }
+                };
+                let mut on_sub = |_: &spg_sql::ast::SelectStatement| {
+                    attributable.set(false);
+                };
+                crate::expr_analysis::visit_expr_columns_and_subqueries(
+                    sub,
+                    &mut on_col,
+                    &mut on_sub,
+                );
             }
-            let q0 = quals[0];
-            if !quals.iter().all(|q| q.eq_ignore_ascii_case(q0)) {
+            let Some(q0) = owner.filter(|_| attributable.get()) else {
                 continue;
-            }
+            };
+            let q0 = q0.as_str();
             if q0.eq_ignore_ascii_case(primary_alias) {
                 if !primary_nullable {
                     primary_preds.push(sub);
