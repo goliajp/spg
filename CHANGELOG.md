@@ -8,7 +8,11 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.5] — 2026-08-20
+
+The last defect on sentori's list — which their own status doc had
+recorded as closed a release early — and a release path for the times
+when waiting costs more than the wide gate does.
 
 ### Fixed
 
