@@ -61,6 +61,7 @@ mod e2e_array_pg17_funcs;
 mod e2e_array_position_element_types;
 mod e2e_array_positions;
 mod e2e_array_remove_replace;
+mod e2e_array_returning_function_v7384;
 mod e2e_array_round257;
 mod e2e_array_shuffle_sample;
 mod e2e_array_subquery_round105;

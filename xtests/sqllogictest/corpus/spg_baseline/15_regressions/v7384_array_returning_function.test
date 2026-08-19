@@ -1,0 +1,72 @@
+# 7.38.4 (sentori step 54) — a SQL function declared to return an array
+# returned NULL. `def.returns` holds the type as the user wrote it
+# (`bigint[]`) while a Named cast target spells it `bigint_array`, so
+# the coercion to the declared return type could not resolve, and the
+# or_else under it turned that into NULL. The body computed the value;
+# nothing errored; the caller got nothing.
+#
+# Their version keys compare through one of these, so every
+# version-targeted push reached zero devices while reporting success.
+# Differential-anchored against PG18 2026-08-19.
+
+statement ok
+CREATE FUNCTION arf_gi() RETURNS BIGINT LANGUAGE sql IMMUTABLE AS $$ SELECT 7::bigint $$
+
+query T
+SELECT arf_gi()
+----
+7
+
+statement ok
+CREATE FUNCTION arf_ga() RETURNS BIGINT[] LANGUAGE sql IMMUTABLE AS $$ SELECT ARRAY[1,2]::bigint[] $$
+
+query T
+SELECT arf_ga()
+----
+{1,2}
+
+statement ok
+CREATE FUNCTION arf_gt() RETURNS TEXT[] LANGUAGE sql IMMUTABLE AS $$ SELECT ARRAY['a','b']::text[] $$
+
+query T
+SELECT arf_gt()
+----
+{a,b}
+
+# The shape sentori ships: version keys must compare as numbers, where
+# text ordering has '4.10.0' before '4.2.0'.
+statement ok
+CREATE FUNCTION arf_vk(v TEXT) RETURNS BIGINT[] LANGUAGE sql IMMUTABLE AS $$ SELECT (string_to_array(v, '.')::bigint[] || ARRAY[0,0,0,0]::bigint[])[1:4] $$
+
+query T
+SELECT arf_vk('4.10.0')
+----
+{4,10,0,0}
+
+query T
+SELECT arf_vk('4.10.0') >= arf_vk('4.2')
+----
+1
+
+query T
+SELECT arf_vk('4.2') >= arf_vk('4.10.0')
+----
+0
+
+# The second coercion site: a body with its own FROM.
+statement ok
+CREATE TABLE arf_src (id INT, n BIGINT)
+
+statement ok
+INSERT INTO arf_src VALUES (1, 10), (1, 20)
+
+statement ok
+CREATE FUNCTION arf_agg(k INT) RETURNS BIGINT[] LANGUAGE sql STABLE AS $$ SELECT array_agg(n ORDER BY n) FROM arf_src WHERE id = k $$
+
+query T
+SELECT arf_agg(1)
+----
+{10,20}
+
+statement ok
+DROP TABLE arf_src
