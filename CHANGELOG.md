@@ -8,11 +8,20 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.5] — 2026-08-20
+## [7.38.6] — 2026-08-20
 
 The last defect on sentori's list — which their own status doc had
 recorded as closed a release early — and a release path for the times
 when waiting costs more than the wide gate does.
+
+**7.38.5 was tagged and never published.** Its own release gate went red
+on `plan_cache`, a perf gate that compares two timed loops run one after
+the other with a ~2 µs numerator — so load landing on one loop and not
+the other moved the verdict. There was no regression behind it (0.117 to
+0.258 on that tree, 0.141 to 0.176 on v7.38.4, spreads overlapping), but
+a tag whose tree cannot pass its own gate is not a release. The
+instrument is fixed here; the tag stays where it is, because a pushed
+tag is never moved.
 
 ### Fixed
 
@@ -38,6 +47,15 @@ when waiting costs more than the wide gate does.
   announces what it did not run, and its checklist carries the debt:
   run the full battery once the hurry is over, and if that goes red,
   cut the next version rather than retag.
+
+### Changed
+
+- **The plan-cache perf gate measures interleaved and takes a median.**
+  Each round now runs the hit and cold batches both, flipping which goes
+  first, so the two are exposed to the same neighbours; the verdict is
+  the median of the per-round ratios. The 0.33 bound is unchanged — it
+  was never the problem. Measured 0.101 idle and 0.135 with four
+  competing perf binaries running.
 
 ---
 
