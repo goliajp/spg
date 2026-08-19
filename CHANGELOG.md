@@ -8,6 +8,53 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **`RETURNING xmax` — PG's `(xmax = 0) AS is_new` upsert idiom**
+  (sentori report 5): plain INSERT reads 0, an `ON CONFLICT DO UPDATE`
+  row reads the writer version (nonzero), UPDATE's new tuple 0,
+  DELETE's old tuple nonzero — all four shapes differential-anchored
+  against PG18. A user column actually named `xmax` still wins, same
+  rule as the scan path.
+
+### Fixed
+
+- **`ALTER TABLE … DROP COLUMN` now takes dependent CHECK constraints
+  with it** (sentori report 5, migration-chain blocker): a column's
+  inline or table-level CHECK used to survive the drop, leaving the
+  table permanently un-insertable (`ColumnNotFound` on the ghost
+  column) with the orphan visible in `pg_constraint`. PG's rule —
+  constraints involving the column drop automatically, unrelated ones
+  survive with teeth — is now matched and pinned.
+- **`SELECT … FOR UPDATE` locked the wrong row**: the locking pre-pass
+  resolved its target by table position instead of RowId, so the lock
+  landed on an arbitrary row and the scanned lock never guarded its
+  target. The pre-pass now seeks through the same index-candidate
+  machinery as execution and locks the real RowId; a point FOR UPDATE
+  no longer sequential-scans the table (tpcc 23.5 → 455 tps on the
+  mini testbed).
+- **Bare-column predicate pushdown in joins**: unqualified column
+  conjuncts (everything TPC-C writes) were never attributed to a side
+  and the whole predicate stayed post-join; a schema-backed owner map
+  now resolves bare names when the join's plain tables can answer them
+  unambiguously.
+
+### Performance
+
+- **Incremental transaction write-sets**: the read-committed
+  COMMIT-rebase used to re-derive a transaction's write-set by
+  full-scanning every touched table per in-transaction statement
+  whenever concurrent commits moved the commit epoch — quadratic under
+  concurrency. Tables now track their in-flight writes at the write
+  funnels (insert / tombstone / replay), with a per-slot verification
+  that falls back to the full scan on any mismatch, so the fast path
+  can only be slow, never wrong. pgbench tpcb c4 +53% on the mini
+  testbed.
+
+---
+
 ## [7.38.1] — 2026-08-19
 
 The ledger clears. v7.38.0 shipped with an honest list of residuals —
