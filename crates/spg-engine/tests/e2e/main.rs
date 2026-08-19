@@ -1100,6 +1100,7 @@ mod e2e_ledger_red_l4_v7381;
 mod e2e_ledger_reds_v7381;
 mod e2e_left_right;
 mod e2e_limit_placeholder;
+mod e2e_locking_prepass_seek_v7382;
 mod e2e_lpad_rpad;
 mod e2e_materialized_view;
 #[allow(

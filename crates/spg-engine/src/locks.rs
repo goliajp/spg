@@ -341,33 +341,73 @@ impl crate::Engine {
         let alias = from.primary.alias.clone();
         let ctx = crate::eval::EvalContext::new(&cols, alias.as_deref())
             .with_catalog(self.active_catalog());
-        let mut picked: alloc::vec::Vec<(usize, spg_storage::Row<'static>)> =
-            alloc::vec::Vec::new();
-        for (idx, row) in table.scan_visible(&snap) {
-            if let Some(pred) = &stmt.where_ {
-                let keep =
-                    crate::eval::eval_expr(pred, row, &ctx).map_err(crate::EngineError::Eval)?;
-                if !matches!(keep, spg_storage::Value::Bool(true)) {
-                    continue;
+        // v7.38.2 (R1) — candidates come from the SAME index-seek
+        // machinery the executor uses. The 10:40 tpcc profile put this
+        // pre-pass at 64% of the serving thread: every FOR UPDATE
+        // walked EVERY visible row through the interpreted evaluator
+        // while the execution right after it seeks. A seek result is a
+        // candidate superset, so the predicate is still re-checked per
+        // candidate — same answers, thousands fewer rows touched.
+        let alias_or_name = alias.as_deref().unwrap_or(&tname);
+        let seeked: Option<alloc::vec::Vec<usize>> = stmt.where_.as_ref().and_then(|pred| {
+            crate::index_access::try_index_seek_positions(pred, &cols, table, alias_or_name, &snap)
+        });
+        // v7.38.2 (R1, red-first pin) — lock by the row's REAL RowId.
+        // This walk used to lock `RowId(position)`, but RowIds are
+        // dense 1-based while positions are 0-based (and diverge
+        // arbitrarily after churn), so `SELECT … FOR UPDATE` locked
+        // the WRONG row: it never conflicted with a DML on the same
+        // row (which locks via `table.rowids()`), and spuriously
+        // blocked writers of a neighbour.
+        let mut picked: alloc::vec::Vec<(
+            usize,
+            spg_storage::row_header::RowId,
+            spg_storage::Row<'static>,
+        )> = alloc::vec::Vec::new();
+        let mut push_if_match =
+            |idx: usize, row: &spg_storage::Row<'static>| -> Result<(), crate::EngineError> {
+                if let Some(pred) = &stmt.where_ {
+                    let keep = crate::eval::eval_expr(pred, row, &ctx)
+                        .map_err(crate::EngineError::Eval)?;
+                    if !matches!(keep, spg_storage::Value::Bool(true)) {
+                        return Ok(());
+                    }
+                }
+                let Some(rid) = table.rowids().get(idx).copied() else {
+                    return Ok(());
+                };
+                picked.push((idx, rid, row.clone()));
+                Ok(())
+            };
+        if let Some(positions) = seeked {
+            for idx in positions {
+                if let Some(row) = table.rows().get(idx) {
+                    push_if_match(idx, row)?;
                 }
             }
-            picked.push((idx, row.clone()));
+        } else {
+            for (idx, row) in table.scan_visible(&snap) {
+                push_if_match(idx, row)?;
+            }
         }
         if !stmt.order_by.is_empty() {
             let descs: alloc::vec::Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
-            let mut tagged: alloc::vec::Vec<(alloc::vec::Vec<crate::orderby::OrderKey>, usize)> =
-                alloc::vec::Vec::with_capacity(picked.len());
-            for (idx, row) in &picked {
+            let mut tagged: alloc::vec::Vec<(
+                alloc::vec::Vec<crate::orderby::OrderKey>,
+                usize,
+                spg_storage::row_header::RowId,
+            )> = alloc::vec::Vec::with_capacity(picked.len());
+            for (idx, rid, row) in &picked {
                 tagged.push((
                     crate::orderby::build_order_keys(&stmt.order_by, row, &ctx)?,
                     *idx,
+                    *rid,
                 ));
             }
             tagged.sort_by(|a, b| crate::orderby::cmp_multi_key(&a.0, &b.0, &descs));
-            let order: alloc::vec::Vec<usize> = tagged.into_iter().map(|(_, i)| i).collect();
-            picked = order
+            picked = tagged
                 .into_iter()
-                .map(|i| (i, spg_storage::Row::new(alloc::vec::Vec::new())))
+                .map(|(_, i, rid)| (i, rid, spg_storage::Row::new(alloc::vec::Vec::new())))
                 .collect();
         }
         // Walk in result order, locking until the query's window is full.
@@ -376,17 +416,11 @@ impl crate::Engine {
         let want = limit.map(|n| n.saturating_add(offset));
         let mut skipped: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
         let mut taken = 0usize;
-        for (idx, _) in &picked {
+        for (idx, rid, _) in &picked {
             if want.is_some_and(|w| taken >= w) {
                 break;
             }
-            let outcome = self.acquire_row_lock(
-                rel,
-                spg_storage::row_header::RowId(*idx as u64),
-                mode,
-                version,
-                policy,
-            );
+            let outcome = self.acquire_row_lock(rel, *rid, mode, version, policy);
             match outcome {
                 LockOutcome::Granted => taken += 1,
                 LockOutcome::Skip => {
