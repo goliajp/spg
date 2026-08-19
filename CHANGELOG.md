@@ -8,7 +8,11 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.4] — 2026-08-20
+
+The one thing sentori's status doc had open, and the one thing they
+asked us to change about a statement we accept and PostgreSQL does
+not.
 
 ### Fixed
 
