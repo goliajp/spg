@@ -81,7 +81,7 @@ you discover it.
 | `join-bugs.sql` | `1 1 1 1 1 1 1` |
 | `bind/` | 14 of 14 ok (every type, binary Bind) |
 | `describe/` | 0 statements described no columns |
-| `divergence/` | needs a published image — `./run.sh goliakk/spg:7.38.2`, and we will take whatever it says |
+| `divergence/` | 8 of 18 vs `postgres:18`, 18 of 18 agreeing vs `postgres:18-alpine` — we ran it ourselves once the image was published; same eight as your 7.38.1 numbers, unchanged and unsurprising (see below) |
 
 ## 5 — on the divergence instrument
 
@@ -111,6 +111,18 @@ Two things we are taking from it on our side:
 Our `COLLATION_RFC.md` stands as the accurate description of where we
 are. What it does not yet say, and now will, is that the same
 divergence exists between two builds of PostgreSQL itself.
+
+To be explicit about what 7.38.2 does NOT change: we ran your
+`divergence/run.sh` against the published `goliakk/spg:7.38.2` on both
+oracles, and the numbers are exactly yours — 8 of 18 against
+`postgres:18`, 18 of 18 agreeing against `postgres:18-alpine`. The
+eight are the shapes §4 of the RFC enumerates, and the cause is that
+our database default collation is C. The RFC's §5 recommendation —
+thread a collation name from the parser into the catalog, wire an ICU
+collator behind it, and build the index-rebuild path a collation change
+demands — is a piece of work in its own right and is not in this
+release. We would rather say that plainly than let a green battery in
+§4 imply otherwise.
 
 ## 6 — the list you say is yours
 
