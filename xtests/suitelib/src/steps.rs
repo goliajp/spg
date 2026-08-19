@@ -73,7 +73,18 @@ pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> 
     }
     let affected = graph.affected(&changed);
     let flags: String = affected.iter().map(|c| format!(" -p {c}")).collect();
-    sh(root, &format!("cargo test -q{flags} --lib --bins"))?;
+    // v7.38.2 — cargo errors on `--lib` when a SINGLE selected package
+    // has no lib target (bins-only spg-server / spgctl), but silently
+    // tolerates the same flags across MULTIPLE packages — so this step
+    // only ever failed when exactly one bins-only crate changed. Retry
+    // without `--lib` on that precise error.
+    match sh(root, &format!("cargo test -q{flags} --lib --bins")) {
+        Ok(_) => {}
+        Err(e) if e.contains("no library targets") => {
+            sh(root, &format!("cargo test -q{flags} --bins"))?;
+        }
+        Err(e) => return Err(e),
+    }
     Ok(format!("unit green over {} crates", affected.len()))
 }
 

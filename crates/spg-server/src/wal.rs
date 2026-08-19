@@ -410,7 +410,12 @@ pub(crate) fn trace_wal_counters(site: &str) {
         return;
     };
     let (a, f) = wal_counters();
-    let line = format!("[wal-trace] {site} appends={a} fsyncs={f}\n");
+    // v7.38.2 (R2 S3.1) — the same trace line carries the lock-wait
+    // counters so one grep prices fsyncs AND poll-retries per window.
+    let r = crate::LOCK_WAIT_RETRIES.load(std::sync::atomic::Ordering::Relaxed);
+    let s = crate::LOCK_WAIT_SLEEP_US.load(std::sync::atomic::Ordering::Relaxed);
+    let line =
+        format!("[wal-trace] {site} appends={a} fsyncs={f} lock_retries={r} lock_sleep_us={s}\n");
     if dest == "1" {
         eprint!("{line}");
     } else if let Ok(mut fh) = std::fs::OpenOptions::new()
