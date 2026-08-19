@@ -750,9 +750,8 @@ use crate::{
     enforce_not_null, enforce_unique_index_inserts, enforce_unique_updates,
     enforce_uniqueness_inserts, eval, eval_runtime_default_free, expr_has_subquery,
     literal_expr_to_value, literal_expr_to_value_in, lookup_row_position_by_keys,
-    on_conflict_keys_exist, plan_fk_parent_deletions, plan_fk_parent_updates,
-    resolve_column_default_free, triggers, try_index_seek_positions, try_pk_predicate,
-    value_to_literal_expr_permissive,
+    plan_fk_parent_deletions, plan_fk_parent_updates, resolve_column_default_free, triggers,
+    try_index_seek_positions, try_pk_predicate, value_to_literal_expr_permissive,
 };
 
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
@@ -5339,13 +5338,33 @@ impl Engine {
             // Which arbiter hit — the DO UPDATE row lookup keys off it (a
             // MySQL-lowered bare clause can have several).
             let mut hit_arbiter = 0usize;
-            for (ai, (cols, nnd)) in arbiters.iter().enumerate() {
+            for (ai, (cols, nnd, predicate)) in arbiters.iter().enumerate() {
                 let kt: Vec<&Value> = cols.iter().map(|&c| &values[c]).collect();
                 let has_null = !nnd && kt.iter().any(|v| matches!(v, Value::Null));
                 if has_null {
                     continue;
                 }
-                if on_conflict_keys_exist(self.active_catalog(), table_name, cols, &kt) {
+                // v7.38.5 (sentori r8) — a PARTIAL unique index only holds
+                // the rows its predicate accepts, so a row the predicate
+                // rejects cannot conflict on it. Check the INCOMING row
+                // here; the existence probe checks the stored ones.
+                if let Some(pred) = predicate
+                    && !crate::constraints::row_satisfies_index_predicate(
+                        self.active_catalog(),
+                        table_name,
+                        pred,
+                        &Row::new(values.clone()),
+                    )
+                {
+                    continue;
+                }
+                if crate::constraints::on_conflict_keys_exist_where(
+                    self.active_catalog(),
+                    table_name,
+                    cols,
+                    &kt,
+                    predicate.as_deref(),
+                ) {
                     if !collides_with_table && !collides_with_batch {
                         hit_arbiter = ai;
                     }
@@ -5361,7 +5380,7 @@ impl Engine {
             }
             let conflict_cols = &arbiters
                 .get(hit_arbiter)
-                .map(|(c, _)| c.clone())
+                .map(|(c, _, _)| c.clone())
                 .unwrap_or_default();
             let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
             let key_tuple_owned: Vec<Value<'static>> =
@@ -5369,7 +5388,20 @@ impl Engine {
             let collides = collides_with_table || collides_with_batch;
             match (&clause.action, collides) {
                 (_, false) => {
-                    for (ai, (cols, nnd)) in arbiters.iter().enumerate() {
+                    for (ai, (cols, nnd, predicate)) in arbiters.iter().enumerate() {
+                        // Same rule as above: a row the predicate rejects
+                        // never enters this arbiter's index, so it must not
+                        // enter its batch-local key set either.
+                        if let Some(pred) = predicate
+                            && !crate::constraints::row_satisfies_index_predicate(
+                                self.active_catalog(),
+                                table_name,
+                                pred,
+                                &Row::new(values.clone()),
+                            )
+                        {
+                            continue;
+                        }
                         let kt: Vec<Value<'static>> =
                             cols.iter().map(|&c| values[c].clone()).collect();
                         if *nnd || !kt.iter().any(|v| matches!(v, Value::Null)) {

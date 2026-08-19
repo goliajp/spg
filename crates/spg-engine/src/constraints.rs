@@ -232,12 +232,18 @@ fn pick_pk_index_column(
 ///     arbiter simply means no conflict is possible).
 ///
 /// Each entry is (column positions, nulls_not_distinct).
+/// v7.38.5 — one arbiter an `ON CONFLICT` clause watches: the key
+/// columns, whether its NULLs compare equal, and the partial index's
+/// predicate when it has one (rows the predicate rejects are not in
+/// the index and so cannot conflict on it).
+pub(crate) type Arbiter = (Vec<usize>, bool, Option<alloc::string::String>);
+
 pub(crate) fn on_conflict_arbiters(
     catalog: &Catalog,
     table_name: &str,
     target: &[String],
     from_constraint_name: bool,
-) -> Result<Vec<(Vec<usize>, bool)>, EngineError> {
+) -> Result<Vec<Arbiter>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
@@ -256,14 +262,35 @@ pub(crate) fn on_conflict_arbiters(
         .map(|idx| idx.column_position)
         .collect();
     if target.is_empty() {
-        let mut out: Vec<(Vec<usize>, bool)> = schema
+        let mut out: Vec<Arbiter> = schema
             .uniqueness_constraints
             .iter()
-            .map(|uc| (uc.columns.clone(), uc.nulls_not_distinct))
+            .map(|uc| (uc.columns.clone(), uc.nulls_not_distinct, None))
             .collect();
         for &pos in &unique_btree_cols {
-            if !out.iter().any(|(cols, _)| cols == &alloc::vec![pos]) {
-                out.push((alloc::vec![pos], false));
+            if !out.iter().any(|(cols, _, _)| cols == &alloc::vec![pos]) {
+                out.push((alloc::vec![pos], false, None));
+            }
+        }
+        // v7.38.5 (sentori r8) — a PARTIAL unique index arbitrates too.
+        // It was excluded from `unique_btree_cols` above (that filter
+        // wants indexes whose every row is covered), so an untargeted
+        // `ON CONFLICT DO NOTHING` could not see it and the conflict
+        // escaped to the duplicate-key check as an error. PG absorbs it:
+        // the bare form arbitrates on EVERY unique index, partial ones
+        // included, with the predicate deciding which rows are in play.
+        // Their idempotency key is one of these, so pressing send twice
+        // was a 500 where PG says INSERT 0 0.
+        for idx in table.indices() {
+            if idx.is_unique
+                && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                && idx.expression.is_none()
+                && let Some(pred) = idx.partial_predicate.as_deref()
+            {
+                let cols = unique_key_positions(idx);
+                if !out.iter().any(|(c, _, _)| c == &cols) {
+                    out.push((cols, false, Some(alloc::string::String::from(pred))));
+                }
             }
         }
         // Legacy fallback, kept deliberately: schemas from before SPG
@@ -278,7 +305,7 @@ pub(crate) fn on_conflict_arbiters(
                     && idx.expression.is_none()
                     && idx.included_columns.is_empty()
                 {
-                    out.push((alloc::vec![idx.column_position], false));
+                    out.push((alloc::vec![idx.column_position], false, None));
                 }
             }
         }
@@ -314,7 +341,10 @@ pub(crate) fn on_conflict_arbiters(
     // PG-valid program never issues the shape PG rejects.
     let _ = from_constraint_name;
     let nnd = matched_uc.is_some_and(|uc| uc.nulls_not_distinct);
-    Ok(alloc::vec![(positions, nnd)])
+    // An EXPLICIT target names its own predicate in the clause
+    // (`ON CONFLICT (k, t) WHERE t IS NOT NULL`) and the caller already
+    // resolved the columns from it, so nothing is carried here.
+    Ok(alloc::vec![(positions, nnd, None)])
 }
 
 /// v7.37.15 (Phase C.3) — does this BTree index locator point at a
@@ -426,6 +456,63 @@ pub(crate) fn on_conflict_keys_exist(
     // existence check must also see cold-tier rows; otherwise an
     // INSERT whose unique-key tuple lives only in the cold tier
     // silently bypasses ON CONFLICT and writes a duplicate.
+    iter_cold_rows_of_parent(catalog, table)
+        .iter()
+        .any(&matches)
+}
+
+/// v7.38.5 (sentori r8) — does this row belong in a partial index?
+///
+/// A partial unique index only holds the rows its predicate accepts, so
+/// only those rows can conflict on it. A predicate that will not parse
+/// or will not evaluate answers `false` — "not in the index" — which is
+/// the same degradation `check_existing_unique_violation` chose, and it
+/// keeps a malformed predicate from turning into a spurious conflict.
+pub(crate) fn row_satisfies_index_predicate(
+    catalog: &Catalog,
+    table_name: &str,
+    predicate: &str,
+    row: &Row<'static>,
+) -> bool {
+    let Some(table) = catalog.get(table_name) else {
+        return false;
+    };
+    let Ok(expr) = spg_sql::parser::parse_expression(predicate) else {
+        return false;
+    };
+    let ctx = eval::EvalContext::new(&table.schema().columns, None);
+    eval::eval_expr(&expr, row, &ctx).is_ok_and(|v| predicate_truthy(&v))
+}
+
+/// v7.38.5 — `on_conflict_keys_exist`, restricted to the rows a partial
+/// index actually holds. `None` is the whole-table question and behaves
+/// exactly as before.
+pub(crate) fn on_conflict_keys_exist_where(
+    catalog: &Catalog,
+    table_name: &str,
+    column_positions: &[usize],
+    key: &[&Value],
+    predicate: Option<&str>,
+) -> bool {
+    let Some(pred) = predicate else {
+        return on_conflict_keys_exist(catalog, table_name, column_positions, key);
+    };
+    let Some(table) = catalog.get(table_name) else {
+        return false;
+    };
+    let matches = |r: &Row<'static>| {
+        column_positions
+            .iter()
+            .enumerate()
+            .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
+            && row_satisfies_index_predicate(catalog, table_name, pred, r)
+    };
+    let hot_hit = table.rows().iter().enumerate().any(|(row_idx, r)| {
+        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
+    });
+    if hot_hit {
+        return true;
+    }
     iter_cold_rows_of_parent(catalog, table)
         .iter()
         .any(&matches)

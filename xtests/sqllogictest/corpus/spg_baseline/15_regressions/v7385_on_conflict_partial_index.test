@@ -1,0 +1,91 @@
+# 7.38.5 (sentori r8, step 66) — an untargeted ON CONFLICT arbitrates on
+# PARTIAL unique indexes too. The bare form collected arbiters from every
+# unique constraint and every FULL unique index; partial ones were
+# filtered out, so a conflict on one was invisible to DO NOTHING and
+# escaped to the duplicate-key check as an error.
+#
+# Theirs is an idempotency key — one delivery per device per key — so
+# pressing send twice was a 500 where PG says INSERT 0 0.
+# Differential-anchored against PG18 2026-08-20, including the rule that
+# the predicate decides who is in play on both sides of the comparison.
+
+statement ok
+CREATE TABLE ocp_a (id INT, k TEXT, t TEXT)
+
+statement ok
+CREATE UNIQUE INDEX ocp_a_plain ON ocp_a (id)
+
+statement ok
+CREATE UNIQUE INDEX ocp_a_partial ON ocp_a (k, t) WHERE t IS NOT NULL
+
+statement ok
+INSERT INTO ocp_a VALUES (1, 'a', 'x')
+
+# Plain unique index: always absorbed.
+statement ok
+INSERT INTO ocp_a VALUES (1, 'zz', 'yy') ON CONFLICT DO NOTHING
+
+# Partial unique index, untargeted: used to raise.
+statement ok
+INSERT INTO ocp_a VALUES (9, 'a', 'x') ON CONFLICT DO NOTHING
+
+# Naming the target always worked.
+statement ok
+INSERT INTO ocp_a VALUES (8, 'a', 'x') ON CONFLICT (k, t) WHERE t IS NOT NULL DO NOTHING
+
+query T
+SELECT count(*) FROM ocp_a
+----
+1
+
+# A row the predicate rejects is outside the index: it neither conflicts
+# nor blocks anything else.
+statement ok
+CREATE TABLE ocp_b (id INT, k TEXT, t TEXT)
+
+statement ok
+CREATE UNIQUE INDEX ocp_b_partial ON ocp_b (k) WHERE t IS NOT NULL
+
+statement ok
+INSERT INTO ocp_b VALUES (1, 'a', 'x')
+
+statement ok
+INSERT INTO ocp_b VALUES (2, 'a', NULL) ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO ocp_b VALUES (3, 'a', NULL) ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO ocp_b VALUES (4, 'a', 'y') ON CONFLICT DO NOTHING
+
+query T
+SELECT count(*) FROM ocp_b
+----
+3
+
+# The same rule inside ONE statement.
+statement ok
+CREATE TABLE ocp_c (id INT, k TEXT, t TEXT)
+
+statement ok
+CREATE UNIQUE INDEX ocp_c_partial ON ocp_c (k) WHERE t IS NOT NULL
+
+statement ok
+INSERT INTO ocp_c VALUES (1, 'a', NULL), (2, 'a', NULL) ON CONFLICT DO NOTHING
+
+statement ok
+INSERT INTO ocp_c VALUES (3, 'b', 'x'), (4, 'b', 'x') ON CONFLICT DO NOTHING
+
+query T
+SELECT count(*) FROM ocp_c
+----
+3
+
+statement ok
+DROP TABLE ocp_a
+
+statement ok
+DROP TABLE ocp_b
+
+statement ok
+DROP TABLE ocp_c
