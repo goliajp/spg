@@ -168,8 +168,8 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// wire smoke below, PLUS the previous release's data directory opened
 /// directly by the CURRENT binary and verified row-for-row.
 ///
-/// The fixture (`xtests/compat-datadirs/v7.38.3/`) was captured by
-/// the v7.38.3 tag's own binary: 500 rows across nine types, two
+/// The fixture (`xtests/compat-datadirs/v7.38.4/`) was captured by
+/// the v7.38.4 tag's own binary: 500 rows across nine types, two
 /// indexes, deletes and updates, statement-level WAL (there is no db
 /// file; replay IS the open). `expected.txt` holds counts and an md5
 /// over an ordered projection, so a silently thinner replay cannot
@@ -179,7 +179,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// Any probe or any fixture assertion failing, named.
 pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     let smoke = ironrule_smoke(root, runid)?;
-    let fixture = root.join("xtests/compat-datadirs/v7.38.3");
+    let fixture = root.join("xtests/compat-datadirs/v7.38.4");
     if !fixture.join("expected.txt").exists() {
         return Err(format!("fixture missing: {}", fixture.display()));
     }
@@ -207,7 +207,7 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
         };
         let r = conn.simple_query(&sql)?;
         if let Some(e) = r.error {
-            return Err(format!("v7.38.3 fixture: {sql}: {e}"));
+            return Err(format!("v7.38.4 fixture: {sql}: {e}"));
         }
         let got = r
             .rows
@@ -217,14 +217,14 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
             .unwrap_or_default();
         if got != want {
             return Err(format!(
-                "v7.38.3 fixture: {key}: want {want}, got {got} — the previous \
+                "v7.38.4 fixture: {key}: want {want}, got {got} — the previous \
                  release's data did not survive the current binary"
             ));
         }
     }
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok(format!("{smoke}; v7.38.3 dir direct-open verified"))
+    Ok(format!("{smoke}; v7.38.4 dir direct-open verified"))
 }
 
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
