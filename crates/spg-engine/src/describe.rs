@@ -1249,6 +1249,81 @@ fn collect_parameter_oids(stmt: &Statement, catalog: &Catalog) -> Vec<u32> {
     oids
 }
 
+/// v7.38.4 (sentori 6a) — the placeholders this statement deduces TWO
+/// different types for, with both spellings, as PG names them.
+///
+/// PG refuses `PREPARE` when a parameter's type cannot be deduced
+/// consistently: their assert-stats upsert puts `$4` in a `bigint`
+/// column and again inside `CASE WHEN $4 > 0`, where the literal is
+/// `integer`, and PG answers "inconsistent types deduced for parameter
+/// $4 — integer versus bigint". SPG's inference let the last context
+/// win silently. That is only visible when the client does NOT declare
+/// the type; sqlx declares, which is why the statement has always run
+/// in production and why this must not fire on a declared parameter.
+///
+/// Returns (1-based parameter number, first type, conflicting type).
+pub(crate) fn conflicting_parameter_deductions(
+    stmt: &Statement,
+    catalog: &Catalog,
+) -> Option<(u16, alloc::string::String, alloc::string::String)> {
+    let max = max_placeholder(stmt);
+    if max == 0 {
+        return None;
+    }
+    let mut seen = alloc::vec![0u32; max as usize];
+    let mut conflict: Option<(u16, u32, u32)> = None;
+    let mut record = |n: u16, oid: u32| {
+        let Some(slot) = seen.get_mut((n as usize).saturating_sub(1)) else {
+            return;
+        };
+        if *slot == 0 {
+            *slot = oid;
+        } else if *slot != oid && conflict.is_none() {
+            conflict = Some((n, *slot, oid));
+        }
+    };
+    walk_placeholder_type_contexts(stmt, catalog, &mut record);
+    conflict.map(|(n, a, b)| (n, oid_type_name(a), oid_type_name(b)))
+}
+
+/// The PG type name for a wire OID, for the message above. Only the
+/// families `wire_oid_for` can produce need a name here.
+fn oid_type_name(oid: u32) -> alloc::string::String {
+    alloc::string::String::from(match oid {
+        16 => "boolean",
+        21 => "smallint",
+        23 => "integer",
+        20 => "bigint",
+        25 => "text",
+        700 => "real",
+        701 => "double precision",
+        1082 => "date",
+        1114 => "timestamp without time zone",
+        1184 => "timestamp with time zone",
+        1700 => "numeric",
+        2950 => "uuid",
+        17 => "bytea",
+        114 => "json",
+        3802 => "jsonb",
+        _ => "unknown",
+    })
+}
+
+/// v7.38.4 — the wire OID a bare literal gives a placeholder it is
+/// compared against. PG types an undecorated integer literal `integer`,
+/// which is the whole of the "integer versus bigint" conflict; anything
+/// whose type is not obvious from the literal alone contributes nothing
+/// rather than a guess.
+fn literal_wire_oid(lit: &spg_sql::ast::Literal) -> Option<u32> {
+    use spg_sql::ast::Literal as L;
+    match lit {
+        L::Integer(_) => Some(23),
+        L::Float(_) => Some(701),
+        L::Bool(_) => Some(16),
+        _ => None,
+    }
+}
+
 /// v7.39 — PG type OID for a column DataType, for ParameterDescription.
 /// Only the families drivers actually bind; anything else keeps the
 /// TEXT fallback upstream.
@@ -1275,6 +1350,22 @@ fn wire_oid_for(ty: DataType) -> u32 {
 
 /// v7.39 — best-effort placeholder typing from column context.
 fn infer_placeholder_oids(stmt: &Statement, catalog: &Catalog, oids: &mut [u32]) {
+    walk_placeholder_type_contexts(stmt, catalog, &mut |n, oid| {
+        if let Some(slot) = oids.get_mut((n as usize).saturating_sub(1)) {
+            *slot = oid;
+        }
+    });
+}
+
+/// v7.38.4 — one walk over every context that gives a placeholder a type,
+/// handing each (parameter number, deduced OID) to the visitor. Inference
+/// and conflict detection ride the same walk so they cannot disagree about
+/// which contexts count.
+fn walk_placeholder_type_contexts(
+    stmt: &Statement,
+    catalog: &Catalog,
+    on_type: &mut dyn FnMut(u16, u32),
+) {
     let col_oid = |schema: &[ColumnSchema], name: &spg_sql::ast::ColumnName| -> Option<u32> {
         schema
             .iter()
@@ -1282,10 +1373,8 @@ fn infer_placeholder_oids(stmt: &Statement, catalog: &Catalog, oids: &mut [u32])
             .map(|c| wire_oid_for(c.ty))
     };
     let mut mark = |n: u16, oid: Option<u32>| {
-        if let Some(oid) = oid
-            && let Some(slot) = oids.get_mut((n as usize).saturating_sub(1))
-        {
-            *slot = oid;
+        if let Some(oid) = oid {
+            on_type(n, oid);
         }
     };
     match stmt {
@@ -1338,6 +1427,23 @@ fn infer_placeholder_oids(stmt: &Statement, catalog: &Catalog, oids: &mut [u32])
                     {
                         mark(*n, Some(wire_oid_for(c.ty)));
                     }
+                    // v7.38.4 (sentori 6a) — a placeholder can also take
+                    // its type from a comparison INSIDE a value
+                    // expression: `CASE WHEN $4 > 0 THEN now() END` types
+                    // `$4` from the literal, which is where PG's
+                    // "integer versus bigint" comes from. Only the walk
+                    // that sees both contexts can notice they disagree.
+                    walk_expr(e, &mut |inner| {
+                        if let Expr::Binary { lhs, rhs, .. } = inner {
+                            match (lhs.as_ref(), rhs.as_ref()) {
+                                (Expr::Placeholder(n), Expr::Literal(lit))
+                                | (Expr::Literal(lit), Expr::Placeholder(n)) => {
+                                    mark(*n, literal_wire_oid(lit));
+                                }
+                                _ => {}
+                            }
+                        }
+                    });
                 }
             }
         }

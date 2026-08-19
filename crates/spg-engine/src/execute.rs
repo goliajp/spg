@@ -1050,6 +1050,26 @@ impl Engine {
                 "prepared statement \"{name}\" already exists"
             )));
         }
+        // v7.38.4 (sentori 6a, at their request) — PG refuses a PREPARE
+        // whose parameter cannot be deduced consistently. Their
+        // assert-stats upsert puts `$4` in a bigint column and again in
+        // `CASE WHEN $4 > 0`, where the literal is integer: PG answers
+        // "inconsistent types deduced for parameter $4". SPG let the
+        // last context win silently.
+        //
+        // Only when the type was NOT declared. `PREPARE p (…, bigint, …)`
+        // is accepted by PG and runs, and sqlx always declares — which is
+        // why the statement works in their production and why refusing a
+        // declared parameter would break every driver that does the
+        // right thing.
+        if let Some((n, first, second)) =
+            crate::describe::conflicting_parameter_deductions(&body, self.active_catalog())
+            && param_types.get((n as usize).saturating_sub(1)).is_none()
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "inconsistent types deduced for parameter ${n} DETAIL: {first} versus {second}"
+            )));
+        }
         self.prepared_statements.insert(
             name,
             crate::PreparedSqlStatement {
