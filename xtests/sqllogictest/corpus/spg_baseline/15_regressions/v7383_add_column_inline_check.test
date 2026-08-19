@@ -1,0 +1,54 @@
+# 7.38.3 (sentori drop-in status §2.2) — `ALTER TABLE … ADD COLUMN …
+# CHECK (…)` was accepted and registered nothing: pg_constraint held no
+# row and a violating INSERT was let in. The separate ADD CONSTRAINT
+# form was always enforced; only the inline-on-ADD-COLUMN spelling
+# vanished. PG semantics, differential-anchored 2026-08-19: the
+# constraint exists as <table>_<column>_check and is validated against
+# the rows already in the table.
+
+statement ok
+CREATE TABLE aic (id INT PRIMARY KEY)
+
+statement ok
+ALTER TABLE aic ADD COLUMN env TEXT CHECK (env IN ('a','b'))
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'aic'::regclass AND contype = 'c'
+----
+aic_env_check
+
+statement error
+INSERT INTO aic VALUES (1, 'zzz')
+
+statement ok
+INSERT INTO aic VALUES (2, 'a')
+
+# Validated against existing rows: the NULL backfill fails a NOT NULL
+# test and PG refuses the whole statement.
+statement ok
+CREATE TABLE aiv (id INT)
+
+statement ok
+INSERT INTO aiv VALUES (1)
+
+statement error
+ALTER TABLE aiv ADD COLUMN e TEXT CHECK (e IS NOT NULL)
+
+# The refused column did not stay behind.
+statement ok
+INSERT INTO aiv VALUES (2)
+
+# A DEFAULT that satisfies the check makes the same shape succeed.
+statement ok
+ALTER TABLE aiv ADD COLUMN f TEXT DEFAULT 'z' CHECK (f IS NOT NULL)
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'aiv'::regclass AND contype = 'c'
+----
+aiv_f_check
+
+statement ok
+DROP TABLE aic
+
+statement ok
+DROP TABLE aiv

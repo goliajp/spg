@@ -1163,6 +1163,15 @@ impl Engine {
         let col_name = column.name.clone();
         let nullable = column.nullable;
         let has_default = column.default.is_some() || column.auto_increment;
+        // v7.38.3 (sentori 2.2) — the inline `CHECK (…)` on an ADD COLUMN.
+        // The parser has always put it on the ColumnDef and this path has
+        // never read it, so `ALTER TABLE t ADD COLUMN env text CHECK (env
+        // IN ('a','b'))` was ACCEPTED and registered nothing: pg_constraint
+        // showed no row and a violating INSERT went in. A constraint that
+        // silently does not exist is worse than one that loudly does not
+        // work. (The separate `ADD CONSTRAINT` form was always enforced —
+        // only the inline-on-ADD-COLUMN spelling vanished.)
+        let inline_check = column.check.clone().map(|e| e.to_string());
         let col_schema = column_def_to_schema(column, add_mysql)?;
         let row_count = table.row_count();
         // Compute the back-fill value. Literal / runtime DEFAULT
@@ -1183,6 +1192,34 @@ impl Engine {
             )));
         };
         table.add_column(col_schema, fill_value);
+        // The column exists before the CHECK is validated, because the
+        // predicate is written in terms of it. PG validates against the
+        // rows already there and refuses the whole statement if any fails
+        // — measured: adding `e text CHECK (e IS NOT NULL)` to a table
+        // with a row errors ("is violated by some row"), while the same
+        // column with a DEFAULT that satisfies it succeeds. On refusal the
+        // column has to come back out; nothing else has happened yet.
+        if let Some(src) = inline_check {
+            let pos = table.schema().columns.len() - 1;
+            let name = alloc::format!("{tbl}_{col_name}_check");
+            if let Err(e) =
+                crate::constraints::validate_check_against_existing_rows(table, tbl, &name, &src)
+            {
+                table.drop_column(pos);
+                return Err(e);
+            }
+            table
+                .schema_mut()
+                .checks
+                .push(spg_storage::CheckConstraint {
+                    // Unnamed: `pg_check_connames` synthesises PG's
+                    // `<table>_<column>_check` from the referenced column, the
+                    // same name the CREATE TABLE spelling gets.
+                    name: None,
+                    expr: src,
+                    validated: true,
+                });
+        }
         Ok(())
     }
 
