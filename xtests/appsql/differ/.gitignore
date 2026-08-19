@@ -1,0 +1,4 @@
+
+# appsql differ builds standalone; its lock/target are local
+xtests/appsql/differ/target/
+xtests/appsql/differ/Cargo.lock
