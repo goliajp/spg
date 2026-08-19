@@ -1,9 +1,5 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 0, "fail": 0, "skip": 0,
-      "files": [
-
-      ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 8, "fail": 0, "skip": 0,
