@@ -10,13 +10,13 @@ query TT
 INSERT INTO rxm_up VALUES (1, 'a') ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING id, (xmax = 0) AS is_new
 ----
 1
-t
+1
 
 query TT
 INSERT INTO rxm_up VALUES (1, 'b') ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING id, (xmax = 0) AS is_new
 ----
 1
-f
+0
 
 query T
 INSERT INTO rxm_up VALUES (2, 'c') RETURNING xmax
@@ -31,7 +31,7 @@ UPDATE rxm_up SET v = 'd' WHERE id = 2 RETURNING xmax
 query T
 DELETE FROM rxm_up WHERE id = 2 RETURNING (xmax = 0)
 ----
-f
+0
 
 statement ok
 DROP TABLE rxm_up
