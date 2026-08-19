@@ -5666,11 +5666,8 @@ impl crate::Engine {
         if declared.eq_ignore_ascii_case("VOID") {
             return Ok(Value::Null);
         }
-        crate::eval::cast::cast_value(
-            v.into_owned(),
-            spg_sql::ast::CastTarget::Named(alloc::string::String::from(declared)),
-        )
-        .or_else(|_| Ok(Value::Null))
+        crate::eval::cast::cast_value(v.into_owned(), declared_return_cast_target(declared))
+            .or_else(|_| Ok(Value::Null))
     }
 }
 
@@ -5816,6 +5813,29 @@ fn substitute_arg_refs_in_select(
             substitute_arg_refs_in_select(s, binds);
         }
     }
+}
+
+/// v7.38.4 (sentori step 54) — the cast target for a function's DECLARED
+/// return type.
+///
+/// `def.returns` holds the type as the user wrote it, so an array is
+/// `bigint[]`; a `CastTarget::Named` spells the same type `bigint_array`.
+/// The coercion therefore could not resolve `RETURNS bigint[]`, and the
+/// `or_else(NULL)` under every call site turned "I could not coerce this"
+/// into a NULL answer: the body computed `{1,2}` and the caller got
+/// nothing, with no error anywhere. Their version keys compare through one
+/// of these, so every version-targeted push reached zero devices while
+/// reporting success.
+///
+/// Shared by both coercion sites — the pure-expression body and the one
+/// with its own FROM — because they had the same line written twice and
+/// fixing one would have left the other.
+pub(crate) fn declared_return_cast_target(declared: &str) -> spg_sql::ast::CastTarget {
+    let name = declared.trim().strip_suffix("[]").map_or_else(
+        || alloc::string::String::from(declared.trim()),
+        |base| alloc::format!("{}_array", base.trim()),
+    );
+    spg_sql::ast::CastTarget::Named(name)
 }
 
 impl crate::Engine {

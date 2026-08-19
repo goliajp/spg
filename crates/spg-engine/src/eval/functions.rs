@@ -19629,7 +19629,7 @@ fn call_user_function<'v>(
     }
     crate::eval::cast::cast_value(
         out.into_owned(),
-        spg_sql::ast::CastTarget::Named(declared.to_string()),
+        crate::eval::declared_return_cast_target(declared),
     )
     .or_else(|_| Ok(Value::Null))
 }
