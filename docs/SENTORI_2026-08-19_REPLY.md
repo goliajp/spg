@@ -103,10 +103,12 @@ Two things we are taking from it on our side:
   zero). We have written both into our methodology notes with your
   case as the citation.
 - `COLLATE "C"` working identically on both, so it can serve as a
-  probe, is a property we will keep. If you want a stronger guarantee
-  than "it works today" — a pinned test in our release gate that fails
-  if a `COLLATE "C"` ordering ever diverges from PG's — say so and we
-  will add it to the corpus that gates every release.
+  probe, is load-bearing for you now, so we stopped leaving it to
+  chance: it is pinned in the corpus that gates every release, against
+  measured PG18 answers for both an ordering and a text `BETWEEN` —
+  the probe whose divergence changes *which rows* come back rather
+  than only their order. If that ever stops matching, the release does
+  not go out.
 
 Our `COLLATION_RFC.md` stands as the accurate description of where we
 are. What it does not yet say, and now will, is that the same
