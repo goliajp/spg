@@ -31,6 +31,7 @@ impl Table {
             cold_row_count_stale: false,
             redo_log: None,
             excl_indexes: Vec::new(),
+            tx_write_track: None,
             prune_horizon: 0,
         }
     }
@@ -240,12 +241,37 @@ impl Table {
         {
             self.headers = new_headers;
         }
+        // v7.38.2 (R2) — record the versioned insert for the rebase's
+        // incremental write-set (see `Table::tx_write_track`).
+        if xmin != 0 {
+            let rid = self
+                .rowids
+                .get(last)
+                .copied()
+                .unwrap_or(crate::row_header::RowId::UNASSIGNED);
+            self.write_track_for(xmin).inserted.push((last, rid));
+        }
         debug_assert_eq!(
             self.rows.len(),
             self.headers.len(),
             "headers must stay in lock-step with rows after insert_with_xmin"
         );
         Ok(())
+    }
+
+    /// v7.38.2 (R2) — the per-table write track, claimed by `v`. A
+    /// different version taking the table replaces the track (one
+    /// writer per shadow; on the base this bounds memory to the last
+    /// writer's footprint). See `Table::tx_write_track`.
+    fn write_track_for(&mut self, v: u64) -> &mut TxWriteTrack {
+        let replace = self.tx_write_track.as_ref().is_none_or(|t| t.version != v);
+        if replace {
+            self.tx_write_track = Some(TxWriteTrack {
+                version: v,
+                ..TxWriteTrack::default()
+            });
+        }
+        self.tx_write_track.as_mut().expect("just ensured")
     }
 
     /// v7.39 (round 493) — publish the snapshot floor the insert path may
@@ -333,6 +359,15 @@ impl Table {
             self.headers = new_headers;
         }
         self.dead_rows += 1;
+        // v7.38.2 (R2) — record the versioned tombstone (stable RowId).
+        if xmax != 0 && xmax != crate::row_header::XMAX_ALIVE {
+            let rid = self
+                .rowids
+                .get(position)
+                .copied()
+                .unwrap_or(crate::row_header::RowId::UNASSIGNED);
+            self.write_track_for(xmax).tombstoned.push(rid);
+        }
         // v7.37.15 (Epic W durable-tombstone slice) — capture the
         // in-place tombstone as row-level redo so a gate-on
         // (`SPG_MVCC_INPLACE`) DELETE / UPDATE-old-version /
@@ -387,6 +422,15 @@ impl Table {
             }
             self.dead_rows += 1;
             newly += 1;
+            // v7.38.2 (R2) — record the versioned tombstone.
+            if xmax != 0 && xmax != crate::row_header::XMAX_ALIVE {
+                let rid = self
+                    .rowids
+                    .get(position)
+                    .copied()
+                    .unwrap_or(crate::row_header::RowId::UNASSIGNED);
+                self.write_track_for(xmax).tombstoned.push(rid);
+            }
             if capture {
                 rowids.push(
                     self.rowids()
@@ -417,6 +461,42 @@ impl Table {
     /// net effect identical.
     #[must_use]
     pub fn extract_tx_writeset(&self, v: u64) -> crate::TxWriteSet {
+        // v7.38.2 (R2) — incremental fast path: the funnels recorded
+        // exactly which slots `v` marked, so extraction is O(writes).
+        // Every recorded insert is re-verified against the live header
+        // and rowid; one mismatch (slot shifted, inherited track,
+        // rows written before tracking) abandons the fast path for the
+        // scan below — the track can be incomplete for a version it
+        // does not name, never for the one it does, because claiming a
+        // version resets it and every marker for that version appends.
+        if let Some(track) = &self.tx_write_track
+            && track.version == v
+        {
+            let mut inserted: alloc::vec::Vec<(crate::row_header::RowId, Row<'static>)> =
+                alloc::vec::Vec::with_capacity(track.inserted.len());
+            let mut ok = true;
+            for &(pos, rid) in &track.inserted {
+                let verified = self.headers.get(pos).is_some_and(|h| h.xmin == v)
+                    && self.rowids.get(pos).copied() == Some(rid);
+                if !verified {
+                    ok = false;
+                    break;
+                }
+                match self.rows.get(pos) {
+                    Some(row) => inserted.push((rid, row.clone())),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                return crate::TxWriteSet {
+                    inserted,
+                    tombstoned: track.tombstoned.clone(),
+                };
+            }
+        }
         let mut inserted: alloc::vec::Vec<(crate::row_header::RowId, Row<'static>)> =
             alloc::vec::Vec::new();
         let mut tombstoned: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
@@ -501,6 +581,11 @@ impl Table {
             if let Some(slot) = self.rowids.get_mut(last) {
                 *slot = *rid;
             }
+            // v7.38.2 (R2) — the replay marks xmin=v OUTSIDE the
+            // insert funnel, so record it here too: without this a
+            // SECOND rebase's fast extraction would miss every row the
+            // first rebase replayed — a lost write.
+            self.write_track_for(v).inserted.push((last, *rid));
         }
         let mut conflicts: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
         for rid in &ws.tombstoned {
@@ -510,6 +595,9 @@ impl Table {
                     Some(h) if h.xmax == crate::row_header::XMAX_ALIVE => {
                         h.xmax = v;
                         self.dead_rows += 1;
+                        // v7.38.2 (R2) — same funnel-bypass recording
+                        // as the insert replay above.
+                        self.write_track_for(v).tombstoned.push(*rid);
                     }
                     Some(h) if h.xmax == v => {} // already ours (idempotent)
                     _ => conflicts.push(*rid),

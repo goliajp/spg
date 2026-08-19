@@ -4391,6 +4391,17 @@ pub struct ExclRangeIndex {
     pub map: PersistentBTreeMap<(i128, u8), crate::posting::PostingList>,
 }
 
+/// v7.38.2 (R2) — see [`Table::tx_write_track`]. Positions are the
+/// insert-time slots (verified against the header's version at
+/// extraction, so a shifted slot falls back to the scan); tombstones
+/// carry the stable RowId, which is what the write-set wants anyway.
+#[derive(Debug, Clone, Default)]
+struct TxWriteTrack {
+    version: u64,
+    inserted: Vec<(usize, row_header::RowId)>,
+    tombstoned: Vec<row_header::RowId>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
@@ -4517,6 +4528,23 @@ pub struct Table {
     /// exclusion constraints on load. Empty for tables with no EXCLUDE
     /// constraint (the common case), so `Table::clone` pays nothing.
     excl_indexes: Vec<ExclRangeIndex>,
+    /// v7.38.2 (R2) — incremental write-set track for the RC rebase.
+    /// `extract_tx_writeset` used to full-scan every header per call —
+    /// ~200 µs on a 20k-row table, per in-transaction statement, every
+    /// time a concurrent COMMIT moved the epoch; on tpcb's 100k-row
+    /// accounts that scan was the c2 concurrency cliff itself. The
+    /// three version-marking funnels (`insert_with_xmin`,
+    /// `mark_row_deleted`, `mark_rows_deleted`) record here instead.
+    ///
+    /// One track per table, keyed by the LAST writer version: a shadow
+    /// belongs to one transaction, so a different version claiming the
+    /// table simply replaces the track (on the committed base that
+    /// makes memory bounded by the last writer's footprint). Extraction
+    /// verifies every recorded position still carries the version —
+    /// any mismatch (compaction, inherited track, pre-track rows)
+    /// falls back to the full scan, so the fast path can be wrong
+    /// about NOTHING, only slow.
+    tx_write_track: Option<TxWriteTrack>,
     /// v7.39 (round 493) — the snapshot floor below which a deleted row
     /// version is invisible to everyone, as of the statement now running.
     ///
