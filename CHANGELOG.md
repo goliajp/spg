@@ -24,6 +24,19 @@ the current build; this file is a release-organized view.
   all of them are closed. Types verified against PG18's own view
   columns — every predicate BOOLEAN, the unary operators keeping their
   operand's type, an unaliased one named `?column?`.
+- **Four more Describe type answers**, found by extracting all 211
+  distinct SQL literals from sentori's source and Describing each
+  against both SPG and PostgreSQL 18 over their real schema — thirteen
+  answers differed, on pages their suite has not reached. An unaliased
+  function call is named after the function (and `COUNT(*)` no longer
+  leaks its internal `count_star` spelling); `->>` and `#>>` are TEXT
+  and the JSON predicates BOOLEAN, where the fallback had called them
+  all JSONB; `array_agg` keeps its element type instead of collapsing
+  everything but two integer widths to TEXT[]; and
+  `percentile_cont` / `percentile_disc` / `mode`, plus a set-returning
+  function as a FROM item, describe at all — an unknown type there
+  empties the whole statement's column list. The harness that found
+  them ships as `xtests/appsql`.
 - **`ALTER TABLE … ADD COLUMN … CHECK (…)` registers the constraint**
   (sentori 2.2): the inline form was accepted and stored nothing —
   `pg_constraint` empty, a violating INSERT allowed. The predicate was
