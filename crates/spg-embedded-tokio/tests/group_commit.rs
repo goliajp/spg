@@ -39,12 +39,24 @@ async fn concurrent_writes_share_fsync() {
     // since serial would be ~256" — a stand-in that answers the machine
     // instead of the engine, failing on a busy box that batches
     // perfectly and passing on a fast disk that batches nothing.
+    //
+    // v7.38.2 — and they are held at a barrier until all N are ready.
+    // Without it the writers arrive at the commit path in whatever
+    // order the runtime happened to schedule them, so the batch size
+    // measured is the BOX's parallelism, not the engine's batching: a
+    // two-core CI runner batched them in pairs and reported exactly
+    // 32 fsyncs for 64 writes, tripping `< N/2` by a single fsync on a
+    // docs-only commit. The barrier makes "they were concurrent" a
+    // property of the test rather than a hope about the scheduler.
     const N: usize = 64;
     let fsyncs0 = spg_embedded::WAL_FSYNC_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(N));
     let mut tasks = Vec::with_capacity(N);
     for i in 0..N {
         let db = db.clone();
+        let gate = gate.clone();
         tasks.push(tokio::spawn(async move {
+            gate.wait().await;
             db.execute(&format!("INSERT INTO t VALUES ({i})"))
                 .await
                 .unwrap();
@@ -64,6 +76,10 @@ async fn concurrent_writes_share_fsync() {
     assert_eq!(count, N as i64);
 
     let fsyncs = spg_embedded::WAL_FSYNC_COUNT.load(std::sync::atomic::Ordering::Relaxed) - fsyncs0;
+    // Printed on every run, not only on failure: a count that is
+    // drifting toward the bound is the warning this test can give
+    // before it starts costing anyone a red CI.
+    eprintln!("group-commit: {N} concurrent INSERTs cost {fsyncs} WAL fsyncs");
     // One per write is the un-batched shape. Half that still leaves room
     // for however the batches happened to land, and no room for "every
     // write synced on its own".
@@ -71,7 +87,10 @@ async fn concurrent_writes_share_fsync() {
     // Round 858 checked that by holding the write lock across the shared
     // fsync, so no two writers can meet in a batch — the v7.19 shape.
     // 64 writes then cost 131 fsyncs, roughly two apiece, and this goes
-    // red. Under batching it is a small fraction of that.
+    // red. Under batching it is a small fraction of that: behind the
+    // barrier it is 2, measured, on every run — so the bound below has
+    // 16x of headroom rather than the single fsync it had when the
+    // writers arrived one at a time.
     assert!(
         fsyncs < N as u64 / 2,
         "{N} concurrent INSERTs cost {fsyncs} WAL fsyncs — group-commit is \
