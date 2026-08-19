@@ -8,6 +8,35 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **An untargeted `ON CONFLICT` arbitrates on partial unique indexes**
+  (sentori r8). The bare clause collected its arbiters from every
+  unique constraint and every FULL unique index — the filter that built
+  the index list required no partial predicate — so a conflict on a
+  partial unique index was invisible to `DO NOTHING` and escaped to the
+  duplicate-key check as an error, where PG absorbs it. An idempotency
+  key is one of these, so pressing send twice was a 500 for an operator
+  who did the safe thing. An arbiter now carries its predicate, and the
+  predicate decides who is in play on both sides: a row it rejects is
+  not in the index, so it neither conflicts nor blocks anything else,
+  in the table or within one statement.
+
+### Added
+
+- **`scripts/release.sh --fast`** — the end-of-the-line path, for
+  shipping a fix to a live defect or getting something new in front of
+  real use. Same preflight and same artefacts; the ~40-minute battery
+  (dogfood replay, `gate.sh all`, the perf gate, the 59-cell drop-in
+  panel) is replaced by the precommit tier's 150-second smoke. It
+  announces what it did not run, and its checklist carries the debt:
+  run the full battery once the hurry is over, and if that goes red,
+  cut the next version rather than retag.
+
+---
+
 ## [7.38.4] — 2026-08-20
 
 The one thing sentori's status doc had open, and the one thing they

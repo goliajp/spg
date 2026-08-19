@@ -5,11 +5,18 @@ description: SPG 发版全链 skill — suite prerelease 闸起步,九步幂等�
 
 # SPG release — 全链九步(7.38 S5.4 固化)
 
+**两条路**:默认全链(下文九步),以及 `--fast`(见文末「快速路」)。
+`--fast` 是为**线上重大缺陷的 hotfix** 和**全新东西要尽快到真实使用面前**
+准备的;它换来的是速度,付出的是证据。不要因为赶就用它 —— 要因为
+「等待的代价高于窄闸的代价」这个**针对本次发布**的判断才用它。
+
 每步幂等可重入:重入时先探测「这步是否已完成」,完成则跳过,不撞。
 任何一步红:停,报「停在第几步 + 日志路径 + 修好后从哪步重入」。
 不使用 SKIP_* 逃生门,除非用户明示(r1041 裁定)。
 
 ## 第 0 步 — 闸(红即止)
+
+> `--fast` 走的是 precommit 档,见文末快速路;以下是默认全链。
 
 ```sh
 scripts/suite.sh prerelease --on-mini     # 或 mini 上直接 suite-run prerelease
@@ -116,3 +123,50 @@ tag 丢 v 前缀 / preflight 脏树 / PERF URI 缺失硬红 / crates 429 /
 4. mini 也红 → 是真红,停列车修。
 
 SKIP_FULL 只能走这条带证据的路;裸 SKIP = r1041 裁定禁止。
+
+
+---
+
+## 快速路 —— `--fast`
+
+```sh
+# 第 0 步照跑 precommit(不是 prerelease),其余九步同样走
+scripts/suite.sh precommit                 # 150 s 硬顶
+# …第 1-5 步不变(定版本 / bump / git-flow / push / perf 腿)…
+PERF_REQUIRED=1 scripts/release.sh X.Y.Z --fast
+```
+
+### 它跑什么
+
+precommit 档,150 秒硬顶:`fmt` · `clippy-affected` ·
+`unit-affected`(受影响 crate 的单元测试)· `pins-current`(**本版新钉**)·
+`slt-smoke`(语料子集)· `ironrule-smoke`(wire 应答 / WAL 真落 / 零列结果集)。
+preflight(拒脏树、校 tag == master)、crates×12、buildx 三 tag **一律照跑** ——
+产物本身和全链完全一样。
+
+### 它不跑什么(这才是重点)
+
+- **dogfood 生产形态重放** —— 历史上 mailrs 那次 P0 第四次复发就是跳这个跳出来的
+- **`gate.sh all`** —— lint / unit / e2e / gates / biz 五类的完整格
+- **perf 闸** —— 本版没有与 live PG18 比过
+- **drop-in 59 格验收面板** —— 没有对着刚推的镜像验过
+
+一句话:**这个构建做过冒烟,没做过发布电池**。
+
+### 它欠下的账(不是可选项)
+
+1. 赶的理由一消失,立刻对 tag `vX.Y.Z` 跑
+   `scripts/suite.sh prerelease` + `scripts/dropin-acceptance.sh`。
+2. **红了就发下一版,永不 retag** —— tag 和 crates 都不可撤回。
+3. 发布说明里**明说本版走的是快速路**,免得别人把这个版本号读成
+   带着通常那份证据。
+
+release.sh 在 `--fast` 下会把上面三条打进收尾 checklist,并在 preflight
+之后就把「没跑什么」原样喊出来 —— 不让一个窄闸的构建看起来跟宽闸的
+一样。
+
+### 与 `SKIP_*` 的区别
+
+`SKIP_FULL=1` 等逃生门仍受 r1041 裁定约束(只能走带证据的邻载红通道)。
+`--fast` 是**被明确授权的、有名字的、会自我声明的**那条路 —— 它把
+「我知道我在少跑什么」写进日志和 checklist,而不是让一次跳闸悄悄发生。
