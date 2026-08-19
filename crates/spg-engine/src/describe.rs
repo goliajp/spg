@@ -565,6 +565,41 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 nullable: true,
             })
         }
+        // v7.38.3 (sentori step 41) — the predicate shapes, every one of
+        // which is BOOLEAN in PG (verified against PG18's own view
+        // columns, 2026-08-19). They had no arm at all, so a select item
+        // whose TOP-LEVEL expression was one of them fell to the `None`
+        // below, and Describe answered the whole statement with NO
+        // COLUMNS — a client asking what `SELECT id, k IS NOT NULL AS
+        // addressable FROM …` returns was told nothing at all. Nested
+        // inside another operator they already described, because the
+        // arm that consumed them (Binary, Case) never asked what they
+        // were; that is why `(a IS NOT NULL AND b IS NOT NULL)` worked
+        // and `a IS NOT NULL` did not.
+        //
+        // sentori hit three of these; the rest were the same hole and
+        // are closed with them rather than left for the next report.
+        Expr::IsNull { .. }
+        | Expr::BoolTest { .. }
+        | Expr::Like { .. }
+        | Expr::InList { .. }
+        | Expr::Unary { op: UnOp::Not, .. } => Some(ExprShape {
+            name: "?column?".to_string(),
+            ty: DataType::Bool,
+            nullable: true,
+        }),
+        // Unary `~` and `+` keep the operand's type, as unary minus does.
+        Expr::Unary {
+            op: UnOp::BitNot | UnOp::Plus,
+            expr,
+        } => {
+            let inner = describe_expr(expr, schema_cols)?;
+            Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: inner.ty,
+                nullable: inner.nullable,
+            })
+        }
         // Unary minus preserves the operand's type.
         Expr::Unary {
             op: UnOp::Neg,
