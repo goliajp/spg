@@ -8,7 +8,10 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.3] — 2026-08-19
+
+Everything sentori's drop-in status listed as open, and four more found
+by asking their own statements instead of waiting for the next report.
 
 ### Fixed
 
