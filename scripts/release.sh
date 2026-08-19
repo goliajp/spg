@@ -23,13 +23,34 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${1:-}"
-[[ -n "$VERSION" ]] || { echo "usage: $0 <X.Y.Z> [--skip-crates] [--skip-docker]" >&2; exit 2; }
+[[ -n "$VERSION" ]] || { echo "usage: $0 <X.Y.Z> [--fast] [--skip-crates] [--skip-docker]" >&2; exit 2; }
 shift
 
 SKIP_CRATES=0
 SKIP_DOCKER=0
+# --fast: the end-of-the-line path. Ships the same artefacts through the
+# same preflight, and replaces the ~40-minute battery (dogfood + gate.sh
+# all + the 59-cell drop-in panel) with the precommit tier, whose own
+# hard cap is 150 s. That tier is not nothing — fmt, clippy, the unit
+# tests of every affected crate, THIS version's pins, an slt smoke subset
+# and the ironrule wire/WAL smoke — but it is a smoke test, and the
+# things it does not run are the ones that have historically caught
+# release-blocking regressions: the prod-shape dogfood replay, the full
+# corpus, the perf gate, and the drop-in acceptance panel.
+#
+# It exists for two jobs the owner named: shipping a fix for a live
+# production defect, and getting something brand new in front of real
+# use quickly. Both are cases where the cost of waiting exceeds the cost
+# of a narrower gate — which is a judgement about THIS release, not a
+# new default.
+#
+# The obligation it creates: run the full battery afterwards. If it goes
+# red, the answer is the next version, never a retag — a published tag
+# and a published crate are both unrecallable.
+FAST=0
 for arg in "$@"; do
     case "$arg" in
+        --fast) FAST=1 ;;
         --skip-crates) SKIP_CRATES=1 ;;
         --skip-docker) SKIP_DOCKER=1 ;;
         *) echo "release.sh: unknown argument: $arg" >&2; exit 2 ;;
@@ -74,7 +95,27 @@ echo "preflight OK: master @ $(git rev-parse --short HEAD), tag v${VERSION}"
 # carries it. Setting SKIP_DOGFOOD=1 selects the legacy
 # "no preflight gate" behaviour for the rare case where the operator
 # already ran it externally.
-if [[ "${SKIP_DOGFOOD:-0}" == 0 ]]; then
+if [[ "$FAST" == 1 ]]; then
+    banner "preflight gate: precommit tier (--fast)"
+    if ! scripts/suite.sh precommit; then
+        echo "preflight: precommit tier FAILED — release blocked. This is \
+the narrow gate already; there is nothing left to fall back to, so the \
+failure is the answer." >&2
+        exit 1
+    fi
+    cat >&2 <<FASTNOTE
+preflight gate: precommit tier PASS (--fast)
+
+  NOT RUN for v${VERSION}: the dogfood prod-shape replay, gate.sh all
+  (lint / unit / e2e / gates / biz), the perf gate, and the 59-cell
+  drop-in acceptance panel. This build has had a smoke test, not a
+  release battery.
+
+  Run \`scripts/suite.sh prerelease\` against tag v${VERSION} as soon as
+  the reason for the hurry is over. If it goes red, cut the next
+  version — the tag and the crates are already unrecallable.
+FASTNOTE
+elif [[ "${SKIP_DOGFOOD:-0}" == 0 ]]; then
     banner "preflight gate: dogfood-replay (fast tier)"
     if ! scripts/gate.sh dogfood; then
         echo "preflight: dogfood-replay gate FAILED — release blocked. \
@@ -103,7 +144,9 @@ fi
 # itself in the log so an unchecked build is visible afterwards rather
 # than indistinguishable from a checked one.
 export PERF_REQUIRED=1
-if [[ "${SKIP_FULL:-0}" == 0 ]]; then
+if [[ "$FAST" == 1 ]]; then
+    echo "preflight gate: gate.sh all SKIPPED (--fast; see the note above)"
+elif [[ "${SKIP_FULL:-0}" == 0 ]]; then
     banner "preflight gate: gate.sh all (G1-G5 + perf)"
     if ! scripts/gate.sh all; then
         echo "preflight: gate.sh all FAILED — release blocked. \
@@ -168,15 +211,34 @@ else
     banner "docker push SKIPPED (--skip-docker)"
 fi
 
-banner "drop-in acceptance vs ${IMAGE_REPO}:${VERSION}"
-scripts/dropin-acceptance.sh \
-    --image "${IMAGE_REPO}:${VERSION}" \
-    --port 25433 \
-    --fixture scripts/fixtures/mailrs-pg-extensions.sql \
-    --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
-    --report "scripts/dropin-acceptance-report-v${VERSION}.md"
+if [[ "$FAST" == 1 ]]; then
+    banner "drop-in acceptance SKIPPED (--fast)"
+else
+    banner "drop-in acceptance vs ${IMAGE_REPO}:${VERSION}"
+    scripts/dropin-acceptance.sh \
+        --image "${IMAGE_REPO}:${VERSION}" \
+        --port 25433 \
+        --fixture scripts/fixtures/mailrs-pg-extensions.sql \
+        --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
+        --report "scripts/dropin-acceptance-report-v${VERSION}.md"
+fi
 
 banner "v${VERSION} published — remaining human steps"
+if [[ "$FAST" == 1 ]]; then
+cat <<EOF
+  This was a --fast release. It is published and unrecallable, and it
+  has had a smoke test rather than a release battery.
+
+  [ ] run \`scripts/suite.sh prerelease\` against tag v${VERSION}, and
+      \`scripts/dropin-acceptance.sh --image ${IMAGE_REPO}:${VERSION}\`,
+      as soon as the reason for the hurry is over
+  [ ] if either goes red: cut the next version. Never retag.
+  [ ] mailrs ack note — include the manifest digest:
+      $(cat "target/release-digest-v${VERSION}.txt" 2>/dev/null || echo '(docker step skipped)')
+  [ ] say in the release note that this build shipped on the fast path,
+      so nobody reads its version number as carrying the usual evidence
+EOF
+else
 cat <<EOF
   [ ] commit scripts/dropin-acceptance-report-v${VERSION}.md on develop
       (chore(release): v${VERSION} post-release — check in dropin report)
@@ -185,3 +247,4 @@ cat <<EOF
   [ ] release battery was green before finish: gate.sh all + mailrs
       zero-change validation (see docs/TESTING.md "Release battery")
 EOF
+fi
