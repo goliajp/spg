@@ -1749,6 +1749,31 @@ impl Engine {
                 fks.remove(i);
             }
         }
+        // v7.38.2 (sentori report 5) — PG's ALTER TABLE rule: "Indexes
+        // and table constraints involving the column will be
+        // automatically dropped as well." A CHECK left behind after its
+        // column made the table permanently un-insertable (every later
+        // INSERT hit ColumnNotFound on the ghost column). Any CHECK
+        // whose expression references the dropped column goes with it;
+        // an expression we can't parse can't be evaluated either way,
+        // so it is kept untouched.
+        let dropped = table.schema().columns[col_pos].name.clone();
+        table.schema_mut().checks.retain(|chk| {
+            let Ok(expr) = spg_sql::parser::parse_expression(&chk.expr) else {
+                return true;
+            };
+            let mut involves = false;
+            crate::visit_expr_columns_and_subqueries(
+                &expr,
+                &mut |c: &spg_sql::ast::ColumnName| {
+                    if c.name.eq_ignore_ascii_case(&dropped) {
+                        involves = true;
+                    }
+                },
+                &mut |_| {},
+            );
+            !involves
+        });
         // Drop the column. New helper on Table does the
         // row + schema + index shift atomically.
         table.drop_column(col_pos);

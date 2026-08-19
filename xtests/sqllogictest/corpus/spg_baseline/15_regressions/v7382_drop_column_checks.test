@@ -1,0 +1,48 @@
+# 7.38.2 S-1 (sentori report 5) — DROP COLUMN takes its CHECK
+# constraints with it. Migration 0012 dropped a bytea column whose
+# inline CHECK stayed behind; every later INSERT then failed with
+# ColumnNotFound on the ghost column and the orphan showed in
+# pg_constraint. PG rule: constraints involving the column are
+# automatically dropped, no CASCADE needed.
+
+statement ok
+CREATE TABLE dcc_ck4 (id BIGINT PRIMARY KEY, fp BYTEA CHECK (fp IS NULL OR octet_length(fp) = 32), note TEXT)
+
+statement ok
+INSERT INTO dcc_ck4 (id, note) VALUES (1, 'a')
+
+statement ok
+ALTER TABLE dcc_ck4 DROP COLUMN fp
+
+# The whole bug: this INSERT used to die on ColumnNotFound{fp}.
+statement ok
+INSERT INTO dcc_ck4 (id, note) VALUES (2, 'b')
+
+query T
+SELECT conname FROM pg_constraint WHERE conname LIKE 'dcc_ck4%' AND contype = 'c'
+----
+
+# Multi-column CHECK involving the column drops too; an unrelated
+# CHECK survives with teeth (differential-anchored vs PG18 2026-08-19).
+statement ok
+CREATE TABLE dcc_ck5 (a INT, b INT, CONSTRAINT dcc_c_ab CHECK (a < b), CONSTRAINT dcc_c_b CHECK (b > 0))
+
+statement ok
+ALTER TABLE dcc_ck5 DROP COLUMN a
+
+query T
+SELECT conname FROM pg_constraint WHERE conrelid = 'dcc_ck5'::regclass AND contype = 'c' ORDER BY conname
+----
+dcc_c_b
+
+statement ok
+INSERT INTO dcc_ck5 (b) VALUES (5)
+
+statement error
+INSERT INTO dcc_ck5 (b) VALUES (-1)
+
+statement ok
+DROP TABLE dcc_ck4
+
+statement ok
+DROP TABLE dcc_ck5
