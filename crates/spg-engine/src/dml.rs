@@ -2213,6 +2213,9 @@ impl Engine {
         // OLD (pre-update) and NEW (post-update = the default row).
         if let Some(items) = &stmt.returning {
             let new_for_returning = updated_for_returning.clone();
+            // PG18 anchor: UPDATE RETURNING projects the NEW tuple, whose
+            // xmax is 0.
+            let xmax_rows = alloc::vec![0i64; updated_for_returning.len()];
             return self.build_returning_rows_old_new(
                 &stmt.table,
                 stmt.alias.as_deref(),
@@ -2220,6 +2223,7 @@ impl Engine {
                 updated_for_returning,
                 Some(old_for_returning),
                 Some(new_for_returning),
+                Some(xmax_rows),
             );
         }
         Ok(QueryResult::CommandOk {
@@ -3998,6 +4002,10 @@ impl Engine {
             // v7.39 (round 126) — DELETE: OLD = the deleted row (= default),
             // NEW = NULL (the row no longer exists).
             let old_for_returning = to_delete_rows.clone();
+            // PG18 anchor: DELETE RETURNING projects the OLD tuple, whose
+            // xmax is the deleting transaction — nonzero.
+            let del_xmax = self.writer_version_for_current_stmt() as i64;
+            let xmax_rows = alloc::vec![del_xmax; to_delete_rows.len()];
             return self.build_returning_rows_old_new(
                 &stmt.table,
                 stmt.alias.as_deref(),
@@ -4005,6 +4013,7 @@ impl Engine {
                 to_delete_rows,
                 Some(old_for_returning),
                 None,
+                Some(xmax_rows),
             );
         }
         Ok(QueryResult::CommandOk {
@@ -5150,7 +5159,7 @@ impl Engine {
         // Stage 3 — insert the surviving rows + fire row triggers under
         // a fresh mutable borrow, then apply queued ON CONFLICT updates.
         let mut raised_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
-        let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images) =
+        let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images, oc_xmax) =
             insert_parsed_rows(
                 table,
                 xmin_for_stmt,
@@ -5209,6 +5218,7 @@ impl Engine {
                 returning_rows,
                 Some(oc_old_images),
                 Some(new_for_returning),
+                Some(oc_xmax),
             );
         }
         // v6.2.1 — auto-analyze: track per-table modified-row
@@ -6162,7 +6172,7 @@ impl Engine {
         items: &[SelectItem],
         mutated_rows: Vec<Vec<Value<'static>>>,
     ) -> Result<QueryResult, EngineError> {
-        self.build_returning_rows_old_new(table_name, None, items, mutated_rows, None, None)
+        self.build_returning_rows_old_new(table_name, None, items, mutated_rows, None, None, None)
     }
 
     /// v7.39 (read01 round 126) — RETURNING with optional `OLD.col` / `NEW.col`
@@ -6182,6 +6192,16 @@ impl Engine {
         default_rows: Vec<Vec<Value<'static>>>,
         old_rows: Option<Vec<Vec<Value<'static>>>>,
         new_rows: Option<Vec<Vec<Value<'static>>>>,
+        // v7.38.2 (sentori report 5) — per-row value for a `xmax` reference in
+        // the RETURNING list, PG's "was this row new" idiom:
+        // `INSERT … ON CONFLICT DO UPDATE … RETURNING (xmax = 0) AS is_new`.
+        // PG18 anchors (differential 2026-08-19): plain INSERT → 0, the
+        // conflict-updated row → nonzero, UPDATE's new tuple → 0, DELETE's
+        // old tuple → nonzero. SPG's in-place MVCC keeps live headers at
+        // xmax = 0, so the caller synthesises the per-statement answer
+        // (writer version for the nonzero cases). `None` = path without an
+        // xmax context; a reference then reads 0, the fresh-row answer.
+        xmax_per_row: Option<Vec<i64>>,
     ) -> Result<QueryResult, EngineError> {
         let table = self.active_catalog().get(table_name).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound {
@@ -6193,7 +6213,7 @@ impl Engine {
         // resolves `OLD.v` / `NEW.v` by name (ignoring the qualifier) to v's
         // name + type, matching PG.
         let qualifier = alias.unwrap_or(table_name);
-        let columns = self.derive_output_columns(items, &schema_cols, qualifier);
+        let mut columns = self.derive_output_columns(items, &schema_cols, qualifier);
 
         // Rewrite OLD./NEW. qualifiers to synthetic bare columns for value
         // resolution. If none appear, take the plain fast path.
@@ -6211,7 +6231,51 @@ impl Engine {
                 SelectItem::Wildcard => {}
             }
         }
-        if !uses_old_new {
+        // v7.38.2 (sentori report 5) — a `xmax` reference resolves to the
+        // synthetic `__ret_xmax` column, unless the table really has a column
+        // of that name (PG reserves it; if a user claimed it here, the user
+        // column wins, matching the scan path's rule).
+        let has_real_xmax = schema_cols
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case("xmax"));
+        let mut uses_xmax = false;
+        if !has_real_xmax {
+            for it in &mut items_rw {
+                if let SelectItem::Expr { expr, .. } = it {
+                    uses_xmax |= rewrite_returning_xmax(expr, qualifier);
+                }
+            }
+            if uses_xmax {
+                // PG names the bare system column "xmax" and types it as a
+                // number; `derive_output_columns` couldn't (it isn't in the
+                // schema), so re-name/re-type those output slots here.
+                let mut out_i = 0usize;
+                for it in items {
+                    match it {
+                        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                            out_i += schema_cols.len();
+                        }
+                        SelectItem::Expr { expr, alias } => {
+                            if let Expr::Column(c) = expr
+                                && c.name.eq_ignore_ascii_case("xmax")
+                                && c.qualifier
+                                    .as_deref()
+                                    .is_none_or(|q| q.eq_ignore_ascii_case(qualifier))
+                                && let Some(col) = columns.get_mut(out_i)
+                            {
+                                *col = ColumnSchema::new(
+                                    alias.clone().unwrap_or_else(|| String::from("xmax")),
+                                    spg_storage::DataType::BigInt,
+                                    false,
+                                );
+                            }
+                            out_i += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if !uses_old_new && !uses_xmax {
             let mut out_rows: Vec<Row<'static>> = Vec::with_capacity(default_rows.len());
             for values in default_rows {
                 let row = Row::new(values);
@@ -6237,6 +6301,13 @@ impl Engine {
             nc.name = alloc::format!("__ret_new_{}", c.name);
             syn_schema.push(nc);
         }
+        if uses_xmax {
+            syn_schema.push(ColumnSchema::new(
+                String::from("__ret_xmax"),
+                spg_storage::DataType::BigInt,
+                false,
+            ));
+        }
         let n = default_rows.len();
         let null_block = || alloc::vec![alloc::vec![Value::Null; arity]; n];
         let old_rows = old_rows.unwrap_or_else(null_block);
@@ -6248,6 +6319,15 @@ impl Engine {
             let mut syn_vals = default_rows[i].clone();
             syn_vals.extend(old_rows[i].iter().cloned());
             syn_vals.extend(new_rows[i].iter().cloned());
+            if uses_xmax {
+                syn_vals.push(Value::BigInt(
+                    xmax_per_row
+                        .as_ref()
+                        .and_then(|v| v.get(i))
+                        .copied()
+                        .unwrap_or(0),
+                ));
+            }
             let syn_row = Row::new(syn_vals);
             let mut vals: Vec<Value<'static>> = Vec::with_capacity(items_rw.len());
             for it in &items_rw {
@@ -6325,6 +6405,59 @@ fn rewrite_returning_old_new(expr: &mut Expr) -> bool {
             }
             if let Some(x) = else_branch {
                 found |= rewrite_returning_old_new(x);
+            }
+            found
+        }
+        _ => false,
+    }
+}
+
+/// v7.38.2 (sentori report 5) — rewrite `xmax` / `<target>.xmax` references in
+/// a RETURNING expression to the synthetic `__ret_xmax` column. Mirrors
+/// `rewrite_returning_old_new`'s tree walk. Returns whether any was found.
+fn rewrite_returning_xmax(expr: &mut Expr, qualifier: &str) -> bool {
+    match expr {
+        Expr::Column(c) => {
+            let q_ok = match &c.qualifier {
+                None => true,
+                Some(q) => q.eq_ignore_ascii_case(qualifier),
+            };
+            if q_ok && c.name.eq_ignore_ascii_case("xmax") {
+                c.name = String::from("__ret_xmax");
+                c.qualifier = None;
+                return true;
+            }
+            false
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            let a = rewrite_returning_xmax(lhs, qualifier);
+            rewrite_returning_xmax(rhs, qualifier) || a
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            rewrite_returning_xmax(expr, qualifier)
+        }
+        Expr::FunctionCall { args, .. } => {
+            let mut found = false;
+            for a in args {
+                found |= rewrite_returning_xmax(a, qualifier);
+            }
+            found
+        }
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => {
+            let mut found = false;
+            if let Some(o) = operand {
+                found |= rewrite_returning_xmax(o, qualifier);
+            }
+            for (c, v) in branches {
+                found |= rewrite_returning_xmax(c, qualifier);
+                found |= rewrite_returning_xmax(v, qualifier);
+            }
+            if let Some(x) = else_branch {
+                found |= rewrite_returning_xmax(x, qualifier);
             }
             found
         }
@@ -7216,6 +7349,11 @@ fn insert_parsed_rows(
         // returning rows: a NULL block for a plain insert, the pre-update row
         // for an ON CONFLICT DO UPDATE. Empty when RETURNING is off.
         Vec<Vec<Value<'static>>>,
+        // v7.38.2 (sentori report 5) — per-returning-row xmax for the
+        // `RETURNING (xmax = 0) AS is_new` idiom: 0 for a plain insert, the
+        // writer version (nonzero) for an ON CONFLICT DO UPDATE row, matching
+        // PG18's observable split. Empty when RETURNING is off.
+        Vec<i64>,
     ),
     EngineError,
 > {
@@ -7231,6 +7369,8 @@ fn insert_parsed_rows(
     let mut returning_rows: Vec<Vec<Value<'static>>> = Vec::new();
     // v7.39 (r129) — OLD image aligned with returning_rows (see return type).
     let mut old_images: Vec<Vec<Value<'static>>> = Vec::new();
+    // v7.38.2 — per-returning-row xmax (see return type).
+    let mut ret_xmax: Vec<i64> = Vec::new();
     // v7.12.7 — collect embedded SQL emitted by any trigger
     // fire across the row loop; engine drains the queue after
     // the table mut borrow drops.
@@ -7287,6 +7427,8 @@ fn insert_parsed_rows(
             returning_rows.push(row.values.clone());
             // A plain insert has no prior row — OLD is all-NULL.
             old_images.push(alloc::vec![Value::Null; arity]);
+            // A fresh row: PG's xmax is 0 — the "is_new" answer.
+            ret_xmax.push(0);
         }
         // v7.12.4 — clone for the AFTER trigger view; insert
         // moves the row into the table.
@@ -7341,6 +7483,9 @@ fn insert_parsed_rows(
             returning_rows.push(new_row.clone());
             // DO UPDATE: OLD is the pre-update conflicting row.
             old_images.push(old_row);
+            // A conflict-updated row: PG reports a nonzero xmax; the writer
+            // version is this statement's nonzero stand-in.
+            ret_xmax.push(xmin as i64);
         }
         if inplace {
             // MVCC: tombstone the conflicting old version (xmax = xmin)
@@ -7375,6 +7520,7 @@ fn insert_parsed_rows(
         affected,
         oc_pairs,
         old_images,
+        ret_xmax,
     ))
 }
 
