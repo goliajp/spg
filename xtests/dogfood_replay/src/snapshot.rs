@@ -58,7 +58,7 @@ pub fn verify_snapshot(
     })
 }
 
-fn sha256_of_file(path: &Path) -> Result<String> {
+pub fn sha256_of_file(path: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut reader = BufReader::new(File::open(path)?);
     let mut buf = vec![0u8; 64 * 1024];

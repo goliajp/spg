@@ -2554,9 +2554,23 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::BigIntArray2D(rows), DataType::BigIntArray2D) => write_bigint_2d_body(out, rows),
         (Value::TextArray2D(rows), DataType::TextArray2D) => write_text_2d_body(out, rows),
         (Value::BoolArray2D(rows), DataType::BoolArray2D) => write_bool_2d_body(out, rows),
-        // Type mismatch shouldn't happen — `Table::insert` validates
-        // value type against column type before pushing. Treat as a
-        // bug, not a runtime error.
+        // v7.38.7 — a TEXT body is the right shape for every
+        // string-carried type, and writing it is strictly better than
+        // dying here.
+        //
+        // This arm used to be `unreachable!()`, on the reasoning that
+        // `Table::insert` validates the pair first. It does — under a
+        // LOOSER rule than this match encodes, and the gap killed the
+        // CHECKPOINT THREAD on sentori's real data: writes kept being
+        // acknowledged while nothing reached disk, which is the worst
+        // way for a durability path to fail. Found by pointing the
+        // dogfood replay at their dump; it took seconds.
+        //
+        // A string value in a string-shaped column writes as a string.
+        // Anything else is a genuine internal inconsistency and still
+        // panics, because silently writing a wrong body would trade a
+        // loud failure for a corrupt one.
+        (Value::Text(s), DataType::Json | DataType::Jsonb) => write_str(out, s),
         (other, ty) => unreachable!(
             "schema-driven encode received mismatched value/type pair: \
              value tag={:?}, column type={:?}",

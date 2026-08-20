@@ -135,11 +135,46 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
                 args,
             });
         }
+        // v7.38.7 — the general case, instead of one more whitelist entry.
+        //
+        // Every arm above names a type someone hit and reported. The list
+        // grew one incident at a time and a UUID was still missing, which
+        // is how a scalar subquery over sentori's tables — where every one
+        // of 27 primary keys is a uuid — died on "not yet materialisable".
+        //
+        // A type that has a TEXT INPUT SYNTAX needs no bespoke arm: its
+        // own rendering, cast back to itself, reconstructs it exactly.
+        // That is what the `tid` arm above discovered and this
+        // generalises, so uuid, inet, macaddr, the date/time family, money
+        // and everything else shaped that way work without being
+        // enumerated.
+        //
+        // The refusal stays for values with no such round trip — a vector,
+        // a range, anything whose text form is not accepted back — because
+        // materialising those wrongly would be a silent wrong answer where
+        // this is a loud one.
         other => {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "subquery result type {} not yet materialisable; cast to text or integer in the inner SELECT",
-                crate::conversions::pg_type_name_for_error_opt(other.data_type())
-            )));
+            let Some(ty) = other.data_type() else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "subquery result type {} not yet materialisable; cast to \
+                     text or integer in the inner SELECT",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                )));
+            };
+            let Some(type_name) =
+                crate::conversions::regtype_oid_to_name(crate::system_catalog::pg_type_oid(ty))
+            else {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "subquery result type {} not yet materialisable; cast to \
+                     text or integer in the inner SELECT",
+                    crate::conversions::pg_type_name_for_error_opt(Some(ty))
+                )));
+            };
+            let text = crate::eval::value_to_text(&other);
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(text))),
+                target: spg_sql::ast::CastTarget::Named(alloc::string::String::from(type_name)),
+            });
         }
     };
     Ok(Expr::Literal(lit))

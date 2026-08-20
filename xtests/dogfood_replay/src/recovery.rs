@@ -15,7 +15,8 @@
 
 use crate::engine_err::ee;
 use crate::fixture::{
-    LockHangFixture, RecoveryStep, SynthesiseSpec, WalRecordBatch, WalReplayFixture,
+    DumpCrashFixture, LockHangFixture, RecoveryStep, SynthesiseSpec, WalRecordBatch,
+    WalReplayFixture,
 };
 use crate::snapshot::{ExtractedSnapshot, SnapshotState, extract_snapshot, verify_snapshot};
 use anyhow::{Context, Result, anyhow};
@@ -237,4 +238,172 @@ fn write_wal_records(db: &mut Database, batches: &[WalRecordBatch]) -> Result<()
         }
     }
     Ok(())
+}
+
+/// v7.38.7 — restore a customer's dump, kill the writer, reopen, check.
+///
+/// The three things this asserts, in the order they matter:
+///
+/// 1. **The dump restores.** A fixture whose data did not load is a
+///    fixture that measures nothing, and reports agreement anyway — the
+///    failure mode this file has hit twice before. So the row counts
+///    are checked against the fixture's own record before the crash
+///    test is allowed to start.
+/// 2. **Every acknowledged write survives.** The child prints how many
+///    the client was told had committed, then SIGKILLs itself. That
+///    number is the contract; anything less is lost data.
+/// 3. **The indexes still answer what a scan answers.** Each probe is
+///    asked twice — once so an index can serve it, once phrased so none
+///    can — and the two must agree. This needs no expectation file, so
+///    it cannot go stale, and it is the only way to catch an index that
+///    came back from an unclean stop subtly wrong rather than absent.
+///    sentori named GIN `jsonb_path_ops` and BRIN as the two they would
+///    least expect to survive; both are probes here.
+pub fn run_dump_crash(fixture_dir: &Path, fx: &DumpCrashFixture) -> Result<RecoveryOutcome> {
+    let gz = fixture_dir.join(&fx.dump_gz);
+    if !gz.exists() {
+        return Ok(RecoveryOutcome::SkippedSnapshotMissing);
+    }
+    let actual = crate::snapshot::sha256_of_file(&gz)?;
+    if actual != fx.sha256 {
+        return Err(anyhow!(
+            "dump sha256 mismatch: expected {}, got {actual} — a fixture whose \
+             data is not the data it records measures something else",
+            fx.sha256
+        ));
+    }
+
+    let tmp = TempDir::new()?;
+    let dump_sql = tmp.path().join("dump.sql");
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "gzip -dc {} > {}",
+            gz.display(),
+            dump_sql.display()
+        ))
+        .status()
+        .context("gunzip the dump")?;
+    if !status.success() {
+        return Err(anyhow!("gunzip failed"));
+    }
+
+    let db_path = tmp.path().join("data.db");
+    let writer = writer_bin()?;
+    let out = std::process::Command::new(&writer)
+        .arg(&db_path)
+        .arg(&dump_sql)
+        .arg(&fx.write_burst.statement)
+        .arg(fx.write_burst.kill_after.to_string())
+        .output()
+        .context("run the crash writer")?;
+
+    // SIGKILL is the expected end. A clean exit means the child never
+    // reached the kill, which makes everything below meaningless.
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let acked: u32 = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("ACKED ")?.trim().parse().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "crash writer never acknowledged a write — stdout {stdout:?}, stderr {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })?;
+    if out.status.code().is_some() {
+        return Err(anyhow!(
+            "crash writer exited cleanly with {:?}; it must die by SIGKILL or \
+             this fixture is testing an orderly shutdown",
+            out.status
+        ));
+    }
+
+    // ── Reopen. Everything below is measured on the recovered database.
+    let mut db = Database::open_path(&db_path).map_err(ee)?;
+
+    // The restored tables must still hold at LEAST what the dump put
+    // there. The burst table also holds whatever survived the kill, so
+    // it is checked for its own contract just below rather than for
+    // equality here — an equality check on it would fail on a perfectly
+    // healthy recovery, which is a gate that cries wolf.
+    for (table, expected) in &fx.restored_rows {
+        let got = scalar_u64(&mut db, &format!("SELECT count(*) FROM {table}"))?;
+        if got < *expected {
+            return Err(anyhow!(
+                "after recovery {table} holds {got} rows, the dump put {expected} there \
+                 — restored data did not survive the kill"
+            ));
+        }
+        if *table != fx.write_burst.table && got != *expected {
+            return Err(anyhow!(
+                "after recovery {table} holds {got} rows and the dump put {expected} \
+                 there — nothing wrote to this table, so it must be unchanged"
+            ));
+        }
+    }
+
+    let burst = scalar_u64(
+        &mut db,
+        &format!("SELECT count(*) FROM {}", fx.write_burst.table),
+    )?;
+    let base = fx
+        .restored_rows
+        .iter()
+        .find(|(t, _)| *t == fx.write_burst.table)
+        .map_or(0, |(_, n)| *n);
+    let survived = burst.saturating_sub(base);
+    if survived < u64::from(acked) {
+        return Err(anyhow!(
+            "the client was told {acked} writes had committed and {survived} are here \
+             after the kill — acknowledged data was lost"
+        ));
+    }
+
+    for probe in &fx.index_probes {
+        let via_index = scalar_u64(&mut db, &probe.indexed)?;
+        let via_scan = scalar_u64(&mut db, &probe.scan)?;
+        if via_index != via_scan {
+            return Err(anyhow!(
+                "{}: the index answers {via_index} and a scan of the same predicate \
+                 answers {via_scan} — the index did not come back from the unclean \
+                 stop intact",
+                probe.what
+            ));
+        }
+    }
+
+    Ok(RecoveryOutcome::Ran(RecoveryRun {
+        recovery_ms: 0.0,
+        steps_run: fx.restored_rows.len() + fx.index_probes.len() + 1,
+    }))
+}
+
+/// The crash writer, built beside this binary.
+fn writer_bin() -> Result<PathBuf> {
+    let me = std::env::current_exe().context("current_exe")?;
+    let dir = me.parent().ok_or_else(|| anyhow!("no exe dir"))?;
+    let p = dir.join("dump-crash-writer");
+    if p.exists() {
+        return Ok(p);
+    }
+    Err(anyhow!(
+        "dump-crash-writer not built at {} — `cargo build -p spg-dogfood-replay`",
+        p.display()
+    ))
+}
+
+fn scalar_u64(db: &mut Database, sql: &str) -> Result<u64> {
+    match db.execute(sql).map_err(ee)? {
+        spg_engine::QueryResult::Rows { rows, .. } => {
+            let v = rows
+                .first()
+                .and_then(|r| r.values.first())
+                .ok_or_else(|| anyhow!("{sql}: no row"))?;
+            spg_engine::eval::value_to_text(v)
+                .trim()
+                .parse()
+                .with_context(|| format!("{sql}: not a number"))
+        }
+        other => Err(anyhow!("{sql}: {other:?}")),
+    }
 }
