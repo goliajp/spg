@@ -984,11 +984,22 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
             });
         }
     };
-    let lhs_doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON on left of @>: {e}"),
-    })?;
     let rhs_doc = parse(rhs_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON on right of @>: {e}"),
+    })?;
+    // v7.38.9 — the shape the customer's audience filter uses, answered
+    // without building a tree for the LEFT document.
+    //
+    // `@>` rides the GIN index, so the cost that shows is the recheck on
+    // each MATCHED row: `traits @> '{"plan":"pro"}'` matched 66,000 of
+    // 200,000 rows and cost 39.5 ms against PG's 13.7, while the same
+    // operator with a constant that matches nothing costs 0.067. The
+    // recheck parsed both documents, and the left one is the big one.
+    if let Some(verdict) = contains_flat_object(lhs_text, &rhs_doc) {
+        return Ok(Value::Bool(verdict));
+    }
+    let lhs_doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON on left of @>: {e}"),
     })?;
     // PG special case: a top-level array `@>` a non-array scalar is
     // true when the scalar equals any element (flat equality). This
@@ -1005,6 +1016,47 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
         _ => json_contains(&lhs_doc, &rhs_doc),
     };
     Ok(Value::Bool(result))
+}
+
+/// Containment when the RIGHT side is a flat object of scalars: `None`
+/// when this does not apply, so the caller falls back to the general
+/// recursion rather than to a second reading of the semantics.
+///
+/// The reduction is exact for this shape and only this shape. PG's rule
+/// for object containment is that every member of the right must be
+/// CONTAINED in the left's member of the same key — and for a scalar,
+/// contained and equal are the same thing. So each member is located in
+/// the left's source text and handed to `json_eq`, the same function the
+/// general path uses, on a slice rather than on a member of a tree that
+/// had to be built first.
+///
+/// Declines on anything else: a non-object left, an object-or-array
+/// value on the right (where containment is recursive and not equality),
+/// or a located slice that will not parse.
+fn contains_flat_object(lhs_text: &str, rhs_doc: &JsonValue) -> Option<bool> {
+    let JsonValue::Object(members) = rhs_doc else {
+        return None;
+    };
+    if members
+        .iter()
+        .any(|(_, v)| matches!(v, JsonValue::Object(_) | JsonValue::Array(_)))
+    {
+        return None;
+    }
+    let b = lhs_text.as_bytes();
+    if b.get(skip_ws_at(b, 0)) != Some(&b'{') {
+        return None;
+    }
+    for (key, want) in members {
+        let Some(slice) = locate_member(lhs_text, key) else {
+            return Some(false);
+        };
+        let got = parse(slice).ok()?;
+        if !json_eq(&got, want) {
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// `jsonb = jsonb` structural equality (PG18-compatible). PG's jsonb
