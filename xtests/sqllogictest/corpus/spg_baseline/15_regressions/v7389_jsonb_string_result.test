@@ -1,0 +1,60 @@
+# v7.38.9 — `->>` hands back an unescaped string token verbatim.
+#
+# It used to run the whole recursive-descent parser over the token to
+# unescape nothing: the customer's `traits->>'plan'` reads a string
+# value on every row, and every one of them was parsed a second time to
+# be handed back unchanged. A token that DOES carry an escape still
+# goes through the decoder, and these are the cases that separate the
+# two — every expectation taken from PostgreSQL 18.
+
+query T
+SELECT '{"a":"pro"}'::jsonb ->> 'a'
+----
+pro
+
+# The escape must still be decoded: three characters, not four.
+query T
+SELECT length('{"a":"x\ny"}'::jsonb ->> 'a')::text
+----
+3
+
+query T
+SELECT length('{"a":"x\ty"}'::jsonb ->> 'a')::text
+----
+3
+
+query T
+SELECT '{"a":"x\"y"}'::jsonb ->> 'a'
+----
+x"y
+
+query T
+SELECT '{"a":"x\\y"}'::jsonb ->> 'a'
+----
+x\y
+
+query T
+SELECT '{"a":"é"}'::jsonb ->> 'a'
+----
+é
+
+query T
+SELECT ('{"a":""}'::jsonb ->> 'a' = '')::text
+----
+true
+
+query T
+SELECT '{"a":42}'::jsonb ->> 'a'
+----
+42
+
+query T
+SELECT COALESCE('{"a":null}'::jsonb ->> 'a', 'ISNULL')
+----
+ISNULL
+
+# `->` is not `->>`: it returns the JSON value, quotes and all.
+query T
+SELECT ('{"a":"pro"}'::jsonb -> 'a')::text
+----
+"pro"
