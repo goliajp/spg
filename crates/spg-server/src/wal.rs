@@ -54,8 +54,7 @@ pub(crate) fn synchronous_commit_disabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("SPG_SYNCHRONOUS_COMMIT")
-            .ok()
-            .is_some_and(|s| matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"))
+            .is_ok_and(|s| matches!(s.trim().to_lowercase().as_str(), "off" | "false" | "0"))
     })
 }
 

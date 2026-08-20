@@ -301,8 +301,9 @@ fn compress_scalar(
 
 fn words_from_le_bytes(bytes: &[u8; BLOCK_LEN]) -> [u32; 16] {
     let mut m = [0u32; 16];
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        m[i] = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let (words, _) = bytes.as_chunks::<4>();
+    for (i, chunk) in words.iter().enumerate() {
+        m[i] = u32::from_le_bytes(*chunk);
     }
     m
 }

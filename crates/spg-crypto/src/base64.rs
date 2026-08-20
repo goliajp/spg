@@ -12,15 +12,14 @@ const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 
 pub fn encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 12) & 0x3f) as usize] as char);
         out.push(ALPHA[((n >> 6) & 0x3f) as usize] as char);
         out.push(ALPHA[(n & 0x3f) as usize] as char);
     }
-    let rem = chunks.remainder();
     if rem.len() == 1 {
         let n = u32::from(rem[0]) << 16;
         out.push(ALPHA[((n >> 18) & 0x3f) as usize] as char);
@@ -49,7 +48,8 @@ pub fn decode(input: &str) -> Result<Vec<u8>, DecodeError> {
         return Err(DecodeError::InvalidLength);
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks_exact(4) {
+    let (quads, _) = bytes.as_chunks::<4>();
+    for chunk in quads {
         let mut quad = [0u32; 4];
         let mut padding = 0;
         for (i, &b) in chunk.iter().enumerate() {

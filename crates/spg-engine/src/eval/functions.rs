@@ -9163,7 +9163,8 @@ fn apply_function_dispatch(
                 });
             }
             let mut out = alloc::string::String::new();
-            for pair in args.chunks_exact(2) {
+            let (pairs, _) = args.as_chunks::<2>();
+            for pair in pairs {
                 let name = match &pair[0] {
                     Value::Text(s) => s.to_string(),
                     other => value_to_format_text(other),
@@ -13700,7 +13701,8 @@ fn apply_function_dispatch(
                     });
                 }
                 let mut first = true;
-                for pair in items.chunks_exact(2) {
+                let (pairs, _) = items.as_chunks::<2>();
+                for pair in pairs {
                     let Some(key) = &pair[0] else {
                         return Err(EvalError::TypeMismatch {
                             detail: "json_object(): key cannot be NULL".into(),

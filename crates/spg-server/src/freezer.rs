@@ -63,9 +63,7 @@ impl FreezerConfig {
     pub(crate) fn from_env() -> Self {
         // Explicit kill-switch — useful in unit/e2e tests that don't
         // want a background thread mutating engine state under them.
-        let disabled = env::var("SPG_FREEZER_DISABLE")
-            .ok()
-            .is_some_and(|s| !s.is_empty() && s != "0");
+        let disabled = env::var("SPG_FREEZER_DISABLE").is_ok_and(|s| !s.is_empty() && s != "0");
         let tick_ms = env::var("SPG_FREEZER_TICK_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())

@@ -260,7 +260,8 @@ pub(crate) fn build_object_canonical(args: &[Value<'_>]) -> Option<Value<'static
     }
     let mut entries: alloc::vec::Vec<(String, JsonValue)> =
         alloc::vec::Vec::with_capacity(args.len() / 2);
-    for pair in args.chunks_exact(2) {
+    let (pairs, _) = args.as_chunks::<2>();
+    for pair in pairs {
         // A NULL key is an error the text path words; leave it there.
         let key = match &pair[0] {
             Value::Text(s) | Value::BpChar(s) => s.to_string(),
@@ -3163,7 +3164,8 @@ pub fn build_object(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     }
     let mut out = String::from("{");
     let mut first = true;
-    for pair in args.chunks_exact(2) {
+    let (pairs, _) = args.as_chunks::<2>();
+    for pair in pairs {
         if !first {
             // v7.38 (read01, T-json-ws) — PG's json_build_object uses `, `
             // between pairs and ` : ` (spaces both sides) around the colon;

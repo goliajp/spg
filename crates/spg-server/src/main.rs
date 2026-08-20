@@ -1698,8 +1698,7 @@ fn run(
     let chaos = ChaosKnobs {
         wal_quota_bytes: parse_env_u64("SPG_FAIL_WAL_QUOTA_BYTES"),
         disable_wal_preflight: env::var("SPG_DISABLE_WAL_PREFLIGHT")
-            .ok()
-            .is_some_and(|s| !s.is_empty() && s != "0"),
+            .is_ok_and(|s| !s.is_empty() && s != "0"),
         fail_fsync_at: parse_env_u64("SPG_FAIL_FSYNC_AT"),
     };
     let cold_preload = parse_cold_preload_env();
