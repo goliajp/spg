@@ -262,6 +262,29 @@ fn relation_columns(
     None
 }
 
+/// v7.38.7 — what PG names an unaliased select item.
+///
+/// Delegates to `spg_sql::ast::figure_column_name`, which the EXECUTOR
+/// already uses for the same question. That is the whole point: the
+/// naming rule existed in two places and they disagreed — a bare
+/// `count(*)` described as `?column?` while the RowDescription that
+/// arrived on Execute said `count`, so a client reading names from
+/// Describe looked for a column the row stream did not have. Rather than
+/// write a third copy here (the first draft of this function did, and
+/// promptly got `now()::date` wrong where the shared one has it right),
+/// Describe now asks the same function the executor asks.
+///
+/// The shared rule carries the strength semantics PG's naming needs: a
+/// cast prefers its operand's name and settles for the target type only
+/// when the operand has none, so `7::bigint` is `int8` while
+/// `now()::date` stays `now`.
+pub(crate) fn pg_select_item_name(
+    e: &Expr,
+    _schema_cols: &[ColumnSchema],
+) -> alloc::string::String {
+    spg_sql::ast::figure_column_name(e).unwrap_or_else(|| alloc::string::String::from("?column?"))
+}
+
 fn describe_select_items(
     items: &[SelectItem],
     schema_cols: &[ColumnSchema],
@@ -301,20 +324,56 @@ fn describe_select_items(
                     }),
                     Expr::ScalarSubquery(inner) => {
                         let cols = describe_select_columns(inner, cat, &[], 0);
-                        match cols.as_slice() {
-                            [c] => Some(ExprShape {
-                                name: c.name.clone(),
-                                ty: c.ty,
-                                nullable: true,
-                            }),
-                            _ => None,
+                        // v7.38.7 — two different Nones live here, and the
+                        // fallback below must only catch one of them.
+                        //
+                        // MORE than one column means the STATEMENT is
+                        // invalid — PG refuses `SELECT (SELECT a, b …)`
+                        // outright — so describing it as a column would be
+                        // inventing an answer for something that cannot
+                        // run. That keeps the honest NoData (r1053).
+                        //
+                        // ZERO columns means the inner is merely
+                        // undescribable, which is the ordinary unknown the
+                        // fallback exists for.
+                        if cols.len() > 1 {
+                            return Vec::new();
                         }
+                        cols.first().map(|c| ExprShape {
+                            name: c.name.clone(),
+                            ty: c.ty,
+                            nullable: true,
+                        })
                     }
-                    _ => describe_expr(expr, schema_cols),
+                    _ => describe_expr_in(expr, schema_cols, Some(cat)),
                 };
-                let Some(desc) = shape else {
-                    return Vec::new();
-                };
+                // v7.38.7 — an item we cannot TYPE still contributes a
+                // COLUMN.
+                //
+                // This `else` used to `return Vec::new()`, which reported
+                // the WHOLE statement as having no columns because one
+                // item was unknown. Nine defects have now come in against
+                // this one behaviour — a data-modifying CTE, a subquery in
+                // the select list, a top-level null test, ordered-set
+                // aggregates, a set-returning function in FROM, and most
+                // recently a call to a user-defined function — and each
+                // time the report says the same thing: an ordinary column
+                // sitting next to the unknown one disappeared with it, and
+                // a driver that sizes rows from Describe got nothing while
+                // psql looked healthy.
+                //
+                // The type is the part we genuinely may not know. The NAME
+                // is derivable from the item alone, and TEXT is a safe
+                // answer for a type on the text wire format (the same
+                // choice round T4 made for placeholders). So an unknown
+                // now costs one loosely-typed column instead of the
+                // statement's entire shape — a failure proportional to
+                // what was actually missing.
+                let desc = shape.unwrap_or_else(|| ExprShape {
+                    name: pg_select_item_name(expr, schema_cols),
+                    ty: DataType::Text,
+                    nullable: true,
+                });
                 let name = alias.clone().unwrap_or(desc.name);
                 out.push(ColumnSchema {
                     collation_name: None,
@@ -544,7 +603,54 @@ pub(crate) fn describe_expr_type(e: &Expr, schema_cols: &[ColumnSchema]) -> Opti
     }
 }
 
+/// v7.38.7 (sentori 3.1) — the declared return type of a user-defined
+/// function, as a shape.
+///
+/// `None` when there is no catalog here, no such function, or a return
+/// type this build cannot map — and `None` is survivable now, because
+/// the select-item loop falls back to a named TEXT column instead of
+/// erasing the whole statement's column list.
+fn user_function_shape(name: &str, cat: Option<&Catalog>) -> Option<ExprShape> {
+    let def = cat?
+        .functions()
+        .values()
+        .find(|f| f.name.eq_ignore_ascii_case(name))?;
+    let declared = def.returns.trim();
+    let lower = declared.to_ascii_lowercase();
+    if lower == "void" || lower.starts_with("setof") || lower.starts_with("table") {
+        return None;
+    }
+    let ty = crate::conversions::type_name_to_data_type(declared)?;
+    Some(ExprShape {
+        name: name.to_ascii_lowercase(),
+        ty,
+        nullable: true,
+    })
+}
+
+/// The catalog-free walk, for callers outside this file.
 pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<ExprShape> {
+    describe_expr_in(e, schema_cols, None)
+}
+
+/// v7.38.7 — the type walker, with the catalog when the caller has one.
+///
+/// `describe_expr` below is the same walk without a catalog, kept for the
+/// 28 callers outside this file that have no reason to hold one. Only the
+/// user-defined-function arm needs it, and a UDF is reachable at ANY
+/// depth (`f()`, `f() + 1`, `coalesce(f(), 0)`), so it is threaded rather
+/// than answered at the top of a select item.
+///
+/// Passing it explicitly rather than parking it in a global: Describe
+/// runs under the engine's READ lock, so several connections walk here at
+/// once, and a transaction shadow gives them DIFFERENT catalogs. A shared
+/// mutable pointer would hand one connection another's schema — the same
+/// shape as every per-connection-state defect this engine has had.
+pub(crate) fn describe_expr_in(
+    e: &Expr,
+    schema_cols: &[ColumnSchema],
+    cat: Option<&Catalog>,
+) -> Option<ExprShape> {
     match e {
         Expr::Column(c) => {
             // Mirror resolve_projection_column's lookup: bare name first,
@@ -614,7 +720,11 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 CastTarget::Named(name) => crate::conversions::type_name_to_data_type(name)?,
             };
             Some(ExprShape {
-                name: "?column?".to_string(),
+                // v7.38.7 (sentori 3.2) — PG names a cast after its TARGET
+                // TYPE's internal name when the operand has none of its
+                // own, and leaves the operand's name alone when it has
+                // one: `7::bigint` is `int8`, `now()::date` stays `now`.
+                name: pg_select_item_name(e, schema_cols),
                 ty,
                 nullable: true,
             })
@@ -647,7 +757,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             op: UnOp::BitNot | UnOp::Plus,
             expr,
         } => {
-            let inner = describe_expr(expr, schema_cols)?;
+            let inner = describe_expr_in(expr, schema_cols, cat)?;
             Some(ExprShape {
                 name: "?column?".to_string(),
                 ty: inner.ty,
@@ -659,7 +769,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             op: UnOp::Neg,
             expr,
         } => {
-            let inner = describe_expr(expr, schema_cols)?;
+            let inner = describe_expr_in(expr, schema_cols, cat)?;
             Some(ExprShape {
                 name: "?column?".to_string(),
                 ty: inner.ty,
@@ -681,19 +791,21 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
         // Describe looked for `count` and was told `?column?`. Only the
         // NAME is taken here; the type still comes from the map below.
         Expr::FunctionCall { name, args } => {
-            function_return_shape(name, args, schema_cols).map(|mut sh| {
-                if sh.name == "?column?" {
-                    // `COUNT(*)` parses to the internal name `count_star`;
-                    // PG calls the column `count`, which is what the user
-                    // wrote. Never let an internal spelling reach the wire.
-                    sh.name = if name.eq_ignore_ascii_case("count_star") {
-                        "count".to_string()
-                    } else {
-                        name.to_ascii_lowercase()
-                    };
-                }
-                sh
-            })
+            function_return_shape(name, args, schema_cols)
+                .map(|mut sh| {
+                    if sh.name == "?column?" {
+                        sh.name = pg_select_item_name(e, schema_cols);
+                    }
+                    sh
+                })
+                // v7.38.7 (sentori 3.1) — a call this map does not know is
+                // a USER-DEFINED function, not an unknown: the catalog
+                // carries its declared return type. Without this every
+                // `SELECT f()` described nothing at all — the whole
+                // statement, an ordinary neighbouring column included —
+                // and a UDF is reachable at ANY depth (`f() + 1`), so the
+                // answer cannot live only at the top of a select item.
+                .or_else(|| user_function_shape(name, cat))
         }
         // v7.26 (round-20 C) — aggregate modifiers delegate to the
         // inner call (DISTINCT / internal ORDER BY don't change the
@@ -735,7 +847,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 nullable: true,
             })
         }
-        Expr::AggregateOrdered { call, .. } => describe_expr(call, schema_cols),
+        Expr::AggregateOrdered { call, .. } => describe_expr_in(call, schema_cols, cat),
         // v7.39 (round 268) — a window call. The pure window functions
         // have fixed result types (measured on PG 18.4); everything else
         // over OVER() is an aggregate and keeps the aggregate's type, so
@@ -762,7 +874,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 lower.as_str(),
                 "lag" | "lead" | "first_value" | "last_value" | "nth_value"
             ) {
-                let inner = describe_expr(args.first()?, schema_cols)?;
+                let inner = describe_expr_in(args.first()?, schema_cols, cat)?;
                 return Some(ExprShape {
                     name: lower,
                     ty: inner.ty,
@@ -787,7 +899,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                 .first()
                 .map(|(_, t)| t)
                 .or(else_branch.as_deref())?;
-            let inner = describe_expr(probe, schema_cols)?;
+            let inner = describe_expr_in(probe, schema_cols, cat)?;
             Some(ExprShape {
                 name: "case".to_string(),
                 ty: inner.ty,
@@ -830,7 +942,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
                     nullable: true,
                 }),
                 _ => {
-                    let inner = describe_expr(lhs, schema_cols)?;
+                    let inner = describe_expr_in(lhs, schema_cols, cat)?;
                     // v7.38 (read01 A-bitcat) — PG's `||` on bit strings is
                     // `bitcat`, whose result is always `bit varying`: the
                     // operands widen to varbit and the concatenated length
@@ -856,7 +968,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
         }
         // (array_agg(…))[1] — element type of the array.
         Expr::ArraySubscript { target, .. } => {
-            let inner = describe_expr(target, schema_cols)?;
+            let inner = describe_expr_in(target, schema_cols, cat)?;
             let elem = match inner.ty {
                 DataType::IntArray => DataType::Int,
                 DataType::BigIntArray => DataType::BigInt,
@@ -870,7 +982,7 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
             })
         }
         // arr[lo:hi] — slice keeps the array type.
-        Expr::ArraySlice { target, .. } => describe_expr(target, schema_cols),
+        Expr::ArraySlice { target, .. } => describe_expr_in(target, schema_cols, cat),
         // v7.37.43-T4 — `$N` placeholders in a projection. Pre-T4 this
         // arm fell through to `_ => None`, which made
         // `describe_select_items` return an empty Vec, which made
