@@ -4608,7 +4608,7 @@ fn analyze_join_pushdown<'w>(
         if on_safe {
             let mut from_owned = from.clone();
             core::mem::swap(&mut from_owned.primary, &mut from_owned.joins[0].table);
-            let primary_preds = peer_preds[0].drain(..).collect();
+            let primary_preds = core::mem::take(&mut peer_preds[0]);
             return (Some(from_owned), primary_preds, peer_preds);
         }
     }
