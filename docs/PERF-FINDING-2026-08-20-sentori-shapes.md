@@ -75,6 +75,72 @@ It is not the jsonb encoding either: `jsonb: containment` and
 `btree: project and kind` bracket it. One is 2.08× on a predicate PG
 also scans sequentially, the other is a tie.
 
+## Ablation — where the time actually goes
+
+The plans above name what we do differently. They do not price it, so
+the same profile was taken apart by ablation instead: the same query
+with one clause removed at a time, min-of-3 in one session, both
+engines in the same window. All figures ms over 200,000 rows.
+
+| probe | SPG | PG 18 | SPG cost per row |
+|---|---|---|---|
+| bare `count(*)` | 2.9 | 4.8 | — (**we win**) |
+| `received_at IS NOT NULL` (touch, no compare) | 5.5 | 4.5 | 13 ns |
+| `id > id` (bigint, column vs column) | 3.3 | 5.3 | ~2 ns |
+| `id > 0` (bigint vs literal) | 7.4 | 5.2 | 22 ns |
+| `kind > kind` (text, column vs column) | 10.9 | 4.6 | 40 ns |
+| `kind = 'click'` (text vs literal) | 6.8 | 3.5 | 20 ns |
+| `received_at > received_at` (column vs column) | 7.0 | 4.7 | 20 ns |
+| **`received_at > timestamp '…'`** | 13.5 | 5.4 | **52 ns** |
+| `traits IS NOT NULL` (touch jsonb) | 5.7 | 4.6 | 14 ns |
+| **`traits->>'plan' = 'pro'`** | 83.2 | 6.7 | **398 ns** |
+| `traits->>'seat' = '42'` (LAST field) | 80.0 | 6.8 | 398 ns |
+
+Two things this settles.
+
+**Scanning is not the problem — we beat PG on the bare count.** What
+we lose is entirely per-row predicate work, so an attack on the scan
+loop itself would be aimed at the one part of this that already wins.
+
+**The jsonb cost does not depend on which field is asked for.** First
+field and last field are the same price, which is the shape of parsing
+the whole document rather than walking to a position. And the
+representation says why: `Value::Json(Cow<str>)` — jsonb is a string
+at rest, in memory and on disk, so every field access re-parses. PG
+stores a binary tree with an offset table and answers in 11 ns.
+
+## One prediction, made and refuted
+
+Worth recording because the refutation is the useful part.
+
+`constfold` (r1042) folds `timestamp '2026-06-01'` at prepare time, so
+the cast is gone from the tree. But its exit converts the folded
+`Value` back into a `Literal`, and `clock.rs:35` reads
+
+```rust
+Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+```
+
+— the folded constant becomes a *string*. `Date`, `Uuid`, `Bytes` and
+`Numeric` take the same exit. So the predicate that runs is a
+timestamp column compared against a string, and the obvious reading is
+that each row clones that string and parses it back into a timestamp.
+
+The discriminator for that reading is `id > '0'`: an integer column
+against a string literal must parse per row too, if the mechanism is
+real. It costs 7.72 ms against 7.58 ms for `id > 0` — 0.7 ns a row
+apart. **The mechanism as stated is not what is happening**, at least
+not for integers, and a story that only holds for one type is not yet
+a diagnosis.
+
+What is certain is the code: the fold's exit cannot express a typed
+constant, so typed constants leave it as text. What is not established
+is how that turns into the 31 ns a timestamp comparison costs over an
+integer one. The next step is a leaf-symbol profile of exactly that
+query — the category first, per the methodology, since the counters
+and the ablation have now given prices for a mechanism nobody has
+seen.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
