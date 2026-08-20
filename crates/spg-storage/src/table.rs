@@ -1088,6 +1088,31 @@ impl Table {
             .map(|(i, (r, _))| (i, r))
     }
 
+    /// v7.38.11 — like [`Table::scan_visible_from`] but visiting only
+    /// the slots a BRIN summary could not rule out.
+    ///
+    /// The caller passes ranges it got from
+    /// [`Table::brin_candidate_slots`]; passing `0..len` gives exactly
+    /// the same rows in the same order as the unpruned scan, which is
+    /// how the callers that have no BRIN index keep their behaviour.
+    pub fn scan_visible_slots<'a, 'b>(
+        &'a self,
+        slots: alloc::vec::Vec<core::ops::Range<usize>>,
+        snapshot: &'b crate::snapshot::Snapshot,
+    ) -> impl Iterator<Item = (usize, &'a Row<'static>)> + 'b
+    where
+        'a: 'b,
+    {
+        self.note_seq_scan();
+        slots.into_iter().flatten().filter_map(move |i| {
+            let h = self.headers.get(i)?;
+            if !self.header_visible(i, h, snapshot) {
+                return None;
+            }
+            self.rows.get(i).map(|r| (i, r))
+        })
+    }
+
     /// v6.8.0 — exposed for the engine layer to patch
     /// `Index::included_columns` post-creation. Could fold into
     /// `add_index` once the engine's IF-NOT-EXISTS guard moves up,
