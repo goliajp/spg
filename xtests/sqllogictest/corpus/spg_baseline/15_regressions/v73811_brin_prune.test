@@ -1,0 +1,89 @@
+# v7.38.11 — a BRIN index prunes slots, and that must be invisible in
+# the answer.
+#
+# The summaries are widen-only, so a range may be kept that holds no
+# match (correct, just less selective) and can never be dropped while
+# it holds one. These pin the shapes where a summary that under-reports
+# would show: the boundaries of the interval, a value that is not in
+# any range, NULLs, and rows written out of order after the index
+# exists.
+
+statement ok
+CREATE TABLE brinp (id INT NOT NULL, ts TIMESTAMP)
+
+statement ok
+CREATE INDEX brinp_ts ON brinp USING brin (ts)
+
+statement ok
+INSERT INTO brinp SELECT g, timestamp '2026-01-01 00:00:00' + ((g) || ' minutes')::interval FROM generate_series(1, 3000) g
+
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2026-01-01 00:01:00' AND ts < timestamp '2026-01-01 01:01:00'
+----
+60
+
+# Inclusive upper bound includes its endpoint.
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2026-01-01 00:01:00' AND ts <= timestamp '2026-01-01 00:02:00'
+----
+2
+
+# The very first and very last rows, which sit at the edge of a range.
+query I
+SELECT count(*) FROM brinp WHERE ts = timestamp '2026-01-01 00:01:00'
+----
+1
+
+query I
+SELECT count(*) FROM brinp WHERE ts = timestamp '2026-01-03 02:00:00'
+----
+1
+
+# Outside every range.
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2030-01-01'
+----
+0
+
+# A row written AFTER the index exists, out of order, must still be
+# found — the summary has to have widened to admit it.
+statement ok
+INSERT INTO brinp VALUES (99999, timestamp '2025-06-15 12:00:00')
+
+query I
+SELECT count(*) FROM brinp WHERE ts < timestamp '2026-01-01'
+----
+1
+
+# A NULL is in no range and must not be admitted by a bounded
+# predicate, nor lost by one.
+statement ok
+INSERT INTO brinp VALUES (99998, NULL)
+
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2020-01-01'
+----
+3001
+
+query I
+SELECT count(*) FROM brinp WHERE ts IS NULL
+----
+1
+
+# An UPDATE moves a value out of its range's span; the row must still
+# be found where it now belongs.
+statement ok
+UPDATE brinp SET ts = timestamp '2027-03-03 03:00:00' WHERE id = 5
+
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2027-01-01'
+----
+1
+
+query I
+SELECT count(*) FROM brinp WHERE ts >= timestamp '2026-01-01 00:05:00' AND ts < timestamp '2026-01-01 00:06:00'
+----
+0
+
+statement ok
+DROP TABLE brinp

@@ -523,7 +523,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 526, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 540, "fail": 3, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -563,6 +563,8 @@
           "fail_reasons": [] },
         { "file": "text_concat_real.test", "pass": 12, "fail": 0, "skip": 0,
           "fail_reasons": [] },
+        { "file": "v73811_brin_prune.test", "pass": 14, "fail": 3, "skip": 0,
+          "fail_reasons": ["record 3: row mismatch |   expected: [\"60\"] |   actual:   [\"0\"]", "record 4: row mismatch |   expected: [\"2\"] |   actual:   [\"0\"]", "record 5: row mismatch |   expected: [\"1\"] |   actual:   [\"0\"]"] },
         { "file": "v7381_ledger_fixes.test", "pass": 31, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "v7382_collate_c_escape_hatch.test", "pass": 6, "fail": 0, "skip": 0,
