@@ -1097,6 +1097,7 @@ mod e2e_json_build;
 mod e2e_json_builder_whitespace;
 mod e2e_json_path;
 mod e2e_jsonb;
+mod e2e_jsonb_column_validates_v7388;
 mod e2e_jsonb_epic6;
 mod e2e_jsonb_object_agg_dedup;
 mod e2e_jsonb_path_query;
