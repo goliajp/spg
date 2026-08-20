@@ -26,7 +26,15 @@ path = "src/bin/stress_cascade.rs"
 name = "spg-counter-dump"
 path = "src/bin/counter_dump.rs"
 
+[[bin]]
+# v7.38.7 — the child half of the dump-crash-recovery fixture: restores
+# a dump, acknowledges writes, then SIGKILLs itself. Separate process
+# because a harness cannot kill -9 itself and carry on.
+name = "dump-crash-writer"
+path = "src/bin/dump_crash_writer.rs"
+
 [dependencies]
+libc = "0.2"
 # v7.37.5 — dogfood-replay framework. Bin-only crate; the framework
 # is intentionally tight on deps so it stays buildable under
 # `--locked` without bumping the workspace lockfile. JSON is used

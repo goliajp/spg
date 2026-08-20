@@ -250,6 +250,7 @@ mod e2e_dml_object_errors_round701;
 mod e2e_dml_seq_scan_stats_round455;
 mod e2e_dml_target_not_cte_round149;
 mod e2e_do_block;
+mod e2e_dogfood_findings_v7387;
 mod e2e_domain_cast;
 mod e2e_domain_round259;
 mod e2e_domain_type;

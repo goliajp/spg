@@ -4242,6 +4242,26 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         DataType::IntArray2D => 1007,
         DataType::BigIntArray2D => 1016,
         DataType::TextArray2D => 1009,
+        // v7.38.7 — the network / money / time-of-day family, which this
+        // table never had.
+        //
+        // `_ => 0` is not a harmless default here: this function is where
+        // `pg_attribute.atttypid` comes from, so an `inet` column has been
+        // reporting type OID 0 to anything that reflects on the schema,
+        // and `format_type` has no way back from 0 to a name. It surfaced
+        // as a scalar subquery over a uuid refusing to materialise —
+        // sentori has 27 tables whose primary key is one — because that
+        // path asks this function what type it is holding.
+        //
+        // Every OID below is PG's own, and each has a matching entry in
+        // `regtype_oid_to_name`, so the round trip closes.
+        DataType::Money => 790,
+        DataType::Macaddr => 829,
+        DataType::Macaddr8 => 774,
+        DataType::Inet => 869,
+        DataType::Cidr => 650,
+        DataType::TsVector => 3614,
+        DataType::TsQuery => 3615,
         _ => 0,
     }
 }

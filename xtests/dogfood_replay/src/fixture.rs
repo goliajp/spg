@@ -63,6 +63,59 @@ pub enum FixtureKind {
     LockHangRecovery(LockHangFixture),
     /// Synthesised WAL + bounded replay budget.
     WalReplayBounded(WalReplayFixture),
+    /// v7.38.7 — a customer's real dump, killed mid-write and reopened.
+    DumpCrashRecovery(DumpCrashFixture),
+}
+
+/// v7.38.7 (sentori, at their request) — restore a real dump, write
+/// under it, `kill -9`, reopen, and check what survived.
+///
+/// What makes this different from the replay fixtures beside it: the
+/// data is a customer's, taken after their own suite had written it,
+/// and the check is SELF-VALIDATING rather than an expectation file.
+/// Every assertion compares two answers the same database gave — an
+/// index-backed query against a sequential scan of the same predicate —
+/// so a rebuilt index that is subtly wrong fails without anyone having
+/// recorded what right looked like. sentori named the two they would
+/// watch: a GIN `jsonb_path_ops` and a BRIN, "the two we would least
+/// expect a from-scratch engine to rebuild identically after an unclean
+/// stop".
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DumpCrashFixture {
+    /// gzipped `pg_dump` output, relative to the fixture dir.
+    pub dump_gz: String,
+    /// SHA-256 of the gzip, verified before anything is restored.
+    pub sha256: String,
+    /// Table → expected row count after a clean restore. A restore that
+    /// silently drops rows must not reach the crash test looking healthy.
+    pub restored_rows: Vec<(String, u64)>,
+    /// Predicates that an index answers and a sequential scan can also
+    /// answer. Each is run both ways after the reopen; they must agree.
+    pub index_probes: Vec<IndexProbe>,
+    /// How many rows to insert before the kill, and into what.
+    pub write_burst: WriteBurst,
+}
+
+/// One index-vs-scan cross-check.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct IndexProbe {
+    /// What this probe is watching, for the failure message.
+    pub what: String,
+    /// The query as the planner would run it (index-eligible).
+    pub indexed: String,
+    /// The same question phrased so no index can answer it.
+    pub scan: String,
+}
+
+/// The writes in flight when the process dies.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WriteBurst {
+    /// Statement run in a loop; `{i}` is replaced by the iteration.
+    pub statement: String,
+    /// Kill after this many have been acknowledged.
+    pub kill_after: u32,
+    /// Table the burst writes into, for the post-reopen count.
+    pub table: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

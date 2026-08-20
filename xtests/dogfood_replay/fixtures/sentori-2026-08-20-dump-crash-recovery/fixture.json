@@ -1,0 +1,44 @@
+{
+  "name": "sentori-2026-08-20-dump-crash-recovery",
+  "filed": "2026-08-20",
+  "source": "sentori",
+  "report": "docs/SENTORI_2026-08-20_REPLY_7386.md",
+  "production": true,
+  "kind": {
+    "type": "dump-crash-recovery",
+    "dump_gz": "sentori-shaped.sql.gz",
+    "sha256": "be19dae7b8913611d584427500ddc6698204502b26978df9a5b23ae7875c0505",
+    "restored_rows": [
+      [
+        "events",
+        54009
+      ],
+      [
+        "device_tokens",
+        12008
+      ]
+    ],
+    "write_burst": {
+      "statement": "INSERT INTO events (id, project_id, issue_id, kind, platform, occurred_at, received_at, release, environment, user_key, payload) SELECT ('00000000-0000-4000-9000-' || lpad({i}::text, 12, '0'))::uuid, project_id, issue_id, kind, platform, occurred_at, received_at, release, environment, user_key, payload FROM events LIMIT 1",
+      "kill_after": 200,
+      "table": "events"
+    },
+    "index_probes": [
+      {
+        "what": "GIN jsonb_path_ops on device_tokens.traits (partial, WHERE revoked_at IS NULL)",
+        "indexed": "SELECT count(*) FROM device_tokens WHERE revoked_at IS NULL AND traits @> '{}'::jsonb",
+        "scan": "SELECT count(*) FROM (SELECT traits, revoked_at FROM device_tokens OFFSET 0) s WHERE s.revoked_at IS NULL AND s.traits @> '{}'::jsonb"
+      },
+      {
+        "what": "BRIN on events.received_at",
+        "indexed": "SELECT count(*) FROM events WHERE received_at > TIMESTAMPTZ '2000-01-01 00:00:00+00'",
+        "scan": "SELECT count(*) FROM (SELECT received_at FROM events OFFSET 0) s WHERE s.received_at > TIMESTAMPTZ '2000-01-01 00:00:00+00'"
+      },
+      {
+        "what": "the events primary key after an unclean stop",
+        "indexed": "SELECT count(*) FROM events WHERE id = '00000000-0000-4000-9000-000000000001'::uuid",
+        "scan": "SELECT count(*) FROM (SELECT id FROM events OFFSET 0) s WHERE s.id = '00000000-0000-4000-9000-000000000001'::uuid"
+      }
+    ]
+  }
+}

@@ -123,6 +123,7 @@ fn cmd_list(root: &Path) -> Result<()> {
             FixtureKind::Query(_) => "query",
             FixtureKind::LockHangRecovery(_) => "lock-hang-recovery",
             FixtureKind::WalReplayBounded(_) => "wal-replay-bounded",
+            FixtureKind::DumpCrashRecovery(_) => "dump-crash-recovery",
         };
         let prod = if fx.production { "prod" } else { "synth" };
         println!("  - {name}  [{kind}, {prod}, filed {}]", fx.filed);
@@ -140,7 +141,7 @@ fn cmd_verify(root: &Path) -> Result<()> {
         let snap_opt = match &fx.kind {
             FixtureKind::Query(q) => Some(&q.snapshot),
             FixtureKind::LockHangRecovery(l) => l.snapshot.as_ref(),
-            FixtureKind::WalReplayBounded(_) => None,
+            FixtureKind::WalReplayBounded(_) | FixtureKind::DumpCrashRecovery(_) => None,
         };
         if let Some(snap) = snap_opt {
             total += 1;
@@ -214,6 +215,7 @@ fn run_fixture(dir: &Path, fx: &Fixture, fast: bool) -> Result<Outcome> {
         FixtureKind::Query(q) => run_query_fixture(dir, fx, q, fast),
         FixtureKind::LockHangRecovery(l) => run_lock_hang_fixture(dir, fx, l, fast),
         FixtureKind::WalReplayBounded(w) => run_wal_replay_fixture(fx, w),
+        FixtureKind::DumpCrashRecovery(d) => run_dump_crash_fixture(dir, fx, d),
     }
 }
 
@@ -313,6 +315,42 @@ fn run_lock_hang_fixture(
                 l.expected.total_recovery_ms_max
             );
             Ok(tag)
+        }
+    }
+}
+
+/// v7.38.7 — the dump-crash-recovery wrapper.
+///
+/// `run_dump_crash` returns an Err for every way this can be wrong —
+/// data that did not restore, an acknowledged write that vanished, an
+/// index that disagrees with a scan — because each of those is a
+/// failure with a specific sentence to say, and a boolean would throw
+/// the sentence away.
+fn run_dump_crash_fixture(
+    dir: &Path,
+    fx: &Fixture,
+    d: &fixture::DumpCrashFixture,
+) -> Result<Outcome> {
+    match recovery::run_dump_crash(dir, d) {
+        Ok(recovery::RecoveryOutcome::SkippedSnapshotMissing) => {
+            println!("  SKIP  {} — dump missing ({})", fx.name, d.dump_gz);
+            Ok(Outcome::Skip)
+        }
+        Ok(recovery::RecoveryOutcome::Ran(run)) => {
+            println!(
+                "  {} {} tables restored, {} acknowledged writes survived SIGKILL, \
+                 {} index probes agree with a sequential scan",
+                Outcome::Pass.tag(),
+                d.restored_rows.len(),
+                d.write_burst.kill_after,
+                d.index_probes.len()
+            );
+            let _ = run;
+            Ok(Outcome::Pass)
+        }
+        Err(e) => {
+            println!("  {} {e:#}", Outcome::Fail.tag());
+            Ok(Outcome::Fail)
         }
     }
 }
