@@ -2870,6 +2870,8 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
             kind: spg_storage::NumericKind::Finite,
         },
         Literal::NumericBig(s) => big_literal_to_value(&s),
+        Literal::Timestamp { micros, .. } => Value::Timestamp(micros),
+        Literal::Date { days, .. } => Value::Date(days),
         Literal::String(s) => Value::text(s),
         Literal::Bool(b) => Value::Bool(b),
         Literal::Null => Value::Null,

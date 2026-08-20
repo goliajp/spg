@@ -5758,6 +5758,20 @@ pub(super) fn compare(
         (Value::Text(a), Value::Text(b)) => {
             return cmp_result(op, a.cmp(b));
         }
+        // v7.38.8 — the same argument as the arms above, for the
+        // variants the customer profile put on the hot path. A
+        // timestamp column against a timestamp value walked the whole
+        // guard chain below to reach the ordering match at the bottom,
+        // because the list here was drawn when integers and text were
+        // the shapes being measured. Each of these is a scalar whose
+        // ordering IS the ordering the bottom of this function gives
+        // it, so the answer is the same by the same arms.
+        (Value::Timestamp(a), Value::Timestamp(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
+        (Value::Date(a), Value::Date(b)) => {
+            return cmp_result(op, a.cmp(b));
+        }
         (Value::Bool(a), Value::Bool(b)) => {
             return cmp_result(op, a.cmp(b));
         }
