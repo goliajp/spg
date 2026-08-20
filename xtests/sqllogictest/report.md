@@ -22,7 +22,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/12_explain` | 12 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 31 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
-| `spg_baseline/15_regressions` | 516 | 0 | 0 | 100.0% |
+| `spg_baseline/15_regressions` | 526 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Per-file detail
@@ -384,6 +384,7 @@ Per-corpus pass / fail / skip:
 | `v7388_jsonb_column_validates.test` | 16 | 0 | 0 |
 | `v7388_qual_order.test` | 8 | 0 | 0 |
 | `v7389_jsonb_containment.test` | 14 | 0 | 0 |
+| `v7389_jsonb_string_result.test` | 10 | 0 | 0 |
 | `wire_streaming_declines.test` | 23 | 0 | 0 |
 
 ### `spg_baseline/16_isolation/`

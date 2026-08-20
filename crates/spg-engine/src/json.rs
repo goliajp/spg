@@ -482,6 +482,17 @@ fn locate_index(src: &str, idx: i64) -> Option<&str> {
 /// Turn a located verbatim slice into the accessor's result. Containers and
 /// scalars alike keep their source text; only `->>` unwraps a string token and
 /// maps a JSON `null` to SQL NULL (`->` yields the JSON `null` itself).
+/// The bytes a JSON string token denotes, when it denotes them
+/// literally — `None` when the token carries an escape and has to be
+/// decoded, or when it is not a string token at all.
+fn string_token_verbatim(tok: &str) -> Option<&str> {
+    let inner = tok.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.as_bytes().contains(&b'\\') {
+        return None;
+    }
+    Some(inner)
+}
+
 fn verbatim_accessor_result(slice: &str, as_text: bool) -> Value<'static> {
     match slice.as_bytes().first() {
         Some(b'n') if slice == "null" => {
@@ -491,7 +502,19 @@ fn verbatim_accessor_result(slice: &str, as_text: bool) -> Value<'static> {
                 Value::json("null")
             }
         }
-        Some(b'"') if as_text => decode_string_token(slice).map_or(Value::Null, Value::text),
+        // v7.38.9 — a string token with no escape in it denotes its own
+        // inner bytes, so `->>` hands those back without running the
+        // parser over the token to unescape nothing. This is the same
+        // waste the key comparison carried, on the RESULT side: the
+        // customer's `traits->>'plan'` reads a string value on every
+        // row, and every one of them was parsed a second time to be
+        // handed back unchanged. A token that DOES carry an escape
+        // defers to `decode_string_token`, so the two paths cannot
+        // disagree about what an escape means.
+        Some(b'"') if as_text => match string_token_verbatim(slice) {
+            Some(inner) => Value::text(inner.to_string()),
+            None => decode_string_token(slice).map_or(Value::Null, Value::text),
+        },
         _ if as_text => Value::text(slice.to_string()),
         _ => Value::json(slice.to_string()),
     }
