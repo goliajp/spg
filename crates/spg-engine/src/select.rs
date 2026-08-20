@@ -6606,7 +6606,21 @@ impl Engine {
             let par = self.parallel_runner.0.as_deref().filter(|_| {
                 n >= crate::PARALLEL_MIN_ROWS && (stmt.where_.is_none() || compiled_where.is_some())
             });
-            if let Some(r) = par {
+            // v7.38.11 — ask the BRIN summary first. When it prunes,
+            // the work left is a few thousand rows and sharding it
+            // costs more than it saves, so the serial pruned loop below
+            // takes it; the shard machinery is left exactly as it was
+            // rather than taught about slots.
+            let brin_slots = stmt
+                .where_
+                .as_ref()
+                .and_then(|w| crate::brin::candidate_slots(w, table));
+            let brin_prunes = brin_slots
+                .as_ref()
+                .is_some_and(|s| s.iter().map(core::ops::Range::len).sum::<usize>() * 2 < n);
+            if let Some(r) = par
+                && !brin_prunes
+            {
                 let n_shards = (n / crate::PARALLEL_MIN_ROWS).clamp(2, 8);
                 let chunk = n.div_ceil(n_shards);
                 type ShardOut = Result<alloc::vec::Vec<usize>, EngineError>;
@@ -6682,15 +6696,11 @@ impl Engine {
                 }
             } else {
                 let mut rows_cur = table.rows().run_cursor();
-                // v7.38.11 — a BRIN index on a column this WHERE puts a
-                // range on tells us which slots cannot hold a match. The
-                // predicate still runs on every row that survives: the
-                // summary decides what to SKIP, never what to return.
-                let slots = stmt
-                    .where_
-                    .as_ref()
-                    .and_then(|w| crate::brin::candidate_slots(w, table));
-                let ranges = slots.unwrap_or_else(|| alloc::vec![0..n]);
+                // v7.38.11 — the slots the BRIN summary could not rule
+                // out. The predicate still runs on every row that
+                // survives: the summary decides what to SKIP, never
+                // what to return.
+                let ranges = brin_slots.unwrap_or_else(|| alloc::vec![0..n]);
                 for range in ranges {
                     for i in range {
                         if !table.is_row_visible(i, &scan_snapshot) {
@@ -8697,7 +8707,16 @@ impl Engine {
                 }
             }
             None => {
-                for (i, row) in table.scan_visible_from(0, &snapshot) {
+                // v7.38.11 — the streaming scan is the path a client
+                // reaches over the wire, so it is the one that has to
+                // ask the BRIN summary which slots can be skipped. The
+                // predicate still runs on every row that survives.
+                let slots = stmt
+                    .where_
+                    .as_ref()
+                    .and_then(|w| crate::brin::candidate_slots(w, table))
+                    .unwrap_or_else(|| alloc::vec![0..table.row_count()]);
+                for (i, row) in table.scan_visible_slots(slots, &snapshot) {
                     if i.is_multiple_of(256) {
                         cancel.check()?;
                     }
