@@ -479,6 +479,33 @@ Step 5 is not optional. It is the only cheap check that separates
 "prunes correctly" from "prunes too much", and a wrong implementation
 looks like a bigger win.
 
+## BRIN landed — where the profile stands now
+
+Both as containers, vacuumed, N=4, control leg clean on all eight
+cells:
+
+| shape | v7.38.10 | with the prune |
+|---|---|---|
+| window: count over a day | 5.7x behind | **unresolved** (1.04-1.69 vs 0.98-3.09) |
+| window: group by kind | 3.7x | **unresolved** |
+| window: distinct seats | 2.0x | **FASTER by 3.9 %** |
+| btree: project and kind | unresolved | unresolved |
+| jsonb: containment | 1.9x | 1.8x |
+| dashboard: top versions | 2.5x | 2.1x |
+| ingest: one row | 2.0x | 2.1x |
+| **jsonb: containment in a window** | 3.7x | **4.1x** |
+
+Three window shapes reached parity or better; the campaign's worst
+cell — 16.4x at the start — is now unresolved against PG.
+
+**The last row did not move, and the reason is not a miss.** That
+query's `traits @> …` is answered by the GIN index, so its rows arrive
+from the index and never reach a scan; there is no slot list to prune.
+PG combines the two indexes into one bitmap and we do not. That is a
+different optimisation — an AND of two index results — and it is now
+the largest single cell on the profile. It is not a regression and it
+is not BRIN's to fix.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
