@@ -93,3 +93,59 @@ fn text_operand_is_still_validated_by_the_accessor() {
 fn alloc_msg(e: &impl core::fmt::Debug) -> String {
     format!("{e:?}")
 }
+
+/// v7.38.8 — the key comparison in `locate_member` stopped decoding
+/// every key it walks past. A key spelled with an escape must still
+/// match the string it denotes, and the escape's own source text must
+/// not be mistaken for the key.
+#[test]
+fn escaped_keys_still_match_what_they_denote() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE k (id INT NOT NULL, j JSON)")
+        .unwrap();
+    // The key token is `\u0061b`, which denotes `ab`.
+    e.execute(r#"INSERT INTO k VALUES (1, '{"\u0061b": "found"}')"#)
+        .unwrap();
+    let hit = e.execute("SELECT j->>'ab' FROM k WHERE id = 1").unwrap();
+    assert!(
+        format!("{hit:?}").contains("found"),
+        "an escaped key must match the string it denotes: {hit:?}"
+    );
+    // ... and its SOURCE TEXT is not the key. A byte comparison that
+    // skipped the escape check would answer this one wrongly.
+    let miss = e
+        .execute(r#"SELECT j->>'\u0061b' FROM k WHERE id = 1"#)
+        .unwrap();
+    assert!(
+        !format!("{miss:?}").contains("found"),
+        "the escape's source text is not the key: {miss:?}"
+    );
+    // A quote inside a key, which the in-place comparison must not
+    // mistake for the token's own closing quote.
+    e.execute(r#"INSERT INTO k VALUES (2, '{"a\"b": "q"}')"#)
+        .unwrap();
+    let q = e
+        .execute(r#"SELECT j->>'a"b' FROM k WHERE id = 2"#)
+        .unwrap();
+    assert!(
+        format!("{q:?}").contains('q'),
+        "a key containing a quote must still match: {q:?}"
+    );
+}
+
+/// PG resolves a duplicate key to the LAST occurrence. The scan must
+/// not stop at the first match — a faster loop that returned early
+/// would answer differently and no other test here would notice.
+#[test]
+fn duplicate_keys_resolve_to_the_last() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE d (id INT NOT NULL, j JSON)")
+        .unwrap();
+    e.execute(r#"INSERT INTO d VALUES (1, '{"a": 1, "a": 2}')"#)
+        .unwrap();
+    let r = e.execute("SELECT j->>'a' FROM d WHERE id = 1").unwrap();
+    assert!(
+        format!("{r:?}").contains('2'),
+        "the last occurrence wins: {r:?}"
+    );
+}
