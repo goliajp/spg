@@ -8,6 +8,71 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.11] — 2026-08-21
+
+A BRIN index now prunes. It did not before: the summaries were derived
+and written into a cold-tier segment's sidecar and no query path read
+them back, and for hot data none existed at all — so the index cost
+writes to maintain and saved no reads.
+
+### Performance
+
+- **Hot-tier BRIN summaries, and the scan prune that uses them.** One
+  `(min, max)` per 1024 slots. Maintenance is WIDEN-ONLY, which is the
+  whole safety argument: an insert widens its range, an update widens,
+  a delete leaves it alone. A range left wider than the rows it covers
+  is correct and merely less selective — PG's contract for a lossy
+  index, since the predicate is re-checked on every row the summary
+  lets through. A summary may over-report; it cannot under-report, so
+  no matching row is skippable. A range with no summary is never
+  skipped, and the reader returns "no opinion" rather than "every
+  slot", so any caller that does not know about BRIN is untouched.
+
+  Wired into the three paths a client reaches: the streaming
+  projecting scan, the aggregate scan, and — where the prune removes
+  more than half the rows — ahead of the parallel shard split, because
+  the work left is then smaller than the sharding costs.
+
+  Measured over pgwire, 200,000 rows, a one-day window over 90 days:
+  `count(*)` 4.9 ms to **0.230**, `SELECT id` 9.48 to **0.335**. In
+  process against the same table with no index at all, 9.58 to 0.115 —
+  **83x**.
+
+### On the customer profile
+
+Both databases as containers, vacuumed, N=4, control leg clean on all
+eight cells:
+
+| shape | v7.38.10 | now |
+|---|---|---|
+| window: count over a day | 5.7x behind | **unresolved** |
+| window: group by kind | 3.7x | **unresolved** |
+| window: distinct seats | 2.0x | **3.9 % ahead** |
+| jsonb: containment | 1.9x | 1.8x |
+| dashboard: top versions | 2.5x | 2.1x |
+| jsonb: containment in a window | 3.7x | 4.1x |
+
+The campaign's worst cell — 16.4x behind when it opened — is now
+unresolved. The last row did not move and that is not a miss: its rows
+come from the GIN index and never reach a scan, so there is no slot
+list to prune. PG combines two indexes into one bitmap and we do not;
+that is the next thing, and it is not BRIN's to fix.
+
+### Tests
+
+Seventeen corpus cases about the ANSWER rather than the time: interval
+boundaries, equality on the first and last row of a range, a value
+outside every range, a row written out of order after the index
+existed, NULLs, and an UPDATE that moves a value out of its range's
+span. Watched failing — making the summary narrow instead of widen
+turns three of them red, and the failure is rows silently vanishing
+(60 becomes 0). The in-process probe carries the other control: on
+cycling timestamps, where correlation gives a prune nothing, the pair
+must stay level, and a version that speeds THAT up is skipping rows it
+should not while looking like a bigger win.
+
+---
+
 ## [7.38.10] — 2026-08-21
 
 Carries everything v7.38.9 was tagged for — that tag published nothing;
