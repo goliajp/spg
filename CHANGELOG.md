@@ -8,6 +8,71 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.9] — 2026-08-21
+
+Two more jsonb costs removed, and a correction: the harness we sent the
+customer was measuring PostgreSQL with its BRIN index doing nothing,
+so every "vs PG" figure we have published so far was flattering us.
+
+### Fixed
+
+- **The performance harness vacuums both databases before timing.**
+  PostgreSQL builds its BRIN summaries in `VACUUM`, so seeding and
+  measuring immediately reports PG at its worst: the same one-day
+  window query read 7.3-8.9 ms unsummarised and 1.2-5.1 ms after, on
+  the same rows in the same session. The v7.38.8 figures also had our
+  side running natively against a containerised PG. Both are fixed, and
+  the corrected arc is below.
+
+### Performance
+
+- **`@>` answers the flat-object case without building a tree for the
+  left document.** Containment rides the GIN index — a constant that
+  matches nothing costs 0.067 ms — so what shows is the recheck on each
+  matched row, and the recheck parsed BOTH documents. When the right
+  side is a flat object of scalars the reduction is exact, because PG's
+  rule is containment per member and for a scalar contained and equal
+  are the same thing; each member is located in the left's source text
+  and handed to the same `json_eq` the general recursion uses. A
+  recursive right-hand value, a left that is not an object, or a slice
+  that will not parse all decline to the general path. One key:
+  38.2-39.2 ms to 17.2-17.6.
+- **`->>` hands back an unescaped string token verbatim**, instead of
+  running the whole parser over it to unescape nothing — the same waste
+  the key comparison carried in v7.38.8, on the result side. A token
+  that does carry an escape still goes through the decoder. A
+  single-member document 10.9-11.7 ms to 9.9-10.4; fetching an absent
+  key is unchanged, which is the control.
+
+### The corrected arc
+
+Both databases as containers on the same box, vacuumed, N=4, control
+leg clean on all eight cells in both runs:
+
+| shape | 7.38.7 | now |
+|---|---|---|
+| window: count over a day | 21.2-23.8 ms · 16.4x | 8.2-9.1 · 6.7x |
+| jsonb: containment in a window | 54.1-54.5 · 10.1x | 8.1-12.0 · **1.7x** |
+| window: distinct seats | 35.7-38.6 · 5.2x | 11.1-11.6 · **1.6x** |
+| dashboard: top versions | 24.6-26.8 · 5.3x | 10.2-14.7 · 2.1x |
+| window: group by kind | 22.6-23.2 · 3.7x | 8.4-9.7 · 2.3x |
+| jsonb: containment | 12.5-15.8 · 2.4x | 8.6-10.0 · 1.9x |
+| ingest: one row | 4.2-5.8 · 2.0x | 3.7-5.9 · 1.7x |
+| btree: project and kind | unresolved | unresolved |
+
+The true starting point was 2.0x to 16.4x, not the 1.6x to 8.9x
+v7.38.8 reported.
+
+**The largest remaining gap is named and it is not jsonb.** A BRIN
+index prunes nothing for us: the summaries are derived and written into
+a cold-tier segment's sidecar, and no query path reads them back — for
+hot data none exist at all. Given an index it can use, the same window
+query answers in 0.105 ms against PG's 1.2, so the machinery is not the
+problem; the index the customer created is the one that does nothing.
+Written up in `docs/PERF-FINDING-2026-08-20-sentori-shapes.md`.
+
+---
+
 ## [7.38.8] — 2026-08-20
 
 The first release measured against what the customer actually runs.
