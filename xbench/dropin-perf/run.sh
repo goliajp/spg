@@ -35,6 +35,13 @@
 #   2  the harness could not measure: an image would not boot, a seed
 #      landed the wrong row count, a profile is missing
 #
+# HOST_ADDR (default 127.0.0.1) is the address psql should use to reach
+# the containers this script starts. Leave it alone when psql is a host
+# binary. Set it to `host.docker.internal` when psql itself runs inside
+# a container — a wrapper that keeps both legs on one client binary is a
+# good idea, and it silently makes 127.0.0.1 mean the wrapper's own
+# loopback, which answers nothing.
+#
 # A profile is a directory:
 #   schema.sql   DDL + seed, must be valid on both engines
 #   shapes.tsv   one shape per line: name<TAB>SQL
@@ -52,6 +59,7 @@ DB_NAME=bench
 CAND_PORT="${CAND_PORT:-25601}"
 REF_PORT="${REF_PORT:-25602}"
 CTL_PORT="${CTL_PORT:-25603}"
+HOST_ADDR="${HOST_ADDR:-127.0.0.1}"
 
 [ -f "$PROFILE/schema.sql" ] || { echo "fatal: $PROFILE/schema.sql missing" >&2; exit 2; }
 [ -f "$PROFILE/shapes.tsv" ] || { echo "fatal: $PROFILE/shapes.tsv missing" >&2; exit 2; }
@@ -73,20 +81,28 @@ boot() { # $1=container $2=image $3=port
   docker run "${args[@]}" >/dev/null 2>&1 || { echo "fatal: $2 would not start" >&2; exit 2; }
 }
 
-uri() { echo "postgres://$USER_NAME:$USER_NAME@127.0.0.1:$1/$DB_NAME"; }
+uri() { echo "postgres://$USER_NAME:$USER_NAME@$HOST_ADDR:$1/$DB_NAME"; }
 
-wait_up() { # $1=uri $2=label
+wait_up() { # $1=uri $2=label $3=container
   local i
   for ((i = 0; i < 120; i++)); do
     "$PSQL" --no-psqlrc -X -q -t -A "$1" -c 'SELECT 1' >/dev/null 2>&1 && return 0
     sleep 1
   done
-  echo "fatal: $2 never answered SELECT 1" >&2; exit 2
+  echo "fatal: $2 never answered SELECT 1 at $1" >&2
+  echo "       If psql runs inside a container, set HOST_ADDR=host.docker.internal." >&2
+  docker logs "$3" 2>&1 | tail -5 >&2
+  exit 2
 }
 
 seed() { # $1=uri $2=label
-  "$PSQL" --no-psqlrc -X -q -v ON_ERROR_STOP=1 "$1" -f "$PROFILE/schema.sql" >/dev/null 2>&1 \
-    || { echo "fatal: seed failed on $2 — run it by hand against $1" >&2; exit 2; }
+  # The schema arrives on STDIN, not as -f <path>: when psql is a wrapper
+  # around `docker exec`, a host path is not a path it can open, and the
+  # failure looks like the schema being wrong rather than unreachable.
+  "$PSQL" --no-psqlrc -X -q -v ON_ERROR_STOP=1 "$1" -f - < "$PROFILE/schema.sql" >/dev/null 2>&1 \
+    || { echo "fatal: seed failed on $2 — reproduce with:" >&2
+         echo "       $PSQL -v ON_ERROR_STOP=1 '$1' -f - < $PROFILE/schema.sql" >&2
+         exit 2; }
   if [ -f "$PROFILE/rows" ]; then
     local want got
     while read -r tbl want; do
@@ -129,7 +145,9 @@ boot "${NAMES[0]}" "$CAND" "$CAND_PORT"
 boot "${NAMES[1]}" "$REF"  "$REF_PORT"
 boot "${NAMES[2]}" "$REF"  "$CTL_PORT"
 A_URI="$(uri "$CAND_PORT")"; B_URI="$(uri "$REF_PORT")"; C_URI="$(uri "$CTL_PORT")"
-wait_up "$A_URI" "$CAND"; wait_up "$B_URI" "$REF"; wait_up "$C_URI" "$REF (control)"
+wait_up "$A_URI" "$CAND" "${NAMES[0]}"
+wait_up "$B_URI" "$REF"  "${NAMES[1]}"
+wait_up "$C_URI" "$REF (control)" "${NAMES[2]}"
 seed "$A_URI" "$CAND"; seed "$B_URI" "$REF"; seed "$C_URI" "$REF (control)"
 
 printf '\n%-34s %-17s %-17s %-17s %-11s %-7s %s\n' \
@@ -138,7 +156,11 @@ printf '%-34s %-17s %-17s %-17s %-11s %-7s %s\n' \
   ---------------------------------- ----------------- ----------------- ----------------- ----------- ------- -------
 
 CELLS=0; SLOWER=0; FASTER=0; CONTROL_DIFFS=0
-while IFS=$'\t' read -r name sql; do
+# The shape list is read on fd 3, not stdin. psql inherits stdin, and a
+# psql that is a `docker exec -i` wrapper will swallow the rest of the
+# list on the first shape — leaving a run that reports one cell and
+# looks like a short profile rather than a truncated one.
+while IFS=$'\t' read -r name sql <&3; do
   case "$name" in ''|'#'*) continue ;; esac
   a=(); b=(); c=()
   for ((i = 0; i < N; i++)); do
@@ -162,7 +184,15 @@ while IFS=$'\t' read -r name sql; do
   CELLS=$((CELLS + 1))
   printf '%-34s %-17s %-17s %-17s %-11s %-7s %s\n' \
     "$name" "$amin-$amax" "$bmin-$bmax" "$cmin-$cmax" "$v" "$g" "$ctl"
-done < "$PROFILE/shapes.tsv"
+done 3< "$PROFILE/shapes.tsv"
+
+EXPECTED="$(grep -cvE '^[[:space:]]*(#|$)' "$PROFILE/shapes.tsv")"
+if [ "$CELLS" -ne "$EXPECTED" ]; then
+  echo "fatal: profile lists $EXPECTED shapes but $CELLS were measured — a run" >&2
+  echo "       that measured fewer cells than it was asked to must not read as" >&2
+  echo "       a complete one." >&2
+  exit 2
+fi
 
 echo
 echo "load after: $(uptime)"
