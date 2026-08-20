@@ -319,6 +319,47 @@ not drive an index scan for us, so we read every row where PG reads a
 fraction. That is the largest single item left and it is not a jsonb
 problem.
 
+## The largest remaining item, named: BRIN prunes nothing
+
+The worst shape is a one-day window over a 90-day table — 6.7x behind
+after two releases of work, and it was 16.4x. Taking it apart:
+
+```
+SELECT count(*) FROM events WHERE received_at >= '2026-06-01' AND received_at < '2026-06-02'
+
+  as the customer's schema has it (BRIN on received_at)      5.09 ms
+  with a BTREE added on the same column                      0.105 ms   <- 48x
+  PostgreSQL 18, BRIN summarised by VACUUM                   1.2 ms
+```
+
+So our index machinery is not the problem: given an index it can use,
+we answer this **11x faster than PG**. The problem is that the index
+the customer created prunes nothing.
+
+`grep` says it plainly: `BrinSummary { page_index, min_key, max_key }`
+is derived and written into a cold-tier segment's sidecar, and **no
+query path in `spg-engine` reads it back**. Not for cold data, and for
+hot data no summaries exist at all. A BRIN index today costs writes to
+maintain and saves no reads.
+
+Two halves to close it, and the second is the one this customer needs:
+
+1. Cold tier: consult the sidecar summaries and skip pages whose
+   `(min,max)` cannot satisfy the predicate. The summaries are already
+   on disk in the right shape.
+2. Hot tier: there is nothing to consult. Summaries have to be
+   maintained for hot segments as rows arrive, which is where the
+   design work is — and where the write-side cost has to be measured
+   rather than assumed, because BRIN's whole appeal is that it is
+   cheap to maintain.
+
+Until that lands there is something the customer can do today, and it
+belongs in the letter rather than in a backlog: a btree on
+`received_at` answers their window queries in 0.105 ms against PG's
+1.2. It costs more to maintain than a BRIN — which is presumably why
+they chose BRIN — so it is a trade they should make knowingly, not a
+recommendation to paper over our gap.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
