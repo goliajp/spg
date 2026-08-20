@@ -8,6 +8,67 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+Two customer reports, and then a step back from them. Nine defects had
+been filed against one subsystem in eight releases, each fixed one arm
+at a time; this release changes the shape that kept producing them, and
+points the dogfood replay at a customer's real database for the first
+time — which found three more within seconds.
+
+### Fixed
+
+- **Describe no longer erases a statement because one item is
+  unknown.** A select item it could not type made the WHOLE statement
+  report no columns, so an ordinary column beside it vanished too, a
+  driver sizing rows from Describe got nothing, and psql looked healthy
+  throughout. Every report in this class — a data-modifying CTE, a
+  subquery in the select list, a top-level null test, ordered-set
+  aggregates, a set-returning function in FROM, a user-defined function
+  — came through that one behaviour. An unknown now costs one
+  loosely-typed column instead of the statement's shape.
+- **One naming rule instead of two.** Describe carried a partial copy of
+  what the executor already computes, and they disagreed: a bare
+  `count(*)` described as `?column?` while the RowDescription said
+  `count`. Describe now asks the same function, and two gaps found in
+  the shared rule are fixed there, so all four paths move together — a
+  cast with an unnamed operand reports the target type's `typname`
+  (`int8`, not `bigint`), and the clock rewrite pins the pre-fold name
+  so `now()::date` stays `now`.
+- **A user-defined function in the select list describes** (sentori
+  §3.1), answered from its declared return type at any depth.
+- **A `TEXT` body in a `jsonb` column no longer kills the checkpoint
+  thread.** The encoder treated an unmatched value/column pair as
+  unreachable on the reasoning that the insert path had validated it —
+  it had, under a looser rule. A background thread dying is the worst
+  version of this: writes keep being acknowledged while nothing reaches
+  disk.
+- **A scalar subquery returning a `uuid` materialises**, along with
+  `inet`, `macaddr`, `money` and the date/time family. The list this
+  consulted had grown one reported incident at a time; a type with a
+  text input syntax now needs no entry at all.
+- **`pg_type_oid` covers the network, money and text-search types.** It
+  is where `pg_attribute.atttypid` comes from, so those columns had been
+  reporting type OID 0 to everything that reflects on the schema.
+
+### Added
+
+- **A Describe coverage gate.** Every `Expr` variant gets a statement
+  that must describe a column, and a second test reads the AST's own
+  source and fails when a variant appears the list does not mention.
+  Watched failing: it names six shapes with no arm today that are
+  surviving on the fallback above.
+- **`sentori-2026-08-20-dump-crash-recovery`** — a customer's real
+  database (27 tables, 40 indexes, ~66k rows) restored, written to,
+  `kill -9`'d mid-write and reopened. Every acknowledged write must
+  survive, and each index probe compares an index-backed answer against
+  a sequential scan of the same predicate, so there is no expectation
+  file to go stale and an index that came back subtly wrong fails where
+  a row count cannot. Committed rather than fetched out-of-band: a gate
+  skipped by default is not a gate.
+
+---
+
 ## [7.38.6] — 2026-08-20
 
 The last defect on sentori's list — which their own status doc had
