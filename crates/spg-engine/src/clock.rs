@@ -31,8 +31,19 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
             scale,
             kind,
         } => Literal::String(eval::format_numeric_kind(kind, scaled, scale)),
-        Value::Date(d) => Literal::String(eval::format_date(d)),
-        Value::Timestamp(t) => Literal::String(eval::format_timestamp(t)),
+        // v7.38.8 — decoded, with the text kept for Display. This exit
+        // is what `constfold` hands back, and handing back a STRING is
+        // what made a folded constant cost a coercion on every row: the
+        // fold removed the cast from the tree and left the parse in the
+        // loop. The text is the same text, so nothing printed changes.
+        Value::Date(d) => Literal::Date {
+            days: d,
+            text: eval::format_date(d),
+        },
+        Value::Timestamp(t) => Literal::Timestamp {
+            micros: t,
+            text: eval::format_timestamp(t),
+        },
         // v7.17.0 Phase 3.P0-69 — UUID round-trips via canonical
         // hyphenated text. Without this arm the fallback below
         // renders `Debug` form ("Uuid([85, …])") which the
