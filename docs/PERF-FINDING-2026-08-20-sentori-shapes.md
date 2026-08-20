@@ -404,6 +404,35 @@ Two things follow, and the first is ours to fix before the second:
    rows is safe by construction — a summary may over-report and must
    never under-report, which is exactly PG's lossy-index contract.
 
+## Re-baselined on the realistic layout — the prize is now visible
+
+Profile regenerated append-ordered (`pg_stats.correlation` 1.0,
+verified), both databases as containers, both vacuumed, N=4, control
+leg clean on all eight cells:
+
+| shape | cycling layout | append-ordered |
+|---|---|---|
+| window: count over a day | 6.7x | **5.7x** (PG 0.997-1.283 ms) |
+| window: group by kind | 1.3x | **3.7x** |
+| jsonb: containment in a window | 1.7x | **3.7x** |
+| window: distinct seats | 1.6x | 2.0x |
+| dashboard: top versions | 2.1x | 2.5x |
+| ingest: one row | 1.7x | 2.0x |
+| **jsonb: containment (no time predicate)** | 1.9x | **1.9x** |
+| btree: project and kind | unresolved | unresolved |
+
+Every shape carrying a time window got relatively worse for us, and
+the one shape with no time predicate did not move at all. That last
+row is the control: it says the change touched what it was supposed to
+touch and nothing else. PG is now pruning with the index the customer
+created, and we are still reading every row.
+
+The earlier numbers were not wrong about our per-row costs — they were
+measured on a table where the customer's index could not help either
+engine, which flattered us on exactly the shapes this campaign is
+about. This is the honest baseline, and it is the one the letters
+should carry.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
