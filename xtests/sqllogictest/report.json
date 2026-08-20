@@ -523,7 +523,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 478, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 502, "fail": 0, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -576,6 +576,10 @@
         { "file": "v7384_array_returning_function.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "v7385_on_conflict_partial_index.test", "pass": 23, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "v7388_jsonb_column_validates.test", "pass": 16, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "v7388_qual_order.test", "pass": 8, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "wire_streaming_declines.test", "pass": 23, "fail": 0, "skip": 0,
           "fail_reasons": [] }

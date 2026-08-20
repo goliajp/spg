@@ -1,0 +1,76 @@
+# v7.38.8 — a json/jsonb column validates what goes into it.
+#
+# INSERT INTO t VALUES ('{bad') into a jsonb column was accepted and
+# the raw text stored, so every later read of that row raised instead.
+# One of those reads was on the checkpoint thread, where writes keep
+# being acknowledged while nothing reaches disk. PG18 refuses the
+# insert: `invalid input syntax for type json`.
+#
+# This is also the guarantee the accessors now rest on: a stored jsonb
+# value is valid by construction, so `->>` no longer parses the whole
+# document per row to find that out.
+
+statement ok
+CREATE TABLE v7388_j (id INT NOT NULL, b JSONB, p JSON)
+
+statement error
+INSERT INTO v7388_j VALUES (1, '{bad', NULL)
+
+statement error
+INSERT INTO v7388_j VALUES (2, NULL, '[1,2')
+
+statement ok
+INSERT INTO v7388_j VALUES (3, '{"a": 1, "b": "x"}', '[1, 2]')
+
+statement error
+UPDATE v7388_j SET b = '{bad' WHERE id = 3
+
+# The refused UPDATE left the row alone.
+query T
+SELECT b->>'b' FROM v7388_j WHERE id = 3
+----
+x
+
+# A key spelled with an escape matches the string it denotes, and its
+# own source text does not. The key comparison stopped decoding every
+# key it walks past, and this is the case that separates a byte
+# comparison from a correct one.
+statement ok
+INSERT INTO v7388_j VALUES (4, NULL, '{"\u0061b": "found"}')
+
+query T
+SELECT p->>'ab' FROM v7388_j WHERE id = 4
+----
+found
+
+query T
+SELECT COALESCE(p->>'\u0061b', 'absent') FROM v7388_j WHERE id = 4
+----
+absent
+
+# PG resolves a duplicate key to the LAST occurrence, which is why the
+# scan does not stop at the first match.
+statement ok
+INSERT INTO v7388_j VALUES (5, NULL, '{"a": 1, "a": 2}')
+
+query T
+SELECT p->>'a' FROM v7388_j WHERE id = 5
+----
+2
+
+# A TEXT operand has passed through no column boundary — PG has no
+# `text -> key` operator at all — so the accessor still checks it.
+statement ok
+CREATE TABLE v7388_t (id INT NOT NULL, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO v7388_t VALUES (1, '{bad')
+
+statement error
+SELECT s->>'a' FROM v7388_t WHERE id = 1
+
+statement ok
+DROP TABLE v7388_j
+
+statement ok
+DROP TABLE v7388_t

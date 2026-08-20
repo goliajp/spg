@@ -8,6 +8,70 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.8] — 2026-08-20
+
+The first release measured against what the customer actually runs.
+Their compose ships `postgres:18-alpine`; we built the harness they
+asked for, pointed it at their shapes, and lost by between 1.6x and
+8.9x. Four changes later the same profile has two shapes ahead of PG
+and the rest within 1.3x, except jsonb, which is its own campaign.
+
+### Fixed
+
+- **A json/jsonb column validates what goes into it.** `INSERT INTO t
+  VALUES ('{bad')` into a jsonb column was accepted — PG18 answers
+  `invalid input syntax for type json` — and the raw text was stored,
+  so every later read of that row raised instead. In v7.38.7 one of
+  those reads was on the checkpoint thread, which is the worst place
+  for it: writes keep being acknowledged while nothing reaches disk.
+  The coercion said so in its own comment ("no structural validation —
+  the responsibility for valid JSON lies with the producer") and the
+  jsonb arm swallowed the parse error and stored what it had failed to
+  canonicalise. Reported ahead of the generic coercion so the message
+  is PG's rather than `expected Jsonb, actual Text`, which describes a
+  conversion that is ordinarily fine.
+
+### Performance
+
+- **A temporal constant is carried decoded.** Comparing a timestamp
+  column to a literal cost 52 ns a row against an integer comparison's
+  22. Three readings of the code were proposed and all three refuted by
+  measurement; what was left is that `compare`'s same-variant fast
+  match had no temporal arm, and that the literal reached the row loop
+  as TEXT whatever the spelling because `Literal` had no variant that
+  could hold a decoded one — so every row walked the guard chain and
+  then coerced. Now 21.6 ns a row, parity with an integer comparison.
+  `Display` keeps the spelling, so EXPLAIN, dumps and error messages
+  are byte identical.
+- **The scan filter runs the cheap half of its conjunction first.** The
+  same query in the other written order cost 4.7 times as much — a
+  jsonb containment before a timestamp window, 40.0 ms; after it, 8.5.
+  Which one a person writes first is habit. It partitions rather than
+  sorts and never moves a conjunct that can raise, so nothing overtakes
+  a guard; equality stays put because that is the shape an index seek
+  consumes.
+- **jsonb accessors stop re-proving the document.** `->>` parsed the
+  whole document into a tree solely to validate it, threw the tree
+  away, and then found the key by scanning the text. With the column
+  boundary above enforced, a stored jsonb value is valid by
+  construction; a text operand, which PG has no operator for at all, is
+  still checked. And the key comparison no longer runs the parser over
+  every key it walks past to allocate a String for it. Together: 758 ns
+  a row to 173.
+
+On the customer profile, against `postgres:18-alpine` on the same box,
+interleaved: window count over a day 21.4 ms to 5.0, group by kind
+22.6 to 5.3, distinct seats 36.2 to 8.7, dashboard top versions 25.0 to
+7.4, single-row ingest 4.4 to 1.1, and an indexed count now ahead of PG
+at 0.06 against 0.17. What remains is the jsonb representation itself —
+`Value::Json(Cow<str>)` is a string at rest, so a field access is 173 ns
+against PG's 7.5 — and the containment operator, which parses both
+documents on every row including the constant. Both are written up in
+`docs/PERF-FINDING-2026-08-20-sentori-shapes.md` with the attack that
+was implemented, measured, and reverted for taking the wrong layer.
+
+---
+
 ## [7.38.7] — 2026-08-20
 
 Two customer reports, and then a step back from them. Nine defects had
