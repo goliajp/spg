@@ -4666,6 +4666,31 @@ pub enum Literal {
     /// `Value::NumericBig` at eval; previously such literals fell back to double.
     NumericBig(String),
     String(String),
+    /// v7.38.8 — a temporal constant that has already been decoded.
+    ///
+    /// Without these the only way to carry one through the AST was as
+    /// text, and a predicate comparing a `timestamp` column against a
+    /// literal then coerced that text back into a timestamp ONCE PER
+    /// ROW — 32 ns of the 52 a comparison cost, measured on a customer
+    /// profile. `constfold` produced text for the same reason: its exit
+    /// had nothing else to hand back.
+    ///
+    /// `text` keeps the spelling so `Display` round-trips byte for byte,
+    /// the way `Interval` already does and for the same reason: this
+    /// node is printed in EXPLAIN, in dumps and in error messages, and
+    /// none of those should change because the value stopped being
+    /// carried as a string. The enum already holds a `String` and an
+    /// `i128`, so neither variant widens it.
+    Timestamp {
+        micros: i64,
+        text: String,
+    },
+    /// Days since the epoch `Value::Date` counts from. See
+    /// [`Literal::Timestamp`].
+    Date {
+        days: i32,
+        text: String,
+    },
     Bool(bool),
     Null,
     /// pgvector-style array literal, e.g. `[1, 2.5, -3]`.
@@ -8527,6 +8552,19 @@ pub fn render_exact_decimal(unscaled: i128, scale: u16) -> alloc::string::String
     alloc::format!("{}{int_part}.{frac_part}", if neg { "-" } else { "" })
 }
 
+/// A single-quoted SQL string, with an embedded quote doubled.
+fn write_quoted(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
+    f.write_str("'")?;
+    for c in s.chars() {
+        if c == '\'' {
+            f.write_str("''")?;
+        } else {
+            write!(f, "{c}")?;
+        }
+    }
+    f.write_str("'")
+}
+
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -8547,17 +8585,10 @@ impl fmt::Display for Literal {
                 f.write_str(&render_exact_decimal(*unscaled, *scale))
             }
             Self::NumericBig(s) => f.write_str(s),
-            Self::String(s) => {
-                f.write_str("'")?;
-                for c in s.chars() {
-                    if c == '\'' {
-                        f.write_str("''")?;
-                    } else {
-                        write!(f, "{c}")?;
-                    }
-                }
-                f.write_str("'")
-            }
+            // Printed exactly as the text form was, so a reader cannot
+            // tell whether the constant was decoded or not.
+            Self::Timestamp { text, .. } | Self::Date { text, .. } => write_quoted(f, text),
+            Self::String(s) => write_quoted(f, s),
             Self::Bool(b) => f.write_str(if *b { "TRUE" } else { "FALSE" }),
             Self::Null => f.write_str("NULL"),
             // PG external array form. Display round-trip re-enters

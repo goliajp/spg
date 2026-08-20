@@ -5586,6 +5586,10 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
             kind: spg_storage::NumericKind::Finite,
         },
         Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
+        // v7.38.8 — already decoded, so the row loop neither clones a
+        // string nor coerces one back into a timestamp.
+        Literal::Timestamp { micros, .. } => Value::Timestamp(*micros),
+        Literal::Date { days, .. } => Value::Date(*days),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Vector(v) => Value::vector(v.clone()),
         Literal::TextArray(items) => Value::TextArray(items.clone()),
