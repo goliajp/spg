@@ -1,0 +1,93 @@
+# v7.38.9 — `@>` answers the flat-object case without building a tree
+# for the LEFT document.
+#
+# `@>` rides the GIN index, so what shows is the recheck on each
+# MATCHED row: on a customer profile `traits @> '{"plan":"pro"}'`
+# matched 66,000 of 200,000 rows and cost 38 ms against PG's 12, and
+# the same operator with a constant matching nothing cost 0.067. The
+# recheck parsed both documents and the left one is the big one.
+#
+# Every expectation below was taken from PostgreSQL 18, not from
+# reading our own code. The cases that matter are the ones where the
+# fast path must DECLINE — a recursive value on the right, a left that
+# is not an object — because those are where a reduction that is only
+# nearly right would answer differently.
+
+query T
+SELECT ('{"a":1,"b":"x"}'::jsonb @> '{"a":1}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('{"a":1}'::jsonb @> '{"a":2}'::jsonb)::text
+----
+false
+
+query T
+SELECT ('{"a":1}'::jsonb @> '{"z":1}'::jsonb)::text
+----
+false
+
+# Numbers compare by VALUE, so 1 contains 1.0.
+query T
+SELECT ('{"a":1}'::jsonb @> '{"a":1.0}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('{"a":null}'::jsonb @> '{"a":null}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('{"a":true}'::jsonb @> '{"a":true}'::jsonb)::text
+----
+true
+
+# A recursive value on the right: containment there is CONTAINMENT and
+# not equality, so the flat reduction must decline and the general
+# recursion must answer.
+query T
+SELECT ('{"a":{"b":1,"c":2}}'::jsonb @> '{"a":{"b":1}}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('{"a":[1,2,3]}'::jsonb @> '{"a":[1]}'::jsonb)::text
+----
+true
+
+# A top-level array containing a bare scalar is PG's flat-equality
+# special case, and it is NOT the object shape.
+query T
+SELECT ('[1,2,3]'::jsonb @> '2'::jsonb)::text
+----
+true
+
+# ... and it applies only at the top level.
+query T
+SELECT ('[1,[2,3]]'::jsonb @> '[2,3]'::jsonb)::text
+----
+false
+
+query T
+SELECT ('{"a":1}'::jsonb @> '{}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('5'::jsonb @> '{"a":1}'::jsonb)::text
+----
+false
+
+# A key spelled with an escape denotes `ab`, and the member is located
+# by what it denotes rather than by its source text.
+query T
+SELECT ('{"ab":1}'::jsonb @> '{"ab":1}'::jsonb)::text
+----
+true
+
+query T
+SELECT ('{"a":"x\ny"}'::jsonb @> '{"a":"x\ny"}'::jsonb)::text
+----
+true
