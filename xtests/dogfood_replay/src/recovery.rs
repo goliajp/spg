@@ -378,7 +378,18 @@ pub fn run_dump_crash(fixture_dir: &Path, fx: &DumpCrashFixture) -> Result<Recov
     }))
 }
 
-/// The crash writer, built beside this binary.
+/// The crash writer, built beside this binary — building it first if the
+/// caller only asked for this one.
+///
+/// `cargo run --bin spg-dogfood-replay` builds exactly that bin, which is
+/// what every gate invocation uses, so a sibling binary this fixture
+/// needs is simply not there. It failed on the release gate the first
+/// time this fixture ran anywhere but the machine that wrote it — the
+/// gate was right and the fixture was wrong to assume its neighbour had
+/// been built.
+///
+/// Building it here rather than teaching every call site keeps the
+/// dependency where the need is, and the build is a no-op once warm.
 fn writer_bin() -> Result<PathBuf> {
     let me = std::env::current_exe().context("current_exe")?;
     let dir = me.parent().ok_or_else(|| anyhow!("no exe dir"))?;
@@ -386,10 +397,31 @@ fn writer_bin() -> Result<PathBuf> {
     if p.exists() {
         return Ok(p);
     }
-    Err(anyhow!(
-        "dump-crash-writer not built at {} — `cargo build -p spg-dogfood-replay`",
-        p.display()
-    ))
+    // Same profile as whatever is running us: `current_exe` sits in
+    // target/<profile>/, so the directory name IS the profile.
+    let profile = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("release");
+    let mut cmd = std::process::Command::new(env!("CARGO"));
+    cmd.args([
+        "build",
+        "-p",
+        "spg-dogfood-replay",
+        "--bin",
+        "dump-crash-writer",
+    ]);
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    let out = cmd.output().context("build dump-crash-writer")?;
+    if !p.exists() {
+        return Err(anyhow!(
+            "dump-crash-writer still absent after building it: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(p)
 }
 
 fn scalar_u64(db: &mut Database, sql: &str) -> Result<u64> {
