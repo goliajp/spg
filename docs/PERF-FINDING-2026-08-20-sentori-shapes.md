@@ -360,6 +360,50 @@ belongs in the letter rather than in a backlog: a btree on
 they chose BRIN — so it is a trade they should make knowingly, not a
 recommendation to paper over our gap.
 
+## Sizing the BRIN prize — and a flaw in our own profile
+
+Before building summary maintenance, how much is it worth? The answer
+turned on something about the profile rather than about BRIN.
+
+`pg_stats.correlation` for `received_at` against physical order:
+
+```
+our profile's events table      0.197     (timestamps cycle: (g % 129600) minutes)
+an append-ordered events table  1.000     (what ingest actually produces)
+```
+
+At 0.197 every block range spans nearly the whole 90 days, so **no
+BRIN implementation can prune anything** — not PG's and not one we
+build. Measured on PG18, a one-day window costs 1.43 ms on our profile
+and 2.31 ms on the ordered table: BRIN is not what is buying PG its
+lead here either.
+
+So the 6.7x on that shape is **not** a pruning gap on this data. Our
+4.9 ms is, by the ablation above, almost entirely per-row predicate
+work — 21.6 ns a row over 200,000 rows. Building BRIN maintenance and
+measuring it on this profile would show nothing, and we would have
+concluded BRIN was not worth it.
+
+**On the layout the customer actually has, it is worth a great deal.**
+An events table is written in time order. A one-day window over 90
+days touches roughly one range in ninety, so the same query would go
+from 4.9 ms to the order of 0.06 ms — and we already know what our
+machinery does when it has an index it can use: 0.105 ms with a btree,
+against PG's 1.2.
+
+Two things follow, and the first is ours to fix before the second:
+
+1. **The profile's data layout is not the customer's.** An events
+   table with randomly-ordered timestamps is not a thing that exists.
+   The profile has to be re-generated append-ordered, and every figure
+   taken against it re-baselined — including the ones already in this
+   document and in the letters.
+2. Only then is BRIN maintenance worth building, and only then can it
+   be measured. `PersistentVec` is a 32-way trie, so the hot tier
+   already has natural blocks; a widen-only `(min,max)` per range of
+   rows is safe by construction — a summary may over-report and must
+   never under-report, which is exactly PG's lossy-index contract.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
