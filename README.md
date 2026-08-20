@@ -74,6 +74,27 @@ cargo build --workspace --release
 ./target/release/spg version
 ```
 
+### Docker: the image has no shell
+
+`goliakk/spg` ships `spg-server`, `spg` and `pg_isready` on a
+distroless base — there is no `/bin/sh` in it. Compose healthchecks
+must therefore use the **exec form**:
+
+```yaml
+healthcheck:
+  test: ["CMD", "pg_isready", "-U", "youruser"]
+```
+
+The `CMD-SHELL` spelling — which is what the `postgres` image's own
+documentation uses, so it is where most people start — runs the test
+through `/bin/sh` and cannot execute here. The container then never
+reports healthy and `depends_on: condition: service_healthy` holds the
+whole stack down before a single statement is issued. The error names
+the database (`container db is unhealthy`), which is the wrong
+component: the database is up and answering.
+
+Reported by sentori, who lost an hour to it.
+
 ### SQL taste
 
 The block below is executable documentation — the test suite's

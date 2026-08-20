@@ -1,0 +1,10 @@
+# name<TAB>SQL — one shape per line. Keep them single-statement: the
+# harness times each three times in one session and takes the best.
+ingest: one row	INSERT INTO events (project_id, kind, traits, received_at) VALUES (3, 'click', '{"plan":"pro","country":"jp","version":"7","seat":42}'::jsonb, timestamp '2026-06-01 12:00:00')
+window: count over a day	SELECT count(*) FROM events WHERE received_at >= timestamp '2026-06-01' AND received_at < timestamp '2026-06-02'
+window: group by kind	SELECT kind, count(*) FROM events WHERE received_at >= timestamp '2026-06-01' AND received_at < timestamp '2026-06-08' GROUP BY kind
+window: distinct seats	SELECT count(DISTINCT traits->>'seat') FROM events WHERE received_at >= timestamp '2026-06-01' AND received_at < timestamp '2026-06-08'
+jsonb: containment	SELECT count(*) FROM events WHERE traits @> '{"plan":"pro","country":"jp"}'::jsonb
+jsonb: containment in a window	SELECT count(*) FROM events WHERE traits @> '{"plan":"pro"}'::jsonb AND received_at >= timestamp '2026-06-01' AND received_at < timestamp '2026-06-08'
+btree: project and kind	SELECT count(*) FROM events WHERE project_id = 3 AND kind = 'click'
+dashboard: top versions	SELECT traits->>'version' AS v, count(*) FROM events WHERE project_id = 3 GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10
