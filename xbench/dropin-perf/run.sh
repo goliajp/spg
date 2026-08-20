@@ -103,6 +103,16 @@ seed() { # $1=uri $2=label
     || { echo "fatal: seed failed on $2 — reproduce with:" >&2
          echo "       $PSQL -v ON_ERROR_STOP=1 '$1' -f - < $PROFILE/schema.sql" >&2
          exit 2; }
+  # VACUUM ANALYZE before anything is timed, on BOTH legs.
+  #
+  # Not tidiness. PostgreSQL's BRIN summaries are built by VACUUM, so a
+  # freshly loaded table measures PG with its BRIN index doing nothing:
+  # the same one-day window query read 7.3-8.9 ms unsummarised and
+  # 1.2-5.1 ms after, on the same data in the same session. A harness
+  # that seeds and immediately measures reports the candidate beating
+  # PostgreSQL at a shape where it does not — which is the direction of
+  # error a vendor's own harness must never make.
+  "$PSQL" --no-psqlrc -X -q "$1" -c 'VACUUM ANALYZE' >/dev/null 2>&1 || true
   if [ -f "$PROFILE/rows" ]; then
     local want got
     while read -r tbl want; do

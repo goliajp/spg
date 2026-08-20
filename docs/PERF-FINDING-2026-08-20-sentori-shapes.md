@@ -284,6 +284,41 @@ filter inside the compiled predicate, after the planner has made its
 choices. The win is real — 4.3x on the shape that motivated it — and
 it is sitting behind one level of the stack.
 
+## Correction — the first measurement under-reported our loss
+
+The harness seeded both databases and measured immediately. PostgreSQL
+builds its BRIN summaries in VACUUM, so a freshly loaded table
+measures PG with that index doing nothing: the same one-day window
+query read 7.3-8.9 ms unsummarised and 1.2-5.1 ms after a
+`VACUUM ANALYZE`, on the same rows in the same session.
+
+So every "vs PG" figure taken before 2026-08-21 was flattering us, and
+the headline number in this document — **1.6x to 8.9x** — was wrong in
+the direction a vendor's own harness must never be wrong. The harness
+now vacuums both legs before anything is timed.
+
+Re-measured with that fix, both databases as containers on the same
+box (the earlier comparison also had us native against a
+containerised PG, which flattered us again), N=4, control leg clean on
+all eight cells in both runs:
+
+| shape | 7.38.7 | after v7.38.8 + v7.38.9 |
+|---|---|---|
+| window: count over a day | 21.2-23.8 ms · **16.4x** | 8.2-9.1 · 6.7x |
+| jsonb: containment in a window | 54.1-54.5 · 10.1x | 8.1-12.0 · **1.7x** |
+| window: distinct seats | 35.7-38.6 · 5.2x | 11.1-11.6 · **1.6x** |
+| dashboard: top versions | 24.6-26.8 · 5.3x | 10.2-14.7 · 2.1x |
+| window: group by kind | 22.6-23.2 · 3.7x | 8.4-9.7 · 2.3x |
+| jsonb: containment | 12.5-15.8 · 2.4x | 8.6-10.0 · 1.9x |
+| ingest: one row | 4.2-5.8 · 2.0x | 3.7-5.9 · 1.7x |
+| btree: project and kind | unresolved | unresolved |
+
+The true starting point was **2.0x to 16.4x**, and the worst shape is
+still the same one: a range predicate on a BRIN-indexed timestamp does
+not drive an index scan for us, so we read every row where PG reads a
+fraction. That is the largest single item left and it is not a jsonb
+problem.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
