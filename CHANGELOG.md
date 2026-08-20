@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.7] — 2026-08-20
 
 Two customer reports, and then a step back from them. Nine defects had
 been filed against one subsystem in eight releases, each fixed one arm
