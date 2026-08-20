@@ -6682,15 +6682,26 @@ impl Engine {
                 }
             } else {
                 let mut rows_cur = table.rows().run_cursor();
-                for i in 0..n {
-                    if !table.is_row_visible(i, &scan_snapshot) {
-                        continue;
+                // v7.38.11 — a BRIN index on a column this WHERE puts a
+                // range on tells us which slots cannot hold a match. The
+                // predicate still runs on every row that survives: the
+                // summary decides what to SKIP, never what to return.
+                let slots = stmt
+                    .where_
+                    .as_ref()
+                    .and_then(|w| crate::brin::candidate_slots(w, table));
+                let ranges = slots.unwrap_or_else(|| alloc::vec![0..n]);
+                for range in ranges {
+                    for i in range {
+                        if !table.is_row_visible(i, &scan_snapshot) {
+                            continue;
+                        }
+                        let Some(row) = rows_cur.get(i) else { continue };
+                        if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                            continue;
+                        }
+                        filtered.push(row);
                     }
-                    let Some(row) = rows_cur.get(i) else { continue };
-                    if !row_passes_where(row, &mut eval_stack, &mut memo)? {
-                        continue;
-                    }
-                    filtered.push(row);
                 }
             }
             for row in &cold_rows_storage {
@@ -7195,7 +7206,14 @@ impl Engine {
             // -18% on the aggregate scan from holding the leaf between
             // rows; this is the same loop for the projecting scan.
             let mut rows_cur = table.rows().run_cursor();
-            for i in 0..table.row_count() {
+            // v7.38.11 — see the aggregate scan above: a BRIN index on a
+            // column this WHERE bounds says which slots cannot match.
+            let brin_slots = stmt
+                .where_
+                .as_ref()
+                .and_then(|w| crate::brin::candidate_slots(w, table))
+                .unwrap_or_else(|| alloc::vec![0..table.row_count()]);
+            for i in brin_slots.into_iter().flatten() {
                 if let Some(cap) = early_cap
                     && emitted >= cap
                 {

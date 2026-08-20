@@ -3062,6 +3062,22 @@ pub enum IndexKind {
         /// Used by the planner to type-check WHERE-clause range
         /// predicates against the BRIN-indexed column.
         column_type: DataType,
+        /// v7.38.11 — one `(min, max)` per [`BRIN_RANGE_ROWS`] slots of
+        /// the hot tier, so a range predicate can skip the ranges that
+        /// cannot contain a match.
+        ///
+        /// Maintenance is WIDEN-ONLY and that is the whole safety
+        /// argument: an insert widens its range, an update widens, and
+        /// a delete leaves the range alone. A range left wider than the
+        /// rows it now covers is correct and merely less selective —
+        /// which is exactly PG's contract for a lossy index, since the
+        /// predicate is re-checked on every row the summary lets
+        /// through. A summary may over-report; it can never
+        /// under-report, so no matching row can be skipped.
+        ///
+        /// `None` for a range whose rows carry no comparable key (all
+        /// NULL, say), and such a range is never skipped.
+        summaries: alloc::vec::Vec<Option<(i64, i64)>>,
     },
     /// v7.12.3 — GIN inverted index over a `tsvector` column.
     ///
@@ -3394,7 +3410,10 @@ impl Index {
         Self {
             name,
             column_position,
-            kind: IndexKind::Brin { column_type },
+            kind: IndexKind::Brin {
+                column_type,
+                summaries: alloc::vec::Vec::new(),
+            },
             included_columns: Vec::new(),
             partial_predicate: None,
             expression: None,
@@ -4400,6 +4419,35 @@ struct TxWriteTrack {
     version: u64,
     inserted: Vec<(usize, row_header::RowId)>,
     tombstoned: Vec<row_header::RowId>,
+}
+
+/// v7.38.11 — hot-tier BRIN granularity: slots per summarised range.
+///
+/// 1024 keeps the summary vector three orders of magnitude smaller
+/// than the table while staying fine enough that a one-day window over
+/// a 90-day table skips ~99 % of it. A tuning constant, not a format:
+/// summaries are rebuilt from the rows on load, so changing it costs
+/// nothing on disk.
+pub const BRIN_RANGE_ROWS: usize = 1024;
+
+/// The comparable scalar a BRIN summary tracks, or `None` for a value
+/// with no ordering this index can use.
+///
+/// Deliberately narrow: only types whose ordering IS the i64 ordering
+/// of this number. A type added here whose comparison is not that —
+/// text under a collation, say — would make the summary under-report
+/// and skip matching rows, which is the one failure this design must
+/// not have.
+#[must_use]
+pub fn brin_scalar(v: &Value<'_>) -> Option<i64> {
+    match v {
+        Value::SmallInt(n) => Some(i64::from(*n)),
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::BigInt(n) | Value::Timestamp(n) => Some(*n),
+        Value::Date(d) => Some(i64::from(*d)),
+        Value::Bool(b) => Some(i64::from(*b)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -8956,7 +9004,7 @@ impl Catalog {
                         write_u16(&mut out, u16::try_from(g.m).expect("≤ 65k NSW neighbours"));
                         write_nsw_graph(&mut out, g);
                     }
-                    IndexKind::Brin { column_type } => {
+                    IndexKind::Brin { column_type, .. } => {
                         // v6.7.1 — tag byte 2 = BRIN. Payload is the
                         // column type code (1 byte mapping to the
                         // shared DataType numeric encoding); no

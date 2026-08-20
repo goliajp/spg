@@ -790,6 +790,65 @@ impl Table {
     /// v4.39: returns the persistent row vector by reference. Callers that
     /// used to take `&[Row]` should switch to `.iter()` (via
     /// `IntoIterator for &PersistentVec`) or `.get(i)` for indexing.
+    /// v7.38.11 — the column positions this table has BRIN indexes on.
+    pub fn brin_columns(&self) -> alloc::vec::Vec<usize> {
+        self.indices
+            .iter()
+            .filter(|i| matches!(i.kind, crate::IndexKind::Brin { .. }))
+            .map(|i| i.column_position)
+            .collect()
+    }
+
+    /// v7.38.11 — the slot ranges a BRIN index cannot rule out for
+    /// `col_pos` under `lo <= x` / `x <= hi`, or `None` when there is
+    /// no BRIN index on that column.
+    ///
+    /// `None` and "every slot" are deliberately different answers:
+    /// `None` means this table has nothing to say, so a caller that
+    /// does not understand BRIN keeps scanning exactly as before.
+    ///
+    /// A range is skipped only when its summary PROVES no row in it can
+    /// match. A range with no summary — never written, or written only
+    /// with values this index cannot order — is always kept. The
+    /// predicate still runs on every row that survives: the summary
+    /// decides what to skip, never what to return.
+    #[must_use]
+    pub fn brin_candidate_slots(
+        &self,
+        col_pos: usize,
+        lo: Option<i64>,
+        hi: Option<i64>,
+    ) -> Option<alloc::vec::Vec<core::ops::Range<usize>>> {
+        let summaries = self.indices.iter().find_map(|idx| match &idx.kind {
+            crate::IndexKind::Brin { summaries, .. } if idx.column_position == col_pos => {
+                Some(summaries)
+            }
+            _ => None,
+        })?;
+        let n = self.rows.len();
+        let mut out: alloc::vec::Vec<core::ops::Range<usize>> = alloc::vec::Vec::new();
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + crate::BRIN_RANGE_ROWS).min(n);
+            let keep = match summaries.get(start / crate::BRIN_RANGE_ROWS) {
+                // Proven disjoint from the predicate's interval.
+                Some(Some((rmin, rmax))) => {
+                    !(lo.is_some_and(|l| *rmax < l) || hi.is_some_and(|h| *rmin > h))
+                }
+                // No summary: nothing is proven, so nothing is skipped.
+                _ => true,
+            };
+            if keep {
+                match out.last_mut() {
+                    Some(last) if last.end == start => last.end = end,
+                    _ => out.push(start..end),
+                }
+            }
+            start = end;
+        }
+        Some(out)
+    }
+
     pub const fn rows(&self) -> &PersistentVec<Row<'static>> {
         &self.rows
     }
@@ -1370,10 +1429,28 @@ impl Table {
                         }
                     }
                 }
+                // v7.38.11 — widen the summary covering this slot.
+                //
+                // Widen-only: this can make a range less selective and
+                // never makes it skip a row. A value with no BRIN
+                // ordering leaves the range as it was, and a range that
+                // has never seen one stays `None`, which the scan reads
+                // as "cannot be skipped".
+                IndexKind::Brin { summaries, .. } => {
+                    let r = new_row_idx / crate::BRIN_RANGE_ROWS;
+                    if summaries.len() <= r {
+                        summaries.resize(r + 1, None);
+                    }
+                    if let Some(n) = crate::brin_scalar(&row.values[idx.column_position]) {
+                        summaries[r] = Some(match summaries[r] {
+                            Some((lo, hi)) => (lo.min(n), hi.max(n)),
+                            None => (n, n),
+                        });
+                    }
+                }
                 // NSW handled below after the row push (so the new row
-                // is visible to the kNN-graph connect step). BRIN
-                // carries no per-row state.
-                IndexKind::Nsw(_) | IndexKind::Brin { .. } => {}
+                // is visible to the kNN-graph connect step).
+                IndexKind::Nsw(_) => {}
             }
         }
         // v7.39 (round 215) — maintain the range-exclusion indexes for the
@@ -3254,7 +3331,7 @@ impl Table {
             .map(|idx| {
                 let kind = match &idx.kind {
                     IndexKind::Nsw(g) => RebuildKind::Nsw(g.m),
-                    IndexKind::Brin { column_type } => RebuildKind::Brin(*column_type),
+                    IndexKind::Brin { column_type, .. } => RebuildKind::Brin(*column_type),
                     IndexKind::BTree(_) => RebuildKind::BTree,
                     IndexKind::BTreeMulti(_) => RebuildKind::BTreeMulti,
                     IndexKind::Gin(_) => RebuildKind::Gin,
@@ -3306,10 +3383,42 @@ impl Table {
                     }
                 }
                 RebuildKind::Brin(column_type) => {
-                    // BRIN has no in-memory rebuild — the summaries
-                    // live in cold segments which freeze emits.
                     self.indices
                         .push(Index::new_brin(name, column_position, column_type));
+                    // v7.38.11 — recompute the hot-tier summaries. They
+                    // are derived from the rows, so a rebuild is a
+                    // single pass and can never disagree with what is
+                    // stored; that is also why they are not serialised.
+                    //
+                    // Without this an UPDATE — which lands here, since
+                    // BRIN cannot be repaired in place — would leave the
+                    // summaries empty. That is SAFE (an absent summary
+                    // is never skipped) but it silently turns pruning
+                    // off for the rest of the table's life, which is the
+                    // kind of regression nothing would report.
+                    let idx_pos = self.indices.len() - 1;
+                    let n = self.rows.len();
+                    let mut sums: Vec<Option<(i64, i64)>> =
+                        alloc::vec![None; n.div_ceil(crate::BRIN_RANGE_ROWS)];
+                    let mut cur = self.rows.run_cursor();
+                    for i in 0..n {
+                        let Some(row) = cur.get(i) else { continue };
+                        let Some(v) = row.values.get(column_position) else {
+                            continue;
+                        };
+                        if let Some(k) = crate::brin_scalar(v) {
+                            let r = i / crate::BRIN_RANGE_ROWS;
+                            sums[r] = Some(match sums[r] {
+                                Some((lo, hi)) => (lo.min(k), hi.max(k)),
+                                None => (k, k),
+                            });
+                        }
+                    }
+                    if let crate::IndexKind::Brin { summaries, .. } =
+                        &mut self.indices[idx_pos].kind
+                    {
+                        *summaries = sums;
+                    }
                 }
                 RebuildKind::BTree => {
                     // v7.39 (round 170) — bulk build: collect + sort +
