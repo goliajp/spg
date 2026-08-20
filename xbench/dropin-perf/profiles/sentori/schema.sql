@@ -4,6 +4,17 @@
 -- jsonb column and a BRIN index on a timestamp; the dashboard is
 -- aggregates over a time window. Everything here is valid on both
 -- PostgreSQL 18 and SPG, so the same file seeds both legs.
+--
+-- The timestamps ASCEND with the physical order, and that is the point
+-- of the column. An events table is written in time order, so
+-- `pg_stats.correlation` for `received_at` is 1.0 in production.
+--
+-- The first version of this file cycled them — `(g % 129600) minutes` —
+-- which put the correlation at 0.197 and made every block range span
+-- nearly the whole 90 days. No BRIN index can prune against that, PG's
+-- included, so the profile was measuring a shape in which the
+-- customer's chosen index does nothing, and any work on ours measured
+-- here would have read as worthless.
 DROP TABLE IF EXISTS events;
 CREATE TABLE events (
   id          bigserial PRIMARY KEY,
@@ -29,7 +40,7 @@ SELECT (g % 8) + 1,
          'version', ((g % 40) + 1)::text,
          'seat',    g % 500
        ),
-       timestamp '2026-05-01 00:00:00' + ((g % 129600) || ' minutes')::interval
+       timestamp '2026-05-01 00:00:00' + ((g * 0.648) || ' minutes')::interval
 FROM generate_series(1, 200000) g;
 
 ANALYZE events;
