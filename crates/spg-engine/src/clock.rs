@@ -134,6 +134,33 @@ pub(crate) fn rewrite_clock_calls(
 }
 
 fn rewrite_select_clock(s: &mut SelectStatement, now: i64, mysql: bool, tz_offset: i64) {
+    // v7.38.7 — pin the name BEFORE the rewrite takes it away.
+    //
+    // Folding `now()` to a literal is what makes the clock stable across
+    // a statement, but it also erases the name the column reports:
+    // `SELECT now()::date` is named for its operand in PG (`now`), and
+    // once the operand is a literal the cast has nothing to prefer, so
+    // the column came back as `date`. Describe and the row stream both
+    // read the rewritten tree, so both were wrong together and neither
+    // could see why.
+    //
+    // Only for an item the user did NOT alias, and only when the name
+    // actually changes — an alias the user wrote is never touched, and
+    // an item whose name survives the fold is left exactly as it was.
+    for item in &mut s.items {
+        if let spg_sql::ast::SelectItem::Expr { expr, alias } = item
+            && alias.is_none()
+        {
+            let before = spg_sql::ast::figure_column_name(expr);
+            let mut probe = expr.clone();
+            rewrite_expr_clock(&mut probe, now, mysql, tz_offset);
+            let after = spg_sql::ast::figure_column_name(&probe);
+            if before != after && before.is_some() {
+                *alias = before;
+            }
+        }
+    }
+
     // v7.25.1 (round-18) — shared traversal: CTE bodies, LATERAL
     // subqueries, JOIN ON, and UNION peers all get the clock
     // rewrite (NOW() inside a CTE previously survived to eval as

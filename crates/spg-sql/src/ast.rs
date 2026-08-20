@@ -7934,6 +7934,35 @@ fn canonical_function_name(name: &str) -> String {
     }
 }
 
+/// v7.38.7 — a cast target's `pg_type.typname`, for the name a cast
+/// reports when its operand has none of its own. Only the spellings that
+/// differ from what the user writes need an entry; everything else is
+/// already its own typname.
+fn cast_target_typname(target: &CastTarget) -> String {
+    let written = target.to_string().to_ascii_lowercase();
+    let base = written.strip_suffix("[]").unwrap_or(&written);
+    let mapped = match base {
+        "bigint" => "int8",
+        "integer" | "int" => "int4",
+        "smallint" => "int2",
+        "boolean" => "bool",
+        "double precision" => "float8",
+        "real" => "float4",
+        "character varying" => "varchar",
+        "character" => "bpchar",
+        "timestamp with time zone" => "timestamptz",
+        "timestamp without time zone" => "timestamp",
+        "time without time zone" => "time",
+        "decimal" => "numeric",
+        other => other,
+    };
+    if written.ends_with("[]") {
+        alloc::format!("_{mapped}")
+    } else {
+        String::from(mapped)
+    }
+}
+
 fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
     let strong = |n: String| (Some(n), NameStrength::Strong);
     match expr {
@@ -7960,7 +7989,11 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
             target,
         } => match figure_name_inner(inner) {
             (Some(n), NameStrength::Strong) => strong(n),
-            _ => (Some(target.to_string()), NameStrength::Weak),
+            // v7.38.7 — the fallback is the target type's INTERNAL name,
+            // which is what PG reports: `SELECT 7::bigint` is `int8`, not
+            // the `bigint` the user typed. Measured on PG18 alongside
+            // `CAST(7 AS bigint)`, which answers `int8` too.
+            _ => (Some(cast_target_typname(target)), NameStrength::Weak),
         },
         // A scalar subquery reports whatever its single output column
         // reports: `(SELECT max(b) …)` is `max`, `(SELECT a+b …)` is not.
