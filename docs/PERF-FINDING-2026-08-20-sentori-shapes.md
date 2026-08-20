@@ -506,6 +506,34 @@ different optimisation — an AND of two index results — and it is now
 the largest single cell on the profile. It is not a regression and it
 is not BRIN's to fix.
 
+## A standing loss the gate keeps rediscovering: 400k distinct-then-order
+
+`SELECT pad FROM t ORDER BY k` with a DISTINCT, at 400,000 rows, sits
+right on the gate's resolution limit and gets called differently from
+run to run — LOSS on the v7.38.11 train, `unresolved` on a rerun of
+the same binary twenty minutes later.
+
+The A/B settles what it is. Three legs, N=6, control clean:
+
+```
+7.38.10          109.343-115.175
+7.38.11          107.552-112.647
+7.38.10 again    108.139-112.409     (control)
+PG18              96.170-100.537
+```
+
+Not a regression — the three SPG legs overlap and the candidate is if
+anything marginally faster. But PG is 96-100 against our 107-115, so
+**this shape loses by about 10 % and has been losing**; the gate is
+merely inconsistent about noticing, because the gap sits inside what
+64-cell run-to-run variance can swallow.
+
+That makes it two separate facts, and they need separate handling: the
+release is not the cause and is not blocked by it, and the loss is
+real and deserves its own attack rather than being rediscovered by the
+gate every few versions. Recorded here so the next campaign starts
+from a measurement instead of from a red cell.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
