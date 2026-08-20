@@ -385,6 +385,29 @@ fn decode_string_token(tok: &str) -> Option<String> {
     }
 }
 
+/// v7.38.8 — does a JSON string TOKEN denote exactly `key`, without
+/// building the string it denotes?
+///
+/// `locate_member` compared keys by calling `decode_string_token` on
+/// each one, which runs the whole recursive-descent parser over the
+/// token and allocates a `String` — once per member, per row, per
+/// accessor, to answer a question that is usually a byte comparison.
+///
+/// A token with no backslash in it denotes its own inner bytes, so it
+/// can be compared in place. One with an escape defers to
+/// `decode_string_token`, so the two paths cannot disagree about what
+/// an escape means.
+fn key_token_eq(tok: &str, key: &str) -> bool {
+    let inner = match tok.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        Some(i) => i,
+        None => return false,
+    };
+    if inner.as_bytes().contains(&b'\\') {
+        return decode_string_token(tok).is_some_and(|d| d == key);
+    }
+    inner == key
+}
+
 /// Verbatim source slice of `key`'s value in the object encoded at `src`.
 /// PG resolves a duplicate key to the LAST occurrence, so the scan does not
 /// stop early. Keys are compared after unescaping (`{"A":1}` has key `A`).
@@ -404,14 +427,14 @@ fn locate_member<'a>(src: &'a str, key: &str) -> Option<&'a str> {
             _ => return None,
         }
         let key_end = scan_string(b, i)?;
-        let this_key = decode_string_token(src.get(i..key_end)?)?;
+        let key_tok = src.get(i..key_end)?;
         i = skip_ws_at(b, key_end);
         if b.get(i) != Some(&b':') {
             return None;
         }
         i = skip_ws_at(b, i + 1);
         let val_end = scan_value(b, i)?;
-        if this_key == key {
+        if key_token_eq(key_tok, key) {
             found = Some(src.get(i..val_end)?);
         }
         i = skip_ws_at(b, val_end);
