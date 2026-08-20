@@ -544,6 +544,11 @@ fn literal_type(lit: &spg_sql::ast::Literal) -> Option<(DataType, bool)> {
         // prepared-bind path; surface as TEXT (no array
         // DataType in the describe surface yet).
         L::TextArray(_) | L::IntArray(_) | L::BigIntArray(_) => (DataType::Text, false),
+        // v7.38.8 — carried decoded, so it can say what it is. As text
+        // it described as TEXT, which is what a folded `now()::date`
+        // reported to a driver.
+        L::Timestamp { .. } => (DataType::Timestamp, false),
+        L::Date { .. } => (DataType::Date, false),
         // PG-canonical literal-int typing: `pg_typeof(1) =
         // integer`, `pg_typeof(2147483648) = bigint`. The
         // engine's runtime Value::Int(i32) flows naturally

@@ -2285,6 +2285,13 @@ pub(crate) fn literal_as_column_value(
             kind: spg_storage::NumericKind::Finite,
         },
         Literal::NumericBig(s) => crate::conversions::big_literal_to_value(s),
+        // v7.38.8 — a decoded temporal constant is an ordinary scalar
+        // key. Declining it here would turn every seek on a timestamp
+        // or date column into a full scan the moment the constant
+        // started being carried decoded — a silent perf regression
+        // wearing the shape of a planner decision.
+        Literal::Timestamp { micros, .. } => Value::Timestamp(*micros),
+        Literal::Date { days, .. } => Value::Date(*days),
         Literal::String(s) => Value::text(s.clone()),
         Literal::Bool(b) => Value::Bool(*b),
         Literal::Null => Value::Null,
