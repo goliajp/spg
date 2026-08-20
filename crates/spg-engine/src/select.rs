@@ -6513,7 +6513,18 @@ impl Engine {
             .where_
             .as_ref()
             .filter(|w| eval::fully_compilable(w))
-            .map(|w| eval::compile_expr(w, &ctx));
+            .map(|w| {
+                // v7.38.8 — the scan filter runs the cheap half of its
+                // conjunction first. Called from HERE and not from
+                // `eval::compiled`, deliberately: the row loop lives in
+                // that file, and adding a function to it cost this
+                // query 11 % through layout alone while doing no work
+                // for it. See `crate::qualorder`.
+                match crate::qualorder::reordered(w) {
+                    Some(r) => eval::compile_expr(&r, &ctx),
+                    None => eval::compile_expr(w, &ctx),
+                }
+            });
         let mut eval_stack: Vec<Value<'static>> = Vec::new();
         let mut row_passes_where = |row: &Row<'static>,
                                     eval_stack: &mut Vec<Value<'static>>,
@@ -6782,7 +6793,18 @@ impl Engine {
             .where_
             .as_ref()
             .filter(|w| eval::fully_compilable(w))
-            .map(|w| eval::compile_expr(w, &ctx));
+            .map(|w| {
+                // v7.38.8 — the scan filter runs the cheap half of its
+                // conjunction first. Called from HERE and not from
+                // `eval::compiled`, deliberately: the row loop lives in
+                // that file, and adding a function to it cost this
+                // query 11 % through layout alone while doing no work
+                // for it. See `crate::qualorder`.
+                match crate::qualorder::reordered(w) {
+                    Some(r) => eval::compile_expr(&r, &ctx),
+                    None => eval::compile_expr(w, &ctx),
+                }
+            });
         let mut eval_stack: Vec<Value<'static>> = Vec::new();
         // v7.37.x (docker-fair SCALARSQ attack) — pre-analyse every
         // SELECT-item scalar subquery for the PK-probe fast path. The
