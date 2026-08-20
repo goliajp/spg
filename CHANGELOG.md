@@ -8,7 +8,38 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.9] — 2026-08-21
+## [7.38.10] — 2026-08-21
+
+Carries everything v7.38.9 was tagged for — that tag published nothing;
+its release train was stopped at the preflight gate three times and the
+third stop found a real defect, so the version was cut again rather
+than retagged. What follows is v7.38.9's content plus that defect.
+
+### Fixed
+
+- **Eleven lints the local gate could not see.** `chunks_exact` where
+  `as_chunks::<N>()` gives arrays and drops the bounds checks (base64
+  encode and decode, the BLAKE3 word load, `format()`, `json_object()`
+  and both json-object builders), `drain(..).collect()` where
+  `core::mem::take` moves the Vec, and `.ok().is_some_and(..)` where
+  `is_ok_and` says it directly.
+
+  They are new lints in the current toolchain, and the local `target/`
+  still held clippy verdicts from before it landed — cargo does not
+  re-run clippy on a crate whose sources have not changed, so a
+  two-day-old green was being reported as today's. The testbed builds
+  from empty and failed on the same tree with the same toolchain, which
+  is how this surfaced.
+
+  It took three rounds to see all of them: after each fix
+  `cargo clippy --workspace` came back clean and was wrong — first
+  because `cargo clean -p` had not evicted enough, then because the
+  precommit gate builds a different profile whose fingerprints were
+  still stale. Only `rm -rf target/*/.fingerprint` showed the set.
+
+---
+
+## [7.38.9] — 2026-08-21 (tagged, never published)
 
 Two more jsonb costs removed, and a correction: the harness we sent the
 customer was measuring PostgreSQL with its BRIN index doing nothing,
