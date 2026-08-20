@@ -433,6 +433,52 @@ engine, which flattered us on exactly the shapes this campaign is
 about. This is the honest baseline, and it is the one the letters
 should carry.
 
+## Phase B plan for BRIN — written to be executed, not re-derived
+
+Pre-Phase-B gate: passed. On `window: count over a day` our time is
+almost entirely per-row predicate over 200,000 rows; pruning to the
+one range in ninety that a one-day window touches removes ~99 % of it.
+That is far above the double-digit-pp bar.
+
+**Hook points, both found:**
+
+- Storage: `Table.rows()` is a `PersistentVec<Row>` — a 32-way trie,
+  so the hot tier already has natural blocks. `crates/spg-storage/src/table.rs:793`.
+- Executor: the sequential filter loop is
+  `crates/spg-engine/src/select.rs:6685`, `for i in 0..n` over a run
+  cursor. Pruning replaces the range it iterates.
+
+**The invariant that makes it safe:** a summary may over-report and
+must never under-report. So maintenance is WIDEN-ONLY — an insert
+widens its range's `(min,max)`, an update widens, and a delete leaves
+it alone. A range left wider than necessary is correct and merely less
+selective, which is exactly PG's lossy-index contract (it rechecks).
+Nothing can ever skip a matching row.
+
+**Steps:**
+
+1. `IndexKind::Brin` carries `summaries: Vec<(i64, i64)>`, one entry
+   per `RANGE_ROWS` (start at 1024) of physical slots. Insert extends
+   or pushes; update widens the containing entry. O(1) either way.
+2. `Table::brin_candidate_slots(col_pos, lo, hi) -> Option<Vec<Range<usize>>>`
+   — `None` when there is no BRIN index on that column, so every
+   caller that does not know about BRIN keeps its current behaviour.
+3. The scan loop asks for candidates when the WHERE carries a range
+   predicate on a BRIN-indexed column, and iterates those slots
+   instead of `0..n`. The predicate still runs on every surviving row:
+   the summary decides what to skip, never what to return.
+4. Persistence: summaries are derivable from the rows, so on load they
+   can be rebuilt in one pass rather than serialised. Cheaper to get
+   right than a new on-disk field, and it cannot go stale.
+5. Measure on the append-ordered profile — and on the cycling one as a
+   NEGATIVE control, where correlation 0.197 means a correct
+   implementation must show no improvement at all. A version that
+   speeds THAT up is skipping rows it should not.
+
+Step 5 is not optional. It is the only cheap check that separates
+"prunes correctly" from "prunes too much", and a wrong implementation
+looks like a bigger win.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
