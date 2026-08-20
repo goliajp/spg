@@ -141,6 +141,66 @@ query — the category first, per the methodology, since the counters
 and the ablation have now given prices for a mechanism nobody has
 seen.
 
+## Three predictions, all refuted, and the diagnosis they cornered
+
+The useful part of this section is that every mechanism proposed from
+reading the code was wrong, and each refutation narrowed the target.
+
+**Refuted 1 — "the folded constant is cloned and re-parsed per row."**
+`constfold` folds `timestamp '…'` and `clock.rs:35` turns the folded
+`Value::Timestamp` back into a `Literal::String`. Discriminator: an
+integer column against a *string* literal would pay the same clone and
+parse. `id > '0'` costs 7.72 ms against `id > 0`'s 7.58 — 0.7 ns a row
+apart. Not it.
+
+**Refuted 2 — "the typed spelling is what does it."** If the fold's
+exit were the cause, an unadorned literal (unknown-typed, resolved
+against the column at prepare time) would be cheaper. All three
+spellings — `timestamp '1900-01-01'`, `'1900-01-01'`, and
+`'1900-01-01'::timestamp` — cost 14.6, 15.9 and 14.3 ms. Not it.
+
+**Refuted 3 — "the compiled fast lane declines and we fall back per
+row."** There is a `PredShape::ColumnCmpLit` lane that compares in
+place. Counter, over 200,000 rows: it **fires 200,000 times** on the
+timestamp shape, exactly as it does on the integer shape. The
+timestamp predicate is five times the price of the integer one
+*inside the same lane*. Not a lane miss.
+
+(The jsonb shape is different in kind: the fast lane fires **zero**
+times there. Its 400-765 ns a row is a different path and a different
+campaign.)
+
+**The diagnosis.** `binop.rs:5742` — `compare`'s same-variant fast
+match — covers `Int/Int`, `BigInt/BigInt`, `SmallInt/SmallInt`,
+`Text/Text` and `Bool/Bool`. It does not cover `Timestamp`, `Date`,
+`Time`, `Uuid`, `Bytes` or `Numeric`. Its own comment says why the
+list is what it is: r483 measured the pre-check chain below it at
+35.6 % of self time on `g = 5`, with `Value::data_type` another 4.5 %,
+and added the arms for the variants that were hot *then*.
+
+A timestamp comparison misses that match twice over. The column is
+`Timestamp`; the literal reaches the row loop as `Text`, whatever the
+spelling, because `Literal` has no temporal variant to hold it. So
+every row walks the full guard chain and then coerces the text into a
+timestamp. `Value::data_type` showing up at 0.71 % of self time in a
+sample of exactly this query is that chain.
+
+## Top-N attacks
+
+| # | file:line | change | est | semantic | blast |
+|---|---|---|---|---|---|
+| 1 | `eval/binop.rs:5742` | add same-variant arms to `compare`'s fast match: `Timestamp`, `Date`, `Time`, `Uuid`, `Bytes`, `Bool` pairs already there | removes the guard walk when both sides are the same variant | none — identical answer by the same arms | one match |
+| 2 | `spg-sql/src/ast.rs` (`Literal`) + `clock.rs:35` | `Literal::Timestamp(i64)` / `Literal::Date(i32)` so a folded or resolved temporal constant reaches the row loop typed rather than as text | removes the per-row coercion; with #1 it lands in the fast match | none if the text form stays the display form | AST + fold exit + literal→value |
+| 3 | jsonb representation | binary form with an offset table instead of `Value::Json(Cow<str>)` | the 400-765 ns a row | none observable | large — own campaign |
+
+`Literal::Integer` is already `i64`, so #2 adds no width to the enum —
+the tax a wider variant would put on every existing literal (v7.37.26)
+does not apply.
+
+#1 and #2 are one change in effect: #1 without #2 helps only
+column-vs-column comparisons, and #2 without #1 skips the coercion but
+still walks the chain.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
