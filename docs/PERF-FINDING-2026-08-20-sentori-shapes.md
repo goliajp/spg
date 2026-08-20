@@ -247,6 +247,43 @@ general. The jsonb items stay on the list behind it:
   boundary and key-comparison fixes is the scan and the allocation of
   the result.
 
+## The conjunct-order attack, implemented and reverted
+
+Built as a plan-time pass: stably partition a conjunction into "cannot
+raise and is cheap" and "everything else", safe half first, each half
+keeping its written order. A partition and not a sort, because moving
+something that CAN raise to the front can make an error appear where
+the query used to short-circuit past it.
+
+It did what it was built to do — containment written before a
+timestamp window went 39.4 ms to 9.2 — and made every indexed shape
+slower:
+
+| probe | develop | with the pass |
+|---|---|---|
+| `project_id = 3` alone (seek) | 1.86 | 1.82 |
+| `traits->>'plan' = 'pro'` alone (no seek) | 17.1 | 17.2 |
+| both, expensive written first | 5.20 | 6.65 |
+| both, cheap written first | 5.99 | 8.24 |
+
+Two controls place the cause. The same worktree built with the pass
+compiled but early-returning measures 5.13-5.29 against develop's
+5.08-5.50 — so it is the pass, not the binary or its layout. And on a
+2000-row copy of the same table **with no indexes** the pass is
+faster, 0.201 against 0.554 — so the cost is not a fixed per-query AST
+rebuild; it scales with rows, and only where an index is involved.
+
+**The layering was wrong.** PG does not reorder the tree.
+`order_qual_clauses` runs in the executor over the quals that are LEFT
+after index conditions have been extracted. Reordering the AST before
+the seek matcher sees it changes which seek it finds. Reverted on
+branch `wt/v7388-qualorder` (`336bd39e`) rather than merged.
+
+The corrected design, for whoever picks this up: order the residual
+filter inside the compiled predicate, after the planner has made its
+choices. The win is real — 4.3x on the shape that motivated it — and
+it is sitting behind one level of the stack.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
