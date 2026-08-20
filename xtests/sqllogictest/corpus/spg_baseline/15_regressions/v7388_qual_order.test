@@ -1,0 +1,57 @@
+# v7.38.8 — the scan filter runs the cheap half of its conjunction
+# first, and doing so changes nothing but the time.
+#
+# The same query written the other way round cost 4.7x: a jsonb
+# containment before a timestamp window is evaluated on every row,
+# after it only on the rows the window let through. Which one a person
+# writes first is habit. These pin that the reorder is invisible in the
+# answer — including under three-valued logic, and including the guard
+# that must not be overtaken by the division it guards.
+
+statement ok
+CREATE TABLE v7388_q (id INT NOT NULL, n INT, s TEXT NOT NULL)
+
+statement ok
+INSERT INTO v7388_q VALUES (1, 0, 'no'), (2, 5, 'yes'), (3, NULL, 'yes'), (4, 4, 'yes'), (5, 2, 'no')
+
+query I
+SELECT id FROM v7388_q WHERE s = 'yes' AND id > 1 AND id < 4 ORDER BY id
+----
+2
+3
+
+query I
+SELECT id FROM v7388_q WHERE id > 1 AND id < 4 AND s = 'yes' ORDER BY id
+----
+2
+3
+
+# A NULL operand makes the conjunct UNKNOWN; AND is commutative under
+# three-valued logic, so the row set cannot depend on which side is
+# written first.
+query I
+SELECT id FROM v7388_q WHERE n > 1 AND id > 0 ORDER BY id
+----
+2
+4
+5
+
+query I
+SELECT id FROM v7388_q WHERE id > 0 AND n > 1 ORDER BY id
+----
+2
+4
+5
+
+# The guard is written first and must stay first: only conjuncts that
+# cannot raise are moved, and only earlier, so nothing overtakes this
+# one and exposes the division on the row where n is 0.
+query I
+SELECT id FROM v7388_q WHERE n > 0 AND 100 / n > 10 ORDER BY id
+----
+2
+4
+5
+
+statement ok
+DROP TABLE v7388_q
