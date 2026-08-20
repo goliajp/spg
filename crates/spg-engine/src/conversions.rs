@@ -4106,6 +4106,47 @@ pub(crate) fn coerce_value(
     if actual == expected {
         return Ok(v);
     }
+    // v7.38.8 — text reaching a json/jsonb column is validated here, the
+    // way PG validates at its own input boundary, and reports what PG
+    // reports when it will not parse.
+    //
+    // It was not validated at all, and the comment where the coercion
+    // used to live said so outright: "no structural validation — the
+    // responsibility for valid JSON lies with the producer". The jsonb
+    // side went further and swallowed the parse error, storing the raw
+    // text when canonicalisation failed. So `INSERT INTO t VALUES
+    // ('{bad')` into a jsonb column was accepted where PG18 answers
+    // `invalid input syntax for type json`, and every later read of
+    // that row raised instead — including, in v7.38.7, one on the
+    // checkpoint thread, which is the worst place for it: writes keep
+    // being acknowledged while nothing reaches disk.
+    //
+    // Handled ahead of the match so the message names the real problem.
+    // Reported through the generic path it read `expected Jsonb, actual
+    // Text`, which describes a coercion that is ordinarily fine and
+    // says nothing about the document being malformed.
+    //
+    // This boundary is also what the accessors now rest on: with it
+    // enforced, a `Value::Json` is valid by construction, and `->>`
+    // stops parsing the whole document once per row to find that out.
+    if matches!(expected, DataType::Json | DataType::Jsonb)
+        && let Value::Text(ref s) | Value::Json(ref s) = v
+    {
+        let bad = || {
+            EngineError::Eval(crate::eval::EvalError::TypeMismatch {
+                detail: alloc::string::String::from("invalid input syntax for type json"),
+            })
+        };
+        return if expected == DataType::Jsonb {
+            crate::json::canonicalize_jsonb(s.as_ref())
+                .map(Value::json)
+                .map_err(|_| bad())
+        } else {
+            crate::json::parse(s.as_ref())
+                .map_err(|_| bad())
+                .map(|_| Value::json(s.clone()))
+        };
+    }
     let coerced: Option<Value<'static>> = match (v, expected) {
         (Value::Int(n), DataType::BigInt) => Some(Value::BigInt(i64::from(n))),
         (Value::Int(n), DataType::Float) => Some(Value::Float(f64::from(n))),
@@ -4454,15 +4495,27 @@ pub(crate) fn coerce_value(
         (Value::Int(n), DataType::Bool) => Some(Value::Bool(n != 0)),
         (Value::SmallInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
         (Value::BigInt(n), DataType::Bool) => Some(Value::Bool(n != 0)),
-        // v4.9: Text ↔ JSON coercion. No structural validation —
-        // any text literal is accepted; the responsibility for
-        // valid JSON lies with the producer.
-        (Value::Text(s), DataType::Json) => Some(Value::json(s)),
-        // v7.38 (read01) — a jsonb column canonicalises its value on
-        // assignment, the same as PG's `::jsonb` cast.
-        (Value::Text(s), DataType::Jsonb) => Some(Value::json(
-            crate::json::canonicalize_jsonb(s.as_ref()).unwrap_or_else(|_| s.into_owned()),
-        )),
+        // v7.38.8 — text reaching a json/jsonb column is validated, the
+        // way PG validates at its own input boundary.
+        //
+        // It was not, and the comment here said so: "no structural
+        // validation — the responsibility for valid JSON lies with the
+        // producer". The jsonb arm went further and swallowed the parse
+        // error, storing the raw text when canonicalisation failed. So
+        // `INSERT INTO t VALUES ('{bad')` into a jsonb column was
+        // accepted (PG18: `invalid input syntax for type json`), and
+        // every later read of that row raised instead — including, in
+        // v7.38.7, one on the checkpoint thread, which is the worst
+        // place for it because writes keep being acknowledged while
+        // nothing reaches disk.
+        //
+        // Rejecting here is also what lets the accessors trust a
+        // `Value::Json`: with the column boundary enforced, a value
+        // that came out of storage IS valid, and `->>` no longer has
+        // to parse the whole document per row to find that out.
+        // Text → json/jsonb is handled before this match, so that a
+        // document that will not parse reports PG's own message
+        // instead of a type mismatch that misnames the problem.
         (Value::Json(s), DataType::Text) => Some(Value::text(s)),
         // v7.13.3 — mailrs round-7 S10. SPG's storage represents
         // both JSON and JSONB on-disk as `Value::json(String)` —

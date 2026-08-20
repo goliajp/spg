@@ -796,9 +796,7 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
     };
     // Validate once, then narrow a VERBATIM source slice per step — PG's `#>` /
     // `#>>` return the located value's original text, not a re-serialization.
-    parse(src).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON for path walk: {e}"),
-    })?;
+    validate_unless_known_json(lhs, src, "path walk")?;
     let mut cur: &str = src;
     for step in &path {
         let at = skip_ws_at(cur.as_bytes(), 0);
@@ -1128,6 +1126,30 @@ fn parse_text_array(s: &str) -> Result<Vec<String>, EvalError> {
 /// containing JSON. `rhs` is either a TEXT key (object access) or
 /// an INT index (array access). `as_text=true` for `->>` (returns
 /// `Value::Text`); `false` for `->` (returns `Value::Json`).
+/// v7.38.8 — validate a document only when it is not already known to be
+/// one.
+///
+/// `Value::Json` reaches an accessor from a json/jsonb column or from a
+/// cast, and both of those validate at their own boundary (the column
+/// one only since v7.38.8 — before that a jsonb column could hold
+/// `{bad`, and this is the guarantee that made re-validating here look
+/// necessary). `Value::Text` is SPG's own leniency: PG has no
+/// `text -> text` operator at all, so a text operand has passed through
+/// no boundary and is checked here.
+///
+/// The cost this removes is the whole document, per row, per accessor:
+/// the parse built a `JsonValue` tree — a Vec plus a String per member —
+/// and threw it away, and the verbatim scan below did the real work. On
+/// a four-member document that was 333 ns a row against PG's 7.5.
+fn validate_unless_known_json(lhs: &Value, src: &str, what: &str) -> Result<(), EvalError> {
+    if matches!(lhs, Value::Json(_)) {
+        return Ok(());
+    }
+    parse(src).map(|_| ()).map_err(|e| EvalError::TypeMismatch {
+        detail: alloc::format!("invalid JSON for {what}: {e}"),
+    })
+}
+
 pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static>, EvalError> {
     let src = match lhs {
         Value::Json(s) | Value::Text(s) => s.as_ref(),
@@ -1143,9 +1165,7 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
     };
     // Validate the document (an invalid one still errors), then extract the
     // located value's VERBATIM source text — PG never re-serializes here.
-    parse(src).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON for path access: {e}"),
-    })?;
+    validate_unless_known_json(lhs, src, "path access")?;
     let located = match rhs {
         Value::Text(k) => locate_member(src, k),
         Value::Int(idx) => locate_index(src, i64::from(*idx)),
