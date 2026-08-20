@@ -201,6 +201,52 @@ does not apply.
 column-vs-column comparisons, and #2 without #1 skips the coercion but
 still walks the chain.
 
+## Where the campaign stands, and the finding that outranks the rest
+
+Three changes landed (v7.38.8): temporal constants carried decoded,
+the json column boundary enforced so the accessors stop re-validating,
+and object keys compared in place. Same box, interleaved, min of four,
+against a v7.38.7 server and postgres:18 on the same machine:
+
+| shape | 7.38.7 | now | PG 18 |
+|---|---|---|---|
+| window: count over a day | 21.4 | 5.0 | 1.2 |
+| window: group by kind | 22.6 | 5.3 | 4.0 |
+| window: distinct seats | 36.2 | 8.7 | 6.8 |
+| dashboard: top versions | 25.0 | 7.4 | 4.4 |
+| jsonb: containment | 13.3 | 12.3 | 4.6 |
+| **jsonb: containment in a window** | 52.5 | **39.7** | 4.7 |
+| btree: project and kind | 0.15 | 0.06 | 0.17 |
+| ingest: one row | 4.4 | 1.1 | 1.4 |
+
+Two of those are now wins. The one that stands out is containment in a
+window, and taking it apart found something that is not about jsonb at
+all:
+
+```
+WHERE traits @> '{"plan":"pro"}' AND received_at >= … AND received_at < …    39.7 ms
+WHERE received_at >= … AND received_at < … AND traits @> '{"plan":"pro"}'     8.4 ms
+```
+
+**The same query, in a different written order, costs 4.7 times as
+much.** PG answers both in 5.3 and 5.4 — it orders the quals by
+estimated cost, and we evaluate them in the order they were typed.
+This is not a jsonb problem: any query whose cheap, selective
+predicate is written after an expensive one pays the difference, and
+which one a person writes first is a matter of habit.
+
+That outranks the remaining jsonb work by a wide margin, because it is
+general. The jsonb items stay on the list behind it:
+
+- `contains` parses BOTH documents on every row, including the
+  constant on the right — 200,000 parses of the same small literal for
+  one query. There is no place to hold a prepared constant on that
+  path today; the compiled expression is where one would go.
+- the representation itself, `Value::Json(Cow<str>)`. A field access is
+  173 ns a row against PG's 7.5 to 12, and what is left after the
+  boundary and key-comparison fixes is the scan and the allocation of
+  the result.
+
 ## Next
 
 Phase A decomposition against PG18's scan path, per
