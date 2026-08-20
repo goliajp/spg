@@ -80,6 +80,7 @@ pub(crate) mod partition_walks;
 pub mod plan_cache;
 mod plpgsql;
 pub mod publications;
+mod qualorder;
 pub mod query_stats;
 mod readonly;
 pub mod reorder;
