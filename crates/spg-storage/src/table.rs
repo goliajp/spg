@@ -228,12 +228,12 @@ impl Table {
         &mut self,
         row: Row<'static>,
         xmin: u64,
-        expr_keys: Option<&[Option<IndexKey>]>,
+        expr_values: Option<&[Option<Value<'static>>]>,
     ) -> Result<(), StorageError> {
         if xmin == crate::row_header::XMIN_FROZEN {
-            return self.insert_keyed(row, expr_keys);
+            return self.insert_keyed(row, expr_values);
         }
-        self.insert_keyed(row, expr_keys)?;
+        self.insert_keyed(row, expr_values)?;
         // Insert appended `RowHeader::frozen()`; overwrite with the
         // alive-xmin header so visibility scans against snapshots
         // taken before the writer's commit hide this row. Subsequent
@@ -1217,15 +1217,22 @@ impl Table {
         self.insert_keyed(row, None)
     }
 
-    /// [`Table::insert`] with the expression indexes' keys supplied by the
-    /// caller, one slot per entry of [`Table::indices`] (`None` where the
-    /// index does not key on an expression, or where the expression
-    /// evaluated to NULL and so enters no B-tree entry, exactly as a NULL
-    /// column value does).
+    /// [`Table::insert`] with the expression indexes' VALUES supplied by
+    /// the caller, one slot per entry of [`Table::indices`] (`None` where
+    /// the index does not key on an expression, or where the expression
+    /// evaluated to NULL and so enters no entry, exactly as a NULL column
+    /// value does).
+    ///
+    /// A value, not a key: each index kind makes its own entries out of
+    /// one. A B-tree wants an [`IndexKey`], a full-text GIN wants the
+    /// lexemes of a `TsVector`, a trigram GIN wants the shingles of a
+    /// string, a JSONB GIN wants the tokens of a document. All four ask
+    /// the same question of the row — "what does this expression say
+    /// here?" — and only the caller can answer it.
     pub fn insert_keyed(
         &mut self,
         row: Row<'static>,
-        expr_keys: Option<&[Option<IndexKey>]>,
+        expr_values: Option<&[Option<Value<'static>>]>,
     ) -> Result<(), StorageError> {
         if row.len() != self.schema.columns.len() {
             return Err(StorageError::ArityMismatch {
@@ -1285,23 +1292,25 @@ impl Table {
         // holds `self.indices` mutably.
         let mut went_stale: Vec<String> = Vec::new();
         for (slot, idx) in self.indices.iter_mut().enumerate() {
+            // What this index reads for this row: the expression's value
+            // when it keys on one, the leading column's cell otherwise.
+            // `None` means the caller could not supply it, and the index
+            // drops out of service rather than take a wrong entry.
+            let supplied = if idx.expression.is_some() {
+                match expr_values.and_then(|vs| vs.get(slot)) {
+                    Some(v) => v.as_ref(),
+                    None => {
+                        went_stale.push(idx.name.clone());
+                        continue;
+                    }
+                }
+            } else {
+                Some(&row.values[idx.column_position])
+            };
+            let Some(cell) = supplied else { continue };
             match &mut idx.kind {
                 IndexKind::BTree(map) => {
-                    // A B-tree on an expression takes its key from the
-                    // caller. `column_position` names the expression's
-                    // leading column, whose value is NOT the key.
-                    let entry_key = if idx.expression.is_some() {
-                        match expr_keys.and_then(|ks| ks.get(slot)) {
-                            Some(supplied) => supplied.clone(),
-                            None => {
-                                went_stale.push(idx.name.clone());
-                                None
-                            }
-                        }
-                    } else {
-                        IndexKey::from_value(&row.values[idx.column_position])
-                    };
-                    if let Some(key) = entry_key {
+                    if let Some(key) = IndexKey::from_value(cell) {
                         // v4.40: PersistentBTreeMap has no in-place entry-or-default.
                         // Clone-then-insert keeps the same semantics — for typical
                         // unique-key schemas the Vec is 1-element so the clone is
@@ -1415,7 +1424,7 @@ impl Table {
                     // v7.12.3 — extend posting list per lexeme word.
                     // NULL or non-TsVector cell → no-op (cell carries
                     // no lexemes to index).
-                    if let Value::TsVector(lexemes) = &row.values[idx.column_position] {
+                    if let Value::TsVector(lexemes) = cell {
                         for lex in lexemes {
                             if let Some(entries) = map.get_mut(&lex.word) {
                                 entries.push(RowLocator::Hot(new_row_idx));
@@ -1434,7 +1443,7 @@ impl Table {
                     // v7.15.0 — trigram GIN. Shingle the TEXT cell
                     // into PG-compatible 3-byte trigrams and extend
                     // each trigram's posting list.
-                    if let Value::Text(s) = &row.values[idx.column_position] {
+                    if let Value::Text(s) = cell {
                         for tri in trgm::extract_trigrams(s) {
                             // r1019 — address the String-keyed map with the borrowed
                             // trigram; allocate one only for a key the map has never
@@ -1459,7 +1468,7 @@ impl Table {
                     // via the storage-local `simple_lex` (same
                     // rule as `to_tsvector('simple', text)`) and
                     // extend each lexeme's posting list.
-                    let text_cell = match &row.values[idx.column_position] {
+                    let text_cell = match cell {
                         Value::Text(s) => Some(s.as_ref()),
                         // mysqldump-style mediumtext / longtext
                         // land as Value::Text on insert; varchar
@@ -1489,7 +1498,7 @@ impl Table {
                     // list. NULL or non-Json cell contributes no
                     // tokens(`labels @> '...'` against a NULL row
                     // is always false so absence here is correct).
-                    let json_cell = match &row.values[idx.column_position] {
+                    let json_cell = match cell {
                         Value::Json(s) => Some(s.as_ref()),
                         _ => None,
                     };
@@ -1520,7 +1529,7 @@ impl Table {
                     if summaries.len() <= r {
                         summaries.resize(r + 1, None);
                     }
-                    if let Some(n) = crate::brin_scalar(&row.values[idx.column_position]) {
+                    if let Some(n) = crate::brin_scalar(cell) {
                         summaries[r] = Some(match summaries[r] {
                             Some((lo, hi)) => (lo.min(n), hi.max(n)),
                             None => (n, n),
@@ -1937,37 +1946,109 @@ impl Table {
     pub fn rebuild_expression_index(
         &mut self,
         name: &str,
-        keys: &[Option<IndexKey>],
+        values: &[Option<Value<'static>>],
     ) -> Result<bool, StorageError> {
-        if keys.len() != self.rows.len() || self.cold_row_count > 0 {
+        if values.len() != self.rows.len() || self.cold_row_count > 0 {
             return Ok(false);
         }
         let Some(pos) = self.indices.iter().position(|i| i.name == name) else {
             return Ok(false);
         };
-        if self.indices[pos].expression.is_none()
-            || !matches!(self.indices[pos].kind, IndexKind::BTree(_))
-        {
+        if self.indices[pos].expression.is_none() {
             return Ok(false);
         }
-        let mut map: crate::persistent_btree::PersistentBTreeMap<
-            IndexKey,
-            crate::posting::PostingList,
-        > = crate::persistent_btree::PersistentBTreeMap::new();
-        for (i, key) in keys.iter().enumerate() {
-            let Some(key) = key else { continue };
-            if let Some(entries) = map.get_mut(key) {
-                entries.push(RowLocator::Hot(i));
-            } else {
-                map.insert_mut(
-                    key.clone(),
-                    crate::posting::PostingList::single(RowLocator::Hot(i)),
-                );
+        // Empty the index, then re-enter every row through the ordinary
+        // maintenance arms. Rebuilding by REPLAYING the insert path is
+        // what keeps a rebuilt GIN identical to an incrementally
+        // maintained one — the tokenising lives in one place and this is
+        // not a second copy of it.
+        match &mut self.indices[pos].kind {
+            IndexKind::BTree(map) => *map = crate::persistent_btree::PersistentBTreeMap::new(),
+            IndexKind::Gin(map) | IndexKind::GinFulltext(map) => {
+                *map = crate::persistent_btree::PersistentBTreeMap::new();
             }
+            IndexKind::GinTrgm(map) | IndexKind::GinJsonb(map) => {
+                *map = crate::persistent_btree::PersistentBTreeMap::new();
+            }
+            // BRIN summarises by row position and HNSW is a graph over
+            // the rows themselves; neither is rebuilt from a value list.
+            _ => return Ok(false),
         }
-        self.indices[pos].kind = IndexKind::BTree(map);
+        for (i, value) in values.iter().enumerate() {
+            let Some(v) = value else { continue };
+            self.enter_expression_entry(pos, v, i);
+        }
         self.expr_index_complete.insert(name.into());
         Ok(true)
+    }
+}
+
+/// Extend one posting list, creating it when the key is new.
+fn push_posting(
+    map: &mut crate::persistent_btree::PersistentBTreeMap<String, crate::posting::PostingList>,
+    key: String,
+    row_idx: usize,
+) {
+    if let Some(entries) = map.get_mut(&key) {
+        entries.push(RowLocator::Hot(row_idx));
+    } else {
+        map.insert_mut(
+            key,
+            crate::posting::PostingList::single(RowLocator::Hot(row_idx)),
+        );
+    }
+}
+
+impl Table {
+    /// Add one row's entries to one expression index, from the value its
+    /// expression produced. The insert path's arms, reduced to the one
+    /// index and the one row.
+    fn enter_expression_entry(&mut self, pos: usize, cell: &Value<'static>, row_idx: usize) {
+        let idx = &mut self.indices[pos];
+        match &mut idx.kind {
+            IndexKind::BTree(map) => {
+                if let Some(key) = IndexKey::from_value(cell) {
+                    let mut entries = map
+                        .insert_mut(key.clone(), crate::posting::PostingList::new())
+                        .unwrap_or_default();
+                    entries.push(RowLocator::Hot(row_idx));
+                    map.insert_mut(key, entries);
+                }
+            }
+            IndexKind::Gin(map) => {
+                if let Value::TsVector(lexemes) = cell {
+                    for lex in lexemes {
+                        push_posting(map, lex.word.clone(), row_idx);
+                    }
+                }
+            }
+            IndexKind::GinFulltext(map) => {
+                if let Value::Text(s) = cell {
+                    for lex in fts_simple::simple_lex(s) {
+                        push_posting(map, lex, row_idx);
+                    }
+                }
+            }
+            IndexKind::GinTrgm(map) => {
+                if let Value::Text(s) = cell {
+                    for tri in trgm::extract_trigrams(s) {
+                        push_posting(
+                            map,
+                            alloc::string::ToString::to_string(trgm::trigram_str(&tri)),
+                            row_idx,
+                        );
+                    }
+                }
+            }
+            IndexKind::GinJsonb(map) => {
+                if let Value::Json(s) = cell {
+                    for tok in jsonb_gin::extract_tokens(s) {
+                        push_posting(map, tok, row_idx);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The expression indexes that are not currently usable, with the
@@ -1976,7 +2057,16 @@ impl Table {
     pub fn stale_expression_indices(&self) -> Vec<(String, String)> {
         self.indices
             .iter()
-            .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
+            .filter(|i| {
+                matches!(
+                    i.kind,
+                    IndexKind::BTree(_)
+                        | IndexKind::Gin(_)
+                        | IndexKind::GinFulltext(_)
+                        | IndexKind::GinTrgm(_)
+                        | IndexKind::GinJsonb(_)
+                )
+            })
             .filter_map(|i| i.expression.as_ref().map(|e| (i.name.clone(), e.clone())))
             .filter(|(n, _)| !self.expr_index_complete.contains(n))
             .collect()
@@ -2143,6 +2233,31 @@ impl Table {
     /// column. Populates posting lists from existing rows. Errors
     /// if the column doesn't exist, isn't `TsVector`, or the index
     /// name is taken.
+    /// A GIN index whose entries come from an EXPRESSION, not from a
+    /// column's own cell.
+    ///
+    /// `anchor_column` only gives the index a well-formed catalog
+    /// position; its type is deliberately not checked, because the
+    /// expression's type is what decides the posting-list shape and the
+    /// anchor is typically the TEXT column the expression reads. The map
+    /// starts empty and `Table::rebuild_expression_index` fills it.
+    pub fn add_gin_index_on_expression(
+        &mut self,
+        name: String,
+        anchor_column: &str,
+    ) -> Result<(), StorageError> {
+        if self.indices.iter().any(|i| i.name == name) {
+            return Err(StorageError::DuplicateIndex { name });
+        }
+        let column_position = self.schema.column_position(anchor_column).ok_or_else(|| {
+            StorageError::ColumnNotFound {
+                column: anchor_column.into(),
+            }
+        })?;
+        self.indices.push(Index::new_gin(name, column_position));
+        Ok(())
+    }
+
     pub fn add_gin_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });

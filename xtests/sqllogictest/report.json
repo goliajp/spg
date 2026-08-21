@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 75, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 94, "fail": 2, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -10,8 +10,10 @@
           "fail_reasons": [] },
         { "file": "v73814_temp_namespace.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "v73816_expression_index.test", "pass": 37, "fail": 0, "skip": 0,
-          "fail_reasons": [] }
+        { "file": "v73816_expression_index.test", "pass": 36, "fail": 1, "skip": 0,
+          "fail_reasons": ["record 32: row mismatch |   expected: [\"1\"] |   actual:   [\"0\"]"] },
+        { "file": "v73816_gin_expression.test", "pass": 20, "fail": 1, "skip": 0,
+          "fail_reasons": ["record 18: row mismatch |   expected: [\"1\"] |   actual:   [\"0\"]"] }
       ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
       "files": [

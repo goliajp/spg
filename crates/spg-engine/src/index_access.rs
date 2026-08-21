@@ -1852,18 +1852,36 @@ pub(crate) fn try_gin_seek<'a>(
     // hits the first arm, FROM-clause-derived (`plainto_tsquery($1)
     // q ... WHERE search_vector @@ q`) the same. CROSS JOIN derived
     // tables resolve `q` to a Column too.
-    let (col_pos, query) = resolve_gin_col_query(lhs, rhs, schema_cols, table_alias, ctx)
-        .or_else(|| resolve_gin_col_query(rhs, lhs, schema_cols, table_alias, ctx))?;
+    let (col_pos, query, expr_key) = resolve_gin_col_query(lhs, rhs, schema_cols, table_alias, ctx)
+        .map(|(p, q)| (p, q, lhs.as_ref()))
+        .or_else(|| {
+            resolve_gin_col_query(rhs, lhs, schema_cols, table_alias, ctx)
+                .map(|(p, q)| (p, q, rhs.as_ref()))
+        })?;
     // v7.17.0 Phase 3.P0-44 — MySQL `FULLTEXT KEY` builds a
     // `IndexKind::GinFulltext` posting list (Phase 2.2). It shares
     // the same `gin_lookup_word` shape as the tsvector-typed GIN,
     // so the MATCH-AGAINST `@@` predicate (desugared by the parser
     // into `to_tsvector(col) @@ plainto_tsquery('term')`) routes
     // through the same candidate-set seek.
-    let idx = table
-        .indices()
-        .iter()
-        .find(|i| i.column_position == col_pos && (i.is_gin() || i.is_gin_fulltext()))?;
+    // v7.38.16 — an index whose key IS this expression answers first.
+    // `column_position` on such an index is only an anchor, so matching
+    // on it alone would pick a full-text index built over a different
+    // expression — or a different text-search configuration, which is
+    // how `to_tsvector('english', body) @@ to_tsquery('english','lazy')`
+    // came to return NO ROWS with an index and one row without: the
+    // index held `lazy` from the `simple` tokeniser and the query asked
+    // for the English stem `lazi`.
+    let idx = crate::expr_index::index_for_expression(table, expr_key)
+        .and_then(|name| table.indices().iter().find(|i| i.name == name))
+        .or_else(|| {
+            let col_pos = col_pos?;
+            table.indices().iter().find(|i| {
+                i.column_position == col_pos
+                    && (i.is_gin() || i.is_gin_fulltext())
+                    && i.expression.is_none()
+            })
+        })?;
     let candidates = gin_query_candidates(idx, &query)?;
     let _ = catalog; // cold-tier row resolution unused in MVP; see below.
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(candidates.len());
@@ -1887,6 +1905,11 @@ pub(crate) fn try_gin_seek<'a>(
             spg_storage::RowLocator::Cold { .. } => {}
         }
     }
+    // v7.38.16 — count it. This seek never did, so `idx_scan` on a table
+    // whose only index is a GIN read 0 whether the index answered the
+    // query or nothing did — and a test could not tell those apart. The
+    // B-tree seeks have counted since they were written.
+    table.note_index_scan(out.len() as u64);
     Some(out)
 }
 
@@ -2199,34 +2222,44 @@ pub(crate) fn resolve_gin_col_query(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     ctx: &eval::EvalContext<'_>,
-) -> Option<(usize, spg_storage::TsQueryAst)> {
+) -> Option<(Option<usize>, spg_storage::TsQueryAst)> {
     // v7.17.0 Phase 3.P0-44 — the MATCH AGAINST desugar wraps the
     // column in `to_tsvector('simple', col)`, so we peel that wrapper
     // before the column lookup. Direct `col @@ tsquery` paths (the
     // tsvector-typed v7.12 surface) skip the wrapper entirely.
     let column = match col_side {
-        Expr::Column(c) => c,
+        Expr::Column(c) => Some(c),
         Expr::FunctionCall { name, args }
             if name.eq_ignore_ascii_case("to_tsvector") && !args.is_empty() =>
         {
             // PG `to_tsvector` accepts either `to_tsvector(col)` or
             // `to_tsvector(config, col)`. In both shapes the column
-            // we care about is the final argument.
-            if let Expr::Column(c) = args.last().unwrap() {
-                c
-            } else {
-                return None;
+            // we care about is the final argument — when there IS one.
+            //
+            // v7.38.16 — and often there is not: `to_tsvector('english',
+            // title || ' ' || body)` is PG's ordinary full-text
+            // spelling. There is no single column to name, so the caller
+            // matches the index by the EXPRESSION instead and this
+            // returns `None` for the position rather than refusing the
+            // whole seek.
+            match args.last().unwrap() {
+                Expr::Column(c) => Some(c),
+                _ => None,
             }
         }
         _ => return None,
     };
-    let c = column;
-    if let Some(q) = &c.qualifier
-        && q != table_alias
-    {
-        return None;
-    }
-    let pos = schema_cols.iter().position(|s| s.name == c.name)?;
+    let pos = match column {
+        Some(c) => {
+            if let Some(q) = &c.qualifier
+                && q != table_alias
+            {
+                return None;
+            }
+            Some(schema_cols.iter().position(|s| s.name == c.name)?)
+        }
+        None => None,
+    };
     // Const-evaluate the query side with an empty row — fails fast
     // (with a `ColumnNotFound` / similar) if the expression actually
     // depends on row data, which is exactly the bail signal we want.

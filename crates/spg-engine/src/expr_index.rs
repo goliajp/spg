@@ -18,7 +18,7 @@ use crate::EngineError;
 use crate::eval;
 use alloc::string::String;
 use alloc::vec::Vec;
-use spg_storage::{IndexKey, Table, Value};
+use spg_storage::{Table, Value};
 
 /// The parsed expression of every B-tree expression index on a table, one
 /// slot per entry of `table.indices()`, `None` where the index keys on a
@@ -31,41 +31,36 @@ impl ExprKeyPlan {
     /// `None` when the table has no expression index — the ordinary case,
     /// and the one that must stay free.
     pub(crate) fn for_table(table: &Table) -> Result<Option<Self>, EngineError> {
-        if !table
-            .indices()
-            .iter()
-            .any(|i| i.expression.is_some() && matches!(i.kind, spg_storage::IndexKind::BTree(_)))
-        {
+        if !table.indices().iter().any(|i| i.expression.is_some()) {
             return Ok(None);
         }
         let mut exprs = Vec::with_capacity(table.indices().len());
         for idx in table.indices() {
-            let parsed = match (&idx.expression, &idx.kind) {
-                (Some(src), spg_storage::IndexKind::BTree(_)) => {
-                    Some(spg_sql::parser::parse_expression(src).map_err(|e| {
-                        EngineError::Unsupported(alloc::format!(
-                            "index {:?} expression {src:?} failed to re-parse: {e:?}",
-                            idx.name
-                        ))
-                    })?)
-                }
-                _ => None,
+            let parsed = match &idx.expression {
+                Some(src) => Some(spg_sql::parser::parse_expression(src).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "index {:?} expression {src:?} failed to re-parse: {e:?}",
+                        idx.name
+                    ))
+                })?),
+                None => None,
             };
             exprs.push(parsed);
         }
         Ok(Some(Self { exprs }))
     }
 
-    /// The index keys for one row, slot-parallel to `table.indices()`.
+    /// The expression values for one row, slot-parallel to
+    /// `table.indices()`.
     ///
-    /// A slot is `None` when the index keys on a column, and also when the
-    /// expression evaluated to NULL — a NULL enters no B-tree entry, which
+    /// A slot is `None` when the index keys on a column, and also when
+    /// the expression evaluated to NULL — a NULL enters no entry, which
     /// is what a NULL column value does too.
     pub(crate) fn keys_for(
         &self,
         values: &[Value<'static>],
         ctx: &eval::EvalContext<'_>,
-    ) -> Result<Vec<Option<IndexKey>>, EngineError> {
+    ) -> Result<Vec<Option<Value<'static>>>, EngineError> {
         let row = spg_storage::Row {
             values: values.to_vec(),
         };
@@ -75,7 +70,7 @@ impl ExprKeyPlan {
                 Some(e) => {
                     let v = eval::eval_expr(e, &row, ctx)
                         .map_err(|e| EngineError::Unsupported(alloc::format!("{e:?}")))?;
-                    IndexKey::from_value(&v)
+                    (!v.is_null()).then_some(v)
                 }
                 None => None,
             });
@@ -103,7 +98,7 @@ pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
                 "index {name:?} expression {src:?} failed to re-parse: {e:?}"
             ))
         })?;
-        let mut keys: Vec<Option<IndexKey>> = Vec::with_capacity(table.stored_row_count());
+        let mut keys: Vec<Option<Value<'static>>> = Vec::with_capacity(table.stored_row_count());
         for i in 0..table.stored_row_count() {
             let Some(values) = table.row_values_at(i) else {
                 return Ok(());
@@ -113,7 +108,7 @@ pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
             };
             let v = eval::eval_expr(&expr, &row, &ctx)
                 .map_err(|e| EngineError::Unsupported(alloc::format!("{e:?}")))?;
-            keys.push(IndexKey::from_value(&v));
+            keys.push((!v.is_null()).then_some(v));
         }
         table
             .rebuild_expression_index(&name, &keys)
@@ -134,8 +129,7 @@ pub(crate) fn index_for_expression(table: &Table, expr: &spg_sql::ast::Expr) -> 
         .indices()
         .iter()
         .find(|i| {
-            matches!(i.kind, spg_storage::IndexKind::BTree(_))
-                && i.expression.as_deref() == Some(wanted.as_str())
+            i.expression.as_deref() == Some(wanted.as_str())
                 && table.expr_index_is_complete(&i.name)
         })
         .map(|i| i.name.clone())

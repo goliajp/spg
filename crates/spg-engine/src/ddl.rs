@@ -2426,8 +2426,34 @@ impl Engine {
             (Some(e), IndexMethod::Gin) => tsvector_source_column(e),
             _ => None,
         };
+        // v7.38.16 — a GIN index on an expression is PG's ordinary
+        // spelling for full-text search, and SPG refused it outright:
+        // `USING gin (to_tsvector('english', title || ' ' || body))` and
+        // `USING gin (coalesce(title,''))` and `USING gin ((meta ->
+        // 'tags'))` all failed the DDL, so a customer's schema did not
+        // load at all. Only `to_tsvector(col)` worked, because
+        // `tsvector_source_column` recognises a bare column as the last
+        // argument and nothing else.
+        //
+        // The index kind follows the EXPRESSION's result type, since
+        // there is no column whose type could decide it.
+        let gin_expr_kind = match (&stmt.expression, stmt.method) {
+            // Every GIN expression key, including `to_tsvector(col)`.
+            // That one used to route to the MySQL FULLTEXT posting list,
+            // which tokenises with the `simple` rule — so a query written
+            // `to_tsvector('english', body) @@ to_tsquery('english','lazy')`
+            // looked for the stem `lazi` in a list that held `lazy`, found
+            // nothing, and returned NO ROWS where the same query without
+            // the index returned one. Keying on the evaluated tsvector
+            // puts the query's own configuration in the index.
+            (Some(e), IndexMethod::Gin) => {
+                crate::describe::describe_expr_type(e, &table.schema().columns)
+            }
+            _ => None,
+        };
         if let Some(key_expr) = &stmt.expression
             && gin_fulltext_col.is_none()
+            && gin_expr_kind.is_none()
             && matches!(
                 stmt.method,
                 IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
@@ -2444,7 +2470,33 @@ impl Engine {
                 "expression keys are not supported on {method} indexes: {key_expr}"
             )));
         }
-        if let Some(col) = gin_fulltext_col.clone() {
+        if let Some(ty) = gin_expr_kind {
+            // The expression's own type picks the posting-list shape.
+            // `column_position` still names the expression's leading
+            // column so the catalog stays well-formed; the ENTRIES come
+            // from `expr_index::refresh` below, never from that column.
+            let anchor = stmt.column.clone();
+            match ty {
+                spg_storage::DataType::TsVector => table
+                    .add_gin_index_on_expression(stmt.name.clone(), &anchor)
+                    .map_err(EngineError::Storage)?,
+                spg_storage::DataType::Json | spg_storage::DataType::Jsonb => table
+                    .add_gin_jsonb_index(stmt.name.clone(), &anchor)
+                    .map_err(EngineError::Storage)?,
+                spg_storage::DataType::Text | spg_storage::DataType::Varchar(_) => table
+                    .add_gin_trgm_index(stmt.name.clone(), &anchor)
+                    .map_err(EngineError::Storage)?,
+                _ => {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "GIN cannot index an expression of type {ty:?}: {}",
+                        stmt.expression.as_ref().map_or_else(
+                            alloc::string::String::new,
+                            alloc::string::ToString::to_string
+                        )
+                    )));
+                }
+            }
+        } else if let Some(col) = gin_fulltext_col.clone() {
             table
                 .add_gin_fulltext_index(stmt.name.clone(), &col)
                 .map_err(EngineError::Storage)?;
