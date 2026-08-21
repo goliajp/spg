@@ -645,7 +645,7 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
             root,
             &format!("{docker} compose -f xtests/oracle/docker-compose.yml up -d --wait mysql"),
         )?;
-        let curi = "--mysql-host=127.0.0.1 --mysql-port=53306 --mysql-user=root --mysql-password=testpass --mysql-db=testdb";
+        let curi = "--mysql-host=127.0.0.1 --mysql-port=15433 --mysql-user=root --mysql-password=testpass --mysql-db=testdb";
         sh(
             root,
             &format!("{sysbench} oltp_read_write {curi} --tables=2 --table-size=1000 prepare"),

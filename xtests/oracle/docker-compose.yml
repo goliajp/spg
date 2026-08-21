@@ -20,7 +20,7 @@ services:
       POSTGRES_DB: testdb
       POSTGRES_INITDB_ARGS: --locale=C.UTF-8 --encoding=UTF8
     ports:
-      - "55432:5432"
+      - "15432:5432"
     tmpfs:
       # 18+ image convention: mount the PARENT dir; the entrypoint
       # places data in a subdirectory (docker-library/postgres#37).
@@ -39,7 +39,7 @@ services:
       MYSQL_ROOT_PASSWORD: testpass
       MYSQL_DATABASE: testdb
     ports:
-      - "53306:3306"
+      - "15433:3306"
     tmpfs:
       - /var/lib/mysql
     healthcheck:
@@ -56,7 +56,7 @@ services:
       MARIADB_ROOT_PASSWORD: testpass
       MARIADB_DATABASE: testdb
     ports:
-      - "53307:3306"
+      - "15434:3306"
     tmpfs:
       - /var/lib/mysql
     healthcheck:
