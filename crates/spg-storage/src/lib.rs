@@ -3350,6 +3350,20 @@ pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
 }
 
 impl Index {
+    /// Any key this B-tree currently holds, or `None` if it holds none.
+    ///
+    /// A probe built from a query literal has to be the same SHAPE as the
+    /// keys the maintenance side made, or `lookup_eq` misses every row and
+    /// the caller reads the empty answer as "no rows match". One stored
+    /// key settles it: an index keys one expression, whose values are one
+    /// type.
+    pub fn sample_key(&self) -> Option<&IndexKey> {
+        match &self.kind {
+            IndexKind::BTree(map) => map.iter().next().map(|(k, _)| k),
+            _ => None,
+        }
+    }
+
     fn new_btree(name: String, column_position: usize) -> Self {
         Self {
             name,
@@ -4453,6 +4467,19 @@ pub fn brin_scalar(v: &Value<'_>) -> Option<i64> {
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
+    /// v7.38.16 — names of the expression indexes whose B-tree currently
+    /// holds keys derived from the EXPRESSION.
+    ///
+    /// Every catalog written before this version stored, under an
+    /// expression index, the values of its leading column — keys no
+    /// lookup could ever match, which is why every read path guarded
+    /// itself with `expression.is_none()` and the index bought nothing
+    /// while costing 1.9x a plain insert to maintain.
+    ///
+    /// Deliberately NOT persisted: a table read off disk starts with the
+    /// set empty, so those old wrong keys can never answer a query. The
+    /// engine, which owns the expression evaluator, refills it.
+    expr_index_complete: alloc::collections::BTreeSet<String>,
     /// v7.37.15 (Phase C.1) — stable per-catalog relation identity.
     /// [`RelId::UNASSIGNED`](row_header::RelId::UNASSIGNED) until
     /// `Catalog::create_table` (or the deserialize dense-assign pass)

@@ -59,7 +59,7 @@ fn update_seek_positions_engages_on_indexed_eq() {
     // so it needs one. `unbounded` accepts every header, which is what this
     // test's freshly-inserted rows are under.
     let snapshot = spg_storage::snapshot::Snapshot::unbounded();
-    let positions = try_index_seek_positions(w, &schema_cols, table, "b", &snapshot);
+    let positions = try_index_seek_positions(w, &schema_cols, table, "b", &snapshot, false);
     assert_eq!(positions, Some(vec![42]), "seek did not engage");
 }
 

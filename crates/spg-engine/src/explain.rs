@@ -515,7 +515,17 @@ fn split_index_cond<'a>(
         return (Some(where_), Vec::new());
     }
     for (i, c) in conjuncts.iter().enumerate() {
-        if try_index_seek(c, cols, engine.active_catalog(), table, alias, &snap).is_some() {
+        if try_index_seek(
+            c,
+            cols,
+            engine.active_catalog(),
+            table,
+            alias,
+            &snap,
+            engine.backslash_escapes,
+        )
+        .is_some()
+        {
             let residual: Vec<&Expr> = conjuncts
                 .iter()
                 .enumerate()
@@ -708,11 +718,17 @@ fn scan_node(
         let cols = &table.schema().columns;
         let a = alias.unwrap_or(name);
         let snap = engine.current_snapshot();
-        try_index_seek(w, cols, engine.active_catalog(), table, a, &snap)
-            .map(|_| ())
-            .or_else(|| {
-                crate::index_access::try_gin_jsonb_seek(w, cols, table, a, &snap).map(|_| ())
-            })
+        try_index_seek(
+            w,
+            cols,
+            engine.active_catalog(),
+            table,
+            a,
+            &snap,
+            engine.backslash_escapes,
+        )
+        .map(|_| ())
+        .or_else(|| crate::index_access::try_gin_jsonb_seek(w, cols, table, a, &snap).map(|_| ()))
         // NOT covered here: `try_gin_seek`, the full-text door. It needs a
         // catalog and an `EvalContext` this node does not build, so a
         // `@@ to_tsquery(...)` that really does use its GIN index still

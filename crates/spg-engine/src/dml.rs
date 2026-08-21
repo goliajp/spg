@@ -823,6 +823,14 @@ impl Engine {
         let r = self
             .exec_update_cancel_inner(stmt, None, cancel)
             .map_err(|e| enrich_not_null(e, &table));
+        // v7.38.16 — an UPDATE rewrites `rows`, which moves the positions
+        // an expression index stores; storage retires it and only an
+        // evaluator can refill it. Do that here, while the statement
+        // still holds the relation, so the index does not quietly stop
+        // being used after the table's first UPDATE.
+        if r.is_ok() {
+            crate::expr_index::refresh_named(self.active_catalog_mut(), &table)?;
+        }
         // 7.38.1 S2.1 — an AUTOCOMMIT writer's tuple locks live only
         // as long as its statement (its implicit tx commits with it);
         // in-tx locks stay held until COMMIT/ROLLBACK releases them.
@@ -1643,7 +1651,14 @@ impl Engine {
         // exactly the same test, so the two must agree.
         let scan_snapshot = self.current_snapshot();
         let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
-            try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str(), &scan_snapshot)
+            try_index_seek_positions(
+                w,
+                &schema_cols,
+                table,
+                stmt.table.as_str(),
+                &scan_snapshot,
+                self.backslash_escapes,
+            )
         });
         let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
         let candidate_positions: Vec<usize> = match &seek_positions {
@@ -3200,6 +3215,13 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         let r = self.exec_delete_cancel_inner(stmt, cancel);
+        // v7.38.16 — see the UPDATE path: a DELETE compacts `rows`, so
+        // every position an expression index holds is stale and only an
+        // evaluator can rebuild it.
+        if r.is_ok() {
+            let name = stmt.table.clone();
+            crate::expr_index::refresh_named(self.active_catalog_mut(), &name)?;
+        }
         // 7.38.1 S2.1 — see exec_update_cancel: autocommit tuple locks
         // end with their statement.
         self.release_autocommit_stmt_locks();
@@ -3608,6 +3630,7 @@ impl Engine {
         // v7.39 (round 524) — with the session: `DELETE … WHERE
         // current_setting('app.tenant') = …` matched nothing.
         let sess = self.dml_session();
+        let mysql_dialect = self.backslash_escapes;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -3655,7 +3678,14 @@ impl Engine {
         // re-evaluates per candidate. Downstream passes assume
         // ascending position order, so the seek result is sorted.
         let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
-            try_index_seek_positions(w, &schema_cols, table, stmt.table.as_str(), &scan_snapshot)
+            try_index_seek_positions(
+                w,
+                &schema_cols,
+                table,
+                stmt.table.as_str(),
+                &scan_snapshot,
+                mysql_dialect,
+            )
         });
         let candidate_positions: Vec<usize> = match seek_positions {
             Some(mut list) => {
@@ -7390,6 +7420,12 @@ fn insert_parsed_rows(
     EngineError,
 > {
     let arity = column_meta.len();
+    // v7.38.16 — an index keyed on an expression takes its key from here:
+    // storage has no evaluator, so an insert that does not carry the keys
+    // leaves the index unusable until something rebuilds it. Parse once
+    // per statement; `None` for the ordinary table, which pays nothing.
+    crate::expr_index::refresh(table)?;
+    let expr_plan = crate::expr_index::ExprKeyPlan::for_table(table)?;
     let mut affected = 0usize;
     let mut oc_pairs: Vec<(
         spg_storage::row_header::RowId,
@@ -7469,7 +7505,15 @@ fn insert_parsed_rows(
         // shares the caller-supplied xmin so concurrent readers
         // see all the rows commit together (autocommit) or stay
         // hidden until the enclosing tx COMMIT (explicit tx).
-        table.insert_with_xmin(row, xmin)?;
+        let expr_keys = match &expr_plan {
+            Some(plan) => {
+                let schema = table.schema().clone();
+                let ctx = crate::eval::EvalContext::new(&schema.columns, None);
+                Some(plan.keys_for(&row.values, &ctx)?)
+            }
+            None => None,
+        };
+        table.insert_with_xmin_keyed(row, xmin, expr_keys.as_deref())?;
         affected += 1;
         // v7.12.4 — AFTER INSERT row-level triggers fire post-
         // write. Return value is ignored (PG semantics); we

@@ -302,6 +302,7 @@ impl Engine {
                             table,
                             alias,
                             &snap,
+                            self.backslash_escapes,
                         )
                     });
                     match seek_positions {
@@ -4420,6 +4421,7 @@ impl Engine {
                 table,
                 alias,
                 seek_snapshot,
+                ctx.mysql_dialect,
             )
             .or_else(|| {
                 // v7.12.3 — GIN-accelerated `WHERE col @@
@@ -8793,7 +8795,14 @@ impl Engine {
         // but a walk that silently reorders its answer when an index happens
         // to exist is a difference nobody asked for.
         let seek_positions: Option<Vec<usize>> = stmt.where_.as_ref().and_then(|w| {
-            crate::index_access::try_index_seek_positions(w, &cols, table, alias, &snapshot)
+            crate::index_access::try_index_seek_positions(
+                w,
+                &cols,
+                table,
+                alias,
+                &snapshot,
+                self.backslash_escapes,
+            )
         });
 
         let mut values: Vec<Value<'static>> = Vec::with_capacity(projection.len());

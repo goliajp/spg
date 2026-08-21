@@ -408,6 +408,7 @@ pub(crate) fn try_index_seek_positions(
     table: &Table,
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
+    mysql: bool,
 ) -> Option<Vec<usize>> {
     // v7.37.16 — two-sided range (BETWEEN) position seek, mirroring the
     // SELECT path's try_range_seek (same parse, same rows/4 selectivity
@@ -693,12 +694,14 @@ pub(crate) fn try_index_seek_positions(
             }
         }
         if let Some((_, c)) = best {
-            return try_index_seek_positions(c, schema_cols, table, table_alias, snapshot);
+            return try_index_seek_positions(c, schema_cols, table, table_alias, snapshot, mysql);
         }
-        if let Some(p) = try_index_seek_positions(lhs, schema_cols, table, table_alias, snapshot) {
+        if let Some(p) =
+            try_index_seek_positions(lhs, schema_cols, table, table_alias, snapshot, mysql)
+        {
             return Some(p);
         }
-        return try_index_seek_positions(rhs, schema_cols, table, table_alias, snapshot);
+        return try_index_seek_positions(rhs, schema_cols, table, table_alias, snapshot, mysql);
     }
     let Expr::Binary {
         lhs,
@@ -708,6 +711,16 @@ pub(crate) fn try_index_seek_positions(
     else {
         return None;
     };
+    // v7.38.16 — `lower(s) = 'x42'` has no column on either side. Until
+    // this version nothing could answer it but a scan: the index that
+    // names exactly that expression held the leading column's values, so
+    // its keys could not match, and every lookup path said
+    // `expression.is_none()` to stay away from them.
+    if let Some(p) = try_expression_index_seek(lhs, rhs, table, snapshot, mysql)
+        .or_else(|| try_expression_index_seek(rhs, lhs, table, snapshot, mysql))
+    {
+        return Some(p);
+    }
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
@@ -1319,6 +1332,7 @@ pub(crate) fn try_index_seek<'a>(
     table: &'a Table,
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
+    mysql: bool,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
     // v7.38 (perf) — a range predicate (`col BETWEEN a AND b`, `col > x`) walks
     // the index range instead of full-scanning. Tried before the `AND` recurse
@@ -1548,15 +1562,30 @@ pub(crate) fn try_index_seek<'a>(
             }
         }
         if let Some((_, c)) = best {
-            return try_index_seek(c, schema_cols, catalog, table, table_alias, snapshot);
+            return try_index_seek(c, schema_cols, catalog, table, table_alias, snapshot, mysql);
         }
         // No equality conjunct is indexable — keep the old recursion
         // for the range / IN-list shapes hiding inside the AND.
-        if let Some(rows) = try_index_seek(lhs, schema_cols, catalog, table, table_alias, snapshot)
-        {
+        if let Some(rows) = try_index_seek(
+            lhs,
+            schema_cols,
+            catalog,
+            table,
+            table_alias,
+            snapshot,
+            mysql,
+        ) {
             return Some(rows);
         }
-        return try_index_seek(rhs, schema_cols, catalog, table, table_alias, snapshot);
+        return try_index_seek(
+            rhs,
+            schema_cols,
+            catalog,
+            table,
+            table_alias,
+            snapshot,
+            mysql,
+        );
     }
     // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeks each literal
     // and unions the rows (PG's bitmap index scan) instead of a full scan
@@ -1580,6 +1609,20 @@ pub(crate) fn try_index_seek<'a>(
     else {
         return None;
     };
+    // v7.38.16 — `lower(s) = 'x42'` has no column on either side. Until
+    // this version nothing could answer it but a scan: the index that
+    // names exactly that expression held the leading column's values, so
+    // its keys could not match, and every lookup path said
+    // `expression.is_none()` to stay away from them.
+    if let Some(positions) = try_expression_index_seek(lhs, rhs, table, snapshot, mysql)
+        .or_else(|| try_expression_index_seek(rhs, lhs, table, snapshot, mysql))
+    {
+        let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(positions.len());
+        for i in positions {
+            out.push(Cow::Borrowed(table.rows().get(i)?));
+        }
+        return Some(out);
+    }
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
@@ -2264,6 +2307,69 @@ pub(crate) fn try_pk_predicate(
 /// See [`spg_storage::IndexKey::from_value_for_column`]: every key under
 /// one index comes from one column, so a probe built in another space
 /// finds nothing — and nothing reads exactly like "no matching rows".
+/// Answer `<expression> = <literal>` from an index keyed on exactly that
+/// expression.
+///
+/// Declines — leaving the caller to scan — unless the index is complete
+/// (its B-tree really holds the expression's values; see
+/// `Table::expr_index_is_complete`) and the probe key has the same shape
+/// as the keys already stored. That second test is the load-bearing one:
+/// a candidate set that is too LARGE only costs the re-check the caller
+/// runs anyway, but one that is too SMALL is a silently wrong answer, and
+/// a probe of the wrong shape misses every entry there is.
+fn try_expression_index_seek(
+    expr_side: &Expr,
+    lit_side: &Expr,
+    table: &Table,
+    snapshot: &spg_storage::snapshot::Snapshot,
+    mysql: bool,
+) -> Option<Vec<usize>> {
+    // Under MySQL a text comparison folds case, and this B-tree is keyed
+    // by bytes: `lower(s) = 'X42'` is TRUE there and would find nothing
+    // here. Decline and let the scan answer it. Non-text keys do not
+    // fold, so `(k + 0) = 42` keeps its seek in both dialects.
+    if mysql && !matches!(expr_side, Expr::Column(_) | Expr::Literal(_)) {
+        let probe = match lit_side {
+            Expr::Literal(l) => crate::eval::literal_to_value(l),
+            _ => return None,
+        };
+        if matches!(probe, Value::Text(_) | Value::BpChar(_)) {
+            return None;
+        }
+    }
+    if matches!(expr_side, Expr::Column(_) | Expr::Literal(_)) {
+        return None;
+    }
+    let Expr::Literal(l) = lit_side else {
+        return None;
+    };
+    let name = crate::expr_index::index_for_expression(table, expr_side)?;
+    let idx = table.indices().iter().find(|i| i.name == name)?;
+    let key = IndexKey::from_value(&crate::eval::literal_to_value(l))?;
+    if idx
+        .sample_key()
+        .is_some_and(|k| core::mem::discriminant(k) != core::mem::discriminant(&key))
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for loc in idx.lookup_eq(&key) {
+        match *loc {
+            spg_storage::RowLocator::Hot(i) => {
+                if table.is_row_visible(i, snapshot) {
+                    out.push(i);
+                }
+            }
+            // A cold body is not readable from here; hand the whole
+            // query back to the scan rather than answer it short.
+            spg_storage::RowLocator::Cold { .. } => return None,
+        }
+    }
+    out.sort_unstable();
+    table.note_index_scan(out.len() as u64);
+    Some(out)
+}
+
 fn probe_key(schema_cols: &[ColumnSchema], col_pos: usize, value: &Value<'_>) -> Option<IndexKey> {
     IndexKey::from_value_for_column(value, schema_cols.get(col_pos)?.ty)
 }

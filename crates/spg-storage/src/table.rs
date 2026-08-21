@@ -13,6 +13,7 @@ impl Table {
     pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,
+            expr_index_complete: alloc::collections::BTreeSet::new(),
             rel_id: crate::row_header::RelId::UNASSIGNED,
             rows: PersistentVec::new(),
             headers: PersistentVec::new(),
@@ -218,10 +219,21 @@ impl Table {
     /// behaviour so the legacy in-memory / WAL-replay paths keep
     /// returning identical results when they end up here.
     pub fn insert_with_xmin(&mut self, row: Row<'static>, xmin: u64) -> Result<(), StorageError> {
+        self.insert_with_xmin_keyed(row, xmin, None)
+    }
+
+    /// [`Table::insert_with_xmin`] with the expression indexes' keys
+    /// supplied. See [`Table::insert_keyed`].
+    pub fn insert_with_xmin_keyed(
+        &mut self,
+        row: Row<'static>,
+        xmin: u64,
+        expr_keys: Option<&[Option<IndexKey>]>,
+    ) -> Result<(), StorageError> {
         if xmin == crate::row_header::XMIN_FROZEN {
-            return self.insert(row);
+            return self.insert_keyed(row, expr_keys);
         }
-        self.insert(row)?;
+        self.insert_keyed(row, expr_keys)?;
         // Insert appended `RowHeader::frozen()`; overwrite with the
         // alive-xmin header so visibility scans against snapshots
         // taken before the writer's commit hide this row. Subsequent
@@ -1190,7 +1202,31 @@ impl Table {
     /// Insert one row after validating it matches the schema (length + type).
     /// Returns `StorageError` on mismatch — the table is left unchanged.
     /// Updates every defined index with the new row's key.
+    /// Insert a row, maintaining every index that keys on a column's own
+    /// value.
+    ///
+    /// An index that keys on an EXPRESSION is not one of those: its key is
+    /// not in the row, and this crate has no expression evaluator. Callers
+    /// that can compute those keys pass them through
+    /// [`Table::insert_keyed`]; this entry point cannot, so it marks each
+    /// such index incomplete and the engine rebuilds it before it is next
+    /// consulted. The index is never left holding keys that do not match
+    /// its expression — that was the v6.8.2 shape, and it cost 1.9x a
+    /// plain insert to maintain something no lookup could match.
     pub fn insert(&mut self, row: Row<'static>) -> Result<(), StorageError> {
+        self.insert_keyed(row, None)
+    }
+
+    /// [`Table::insert`] with the expression indexes' keys supplied by the
+    /// caller, one slot per entry of [`Table::indices`] (`None` where the
+    /// index does not key on an expression, or where the expression
+    /// evaluated to NULL and so enters no B-tree entry, exactly as a NULL
+    /// column value does).
+    pub fn insert_keyed(
+        &mut self,
+        row: Row<'static>,
+        expr_keys: Option<&[Option<IndexKey>]>,
+    ) -> Result<(), StorageError> {
         if row.len() != self.schema.columns.len() {
             return Err(StorageError::ArityMismatch {
                 expected: self.schema.columns.len(),
@@ -1244,10 +1280,28 @@ impl Table {
         // Pre-validate before mutating: ensure indices receive an IndexKey.
         // For NSW we defer the graph update to *after* the row is pushed
         // so the kNN search can see it in `self.rows`.
-        for idx in &mut self.indices {
+        // Expression indexes whose key the caller could not supply. Named
+        // here and struck from `expr_index_complete` after the loop, which
+        // holds `self.indices` mutably.
+        let mut went_stale: Vec<String> = Vec::new();
+        for (slot, idx) in self.indices.iter_mut().enumerate() {
             match &mut idx.kind {
                 IndexKind::BTree(map) => {
-                    if let Some(key) = IndexKey::from_value(&row.values[idx.column_position]) {
+                    // A B-tree on an expression takes its key from the
+                    // caller. `column_position` names the expression's
+                    // leading column, whose value is NOT the key.
+                    let entry_key = if idx.expression.is_some() {
+                        match expr_keys.and_then(|ks| ks.get(slot)) {
+                            Some(supplied) => supplied.clone(),
+                            None => {
+                                went_stale.push(idx.name.clone());
+                                None
+                            }
+                        }
+                    } else {
+                        IndexKey::from_value(&row.values[idx.column_position])
+                    };
+                    if let Some(key) = entry_key {
                         // v4.40: PersistentBTreeMap has no in-place entry-or-default.
                         // Clone-then-insert keeps the same semantics — for typical
                         // unique-key schemas the Vec is 1-element so the clone is
@@ -1477,6 +1531,9 @@ impl Table {
                 // is visible to the kNN-graph connect step).
                 IndexKind::Nsw(_) => {}
             }
+        }
+        for name in went_stale {
+            self.expr_index_complete.remove(&name);
         }
         // v7.39 (round 215) — maintain the range-exclusion indexes for the
         // freshly-inserted row (before the move; `new_row_idx` is the slot it
@@ -1835,6 +1892,94 @@ impl Table {
             ..Index::new_btree(name, column_position)
         });
         Ok(())
+    }
+
+    /// One row's stored values, by physical position — the same positions
+    /// a `RowLocator::Hot` names. Includes rows no snapshot can see: an
+    /// index entry outlives the version it points at, and visibility is
+    /// decided when the entry is followed, not when it is made.
+    pub fn row_values_at(&self, position: usize) -> Option<&[Value<'static>]> {
+        self.rows.get(position).map(|r| r.values.as_slice())
+    }
+
+    /// Physical row count, dead versions included.
+    pub fn stored_row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Every path that rewrites `rows` wholesale, or appends without
+    /// keying, drops the expression indexes back to unusable. They hold
+    /// row positions, and this crate cannot re-derive their keys.
+    fn invalidate_expr_indices(&mut self) {
+        self.expr_index_complete.clear();
+    }
+
+    /// Is this expression index's B-tree currently keyed by its
+    /// expression's value, and therefore safe to look up in?
+    ///
+    /// `false` for every index read off disk, for one that a plain
+    /// [`Table::insert`] has touched since it was built, and for an index
+    /// that keys on a column (which has no expression to be complete
+    /// about — ask `expression.is_none()` instead).
+    pub fn expr_index_is_complete(&self, name: &str) -> bool {
+        self.expr_index_complete.contains(name)
+    }
+
+    /// Rebuild an expression index's B-tree from `keys`, one per row of
+    /// this table in row order, and mark it complete.
+    ///
+    /// The caller owns the evaluator, so it owns the keys; this crate
+    /// only owns the invariant that the map and the flag move together.
+    /// Returns `false` — index untouched, still incomplete — when the
+    /// index does not key on an expression, is not a B-tree, the key
+    /// count does not match the row count, or any row body lives in a
+    /// cold segment (whose values the caller could not have evaluated).
+    pub fn rebuild_expression_index(
+        &mut self,
+        name: &str,
+        keys: &[Option<IndexKey>],
+    ) -> Result<bool, StorageError> {
+        if keys.len() != self.rows.len() || self.cold_row_count > 0 {
+            return Ok(false);
+        }
+        let Some(pos) = self.indices.iter().position(|i| i.name == name) else {
+            return Ok(false);
+        };
+        if self.indices[pos].expression.is_none()
+            || !matches!(self.indices[pos].kind, IndexKind::BTree(_))
+        {
+            return Ok(false);
+        }
+        let mut map: crate::persistent_btree::PersistentBTreeMap<
+            IndexKey,
+            crate::posting::PostingList,
+        > = crate::persistent_btree::PersistentBTreeMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let Some(key) = key else { continue };
+            if let Some(entries) = map.get_mut(key) {
+                entries.push(RowLocator::Hot(i));
+            } else {
+                map.insert_mut(
+                    key.clone(),
+                    crate::posting::PostingList::single(RowLocator::Hot(i)),
+                );
+            }
+        }
+        self.indices[pos].kind = IndexKind::BTree(map);
+        self.expr_index_complete.insert(name.into());
+        Ok(true)
+    }
+
+    /// The expression indexes that are not currently usable, with the
+    /// expression each one keys on. The engine evaluates these per row and
+    /// hands the results back to [`Table::rebuild_expression_index`].
+    pub fn stale_expression_indices(&self) -> Vec<(String, String)> {
+        self.indices
+            .iter()
+            .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
+            .filter_map(|i| i.expression.as_ref().map(|e| (i.name.clone(), e.clone())))
+            .filter(|(n, _)| !self.expr_index_complete.contains(n))
+            .collect()
     }
 
     /// v7.38.1 (L12) — upgrade a leading-column B-tree that carries
@@ -2456,6 +2601,7 @@ impl Table {
             values.push(fill_value.clone());
             new_rows.push_mut(Row::new(values));
         }
+        self.invalidate_expr_indices();
         self.rows = new_rows;
     }
 
@@ -2514,6 +2660,7 @@ impl Table {
             }
             new_rows.push_mut(Row::new(values));
         }
+        self.invalidate_expr_indices();
         self.rows = new_rows;
         // Drop indices on the column outright; shift the rest.
         // v7.38.1 (L12) — an index whose EXTRA columns name the dropped
@@ -2586,6 +2733,7 @@ impl Table {
     /// but skips the per-position bookkeeping for the all-removed
     /// fast path. Indices are rebuilt (empty).
     pub fn truncate(&mut self) {
+        self.invalidate_expr_indices();
         self.rows = PersistentVec::new();
         // v7.37.15 (Phase A.2) — keep headers lock-step.
         self.headers = PersistentVec::new();
@@ -2706,6 +2854,7 @@ impl Table {
                 }
             }
         }
+        self.invalidate_expr_indices();
         self.rows = new_rows;
         self.headers = new_headers;
         self.rowids = new_rowids;
@@ -2723,6 +2872,10 @@ impl Table {
     /// Used by `Catalog::apply_redo` to coalesce per-record rebuilds
     /// across a batch of `RowChange`s into one rebuild per touched table.
     pub fn rebuild_indices_pub(&mut self) {
+        // Rebuilding from `column_position` cannot reproduce an
+        // expression index's keys; it would refill it with the leading
+        // column's values, which is the shape this version removed.
+        self.invalidate_expr_indices();
         self.rebuild_indices();
     }
 
@@ -2775,6 +2928,7 @@ impl Table {
             };
             new_rowids.push_mut(rid);
         }
+        self.invalidate_expr_indices();
         self.rows = new_rows;
         self.headers = new_headers;
         self.rowids = new_rowids;
@@ -2809,6 +2963,7 @@ impl Table {
             );
             new_rowids.push_mut(rid);
         }
+        self.invalidate_expr_indices();
         self.rows = new_rows;
         self.headers = new_headers;
         self.rowids = new_rowids;
@@ -2843,6 +2998,7 @@ impl Table {
             });
         }
         validate_row_against_schema(&row.values, &self.schema)?;
+        self.invalidate_expr_indices();
         self.hot_bytes = self
             .hot_bytes
             .saturating_add(row_body_encoded_len(&row, &self.schema) as u64);
@@ -2902,6 +3058,7 @@ impl Table {
         let old_bytes = row_body_encoded_len(old_row, &self.schema) as u64;
         let new_row = Row::new(new_values);
         let new_bytes = row_body_encoded_len(&new_row, &self.schema) as u64;
+        self.invalidate_expr_indices();
         self.rows = self
             .rows
             .set(position, new_row)
@@ -3084,6 +3241,7 @@ impl Table {
                     })
                     .collect()
             };
+        self.invalidate_expr_indices();
         self.rows = self
             .rows
             .set(position, new_row)
@@ -3227,6 +3385,10 @@ impl Table {
     /// shift bookkeeping across B-tree + NSW — would be far more
     /// invasive than the savings justify.
     fn rebuild_indices(&mut self) {
+        // Rebuilding from `column_position` cannot reproduce an
+        // expression index's keys; it would refill it with the leading
+        // column's values, which is the shape this version removed.
+        self.invalidate_expr_indices();
         // v5.2.3: capture every `Cold` locator on every BTree index
         // before the rebuild, so the from-rows re-emission below
         // (which only produces `Hot` locators) doesn't drop cold-

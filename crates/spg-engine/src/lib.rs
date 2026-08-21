@@ -59,6 +59,7 @@ pub mod eval;
 mod execute;
 mod explain;
 mod expr_analysis;
+mod expr_index;
 pub(crate) mod extsort;
 pub mod fts;
 mod guc_catalog;
@@ -2163,6 +2164,10 @@ impl Engine {
                 let mut catalog =
                     Catalog::deserialize(catalog_bytes).map_err(EngineError::Storage)?;
                 crate::ddl::rebuild_all_excl_indexes(&mut catalog);
+                // v7.38.16 — and refill the expression indexes, whose keys
+                // the format cannot carry: what is on disk under one was
+                // written by a version that stored the wrong values there.
+                crate::expr_index::rebuild_all(&mut catalog);
                 let users = users::deserialize_users(user_bytes)
                     .map_err(|e| EngineError::Unsupported(alloc::format!("users restore: {e}")))?;
                 let publications = match pub_bytes {
@@ -2287,6 +2292,10 @@ impl Engine {
             EnvelopeParse::Bare => {
                 let mut catalog = Catalog::deserialize(buf).map_err(EngineError::Storage)?;
                 crate::ddl::rebuild_all_excl_indexes(&mut catalog);
+                // v7.38.16 — and refill the expression indexes, whose keys
+                // the format cannot carry: what is on disk under one was
+                // written by a version that stored the wrong values there.
+                crate::expr_index::rebuild_all(&mut catalog);
                 Ok(Self::restore(catalog))
             }
         }
