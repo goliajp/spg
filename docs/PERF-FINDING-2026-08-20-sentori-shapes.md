@@ -542,3 +542,92 @@ points, not a diagnosis. The Pre-Phase-A gate is satisfied: the gap is
 measured against the reference the customer actually runs, on a box
 whose noise floor was measured in the same run, and it reproduces on a
 second machine.
+
+---
+
+## v7.38.13 Phase A — the jsonb accessor, and two refuted predictions
+
+The `dashboard: top versions` cell (`traits->>'version'` grouped over
+25,000 rows) is 2.1-2.2x behind PG18 and was the largest remaining
+loss. Phase A below; **the attack it produced measured SLOWER and was
+reverted.** What survives is the decomposition, and two prediction
+failures worth more than the attack would have been.
+
+### Refuted #1 — "the key scan is the cost"
+
+The letter draft said: your object canonicalises to sorted keys, so
+`->>'version'` scans past every other key. Discriminator: read the
+FIRST key instead of the last.
+
+```
+traits->>'version'  (last key)    9.191 ms
+traits->>'country'  (first key)   9.328 ms
+```
+
+Identical. The scan position does not matter, so the cost is not the
+scan. (The sentence had already been written into the customer letter;
+it was removed.)
+
+### The cost IS byte-proportional — but on which path?
+
+Same query, same row count, only the document size differing:
+
+```
+16-byte document    89 ns/row
+927-byte document  350 ns/row
+                   -> 0.286 ns/byte, i.e. memcpy speed
+```
+
+A byte-proportional copy of the document, once per row. Reading the
+code found the shape of it: `Value::Json(Cow<'arena, str>)` supports
+borrowing, but `eval_expr`'s general binary arm evaluates both
+operands OWNED, and v7.32's borrow channel (`eval_expr_cow`) is wired
+to the six comparison operators only. The four path accessors read
+their operands exactly as a comparison does.
+
+### Refuted #2 — the pricing vehicle was on a different path
+
+The split (92 ns/row accessor machinery, 126 ns/row column operand)
+was measured with `count(traits->>'version')` as the vehicle. A probe
+that returns a wrong answer from the new code proved that path is
+never taken inside `count()`:
+
+```
+simple projection      -> PROBE     (path live)
+GROUP BY key           -> PROBE     (path live)
+count(traits->>'...')  -> 25000     (path NOT live; a Null probe left
+                                     the count at 25000 too)
+```
+
+So the 92/126 decomposition priced a code path that the attack did not
+change. The same failure as `EXPLAIN ANALYZE` excluding the losing
+segment: **the instrument sat outside the thing being attacked.**
+
+The obvious replacement control also fails: grouping on a literal
+accessor collapses 40 groups into 1, so `literal minus column` prices
+the grouping, not the accessor.
+
+### The attack, and its measurement
+
+Borrow channel extended to `-> ->> #> #>>`, out-of-line in its own
+module. Interleaved A/B against HEAD, median of 9, twice:
+
+```
+        HEAD            PATCH
+round1  7.842           8.609
+round2  7.692           8.528
+```
+
+**Consistently ~10 % SLOWER, ranges disjoint.** Reverted whole; per
+methodology §7 no bisect of a rejected chain. Plausible causes (not
+measured, and not to be acted on without measuring): the added
+`is_borrowable` branch at the top of the hot binary arm taxes every
+other operator, and the RHS literal gains a `Cow` wrapper for nothing.
+
+### What Phase A owes the next round
+
+Neither prediction came from a profile — both came from reading source
+and from ablation on a vehicle chosen for convenience. §9's rule
+applies and was not followed: **profile to establish the category,
+ablate to price it.** The next round starts with a leaf-symbol profile
+of the customer shape, not with a hypothesis.
