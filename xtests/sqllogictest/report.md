@@ -22,8 +22,15 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/12_explain` | 12 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 31 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
-| `spg_baseline/15_regressions` | 543 | 0 | 0 | 100.0% |
+| `spg_baseline/15_regressions` | 554 | 2 | 0 | 99.6% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
+
+## Top fail patterns
+
+| count | pattern |
+|---|---|
+| 1 | `record 10: row mismatch | expected:` |
+| 1 | `record 8: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -375,6 +382,7 @@ Per-corpus pass / fail / skip:
 | `round_29_filter_clause.test` | 6 | 0 | 0 |
 | `text_concat_real.test` | 12 | 0 | 0 |
 | `v73811_brin_prune.test` | 17 | 0 | 0 |
+| `v73812_gin_brin_intersect.test` | 11 | 2 | 0 |
 | `v7381_ledger_fixes.test` | 31 | 0 | 0 |
 | `v7382_collate_c_escape_hatch.test` | 6 | 0 | 0 |
 | `v7382_drop_column_checks.test` | 12 | 0 | 0 |
@@ -387,6 +395,12 @@ Per-corpus pass / fail / skip:
 | `v7389_jsonb_containment.test` | 14 | 0 | 0 |
 | `v7389_jsonb_string_result.test` | 10 | 0 | 0 |
 | `wire_streaming_declines.test` | 23 | 0 | 0 |
+
+<details><summary>`v73812_gin_brin_intersect.test` fail snippets</summary>
+
+- record 8: row mismatch |   expected: ["1000"] |   actual:   ["999"]
+- record 10: row mismatch |   expected: ["1"] |   actual:   ["0"]
+</details>
 
 ### `spg_baseline/16_isolation/`
 

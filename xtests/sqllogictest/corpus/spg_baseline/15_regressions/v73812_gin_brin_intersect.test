@@ -1,0 +1,77 @@
+# v7.38.12 — a GIN containment seek and a BRIN range meet at the row
+# locator, and the intersection must be invisible in the answer.
+#
+# The GIN seek hands back locators, and that is the only moment they
+# exist before the rows are materialised. A locator whose slot the BRIN
+# summary ruled out cannot satisfy the range, so it is dropped before
+# the row is touched. Every expectation here was taken from
+# PostgreSQL 18.
+#
+# The cases that matter are the ones where dropping too much would
+# show: a window that excludes everything, one that includes
+# everything, the two conjuncts written in either order, and a row
+# whose timestamp is moved by an UPDATE after both indexes exist.
+
+statement ok
+CREATE TABLE gb (id INT NOT NULL, t JSONB NOT NULL, ts TIMESTAMP NOT NULL)
+
+statement ok
+CREATE INDEX gb_t ON gb USING gin (t jsonb_path_ops)
+
+statement ok
+CREATE INDEX gb_ts ON gb USING brin (ts)
+
+statement ok
+INSERT INTO gb SELECT g, jsonb_build_object('p', (ARRAY['a','b','c'])[(g % 3) + 1]), timestamp '2026-01-01 00:00:00' + ((g) || ' minutes')::interval FROM generate_series(1, 3000) g
+
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb
+----
+1000
+
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb AND ts >= timestamp '2026-01-01 00:00:00' AND ts < timestamp '2026-01-01 01:00:00'
+----
+19
+
+# 19, not 20: the first row is at 00:01 and the window is half-open, so
+# it holds minutes 1..59 of the 'a' rows. Taken from PostgreSQL 18 —
+# the first draft of this file hand-computed 20 and the run caught it,
+# which is the whole reason expectations come from the oracle.
+
+# The same query with the conjuncts the other way round.
+query I
+SELECT count(*) FROM gb WHERE ts >= timestamp '2026-01-01 00:00:00' AND ts < timestamp '2026-01-01 01:00:00' AND t @> '{"p":"a"}'::jsonb
+----
+19
+
+# A window that excludes every row.
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb AND ts >= timestamp '2030-01-01'
+----
+0
+
+# A window that includes every row must not lose any.
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb AND ts >= timestamp '2020-01-01'
+----
+1000
+
+# A row moved out of its range's span after both indexes exist has to
+# stay findable by both predicates.
+statement ok
+UPDATE gb SET ts = timestamp '2027-06-06 06:00:00' WHERE id = 3
+
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb AND ts >= timestamp '2027-01-01'
+----
+1
+
+# ... and no longer by the window it left.
+query I
+SELECT count(*) FROM gb WHERE t @> '{"p":"a"}'::jsonb AND ts >= timestamp '2026-01-01 00:03:00' AND ts < timestamp '2026-01-01 00:04:00'
+----
+0
+
+statement ok
+DROP TABLE gb
