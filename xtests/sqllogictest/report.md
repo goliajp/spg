@@ -4,9 +4,9 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `15_regressions` | 74 | 1 | 0 | 98.7% |
+| `15_regressions` | 75 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 271 | 0 | 0 | 100.0% |
+| `mysql` | 296 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -26,12 +26,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 32: row mismatch | expected:` |
-
 ## Per-file detail
 
 ### `15_regressions/`
@@ -42,12 +36,7 @@ Per-corpus pass / fail / skip:
 | `v73814_explain_names_the_index.test` | 7 | 0 | 0 |
 | `v73814_insert_select_tsvector.test` | 7 | 0 | 0 |
 | `v73814_temp_namespace.test` | 10 | 0 | 0 |
-| `v73816_expression_index.test` | 36 | 1 | 0 |
-
-<details><summary>`v73816_expression_index.test` fail snippets</summary>
-
-- record 32: row mismatch |   expected: ["1"] |   actual:   ["0"]
-</details>
+| `v73816_expression_index.test` | 37 | 0 | 0 |
 
 ### `duckdb/`
 
@@ -89,6 +78,7 @@ Per-corpus pass / fail / skip:
 | `09_if_ifnull.test` | 16 | 0 | 0 |
 | `10_tinyint1_int_coerce.test` | 21 | 0 | 0 |
 | `11_fulltext_gin_seek.test` | 9 | 0 | 0 |
+| `12_collation_index_agreement.test` | 25 | 0 | 0 |
 | `12_unique_collation.test` | 17 | 0 | 0 |
 | `13_show_databases.test` | 2 | 0 | 0 |
 | `14_show_create_table.test` | 3 | 0 | 0 |

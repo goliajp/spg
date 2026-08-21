@@ -324,6 +324,7 @@ fn real_range_rows(
         table,
         alias.unwrap_or(name),
         &engine.current_snapshot(),
+        engine.backslash_escapes,
     )
 }
 
@@ -511,7 +512,13 @@ fn split_index_cond<'a>(
     // them on the same column, and now that each half seeks on its own the
     // loop below would claim one and call the other a Filter, which reads
     // as a re-check the executor never performs.
-    if crate::index_access::whole_predicate_is_one_range(where_, cols, table, alias) {
+    if crate::index_access::whole_predicate_is_one_range(
+        where_,
+        cols,
+        table,
+        alias,
+        engine.backslash_escapes,
+    ) {
         return (Some(where_), Vec::new());
     }
     for (i, c) in conjuncts.iter().enumerate() {

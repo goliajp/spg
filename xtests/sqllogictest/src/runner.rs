@@ -169,6 +169,10 @@ impl Runner {
     fn run_one(&mut self, record: &Record) -> Outcome {
         match record {
             Record::Halt => Outcome::Pass,
+            Record::Dialect(mysql) => {
+                self.engine.set_backslash_escapes(*mysql);
+                Outcome::Pass
+            }
             Record::Statement {
                 directive,
                 sql,

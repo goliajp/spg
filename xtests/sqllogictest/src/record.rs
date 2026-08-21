@@ -41,6 +41,12 @@ pub fn record_file(path: &Path, oracle: Option<&str>) -> Result<(usize, String),
     for rec in &records {
         match rec {
             Record::Halt => break,
+            Record::Dialect(_) => {
+                // The blesser re-runs against an ORACLE, which is a real
+                // PostgreSQL. It has no MySQL dialect to switch into, so a
+                // file that asks for one cannot be blessed from here.
+                actuals.push(None);
+            }
             Record::Statement {
                 directive,
                 sql,

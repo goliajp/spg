@@ -132,8 +132,15 @@ pub(super) fn collation_fold_for_compare(
     // A PG `case_insensitive` column keeps its ASCII-only contract; the
     // MySQL session uses the full accent-aware fold measured in P1.
     let fold = |v: Value<'static>| match v {
-        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
-        Value::Text(s) => Value::text(s.to_ascii_lowercase()),
+        // v7.38.16 — BpChar as well as Text. A CHAR column compared with
+        // `>=` or BETWEEN kept its byte order and its padding: over
+        // alpha/Beta/GAMMA/delta in CHAR(8), `s BETWEEN 'ALPHA' AND
+        // 'DELTA'` answered 1,4 where MySQL answers 1,2,4 — 'Beta' lost
+        // to case and 'delta   ' lost to its own padding.
+        Value::Text(s) | Value::BpChar(s) if mysql => {
+            Value::text(spg_storage::mysql_compare_fold(&s))
+        }
+        Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
         other => other,
     };
     (fold(l), fold(r))

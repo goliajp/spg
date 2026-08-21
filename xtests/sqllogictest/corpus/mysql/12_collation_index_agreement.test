@@ -1,0 +1,141 @@
+# v7.38.16 — an index must not change the ANSWER under MySQL's collation.
+#
+# MySQL's default text collation is `utf8mb4_0900_ai_ci`: it folds case
+# and accents, and it PAD SPACEs, so `s = 'ALPHA'` finds a row stored as
+# `alpha`. SPG's B-tree keys are bytes. Where a seek was allowed to
+# answer such a query, rows disappeared — the one thing an index may
+# never do.
+#
+# Every expected value below is MySQL 9.7.1's own answer, taken from the
+# oracle at default collation, not reasoned out.
+#
+#                                    MySQL   no index   indexed (before)
+#   s = 'ALPHA'                      1       1          (none)
+#   s IN ('ALPHA','BETA')            1,2     1,2        (none)
+#   s BETWEEN 'ALPHA' AND 'DELTA'    1,2,4   1,2,4      2
+#   ORDER BY s LIMIT 2               1,2     1,2        2,3
+#
+# on TEXT, VARCHAR and CHAR alike. A CHAR column was wrong even with no
+# index for IN, `>=` and BETWEEN: three sites folded `Value::Text` and
+# not `Value::BpChar`, so a CHAR cell kept its case AND its padding.
+#
+# This file needs the `dialect` directive, which did not exist before
+# this version — which is why none of this could be pinned. Everything
+# under corpus/mysql/ had been running in PostgreSQL dialect, asserting
+# that MySQL SYNTAX is accepted and nothing about MySQL SEMANTICS.
+
+dialect mysql
+
+statement ok
+CREATE TABLE ci_t (k INT, s TEXT)
+
+statement ok
+INSERT INTO ci_t VALUES (1,'alpha'),(2,'Beta'),(3,'GAMMA'),(4,'delta')
+
+# Without an index first: this is the answer the index has to agree with.
+query I
+SELECT k FROM ci_t WHERE s = 'ALPHA'
+----
+1
+
+statement ok
+CREATE INDEX ci_t_s ON ci_t (s)
+
+query I
+SELECT k FROM ci_t WHERE s = 'ALPHA'
+----
+1
+
+query I
+SELECT k FROM ci_t WHERE s IN ('ALPHA','BETA') ORDER BY k
+----
+1
+2
+
+query I
+SELECT k FROM ci_t WHERE s >= 'DELTA' ORDER BY k
+----
+3
+4
+
+query I
+SELECT k FROM ci_t WHERE s BETWEEN 'ALPHA' AND 'DELTA' ORDER BY k
+----
+1
+2
+4
+
+# Ordering folds too, so the B-tree's byte order is the wrong order.
+query I
+SELECT k FROM ci_t ORDER BY s
+----
+1
+2
+4
+3
+
+query I
+SELECT k FROM ci_t ORDER BY s LIMIT 2
+----
+1
+2
+
+# CHAR carries padding as well as case.
+statement ok
+CREATE TABLE ci_c (k INT, s CHAR(8))
+
+statement ok
+INSERT INTO ci_c VALUES (1,'alpha'),(2,'Beta'),(3,'GAMMA'),(4,'delta')
+
+statement ok
+CREATE INDEX ci_c_s ON ci_c (s)
+
+query I
+SELECT k FROM ci_c WHERE s IN ('ALPHA','BETA') ORDER BY k
+----
+1
+2
+
+query I
+SELECT k FROM ci_c WHERE s >= 'DELTA' ORDER BY k
+----
+3
+4
+
+# 'delta   ' is eight characters and 'DELTA' is five; PAD SPACE says they
+# are the same value, so row 4 is inside the range.
+query I
+SELECT k FROM ci_c WHERE s BETWEEN 'ALPHA' AND 'DELTA' ORDER BY k
+----
+1
+2
+4
+
+# A column that DECLARES a byte-wise collation keeps byte semantics, and
+# keeps its seek. MySQL 9.7.1 answers nothing for this one.
+statement ok
+CREATE TABLE ci_b (k INT, s TEXT COLLATE utf8mb4_bin)
+
+statement ok
+INSERT INTO ci_b VALUES (1,'alpha'),(2,'Beta')
+
+statement ok
+CREATE INDEX ci_b_s ON ci_b (s)
+
+query I
+SELECT k FROM ci_b WHERE s = 'ALPHA'
+----
+
+query I
+SELECT k FROM ci_b WHERE s = 'alpha'
+----
+1
+
+statement ok
+DROP TABLE ci_t
+
+statement ok
+DROP TABLE ci_c
+
+statement ok
+DROP TABLE ci_b

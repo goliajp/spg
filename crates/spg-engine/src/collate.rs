@@ -155,6 +155,51 @@ fn normalise(name: &str) -> String {
     head.replace('_', "-")
 }
 
+/// Can a byte-keyed B-tree answer a comparison — or an ordering — on
+/// this column?
+///
+/// SPG's index keys are bytes. MySQL's default text collation is not:
+/// `utf8mb4_0900_ai_ci` folds case, so `s = 'ALPHA'` finds a row stored
+/// as `alpha` and a byte probe for `ALPHA` finds nothing. An index that
+/// answers a query the scan would answer differently has changed the
+/// ANSWER, which is the one thing an index may never do.
+///
+/// Measured against MySQL 9.7.1 on a four-row table, before this test
+/// existed — same query, same data, index versus no index:
+///
+/// | | MySQL | no index | indexed |
+/// |---|---|---|---|
+/// | `s = 'ALPHA'`                  | 1     | 1     | *(none)* |
+/// | `s IN ('ALPHA','BETA')`        | 1,2   | 1,2   | *(none)* |
+/// | `s BETWEEN 'ALPHA' AND 'DELTA'`| 1,2,4 | 1,2,4 | 2 |
+/// | `ORDER BY s LIMIT 2`           | 1,2   | 1,2   | 2,3 |
+///
+/// on TEXT, VARCHAR and CHAR alike. Answering `false` here costs a scan;
+/// the alternative cost rows.
+///
+/// A column that says nothing about its collation stores
+/// [`Collation::Binary`], which is also the struct's default — so this
+/// asks the DIALECT first. Under MySQL a plain text column stores
+/// `CaseInsensitive` (verified, not assumed) and only a declared
+/// `COLLATE utf8mb4_bin` stores `Binary`, which keeps its seek.
+pub(crate) fn column_key_is_bytewise(col: &spg_storage::ColumnSchema, mysql: bool) -> bool {
+    // Only text folds. Integers, dates and uuids compare by value in
+    // every collation there is, and keep their seeks in both dialects.
+    if !matches!(
+        col.ty,
+        spg_storage::DataType::Text
+            | spg_storage::DataType::Varchar(_)
+            | spg_storage::DataType::Char(_)
+    ) {
+        return true;
+    }
+    // A case-insensitive collation folds whoever asks, PG included.
+    if matches!(col.collation, spg_storage::Collation::CaseInsensitive) {
+        return false;
+    }
+    !mysql || matches!(col.collation, spg_storage::Collation::Binary)
+}
+
 #[cfg(test)]
 #[path = "collate_survey.rs"]
 mod survey;

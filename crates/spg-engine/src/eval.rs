@@ -939,7 +939,15 @@ fn is_numeric_type(t: spg_storage::DataType) -> bool {
 /// whose comparisons do not pass through `collation_fold_for_compare`.
 fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
     match v {
-        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
+        // v7.38.16 — BpChar too. `mysql_compare_fold` trims trailing
+        // spaces before folding, which is the PAD SPACE half of the same
+        // comparison, so a CHAR cell needs exactly this call and was not
+        // getting it: `s IN ('ALPHA','BETA')` on CHAR(8) answered 1 where
+        // MySQL 9.7.1 answers 1,2. `eval/values.rs` had the pair right
+        // and these two sites did not.
+        Value::Text(s) | Value::BpChar(s) if mysql => {
+            Value::text(spg_storage::mysql_compare_fold(&s))
+        }
         other => other,
     }
 }

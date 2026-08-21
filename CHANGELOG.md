@@ -12,6 +12,49 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **Under MySQL, adding an index to a text column made rows disappear.**
+  MySQL's default collation `utf8mb4_0900_ai_ci` folds case and accents
+  and pads with spaces, so `s = 'ALPHA'` finds a row stored as `alpha`.
+  SPG's B-tree keys are bytes. Wherever a seek was allowed to answer
+  such a query it answered from the wrong keys — and an index that
+  changes the answer is the one thing an index may never do.
+
+  Measured against MySQL 9.7.1 at its default collation, same four-row
+  table, same query with and without an index:
+
+  | | MySQL | no index | indexed |
+  |---|---|---|---|
+  | `s = 'ALPHA'` | 1 | 1 | *(none)* |
+  | `s IN ('ALPHA','BETA')` | 1,2 | 1,2 | *(none)* |
+  | `s BETWEEN 'ALPHA' AND 'DELTA'` | 1,2,4 | 1,2,4 | 2 |
+  | `ORDER BY s LIMIT 2` | 1,2 | 1,2 | 2,3 |
+
+  on TEXT, VARCHAR and CHAR alike. Whether a byte-keyed index can answer
+  a comparison is now one decision in one place, asked by the equality
+  seek, the `IN` seek, the range seeks and the ordering walk. A column
+  that declares `COLLATE utf8mb4_bin` is byte-wise and keeps every seek;
+  anything else under MySQL falls back to the scan, which costs time and
+  not rows.
+
+- **A `CHAR` column was compared by bytes even without an index.** Three
+  sites folded `Value::Text` and not `Value::BpChar`, so `IN`, `>=` and
+  `BETWEEN` on a CHAR column kept both their case and their trailing
+  padding: `s BETWEEN 'ALPHA' AND 'DELTA'` over alpha/Beta/GAMMA/delta
+  answered 1,4 where MySQL answers 1,2,4 — 'Beta' lost to case and
+  `'delta   '` lost to its own eight-character padding. A fourth site,
+  a few hundred lines away, had had the pair right since it was written.
+
+### Changed
+
+- **`corpus/mysql/` now actually runs under the MySQL dialect.** The
+  sqllogictest runner had no notion of a dialect, so every file in that
+  directory had been executing in PostgreSQL dialect since it was
+  created — asserting that MySQL *syntax* is accepted, and nothing about
+  MySQL *semantics*. The wrong answers above could not be written down,
+  which is why they were found by hand instead of by the gate. A
+  `dialect mysql` directive now switches the session, and the table
+  above is pinned as a fixture.
+
 - **An index on an expression was maintained but never used — pure
   cost.** `CREATE INDEX ON t (lower(s))` built, answered correctly, and
   nothing ever selected it. The reason was in the index, not the
