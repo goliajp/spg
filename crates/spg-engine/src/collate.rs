@@ -112,6 +112,22 @@ fn pg_options() -> icu_collator::options::CollatorOptions {
     o
 }
 
+/// v7.38.14 — is this collation BYTE-WISE?
+///
+/// The same test `compare` applies before it reaches ICU, exposed so that
+/// callers deciding whether to fold ask one question with one answer
+/// rather than re-deriving the name rules each time.
+pub(crate) fn is_byte_wise(collation: &str) -> bool {
+    let name = collation.trim();
+    let base = name.split(['.', '@']).next().unwrap_or(name);
+    base.eq_ignore_ascii_case("C")
+        || base.eq_ignore_ascii_case("POSIX")
+        || base.eq_ignore_ascii_case("binary")
+        || base
+            .rsplit_once('_')
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
+}
+
 /// Whether this build can perform a collation by that name.
 pub(crate) fn is_supported(collation: &str) -> bool {
     compare(collation, "a", "b").is_some()

@@ -227,10 +227,46 @@ pub(super) fn mysql_text_fold_applies(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<
 /// deliberately declared binary answers true — and it suppresses the
 /// dialect's default fold.
 pub(super) fn operand_is_binary_column(e: &Expr, ctx: &EvalContext<'_>) -> bool {
-    matches!(
+    if matches!(
         column_collation(e, ctx),
         Some(spg_storage::Collation::Binary)
-    )
+    ) {
+        return true;
+    }
+    // v7.38.14 — and through an EXPRESSION, not only a bare column.
+    //
+    // A byte-wise column stopped being byte-wise the moment anything
+    // wrapped it: `GREATEST(s,'A') = 'A'` and `CONCAT(s,'') = 'A'` both
+    // answered 2 on a `COLLATE utf8mb4_bin` column where MySQL 9.7.1
+    // answers 1, because this test recognised a column reference and
+    // nothing else, so an expression looked like a value with no
+    // collation at all — and "no collation" reads here as "fold it".
+    //
+    // `collate_derive` already answers exactly this question and ORDER BY
+    // has used it since round 692. Two sites deciding one question by
+    // different rules is how the answer came to depend on whether the
+    // column was wrapped.
+    operand_derives_binary(e, ctx)
+}
+
+/// v7.38.14 — does this expression DERIVE a byte-wise collation?
+///
+/// `None` means the expression declares nothing, which keeps today's
+/// behaviour (the dialect default folds). A derived name that this build
+/// cannot perform is also left alone rather than guessed at.
+fn operand_derives_binary(e: &Expr, ctx: &EvalContext<'_>) -> bool {
+    // A bare column is already answered above; only expressions reach here,
+    // and a literal derives nothing, so this is not paid on the common shape.
+    if matches!(e, Expr::Column(_) | Expr::Literal(_)) {
+        return false;
+    }
+    let resolve = |c: &spg_sql::ast::ColumnName| -> Option<alloc::string::String> {
+        let pos = find_column_pos(c, ctx)?;
+        ctx.columns.get(pos)?.collation_name.clone()
+    };
+    crate::collate_derive::derive(e, &resolve)
+        .name()
+        .is_some_and(crate::collate::is_byte_wise)
 }
 
 pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
