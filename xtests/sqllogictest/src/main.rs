@@ -36,6 +36,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use sqllogictest::parser::Record;
 use sqllogictest::{Outcome, Runner, parser};
 
 fn main() -> ExitCode {
@@ -117,6 +118,16 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
+    let unregistered = unregistered_dialect_dirs(&corpus);
+    if !unregistered.is_empty() {
+        eprintln!(
+            "sqllogictest: corpus dir(s) named after a dialect but not in \
+             DIALECT_DIRS: {}. A directory name is a claim; register it so \
+             the runner can check its files enter that dialect.",
+            unregistered.join(", ")
+        );
+        return ExitCode::FAILURE;
+    }
     let mut groups: Vec<GroupReport> = Vec::new();
     let mut diffs: Vec<String> = Vec::new();
     for entry in fs::read_dir(&corpus).expect("read corpus") {
@@ -235,6 +246,17 @@ struct FileReport {
     pass: usize,
     fail: usize,
     skip: usize,
+    /// v7.38.17 — the dialect this file actually ran in, not the one its
+    /// directory is named after.
+    ///
+    /// Those were different for every file under `corpus/mysql/` from the
+    /// day that directory was created: the runner had no notion of a
+    /// dialect at all, so twenty-one files asserted that MySQL SYNTAX is
+    /// accepted and nothing whatsoever about MySQL SEMANTICS. The report
+    /// said "21 pass" and meant "21 PostgreSQL runs". Silent wrong
+    /// answers on the most ordinary query shapes lived behind that for as
+    /// long as the directory existed, and were found by hand instead.
+    dialect: &'static str,
     /// First few failures' short text. We don't dump every failure into the
     /// report — the top patterns are enough to drive v1.2 hot planning.
     fail_reasons: Vec<String>,
@@ -266,7 +288,13 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
             missing += 1;
             continue;
         }
-        reports.push(run_one_file(&path, &mut diffs));
+        // The `--list` path honours the same contract: a listed file
+        // still has to enter the dialect its directory claims.
+        reports.push(run_one_file(
+            &path,
+            &mut diffs,
+            path.parent().and_then(claimed_dialect),
+        ));
     }
     let pass: usize = reports.iter().map(|f| f.pass).sum();
     let fail: usize = reports.iter().map(|f| f.fail).sum::<usize>() + missing;
@@ -285,7 +313,76 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
 
 /// One corpus file → its report. Shared by the directory walk and the
 /// list mode so the two cannot disagree about what "running a file" is.
-fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
+/// What dialect a corpus directory's NAME claims its files run in.
+///
+/// v7.38.17 — a directory name is an assertion, and until this table
+/// existed nothing checked it. `corpus/mysql/` held twenty-one files and
+/// every one of them ran in PostgreSQL dialect; the report counted them
+/// as passing MySQL coverage. Four silent wrong answers on the most
+/// ordinary query shapes -- an indexed join returning the empty set
+/// among them -- lived behind that and were found by hand in v7.38.16.
+///
+/// A directory listed here REQUIRES each of its files to declare the
+/// matching `dialect` line. A file that does not is a failure, not a
+/// skip: a skip is how this grew in the first place.
+///
+/// Adding a directory named after a mode means adding it here. That is
+/// the point — the table is the place the claim gets written down.
+const DIALECT_DIRS: &[(&str, &str)] = &[("mysql", "mysql"), ("mariadb", "mariadb")];
+
+/// Every word the `dialect` directive accepts. A corpus directory named
+/// after one of these is making a claim, so it has to be registered in
+/// [`DIALECT_DIRS`] — otherwise the next `corpus/postgres/` repeats
+/// `corpus/mysql/`'s history with a different noun.
+const DIALECT_WORDS: &[&str] = &["mysql", "mariadb", "postgres", "postgresql", "pg"];
+
+/// Refuse a corpus directory that names a dialect without registering it.
+///
+/// Returns the offenders. The caller fails the run rather than warning:
+/// a yellow line is what let twenty-one files sit in the wrong mode for
+/// as long as they did.
+fn unregistered_dialect_dirs(corpus: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(corpus) else {
+        return out;
+    };
+    for e in entries.filter_map(Result::ok) {
+        if !e.path().is_dir() {
+            continue;
+        }
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if DIALECT_WORDS.contains(&name.as_str()) && !DIALECT_DIRS.iter().any(|(d, _)| *d == name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// The dialect `dir` claims, if it claims one.
+fn claimed_dialect(dir: &Path) -> Option<&'static str> {
+    let name = dir.file_name().and_then(|s| s.to_str())?;
+    DIALECT_DIRS
+        .iter()
+        .find(|(d, _)| *d == name)
+        .map(|(_, want)| *want)
+}
+
+/// The dialect a parsed file actually enters, as a name.
+fn entered_dialect(records: &[Record]) -> &'static str {
+    match records.iter().find_map(|r| match r {
+        Record::Dialect(mysql) => Some(*mysql),
+        _ => None,
+    }) {
+        Some(true) => "mysql",
+        Some(false) => "postgres",
+        // No directive at all: the runner's default session.
+        None => "postgres",
+    }
+}
+
+fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) -> FileReport {
     let file_name = path
         .file_name()
         .and_then(|s| s.to_str())
@@ -299,10 +396,12 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
                 pass: 0,
                 fail: 1,
                 skip: 0,
+                dialect: "unparsed",
                 fail_reasons: vec![format!("parse: {e}")],
             };
         }
     };
+    let entered = entered_dialect(&records);
     let mut runner = Runner::new();
     let outcome = runner.run(&records);
     // r1052 (S2.4) — cleanup discipline: name what the file left behind.
@@ -310,6 +409,22 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
     // a leak is now a RED, not a shrug. A yellow warning that survives
     // 210 files is how the pile grew in the first place (the r1020
     // lesson: an unclassified diff line is a bug report nobody read).
+    // The directory's claim. Checked as an EXTRA failure rather than
+    // instead of running the file: the assertions inside are real
+    // coverage of something, and dropping them to punish the filing
+    // would trade one blind spot for another. What the file is not is
+    // coverage of the dialect its directory is named after, and that is
+    // what this says.
+    let mut claim_broken: Option<String> = None;
+    if let Some(want) = claims
+        && entered != want
+    {
+        claim_broken = Some(format!(
+            "dialect: filed under {want}/ but runs in {entered} — add a \
+             `dialect {want}` line, or move the file out of a directory \
+             whose name claims something it does not test"
+        ));
+    }
     let leaks = runner.leftover_objects();
     if !leaks.is_empty() {
         println!(
@@ -335,11 +450,16 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>) -> FileReport {
         fail += 1;
         fail_reasons.push(format!("leak: left {}", leaks.join(", ")));
     }
+    if let Some(reason) = claim_broken {
+        fail += 1;
+        fail_reasons.push(reason);
+    }
     FileReport {
         file: file_name,
         pass: outcome.pass,
         fail,
         skip: outcome.skip,
+        dialect: entered,
         fail_reasons,
     }
 }
@@ -361,8 +481,9 @@ fn run_group(name: &str, dir: &Path, diff_sink: &mut Vec<String>) -> GroupReport
         files: Vec::new(),
     };
 
+    let claims = claimed_dialect(dir);
     for path in files {
-        let report = run_one_file(&path, diff_sink);
+        let report = run_one_file(&path, diff_sink, claims);
         group.pass += report.pass;
         group.fail += report.fail;
         group.skip += report.skip;
@@ -432,6 +553,24 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+/// What dialects a group's files actually ran in, counted.
+///
+/// v7.38.17 — the summary line is where "21 mysql files, 21 pass" was
+/// read as MySQL coverage for as long as `corpus/mysql/` existed, while
+/// every one of those runs was PostgreSQL. A total that cannot show the
+/// mode is a total that can hide it.
+fn dialect_mix(files: &[FileReport]) -> String {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for f in files {
+        *counts.entry(f.dialect).or_insert(0) += 1;
+    }
+    counts
+        .iter()
+        .map(|(d, n)| format!("{d} × {n}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn write_md(path: &Path, groups: &[GroupReport]) -> std::io::Result<()> {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -439,8 +578,8 @@ fn write_md(path: &Path, groups: &[GroupReport]) -> std::io::Result<()> {
     writeln!(s).unwrap();
     writeln!(s, "Per-corpus pass / fail / skip:").unwrap();
     writeln!(s).unwrap();
-    writeln!(s, "| corpus | pass | fail | skip | % pass |").unwrap();
-    writeln!(s, "|---|---|---|---|---|").unwrap();
+    writeln!(s, "| corpus | pass | fail | skip | % pass | ran in |").unwrap();
+    writeln!(s, "|---|---|---|---|---|---|").unwrap();
     for g in groups {
         let total = g.pass + g.fail + g.skip;
         let pct = if total == 0 {
@@ -450,8 +589,13 @@ fn write_md(path: &Path, groups: &[GroupReport]) -> std::io::Result<()> {
         };
         writeln!(
             s,
-            "| `{}` | {} | {} | {} | {:.1}% |",
-            g.name, g.pass, g.fail, g.skip, pct
+            "| `{}` | {} | {} | {} | {:.1}% | {} |",
+            g.name,
+            g.pass,
+            g.fail,
+            g.skip,
+            pct,
+            dialect_mix(&g.files)
         )
         .unwrap();
     }
@@ -485,10 +629,15 @@ fn write_md(path: &Path, groups: &[GroupReport]) -> std::io::Result<()> {
         writeln!(s).unwrap();
         writeln!(s, "### `{}/`", g.name).unwrap();
         writeln!(s).unwrap();
-        writeln!(s, "| file | pass | fail | skip |").unwrap();
-        writeln!(s, "|---|---|---|---|").unwrap();
+        writeln!(s, "| file | pass | fail | skip | ran in |").unwrap();
+        writeln!(s, "|---|---|---|---|---|").unwrap();
         for f in &g.files {
-            writeln!(s, "| `{}` | {} | {} | {} |", f.file, f.pass, f.fail, f.skip).unwrap();
+            writeln!(
+                s,
+                "| `{}` | {} | {} | {} | {} |",
+                f.file, f.pass, f.fail, f.skip, f.dialect
+            )
+            .unwrap();
         }
         for f in &g.files {
             if !f.fail_reasons.is_empty() {
