@@ -131,6 +131,69 @@ SELECT k FROM ci_b WHERE s = 'alpha'
 ----
 1
 
+# A JOIN key is the same question. v7.38.14 taught the hash stage to
+# fold; the INDEXED nested-loop stage kept its byte probe, so an inner
+# join over 'alpha'/'ALPHA' returned the EMPTY SET and a left join
+# returned every left row with NULLs beside it — with an index present,
+# and the right answer without one. MySQL 9.7.1 matches both pairs.
+
+statement ok
+CREATE TABLE jn_a (k INT, s TEXT)
+
+statement ok
+CREATE TABLE jn_b (k INT, s TEXT)
+
+statement ok
+INSERT INTO jn_a VALUES (1,'alpha'),(2,'Beta')
+
+statement ok
+INSERT INTO jn_b VALUES (10,'ALPHA'),(20,'beta')
+
+statement ok
+CREATE INDEX jn_a_s ON jn_a (s)
+
+statement ok
+CREATE INDEX jn_b_s ON jn_b (s)
+
+query II
+SELECT jn_a.k, jn_b.k FROM jn_a JOIN jn_b ON jn_a.s = jn_b.s ORDER BY jn_a.k
+----
+1
+10
+2
+20
+
+query II
+SELECT jn_a.k, jn_b.k FROM jn_a LEFT JOIN jn_b ON jn_a.s = jn_b.s ORDER BY jn_a.k
+----
+1
+10
+2
+20
+
+# A predicate pushed onto a joined table, and two counts answered from
+# index keys without re-reading the rows.
+query I
+SELECT jn_a.k FROM jn_a JOIN jn_b ON jn_a.k * 10 = jn_b.k WHERE jn_b.s = 'ALPHA'
+----
+1
+
+query I
+SELECT count(*) FROM jn_a WHERE s IN ('ALPHA','BETA')
+----
+2
+
+query I
+SELECT count(*) FROM jn_a WHERE s >= 'ALPHA'
+----
+2
+
+statement ok
+DROP TABLE jn_a
+
+statement ok
+DROP TABLE jn_b
+
 statement ok
 DROP TABLE ci_t
 
