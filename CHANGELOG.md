@@ -8,6 +8,58 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **An index on an expression was maintained but never used — pure
+  cost.** `CREATE INDEX ON t (lower(s))` built, answered correctly, and
+  nothing ever selected it. The reason was in the index, not the
+  planner: the storage layer has no expression evaluator, so it filled
+  the B-tree with the *leading column's* values, keys no `lower(s) = …`
+  could ever match. Every lookup path then guarded itself with
+  `expression.is_none()` to stay away from them.
+
+  So the index cost writes and bought reads nothing. Measured on a
+  20,000-row table: an insert ran 5.20 µs against 2.70 µs with no index
+  at all — 1.93× — while the same SELECT ran within one percent of
+  itself with the index and without it.
+
+  The engine now supplies the keys, and the index answers:
+
+  |             | 10,000 rows | 100,000 rows |
+  |-------------|------------:|-------------:|
+  | before      |    0.753 ms |     7.739 ms |
+  | after       |    0.004 ms |     0.004 ms |
+
+  Flat where the scan is linear, and the write cost is unchanged (1.88×)
+  — the same maintenance, now on keys something can read. Inserts made
+  after the index was built are keyed as they arrive; UPDATE and DELETE
+  move stored row positions, so the index is rebuilt at the end of those
+  statements rather than left quietly retired.
+
+  Completeness is tracked and deliberately **not** persisted: a catalog
+  written by any earlier version holds the wrong keys under an
+  expression index, so a restored table starts unusable and is refilled
+  on the restore path. An index that cannot be filled is never consulted
+  — it costs a scan, never a wrong answer.
+
+- **`UNIQUE` on an expression enforced by re-reading the table.**
+  `CREATE UNIQUE INDEX ON t (lower(email))` rejected duplicates
+  correctly, but to do it, it scanned every row on every insert: 0.43 ms
+  per insert at 2,000 rows and 3.9 ms at 20,000, a cost rising with the
+  data. It was the same missing piece — with no usable index there was
+  nothing to probe. Now 6.0 µs at both sizes, level with a unique index
+  on a column. NULLs stay distinct and the rejection keeps PG's message
+  and `DETAIL`.
+
+  Under MySQL a text comparison folds case while this B-tree is keyed by
+  bytes, so a text-keyed expression index declines the seek there and
+  the scan answers — the same answer, without the shortcut that would
+  have been wrong.
+
+---
+
 ## [7.38.15] — 2026-08-22
 
 7.38.14 was tagged and never published. Its release train stopped inside

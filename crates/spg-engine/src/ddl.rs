@@ -2594,6 +2594,13 @@ impl Engine {
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.expression = Some(canonical);
             }
+            // v7.38.16 — and now FILL it with the expression's values.
+            // Until this call the B-tree holds the leading column's
+            // values, which is what the index was built from and what no
+            // lookup of `lower(s) = …` could ever match. `refresh` is a
+            // no-op for a GIN full-text index, whose expression names a
+            // source column that its own maintenance path already reads.
+            crate::expr_index::refresh(table)?;
         }
         // v7.9.29 — persist `is_unique` flag on the storage Index.
         // Combined with `partial_predicate`, INSERT enforcement

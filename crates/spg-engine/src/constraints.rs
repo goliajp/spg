@@ -896,6 +896,33 @@ pub static UNIQ_PROBE_LOCATORS: core::sync::atomic::AtomicU64 =
 /// unselective probe back would read as a slowdown with no cause attached.
 pub static UNIQ_FOLD_CHOSEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// The row already carrying `key` in an expression index, if any.
+///
+/// No fold: for an index whose B-tree is keyed BY the expression — which
+/// is what `Table::expr_index_is_complete` asserts and what every caller
+/// here checks first — the stored key already is the whole key, so a hit
+/// is a conflict. That is the difference between this and the O(table)
+/// pass below: enforcing `UNIQUE (lower(email))` used to re-read every
+/// row on every insert, 0.43 ms at 2,000 rows and 3.9 ms at 20,000.
+fn probe_expr_key_conflict(
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    key: &spg_storage::IndexKey,
+) -> Option<usize> {
+    for loc in idx.lookup_eq(key) {
+        let spg_storage::RowLocator::Hot(ri) = loc else {
+            continue;
+        };
+        if table.headers().get(*ri).is_some_and(|h| h.is_deleted()) {
+            continue;
+        }
+        if table.rows().get(*ri).is_some() {
+            return Some(*ri);
+        }
+    }
+    None
+}
+
 fn probe_key_conflict(
     table: &spg_storage::Table,
     idx: &spg_storage::Index,
@@ -1875,6 +1902,58 @@ pub(crate) fn enforce_unique_index_inserts(
             })?;
             Ok(predicate_truthy(&v))
         };
+        // v7.38.16 — and so is an expression index, now that its B-tree
+        // holds the expression's own values. Same trade as the plain
+        // case below: one descent per batch row instead of one pass over
+        // the table per batch row.
+        if let Some(expr) = &expr_key
+            && idx.partial_predicate.is_none()
+            && !idx.nulls_not_distinct
+            && !mysql
+            && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && table.expr_index_is_complete(&idx.name)
+        {
+            // Keyed by the encoded value, as the plain path is: `IndexKey`
+            // is ordered, not hashed.
+            let mut batch_seen: hashbrown::HashSet<alloc::string::String> =
+                hashbrown::HashSet::with_capacity(rows.len());
+            let mut probe_ok = true;
+            for row_values in rows.iter() {
+                let tmp_row = spg_storage::Row {
+                    values: row_values.clone(),
+                };
+                let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
+                    EngineError::Unsupported(alloc::format!(
+                        "UNIQUE INDEX {:?} expression eval: {e:?}",
+                        idx.name
+                    ))
+                })?;
+                // A NULL key exempts the row, exactly as a NULL column
+                // value does under NULLS DISTINCT.
+                if v.is_null() {
+                    continue;
+                }
+                let Some(ik) = spg_storage::IndexKey::from_value(&v) else {
+                    // A value with no key cannot be probed for; let the
+                    // O(table) pass below settle this index.
+                    probe_ok = false;
+                    break;
+                };
+                if !batch_seen.insert(aggregate::encode_key(core::slice::from_ref(&v)))
+                    || probe_expr_key_conflict(table, idx, &ik).is_some()
+                {
+                    let detail = unique_key_detail(&key_col_names, &[v]);
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "duplicate key value violates unique constraint \"{}\" \
+                         on table \"{table_name}\"{detail}",
+                        idx.name
+                    )));
+                }
+            }
+            if probe_ok {
+                continue;
+            }
+        }
         // v7.39 (round 166, attack A2) — a plain (non-expression,
         // non-partial) unique index IS its own probe btree: check each
         // batch row via lookup_eq instead of folding the whole table.

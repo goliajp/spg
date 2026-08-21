@@ -1,0 +1,180 @@
+# v7.38.16 — an index on an expression is used, and maintained.
+#
+# `CREATE INDEX ON t (lower(s))` built, answered correctly, and was never
+# chosen. The reason was in the index itself, not the planner: storage has
+# no expression evaluator, so it filled the B-tree with the LEADING
+# COLUMN's values — keys no `lower(s) = …` could ever match. Every lookup
+# path then guarded itself with `expression.is_none()` to stay away from
+# them, which is why nothing selected it.
+#
+# Measured, in-process, before and after: the same query with the index
+# and without it ran within one percent of itself (0.753 vs 0.750 ms at
+# 10,000 rows), while an insert cost 1.93x a table with no index at all
+# — maintenance for something nothing could read. It now seeks: 0.004 ms
+# at 10,000 rows and 0.004 ms at 100,000, flat where the scan is linear.
+#
+# The tests here pin the ANSWERS, which is what a customer sees. The
+# scaling lives in `examples/probe_exprindex.rs`.
+
+statement ok
+CREATE TABLE ei (k INT, s TEXT)
+
+statement ok
+INSERT INTO ei VALUES (1, 'Alpha'), (2, 'BETA'), (3, 'gamma')
+
+statement ok
+CREATE INDEX ei_lower ON ei (lower(s))
+
+# The index is consulted for this. Case is the point: the rows were
+# stored with three different spellings.
+query I
+SELECT k FROM ei WHERE lower(s) = 'alpha'
+----
+1
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'beta'
+----
+2
+
+# A key that is in no row returns nothing, rather than everything.
+query I
+SELECT k FROM ei WHERE lower(s) = 'delta'
+----
+
+# Rows inserted AFTER the index was built have to be in it. This is the
+# half that a rebuild-once implementation gets wrong.
+statement ok
+INSERT INTO ei VALUES (4, 'ALPHA'), (5, 'Delta')
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'alpha' ORDER BY k
+----
+1
+4
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'delta'
+----
+5
+
+# An UPDATE moves every stored row position, so the index has to be
+# rebuilt rather than merely appended to. Before this version the first
+# UPDATE would have retired it silently.
+statement ok
+UPDATE ei SET s = 'ALPHA' WHERE k = 3
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'alpha' ORDER BY k
+----
+1
+3
+4
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'gamma'
+----
+
+# So does a DELETE.
+statement ok
+DELETE FROM ei WHERE k = 1
+
+query I
+SELECT k FROM ei WHERE lower(s) = 'alpha' ORDER BY k
+----
+3
+4
+
+# An expression that is not text keeps its seek too.
+statement ok
+CREATE TABLE ei2 (k INT, n INT)
+
+statement ok
+INSERT INTO ei2 VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE INDEX ei2_double ON ei2 ((n * 2))
+
+query I
+SELECT k FROM ei2 WHERE n * 2 = 40
+----
+2
+
+# NULL keys enter no index entry, and `= NULL` is never true — the index
+# must not hand the row back for one.
+statement ok
+INSERT INTO ei2 VALUES (4, NULL)
+
+query I
+SELECT k FROM ei2 WHERE n * 2 = 40
+----
+2
+
+# UNIQUE on an expression: rejects, and no longer by re-reading the whole
+# table on every insert (0.43 ms per insert at 2,000 rows and 3.9 ms at
+# 20,000 before; 6.0 us at both after, level with a plain unique index).
+statement ok
+CREATE TABLE eu (k INT, email TEXT)
+
+statement ok
+CREATE UNIQUE INDEX eu_lower ON eu (lower(email))
+
+statement ok
+INSERT INTO eu VALUES (1, 'Ann@example.com')
+
+statement error
+INSERT INTO eu VALUES (2, 'ANN@EXAMPLE.COM')
+
+statement ok
+INSERT INTO eu VALUES (3, 'bob@example.com')
+
+# NULLS are distinct, so two of them coexist under a unique expression
+# index exactly as under a unique column index.
+statement ok
+INSERT INTO eu VALUES (4, NULL), (5, NULL)
+
+query I
+SELECT count(*) FROM eu
+----
+4
+
+# The answers above are the same whether an index or a scan produced
+# them, so on their own they cannot tell this version from the one that
+# never used the index. This can: `idx_scan` counts seeks, and the seek
+# is the thing that did not happen before.
+
+statement ok
+CREATE TABLE ew (k INT, s TEXT)
+
+statement ok
+INSERT INTO ew VALUES (1, 'Alpha'), (2, 'BETA')
+
+statement ok
+CREATE INDEX ew_lower ON ew (lower(s))
+
+query I
+SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ew'
+----
+0
+
+query I
+SELECT k FROM ew WHERE lower(s) = 'alpha'
+----
+1
+
+query I
+SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ew'
+----
+1
+
+statement ok
+DROP TABLE ew
+
+statement ok
+DROP TABLE ei
+
+statement ok
+DROP TABLE ei2
+
+statement ok
+DROP TABLE eu

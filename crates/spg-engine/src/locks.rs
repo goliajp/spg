@@ -350,7 +350,14 @@ impl crate::Engine {
         // candidate — same answers, thousands fewer rows touched.
         let alias_or_name = alias.as_deref().unwrap_or(&tname);
         let seeked: Option<alloc::vec::Vec<usize>> = stmt.where_.as_ref().and_then(|pred| {
-            crate::index_access::try_index_seek_positions(pred, &cols, table, alias_or_name, &snap)
+            crate::index_access::try_index_seek_positions(
+                pred,
+                &cols,
+                table,
+                alias_or_name,
+                &snap,
+                self.backslash_escapes,
+            )
         });
         // v7.38.2 (R1, red-first pin) — lock by the row's REAL RowId.
         // This walk used to lock `RowId(position)`, but RowIds are

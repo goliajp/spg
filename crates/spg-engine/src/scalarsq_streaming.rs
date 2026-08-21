@@ -378,12 +378,18 @@ impl Engine {
         // and thread it into every index-seek fast path. No-op today.
         let seek_snapshot = self.current_snapshot();
         let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
-            try_index_seek(w, schema_cols, catalog, table, alias, &seek_snapshot)
-                .or_else(|| {
-                    try_gin_seek(w, schema_cols, catalog, table, alias, &ctx, &seek_snapshot)
-                })
-                .or_else(|| try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot))
-                .or_else(|| try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot))
+            try_index_seek(
+                w,
+                schema_cols,
+                catalog,
+                table,
+                alias,
+                &seek_snapshot,
+                ctx.mysql_dialect,
+            )
+            .or_else(|| try_gin_seek(w, schema_cols, catalog, table, alias, &ctx, &seek_snapshot))
+            .or_else(|| try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot))
+            .or_else(|| try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot))
         });
         // Compile the WHERE once. For subquery-free predicates the
         // compiled path runs a flat step program; correlated /
