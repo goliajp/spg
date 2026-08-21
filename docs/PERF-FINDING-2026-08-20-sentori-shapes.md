@@ -790,3 +790,42 @@ Correct build: 6,496 pass, 0 fail.
 This is the shared hot path of every binary operator, so the 64-cell
 constant-answer sweep is the real gate — the v7.38.8 finding is that
 such a change taxes shapes that never take it.
+
+---
+
+## v7.38.13 — the 64-cell sweep caught one loss; it is the standing one
+
+The dispatch change is on the shared path of every binary operator, so
+the constant-answer sweep is its real gate. It came back
+`cells=64 losses=1 control_false_differences=0`, and the losing cell is
+`400000 distinct then order` — the standing loss already recorded and
+already named to the customer as open.
+
+Proven, not assumed. Alternating legs on **the sweep's own table**
+(`id INT PRIMARY KEY, k INT, pad TEXT`, 400k rows, 400k distinct k):
+
+```
+before   133.6 [132.5..136.2]     134.7 [133.9..137.1]
+after    133.9 [130.9..135.3]     134.9 [131.9..136.1]
+```
+
+0.2 %, inside the band. Not a regression.
+
+**The first cut of this A/B measured the wrong thing** and would have
+said the same. It built its own table — 40k distinct, no `pad` column —
+and measured 21 ms where the failing cell measures 133. Same SQL text,
+different table, different work. The tell was the magnitude, and the
+fix was to take the table definition from `perf-endpoint-sweep.sh`
+rather than write one. Second occurrence this session of the same
+error: **the vehicle has to be the thing that failed.**
+
+### This cell has now cost three cycles of proving the same negative
+
+7.38.9, 7.38.11 and now 7.38.13 each spent a round demonstrating that
+this cell's LOSS is not that release's regression. Three times is the
+signal to attack it rather than re-prove it. SPG ~134 ms against PG's
+~126 (the sweep's PG leg: 120.4-132.5); the gap fits inside the gate's
+own run-to-run variance, which is why the verdict flickers.
+
+An instrument now exists that does not flicker: `/tmp/leg.sh` measures
+exactly this shape at 1-2 % spread, median-of-9 after 3 warm runs.
