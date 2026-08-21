@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `15_regressions` | 96 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 307 | 2 | 0 | 99.4% |
+| `mysql` | 309 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -25,13 +25,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 28: row mismatch | expected:` |
-| 1 | `record 29: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -86,7 +79,7 @@ Per-corpus pass / fail / skip:
 | `09_if_ifnull.test` | 16 | 0 | 0 |
 | `10_tinyint1_int_coerce.test` | 21 | 0 | 0 |
 | `11_fulltext_gin_seek.test` | 9 | 0 | 0 |
-| `12_collation_index_agreement.test` | 36 | 2 | 0 |
+| `12_collation_index_agreement.test` | 38 | 0 | 0 |
 | `12_unique_collation.test` | 17 | 0 | 0 |
 | `13_show_databases.test` | 2 | 0 | 0 |
 | `14_show_create_table.test` | 3 | 0 | 0 |
@@ -97,12 +90,6 @@ Per-corpus pass / fail / skip:
 | `v73814_expr_collation.test` | 15 | 0 | 0 |
 | `v73814_join_collation.test` | 22 | 0 | 0 |
 | `v73814_setop_collation.test` | 20 | 0 | 0 |
-
-<details><summary>`12_collation_index_agreement.test` fail snippets</summary>
-
-- record 28: row mismatch |   expected: ["1", "10", "2", "20"] |   actual:   []
-- record 29: row mismatch |   expected: ["1", "10", "2", "20"] |   actual:   ["1", "NULL", "2", "NULL"]
-</details>
 
 ### `pg_regress/`
 
