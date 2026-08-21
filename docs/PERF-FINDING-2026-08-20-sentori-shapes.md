@@ -1086,8 +1086,19 @@ The reason is written at `select.rs:7474-7477`: the seen-set holds
 vector addressable, which an arena that hands rows away as the merge
 produces them cannot offer. That is a structural coupling, not an
 oversight — and `try_int_key_sorted_stream` (round 1031) would otherwise
-be a near-perfect fit for this shape: one NOT NULL integer key, one
-table.
+be a good fit for this shape.
+
+**Checked, because the obvious reading of that lane is wrong.** Its doc
+comment says every ORDER BY term must be a *NOT NULL* integer column,
+and the sweep's `k` is declared `k INT` — nullable. If that were the
+live condition the lane would decline this shape anyway and removing the
+DISTINCT gate would buy nothing. It is not the live condition: the gate
+at `select.rs:8190-8196` tests only `SmallInt | Int | BigInt`, and the
+comparator carries a null bitmap (`select.rs:8300-8324`). The comment is
+older than the code. **The sweep's column is eligible.**
+
+Worth doing early next round: correct that comment, so the next reader
+does not have to re-derive this.
 
 So the value of a sort-then-adjacent-dedup plan is **not** the 2.4 % of
 hash it saves. It is that **the objection disappears**: with no seen-set
