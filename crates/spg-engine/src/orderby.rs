@@ -1665,16 +1665,25 @@ pub(crate) fn build_order_keys_into(
     ctx: &EvalContext,
     keys: &mut Vec<OrderKey>,
 ) -> Result<(), EngineError> {
-    build_order_keys_bound(order_by, &[], row, ctx, keys)
+    build_order_keys_bound(order_by, &[], &[], row, ctx, keys)
 }
 
 /// The same, reading a bound key's cell instead of evaluating it.
 /// `bound` may be shorter than `order_by`; a missing or `None` entry
 /// falls back to the interpretive path, so the keys are the ones
 /// `build_order_keys_into` would have produced.
+///
+/// v7.38.13 — `collations` is [`order_by_collations`]' output for the same
+/// positions, and it decides ONE thing here: whether the MySQL fold below
+/// may touch this key. A position carrying a collation is compared by
+/// [`order_key_elem_cmp_in`] through `crate::collate::compare`, so a folded
+/// key would hand that comparator text the row never held. Resolved once
+/// per sort by the caller, never per row. A short or empty slice means
+/// "no opinion" and folds exactly as before.
 pub(crate) fn build_order_keys_bound(
     order_by: &[OrderBy],
     bound: &[Option<usize>],
+    collations: &[Option<alloc::string::String>],
     row: &Row<'static>,
     ctx: &EvalContext,
     keys: &mut Vec<OrderKey>,
@@ -1721,12 +1730,24 @@ pub(crate) fn build_order_keys_bound(
             // the label text: `ORDER BY mood` puts 'sad' < 'ok' < 'happy'
             // when that is the CREATE TYPE order, not alphabetical.
             keys.push(OrderKey::Num(ord));
-        } else if ctx.mysql_dialect && matches!(v, Value::Text(_) | Value::BpChar(_)) {
+        } else if ctx.mysql_dialect
+            && matches!(v, Value::Text(_) | Value::BpChar(_))
+            && collations.get(i).is_none_or(Option::is_none)
+        {
             // v7.39 (round 411) — under the MySQL collation (case- and
             // accent-insensitive, PAD SPACE) ORDER BY sorts by the FOLDED
             // text, so `apple`/`Apple` sort adjacent and `Zebra` after
             // `Mango`. The precomputed key must fold to match
             // `order_by_value_cmp_in`; a byte key would sort by ASCII case.
+            //
+            // v7.38.13 — but ONLY when no collation applies at this
+            // position. `COLLATE utf8mb4_bin` compares byte-wise, and a
+            // folded key cannot be un-folded by any comparator downstream:
+            // ORDER BY on such a column answered `a, A, bar, Bar` where
+            // MySQL 9.7.1 answers `A, Bar, a, bar`. The two spellings the
+            // fold used to swallow -- the column's declaration and an
+            // explicit COLLATE in the query -- are both resolved into
+            // `collations` before the scan starts.
             let s = match v {
                 Value::Text(s) | Value::BpChar(s) => s.as_ref(),
                 _ => unreachable!("guarded by matches! above"),

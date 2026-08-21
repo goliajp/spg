@@ -36,6 +36,26 @@ pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     if base.eq_ignore_ascii_case("C") || base.eq_ignore_ascii_case("POSIX") {
         return Some(a.as_bytes().cmp(b.as_bytes()));
     }
+    // v7.38.13 — MySQL's byte-order collations, for the same reason `C` is
+    // answered here: they ARE byte order by definition, so handing them to
+    // ICU would be asking it to perform something it has no locale for.
+    // `binary` is the `binary` charset's collation; every charset also
+    // publishes a `_bin` variant (`utf8mb4_bin`, `latin1_bin`, ...) which
+    // compares by CODE POINT — and UTF-8 byte order is code-point order,
+    // so the two coincide. They are NO PAD, which a byte compare gives.
+    //
+    // Without this the name reached `Locale::try_from_str`, failed to
+    // parse, and `compare` returned None — which callers read as "this
+    // build cannot perform it" and dropped, leaving `ORDER BY` on a
+    // `COLLATE utf8mb4_bin` column sorting case-INSENSITIVELY. MySQL
+    // 9.7.1 answers `A, Bar, a, bar`; SPG answered `a, A, bar, Bar`.
+    if base.eq_ignore_ascii_case("binary")
+        || base
+            .rsplit_once('_')
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
+    {
+        return Some(a.as_bytes().cmp(b.as_bytes()));
+    }
     let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
     let prefs = icu_collator::CollatorPreferences::from(&locale);
     let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;

@@ -41,12 +41,8 @@ SELECT COUNT(*) FROM (SELECT t FROM bin_t GROUP BY t) g
 # wrong count. Ordered by LENGTH then by the count of each, which needs
 # no claim about how a binary collation sorts.
 #
-# RESIDUAL, recorded rather than faked: SPG answers `a, A, bar, Bar` for
-# `ORDER BY t` on this column, and a byte-wise collation would sort
-# `A, Bar, a, bar` ('A' is 65, 'a' is 97). That may be a second bug in
-# the same family, but the expectation is not pinned here because it was
-# not taken from a MariaDB 11 run — the first draft of this file DID
-# hand-compute it, and the runner disagreed.
+# The order this file used to leave unpinned is pinned below, from a
+# MySQL 9.7.1 run.
 query II
 SELECT LENGTH(t), COUNT(*) FROM (SELECT DISTINCT t FROM bin_t) g GROUP BY 1 ORDER BY 1
 ----
@@ -68,6 +64,98 @@ query I
 SELECT COUNT(*) FROM (SELECT DISTINCT t FROM ci_t) g
 ----
 2
+
+# v7.38.13 — ORDER BY on the byte-wise column, the sibling this file
+# recorded and could not pin. Every expectation below is from a MySQL
+# 9.7.1 run (`docker exec spg-bench-mysql mysql`), not hand-computed:
+# the first draft of this file DID hand-compute this shape and the
+# runner disagreed.
+#
+# SPG answered `a, A, bar, Bar` -- the DEFAULT collation's answer -- for
+# all three of the column's declaration, an explicit `COLLATE "C"`, and
+# an explicit `COLLATE utf8mb4_bin`. Two causes stacked: `collate::compare`
+# had no case for MySQL's byte-order names and returned "cannot perform",
+# and the ORDER BY key was folded at BUILD time, where no comparator
+# downstream can un-fold it.
+#
+# No ties are possible here: byte-wise, all four values differ, so the
+# whole sequence is determined and a wrong survivor cannot hide behind an
+# unspecified tie order.
+query T
+SELECT t FROM bin_t ORDER BY t
+----
+A
+Bar
+a
+bar
+
+query T
+SELECT t FROM bin_t ORDER BY t DESC
+----
+bar
+a
+Bar
+A
+
+# The DISTINCT and GROUP BY spellings order the same way.
+query T
+SELECT DISTINCT t FROM bin_t ORDER BY t
+----
+A
+Bar
+a
+bar
+
+query T
+SELECT t FROM bin_t GROUP BY t ORDER BY t
+----
+A
+Bar
+a
+bar
+
+# MIN/MAX read the same collation. MySQL 9.7.1 answers A / bar; SPG
+# answered a / bar, so MIN was wrong and MAX agreed by accident.
+query TT
+SELECT MIN(t), MAX(t) FROM bin_t
+----
+A
+bar
+
+# NEGATIVE CONTROL for the ORDER BY fix, on values that admit NO tie.
+# 'B' is 0x42 and 'a' is 0x61, so byte order gives B, a while the MySQL
+# default folds to a, B. A fix that exempted every column -- or that
+# stopped folding unconditionally -- turns this pair around.
+statement ok
+CREATE TABLE ord_ci (t VARCHAR(10))
+
+statement ok
+INSERT INTO ord_ci VALUES ('B'),('a')
+
+query T
+SELECT t FROM ord_ci ORDER BY t
+----
+a
+B
+
+# The same two values on a byte-wise column go the other way.
+statement ok
+CREATE TABLE ord_bin (t VARCHAR(10) COLLATE utf8mb4_bin)
+
+statement ok
+INSERT INTO ord_bin VALUES ('B'),('a')
+
+query T
+SELECT t FROM ord_bin ORDER BY t
+----
+B
+a
+
+statement ok
+DROP TABLE ord_ci
+
+statement ok
+DROP TABLE ord_bin
 
 # Trailing spaces still PAD-SPACE-fold on the default column, and still
 # do not on the byte-wise one.
