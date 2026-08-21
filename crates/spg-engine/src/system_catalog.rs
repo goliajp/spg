@@ -3164,6 +3164,21 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
 /// and the cast agree.
 #[must_use]
 pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
+    // v7.38.14 — a session's temporary namespace, which PG publishes as
+    // `pg_temp_N` and SPG reported as `public`.
+    //
+    // The objects themselves have been session-scoped since round 469 --
+    // they carry a per-session name prefix, and another connection cannot
+    // see or use them -- so the LIFETIME was never the defect the ledger
+    // recorded. What was wrong is what the catalog SAYS: a schema-diff or
+    // migration tool reading `pg_class`/`pg_namespace` saw a temporary
+    // object sitting in `public` and had no way to tell it apart from a
+    // permanent one.
+    if let Some(sid) = oid.checked_sub(TEMP_NS_OID_BASE)
+        && (0..TEMP_NS_OID_SPAN).contains(&sid)
+    {
+        return Some(alloc::format!("pg_temp_{sid}"));
+    }
     let name = match oid {
         11 => "pg_catalog",
         2200 => "public",
@@ -3171,6 +3186,23 @@ pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
         _ => return None,
     };
     Some(alloc::string::String::from(name))
+}
+
+/// v7.38.14 — the oid a session's `pg_temp_N` namespace takes. Chosen
+/// above every oid this catalog hands out so the two spaces cannot
+/// collide, and derived from the session id so the name is stable for as
+/// long as the session is.
+pub(crate) const TEMP_NS_OID_BASE: i64 = 900_000;
+/// How many sessions the temp-namespace oid space covers before it would
+/// run into whatever comes next. Nothing allocates above it today; the
+/// bound exists so `schema_name_for_oid` cannot claim an unrelated oid.
+pub(crate) const TEMP_NS_OID_SPAN: i64 = 100_000;
+
+/// The namespace oid a relation named `name` belongs to: its session's
+/// temporary one when the name carries a temp prefix, `public` otherwise.
+#[must_use]
+pub(crate) fn namespace_oid_for_relname(name: &str) -> i64 {
+    crate::Engine::temp_session_of(name).map_or(2200, |sid| TEMP_NS_OID_BASE + i64::from(sid))
 }
 
 /// v7.39 (round 623, S05b) — pg_class's own columns, hoisted for the same
@@ -3309,14 +3341,15 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(this_oid),
             Value::text(tname.clone()),
-            Value::BigInt(2200),     // public namespace
-            Value::BigInt(0),        // reltype (composite type OID; SPG no composite)
-            Value::BigInt(0),        // reloftype
-            Value::BigInt(10),       // relowner — PG postgres superuser OID
-            Value::BigInt(0),        // relam (table AM; 0 == default heap)
+            // v7.38.14 — `pg_temp_N` for a session's temporary relation.
+            Value::BigInt(namespace_oid_for_relname(&stored)),
+            Value::BigInt(0),  // reltype (composite type OID; SPG no composite)
+            Value::BigInt(0),  // reloftype
+            Value::BigInt(10), // relowner — PG postgres superuser OID
+            Value::BigInt(0),  // relam (table AM; 0 == default heap)
             Value::BigInt(this_oid), // relfilenode shares oid in SPG (no separate fork)
-            Value::BigInt(0),        // reltablespace (0 == default)
-            Value::Int(relpages),    // hot_bytes in 8 KiB PG-page units
+            Value::BigInt(0),  // reltablespace (0 == default)
+            Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
             Value::Int(0),    // relallvisible — visibility map lands in 15.17
             Value::BigInt(0), // reltoastrelid (SPG no TOAST)
@@ -3396,12 +3429,12 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(view_oid),
             Value::text(vname.to_string()),
-            Value::BigInt(2200), // relnamespace — public
-            Value::BigInt(0),    // reltype
-            Value::BigInt(0),    // reloftype
-            Value::BigInt(10),   // relowner
-            Value::BigInt(0),    // relam — a view has no access method
-            Value::BigInt(0),    // relfilenode — nor any storage
+            Value::BigInt(namespace_oid_for_relname(stored)),
+            Value::BigInt(0),  // reltype
+            Value::BigInt(0),  // reloftype
+            Value::BigInt(10), // relowner
+            Value::BigInt(0),  // relam — a view has no access method
+            Value::BigInt(0),  // relfilenode — nor any storage
             Value::BigInt(0),
             Value::Int(0),      // relpages
             Value::Float(-1.0), // reltuples — -1 = never analysed
@@ -3437,7 +3470,7 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(comp_oid),
             Value::text(cname.clone()),
-            Value::BigInt(2200),               // relnamespace — public
+            Value::BigInt(namespace_oid_for_relname(cname)),
             Value::BigInt(54_001 + ci as i64), // reltype — the pg_type row
             Value::BigInt(0),                  // reloftype
             Value::BigInt(10),                 // relowner
@@ -3482,7 +3515,7 @@ pub(crate) fn synth_pg_class(
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
                 Value::text(idx.name.clone()),
-                Value::BigInt(2200),                 // relnamespace — public
+                Value::BigInt(namespace_oid_for_relname(&idx.name)),
                 Value::BigInt(0),                    // reltype (indexes have none)
                 Value::BigInt(0),                    // reloftype
                 Value::BigInt(10),                   // relowner
@@ -3527,7 +3560,7 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
             Value::text(name.to_string()),
-            Value::BigInt(2200), // relnamespace — public
+            Value::BigInt(namespace_oid_for_relname(stored)),
             Value::BigInt(0),
             Value::BigInt(0),
             Value::BigInt(10), // relowner
@@ -10166,7 +10199,30 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("nspacl", DataType::Text, true),
     ];
     let public_acl = crate::acl::render_nspacl(cat);
-    let rows = alloc::vec![
+    // v7.38.14 — every session that owns a temporary relation also owns a
+    // `pg_temp_N` namespace, and `pg_class.relnamespace` now points at it.
+    // Without the matching row the join simply drops those relations, which
+    // would trade one wrong answer for a missing one. Derived from the
+    // catalog's own names rather than tracked separately, so a namespace
+    // cannot outlive the objects that put it here.
+    let mut temp_ns: alloc::vec::Vec<u32> = cat
+        .table_names()
+        .iter()
+        .filter_map(|n| crate::Engine::temp_session_of(n.as_str()))
+        .chain(
+            cat.sequences_all()
+                .keys()
+                .filter_map(|n| crate::Engine::temp_session_of(n)),
+        )
+        .chain(
+            cat.views_all()
+                .keys()
+                .filter_map(|n| crate::Engine::temp_session_of(n)),
+        )
+        .collect();
+    temp_ns.sort_unstable();
+    temp_ns.dedup();
+    let mut rows = alloc::vec![
         Row::new(alloc::vec![
             Value::BigInt(11),
             Value::text("pg_catalog"),
@@ -10204,6 +10260,14 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             Value::Null,
         ]),
     ];
+    for sid in temp_ns {
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(TEMP_NS_OID_BASE + i64::from(sid)),
+            Value::text(alloc::format!("pg_temp_{sid}")),
+            Value::BigInt(10),
+            Value::Null,
+        ]));
+    }
     (schema, rows)
 }
 

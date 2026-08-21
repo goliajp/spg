@@ -4,9 +4,9 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `15_regressions` | 14 | 0 | 0 | 100.0% |
+| `15_regressions` | 23 | 1 | 0 | 95.8% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 270 | 1 | 0 | 99.6% |
+| `mysql` | 271 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -30,7 +30,7 @@ Per-corpus pass / fail / skip:
 
 | count | pattern |
 |---|---|
-| 1 | `record 6: row mismatch | expected:` |
+| 1 | `record 5: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -39,6 +39,12 @@ Per-corpus pass / fail / skip:
 | file | pass | fail | skip |
 |---|---|---|---|
 | `v73813_bare_group_by.test` | 14 | 0 | 0 |
+| `v73814_temp_namespace.test` | 9 | 1 | 0 |
+
+<details><summary>`v73814_temp_namespace.test` fail snippets</summary>
+
+- record 5: row mismatch |   expected: ["public"] |   actual:   ["pg_temp_0"]
+</details>
 
 ### `duckdb/`
 
@@ -87,14 +93,9 @@ Per-corpus pass / fail / skip:
 | `16_info_schema_mysql.test` | 13 | 0 | 0 |
 | `v73813_distinct_binary_collation.test` | 30 | 0 | 0 |
 | `v73814_distinct_sources.test` | 14 | 0 | 0 |
-| `v73814_expr_collation.test` | 14 | 1 | 0 |
+| `v73814_expr_collation.test` | 15 | 0 | 0 |
 | `v73814_join_collation.test` | 22 | 0 | 0 |
 | `v73814_setop_collation.test` | 20 | 0 | 0 |
-
-<details><summary>`v73814_expr_collation.test` fail snippets</summary>
-
-- record 6: row mismatch |   expected: ["2"] |   actual:   ["1"]
-</details>
 
 ### `pg_regress/`
 
