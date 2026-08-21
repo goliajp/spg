@@ -228,6 +228,15 @@ pub(crate) enum Step {
     /// Bool predicate; simple form has `operand=Some(prog)` and
     /// compares the operand value with each WHEN via `BinOp::Eq`.
     Case {
+        /// v7.38.14 — may the simple-form operand match fold text?
+        ///
+        /// Decided at COMPILE time, where the operand's and the WHEN
+        /// arms' expressions are still in hand, and never in the row
+        /// loop. The runtime arm below used `apply_binary_by_ref(Eq)`,
+        /// which is dialect-blind, so `CASE s WHEN 'A'` compared bytes
+        /// while the interpreter's `Expr::Case` folded — one semantic
+        /// with two implementations, disagreeing.
+        fold_operand: bool,
         operand: Option<CompiledExpr>,
         branches: alloc::vec::Vec<(CompiledExpr, CompiledExpr)>,
         else_branch: Option<CompiledExpr>,
@@ -1162,7 +1171,16 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
                 .map(|(w, t)| (compile_expr(w, ctx), compile_expr(t, ctx)))
                 .collect();
             let else_c = else_branch.as_deref().map(|el| compile_expr(el, ctx));
+            // Either side byte-wise keeps the whole operand match byte-wise,
+            // the rule `mysql_text_fold_applies` states for a comparison's
+            // two operands — a CASE arm is that comparison.
+            let fold_operand = operand.as_deref().is_some_and(|o| {
+                branches
+                    .iter()
+                    .all(|(w, _)| super::resolve::mysql_text_fold_applies(o, w, ctx))
+            });
             steps.push(Step::Case {
+                fold_operand,
                 operand: op_c,
                 branches: branches_c,
                 else_branch: else_c,
@@ -2572,6 +2590,7 @@ where
                 }
             }
             Step::Case {
+                fold_operand,
                 operand,
                 branches,
                 else_branch,
@@ -2614,15 +2633,36 @@ where
                             // back to owning apply_binary only if the
                             // by-ref path returns None (non-comparison
                             // op, which Eq never is).
-                            let eq_result =
-                                match super::apply_binary_by_ref(BinOp::Eq, op_v, &when_v)? {
+                            // v7.38.14 — fold first when the compile-time
+                            // decision says this arm's collation folds.
+                            // `apply_binary_by_ref` compares bytes and knows
+                            // nothing about a dialect, which is why
+                            // `CASE s WHEN 'A'` missed 'a' on a
+                            // case-insensitive column.
+                            let folded = if *fold_operand {
+                                match (op_v, &when_v) {
+                                    (Value::Text(x), Value::Text(y))
+                                    | (Value::BpChar(x), Value::BpChar(y)) => Some((
+                                        Value::text(spg_storage::mysql_compare_fold(x)),
+                                        Value::text(spg_storage::mysql_compare_fold(y)),
+                                    )),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            let eq_result = match folded {
+                                Some((l, r)) => apply_binary(BinOp::Eq, l, r)?,
+                                None => match super::apply_binary_by_ref(BinOp::Eq, op_v, &when_v)?
+                                {
                                     Some(v) => v,
                                     None => apply_binary(
                                         BinOp::Eq,
                                         op_v.clone().into_owned(),
                                         when_v.clone().into_owned(),
                                     )?,
-                                };
+                                },
+                            };
                             matches!(eq_result, Value::Bool(true))
                         }
                     };

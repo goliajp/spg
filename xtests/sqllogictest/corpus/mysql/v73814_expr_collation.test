@@ -1,0 +1,86 @@
+# v7.38.14 — a declared collation has to survive being WRAPPED, and it has
+# to mean the same thing in both implementations of a comparison.
+#
+# Two defects, found by asking one question five ways. Every expectation
+# from a MySQL 9.7.1 run over `('a'),('A'),('b')`:
+#
+#                              utf8mb4_bin   default (CI)
+#   CASE s WHEN 'A'                 1              2
+#   s = 'A'                         1              2
+#   GREATEST(s,'A') = 'A'           1              2
+#   CONCAT(s,'') = 'A'              1              2
+#
+# 1. Equality recognised a bare COLUMN and nothing else, so the moment
+#    anything wrapped the column the operand looked like a value with no
+#    collation — and "no collation" reads as "fold it". A byte-wise
+#    column stopped being byte-wise inside `GREATEST` or `CONCAT`.
+#    `collate_derive` already answered this and ORDER BY had used it
+#    since round 692; equality had not.
+#
+# 2. `CASE s WHEN v` is compiled, and the compiled arm compared with a
+#    dialect-blind by-ref equality while the interpreter's arm folded.
+#    One semantic, two implementations, disagreeing — so the answer
+#    depended on whether the expression compiled.
+
+statement ok
+SET sql_mode = 'STRICT_TRANS_TABLES'
+
+statement ok
+CREATE TABLE m5b (s VARCHAR(20) COLLATE utf8mb4_bin)
+
+statement ok
+CREATE TABLE m5c (s VARCHAR(20))
+
+statement ok
+INSERT INTO m5b VALUES ('a'),('A'),('b')
+
+statement ok
+INSERT INTO m5c VALUES ('a'),('A'),('b')
+
+query I
+SELECT COUNT(*) FROM m5b WHERE CASE s WHEN 'A' THEN 1 ELSE 0 END = 1
+----
+1
+
+query I
+SELECT COUNT(*) FROM m5c WHERE CASE s WHEN 'A' THEN 1 ELSE 0 END = 1
+----
+2
+
+query I
+SELECT COUNT(*) FROM m5b WHERE GREATEST(s,'A') = 'A'
+----
+1
+
+query I
+SELECT COUNT(*) FROM m5c WHERE GREATEST(s,'A') = 'A'
+----
+2
+
+query I
+SELECT COUNT(*) FROM m5b WHERE CONCAT(s,'') = 'A'
+----
+1
+
+query I
+SELECT COUNT(*) FROM m5c WHERE CONCAT(s,'') = 'A'
+----
+2
+
+# The unwrapped spelling beside them, so a fix that only moved the
+# wrapped cases cannot pass.
+query I
+SELECT COUNT(*) FROM m5b WHERE s = 'A'
+----
+1
+
+query I
+SELECT COUNT(*) FROM m5c WHERE s = 'A'
+----
+2
+
+statement ok
+DROP TABLE m5b
+
+statement ok
+DROP TABLE m5c
