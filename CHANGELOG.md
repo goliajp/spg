@@ -8,7 +8,27 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.14] — 2026-08-22
+## [7.38.15] — 2026-08-22
+
+7.38.14 was tagged and never published. Its release train stopped inside
+the pre-publish gate, on a test that walked the whole of `/tmp` — nothing
+reached crates.io or the registry. Tags do not get moved, so the work
+ships here instead, unchanged apart from the fix that unblocked it.
+
+### Fixed
+
+- **A harness test measured the machine instead of the code.** A test
+  that spawns one process and reaps it handed the temporary directory
+  *itself* to a size report that walks trees recursively, so it counted
+  every build artefact every project on the machine had left there.
+  Seven minutes at 60 % CPU on a developer box, milliseconds on a clean
+  one — a verdict decided by the state of `/tmp`. The size report now
+  stops after fifty thousand entries and says so, because a breach means
+  the caller passed the wrong path.
+
+---
+
+## [7.38.14] — 2026-08-22 (tagged, never published)
 
 One theme: **a declared collation reaches every comparison path, and the
 answer stops depending on how the query is written.** 7.38.13 taught
