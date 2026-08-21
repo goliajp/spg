@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `15_regressions` | 37 | 1 | 0 | 97.4% |
+| `15_regressions` | 38 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
 | `mysql` | 271 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
@@ -26,12 +26,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 5: row mismatch | expected:` |
-
 ## Per-file detail
 
 ### `15_regressions/`
@@ -39,14 +33,9 @@ Per-corpus pass / fail / skip:
 | file | pass | fail | skip |
 |---|---|---|---|
 | `v73813_bare_group_by.test` | 14 | 0 | 0 |
-| `v73814_explain_names_the_index.test` | 6 | 1 | 0 |
+| `v73814_explain_names_the_index.test` | 7 | 0 | 0 |
 | `v73814_insert_select_tsvector.test` | 7 | 0 | 0 |
 | `v73814_temp_namespace.test` | 10 | 0 | 0 |
-
-<details><summary>`v73814_explain_names_the_index.test` fail snippets</summary>
-
-- record 5: row mismatch |   expected: ["Aggregate  (cost=8.16..8.16 rows=1 width=16)", "  ->  Index Scan using exn_j on exn  (cost=0.15..8.16 rows=1 width=40)", "        I…
-</details>
 
 ### `duckdb/`
 
