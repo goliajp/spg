@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `15_regressions` | 23 | 1 | 0 | 95.8% |
+| `15_regressions` | 24 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
 | `mysql` | 271 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
@@ -26,12 +26,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 5: row mismatch | expected:` |
-
 ## Per-file detail
 
 ### `15_regressions/`
@@ -39,12 +33,7 @@ Per-corpus pass / fail / skip:
 | file | pass | fail | skip |
 |---|---|---|---|
 | `v73813_bare_group_by.test` | 14 | 0 | 0 |
-| `v73814_temp_namespace.test` | 9 | 1 | 0 |
-
-<details><summary>`v73814_temp_namespace.test` fail snippets</summary>
-
-- record 5: row mismatch |   expected: ["public"] |   actual:   ["pg_temp_0"]
-</details>
+| `v73814_temp_namespace.test` | 10 | 0 | 0 |
 
 ### `duckdb/`
 

@@ -8108,7 +8108,20 @@ impl Engine {
 
         if stmt.order_by.is_empty()
             || stmt.order_by.len() > MAX_KEYS
-            || stmt.distinct
+            // v7.38.14 — DISTINCT is admitted when the projected set is
+            // exactly the ORDER BY set, and only then. This lane sorts, and
+            // when the sort key determines the projected row every duplicate
+            // lands ADJACENT to its twin -- so the de-duplication is a
+            // comparison with the previous row rather than a hash table, and
+            // the reason this lane declined DISTINCT disappears with it. The
+            // seen-set it could not offer held indices into a materialised
+            // vector; there is no seen-set now.
+            //
+            // The gate is as narrow as the bare-GROUP-BY rewrite's for the
+            // same reason: `ORDER BY a` over a projection of `a, b` does NOT
+            // place duplicates of the PAIR adjacent, so set EQUALITY, never
+            // overlap.
+            || (stmt.distinct && !Self::distinct_is_adjacent_after_sort(stmt))
             || stmt.limit_with_ties
             || stmt.limit.is_some()
             || stmt.offset.is_some()
@@ -8314,11 +8327,73 @@ impl Engine {
         });
 
         emit(crate::StreamItem::Header(&columns))?;
-        let count = sorted.len();
+        // v7.38.14 — DISTINCT, de-duplicated against the PREVIOUS row.
+        //
+        // The gate above only admits DISTINCT when the sort key determines
+        // the projected row, so every duplicate is adjacent to its twin by
+        // the time this loop runs and one comparison replaces a hash table
+        // of every row seen. Equality is `values_eq_norm` with the same mask
+        // the materialising path builds -- deliberately the same function,
+        // because a de-duplication that disagreed with the one on the other
+        // path would make the answer depend on which lane a query took.
+        //
+        // A query that did not ask for DISTINCT pays one already-false bool
+        // test per row: the short-circuit means the comparison never runs
+        // and `prev` is never written.
+        let dedup_mask = fold_mask(&projection);
+        let fold = FoldSpec::of(self.backslash_escapes, &dedup_mask);
+        let mut count = 0usize;
+        let mut prev: Option<&[Value<'static>]> = None;
         for (_, _, vals) in &sorted {
+            if stmt.distinct
+                && let Some(p) = prev
+                && values_eq_norm(p, vals, fold)
+            {
+                continue;
+            }
             emit(crate::StreamItem::Row(crate::RowCells::Values(vals)))?;
+            count += 1;
+            if stmt.distinct {
+                prev = Some(vals);
+            }
         }
         Ok(Some(count))
+    }
+
+    /// v7.38.14 — would sorting place every duplicate next to its twin?
+    ///
+    /// True when the projected expressions and the ORDER BY expressions are the
+    /// same SET. Then the sort key determines the projected row, so equal rows
+    /// are adjacent afterwards and an adjacent comparison de-duplicates exactly
+    /// as a hash would -- and, because both sort paths are stable, the survivor
+    /// is the first-seen row, which is the one the hash keeps too.
+    ///
+    /// A wildcard's expansion is not known here, so it is not a set this can
+    /// compare; an ordinal ORDER BY names a select-list position rather than a
+    /// value and is left alone.
+    fn distinct_is_adjacent_after_sort(stmt: &SelectStatement) -> bool {
+        if stmt.order_by.is_empty() || !stmt.distinct_on.is_empty() {
+            return false;
+        }
+        let mut projected: alloc::vec::Vec<&Expr> =
+            alloc::vec::Vec::with_capacity(stmt.items.len());
+        for item in &stmt.items {
+            match item {
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => return false,
+                SelectItem::Expr { expr, .. } => projected.push(expr),
+            }
+        }
+        if projected.is_empty() {
+            return false;
+        }
+        let keys: alloc::vec::Vec<&Expr> = stmt.order_by.iter().map(|o| &o.expr).collect();
+        if keys
+            .iter()
+            .any(|k| matches!(k, Expr::Literal(spg_sql::ast::Literal::Integer(_))))
+        {
+            return false;
+        }
+        projected.iter().all(|p| keys.contains(p)) && keys.iter().all(|k| projected.contains(k))
     }
 
     fn try_spill_sorted_stream<F>(
