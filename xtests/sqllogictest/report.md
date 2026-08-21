@@ -4,8 +4,9 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
+| `15_regressions` | 0 | 0 | 0 | 0.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 170 | 0 | 0 | 100.0% |
+| `mysql` | 183 | 2 | 0 | 98.9% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -22,7 +23,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/12_explain` | 12 | 0 | 0 | 100.0% |
 | `spg_baseline/13_recovery` | 31 | 0 | 0 | 100.0% |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
-| `spg_baseline/15_regressions` | 554 | 2 | 0 | 99.6% |
+| `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
 
 ## Top fail patterns
@@ -33,6 +34,11 @@ Per-corpus pass / fail / skip:
 | 1 | `record 8: row mismatch | expected:` |
 
 ## Per-file detail
+
+### `15_regressions/`
+
+| file | pass | fail | skip |
+|---|---|---|---|
 
 ### `duckdb/`
 
@@ -79,6 +85,13 @@ Per-corpus pass / fail / skip:
 | `14_show_create_table.test` | 3 | 0 | 0 |
 | `15_show_indexes_status_processlist.test` | 9 | 0 | 0 |
 | `16_info_schema_mysql.test` | 13 | 0 | 0 |
+| `v73813_distinct_binary_collation.test` | 13 | 2 | 0 |
+
+<details><summary>`v73813_distinct_binary_collation.test` fail snippets</summary>
+
+- record 8: row mismatch |   expected: ["2"] |   actual:   ["4"]
+- record 10: row mismatch |   expected: ["2"] |   actual:   ["5"]
+</details>
 
 ### `pg_regress/`
 
@@ -382,7 +395,7 @@ Per-corpus pass / fail / skip:
 | `round_29_filter_clause.test` | 6 | 0 | 0 |
 | `text_concat_real.test` | 12 | 0 | 0 |
 | `v73811_brin_prune.test` | 17 | 0 | 0 |
-| `v73812_gin_brin_intersect.test` | 11 | 2 | 0 |
+| `v73812_gin_brin_intersect.test` | 13 | 0 | 0 |
 | `v7381_ledger_fixes.test` | 31 | 0 | 0 |
 | `v7382_collate_c_escape_hatch.test` | 6 | 0 | 0 |
 | `v7382_drop_column_checks.test` | 12 | 0 | 0 |
@@ -395,12 +408,6 @@ Per-corpus pass / fail / skip:
 | `v7389_jsonb_containment.test` | 14 | 0 | 0 |
 | `v7389_jsonb_string_result.test` | 10 | 0 | 0 |
 | `wire_streaming_declines.test` | 23 | 0 | 0 |
-
-<details><summary>`v73812_gin_brin_intersect.test` fail snippets</summary>
-
-- record 8: row mismatch |   expected: ["1000"] |   actual:   ["999"]
-- record 10: row mismatch |   expected: ["1"] |   actual:   ["0"]
-</details>
 
 ### `spg_baseline/16_isolation/`
 

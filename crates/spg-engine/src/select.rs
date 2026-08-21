@@ -794,7 +794,7 @@ impl Engine {
         // after ORDER BY (duplicate rows share sort keys, so order is preserved)
         // and before LIMIT.
         if stmt.distinct {
-            out_rows = dedup_rows(out_rows, self.backslash_escapes);
+            out_rows = dedup_rows(out_rows, FoldSpec::dialect(self.backslash_escapes));
         }
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
@@ -3196,11 +3196,16 @@ impl Engine {
             // text by the session collation (CI + accent + PAD SPACE), like
             // GROUP BY. PG stays byte-exact.
             let mysql = self.backslash_escapes;
+            // v7.38.13 — RESIDUAL, recorded rather than faked: a set
+            // operation over a byte-wise column has the same folding hole
+            // DISTINCT had, and this site has no output columns in scope
+            // to build a mask from. Behaviour here is unchanged.
+            let fold = FoldSpec::dialect(mysql);
             match kind {
                 UnionKind::All => rows.extend(peer_rows),
                 UnionKind::Distinct => {
                     rows.extend(peer_rows);
-                    rows = dedup_rows(rows, mysql);
+                    rows = dedup_rows(rows, fold);
                 }
                 // v7.37.17 (17.6 siblings) — PG set semantics.
                 // v7.39 (round 591) — all four ask the same question of the
@@ -3209,8 +3214,8 @@ impl Engine {
                 // DISTINCT already uses, so the answer is a lookup.
                 // INTERSECT: distinct rows present on both sides.
                 UnionKind::Intersect => {
-                    let idx = PeerIndex::build(&peer_rows, mysql);
-                    rows = dedup_rows(rows, mysql)
+                    let idx = PeerIndex::build(&peer_rows, fold);
+                    rows = dedup_rows(rows, fold)
                         .into_iter()
                         .filter(|r| idx.contains(r))
                         .collect();
@@ -3218,7 +3223,7 @@ impl Engine {
                 // INTERSECT ALL: multiset intersection — each row
                 // keeps min(left count, right count) occurrences.
                 UnionKind::IntersectAll => {
-                    let mut idx = PeerIndex::build(&peer_rows, mysql);
+                    let mut idx = PeerIndex::build(&peer_rows, fold);
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
                         if idx.take_one(&r) {
@@ -3229,8 +3234,8 @@ impl Engine {
                 }
                 // EXCEPT: distinct left rows absent from the right.
                 UnionKind::Except => {
-                    let idx = PeerIndex::build(&peer_rows, mysql);
-                    rows = dedup_rows(rows, mysql)
+                    let idx = PeerIndex::build(&peer_rows, fold);
+                    rows = dedup_rows(rows, fold)
                         .into_iter()
                         .filter(|r| !idx.contains(r))
                         .collect();
@@ -3238,7 +3243,7 @@ impl Engine {
                 // EXCEPT ALL: multiset subtraction — each right
                 // occurrence cancels one left occurrence.
                 UnionKind::ExceptAll => {
-                    let mut idx = PeerIndex::build(&peer_rows, mysql);
+                    let mut idx = PeerIndex::build(&peer_rows, fold);
                     let mut kept: Vec<Row<'static>> = Vec::new();
                     for r in rows {
                         if !idx.take_one(&r) {
@@ -3935,7 +3940,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
+            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
         }
         // LIMIT / OFFSET — apply at the tail.
         if let Some(offset) = stmt.offset_literal() {
@@ -4156,7 +4161,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
+            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -5641,7 +5646,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
+            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -5915,7 +5920,7 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, scan_ctx.mysql_dialect);
+            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -6947,6 +6952,10 @@ impl Engine {
         let mut seen_distinct: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
             hashbrown::HashMap::new();
         let distinct_hb = hashbrown::DefaultHashBuilder::default();
+        // v7.38.13 — which output positions must NOT fold. Built once per
+        // scan from the projection, which carries the source column's
+        // byte-wise-ness; see `FoldSpec`.
+        let distinct_mask = fold_mask(&projection);
         // v7.39 (round 485) — one projection buffer for the whole scan
         // rather than a fresh `Vec` per input row. A row that survives
         // the DISTINCT probe takes the buffer with it (`mem::take`) and
@@ -7062,12 +7071,19 @@ impl Engine {
                 for out in expand_srf_row_with(self, plan, &projection, row, &ctx)? {
                     if stmt.distinct {
                         let bucket = seen_distinct
-                            .entry(norm_hash_row(&out, &distinct_hb, ctx.mysql_dialect))
+                            .entry(norm_hash_row(
+                                &out,
+                                &distinct_hb,
+                                FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                            ))
                             .or_default();
-                        if bucket
-                            .iter()
-                            .any(|i| row_eq_norm(&tagged[i].1, &out, ctx.mysql_dialect))
-                        {
+                        if bucket.iter().any(|i| {
+                            row_eq_norm(
+                                &tagged[i].1,
+                                &out,
+                                FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                            )
+                        }) {
                             continue;
                         }
                         bucket.push(tagged.len());
@@ -7153,12 +7169,19 @@ impl Engine {
                 crate::bump_counter!(crate::select::PROJ_ROW_BUILT);
                 if stmt.distinct {
                     let bucket = seen_distinct
-                        .entry(norm_hash_values(&proj_buf, &distinct_hb, ctx.mysql_dialect))
+                        .entry(norm_hash_values(
+                            &proj_buf,
+                            &distinct_hb,
+                            FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                        ))
                         .or_default();
-                    if bucket
-                        .iter()
-                        .any(|i| values_eq_norm(&tagged[i].1.values, &proj_buf, ctx.mysql_dialect))
-                    {
+                    if bucket.iter().any(|i| {
+                        values_eq_norm(
+                            &tagged[i].1.values,
+                            &proj_buf,
+                            FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                        )
+                    }) {
                         crate::bump_counter!(crate::select::DISTINCT_DUP_DROPPED);
                         return Ok(());
                     }
@@ -9224,6 +9247,10 @@ impl Engine {
         let mut seen_distinct: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
             hashbrown::HashMap::new();
         let distinct_hb = hashbrown::DefaultHashBuilder::default();
+        // v7.38.13 — which output positions must NOT fold. Built once per
+        // scan from the projection, which carries the source column's
+        // byte-wise-ness; see `FoldSpec`.
+        let distinct_mask = fold_mask(&projection);
         for surv_i in 0..n_surv {
             let tuple = &survivors_ref[surv_i * stride..(surv_i + 1) * stride];
             let row = &refs[surv_i];
@@ -9299,12 +9326,19 @@ impl Engine {
             // build_order_keys eval and never enter `tagged`.
             if stmt.distinct {
                 let bucket = seen_distinct
-                    .entry(norm_hash_row(&out_row, &distinct_hb, ctx.mysql_dialect))
+                    .entry(norm_hash_row(
+                        &out_row,
+                        &distinct_hb,
+                        FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                    ))
                     .or_default();
-                if bucket
-                    .iter()
-                    .any(|i| row_eq_norm(&tagged[i].1, &out_row, ctx.mysql_dialect))
-                {
+                if bucket.iter().any(|i| {
+                    row_eq_norm(
+                        &tagged[i].1,
+                        &out_row,
+                        FoldSpec::of(ctx.mysql_dialect, &distinct_mask),
+                    )
+                }) {
                     continue;
                 }
                 bucket.push(tagged.len());
@@ -9492,6 +9526,19 @@ pub(crate) struct ProjectedItem {
     /// projection rebuilt the output column and the ORDER BY resolves
     /// against THAT schema.
     pub(crate) collation_name: Option<String>,
+    /// v7.38.13 — and whether this position must NOT fold when DISTINCT
+    /// de-dups it. The fourth thing to live outside the DataType lattice
+    /// and the fourth to be lost the same way: a column declared
+    /// `COLLATE utf8mb4_bin` is byte-wise, `SELECT DISTINCT t` folded it
+    /// anyway, and `'a'` and `'A'` came back as one row where MariaDB 11
+    /// returns two.
+    ///
+    /// A BOOL rather than the `Collation` enum on purpose. The enum's
+    /// storage default is `Binary`, but the FOLD default under MySQL is
+    /// case-insensitive — carrying the enum would silently mean
+    /// "exempt" for every projected expression that is not a column.
+    /// This field states the question it answers.
+    pub(crate) fold_exempt: bool,
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is
@@ -9749,11 +9796,11 @@ struct PeerIndex<'r> {
     bh: hashbrown::DefaultHashBuilder,
     buckets: hashbrown::HashMap<u64, Vec<usize>>,
     rows: &'r [Row<'static>],
-    mysql: bool,
+    fold: FoldSpec<'r>,
 }
 
 impl<'r> PeerIndex<'r> {
-    fn build(rows: &'r [Row<'static>], mysql: bool) -> Self {
+    fn build(rows: &'r [Row<'static>], fold: FoldSpec<'r>) -> Self {
         // ONE hasher for the whole pass: the default builder is seeded per
         // instance, so a fresh one per row would put equal rows in different
         // buckets.
@@ -9762,7 +9809,7 @@ impl<'r> PeerIndex<'r> {
             hashbrown::HashMap::with_capacity(rows.len());
         for (i, r) in rows.iter().enumerate() {
             buckets
-                .entry(norm_hash_row(r, &bh, mysql))
+                .entry(norm_hash_row(r, &bh, fold))
                 .or_default()
                 .push(i);
         }
@@ -9770,27 +9817,27 @@ impl<'r> PeerIndex<'r> {
             bh,
             buckets,
             rows,
-            mysql,
+            fold,
         }
     }
 
     fn contains(&self, r: &Row<'static>) -> bool {
-        let h = norm_hash_row(r, &self.bh, self.mysql);
+        let h = norm_hash_row(r, &self.bh, self.fold);
         self.buckets
             .get(&h)
-            .is_some_and(|b| b.iter().any(|&i| row_eq_norm(&self.rows[i], r, self.mysql)))
+            .is_some_and(|b| b.iter().any(|&i| row_eq_norm(&self.rows[i], r, self.fold)))
     }
 
     /// Remove ONE occurrence, so the multiset forms cancel row for row the
     /// way the pool they replaced did.
     fn take_one(&mut self, r: &Row<'static>) -> bool {
-        let h = norm_hash_row(r, &self.bh, self.mysql);
+        let h = norm_hash_row(r, &self.bh, self.fold);
         let Some(b) = self.buckets.get_mut(&h) else {
             return false;
         };
         let Some(pos) = b
             .iter()
-            .position(|&i| row_eq_norm(&self.rows[i], r, self.mysql))
+            .position(|&i| row_eq_norm(&self.rows[i], r, self.fold))
         else {
             return false;
         };
@@ -9799,8 +9846,8 @@ impl<'r> PeerIndex<'r> {
     }
 }
 
-pub(crate) fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'static>> {
-    dedup_by_row(rows, |r| r, mysql)
+pub(crate) fn dedup_rows(rows: Vec<Row<'static>>, fold: FoldSpec<'_>) -> Vec<Row<'static>> {
+    dedup_by_row(rows, |r| r, fold)
 }
 
 /// v7.37.16 — hash-bucketed DISTINCT. The old `out.iter().any(row_eq_norm)`
@@ -9810,13 +9857,17 @@ pub(crate) fn dedup_rows(rows: Vec<Row<'static>>, mysql: bool) -> Vec<Row<'stati
 /// order is preserved, and correctness needs only the one-way guarantee
 /// "row_eq_norm-Equal ⇒ equal hash" (collisions are re-checked exactly).
 /// Small inputs keep the linear scan — no hasher setup for a 10-row page.
-fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>, mysql: bool) -> Vec<T> {
+fn dedup_by_row<T>(
+    items: Vec<T>,
+    row_of: impl Fn(&T) -> &Row<'static>,
+    fold: FoldSpec<'_>,
+) -> Vec<T> {
     if items.len() <= 32 {
         let mut out: Vec<T> = Vec::with_capacity(items.len());
         for it in items {
             if !out
                 .iter()
-                .any(|seen| row_eq_norm(row_of(seen), row_of(&it), mysql))
+                .any(|seen| row_eq_norm(row_of(seen), row_of(&it), fold))
             {
                 out.push(it);
             }
@@ -9831,11 +9882,11 @@ fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>, mysql: b
     let mut buckets: hashbrown::HashMap<u64, crate::distinct::DistinctBucket> =
         hashbrown::HashMap::with_capacity(items.len());
     for it in items {
-        let h = norm_hash_row(row_of(&it), &bh, mysql);
+        let h = norm_hash_row(row_of(&it), &bh, fold);
         let bucket = buckets.entry(h).or_default();
         if !bucket
             .iter()
-            .any(|i| row_eq_norm(row_of(&out[i]), row_of(&it), mysql))
+            .any(|i| row_eq_norm(row_of(&out[i]), row_of(&it), fold))
         {
             bucket.push(out.len());
             out.push(it);
@@ -9868,8 +9919,12 @@ fn dedup_by_row<T>(items: Vec<T>, row_of: impl Fn(&T) -> &Row<'static>, mysql: b
 /// - Everything value_cmp falls back to debug-format ordering for
 ///   (Json, arrays, vectors, geometry, ranges, …) shares one constant
 ///   bucket — degrades to the exact linear scan, never wrong.
-fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder, mysql: bool) -> u64 {
-    norm_hash_values(&row.values, bh, mysql)
+fn norm_hash_row(
+    row: &Row<'static>,
+    bh: &hashbrown::DefaultHashBuilder,
+    fold: FoldSpec<'_>,
+) -> u64 {
+    norm_hash_values(&row.values, bh, fold)
 }
 
 /// v7.39 (round 485) — the same hash over a bare value slice, so the
@@ -9878,19 +9933,24 @@ fn norm_hash_row(row: &Row<'static>, bh: &hashbrown::DefaultHashBuilder, mysql: 
 fn norm_hash_values(
     values: &[Value<'static>],
     bh: &hashbrown::DefaultHashBuilder,
-    mysql: bool,
+    fold: FoldSpec<'_>,
 ) -> u64 {
     use core::hash::{BuildHasher, Hash, Hasher};
     let mut h = bh.build_hasher();
-    for v in values {
+    for (i, v) in values.iter().enumerate() {
         // v7.39 (round 410) — hash the folded key when the MySQL collation
         // deduplicates a text value, so `row_eq_norm`-equal rows (`'a'` vs
         // `'A'` vs `'a '`) share a hash bucket.
-        if mysql {
-            if let Some(folded) = mysql_dedup_fold(v) {
-                folded.hash(&mut h);
-                continue;
-            }
+        //
+        // v7.38.13 — per POSITION, in lockstep with `values_eq_norm`. A
+        // byte-wise column that folded here while the comparator did not
+        // would scatter equal rows across buckets and stop de-duplicating
+        // at all; the hash and the comparator have to read the same mask.
+        if fold.folds(i)
+            && let Some(folded) = mysql_dedup_fold(v)
+        {
+            folded.hash(&mut h);
+            continue;
         }
         norm_hash_value(v, &mut h);
     }
@@ -10156,20 +10216,75 @@ pub static PROJ_ROW_BUILT: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 pub static DISTINCT_DUP_DROPPED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>, mysql: bool) -> bool {
-    values_eq_norm(&a.values, &b.values, mysql)
+/// v7.38.13 — how DISTINCT must compare one row of output.
+///
+/// The MySQL default collation folds case and trailing spaces when it
+/// de-dups, but a column declared `COLLATE utf8mb4_bin` is BYTE-WISE and
+/// must not fold — `e2e_mysql_collate_binary_round370` calls the
+/// alternative "a silent data-integrity bug: `'a'` and `'A'` de-dup as
+/// one when the schema asked to keep them apart", and names DISTINCT as
+/// one of the sites that has to honour it.
+///
+/// It did not. `values_eq_norm` took a bare `bool` and folded every Text
+/// value in a MySQL session, because a bool cannot see a column. The
+/// GROUP BY path consults the schema and was right all along; the test
+/// only ever exercised that spelling, so the DISTINCT hole was never
+/// covered. `SELECT DISTINCT t` answered 2 where MariaDB 11 answers 4.
+///
+/// `binary` is indexed by OUTPUT POSITION; a position past its end folds,
+/// which is what a caller with no schema to offer gets.
+#[derive(Clone, Copy)]
+pub(crate) struct FoldSpec<'c> {
+    mysql: bool,
+    binary: &'c [bool],
+}
+
+impl<'c> FoldSpec<'c> {
+    /// No column information — every Text position folds under MySQL.
+    pub(crate) const fn dialect(mysql: bool) -> Self {
+        Self { mysql, binary: &[] }
+    }
+
+    /// The mask read off the output columns.
+    pub(crate) fn of(mysql: bool, binary: &'c [bool]) -> Self {
+        Self { mysql, binary }
+    }
+
+    /// Does position `i` fold?
+    #[inline]
+    fn folds(&self, i: usize) -> bool {
+        self.mysql && !self.binary.get(i).copied().unwrap_or(false)
+    }
+}
+
+/// The fold-exempt mask for a projection.
+///
+/// Read off `ProjectedItem`, not off the output `ColumnSchema`: the
+/// projection rebuilds that schema through `ColumnSchema::new`, whose
+/// collation default is `Binary` — a mask built from it would mark
+/// EVERY column byte-wise and stop DISTINCT folding at all.
+pub(crate) fn fold_mask(projection: &[ProjectedItem]) -> alloc::vec::Vec<bool> {
+    projection.iter().map(|p| p.fold_exempt).collect()
+}
+
+pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>, fold: FoldSpec<'_>) -> bool {
+    values_eq_norm(&a.values, &b.values, fold)
 }
 
 /// v7.39 (round 485) — `row_eq_norm` over bare value slices, so the
 /// DISTINCT probe can compare a reused projection buffer against a kept
 /// row without building a `Row` for it.
-pub(crate) fn values_eq_norm(a: &[Value<'static>], b: &[Value<'static>], mysql: bool) -> bool {
+pub(crate) fn values_eq_norm(
+    a: &[Value<'static>],
+    b: &[Value<'static>],
+    fold: FoldSpec<'_>,
+) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b).all(|(x, y)| {
-            if mysql {
-                if let (Some(fx), Some(fy)) = (mysql_dedup_fold(x), mysql_dedup_fold(y)) {
-                    return fx == fy;
-                }
+        && a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+            if fold.folds(i)
+                && let (Some(fx), Some(fy)) = (mysql_dedup_fold(x), mysql_dedup_fold(y))
+            {
+                return fx == fy;
             }
             crate::orderby::value_cmp(x, y) == core::cmp::Ordering::Equal
         })
@@ -10807,6 +10922,7 @@ pub(crate) fn build_projection_hiding_tail(
                         user_enum_type: col.user_enum_type.clone(),
                         mysql_fsp: col.mysql_fsp,
                         collation_name: col.collation_name.clone(),
+                        fold_exempt: matches!(col.collation, spg_storage::Collation::Binary),
                     });
                 }
             }
@@ -10843,6 +10959,7 @@ pub(crate) fn build_projection_hiding_tail(
                         user_enum_type: col.user_enum_type.clone(),
                         mysql_fsp: col.mysql_fsp,
                         collation_name: col.collation_name.clone(),
+                        fold_exempt: matches!(col.collation, spg_storage::Collation::Binary),
                     });
                 }
                 if matched == 0 {
@@ -10871,6 +10988,9 @@ pub(crate) fn build_projection_hiding_tail(
                         user_enum_type: sch.user_enum_type.clone(),
                         mysql_fsp: sch.mysql_fsp,
                         collation_name: sch.collation_name.clone(),
+                        // v7.38.13 — and its byte-wise-ness. This is the
+                        // site `SELECT DISTINCT t FROM t` arrives at.
+                        fold_exempt: matches!(sch.collation, spg_storage::Collation::Binary),
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
                     let output_name = alias
@@ -10898,6 +11018,17 @@ pub(crate) fn build_projection_hiding_tail(
                                 .and_then(|sc| sc.collation_name.clone()),
                             _ => None,
                         },
+                        fold_exempt: match expr {
+                            Expr::Column(c) => schema_cols
+                                .iter()
+                                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                                .is_some_and(|sc| {
+                                    matches!(sc.collation, spg_storage::Collation::Binary)
+                                }),
+                            // Not a column: no declared collation to honour,
+                            // so the session default applies and it folds.
+                            _ => false,
+                        },
                     });
                 } else {
                     let output_name = alias
@@ -10922,6 +11053,17 @@ pub(crate) fn build_projection_hiding_tail(
                                 .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
                                 .and_then(|sc| sc.collation_name.clone()),
                             _ => None,
+                        },
+                        fold_exempt: match expr {
+                            Expr::Column(c) => schema_cols
+                                .iter()
+                                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                                .is_some_and(|sc| {
+                                    matches!(sc.collation, spg_storage::Collation::Binary)
+                                }),
+                            // Not a column: no declared collation to honour,
+                            // so the session default applies and it folds.
+                            _ => false,
                         },
                     });
                 }
