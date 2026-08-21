@@ -1775,6 +1775,23 @@ impl Engine {
             .columns
             .get(idx.column_position)
             .map(|c| c.ty);
+        // v7.38.16 — and the key SPACE is bytes, which under MySQL is not
+        // how the ON clause compares. `ON a.s = b.s` over 'alpha'/'ALPHA'
+        // is a match there and this probe found none: an inner join
+        // returned the EMPTY SET and a left join returned every left row
+        // with NULLs beside it. v7.38.14 taught the hash stage to fold;
+        // this stage was the other half and kept its byte probe.
+        //
+        // Hand the whole stage back for the same reason r1036 does above
+        // — the hash join compares values, not index keys.
+        if !table
+            .schema()
+            .columns
+            .get(idx.column_position)
+            .is_some_and(|c| crate::collate::column_key_is_bytewise(c, ctx.mysql_dialect))
+        {
+            return Ok(false);
+        }
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;

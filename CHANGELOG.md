@@ -36,6 +36,15 @@ the current build; this file is a release-organized view.
   anything else under MySQL falls back to the scan, which costs time and
   not rows.
 
+- **An indexed JOIN under MySQL returned the empty set.** `ON a.s = b.s`
+  over `'alpha'` and `'ALPHA'` is a match in MySQL. v7.38.14 taught the
+  hash join to fold; the indexed nested-loop stage kept its byte probe,
+  so with an index present an inner join returned **no rows** and a left
+  join returned every left row with NULLs beside it — and both returned
+  the right answer with no index. The stage now hands itself back to the
+  hash join, which compares values, exactly as it already did for a key
+  type the index cannot represent.
+
 - **A `CHAR` column was compared by bytes even without an index.** Three
   sites folded `Value::Text` and not `Value::BpChar`, so `IN`, `>=` and
   `BETWEEN` on a CHAR column kept both their case and their trailing
