@@ -8,6 +8,129 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.13] — 2026-08-21
+
+Two dispatch shapes that paid for machinery they never used, and a
+silent wrong answer that measuring the second of them exposed.
+
+### Fixed
+
+- **`DISTINCT` ignored an explicit binary collation.** A column
+  declared `COLLATE utf8mb4_bin` compares byte-wise, so `'a'` and
+  `'A'` are two values. `GROUP BY` got this right; `DISTINCT` folded
+  them and answered one row where MariaDB 11 answers two.
+
+  Two causes, both structural. The `DISTINCT` comparator and its hash
+  companion took a bare dialect bool, so neither could see a column at
+  all; they now take a `FoldSpec` carrying the dialect flag and which
+  output positions are exempt, and the two read the same mask — a hash
+  that folded where the comparator did not would scatter equal rows
+  across buckets and stop de-duplicating at all. And the projection
+  dropped the declared collation on its way to the output schema:
+  `ProjectedItem` gains `fold_exempt`, the **fourth** field to fall
+  through that same hole after enum identity, MySQL fsp and the
+  PostgreSQL collation name.
+
+  It is a `bool` and not the `Collation` enum on purpose: the enum's
+  storage default is `Binary` while the fold default under MySQL is
+  case-insensitive, so carrying the enum would have read as exempt for
+  every projected expression that is not a column.
+
+  Found while measuring the `GROUP BY` rewrite below, which routed
+  `GROUP BY` into `DISTINCT` and turned the one correct answer wrong.
+
+  Set operations keep the same hole — that site has no output columns
+  in scope to build a mask from. Named in the code, behaviour
+  unchanged.
+
+### Performance
+
+- **A bare `GROUP BY` is a `DISTINCT`, and now takes that path.**
+  `SELECT k FROM t GROUP BY k ORDER BY k` returns byte-identical
+  output to `SELECT DISTINCT k FROM t ORDER BY k` — md5 equal across
+  both spellings and both engines. SPG answered the first in 155.7 ms
+  and the second in 95.2, against PostgreSQL 18's 111.3 for either:
+  `uses_aggregate` returned true for any statement carrying a
+  `GROUP BY`, so a query with no aggregate in it went through the
+  aggregate executor and paid for machinery it never used.
+
+  A statement whose select list is exactly its group keys, with no
+  aggregate, no `HAVING` and no window, re-enters the ordinary path as
+  a `DISTINCT`.
+
+  | | before | now |
+  |---|---|---|
+  | `GROUP BY k ORDER BY k` | 155.7 ms | **97.6 ms** |
+  | `DISTINCT k ORDER BY k` | — | 97.4 ms |
+  | PostgreSQL 18, either | 111.3 ms | 111.3 ms |
+
+  A 40 % loss becomes a 12 % win, and the two spellings now cost the
+  same.
+
+  The gate is deliberately narrow. `GROUP BY a, b` projecting `a` is
+  **not** a `DISTINCT` — it yields one row per pair and may repeat
+  `a` — so the projected set and the key set must match, not merely
+  overlap. `HAVING` filters groups and has no `DISTINCT` spelling. A
+  window is evaluated after grouping. An ordinal key names a
+  select-list position and is left alone.
+
+  This shape is not one of the sweep's cells, which is why a 40 % loss
+  sat in it undisturbed while a neighbouring cell that flickers with
+  the machine cost three releases a round each.
+
+- **Two no-op dispatch hops skipped in PostgreSQL mode, and the
+  coercion gate inlined.** On the customer's jsonb accessor shape,
+  4.1 % — and on the mini testbed `max(patched) < min(baseline)`, all
+  nine pairs favouring the change.
+
+  Recorded honestly: this was the *third* attack aimed at that shape,
+  after two were reverted. The two that survive here were first judged
+  failures and only re-read as wins once the instrument could resolve
+  them. The remainder of that gap is still open, and the next round
+  re-decomposes it rather than polishing the same face.
+
+### Tests
+
+Every expectation from a PostgreSQL 18 or MariaDB 11 run, never hand
+computed — one earlier draft in this campaign hand-computed an
+expectation and was wrong.
+
+Both fixtures were watched failing, and the negative controls were
+chosen so that only the new rule can save them:
+
+- Widen the `GROUP BY` gate to "projection is a *subset* of the keys"
+  and `SELECT a FROM bg GROUP BY a, b` turns `1,1,2,3` into `1,2,3` —
+  rows silently vanishing, the failure worth guarding.
+- Drop the `HAVING` gate and the aggregate-free `HAVING` case errors.
+  This needed a **new** case: the first draft's two `HAVING` examples
+  both contained `count()`, so the aggregate check already rejected
+  them and removing the `HAVING` gate left the file green. A control
+  that survives its own rule's removal pins nothing.
+- For the collation fix, watched failing **both ways** — exempting
+  nothing turns three records red with values silently merged
+  (`4 -> 2`, `5 -> 2`); exempting everything turns the negative
+  control red (`2 -> 4`, `2 -> 5`).
+
+### Recorded, not fixed
+
+- SPG answers `ORDER BY` on a binary-collation column in a
+  non-byte-wise order, which may be a sibling of the `DISTINCT` bug
+  above. Not pinned: that expectation was not taken from a MariaDB
+  run, and the first draft of the fixture hand-computed it and was
+  wrong. Pinning it needs a MariaDB differential first.
+
+### A correction to the 7.38.12 entry
+
+The table published under 7.38.12 reported two customer cells as
+*ahead* of PostgreSQL 18 (71.6 % and 14.4 %). Re-run at N=6 and
+repeated, those two do not reproduce as wins; both are level. The
+letter to the customer was corrected the same way, and the table
+below has been amended in place. The rule that produced the
+correction — overlapping intervals are not a win — is one we had been
+applying to our losses and not to our wins.
+
+---
+
 ## [7.38.12] — 2026-08-21
 
 The two indexes meet. A jsonb containment inside a time window was the
@@ -34,24 +157,32 @@ there was no slot list to prune.
 
 ### On the customer profile
 
-Both as containers, vacuumed, N=4, control clean on all eight cells:
+Both as containers, vacuumed, **N=6 and the run repeated once**,
+control clean on all eight cells. (Amended after publication — see the
+correction note under 7.38.13. The first table here was N=4 and
+reported two of these cells as *ahead*; they are level.)
 
-| shape | v7.38.11 | now |
+| shape | campaign open | now |
 |---|---|---|
-| window: count over a day | level | **71.6 % ahead** |
-| window: distinct seats | 3.9 % ahead | **14.4 % ahead** |
-| jsonb: containment in a window | **4.1x behind** | **3.1 % behind — level** |
-| window: group by kind | level | 10.1 % behind |
-| jsonb: containment (no window) | 1.8x | 1.9x |
-| dashboard: top versions | 2.1x | 2.1x |
-| ingest: one row | 2.1x | 2.0x |
-| btree: project and kind | unresolved | unresolved |
+| jsonb: containment in a window | 16.4x behind | **level** |
+| window: count over a day | 5.7x behind | **level** |
+| window: group by kind | 3.7x behind | **level** |
+| window: distinct seats | 2.0x behind | **level** |
+| btree: project and kind | behind | **level** |
+| jsonb: containment (no window) | 2.4x behind | 1.7-1.8x behind |
+| ingest: one row | 2.1x behind | 1.6-1.8x behind |
+| dashboard: top versions | 2.5x behind | 2.1-2.2x behind |
 
-Two shapes ahead, two level. When this campaign opened every one of
-them was between 2.0x and 16.4x behind. What is left is
-representation-bound rather than index-bound: `Value::Json(Cow<str>)`
-is a string at rest, which is what the containment and dashboard rows
-are paying for.
+Five of the eight are level with PostgreSQL 18; three are still
+behind. When this campaign opened every one of them was between 2.0x
+and 16.4x behind.
+
+What is left was described here as representation-bound —
+`Value::Json(Cow<str>)` being a string at rest. A profile taken for
+7.38.13 does not support that: reading the JSON is 6.8 % of the shape
+and the code that walks to it is roughly three and a half times
+that. Three attacks built on the representation reading were
+discarded. The gap is dispatch, not representation.
 
 ### Tests
 
