@@ -999,3 +999,122 @@ Pinned in `xtests/sqllogictest/corpus/mysql/v73813_distinct_binary_collation.tes
 * Set operations (UNION / INTERSECT / EXCEPT) keep the same hole. That
   site has no output columns in scope to build a mask from. Named in
   the code; behaviour unchanged.
+
+---
+
+## v7.38.13 — decomposing the flickering cell, and where its gap actually is
+
+`400000 distinct then order` — `SELECT DISTINCT k FROM t ORDER BY k` — has
+tripped the sweep gate on and off for three releases. Each of 7.38.9,
+7.38.11 and 7.38.13 spent a round proving it was "not a regression" and
+none of them decomposed it. That is the shape the methodology says to
+stop polishing and take apart.
+
+### The reference plan, measured not assumed
+
+    docker exec spg-bench-postgres psql -U bench -d bench \
+      -c 'EXPLAIN (COSTS OFF) SELECT DISTINCT k FROM sweep_400000 ORDER BY k'
+
+     Unique
+       ->  Sort
+             Sort Key: k
+             ->  Seq Scan on sweep_400000
+
+PostgreSQL 18 **sorts first and de-duplicates adjacent rows**. That dedup
+is a comparison against the previous row: no hash, no table, no
+allocation. The control cell one line up in the same sweep,
+`SELECT id FROM t ORDER BY k`, plans the same `Sort ← Seq Scan` without
+the `Unique`.
+
+The sweep's `k` is `(g * 7919) % rows` and 7919 is coprime with the row
+count, so the column is a **permutation**: 400,000 values, 400,000
+distinct, and the DISTINCT removes nothing at all.
+
+### The SPG path, decomposed
+
+SPG de-duplicates with a `hashbrown::HashMap<u64, DistinctBucket>`
+(foldhash) **before** the sort, streaming, inside the scan loop
+(`select.rs:6961`, probe at `:7179`). Every one of the 400,000 rows
+inserts, none of them finds a duplicate. Keys are then built for the
+survivors (`:7203`), the whole set is sorted (`:7314`), and the rows are
+moved a second time by the permutation rebuild (`orderby.rs:1349`).
+
+### The obvious suspect is not the answer
+
+The hash is the thing that leaps out, and it is **not** where the time
+is. The round-940 profile of this exact query put **24.5 % in the sort
+machinery against 2.4 % in the dedup**. Deleting the hash outright buys
+about two and a half percent.
+
+What the decomposition found instead, at `select.rs:7203`:
+
+    let order_keys = if stmt.distinct && !order_by.is_empty() {
+        build_order_keys(&order_by, row, &ctx)?      // <- no `bound`
+    } else {
+        order_keys                                   // built at :7039 WITH it
+    };
+
+Under DISTINCT the sort keys are built *after* the duplicate probe, so
+only survivors pay — a deliberate and good choice. But that branch routed
+to `build_order_keys_bound` with an **empty bound slice**, so every key
+was evaluated interpretively and the column `k` was resolved **by string,
+once per surviving row**. Round 582 added the bound-cell path to stop
+exactly that, and the branch twelve lines above has passed it ever since.
+No comment or test defends the omission.
+
+Fixed in `cb8b173e`. Interleaved A/B on the testbed, order flipped at
+round 4, both binaries side by side and md5-checked:
+
+    HEAD    103.7  104.7  104.7  104.9  105.1  106.0 ms
+    PATCH    96.5   96.6   96.8   96.9   96.9   97.4 ms
+
+`max(PATCH) 97.4 < min(HEAD) 103.7` — no overlap, six pairs out of six,
+verdict unmoved by the flip. About 7.4 %.
+
+### The remaining gap, and why the next attack is not the hash either
+
+Three sort lanes decline this shape, all three on `stmt.distinct`:
+
+| lane | gate |
+|---|---|
+| `try_spill_sorted_scan` | `select.rs:7480` |
+| `try_spill_sorted_stream` | `select.rs:8322` |
+| `try_int_key_sorted_stream` | `select.rs:8086` |
+
+The reason is written at `select.rs:7474-7477`: the seen-set holds
+**indices into `tagged`**, so DISTINCT needs the entire materialised
+vector addressable, which an arena that hands rows away as the merge
+produces them cannot offer. That is a structural coupling, not an
+oversight — and `try_int_key_sorted_stream` (round 1031) would otherwise
+be a near-perfect fit for this shape: one NOT NULL integer key, one
+table.
+
+So the value of a sort-then-adjacent-dedup plan is **not** the 2.4 % of
+hash it saves. It is that **the objection disappears**: with no seen-set
+there is nothing to probe back into, and the shape becomes eligible for
+the lane it is currently excluded from. That is the next round's attack,
+and it should be sized against the `SELECT k FROM t ORDER BY k` control
+in the same run rather than against this cell's history.
+
+Correctness argument, derived and **not yet implemented or tested**: when
+the ORDER BY key set **equals** the projected set, sorting places every
+duplicate adjacent (values that fold equal compare equal and are adjacent
+too), so an adjacent dedup is equivalent to the hash. Both sort paths are
+**stable**, so the survivor is the first-seen row — the same one the hash
+keeps. The gate must be as narrow as the bare-GROUP-BY rewrite's: set
+**equality**, not overlap.
+
+### A reading error worth keeping
+
+Two prerelease runs the same afternoon, on trees differing by **one
+CHANGELOG commit**, disagreed about which cell loses. The second reported
+`numeric range` at 3.942-5.038 ms against PG's 1.474-1.692 — eight times
+slower than the run before it had measured for the same code.
+
+A documentation commit cannot do that, so the run is the instrument and
+not the verdict. The corroborating evidence is not in that cell at all:
+`descending` widened from 159-164 to 180-272 and four cells fell from
+`win` to `unresolved` — **the whole block's spread opened at once**. The
+cause was another project's build sharing the testbed for that hour.
+Interleaving defends against drift; it does not defend against losing
+half the cores.
