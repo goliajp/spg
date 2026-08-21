@@ -794,7 +794,13 @@ impl Engine {
         // after ORDER BY (duplicate rows share sort keys, so order is preserved)
         // and before LIMIT.
         if stmt.distinct {
-            out_rows = dedup_rows(out_rows, FoldSpec::dialect(self.backslash_escapes));
+            // v7.38.14 — see the synthetic-source sites below: the mask was
+            // always available here, from the same projection this function
+            // already built.
+            out_rows = dedup_rows(
+                out_rows,
+                FoldSpec::of(self.backslash_escapes, &fold_mask(&projection)),
+            );
         }
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
@@ -3940,7 +3946,16 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
+            // v7.38.14 — `FoldSpec::of`, not `::dialect`. The dialect-only
+            // spec folds EVERY text position, so a column declared
+            // `COLLATE utf8mb4_bin` had its values merged here exactly the
+            // way 3b494b6e fixed on the main scan path. The projection is
+            // already in scope at each of these sites, so the mask needs no
+            // new plumbing -- it was simply never asked for.
+            projected_rows = dedup_rows(
+                projected_rows,
+                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+            );
         }
         // LIMIT / OFFSET — apply at the tail.
         if let Some(offset) = stmt.offset_literal() {
@@ -4161,7 +4176,16 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
+            // v7.38.14 — `FoldSpec::of`, not `::dialect`. The dialect-only
+            // spec folds EVERY text position, so a column declared
+            // `COLLATE utf8mb4_bin` had its values merged here exactly the
+            // way 3b494b6e fixed on the main scan path. The projection is
+            // already in scope at each of these sites, so the mask needs no
+            // new plumbing -- it was simply never asked for.
+            projected_rows = dedup_rows(
+                projected_rows,
+                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+            );
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -5655,7 +5679,16 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
+            // v7.38.14 — `FoldSpec::of`, not `::dialect`. The dialect-only
+            // spec folds EVERY text position, so a column declared
+            // `COLLATE utf8mb4_bin` had its values merged here exactly the
+            // way 3b494b6e fixed on the main scan path. The projection is
+            // already in scope at each of these sites, so the mask needs no
+            // new plumbing -- it was simply never asked for.
+            projected_rows = dedup_rows(
+                projected_rows,
+                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+            );
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -5929,7 +5962,16 @@ impl Engine {
         }
         // v7.38 (read01) — DISTINCT over a synthetic source was dropped here.
         if stmt.distinct {
-            projected_rows = dedup_rows(projected_rows, FoldSpec::dialect(scan_ctx.mysql_dialect));
+            // v7.38.14 — `FoldSpec::of`, not `::dialect`. The dialect-only
+            // spec folds EVERY text position, so a column declared
+            // `COLLATE utf8mb4_bin` had its values merged here exactly the
+            // way 3b494b6e fixed on the main scan path. The projection is
+            // already in scope at each of these sites, so the mask needs no
+            // new plumbing -- it was simply never asked for.
+            projected_rows = dedup_rows(
+                projected_rows,
+                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+            );
         }
         if let Some(offset) = stmt.offset_literal() {
             let off = (offset as usize).min(projected_rows.len());
@@ -10325,6 +10367,27 @@ impl<'c> FoldSpec<'c> {
 /// EVERY column byte-wise and stop DISTINCT folding at all.
 pub(crate) fn fold_mask(projection: &[ProjectedItem]) -> alloc::vec::Vec<bool> {
     projection.iter().map(|p| p.fold_exempt).collect()
+}
+
+/// v7.38.14 — the same mask, from an OUTPUT SCHEMA instead of a
+/// projection.
+///
+/// Some de-duplication sites hold `Vec<ColumnSchema>` and never see the
+/// `ProjectedItem`s it came from. `ProjectedItem::fold_exempt` is built
+/// from exactly this test (`select.rs`, `build_projection`), so the two
+/// must keep answering identically -- a site that decided "byte-wise" one
+/// way while its neighbour decided the other is how the answer came to
+/// depend on which executor ran the query.
+///
+/// The direction matters: `Collation::Binary` is `ColumnSchema::new`'s
+/// DEFAULT, so a schema rebuilt without carrying the field reads as
+/// "byte-wise on purpose" here. That is a real trap and it has caught
+/// five fields so far; it is why S4 of this release exists.
+pub(crate) fn fold_mask_of_columns(columns: &[ColumnSchema]) -> alloc::vec::Vec<bool> {
+    columns
+        .iter()
+        .map(|c| matches!(c.collation, spg_storage::Collation::Binary))
+        .collect()
 }
 
 pub(crate) fn row_eq_norm(a: &Row<'static>, b: &Row<'static>, fold: FoldSpec<'_>) -> bool {

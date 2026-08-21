@@ -1,0 +1,77 @@
+# v7.38.14 — `SELECT DISTINCT` reaches its answer through a different
+# executor depending on what it selects FROM, and only the main scan path
+# had been taught to honour a declared collation (3b494b6e). The other
+# sites de-duplicated with a dialect-only spec, which folds EVERY text
+# position — so a `COLLATE utf8mb4_bin` column had its values merged in
+# exactly the way that fix exists to prevent.
+#
+# Every expectation from a MySQL 9.7.1 run. Four values, two of which
+# differ from another only by case:
+#
+#   collation      DISTINCT rows
+#   utf8mb4_bin          4
+#   default (CI)         2
+
+statement ok
+SET sql_mode = 'STRICT_TRANS_TABLES'
+
+statement ok
+CREATE TABLE s2b (g INT, s VARCHAR(20) COLLATE utf8mb4_bin)
+
+statement ok
+CREATE TABLE s2c (g INT, s VARCHAR(20))
+
+statement ok
+INSERT INTO s2b VALUES (1,'a'),(1,'A'),(2,'b'),(2,'B')
+
+statement ok
+INSERT INTO s2c VALUES (1,'a'),(1,'A'),(2,'b'),(2,'B')
+
+# DISTINCT over a GROUP BY result (aggregate.rs).
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM s2b GROUP BY s) t
+----
+4
+
+# NEGATIVE CONTROL — the default collation must still fold.
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM s2c GROUP BY s) t
+----
+2
+
+# The un-nested spellings, which reach the same executors directly.
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM s2b) t
+----
+4
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM s2c) t
+----
+2
+
+# RECORDED, NOT PINNED — one shape is still wrong, and writing its
+# current answer here would freeze the defect into the corpus:
+#
+#   SELECT COUNT(*) FROM (SELECT DISTINCT s FROM (SELECT s FROM s2c) d) t
+#     MySQL 9.7.1: 2      SPG: 4
+#
+# The BINARY twin of that query is right (4), and it responds to the mask
+# — forcing the mask to all-false turns it into 2 — so the de-duplication
+# site itself is reached and reads the mask correctly. The CI one does not
+# move under the same ablation, which places the fault upstream: the INNER
+# derived table rebuilds its schema and the collation does not survive the
+# rebuild, so by the time the mask is built every column already claims to
+# be byte-wise.
+#
+# That is the same hole this release has now found in three other places
+# (join.rs::build_combined_schema, the aggregate's synth_schema, and its
+# projection columns), each of which hand-picks which attributes survive
+# and none of which picks all of them. It is what S4 of the v7.38.14
+# roadmap exists to end; this line is its failing witness.
+
+statement ok
+DROP TABLE s2b
+
+statement ok
+DROP TABLE s2c
