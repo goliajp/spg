@@ -2,6 +2,8 @@
 # `if(cond, then, else)` (alias for CASE WHEN).
 # Required for Hibernate / Laravel / Sequelize 0-change cutover.
 
+dialect mysql
+
 query T
 SELECT ifnull('alice', 'default')
 ----

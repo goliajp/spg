@@ -4,6 +4,8 @@
 # name; ORM queries using `WHERE author_id = ?` get the
 # leading-column equality lookup.
 
+dialect mysql
+
 statement ok
 CREATE TABLE posts (
   id INT NOT NULL,

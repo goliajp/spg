@@ -12,6 +12,8 @@
 # walks. Correctness mirrors what Phase 2.2 produced via full-scan.
 
 # Single-column MATCH AGAINST with single-term against FULLTEXT KEY.
+dialect mysql
+
 statement ok
 CREATE TABLE articles (
     id INT NOT NULL,

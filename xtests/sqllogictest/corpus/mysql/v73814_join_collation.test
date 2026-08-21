@@ -11,6 +11,8 @@
 # spellings take different join strategies, and only one of them was
 # honouring the column's collation.
 
+dialect mysql
+
 statement ok
 SET sql_mode = 'STRICT_TRANS_TABLES'
 

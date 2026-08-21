@@ -12,6 +12,8 @@
 #   utf8mb4_bin          4
 #   default (CI)         2
 
+dialect mysql
+
 statement ok
 SET sql_mode = 'STRICT_TRANS_TABLES'
 

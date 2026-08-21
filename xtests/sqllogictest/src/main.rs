@@ -36,7 +36,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use sqllogictest::parser::Record;
 use sqllogictest::{Outcome, Runner, parser};
 
 fn main() -> ExitCode {
@@ -211,9 +210,41 @@ fn main() -> ExitCode {
     // So: one total line that cannot scroll away, every failing file named,
     // and a non-zero status.
     let pass: usize = groups.iter().map(|g| g.pass).sum();
-    let fail: usize = groups.iter().map(|g| g.fail).sum();
+    let mut fail: usize = groups.iter().map(|g| g.fail).sum();
     let skip: usize = groups.iter().map(|g| g.skip).sum();
     write_diffs(&workspace_root, &diffs);
+
+    // v7.38.17 — a coverage assertion about an axis PAIR, not a case.
+    //
+    // v7.38.16 found four silent wrong answers that all lived where
+    // "MySQL semantics" met "an index exists": an indexed join returning
+    // the empty set, `s = 'ALPHA'` returning nothing, BETWEEN and
+    // ORDER BY LIMIT returning the wrong rows. Across the whole corpus
+    // that intersection was EMPTY. The collation fixtures written for
+    // 7.38.13 and 7.38.14 exercise comparison paths and never build an
+    // index; the files that build indexes never entered MySQL. Not a
+    // forgotten case — the two axes had never met, so no amount of
+    // adding cases along either one would have found it.
+    //
+    // Counting cases cannot see that. Counting the intersection can.
+    let with_both: Vec<&FileReport> = groups
+        .iter()
+        .flat_map(|g| g.files.iter())
+        .filter(|f| f.mysql_with_index)
+        .collect();
+    println!(
+        "\nAXIS  mysql-semantics x index-present: {} file(s)",
+        with_both.len()
+    );
+    if with_both.is_empty() {
+        fail += 1;
+        println!(
+            "  EMPTY — no file runs a statement in MySQL semantics while an \
+             index exists. That intersection is where v7.38.16's four wrong \
+             answers were found; leaving it empty means they can come back \
+             unseen."
+        );
+    }
     println!("\nTOTAL          pass={pass} fail={fail} skip={skip}");
 
     if fail == 0 {
@@ -257,6 +288,9 @@ struct FileReport {
     /// answers on the most ordinary query shapes lived behind that for as
     /// long as the directory existed, and were found by hand instead.
     dialect: &'static str,
+    /// v7.38.17 — did this file ever run a statement in MySQL semantics
+    /// while an index existed? See `RunOutcome::mysql_with_index`.
+    mysql_with_index: bool,
     /// First few failures' short text. We don't dump every failure into the
     /// report — the top patterns are enough to drive v1.2 hot planning.
     fail_reasons: Vec<String>,
@@ -369,16 +403,19 @@ fn claimed_dialect(dir: &Path) -> Option<&'static str> {
         .map(|(_, want)| *want)
 }
 
-/// The dialect a parsed file actually enters, as a name.
-fn entered_dialect(records: &[Record]) -> &'static str {
-    match records.iter().find_map(|r| match r {
-        Record::Dialect(mysql) => Some(*mysql),
-        _ => None,
-    }) {
-        Some(true) => "mysql",
-        Some(false) => "postgres",
-        // No directive at all: the runner's default session.
-        None => "postgres",
+/// Name the dialects a run actually visited, from what the engine
+/// reported after each record.
+///
+/// v7.38.17 — this used to read the `dialect` directive, which was the
+/// same mistake in a new place: `SET sql_mode = 'STRICT_TRANS_TABLES'`
+/// puts a session into MySQL semantics with no directive in sight, and
+/// six corpus files entered MySQL exactly that way while a directive-
+/// reading report called them PostgreSQL. Observe, do not parse.
+fn observed_dialect(o: &sqllogictest::RunOutcome) -> &'static str {
+    match (o.entered_mysql, o.entered_postgres) {
+        (true, true) => "mixed",
+        (true, false) => "mysql",
+        _ => "postgres",
     }
 }
 
@@ -397,13 +434,14 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) 
                 fail: 1,
                 skip: 0,
                 dialect: "unparsed",
+                mysql_with_index: false,
                 fail_reasons: vec![format!("parse: {e}")],
             };
         }
     };
-    let entered = entered_dialect(&records);
     let mut runner = Runner::new();
     let outcome = runner.run(&records);
+    let entered = observed_dialect(&outcome);
     // r1052 (S2.4) — cleanup discipline: name what the file left behind.
     // 7.38.1 S4.2 — the ratchet: the corpus reached zero leftovers, so
     // a leak is now a RED, not a shrug. A yellow warning that survives
@@ -417,12 +455,13 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) 
     // what this says.
     let mut claim_broken: Option<String> = None;
     if let Some(want) = claims
-        && entered != want
+        && !(want == "mysql" && outcome.entered_mysql)
     {
         claim_broken = Some(format!(
-            "dialect: filed under {want}/ but runs in {entered} — add a \
-             `dialect {want}` line, or move the file out of a directory \
-             whose name claims something it does not test"
+            "dialect: filed under {want}/ but never enters {want} semantics \
+             (observed: {entered}) — add a `dialect {want}` line, or move \
+             the file out of a directory whose name claims something it \
+             does not test"
         ));
     }
     let leaks = runner.leftover_objects();
@@ -460,6 +499,7 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) 
         fail,
         skip: outcome.skip,
         dialect: entered,
+        mysql_with_index: outcome.mysql_with_index,
         fail_reasons,
     }
 }
@@ -519,8 +559,8 @@ fn write_json(path: &Path, groups: &[GroupReport]) -> std::io::Result<()> {
                 s.push_str(",\n");
             }
             s.push_str(&format!(
-                "        {{ \"file\": \"{}\", \"pass\": {}, \"fail\": {}, \"skip\": {},\n",
-                f.file, f.pass, f.fail, f.skip
+                "        {{ \"file\": \"{}\", \"pass\": {}, \"fail\": {}, \"skip\": {}, \"dialect\": \"{}\",\n",
+                f.file, f.pass, f.fail, f.skip, f.dialect
             ));
             s.push_str("          \"fail_reasons\": [");
             for (ri, r) in f.fail_reasons.iter().enumerate() {

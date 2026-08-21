@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|---|
 | `15_regressions` | 96 | 0 | 0 | 100.0% | postgres × 6 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 309 | 20 | 0 | 93.9% | mysql × 1, postgres × 20 |
+| `mysql` | 333 | 0 | 0 | 100.0% | mysql × 21 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -25,12 +25,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |  |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% | postgres × 33 |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% | postgres × 1 |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 20 | `dialect: filed under mysql/ but runs` |
 
 ## Per-file detail
 
@@ -75,127 +69,27 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip | ran in |
 |---|---|---|---|---|
-| `01_dialect.test` | 15 | 1 | 0 | postgres |
-| `02_int_types.test` | 7 | 1 | 0 | postgres |
-| `03_inline_key.test` | 17 | 1 | 0 | postgres |
-| `05_delimiter.test` | 8 | 1 | 0 | postgres |
-| `06_tinyint_bool.test` | 12 | 1 | 0 | postgres |
-| `07_unsigned.test` | 16 | 1 | 0 | postgres |
-| `08_create_procedure.test` | 5 | 1 | 0 | postgres |
-| `09_if_ifnull.test` | 16 | 1 | 0 | postgres |
-| `10_tinyint1_int_coerce.test` | 21 | 1 | 0 | postgres |
-| `11_fulltext_gin_seek.test` | 9 | 1 | 0 | postgres |
+| `01_dialect.test` | 16 | 0 | 0 | mysql |
+| `02_int_types.test` | 8 | 0 | 0 | mysql |
+| `03_inline_key.test` | 18 | 0 | 0 | mysql |
+| `05_delimiter.test` | 9 | 0 | 0 | mysql |
+| `06_tinyint_bool.test` | 13 | 0 | 0 | mysql |
+| `07_unsigned.test` | 17 | 0 | 0 | mysql |
+| `08_create_procedure.test` | 6 | 0 | 0 | mysql |
+| `09_if_ifnull.test` | 17 | 0 | 0 | mysql |
+| `10_tinyint1_int_coerce.test` | 22 | 0 | 0 | mysql |
+| `11_fulltext_gin_seek.test` | 10 | 0 | 0 | mysql |
 | `12_collation_index_agreement.test` | 38 | 0 | 0 | mysql |
-| `12_unique_collation.test` | 17 | 1 | 0 | postgres |
-| `13_show_databases.test` | 2 | 1 | 0 | postgres |
-| `14_show_create_table.test` | 3 | 1 | 0 | postgres |
-| `15_show_indexes_status_processlist.test` | 9 | 1 | 0 | postgres |
-| `16_info_schema_mysql.test` | 13 | 1 | 0 | postgres |
-| `v73813_distinct_binary_collation.test` | 30 | 1 | 0 | postgres |
-| `v73814_distinct_sources.test` | 14 | 1 | 0 | postgres |
-| `v73814_expr_collation.test` | 15 | 1 | 0 | postgres |
-| `v73814_join_collation.test` | 22 | 1 | 0 | postgres |
-| `v73814_setop_collation.test` | 20 | 1 | 0 | postgres |
-
-<details><summary>`01_dialect.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`02_int_types.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`03_inline_key.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`05_delimiter.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`06_tinyint_bool.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`07_unsigned.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`08_create_procedure.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`09_if_ifnull.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`10_tinyint1_int_coerce.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`11_fulltext_gin_seek.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`12_unique_collation.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`13_show_databases.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`14_show_create_table.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`15_show_indexes_status_processlist.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`16_info_schema_mysql.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`v73813_distinct_binary_collation.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`v73814_distinct_sources.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`v73814_expr_collation.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`v73814_join_collation.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
-
-<details><summary>`v73814_setop_collation.test` fail snippets</summary>
-
-- dialect: filed under mysql/ but runs in postgres — add a `dialect mysql` line, or move the file out of a directory whose name claims something it does not test
-</details>
+| `12_unique_collation.test` | 22 | 0 | 0 | mysql |
+| `13_show_databases.test` | 3 | 0 | 0 | mysql |
+| `14_show_create_table.test` | 4 | 0 | 0 | mysql |
+| `15_show_indexes_status_processlist.test` | 10 | 0 | 0 | mysql |
+| `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
+| `v73813_distinct_binary_collation.test` | 31 | 0 | 0 | mysql |
+| `v73814_distinct_sources.test` | 15 | 0 | 0 | mysql |
+| `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |
+| `v73814_join_collation.test` | 23 | 0 | 0 | mysql |
+| `v73814_setop_collation.test` | 21 | 0 | 0 | mysql |
 
 ### `pg_regress/`
 

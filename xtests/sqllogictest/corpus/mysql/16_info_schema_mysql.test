@@ -1,5 +1,7 @@
 # v7.17.0 Phase 3.P0-63/64/65 — information_schema MySQL views + mysql.user/db.
 
+dialect mysql
+
 statement ok
 CREATE TABLE parents (id INT NOT NULL, PRIMARY KEY (id))
 
