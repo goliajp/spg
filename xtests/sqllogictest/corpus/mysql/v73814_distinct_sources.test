@@ -50,25 +50,27 @@ SELECT COUNT(*) FROM (SELECT DISTINCT s FROM s2c) t
 ----
 2
 
-# RECORDED, NOT PINNED — one shape is still wrong, and writing its
-# current answer here would freeze the defect into the corpus:
-#
-#   SELECT COUNT(*) FROM (SELECT DISTINCT s FROM (SELECT s FROM s2c) d) t
-#     MySQL 9.7.1: 2      SPG: 4
-#
-# The BINARY twin of that query is right (4), and it responds to the mask
-# — forcing the mask to all-false turns it into 2 — so the de-duplication
-# site itself is reached and reads the mask correctly. The CI one does not
-# move under the same ablation, which places the fault upstream: the INNER
-# derived table rebuilds its schema and the collation does not survive the
-# rebuild, so by the time the mask is built every column already claims to
-# be byte-wise.
-#
-# That is the same hole this release has now found in three other places
-# (join.rs::build_combined_schema, the aggregate's synth_schema, and its
-# projection columns), each of which hand-picks which attributes survive
-# and none of which picks all of them. It is what S4 of the v7.38.14
-# roadmap exists to end; this line is its failing witness.
+# DISTINCT over an INNER derived table. This was recorded here as
+# unpinned and wrong (SPG 4, MySQL 2) until the projection-to-schema
+# conversion was unified: the inner SELECT's output schema was rebuilt by
+# one of TWENTY-ONE hand-written conversions, none of which carried the
+# collation, so by the time the de-duplication asked, every column already
+# claimed to be byte-wise. The nested spelling is included because it is
+# the one that has to survive more than one rebuild.
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM (SELECT s FROM s2b) d) t
+----
+4
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM (SELECT s FROM s2c) d) t
+----
+2
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT s FROM (SELECT s FROM (SELECT s FROM s2c) e) d) t
+----
+2
 
 statement ok
 DROP TABLE s2b

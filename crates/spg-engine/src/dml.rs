@@ -3166,7 +3166,7 @@ impl Engine {
         let projection = build_projection(&expanded, &syn, "", self.backslash_escapes)?;
         let columns: Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .map(crate::select::ProjectedItem::to_column_schema)
             .collect();
 
         let ctx = self.ev_ctx(&syn, None);

@@ -136,6 +136,11 @@ fn main() {
             // evidence — its test binary (proclib+wireclient+dev deps)
             // measured 48-74 s cold on the local runner, biting the
             // 35 s unit budget three commits running.
+            /// v7.38.14 — the ceiling a banded budget may reach. The whole
+            /// workspace's unit tests measured 441.6 s on the local runner
+            /// for a no-op comment change to `spg-storage`; this leaves
+            /// headroom over that and refuses to grow past it.
+            const BUDGET_CAP_S: u64 = 480;
             const HEAVY: [&str; 5] = [
                 "spg-engine",
                 "spg-server",
@@ -143,18 +148,41 @@ fn main() {
                 "spg-sql",
                 "suitelib",
             ];
-            let wide = suitelib::steps::changed_crates(root, &graph)
+            // v7.38.14 — band by the AFFECTED COUNT, and apply the cap the
+            // message has always claimed.
+            //
+            // This printed "cap 480 s" while the code multiplied by a flat 8
+            // and capped nothing. The two disagreed, and the gap is not
+            // academic: a change to `spg-storage` rebuilds and tests all
+            // TWENTY-ONE crates, was judged against 35x8x1.2 = 336 s, and
+            // measured 390 s. Its own baseline -- HEAD plus a COMMENT on
+            // `spg-storage`, no behaviour change at all -- measured 441.6 s.
+            // So the budget rejected commits for being what a base-crate
+            // change costs, which is the false red the D26 banding exists to
+            // prevent, reintroduced by under-counting the band.
+            //
+            // Evidence-adjusted the way r1065 adjusted the HEAVY list: a
+            // number that was measured, with the measurement written down.
+            // The cap is what keeps this a budget rather than a blank
+            // cheque -- 441.6 s is the whole workspace, so 480 s leaves
+            // headroom over the worst case and nothing above it.
+            let affected = suitelib::steps::changed_crates(root, &graph)
                 .map(|c| {
                     let a = graph.affected(&c);
-                    a.len() >= 8 || a.iter().any(|x| HEAVY.contains(&x.as_str()))
+                    let heavy = a.iter().any(|x| HEAVY.contains(&x.as_str()));
+                    if a.len() >= 8 || heavy {
+                        a.len().max(8) as u64
+                    } else {
+                        1
+                    }
                 })
-                .unwrap_or(false);
-            let band = if tier == "precommit" && wide {
-                println!("budget band: BASE (affected ≥ 8 crates; clippy/unit ×8×1.2, cap 480 s)");
-                8u64
-            } else {
-                1u64
-            };
+                .unwrap_or(1);
+            let band = if tier == "precommit" { affected } else { 1u64 };
+            if band > 1 {
+                println!(
+                    "budget band: BASE ({band} crates affected; clippy/unit x{band}x1.2, cap 480 s)"
+                );
+            }
             println!("tier {tier} — {} steps, run {runid}", m.tier(tier).len());
             // S4.4 — /tmp leak assertion (the S2.4 half deferred here):
             // full tier snapshots /tmp/spg-* before its steps and any
@@ -268,7 +296,7 @@ fn main() {
                             "unit-affected" | "clippy-affected" | "pins-current" | "slt-smoke"
                         )
                     {
-                        b * band * 12 / 10
+                        (b * band * 12 / 10).min(BUDGET_CAP_S)
                     } else {
                         b
                     }
@@ -364,7 +392,19 @@ fn main() {
             }
             let total = t_total.elapsed();
             println!("total {total:?} — report {}", report.display());
-            let hard_cap = std::time::Duration::from_secs(if band > 1 { 480 } else { 150 });
+            // v7.38.14 — the banded tier cap, measured rather than guessed.
+            //
+            // 480 s rejected a no-op: HEAD plus a COMMENT on `spg-storage`,
+            // zero behaviour change, ran the whole precommit tier in 498.6 s
+            // on the local runner (its `unit-affected` step alone was
+            // 441.6 s). A cap that a no-op cannot clear is not measuring the
+            // change, it is measuring the workspace.
+            //
+            // 600 s clears that worst case with headroom and refuses to grow
+            // past it. The narrow band stays at 150 s: that is the number the
+            // tier is designed around, and nothing about a cement-level
+            // change should cost more.
+            let hard_cap = std::time::Duration::from_secs(if band > 1 { 600 } else { 150 });
             let mut rc = 0;
             if failed.is_some() {
                 rc = 1;

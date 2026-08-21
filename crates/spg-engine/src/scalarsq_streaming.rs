@@ -423,7 +423,7 @@ impl Engine {
         // borrows this slice for every row.
         let columns: Vec<ColumnSchema> = projection
             .iter()
-            .map(|p| ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable))
+            .map(crate::select::ProjectedItem::to_column_schema)
             .collect();
         // v7.37.42-arena Phase 2 — row projection buffer lives in
         // the bumpalo arena. The buffer is reused via `clear()` +

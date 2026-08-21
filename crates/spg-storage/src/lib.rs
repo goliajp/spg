@@ -8496,6 +8496,43 @@ impl ColumnSchema {
         }
     }
 
+    /// v7.38.14 — the SAME column, re-described.
+    ///
+    /// `ColumnSchema::new` is for SYNTHESISING a column: a catalog row, an
+    /// admin view, a computed output. It sets twenty-two fields to their
+    /// defaults, which is right when there is no source column to speak of.
+    ///
+    /// It is wrong, and quietly so, when there IS one -- a join's combined
+    /// schema, an aggregate's synthetic keys, a derived table's output. Those
+    /// sites re-describe an existing column under a new name or type, and
+    /// have each been written as `new(..)` followed by hand-picking a few
+    /// attributes to copy across. They all pick differently and none picks
+    /// them all.
+    ///
+    /// Five fields have been lost through that shape so far -- enum identity,
+    /// MySQL fsp, the PG collation name, `ProjectedItem::fold_exempt`, and
+    /// the `collation` enum -- and v7.38.14 alone found four sites dropping
+    /// the last of those. The failure is never loud: `collation` defaults to
+    /// `Binary`, which downstream reads as "byte-wise ON PURPOSE" rather than
+    /// as "unknown", so a dropped declaration presents as a deliberate one.
+    ///
+    /// This constructor copies everything by construction. A field added to
+    /// `ColumnSchema` therefore reaches every re-describe site without anyone
+    /// having to remember, which is the property the hand-written copy lists
+    /// never had.
+    ///
+    /// The two fields a re-describe legitimately changes -- name and
+    /// nullability -- are parameters. Callers that also retype the column
+    /// assign `ty` afterwards.
+    #[must_use]
+    pub fn rederive(source: &Self, name: impl Into<String>, nullable: bool) -> Self {
+        Self {
+            name: name.into(),
+            nullable,
+            ..source.clone()
+        }
+    }
+
     /// Builder-style helper to attach a default value to an otherwise
     /// plain column schema. Used by the engine when CREATE TABLE
     /// specifies `column TYPE DEFAULT <expr>`.
