@@ -595,11 +595,20 @@ fn index_name_for_cond(engine: &Engine, table: &str, alias: &str, cond: &Expr) -
         // table's primary key as the index serving `j @> '…'`. A plan that
         // names the wrong index is harder to argue with than one that says
         // Seq Scan, because it looks like it was checked.
+        //
+        // All FOUR variants, not the two whose names read like "GIN". The
+        // first cut listed `Gin` and `GinFulltext` and still printed
+        // `t_pkey`, because a jsonb containment index is `GinJsonb` --
+        // matching on what a name looks like rather than on what the
+        // catalog stores is how the wrong index got named twice.
         if let Some(idx) = t.indices().iter().find(|i| {
             i.column_position == pos
                 && matches!(
                     i.kind,
-                    spg_storage::IndexKind::Gin(_) | spg_storage::IndexKind::GinFulltext(_)
+                    spg_storage::IndexKind::Gin(_)
+                        | spg_storage::IndexKind::GinTrgm(_)
+                        | spg_storage::IndexKind::GinFulltext(_)
+                        | spg_storage::IndexKind::GinJsonb(_)
                 )
         }) {
             return Some(idx.name.clone());
