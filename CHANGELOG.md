@@ -44,6 +44,35 @@ the current build; this file is a release-organized view.
   `'delta   '` lost to its own eight-character padding. A fourth site,
   a few hundred lines away, had had the pair right since it was written.
 
+- **A GIN index on an expression was refused, so a PostgreSQL schema
+  would not load.** `CREATE INDEX ON d USING gin (to_tsvector('english',
+  title || ' ' || body))` is PostgreSQL's ordinary spelling for a
+  full-text index, and SPG answered *"expression keys are not supported
+  on GIN indexes"*. So did `coalesce(title,'')` and `(meta -> 'tags')`.
+  PG 18.4 accepts all three. Only `to_tsvector(col)` worked, because the
+  DDL recognised a bare column as the last argument and nothing else.
+
+  All three build now, keyed on the expression's own value, and the `@@`
+  seek matches an index by the expression it stores rather than by the
+  column it happens to be anchored to.
+
+- **And the one full-text spelling that did work returned nothing.**
+  `to_tsvector('english', body)` built the MySQL `FULLTEXT` posting
+  list, which tokenises with the `simple` rule. A query written
+  `to_tsvector('english', body) @@ to_tsquery('english','lazy')` then
+  looked for the English stem `lazi` in a list holding `lazy`: **no rows
+  with the index, one row without it**, where PG 18.4 returns one. The
+  index now holds what the expression evaluates to, configuration
+  included.
+
+  Once used rather than merely built, the seek is 0.013 ms against
+  50.167 ms for the scan at 20,000 rows — flat where the scan is linear.
+
+- **The GIN seek never counted itself.** `idx_scan` on a table whose
+  only index is a GIN read 0 whether the index had answered the query or
+  nothing had, so no test could tell those two apart. The B-tree seeks
+  have counted since they were written.
+
 ### Changed
 
 - **`corpus/mysql/` now actually runs under the MySQL dialect.** The

@@ -1,0 +1,115 @@
+# v7.38.16 — a GIN index on an expression: accepted, filled, and used.
+#
+# PostgreSQL's ordinary spelling for a full-text index puts an
+# expression in the key. SPG refused the DDL outright:
+#
+#   CREATE INDEX ON d USING gin (to_tsvector('english', title||' '||body))
+#   CREATE INDEX ON d USING gin (to_tsvector('english', coalesce(title,'')))
+#   CREATE INDEX ON d USING gin ((meta -> 'tags'))
+#
+# — "expression keys are not supported on GIN indexes". PG 18.4 accepts
+# all three, so a customer's schema did not load at all. Only
+# `to_tsvector(col)` worked, because the DDL path recognised a bare
+# column as the last argument and nothing else.
+#
+# And the one spelling that DID work returned the wrong answer. It built
+# the MySQL FULLTEXT posting list, which tokenises with the `simple`
+# rule, so `to_tsvector('english', body) @@ to_tsquery('english','lazy')`
+# looked for the English stem `lazi` in a list holding `lazy`: NO ROWS
+# with the index, one row without it. Every expected count below is PG
+# 18.4's own answer.
+
+statement ok
+CREATE TABLE gx (id INT, title TEXT, body TEXT, meta JSONB)
+
+statement ok
+INSERT INTO gx VALUES (1,'quick fox','jumps over the lazy dog','{"tags":["a"]}'), (2,'slow turtle','sits','{"tags":["b"]}')
+
+# Before the index, so there is an answer to agree with.
+query I
+SELECT id FROM gx WHERE to_tsvector('english', body) @@ to_tsquery('english','lazy')
+----
+1
+
+statement ok
+CREATE INDEX gx_ft ON gx USING gin (to_tsvector('english', title || ' ' || body))
+
+statement ok
+CREATE INDEX gx_co ON gx USING gin (to_tsvector('english', coalesce(title,'')))
+
+statement ok
+CREATE INDEX gx_tags ON gx USING gin ((meta -> 'tags'))
+
+query I
+SELECT id FROM gx WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english','fox')
+----
+1
+
+query I
+SELECT id FROM gx WHERE to_tsvector('english', coalesce(title,'')) @@ to_tsquery('english','quick')
+----
+1
+
+query I
+SELECT id FROM gx WHERE meta -> 'tags' @> '["a"]'
+----
+1
+
+# A row added after the index was built is in it.
+statement ok
+INSERT INTO gx VALUES (3,'quick hare','naps by the lazy river','{"tags":["a"]}')
+
+query I
+SELECT id FROM gx WHERE to_tsvector('english', title || ' ' || body) @@ to_tsquery('english','quick') ORDER BY id
+----
+1
+3
+
+query I
+SELECT id FROM gx WHERE meta -> 'tags' @> '["a"]' ORDER BY id
+----
+1
+3
+
+# The `simple` tokeniser against an `english` query — the answer that
+# was empty before. Same query as the first one in this file, now with
+# a GIN index in the way.
+query I
+SELECT id FROM gx WHERE to_tsvector('english', body) @@ to_tsquery('english','lazy') ORDER BY id
+----
+1
+3
+
+# The answers above would look the same if nothing selected the index —
+# a scan gets there too. `idx_scan` counts seeks, and until this version
+# the GIN seek did not report any, so a table whose only index is a GIN
+# read 0 whether the index answered or nothing did.
+statement ok
+CREATE TABLE gy (id INT, body TEXT)
+
+statement ok
+INSERT INTO gy VALUES (1,'jumps over the lazy dog'), (2,'sits')
+
+statement ok
+CREATE INDEX gy_ft ON gy USING gin (to_tsvector('english', body))
+
+query I
+SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'gy'
+----
+0
+
+query I
+SELECT id FROM gy WHERE to_tsvector('english', body) @@ to_tsquery('english','lazy')
+----
+1
+
+query I
+SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'gy'
+----
+1
+
+statement ok
+DROP TABLE gx
+
+statement ok
+DROP TABLE gy
