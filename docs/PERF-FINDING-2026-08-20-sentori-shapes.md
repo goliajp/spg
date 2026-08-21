@@ -883,3 +883,60 @@ keys is a DISTINCT) has to be gated tightly — no aggregates, no
 HAVING, no select-list expression that is not a group key — and
 measured on the full matrix like any shared-path change. Recorded
 here; not attempted in this round.
+
+---
+
+## v7.38.13 — the GROUP BY rewrite works, and is blocked by a bug it found
+
+The rewrite (a bare `GROUP BY` whose select list is exactly the group
+keys re-enters the ordinary path as a `DISTINCT`, alongside
+`desugar_using_natural`) does what the decomposition said it would:
+
+```
+SELECT k FROM big GROUP BY k ORDER BY k     155.7  ->  95.6 ms
+SELECT DISTINCT k FROM big ORDER BY k                 97.8 ms
+PostgreSQL 18, either spelling                       111.3 ms
+```
+
+A 40 % loss becomes a 14 % win, and the two spellings now cost the
+same, which is the point. Output md5 unchanged.
+
+**It is not landed.** The e2e suite turned one test red, and the test
+is right.
+
+### The bug it found (pre-existing, in DISTINCT)
+
+`e2e_mysql_collate_binary_round370` asserts that a column declared
+`COLLATE utf8mb4_bin` de-dups BYTE-WISE — its own module note calls the
+alternative "a silent data-integrity bug: `'a'` and `'A'` de-dup as one
+when the schema asked to keep them apart", and lists DISTINCT among the
+sites that must skip the fold.
+
+On HEAD, with no change of mine:
+
+```
+SELECT COUNT(*) FROM (SELECT t FROM t GROUP BY t) g    -> 4   correct
+SELECT COUNT(*) FROM (SELECT DISTINCT t FROM t) g      -> 2   WRONG
+                                        MariaDB 11:       4
+```
+
+**DISTINCT ignores an explicit binary collation and folds case.**
+GROUP BY gets it right. The guarding test only ever exercised the
+GROUP BY spelling, so the DISTINCT hole sat uncovered — and my rewrite,
+by routing GROUP BY into DISTINCT, would have turned the one correct
+answer into the wrong one.
+
+Root cause: `values_eq_norm(a, b, mysql)` applies `mysql_dedup_fold` to
+every Text value whenever the dialect is MySQL. It takes a bare `bool`
+and never sees a column, so it cannot know that this column's
+`Collation` is `Binary`. Twelve call sites pass that bool.
+
+### Order of work
+
+1. Make DISTINCT collation-aware — replace the `mysql: bool` with
+   something carrying which output positions are fold-exempt. This is a
+   correctness fix and stands on its own.
+2. Then the GROUP BY rewrite is safe to land.
+
+The perf patch is kept out of tree until (1) lands. Landing it first
+would trade a 40 % win for a wrong answer.
