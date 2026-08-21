@@ -122,6 +122,24 @@ SELECT MIN(t), MAX(t) FROM bin_t
 A
 bar
 
+# Top-N takes a different route to the answer: the trim discards rows
+# BEFORE the collation-aware sort runs, comparing with the sort
+# directions and no collation at all. If it dropped the wrong row the
+# limited answer would stop being a prefix of the unlimited one. These
+# expectations are that prefix, from the same MySQL 9.7.1 order above --
+# no tie is involved, so there is nothing to hand-compute.
+query T
+SELECT t FROM bin_t ORDER BY t LIMIT 2
+----
+A
+Bar
+
+query T
+SELECT t FROM bin_t ORDER BY t DESC LIMIT 2
+----
+bar
+a
+
 # NEGATIVE CONTROL for the ORDER BY fix, on values that admit NO tie.
 # 'B' is 0x42 and 'a' is 0x61, so byte order gives B, a while the MySQL
 # default folds to a, B. A fix that exempted every column -- or that
