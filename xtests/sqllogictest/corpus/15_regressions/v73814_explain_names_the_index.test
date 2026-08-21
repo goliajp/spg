@@ -1,0 +1,53 @@
+# v7.38.14 — EXPLAIN has to name the index the executor actually uses.
+#
+# It asked one question — `try_index_seek`, the btree/hash door — and a
+# jsonb containment goes through a different one, so a query that really
+# did use its GIN index printed `Seq Scan`.
+#
+# That is not cosmetic. A read-only survey of this engine reported, from
+# these plans, that no GIN index is ever chosen by the planner. Timed at
+# 10k rows against 100k, the containment is FLAT (0.003 ms both) while a
+# real sequential scan is linear (0.105 -> 1.222 ms): the index was
+# working the whole time and the plan said otherwise, which sent a real
+# investigation to a wrong conclusion.
+#
+# The first cut of the fix moved the lie rather than removing it — the
+# plan then named the table's PRIMARY KEY as the index serving `@>`,
+# because the name lookup matched `Gin` and `GinFulltext` and a jsonb
+# containment index is `GinJsonb`. A plan that names the wrong index is
+# harder to argue with than one that says Seq Scan, because it looks
+# like it was checked.
+
+statement ok
+CREATE TABLE exn (id INT PRIMARY KEY, k INT, j JSONB)
+
+statement ok
+INSERT INTO exn SELECT g, g, ('{"k":' || g::text || '}')::jsonb FROM generate_series(1,200) g
+
+statement ok
+CREATE INDEX exn_k ON exn (k)
+
+statement ok
+CREATE INDEX exn_j ON exn USING gin (j)
+
+# The btree control: already correct, and it has to stay correct. The
+# whole plan is asserted rather than a filtered line, because `EXPLAIN`
+# is not a relation here and cannot be selected from.
+query T
+EXPLAIN SELECT count(*) FROM exn WHERE k = 42
+----
+Aggregate  (cost=8.16..8.16 rows=1 width=16)
+  ->  Index Scan using exn_k on exn  (cost=0.15..8.16 rows=1 width=40)
+        Index Cond: (k = 42)
+
+# The containment: names its own index, not the primary key, and not a
+# Seq Scan.
+query T
+EXPLAIN SELECT count(*) FROM exn WHERE j @> '{"k":42}'
+----
+Aggregate  (cost=8.16..8.16 rows=1 width=16)
+  ->  Index Scan using exn_j on exn  (cost=0.15..8.16 rows=1 width=40)
+        Index Cond: (j @> '{"k":42}')
+
+statement ok
+DROP TABLE exn
