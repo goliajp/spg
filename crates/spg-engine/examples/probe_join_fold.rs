@@ -32,9 +32,21 @@ fn main() {
         ))
         .unwrap();
         let joined = count(&mut e, "SELECT l.id FROM l JOIN r ON l.s = r.s");
+        // Discriminating experiments: the SAME equality reached three
+        // other ways. If any of these folds while `JOIN ... ON` does not,
+        // the defect is in the ON path and not in the comparison.
+        let crossw = count(&mut e, "SELECT l.id FROM l, r WHERE l.s = r.s");
+        let subq = count(&mut e, "SELECT id FROM l WHERE s IN (SELECT s FROM r)");
+        let exists = count(
+            &mut e,
+            "SELECT id FROM l WHERE EXISTS (SELECT 1 FROM r WHERE r.s = l.s)",
+        );
         // Control: the same equality outside a join, which takes the
         // nested-loop/eval path for certain.
         let wherecmp = count(&mut e, "SELECT id FROM l WHERE s = 'A'");
-        println!("rows={n:<5} join(l.s=r.s) -> {joined:<10} control WHERE s='A' -> {wherecmp}");
+        println!(
+            "rows={n:<5} JOIN..ON -> {joined:<8} cross+WHERE -> {crossw:<8} \
+IN(subq) -> {subq:<8} EXISTS -> {exists:<8} control WHERE s='A' -> {wherecmp}"
+        );
     }
 }
