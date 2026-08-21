@@ -117,6 +117,13 @@ pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
     if stmt.group_by.is_some() || stmt.having.is_some() {
         return true;
     }
+    uses_aggregate_ignoring_group_by(stmt)
+}
+
+/// v7.38.13 — the same question with the GROUP BY / HAVING short-circuit
+/// removed: does an aggregate CALL appear anywhere? `baregroup` needs
+/// this to tell a grouped aggregate from a GROUP BY that is a DISTINCT.
+pub(crate) fn uses_aggregate_ignoring_group_by(stmt: &SelectStatement) -> bool {
     for item in &stmt.items {
         if let SelectItem::Expr { expr, .. } = item
             && contains_aggregate(expr)
