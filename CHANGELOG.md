@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased] — 7.38.14
+## [7.38.14] — 2026-08-22
 
 One theme: **a declared collation reaches every comparison path, and the
 answer stops depending on how the query is written.** 7.38.13 taught
