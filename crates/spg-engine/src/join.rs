@@ -4629,9 +4629,24 @@ fn build_combined_schema(
     // nullability, so a column's collation stopped here and `ORDER BY a.loc`
     // over a join sorted by bytes. Proven on the path by panicking inside
     // this function and watching the query hit it (round 687).
+    // v7.38.14 — `collation` too, and it is the one that bites hardest.
+    // Round 688 carried the collation NAME and stopped there; the fold
+    // that MySQL text comparison performs reads the ENUM, and
+    // `ColumnSchema::new` defaults that to `Binary`. So every column in a
+    // join's combined schema announced itself as an explicit binary
+    // column, `any_binary` went true in `collation_fold_for_compare`, and
+    // the dialect fold was switched off for the whole join: MySQL answers
+    // 3 rows for `l JOIN r ON l.s = r.s` where the left side is lower and
+    // the right side upper, SPG answered 0. A silently EMPTY result.
+    //
+    // The trap is that the default is not neutral. It is a MEANINGFUL
+    // value that reads as "byte-wise on purpose", which is exactly the
+    // note v7.38.13 left on `ProjectedItem::fold_exempt` -- and this is
+    // the fifth field to fall through a schema rebuild.
     let carry = |name: alloc::string::String, col: &ColumnSchema| {
         let mut c = ColumnSchema::new(name, col.ty, col.nullable);
         c.collation_name = col.collation_name.clone();
+        c.collation = col.collation;
         c.user_enum_type = col.user_enum_type.clone();
         c
     };
