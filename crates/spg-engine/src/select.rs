@@ -7039,6 +7039,7 @@ impl Engine {
                 crate::orderby::build_order_keys_bound(
                     &order_by,
                     &order_bound,
+                    &order_colls,
                     row,
                     &ctx,
                     &mut buf,
@@ -7120,6 +7121,7 @@ impl Engine {
                         crate::orderby::build_order_keys_bound(
                             &order_by,
                             &srf_key_bound,
+                            &order_colls,
                             &key_row,
                             &ctx,
                             &mut buf,
@@ -7201,7 +7203,16 @@ impl Engine {
                     proj_pool.pop().unwrap_or_default(),
                 ));
                 let order_keys = if stmt.distinct && !order_by.is_empty() {
-                    build_order_keys(&order_by, row, &ctx)?
+                    let mut buf = Vec::with_capacity(order_by.len());
+                    crate::orderby::build_order_keys_bound(
+                        &order_by,
+                        &[],
+                        &order_colls,
+                        row,
+                        &ctx,
+                        &mut buf,
+                    )?;
+                    buf
                 } else {
                     order_keys
                 };
@@ -7581,14 +7592,31 @@ impl Engine {
                 }
             }
             keys.clear();
-            crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
+            // `&[]`: this sorter compares with `cmp_multi_key_in(.., &[])`
+            // (extsort.rs:213/543/1221), so the key must stay folded or the
+            // two would disagree. See `build_order_keys_bound`.
+            crate::orderby::build_order_keys_bound(
+                &order_by,
+                &order_bound,
+                &[],
+                row,
+                &ctx,
+                &mut keys,
+            )?;
             sorter.push(&mut keys, row)?;
         }
 
         let key_ctx = &ctx;
         let rows = sorter.finish(
             |src, buf| {
-                crate::orderby::build_order_keys_bound(&order_by, &order_bound, src, key_ctx, buf)
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &[],
+                    src,
+                    key_ctx,
+                    buf,
+                )
             },
             |src| {
                 let mut values = Vec::with_capacity(projection.len());
@@ -8453,7 +8481,17 @@ impl Engine {
                 }
             }
             keys.clear();
-            crate::orderby::build_order_keys_bound(&order_by, &order_bound, row, &ctx, &mut keys)?;
+            // `&[]`: this sorter compares with `cmp_multi_key_in(.., &[])`
+            // (extsort.rs:213/543/1221), so the key must stay folded or the
+            // two would disagree. See `build_order_keys_bound`.
+            crate::orderby::build_order_keys_bound(
+                &order_by,
+                &order_bound,
+                &[],
+                row,
+                &ctx,
+                &mut keys,
+            )?;
             sorter.push(&mut keys, row)?;
         }
 
@@ -8472,7 +8510,14 @@ impl Engine {
         let mut emitted_since_check = 0usize;
         let n = sorter.finish_each(
             |src, buf| {
-                crate::orderby::build_order_keys_bound(&order_by, &order_bound, src, key_ctx, buf)
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &[],
+                    src,
+                    key_ctx,
+                    buf,
+                )
             },
             |src, values| {
                 for p in &projection {
