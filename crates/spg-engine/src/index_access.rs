@@ -1816,6 +1816,13 @@ pub(crate) fn try_gin_seek<'a>(
 /// vs another would broaden the candidate set unsafely without
 /// the OR's full-result containment requirement that's already
 /// checked per row downstream.
+/// v7.38.12 — is slot `i` in a range the BRIN summary could not rule
+/// out? `None` means no summary had an opinion, and then every slot is
+/// kept.
+fn slot_kept(slots: Option<&[core::ops::Range<usize>]>, i: usize) -> bool {
+    slots.is_none_or(|rs| rs.iter().any(|r| r.contains(&i)))
+}
+
 pub(crate) fn try_gin_jsonb_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
@@ -1823,16 +1830,50 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    // v7.38.12 — the two indexes meet here.
+    //
+    // A GIN containment seek hands back row locators, and this is the
+    // only moment they exist before the rows are materialised. If the
+    // same WHERE also bounds a BRIN-indexed column, a locator whose
+    // slot the summary ruled out cannot satisfy that bound — so it is
+    // dropped before the row is touched, which is PG combining two
+    // index results into one bitmap, done at the locator level.
+    //
+    // Computed from the WHOLE predicate at the top call, not from the
+    // sub-expression the recursion below descends into: the range that
+    // prunes lives in a different conjunct from the containment that
+    // seeks.
+    let brin_slots = crate::brin::candidate_slots(where_expr, table);
+    try_gin_jsonb_seek_in(
+        where_expr,
+        schema_cols,
+        table,
+        table_alias,
+        snapshot,
+        &brin_slots,
+    )
+}
+
+fn try_gin_jsonb_seek_in<'a>(
+    where_expr: &Expr,
+    schema_cols: &[ColumnSchema],
+    table: &'a Table,
+    table_alias: &str,
+    snapshot: &spg_storage::snapshot::Snapshot,
+    brin_slots: &Option<Vec<core::ops::Range<usize>>>,
+) -> Option<Vec<Cow<'a, Row<'static>>>> {
     if let Expr::Binary {
         lhs,
         op: BinOp::And,
         rhs,
     } = where_expr
     {
-        if let Some(rows) = try_gin_jsonb_seek(lhs, schema_cols, table, table_alias, snapshot) {
+        if let Some(rows) =
+            try_gin_jsonb_seek_in(lhs, schema_cols, table, table_alias, snapshot, brin_slots)
+        {
             return Some(rows);
         }
-        return try_gin_jsonb_seek(rhs, schema_cols, table, table_alias, snapshot);
+        return try_gin_jsonb_seek_in(rhs, schema_cols, table, table_alias, snapshot, brin_slots);
     }
     let Expr::Binary {
         lhs,
@@ -1893,6 +1934,7 @@ pub(crate) fn try_gin_jsonb_seek<'a>(
     for loc in candidates {
         // Phase C.3 step 2c — MVCC read gate on the Hot arm. No-op today.
         if let spg_storage::RowLocator::Hot(i) = loc
+            && slot_kept(brin_slots.as_deref(), i)
             && table.is_row_visible(i, snapshot)
             && let Some(row) = table.rows().get(i)
         {
