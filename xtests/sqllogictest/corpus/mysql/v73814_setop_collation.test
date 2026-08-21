@@ -1,0 +1,95 @@
+# v7.38.14 — set operations and a declared collation.
+#
+# `xtests/` had NO set-operation collation fixture at all before this
+# file, which is part of why the hole survived: 7.38.13 recorded this
+# site as one where "no output columns are in scope to build a mask
+# from". That was wrong. The columns were always in scope; what was
+# missing is that the branches' output schemas did not CARRY the
+# collation, so a mask built from them would have called every column
+# byte-wise. Unifying the projection-to-schema conversion fixed the
+# supply side and the mask became buildable from what was already there.
+#
+# Every expectation from a MySQL 9.7.1 run. `u1 = {'a','b'}`,
+# `u2 = {'A','b'}` — chosen so all six cells differ, which is what makes
+# a wrong fold visible rather than coincidental:
+#
+#              utf8mb4_bin   default (CI)
+#   UNION            3            2
+#   INTERSECT        1            2
+#   EXCEPT           1            0
+
+statement ok
+SET sql_mode = 'STRICT_TRANS_TABLES'
+
+statement ok
+CREATE TABLE u1b (s VARCHAR(20) COLLATE utf8mb4_bin)
+
+statement ok
+CREATE TABLE u2b (s VARCHAR(20) COLLATE utf8mb4_bin)
+
+statement ok
+CREATE TABLE u1c (s VARCHAR(20))
+
+statement ok
+CREATE TABLE u2c (s VARCHAR(20))
+
+statement ok
+INSERT INTO u1b VALUES ('a'),('b')
+
+statement ok
+INSERT INTO u2b VALUES ('A'),('b')
+
+statement ok
+INSERT INTO u1c VALUES ('a'),('b')
+
+statement ok
+INSERT INTO u2c VALUES ('A'),('b')
+
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1b UNION SELECT s FROM u2b) t
+----
+3
+
+# NEGATIVE CONTROL — the default collation must still fold.
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1c UNION SELECT s FROM u2c) t
+----
+2
+
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1b INTERSECT SELECT s FROM u2b) t
+----
+1
+
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1c INTERSECT SELECT s FROM u2c) t
+----
+2
+
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1b EXCEPT SELECT s FROM u2b) t
+----
+1
+
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1c EXCEPT SELECT s FROM u2c) t
+----
+0
+
+# UNION ALL compares nothing, so it must be untouched by any of this.
+query I
+SELECT COUNT(*) FROM (SELECT s FROM u1b UNION ALL SELECT s FROM u2b) t
+----
+4
+
+statement ok
+DROP TABLE u1b
+
+statement ok
+DROP TABLE u2b
+
+statement ok
+DROP TABLE u1c
+
+statement ok
+DROP TABLE u2c
