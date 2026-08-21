@@ -50,7 +50,7 @@
         { "file": "21_order_by_desc.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 234, "fail": 2, "skip": 0,
+    { "name": "mysql", "pass": 253, "fail": 3, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -84,10 +84,12 @@
           "fail_reasons": [] },
         { "file": "v73813_distinct_binary_collation.test", "pass": 30, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "v73814_distinct_sources.test", "pass": 12, "fail": 2, "skip": 0,
-          "fail_reasons": ["record 10: row mismatch |   expected: [\"2\"] |   actual:   [\"4\"]", "record 11: row mismatch |   expected: [\"2\"] |   actual:   [\"4\"]"] },
+        { "file": "v73814_distinct_sources.test", "pass": 14, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "v73814_join_collation.test", "pass": 22, "fail": 0, "skip": 0,
-          "fail_reasons": [] }
+          "fail_reasons": [] },
+        { "file": "v73814_setop_collation.test", "pass": 17, "fail": 3, "skip": 0,
+          "fail_reasons": ["record 9: row mismatch |   expected: [\"3\"] |   actual:   [\"2\"]", "record 11: row mismatch |   expected: [\"1\"] |   actual:   [\"2\"]", "record 13: row mismatch |   expected: [\"1\"] |   actual:   [\"0\"]"] }
       ] },
     { "name": "pg_regress", "pass": 1506, "fail": 0, "skip": 0,
       "files": [

@@ -3196,11 +3196,27 @@ impl Engine {
             // text by the session collation (CI + accent + PAD SPACE), like
             // GROUP BY. PG stays byte-exact.
             let mysql = self.backslash_escapes;
-            // v7.38.13 — RESIDUAL, recorded rather than faked: a set
-            // operation over a byte-wise column has the same folding hole
-            // DISTINCT had, and this site has no output columns in scope
-            // to build a mask from. Behaviour here is unchanged.
-            let fold = FoldSpec::dialect(mysql);
+            // v7.38.14 — the mask, which 7.38.13 recorded as impossible here
+            // and was wrong about. `columns` and `peer_cols` are both in
+            // scope; what was actually missing is that the branches' output
+            // schemas did not CARRY the collation, so a mask built from them
+            // would have marked every column byte-wise. Unifying the
+            // projection-to-schema conversion fixed the supply side, and the
+            // mask is now buildable from what was always there.
+            //
+            // Either side byte-wise keeps the position byte-wise, mirroring
+            // `eval::resolve::mysql_text_fold_applies`: a set operation
+            // between a folding column and a declared-binary one must not
+            // quietly fold the binary one's values away.
+            let set_mask: alloc::vec::Vec<bool> = columns
+                .iter()
+                .zip(peer_cols.iter())
+                .map(|(l, r)| {
+                    matches!(l.collation, spg_storage::Collation::Binary)
+                        || matches!(r.collation, spg_storage::Collation::Binary)
+                })
+                .collect();
+            let fold = FoldSpec::of(mysql, &set_mask);
             match kind {
                 UnionKind::All => rows.extend(peer_rows),
                 UnionKind::Distinct => {
