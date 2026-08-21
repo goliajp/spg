@@ -631,3 +631,104 @@ and from ablation on a vehicle chosen for convenience. §9's rule
 applies and was not followed: **profile to establish the category,
 ablate to price it.** The next round starts with a leaf-symbol profile
 of the customer shape, not with a hypothesis.
+
+---
+
+## v7.38.13 Phase A, second pass — profile first, three attacks refuted
+
+The first pass reasoned from source and priced with a vehicle that did
+not take the path it changed. This pass starts where §9 of the
+methodology says to start: a leaf-symbol profile.
+
+### Instrument
+
+`crates/spg-engine/examples/probe_json_shape.rs` — the customer's
+`dashboard: top versions` shape in process, against a control that
+groups on a plain TEXT column **of the same cardinality (40 values)**.
+Equal cardinality is the point: grouping on a literal accessor
+collapses 40 groups into 1 and prices the grouping instead. Legs
+interleave with a rotating start and the probe reports a BAND, because
+the first cut reported a bare median and a 13 % spread read as a 7 %
+win.
+
+In process, 200k rows, `project_id = 3` selecting 25,000:
+
+```
+accessor  7.9 ms      plain  3.4 ms      accessor costs 179-212 ns/row
+```
+
+### What the profile says (samples under the aggregate entry only —
+### the probe seeds 200k rows first and that is not the query)
+
+Diffed against the same profile of the `plain` shape, so what is left
+is the accessor's own work:
+
+```
+apply_binary                       15.3 %
+eval_expr                           9.7 %
+libsystem_platform (memmove etc.)   7.1 %
+apply_binary_in                     4.0 %
+apply_binary_mysql_unsigned         3.5 %   <- in a PostgreSQL query
+libsystem_malloc                    3.0 %
+collation_fold_for_compare          1.2 %
+--------------------------------------------
+json locate_member + scan_value + key_token_eq   6.8 %
+```
+
+**Reading the JSON is 6.8 %. Getting to the code that reads it is
+roughly three and a half times that.** Whatever the customer's
+remaining jsonb losses are, they are not mostly the jsonb
+representation — a claim that had already been written into the
+7.38.12 letter and has been corrected there.
+
+Two structural facts behind it, both mechanical:
+
+* `Value` is **48 bytes**. A binary operator's operands are passed BY
+  VALUE through `eval_expr` -> `apply_binary_mysql_unsigned` ->
+  `apply_binary_in` -> `apply_binary`; in PG mode the middle two hops
+  are pure passthroughs (each checks a dialect flag and forwards).
+* `apply_binary`'s first statement hands both operands to
+  `coerce_array_literal_operands`, which returns them unchanged for
+  every operator outside a three-element set.
+
+### Three attacks, all refuted by measurement
+
+| # | change | result |
+|---|---|---|
+| 1 | borrow channel extended to `-> ->> #> #>>` | **~10 % SLOWER**, A/B twice, disjoint |
+| 2 | skip the two PG-noop hops at the call site | unresolved (186-213 vs 206) |
+| 3 | inline the `coerce_array_literal_operands` gate, body out of line | unresolved / slightly slower |
+
+Attack 3 is the interesting failure. The profile put **12.5 % of the
+whole query on one source line** — `binop.rs:448`, the coercion call —
+and attacking that exact line changed nothing. The build profiled
+(`release-dbg`) differs from `release` only in debug info (same
+opt-level 3, fat LTO, one codegen unit), so the profile is
+representative; what is NOT representative is **line-level attribution
+inside a fat-LTO -O3 function**. The helper was already inlined; the
+line number is where the optimiser parked a block, not a call that
+could be removed.
+
+That is the same shape as the counter lesson in methodology §9:
+a leaf-symbol profile answers *which category of work dominates*, and
+that answer held up. It does not answer *which line to edit*, and
+treating it as if it did cost a round.
+
+### What is established, and what the next round may NOT assume
+
+Established (survives its own test):
+* the category split above, from ~3,700 query-only samples
+* `Value` is 48 bytes and travels by value through four frames
+* the two PG-noop hops exist and are non-inlined
+
+NOT established:
+* that any single line is the cost
+* that removing the hops is worth anything — attack 2 was unresolved,
+  not refuted. Per §1 a sub-noise win is "no result", and the honest
+  next step for it is to accumulate several and measure together, on a
+  quieter box than a 7-10 % spread allows.
+
+Three attacks without moving the needle is the §0 stop condition. The
+next round re-decomposes rather than polishing this same surface, and
+it needs a **quieter instrument first** (the local box spreads 7-10 %;
+resolving a 7 % effect needs better than that).
