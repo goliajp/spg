@@ -348,12 +348,36 @@ impl Roster {
 /// Recursive on-disk size of a directory in KB — the disk account
 /// every reap prints (WAL + audit + db growth is visible per run).
 fn dir_size_kb(dir: &Path) -> u64 {
-    fn walk(d: &Path, acc: &mut u64) {
+    /// v7.38.14 — stop and SAY SO rather than walk forever.
+    ///
+    /// This is a size report for one server's data directory, which holds
+    /// tens of files. Pointed at a directory that is not one -- a test once
+    /// handed it `/tmp` itself -- it walked every build artefact on the
+    /// machine: 60 % CPU for over seven minutes, and a release train stuck
+    /// behind it with nothing in the log to say why.
+    ///
+    /// A bound turns that into a number and a line of output. It is
+    /// deliberately far above any real data directory, so a breach means the
+    /// caller passed the wrong path, not that a server grew.
+    const MAX_ENTRIES: u32 = 50_000;
+    fn walk(d: &Path, acc: &mut u64, seen: &mut u32) {
+        if *seen >= MAX_ENTRIES {
+            return;
+        }
         if let Ok(rd) = std::fs::read_dir(d) {
             for e in rd.filter_map(Result::ok) {
+                *seen += 1;
+                if *seen >= MAX_ENTRIES {
+                    println!(
+                        "proclib: dir_size_kb gave up after {MAX_ENTRIES} entries under {} \
+                         — that is not a data directory; the size below is a floor",
+                        d.display()
+                    );
+                    return;
+                }
                 let p = e.path();
                 if p.is_dir() {
-                    walk(&p, acc);
+                    walk(&p, acc, seen);
                 } else if let Ok(m) = e.metadata() {
                     *acc += m.len();
                 }
@@ -361,7 +385,8 @@ fn dir_size_kb(dir: &Path) -> u64 {
         }
     }
     let mut bytes = 0u64;
-    walk(dir, &mut bytes);
+    let mut seen = 0u32;
+    walk(dir, &mut bytes, &mut seen);
     bytes / 1024
 }
 
@@ -494,15 +519,43 @@ mod tests {
             .arg("30")
             .spawn()
             .expect("spawn sleep");
+        // v7.38.14 — an EMPTY directory of our own, not `temp_dir()` itself.
+        //
+        // `reap_all_checked` calls `dir_size_kb(&p.data_dir)`, which walks the
+        // whole tree recursively. Handing it `/tmp` made this "spawn a sleep
+        // and reap it" test walk every build artefact every project on the
+        // machine had left there: measured on a developer box whose /tmp held
+        // an 848 MB tarball and several 250 MB+ trees, the test span at 60 %
+        // CPU for over seven minutes and `find /tmp -type f` did not finish
+        // counting in twenty seconds. The same code passed in 100 s on a
+        // testbed whose /tmp was clean.
+        //
+        // So the test's verdict depended on the machine's /tmp rather than on
+        // the code, which is the property a test must not have. It blocked a
+        // release train to say so.
+        let data_dir = std::env::temp_dir().join(alloc_probe_dir_name());
+        std::fs::create_dir_all(&data_dir).expect("probe dir");
         r.procs.push(Proc {
             name: "sleeper".into(),
             child,
             port: PORT_RANGE.start,
             peak_rss_kb: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            data_dir: std::env::temp_dir(),
+            data_dir: data_dir.clone(),
         });
         r.reap_all();
         assert!(r.procs.is_empty());
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    /// A directory name no other run will pick: pid plus a monotonic counter.
+    fn alloc_probe_dir_name() -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "spg-proclib-probe-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     fn server_bin() -> Option<std::path::PathBuf> {
