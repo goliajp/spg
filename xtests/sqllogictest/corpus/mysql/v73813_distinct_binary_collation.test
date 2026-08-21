@@ -1,0 +1,94 @@
+# v7.38.13 — DISTINCT honours an explicit binary collation.
+#
+# A column declared `COLLATE utf8mb4_bin` compares BYTE-WISE, so 'a' and
+# 'A' are two values, not one. GROUP BY got this right; DISTINCT folded
+# them anyway and answered one row where MariaDB 11 answers two — the
+# silent-wrong-answer shape the round-370 tests were written against,
+# in the one spelling they did not cover.
+#
+# Root cause: the DISTINCT comparator took a bare `mysql: bool` and so
+# could never see a column, and the projection dropped the declared
+# collation on its way to the output schema — the fourth field to be
+# lost through that same hole, after enum identity, fsp and the PG
+# collation name.
+#
+# Every expectation below is from a MariaDB 11 run.
+
+# Declare the session's dialect the way a mysqldump would, as the
+# neighbouring fixtures do.
+statement ok
+SET sql_mode = 'STRICT_TRANS_TABLES'
+
+statement ok
+CREATE TABLE bin_t (t VARCHAR(10) COLLATE utf8mb4_bin)
+
+statement ok
+INSERT INTO bin_t VALUES ('a'),('A'),('bar'),('Bar')
+
+# Four distinct values, because the column is byte-wise.
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT t FROM bin_t) g
+----
+4
+
+# The GROUP BY spelling of the same question agrees.
+query I
+SELECT COUNT(*) FROM (SELECT t FROM bin_t GROUP BY t) g
+----
+4
+
+# The values themselves, so a wrong survivor is visible and not just a
+# wrong count. Ordered by LENGTH then by the count of each, which needs
+# no claim about how a binary collation sorts.
+#
+# RESIDUAL, recorded rather than faked: SPG answers `a, A, bar, Bar` for
+# `ORDER BY t` on this column, and a byte-wise collation would sort
+# `A, Bar, a, bar` ('A' is 65, 'a' is 97). That may be a second bug in
+# the same family, but the expectation is not pinned here because it was
+# not taken from a MariaDB 11 run — the first draft of this file DID
+# hand-compute it, and the runner disagreed.
+query II
+SELECT LENGTH(t), COUNT(*) FROM (SELECT DISTINCT t FROM bin_t) g GROUP BY 1 ORDER BY 1
+----
+1
+2
+3
+2
+
+# NEGATIVE CONTROL — a column with NO explicit collation still folds
+# under the MySQL default. A fix that exempted every column would turn
+# this from 2 into 4.
+statement ok
+CREATE TABLE ci_t (t VARCHAR(10))
+
+statement ok
+INSERT INTO ci_t VALUES ('a'),('A'),('bar'),('Bar')
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT t FROM ci_t) g
+----
+2
+
+# Trailing spaces still PAD-SPACE-fold on the default column, and still
+# do not on the byte-wise one.
+statement ok
+INSERT INTO ci_t VALUES ('a ')
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT t FROM ci_t) g
+----
+2
+
+statement ok
+INSERT INTO bin_t VALUES ('a ')
+
+query I
+SELECT COUNT(*) FROM (SELECT DISTINCT t FROM bin_t) g
+----
+5
+
+statement ok
+DROP TABLE bin_t
+
+statement ok
+DROP TABLE ci_t

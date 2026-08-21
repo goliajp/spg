@@ -1,5 +1,9 @@
 {
   "groups": [
+    { "name": "15_regressions", "pass": 0, "fail": 0, "skip": 0,
+      "files": [
+
+      ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_select_basic.test", "pass": 8, "fail": 0, "skip": 0,
@@ -45,7 +49,7 @@
         { "file": "21_order_by_desc.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 170, "fail": 0, "skip": 0,
+    { "name": "mysql", "pass": 183, "fail": 2, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -76,7 +80,9 @@
         { "file": "15_show_indexes_status_processlist.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "16_info_schema_mysql.test", "pass": 13, "fail": 0, "skip": 0,
-          "fail_reasons": [] }
+          "fail_reasons": [] },
+        { "file": "v73813_distinct_binary_collation.test", "pass": 13, "fail": 2, "skip": 0,
+          "fail_reasons": ["record 8: row mismatch |   expected: [\"2\"] |   actual:   [\"4\"]", "record 10: row mismatch |   expected: [\"2\"] |   actual:   [\"5\"]"] }
       ] },
     { "name": "pg_regress", "pass": 1506, "fail": 0, "skip": 0,
       "files": [
@@ -523,7 +529,7 @@
       "files": [
 
       ] },
-    { "name": "spg_baseline/15_regressions", "pass": 554, "fail": 2, "skip": 0,
+    { "name": "spg_baseline/15_regressions", "pass": 556, "fail": 0, "skip": 0,
       "files": [
         { "file": "distinct_index_walk.test", "pass": 16, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -565,8 +571,8 @@
           "fail_reasons": [] },
         { "file": "v73811_brin_prune.test", "pass": 17, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "v73812_gin_brin_intersect.test", "pass": 11, "fail": 2, "skip": 0,
-          "fail_reasons": ["record 8: row mismatch |   expected: [\"1000\"] |   actual:   [\"999\"]", "record 10: row mismatch |   expected: [\"1\"] |   actual:   [\"0\"]"] },
+        { "file": "v73812_gin_brin_intersect.test", "pass": 13, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "v7381_ledger_fixes.test", "pass": 31, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "v7382_collate_c_escape_hatch.test", "pass": 6, "fail": 0, "skip": 0,

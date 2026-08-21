@@ -1242,7 +1242,10 @@ pub(crate) fn run(
     // set (`defer_enabled` requires `!stmt.distinct`), so nothing indexes
     // into `kept_synth` alongside these rows.
     if stmt.distinct {
-        out_rows = crate::select::dedup_rows(out_rows, engine.is_some_and(|e| e.backslash_escapes));
+        out_rows = crate::select::dedup_rows(
+            out_rows,
+            crate::select::FoldSpec::dialect(engine.is_some_and(|e| e.backslash_escapes)),
+        );
     }
 
     let (synth_rows_out, synth_schema_out) = if deferred.is_empty() {
