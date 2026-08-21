@@ -36,7 +36,7 @@ pub(crate) mod math;
 mod regexp;
 mod resolve;
 mod strings;
-mod textsearch;
+pub(crate) mod textsearch;
 pub(crate) mod values;
 
 pub use crate::conversions::format_money_array;

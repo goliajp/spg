@@ -323,11 +323,23 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
             }
             Literal::String(s)
         }
+        // v7.38.14 — tsvector round-trips through its canonical text form,
+        // the way UUID and bytea do above. Before this, the full-text shape
+        // `INSERT INTO t SELECT to_tsvector('english', …) FROM …` was
+        // refused, and refused with advice nobody could act on: the error
+        // said to add an explicit CAST to the inner SELECT, and adding one
+        // changed nothing, because the value ALREADY had the target type.
+        // An error that tells you to do the thing you just did is worse
+        // than one that says only "unsupported".
+        Value::TsVector(lexemes) => {
+            Literal::String(crate::eval::textsearch::format_tsvector(&lexemes))
+        }
         other => {
+            let ty = crate::conversions::pg_type_name_for_error_opt(other.data_type());
             return Err(EngineError::Unsupported(alloc::format!(
-                "INSERT … SELECT cannot materialise value of type {}; \
-                 add an explicit CAST in the inner SELECT",
-                crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                "INSERT … SELECT cannot materialise a value of type {ty}. \
+                 This is a gap in SPG, not something the query can work \
+                 around: the value already has that type."
             )));
         }
     };
