@@ -940,3 +940,62 @@ and never sees a column, so it cannot know that this column's
 
 The perf patch is kept out of tree until (1) lands. Landing it first
 would trade a 40 % win for a wrong answer.
+
+---
+
+## v7.38.13 — DISTINCT ignored an explicit binary collation
+
+Found by the perf work, not by a bug report. Routing `GROUP BY` into
+`DISTINCT` turned a correct answer wrong, which meant `DISTINCT` was
+wrong to begin with.
+
+A column declared `COLLATE utf8mb4_bin` compares BYTE-WISE. `'a'` and
+`'A'` are two values. `GROUP BY` knew that; `DISTINCT` folded them and
+answered one row where MariaDB 11 answers two.
+
+`e2e_mysql_collate_binary_round370` exists precisely to stop this — its
+module note calls the alternative "a silent data-integrity bug" and
+names DISTINCT among the sites that must honour the declaration. It
+only ever exercised the GROUP BY spelling, so the hole sat open.
+
+### Two structural causes
+
+1. The comparator (`values_eq_norm`) and its hash companion
+   (`norm_hash_values`) took a bare `mysql: bool`. A bool cannot see a
+   column, so every Text value folded in a MySQL session. Both now take
+   a `FoldSpec` carrying the dialect flag plus a per-OUTPUT-POSITION
+   exempt mask — and both read the same mask, because a hash that folds
+   where the comparator does not would scatter equal rows into
+   different buckets and stop de-duplicating altogether.
+
+2. The projection dropped the declared collation on the way to the
+   output schema. `ProjectedItem` gains `fold_exempt` — the FOURTH
+   field carried through that same hole, after enum identity, MySQL
+   fsp, and the PG collation name, each added for the same reason after
+   the same class of bug.
+
+   It is a `bool`, not the `Collation` enum, and that is deliberate:
+   the enum's storage default is `Binary` while the FOLD default under
+   MySQL is case-insensitive. A mask built from the enum would have
+   marked every non-column projection "exempt" and stopped DISTINCT
+   folding anywhere. An intermediate version of this fix did exactly
+   that, and the negative control is what caught it.
+
+### Watched failing, both directions
+
+* exempt nothing → 3 records red, values silently merged (4 → 2, 5 → 2)
+* exempt everything → the negative control red (2 → 4, 2 → 5)
+
+Pinned in `xtests/sqllogictest/corpus/mysql/v73813_distinct_binary_collation.test`.
+
+### Recorded rather than faked
+
+* `ORDER BY t` on such a column answers in a non-byte order
+  (`a, A, bar, Bar` where bytes give `A, Bar, a, bar`). Possibly a
+  sibling bug; NOT pinned, because that expectation was not taken from
+  a MariaDB run — the fixture's first draft hand-computed it and the
+  runner disagreed. Second time this session a hand-computed
+  expectation was wrong.
+* Set operations (UNION / INTERSECT / EXCEPT) keep the same hole. That
+  site has no output columns in scope to build a mask from. Named in
+  the code; behaviour unchanged.
