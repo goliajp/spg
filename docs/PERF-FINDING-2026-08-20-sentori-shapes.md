@@ -1042,9 +1042,15 @@ moved a second time by the permutation rebuild (`orderby.rs:1349`).
 ### The obvious suspect is not the answer
 
 The hash is the thing that leaps out, and it is **not** where the time
-is. The round-940 profile of this exact query put **24.5 % in the sort
-machinery against 2.4 % in the dedup**. Deleting the hash outright buys
-about two and a half percent.
+is. The round-940 profile of this exact query put **2.4 % in the dedup**
+and 24.5 % in the sort machinery around it. Deleting the hash outright
+buys about two and a half percent.
+
+Read the two halves of that with different confidence. The 24.5 % is a
+**pre-fix** number — the comment recording it at `orderby.rs:1308-1318`
+goes on to introduce the permutation sort that was made in answer to it,
+so the sort share today is lower and unmeasured. The 2.4 % is the one
+the conclusion rests on, and nothing in that round touched the dedup.
 
 What the decomposition found instead, at `select.rs:7203`:
 
