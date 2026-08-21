@@ -61,22 +61,56 @@ SELECT COUNT(*) FROM bl JOIN br ON bl.s = br.s
 ----
 1
 
-# RECORDED, NOT PINNED — the equi-key path is still byte-wise.
-# `SELECT COUNT(*) FROM jl JOIN jr ON jl.s = jr.s` answers 1 here and 2
-# on MySQL 9.7.1. It is deliberately absent rather than written with the
-# wrong number: pinning 1 would freeze the defect into the corpus.
+# The equi-key spelling, which reaches the answer a completely different
+# way: `extract_join_keys` (join.rs:708) lifts the conjunct out of the ON
+# and turns it into a HASH KEY, so the fold has to happen in the key
+# ENCODING or it does not happen at all -- byte-equal and fold-equal put
+# 'a' and 'A' in different buckets and the rows never meet. That is why
+# three separate fixes to the expression comparator changed nothing here.
 #
-# Root cause, verified by ablation rather than read: an equi conjunct is
-# lifted out of the ON by `extract_join_keys` (join.rs:708) and becomes a
-# HASH KEY, encoded by `aggregate::encode_key_refs_into`, which resolves
-# to `encode_key_refs_into_in(.., false)` (aggregate.rs:7505) — byte-wise
-# whatever the column declares. The expression comparator is never
-# consulted, which is why three separate fixes to it changed nothing.
-#
-# The fix needs a per-position fold mask built once per join from the key
-# columns' collations and applied to BOTH the build and the probe side —
-# a hash that folds on one side only would stop matching entirely, which
-# is the same trap 3b494b6e names for DISTINCT.
+# Both halves of the hash read one mask resolved once per join. A mask
+# consulted on the build side only would stop the join matching at all,
+# which is the trap 3b494b6e names for DISTINCT's hash and comparator.
+query I
+SELECT COUNT(*) FROM jl JOIN jr ON jl.s = jr.s
+----
+2
+
+# NEGATIVE CONTROL — the same spelling on byte-wise columns must NOT
+# fold. A fix that folded whenever the dialect is MySQL turns this into 2.
+query I
+SELECT COUNT(*) FROM bl JOIN br ON bl.s = br.s
+----
+1
+
+# Two more spellings of the same equality, both from the same MySQL
+# 9.7.1 run. ANSI-89 is not a variation for its own sake: its equi key is
+# lifted out of the WHERE at a DIFFERENT site from the ON conjuncts, and
+# that site used to push the key without the fold flag beside it -- so
+# this spelling answered 0 while `JOIN ... ON` answered correctly.
+query I
+SELECT COUNT(*) FROM jl, jr WHERE jl.s = jr.s
+----
+2
+
+query I
+SELECT COUNT(*) FROM jl WHERE EXISTS (SELECT 1 FROM jr WHERE jr.s = jl.s)
+----
+2
+
+# NEGATIVE CONTROLS — byte-wise columns, same two spellings.
+query I
+SELECT COUNT(*) FROM bl, br WHERE bl.s = br.s
+----
+1
+
+query I
+SELECT COUNT(*) FROM bl WHERE EXISTS (SELECT 1 FROM br WHERE br.s = bl.s)
+----
+1
+
+# The predicate SHAPE now makes no difference on either collation, which
+# is the property MySQL has and the one that was missing.
 
 statement ok
 DROP TABLE jl

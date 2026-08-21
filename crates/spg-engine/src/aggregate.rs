@@ -7506,6 +7506,21 @@ pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
     encode_key_refs_into_in(vals, out, false);
 }
 
+/// v7.38.14 — key encode with a per-POSITION fold decision.
+///
+/// `encode_key_refs_into_in` takes one bool for the whole key, which
+/// cannot express the case a join actually presents: one key column
+/// declared `COLLATE utf8mb4_bin` beside another that folds. `folds` is
+/// resolved once per join from the key columns' collations; a short or
+/// missing entry means "do not fold", which is what every existing
+/// caller wants.
+pub(crate) fn encode_key_refs_folded(vals: &[&Value], out: &mut String, folds: &[bool]) {
+    out.clear();
+    for (i, v) in vals.iter().enumerate() {
+        encode_one_in(out, v, folds.get(i).copied().unwrap_or(false));
+    }
+}
+
 /// v7.39 (round 364, M4 P2) — key encode with the session dialect.
 pub(crate) fn encode_key_refs_into_in(vals: &[&Value], out: &mut String, mysql: bool) {
     out.clear();
