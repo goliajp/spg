@@ -43,6 +43,40 @@ silent wrong answer that measuring the second of them exposed.
   in scope to build a mask from. Named in the code, behaviour
   unchanged.
 
+- **`ORDER BY` on such a column was not byte-wise either**, and neither
+  was `MIN()`. This entry originally recorded that as unpinned, for
+  want of a reference run. There is one now: MySQL 9.7.1 answers
+  `A, Bar, a, bar` and SPG answered `a, A, bar, Bar` — the *default*
+  collation's answer, which it also gave for an explicit
+  `COLLATE "C"` and an explicit `COLLATE utf8mb4_bin`.
+
+  That last observation refuted the first diagnosis. `C` **is**
+  recognised and **is** byte order, so "the MySQL name is unknown"
+  could not be the whole story. Two causes were stacked, and removing
+  either one alone still leaves the answer wrong:
+
+  1. `collate::compare` had no case for MySQL's byte-order names, so
+     `utf8mb4_bin` was handed to a locale parser, failed, and came back
+     as "this build cannot perform it". `binary` and the `_bin` family
+     are byte order *by definition* — the same reason `C` and `POSIX`
+     are answered directly and never handed to ICU. This half alone
+     also fixes `MIN`/`MAX`, which reach a collation by another route.
+  2. the `ORDER BY` key was **folded at build time**, where no
+     comparator downstream can un-fold it. The fold is now gated on the
+     collation resolved for that position — once per sort, beside the
+     sort directions, never per row.
+
+  The gate is passed only to sites whose comparator will also see it.
+  The spill and streaming sorts compare without collations, so their
+  keys keep folding, named at each call site: a key and a comparator
+  that disagree is precisely the defect above, relocated.
+
+  **Not fixed, and named rather than implied:** the MySQL fold is
+  applied at fourteen comparison sites. This release covers `ORDER BY`
+  and the `MIN`/`MAX` comparator. The full surface has been recorded in
+  the source since round 678 as forty-seven sites and a release of its
+  own.
+
 ### Performance
 
 - **A bare `GROUP BY` is a `DISTINCT`, and now takes that path.**
@@ -78,6 +112,34 @@ silent wrong answer that measuring the second of them exposed.
   sat in it undisturbed while a neighbouring cell that flickers with
   the machine cost three releases a round each.
 
+- **`SELECT DISTINCT k … ORDER BY k` never got the bound-key path.**
+  Under `DISTINCT` the sort keys are built *after* the duplicate probe,
+  so only survivors pay for them — and that branch alone still
+  evaluated each key interpretively, resolving the column by name once
+  per surviving row. The optimisation that exists to prevent this has
+  been passed by the neighbouring branch, twelve lines above, since it
+  was written. Nothing in the code or the tests suggests the omission
+  was deliberate.
+
+  Interleaved against the unpatched binary, order flipped halfway, both
+  binaries kept side by side and checksummed so a skipped rebuild could
+  not pose as a result:
+
+  | | runs (ms) |
+  |---|---|
+  | before | 103.7 104.7 104.7 104.9 105.1 106.0 |
+  | after | 96.5 96.6 96.8 96.9 96.9 97.4 |
+
+  The ranges do not overlap, all six pairs favour the change, and
+  flipping the order did not move the verdict. About 7.4 %.
+
+  This came out of decomposing the one sweep cell that has flickered
+  for three releases rather than looking at it a fourth time. The
+  obvious suspect was the hash de-duplication — 400,000 insertions for
+  a column whose values are all distinct, so it removes nothing, where
+  PostgreSQL 18 sorts first and de-duplicates adjacent rows for free.
+  That is real, and it is still open; it is simply not what this was.
+
 - **Two no-op dispatch hops skipped in PostgreSQL mode, and the
   coercion gate inlined.** On the customer's jsonb accessor shape,
   4.1 % — and on the mini testbed `max(patched) < min(baseline)`, all
@@ -106,18 +168,29 @@ chosen so that only the new rule can save them:
   both contained `count()`, so the aggregate check already rejected
   them and removing the `HAVING` gate left the file green. A control
   that survives its own rule's removal pins nothing.
-- For the collation fix, watched failing **both ways** — exempting
-  nothing turns three records red with values silently merged
-  (`4 -> 2`, `5 -> 2`); exempting everything turns the negative
+- For the `DISTINCT` collation fix, watched failing **both ways** —
+  exempting nothing turns three records red with values silently
+  merged (`4 -> 2`, `5 -> 2`); exempting everything turns the negative
   control red (`2 -> 4`, `2 -> 5`).
+- For the `ORDER BY` collation fix, watched failing **three ways**, and
+  each control needs a *different half* of the fix: reverting the
+  collation-name half turns six records red (the extra one is
+  `MIN`/`MAX`); neutralising the fold gate turns five red; folding
+  nothing at all turns exactly one red — the negative control.
+
+  That negative control is deliberately **tie-free**. Pinning `'a'`
+  against `'A'` would pin a tie order no engine specifies; `'B'`
+  (`0x42`) against `'a'` (`0x61`) is decided by the collation and by
+  nothing else. The two orders disagree — `a, B` folded, `B, a`
+  byte-wise — so neither direction can pass by accident.
 
 ### Recorded, not fixed
 
-- SPG answers `ORDER BY` on a binary-collation column in a
-  non-byte-wise order, which may be a sibling of the `DISTINCT` bug
-  above. Not pinned: that expectation was not taken from a MariaDB
-  run, and the first draft of the fixture hand-computed it and was
-  wrong. Pinning it needs a MariaDB differential first.
+- PostgreSQL 18 answers `SELECT DISTINCT k … ORDER BY k` by sorting and
+  then de-duplicating adjacent rows, which costs it nothing. SPG builds
+  a hash set first — 400,000 insertions on a column that has no
+  duplicates to find. The next release re-decomposes that rather than
+  polishing this face again.
 
 ### A correction to the 7.38.12 entry
 
