@@ -6165,3 +6165,75 @@ fn composite_conversion_and_drop_column_extras_shift() {
     t.drop_column(2);
     assert!(t.indices().iter().all(|i| i.name != "t_kv"));
 }
+
+/// v7.38.14 — the structural guard for `ColumnSchema::rederive`.
+///
+/// Five attributes have been lost by re-describing a column with
+/// `ColumnSchema::new` and hand-copying a few fields after it — enum
+/// identity, MySQL fsp, the PG collation name, projection fold-exemption,
+/// and the `collation` enum. Four sites dropping the last of those were
+/// found in v7.38.14 alone, and each failure was silent: `collation`
+/// defaults to `Binary`, which reads downstream as "byte-wise on purpose"
+/// rather than as "unknown".
+///
+/// So this test does not check a list of fields — a list is the thing that
+/// keeps going stale. It builds a column with EVERY attribute set away
+/// from its default, re-derives it, and asserts the two are equal but for
+/// the name and nullability a re-describe is entitled to change. A field
+/// added to `ColumnSchema` and forgotten by `rederive` fails here, which
+/// is the whole point: the sixth field should be caught by the compiler
+/// and this assertion, not by a customer.
+#[test]
+fn rederive_loses_nothing() {
+    let mut src = ColumnSchema::new("orig", DataType::Text, true);
+    // Every field `new` defaults, moved off its default.
+    src.collation_name = Some("utf8mb4_bin".into());
+    src.default = Some(Value::text("d"));
+    src.runtime_default = Some("CURRENT_TIMESTAMP".into());
+    src.auto_increment = true;
+    src.user_enum_type = Some("mood".into());
+    src.user_domain_type = Some("posint".into());
+    src.user_composite_type = Some("addr".into());
+    src.acl = vec![AclItem {
+        grantee: "alice".into(),
+        privs: 1,
+        grantable: 0,
+        grantor: "bob".into(),
+    }];
+    src.on_update_runtime = Some("CURRENT_TIMESTAMP".into());
+    src.collation = Collation::CaseInsensitive;
+    src.is_unsigned = true;
+    src.inline_enum_variants = Some(vec!["a".into(), "b".into()]);
+    src.inline_set_variants = Some(vec!["x".into(), "y".into()]);
+    src.generated_stored_expr = Some("a + 1".into());
+    src.identity_always = true;
+    src.default_text = Some("'d'".into());
+    src.auto_restart = Some(7);
+    src.scalar_row_source = true;
+    src.mysql_int_width = Some(MysqlIntWidth::Tiny);
+    src.mysql_fsp = Some(3);
+
+    let out = ColumnSchema::rederive(&src, "renamed", false);
+
+    assert_eq!(out.name, "renamed", "rederive must take the new name");
+    assert!(!out.nullable, "rederive must take the new nullability");
+
+    // Everything else must survive. Compared as a whole rather than field
+    // by field, so a NEW field cannot slip past by not being listed.
+    let mut expect = src.clone();
+    expect.name = "renamed".into();
+    expect.nullable = false;
+    assert_eq!(
+        out, expect,
+        "rederive dropped an attribute — that is the defect this test exists for"
+    );
+
+    // And the guard's own control: `new` must NOT preserve them, or the
+    // assertion above would pass for the wrong reason.
+    let fresh = ColumnSchema::new("renamed", DataType::Text, false);
+    assert_ne!(
+        fresh, expect,
+        "ColumnSchema::new should synthesise a bare column; if it now copies \
+         a source, this test proves nothing"
+    );
+}

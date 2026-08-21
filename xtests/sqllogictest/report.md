@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `15_regressions` | 14 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 232 | 1 | 0 | 99.6% |
+| `mysql` | 234 | 2 | 0 | 99.2% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -30,7 +30,8 @@ Per-corpus pass / fail / skip:
 
 | count | pattern |
 |---|---|
-| 1 | `record 5: row mismatch | expected:` |
+| 1 | `record 10: row mismatch | expected:` |
+| 1 | `record 11: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -86,12 +87,13 @@ Per-corpus pass / fail / skip:
 | `15_show_indexes_status_processlist.test` | 9 | 0 | 0 |
 | `16_info_schema_mysql.test` | 13 | 0 | 0 |
 | `v73813_distinct_binary_collation.test` | 30 | 0 | 0 |
-| `v73814_distinct_sources.test` | 10 | 1 | 0 |
+| `v73814_distinct_sources.test` | 12 | 2 | 0 |
 | `v73814_join_collation.test` | 22 | 0 | 0 |
 
 <details><summary>`v73814_distinct_sources.test` fail snippets</summary>
 
-- record 5: row mismatch |   expected: ["4"] |   actual:   ["2"]
+- record 10: row mismatch |   expected: ["2"] |   actual:   ["4"]
+- record 11: row mismatch |   expected: ["2"] |   actual:   ["4"]
 </details>
 
 ### `pg_regress/`

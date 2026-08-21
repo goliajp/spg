@@ -382,7 +382,7 @@ pub(crate) fn materialise_in_order(
     );
     let columns: Vec<ColumnSchema> = projection
         .into_iter()
-        .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+        .map(|p| p.to_column_schema())
         .collect();
     Ok(QueryResult::Rows {
         columns,

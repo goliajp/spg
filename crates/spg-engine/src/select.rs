@@ -805,13 +805,7 @@ impl Engine {
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
         let final_cols: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         Ok(QueryResult::Rows {
             columns: final_cols,
@@ -3886,12 +3880,7 @@ impl Engine {
             // the projection (it lives outside the DataType lattice), or a
             // derived table / UNION / windowed result forgets it and any outer
             // `ORDER BY <enum col>` silently sorts by the label's TEXT.
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         // Re-evaluate ORDER BY against the source schema (pre-projection
         // so col refs by name still resolve through `scan_ctx`).
@@ -4121,12 +4110,7 @@ impl Engine {
             // the projection (it lives outside the DataType lattice), or a
             // derived table / UNION / windowed result forgets it and any outer
             // `ORDER BY <enum col>` silently sorts by the label's TEXT.
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         // ORDER BY against the source schema.
         // v7.39 (round 621) — one entry per OUTPUT row (a target-list SRF makes
@@ -5633,12 +5617,7 @@ impl Engine {
             // the projection (it lives outside the DataType lattice), or a
             // derived table / UNION / windowed result forgets it and any outer
             // `ORDER BY <enum col>` silently sorts by the label's TEXT.
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         // ORDER BY.
         if !stmt.order_by.is_empty() {
@@ -5888,12 +5867,7 @@ impl Engine {
             // the projection (it lives outside the DataType lattice), or a
             // derived table / UNION / windowed result forgets it and any outer
             // `ORDER BY <enum col>` silently sorts by the label's TEXT.
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         // ORDER BY over the source rows (same shape as the other
         // synthetic-table executors).
@@ -6031,13 +6005,7 @@ impl Engine {
             if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
                 let columns: Vec<ColumnSchema> = projection
                     .into_iter()
-                    .map(|p| {
-                        let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                        c.user_enum_type = p.user_enum_type;
-                        c.collation_name = p.collation_name;
-                        c.mysql_fsp = p.mysql_fsp;
-                        c
-                    })
+                    .map(|p| p.to_column_schema())
                     .collect();
                 return Ok(QueryResult::Rows {
                     columns,
@@ -6056,13 +6024,7 @@ impl Engine {
             let mut rows = expand_srf_row(self, &projection, &srf_idxs, &dummy_row, &ctx)?;
             let columns: Vec<ColumnSchema> = projection
                 .into_iter()
-                .map(|p| {
-                    let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                    c.user_enum_type = p.user_enum_type;
-                    c.collation_name = p.collation_name;
-                    c.mysql_fsp = p.mysql_fsp;
-                    c
-                })
+                .map(|p| p.to_column_schema())
                 .collect();
             // v7.39 (read01 round 80) — a FROM-less SELECT still has an ORDER BY,
             // an OFFSET and a LIMIT, and they apply to the rows the SRF expanded
@@ -6110,13 +6072,7 @@ impl Engine {
         }
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         // v7.39 (round 239) — the FROM-less scalar path ignored LIMIT and
         // OFFSET entirely, so `SELECT 1 LIMIT 0` returned its row where PG
@@ -7403,13 +7359,7 @@ impl Engine {
 
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
 
         Ok(QueryResult::Rows {
@@ -7677,15 +7627,7 @@ impl Engine {
             },
         )?;
 
-        let columns: Vec<ColumnSchema> = projection
-            .iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
-            .collect();
+        let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         Ok(Some(QueryResult::Rows { columns, rows }))
     }
 
@@ -7944,15 +7886,7 @@ impl Engine {
             .with_catalog(self.active_catalog())
             .with_session(&sess);
         let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
-        let columns: Vec<ColumnSchema> = projection
-            .iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
-            .collect();
+        let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         emit(crate::StreamItem::Header(&columns))?;
         let bound_pos: Vec<Option<usize>> = projection
             .iter()
@@ -8247,15 +8181,7 @@ impl Engine {
             .with_catalog(self.active_catalog())
             .with_session(&sess);
         let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
-        let columns: Vec<ColumnSchema> = projection
-            .iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
-            .collect();
+        let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         let bound_pos: Vec<Option<usize>> = projection
             .iter()
             .map(|p| match &p.expr {
@@ -8543,15 +8469,7 @@ impl Engine {
             sorter.push(&mut keys, row)?;
         }
 
-        let columns: Vec<ColumnSchema> = projection
-            .iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
-            .collect();
+        let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         emit(crate::StreamItem::Header(&columns))?;
 
         let key_ctx = &ctx;
@@ -8721,15 +8639,7 @@ impl Engine {
             .with_session(&sess);
         let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
 
-        let columns: Vec<ColumnSchema> = projection
-            .iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
-            .collect();
+        let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         emit(crate::StreamItem::Header(&columns))?;
 
         // v7.37 (round 957) — resolve each bare-column projection ONCE
@@ -9090,12 +9000,7 @@ impl Engine {
             // the projection (it lives outside the DataType lattice), or a
             // derived table / UNION / windowed result forgets it and any outer
             // `ORDER BY <enum col>` silently sorts by the label's TEXT.
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name.clone(), p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type.clone();
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         emit(crate::StreamItem::Header(&columns))?;
         let sources_ref = &deferred.sources;
@@ -9483,13 +9388,7 @@ impl Engine {
         );
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| {
-                let mut c = ColumnSchema::new(p.output_name, p.ty, p.nullable);
-                c.user_enum_type = p.user_enum_type;
-                c.collation_name = p.collation_name;
-                c.mysql_fsp = p.mysql_fsp;
-                c
-            })
+            .map(|p| p.to_column_schema())
             .collect();
         Ok(QueryResult::Rows {
             columns,
@@ -9641,6 +9540,44 @@ pub(crate) struct ProjectedItem {
     /// "exempt" for every projected expression that is not a column.
     /// This field states the question it answers.
     pub(crate) fold_exempt: bool,
+}
+
+impl ProjectedItem {
+    /// v7.38.14 — the output column this projected item describes.
+    ///
+    /// There were TWENTY-ONE places converting a `ProjectedItem` into a
+    /// `ColumnSchema`, each written as `ColumnSchema::new(..)` followed by a
+    /// hand-picked list of attributes to copy after it, and the lists did not
+    /// agree: six carried enum identity, the collation NAME and MySQL fsp; ten
+    /// carried the first and last but not the name; five carried nothing at
+    /// all. Not one carried `collation`, the enum every MySQL text comparison
+    /// actually reads.
+    ///
+    /// That is how a declared collation vanished between a subquery and the
+    /// query that selects from it: the inner SELECT's output schema claimed
+    /// `ColumnSchema::new`'s default, which is `Binary` — a value downstream
+    /// reads as "byte-wise ON PURPOSE" rather than as "unknown", so the loss
+    /// presents as a deliberate declaration.
+    ///
+    /// One conversion, so a field added to either type has one place to be
+    /// remembered instead of twenty-one.
+    pub(crate) fn to_column_schema(&self) -> ColumnSchema {
+        let mut c = ColumnSchema::new(self.output_name.clone(), self.ty, self.nullable);
+        c.user_enum_type.clone_from(&self.user_enum_type);
+        c.collation_name.clone_from(&self.collation_name);
+        c.mysql_fsp = self.mysql_fsp;
+        // `fold_exempt` is the projection's answer to the same question
+        // `ColumnSchema::collation` answers downstream, and it was computed
+        // from the source column. Keeping the two in step here is what stops
+        // a de-duplication site further on from asking the schema and being
+        // told the opposite of what the projection knew.
+        c.collation = if self.fold_exempt {
+            spg_storage::Collation::Binary
+        } else {
+            spg_storage::Collation::CaseInsensitive
+        };
+        c
+    }
 }
 
 /// Dedupe a row set, preserving first-seen order. `Row`'s `PartialEq` is

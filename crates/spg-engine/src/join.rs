@@ -3857,7 +3857,7 @@ impl Engine {
         }
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| p.to_column_schema())
             .collect();
         Ok(Some(QueryResult::Rows { columns, rows }))
     }
@@ -4160,7 +4160,7 @@ impl Engine {
         }
         let columns: Vec<ColumnSchema> = projection
             .into_iter()
-            .map(|p| ColumnSchema::new(p.output_name, p.ty, p.nullable))
+            .map(|p| p.to_column_schema())
             .collect();
         Ok(Some(QueryResult::Rows { columns, rows }))
     }
