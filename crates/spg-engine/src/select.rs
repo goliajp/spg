@@ -7203,10 +7203,16 @@ impl Engine {
                     proj_pool.pop().unwrap_or_default(),
                 ));
                 let order_keys = if stmt.distinct && !order_by.is_empty() {
-                    let mut buf = Vec::with_capacity(order_by.len());
+                    // v7.38.13 — `&order_bound`, not `&[]`. Round 582 added
+                    // the bound-cell path precisely so an ORDER BY key that
+                    // names a column is READ instead of evaluated, and the
+                    // non-DISTINCT branch above has passed it ever since;
+                    // this branch never did, so `SELECT DISTINCT k .. ORDER
+                    // BY k` resolved "k" by string for every surviving row.
+                    let mut buf = key_pool.pop().unwrap_or_default();
                     crate::orderby::build_order_keys_bound(
                         &order_by,
-                        &[],
+                        &order_bound,
                         &order_colls,
                         row,
                         &ctx,
