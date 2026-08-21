@@ -6461,7 +6461,34 @@ fn or_3vl(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
 /// A text that does not parse as an array literal is left alone — it may well be
 /// the JSON or inet reading of the same operator, which the dispatch below still
 /// has to reach.
+/// v7.38.13 — the TEST inlined, the body left out of line, so an
+/// operator outside the three-element set never moves its operands to
+/// have them handed straight back. `Value` is 48 bytes and this sits on
+/// the shared path of every binary operator.
+// `inline_always` is the point, not an oversight: the whole change is
+// that the TEST must be visible at the call site so the common
+// operator's two 48-byte operands are never moved into a call. Left to
+// its own judgement LLVM did not inline the original, which is what the
+// profile found. Measured: 4.1 % on the customer shape, together with
+// the dispatch-hop gate in `eval.rs`.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 fn coerce_array_literal_operands(
+    op: BinOp,
+    l: Value<'static>,
+    r: Value<'static>,
+) -> (Value<'static>, Value<'static>) {
+    if matches!(
+        op,
+        BinOp::JsonContains | BinOp::JsonContainedBy | BinOp::InetOverlap
+    ) {
+        return coerce_array_literal_operands_slow(op, l, r);
+    }
+    (l, r)
+}
+
+#[inline(never)]
+fn coerce_array_literal_operands_slow(
     op: BinOp,
     l: Value<'static>,
     r: Value<'static>,

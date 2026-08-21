@@ -5002,7 +5002,14 @@ pub fn eval_expr(
                 let (sl, sr) = (styled(l), styled(r));
                 return apply_binary(*op, sl, sr);
             }
-            apply_binary_mysql_unsigned(*op, lhs, rhs, l, r, ctx)
+            // v7.38.13 — in PG mode `apply_binary_mysql_unsigned` checks a
+            // dialect flag and forwards, and `apply_binary_in` does the
+            // same; both take two 48-byte `Value`s by value. Skip them.
+            if ctx.mysql_dialect {
+                apply_binary_mysql_unsigned(*op, lhs, rhs, l, r, ctx)
+            } else {
+                binop::apply_binary(*op, l, r)
+            }
         }
         Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),
         Expr::FieldAccess { base, field } => eval_field_access_arm(base, field, row, ctx),

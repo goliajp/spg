@@ -732,3 +732,61 @@ Three attacks without moving the needle is the §0 stop condition. The
 next round re-decomposes rather than polishing this same surface, and
 it needs a **quieter instrument first** (the local box spreads 7-10 %;
 resolving a 7 % effect needs better than that).
+
+---
+
+## v7.38.13 Phase B — the instrument, then the same attacks resolve
+
+The three refuted attacks above included one — skipping the two
+PG-noop dispatch hops — that was *unresolved*, not refuted. §1 says a
+sub-noise result is "no result", and that the answer is a better
+instrument plus accumulation, not a louder claim. Both were applied.
+
+### The instrument
+
+Local box spreads 7-10 % on this probe; mini's accessor leg is stable
+to **0.2-0.6 % run-to-run** on median-of-5-of-9. A/B alternates
+HEAD/PATCH with a rebuild between, and reverts from a **pristine copy,
+never `git checkout`** — mini's git HEAD is not what rsync put in the
+working tree, and checkout silently substituted an older file the
+first time (r957's trap, walked into again).
+
+### Accumulated, then measured
+
+Two changes, both mechanical, both on the shared binary-operator path:
+
+1. In PG mode, `apply_binary_mysql_unsigned` and `apply_binary_in` each
+   check a dialect flag and forward. Gate at the call site so neither
+   frame is entered — two fewer non-inlined hops, each moving two
+   48-byte `Value`s in and one out.
+2. `coerce_array_literal_operands`'s TEST inlined, its body left out of
+   line, so an operator outside the three-element set never moves its
+   operands to have them handed straight back.
+
+Alone, #1 was 8 of 9 pairs favourable but overlapping (n=3). Together:
+
+```
+HEAD    15.204   15.237   15.203      spread 0.2 %
+PATCH   14.583   14.496   14.894      spread 2.7 %
+```
+
+**max(PATCH) < min(HEAD); all nine pairs favour PATCH. 4.1 % on the
+whole shape.** Note what this vindicates and what it does not: #2 was
+judged REFUTED on the local box at 7-10 % spread. It was not refuted;
+it was unmeasurable. The refutation was the instrument's, not the
+change's.
+
+### Correctness
+
+Both gates are watched failing, against the existing e2e suite:
+
+* forcing the MySQL hop to be skipped in MySQL mode turns 4 tests red,
+  including `round471_the_unsigned_arithmetic_guard_still_sees_it`
+* dropping `JsonContains`/`JsonContainedBy` from the inlined gate's set
+  turns 4 tests red
+
+Correct build: 6,496 pass, 0 fail.
+
+This is the shared hot path of every binary operator, so the 64-cell
+constant-answer sweep is the real gate — the v7.38.8 finding is that
+such a change taxes shapes that never take it.
