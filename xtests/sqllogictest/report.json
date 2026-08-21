@@ -50,7 +50,7 @@
         { "file": "21_order_by_desc.test", "pass": 9, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 198, "fail": 0, "skip": 0,
+    { "name": "mysql", "pass": 200, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 15, "fail": 0, "skip": 0,
           "fail_reasons": [] },
@@ -82,7 +82,7 @@
           "fail_reasons": [] },
         { "file": "16_info_schema_mysql.test", "pass": 13, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "v73813_distinct_binary_collation.test", "pass": 28, "fail": 0, "skip": 0,
+        { "file": "v73813_distinct_binary_collation.test", "pass": 30, "fail": 0, "skip": 0,
           "fail_reasons": [] }
       ] },
     { "name": "pg_regress", "pass": 1506, "fail": 0, "skip": 0,
