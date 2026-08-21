@@ -1,8 +1,10 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 24, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 31, "fail": 0, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
+        { "file": "v73814_insert_select_tsvector.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "v73814_temp_namespace.test", "pass": 10, "fail": 0, "skip": 0,
           "fail_reasons": [] }

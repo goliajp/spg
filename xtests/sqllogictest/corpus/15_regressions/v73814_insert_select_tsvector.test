@@ -1,0 +1,45 @@
+# v7.38.14 — `INSERT … SELECT` can produce a tsvector.
+#
+# The full-text shape `INSERT INTO t SELECT to_tsvector(...) FROM ...` was
+# refused, and refused with advice nobody could act on: the error said to
+# add an explicit CAST to the inner SELECT, and adding one changed nothing
+# — the value already had the target type. An error that tells you to do
+# the thing you just did is worse than one that says only "unsupported",
+# so the fallback message no longer offers a workaround that does not
+# exist.
+#
+# tsvector now round-trips through its canonical text form, the way UUID
+# and bytea already did at the same site.
+
+statement ok
+CREATE TABLE tsv_t (id INT, v TSVECTOR)
+
+statement ok
+INSERT INTO tsv_t SELECT g, to_tsvector('english', 'the quick fox ' || g::text) FROM generate_series(1,3) g
+
+# The round trip has to PRESERVE the value, not merely avoid the error:
+# lexemes, their positions, and the dropped stop word all have to match
+# what the same call produces directly.
+query T
+SELECT v::text FROM tsv_t WHERE id = 1
+----
+'1':4 'fox':3 'quick':2
+
+query T
+SELECT to_tsvector('english', 'the quick fox 1')::text
+----
+'1':4 'fox':3 'quick':2
+
+# And it still matches, which a merely well-formed value need not.
+query I
+SELECT COUNT(*) FROM tsv_t WHERE v @@ to_tsquery('english', 'fox')
+----
+3
+
+query I
+SELECT COUNT(*) FROM tsv_t WHERE v @@ to_tsquery('english', 'elephant')
+----
+0
+
+statement ok
+DROP TABLE tsv_t
