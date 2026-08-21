@@ -10,15 +10,21 @@ the current build; this file is a release-organized view.
 
 ## [7.38.13] — 2026-08-21
 
-Two dispatch shapes that paid for machinery they never used, and a
-silent wrong answer that measuring the second of them exposed.
+Three shapes that paid for machinery they never used, and two silent
+wrong answers found by measuring them. Neither defect was reachable
+from a benchmark: a `COLLATE utf8mb4_bin` column merged values it
+should have kept, and ordered them by the wrong collation — and both
+turned up because a performance rewrite routed one spelling of a query
+into another and the answer changed.
 
 ### Fixed
 
 - **`DISTINCT` ignored an explicit binary collation.** A column
   declared `COLLATE utf8mb4_bin` compares byte-wise, so `'a'` and
   `'A'` are two values. `GROUP BY` got this right; `DISTINCT` folded
-  them and answered one row where MariaDB 11 answers two.
+  them and answered one row where MariaDB 11 answers two — and where
+  MySQL 9.7.1, consulted later for the `ORDER BY` sibling below,
+  independently answers two as well.
 
   Two causes, both structural. The `DISTINCT` comparator and its hash
   companion took a bare dialect bool, so neither could see a column at
