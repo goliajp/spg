@@ -589,6 +589,21 @@ fn index_name_for_cond(engine: &Engine, table: &str, alias: &str, cond: &Expr) -
         }) {
             return Some(idx.name.clone());
         }
+        // v7.38.14 — and the GIN kinds, for the same reason. Teaching the
+        // node to say `Index Scan` for a containment while leaving this
+        // function btree-only just moved the lie: the plan named the
+        // table's primary key as the index serving `j @> '…'`. A plan that
+        // names the wrong index is harder to argue with than one that says
+        // Seq Scan, because it looks like it was checked.
+        if let Some(idx) = t.indices().iter().find(|i| {
+            i.column_position == pos
+                && matches!(
+                    i.kind,
+                    spg_storage::IndexKind::Gin(_) | spg_storage::IndexKind::GinFulltext(_)
+                )
+        }) {
+            return Some(idx.name.clone());
+        }
     }
     None
 }
@@ -662,19 +677,38 @@ fn scan_node(
         }
         return app;
     }
+    // v7.38.14 — ask what the EXECUTOR asks, which is more than one
+    // question.
+    //
+    // `try_index_seek` is the btree/hash door and it is the only one this
+    // node used to knock on. A jsonb containment or a full-text match goes
+    // through `try_gin_jsonb_seek` / `try_gin_seek` instead, so a query
+    // that really did use a GIN index printed `Seq Scan`.
+    //
+    // That is not a cosmetic gap. A read-only survey of this engine
+    // reported, from these plans, that no GIN index is ever chosen by the
+    // planner -- and it was wrong: timed at 10k against 100k rows, the
+    // containment is FLAT (0.003 ms both) while a real sequential scan is
+    // linear (0.105 -> 1.222). The index was working the whole time and
+    // the plan said otherwise, which sent a real investigation to a wrong
+    // conclusion. Round 565 left the rule on this same function -- "the
+    // node has to follow the executor, not the gate" -- and this is that
+    // rule applied to the doors it did not yet know about.
     let seek = where_.and_then(|w| {
         let table = engine.active_catalog().get(name)?;
         let cols = &table.schema().columns;
         let a = alias.unwrap_or(name);
-        try_index_seek(
-            w,
-            cols,
-            engine.active_catalog(),
-            table,
-            a,
-            &engine.current_snapshot(),
-        )
-        .map(|_| ())
+        let snap = engine.current_snapshot();
+        try_index_seek(w, cols, engine.active_catalog(), table, a, &snap)
+            .map(|_| ())
+            .or_else(|| {
+                crate::index_access::try_gin_jsonb_seek(w, cols, table, a, &snap).map(|_| ())
+            })
+        // NOT covered here: `try_gin_seek`, the full-text door. It needs a
+        // catalog and an `EvalContext` this node does not build, so a
+        // `@@ to_tsquery(...)` that really does use its GIN index still
+        // prints `Seq Scan`. Named rather than left looking handled --
+        // the honest half of a fix is saying which half it is.
     });
     let table_rows = engine
         .active_catalog()
