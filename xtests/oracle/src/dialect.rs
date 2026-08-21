@@ -37,13 +37,22 @@ impl Oracle {
 
     /// Default localhost connection URI for the docker-compose
     /// service of this oracle. Picks the matching ported host port
-    /// (PG `55432` / MySQL `53306` / MariaDB `53307`) so a developer
-    /// can run `psql -p 55432` without colliding with system PG.
+    /// (PG `15432` / MySQL `15433` / MariaDB `15434`) so a developer
+    /// can run `psql -p 15432` without colliding with system PG.
+    ///
+    /// v7.38.14 — moved off 55432 / 53306 / 53307. Those sit inside
+    /// macOS's EPHEMERAL port range, so any process on the machine can
+    /// take one transiently, and one had: another project's
+    /// `portal-dev-postgres` was listening on 55432, which means this
+    /// harness would have opened a connection to a stranger's database
+    /// and used its answers as the oracle. The replacements are
+    /// registered in the shared port registry rather than picked, which
+    /// is what stops the next collision being found the same way.
     pub fn connect_uri(self) -> &'static str {
         match self {
-            Oracle::Pg18 => "postgres://testuser:testpass@127.0.0.1:55432/testdb",
-            Oracle::Mysql => "mysql://root:testpass@127.0.0.1:53306/testdb",
-            Oracle::Mariadb => "mysql://root:testpass@127.0.0.1:53307/testdb",
+            Oracle::Pg18 => "postgres://testuser:testpass@127.0.0.1:15432/testdb",
+            Oracle::Mysql => "mysql://root:testpass@127.0.0.1:15433/testdb",
+            Oracle::Mariadb => "mysql://root:testpass@127.0.0.1:15434/testdb",
         }
     }
 

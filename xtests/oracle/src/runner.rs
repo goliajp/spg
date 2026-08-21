@@ -25,6 +25,61 @@ use crate::normalise::AdjustPipeline;
 /// Entry point used by `Cmd::Run` and `Cmd::All`. With `bless`, the
 /// oracle side is executed live (docker) and its raw output written
 /// as the `expected/<stem>.<suffix>.out` baseline instead of compared.
+/// v7.38.14 — which collation is the oracle actually answering under?
+///
+/// Not decoration. The `initdb` pin this release deleted and the per-run
+/// `CREATE DATABASE` disagreed, and whichever ran last won — so a corpus
+/// expectation silently depended on how old the container was. The run
+/// now states its own configuration, which is the cheap version of the
+/// rule that every measurement should carry a witness independent of the
+/// thing being measured.
+///
+/// Best-effort: a stack that is down, or a client that changes its output
+/// shape, yields `"?"` rather than failing the run. The value is context
+/// for a mismatch, never a gate.
+fn oracle_collation(oracle: Oracle) -> String {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let (container, args, sql): (&str, Vec<&str>, &str) = match oracle {
+        Oracle::Pg18 => (
+            "spg-oracle-pg18",
+            vec![
+                "psql", "-X", "-q", "-tA", "-U", "testuser", "-d", "testdb", "-f", "-",
+            ],
+            "SELECT datcollate FROM pg_database WHERE datname = current_database();",
+        ),
+        Oracle::Mysql => (
+            "spg-oracle-mysql",
+            vec!["mysql", "-uroot", "-ptestpass", "-N", "--batch", "testdb"],
+            "SELECT @@collation_database;",
+        ),
+        Oracle::Mariadb => (
+            "spg-oracle-mariadb",
+            vec!["mariadb", "-uroot", "-ptestpass", "-N", "--batch", "testdb"],
+            "SELECT @@collation_database;",
+        ),
+    };
+    let mut cmd = Command::new("docker");
+    cmd.arg("exec").arg("-i").arg(container).args(&args);
+    let Ok(mut child) = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return "?".into();
+    };
+    if let Some(mut si) = child.stdin.take() {
+        let _ = si.write_all(sql.as_bytes());
+    }
+    let Ok(out) = child.wait_with_output() else {
+        return "?".into();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("?");
+    first.trim().to_string()
+}
+
 pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle, bless: bool) -> Result<()> {
     let grouped = naming::list(corpus)?;
     let partition = load_partition(corpus, oracle)?;
@@ -64,7 +119,8 @@ pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle, bless: bool) -> R
     }
 
     println!(
-        "oracle={oracle:?} fixtures={total} failed={failed} skipped_by_partition={skipped}{}",
+        "oracle={oracle:?} collation={} fixtures={total} failed={failed} skipped_by_partition={skipped}{}",
+        oracle_collation(oracle),
         if bless { " [BLESS]" } else { "" }
     );
     if failed > 0 {
@@ -477,6 +533,21 @@ fn run_on_oracle(fixture: &Path, oracle: Oracle) -> Result<String> {
                 "-",
             ],
         ),
+        // v7.38.14 — the bare CREATE DATABASE inherits the SERVER
+        // collation, and that is pinned to `utf8mb4_bin` in
+        // `mysql/oracle.cnf` / `mariadb/oracle.cnf`. The pin is
+        // deliberate and documented there: byte-wise mirrors PG's
+        // C-locale text comparison, so one shared corpus can be compared
+        // against all three oracles without a per-fixture folding rule.
+        //
+        // The consequence, which was NOT written down anywhere and is
+        // the reason `oracle_collation` now reports into every run: this
+        // harness structurally cannot observe MySQL's DEFAULT
+        // (case-insensitive) collation. A fixture that wants that
+        // behaviour has to declare it on the column, because the server
+        // will not supply it. Two redundant `initdb` ALTER DATABASE
+        // scripts that restated the same pin have been deleted — they
+        // implied the database was the source of truth, and it is not.
         Oracle::Mysql => (
             "spg-oracle-mysql",
             "DROP DATABASE IF EXISTS testdb; CREATE DATABASE testdb;",
