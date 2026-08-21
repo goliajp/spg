@@ -1,11 +1,11 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 37, "fail": 1, "skip": 0,
+    { "name": "15_regressions", "pass": 38, "fail": 0, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0,
           "fail_reasons": [] },
-        { "file": "v73814_explain_names_the_index.test", "pass": 6, "fail": 1, "skip": 0,
-          "fail_reasons": ["record 5: row mismatch |   expected: [\"Aggregate  (cost=8.16..8.16 rows=1 width=16)\", \"  ->  Index Scan using exn_j on exn  (cost=0.15..8.16 rows=1 width=40)\", \"        I…"] },
+        { "file": "v73814_explain_names_the_index.test", "pass": 7, "fail": 0, "skip": 0,
+          "fail_reasons": [] },
         { "file": "v73814_insert_select_tsvector.test", "pass": 7, "fail": 0, "skip": 0,
           "fail_reasons": [] },
         { "file": "v73814_temp_namespace.test", "pass": 10, "fail": 0, "skip": 0,
