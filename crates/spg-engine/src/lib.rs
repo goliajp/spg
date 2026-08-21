@@ -2365,6 +2365,15 @@ impl Engine {
         alloc::format!("__spg_temp_{id}__")
     }
 
+    /// v7.38.14 — which session's temporary namespace does this catalog
+    /// name belong to, if any? The inverse of `session_temp_name`, so the
+    /// system catalog can report `pg_temp_N` for it instead of `public`.
+    pub(crate) fn temp_session_of(catalog_name: &str) -> Option<u32> {
+        let rest = catalog_name.strip_prefix("__spg_temp_")?;
+        let (id, _) = rest.split_once("__")?;
+        id.parse().ok()
+    }
+
     /// The catalog name this session's TEMPORARY table `logical` takes.
     pub(crate) fn session_temp_name(&self, logical: &str) -> String {
         alloc::format!("{}{logical}", Self::temp_prefix_for(self.current_session))

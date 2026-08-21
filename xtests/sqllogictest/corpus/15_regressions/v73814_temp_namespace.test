@@ -1,0 +1,62 @@
+# v7.38.14 — a temporary relation reports `pg_temp_N`, not `public`.
+#
+# The ledger recorded this as "CREATE TEMP SEQUENCE / VIEW return ok but
+# create PERMANENT objects", and that half was fixed in round 469: the
+# objects carry a per-session name prefix, another connection cannot see
+# or use them, and they go with the session. Measured again today before
+# planning anything on top of it.
+#
+# What was still wrong is what the CATALOG says. `pg_class.relnamespace`
+# was hard-coded to `public` for every relation, so a schema-diff or
+# migration tool reading the catalog saw a temporary object sitting in
+# `public` with no way to tell it from a permanent one. PG18 answers
+# `pg_temp_NN`.
+#
+# The matching `pg_namespace` row matters as much as the oid: without it
+# the join drops the relation entirely, which trades a wrong answer for a
+# missing one.
+
+statement ok
+CREATE TEMP SEQUENCE tns_seq
+
+statement ok
+CREATE TEMP VIEW tns_v AS SELECT 1 AS x
+
+statement ok
+CREATE TABLE tns_perm (a INT)
+
+query T
+SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'tns_seq'
+----
+pg_temp_0
+
+query T
+SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'tns_v'
+----
+pg_temp_0
+
+# NEGATIVE CONTROL — a permanent relation must still report `public`. A
+# fix that pointed everything at the temp namespace passes the two rows
+# above and fails this one.
+query T
+SELECT n.nspname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = 'tns_perm'
+----
+public
+
+# The namespace has to be joinable, not merely referenced.
+query I
+SELECT COUNT(*) FROM pg_namespace WHERE nspname = 'pg_temp_0'
+----
+1
+
+statement ok
+DROP VIEW tns_v
+
+statement ok
+DROP SEQUENCE tns_seq
+
+statement ok
+DROP TABLE tns_perm
