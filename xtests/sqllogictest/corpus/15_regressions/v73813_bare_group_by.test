@@ -1,0 +1,114 @@
+# v7.38.13 — a bare GROUP BY takes the DISTINCT path.
+#
+# `SELECT k FROM t GROUP BY k` has no aggregate in it and returns
+# exactly what `SELECT DISTINCT k` returns, but `uses_aggregate` is true
+# for any statement carrying a GROUP BY, so it went through the
+# aggregate executor: 155.7 ms against the DISTINCT path's 95.2 and
+# PostgreSQL 18's 111.3 on 400k rows.
+#
+# These cases are about the ANSWER. The equivalence is narrow, and the
+# rows below are what break if the gate is widened — every expectation
+# taken from a PostgreSQL 18 run, not computed by hand.
+
+statement ok
+CREATE TABLE bg (a INT, b INT, t TEXT)
+
+statement ok
+INSERT INTO bg VALUES (1,10,'x'),(1,20,'x'),(2,10,'y'),(2,10,'y'),(3,30,NULL),(3,30,NULL)
+
+# The rewritten shape.
+query I
+SELECT a FROM bg GROUP BY a ORDER BY a
+----
+1
+2
+3
+
+# THE case the gate exists for: grouping by (a, b) and projecting only
+# `a` yields one row per PAIR, so `a = 1` appears TWICE. Rewriting this
+# to `SELECT DISTINCT a` would collapse it to three rows.
+query I
+SELECT a FROM bg GROUP BY a, b ORDER BY a
+----
+1
+1
+2
+3
+
+query I
+SELECT count(*) FROM (SELECT a FROM bg GROUP BY a, b) s
+----
+4
+
+# Keys and projection matching as a set is fine in any order.
+query II
+SELECT a, b FROM bg GROUP BY a, b ORDER BY a, b
+----
+1
+10
+1
+20
+2
+10
+3
+30
+
+# NULL is one group, and one distinct value — the two spellings agree.
+query I
+SELECT count(*) FROM (SELECT t FROM bg GROUP BY t) s
+----
+3
+
+# HAVING filters GROUPS. There is no DISTINCT spelling of it, so the
+# rewrite must not fire.
+query I
+SELECT a FROM bg GROUP BY a HAVING count(*) > 1 ORDER BY a
+----
+1
+2
+3
+
+query I
+SELECT a FROM bg GROUP BY a HAVING count(DISTINCT b) > 1 ORDER BY a
+----
+1
+
+# A HAVING with NO aggregate in it. This is the case that pins the
+# HAVING gate: the two above are already rejected by the aggregate check
+# (their HAVING contains `count`), so removing the gate left them green
+# — a control that survives the rule's removal pins nothing.
+query I
+SELECT a FROM bg GROUP BY a HAVING a > 1 ORDER BY a
+----
+2
+3
+
+# And with a key the projection does not carry, so both gates matter.
+query I
+SELECT a FROM bg GROUP BY a, b HAVING b = 10 ORDER BY a
+----
+1
+2
+
+# An aggregate in the select list keeps the aggregate path.
+query II
+SELECT a, count(*) FROM bg GROUP BY a ORDER BY a
+----
+1
+2
+2
+2
+3
+2
+
+# An ordinal key names a select-list position; the gate leaves it alone
+# rather than reasoning about it, and the answer is unchanged either way.
+query I
+SELECT a FROM bg GROUP BY 1 ORDER BY 1
+----
+1
+2
+3
+
+statement ok
+DROP TABLE bg

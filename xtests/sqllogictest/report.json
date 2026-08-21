@@ -1,8 +1,9 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 0, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 14, "fail": 0, "skip": 0,
       "files": [
-
+        { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0,
+          "fail_reasons": [] }
       ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
       "files": [

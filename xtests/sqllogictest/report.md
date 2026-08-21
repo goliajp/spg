@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass |
 |---|---|---|---|---|
-| `15_regressions` | 0 | 0 | 0 | 0.0% |
+| `15_regressions` | 14 | 0 | 0 | 100.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
 | `mysql` | 185 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
@@ -32,6 +32,7 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip |
 |---|---|---|---|
+| `v73813_bare_group_by.test` | 14 | 0 | 0 |
 
 ### `duckdb/`
 
