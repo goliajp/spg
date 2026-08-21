@@ -13,11 +13,19 @@ cd "$(dirname "$0")/.."
 
 # S1.4 — `--result` reads the detached mini run's verdict; refuses to
 # guess while it is still running (test-on-mini.sh discipline).
+#
+# v7.38.13 — the liveness probe used to look for "scripts/suite.sh",
+# which `--on-mini` never launches: it launches
+# `bash scripts/mini-suite-runner.sh`. So EVERY in-progress run was
+# reported as "the run died", exit 1. That is the worst direction for
+# this particular lie to point -- it invites killing a healthy run and
+# starting it over. Caught during the 7.38.13 release, on a run whose
+# clippy was visibly still going.
 if [[ "${1:-}" == "--result" ]]; then
     exec ssh "${SPG_MINI_HOST:-mini.local}" '
         if [ -f /tmp/spg-suite.done ]; then
             tail -20 /tmp/spg-suite.log
-        elif pgrep -qf "scripts/suite\.sh"; then
+        elif pgrep -qf "mini-suite-runner\.sh|suite-run (precommit|prerelease|full)"; then
             echo "still running:"; tail -3 /tmp/spg-suite.log
         else
             echo "NOT RUNNING and no sentinel — the run died. Last lines:"
