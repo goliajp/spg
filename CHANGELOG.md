@@ -8,6 +8,62 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.38.12] — 2026-08-21
+
+The two indexes meet. A jsonb containment inside a time window was the
+largest cell left on the customer profile and BRIN could not touch it:
+those rows are answered by the GIN index and never reach a scan, so
+there was no slot list to prune.
+
+### Performance
+
+- **A GIN seek and a BRIN range intersect at the row locator.** The
+  seek hands back locators, and that is the only moment they exist
+  before the rows are materialised; a locator whose slot the summary
+  ruled out cannot satisfy the range, so it is dropped there. Same
+  bitmap intersection PostgreSQL does, at the locator level.
+
+  The slots come from the WHOLE predicate at the top call rather than
+  the sub-expression the recursion descends into — the range that
+  prunes lives in a different conjunct from the containment that
+  seeks. `None` still means "no opinion": with no BRIN index, or no
+  bound on one, every locator is kept and the path is unchanged.
+
+  Over the wire, 200,000 rows: 9-11 ms to **2.119**, against PG18's
+  1.8-2.0.
+
+### On the customer profile
+
+Both as containers, vacuumed, N=4, control clean on all eight cells:
+
+| shape | v7.38.11 | now |
+|---|---|---|
+| window: count over a day | level | **71.6 % ahead** |
+| window: distinct seats | 3.9 % ahead | **14.4 % ahead** |
+| jsonb: containment in a window | **4.1x behind** | **3.1 % behind — level** |
+| window: group by kind | level | 10.1 % behind |
+| jsonb: containment (no window) | 1.8x | 1.9x |
+| dashboard: top versions | 2.1x | 2.1x |
+| ingest: one row | 2.1x | 2.0x |
+| btree: project and kind | unresolved | unresolved |
+
+Two shapes ahead, two level. When this campaign opened every one of
+them was between 2.0x and 16.4x behind. What is left is
+representation-bound rather than index-bound: `Value::Json(Cow<str>)`
+is a string at rest, which is what the containment and dashboard rows
+are paying for.
+
+### Tests
+
+Thirteen corpus cases, every expectation taken from PostgreSQL 18 —
+which mattered: the first draft hand-computed 20 for a half-open
+one-hour window and the run answered 19. The implementation was right
+and the expectation was wrong. Watched failing — shortening each kept
+range by one slot turns two cases red, and the failure is rows
+silently vanishing (1000 becomes 999, 1 becomes 0).
+
+---
+
 ## [7.38.11] — 2026-08-21
 
 A BRIN index now prunes. It did not before: the summaries were derived
