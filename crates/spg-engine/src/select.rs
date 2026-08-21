@@ -4660,6 +4660,15 @@ impl Engine {
         if let Some(rewritten) = self.desugar_using_natural(stmt)? {
             return self.exec_bare_select_cancel(&rewritten, cancel);
         }
+        // v7.38.13 — a GROUP BY with no aggregate, whose select list is
+        // exactly the group keys, IS a DISTINCT and was paying for the
+        // aggregate executor to find that out. Same placement and shape
+        // as the desugar above; the rewrite clears `group_by`, so the
+        // re-entry is a no-op on the second pass. See `baregroup` for
+        // what the gate rules out.
+        if let Some(rewritten) = crate::baregroup::as_distinct(stmt) {
+            return self.exec_bare_select_cancel(&rewritten, cancel);
+        }
         // v7.39 (RLS) Phase 3 — cross-table joins: wrap each RLS-enabled join
         // operand in a security-barrier subquery, then re-enter (the wrapped
         // operands are no longer bare RLS tables, so this is a no-op on the

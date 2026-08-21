@@ -37,6 +37,7 @@ macro_rules! bump_counter {
 mod acl;
 pub mod aggregate;
 pub(crate) mod amcheck;
+mod baregroup;
 pub mod brin;
 mod bytebudget;
 mod cancel;

@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|
 | `15_regressions` | 0 | 0 | 0 | 0.0% |
 | `duckdb` | 170 | 0 | 0 | 100.0% |
-| `mysql` | 183 | 2 | 0 | 98.9% |
+| `mysql` | 185 | 0 | 0 | 100.0% |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% |
 | `pgvector` | 76 | 0 | 0 | 100.0% |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% |
@@ -25,13 +25,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 10: row mismatch | expected:` |
-| 1 | `record 8: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -85,13 +78,7 @@ Per-corpus pass / fail / skip:
 | `14_show_create_table.test` | 3 | 0 | 0 |
 | `15_show_indexes_status_processlist.test` | 9 | 0 | 0 |
 | `16_info_schema_mysql.test` | 13 | 0 | 0 |
-| `v73813_distinct_binary_collation.test` | 13 | 2 | 0 |
-
-<details><summary>`v73813_distinct_binary_collation.test` fail snippets</summary>
-
-- record 8: row mismatch |   expected: ["2"] |   actual:   ["4"]
-- record 10: row mismatch |   expected: ["2"] |   actual:   ["5"]
-</details>
+| `v73813_distinct_binary_collation.test` | 15 | 0 | 0 |
 
 ### `pg_regress/`
 
