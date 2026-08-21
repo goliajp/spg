@@ -1249,9 +1249,17 @@ pub(crate) fn run(
     // set (`defer_enabled` requires `!stmt.distinct`), so nothing indexes
     // into `kept_synth` alongside these rows.
     if stmt.distinct {
+        // v7.38.14 — masked, not dialect-only. `SELECT DISTINCT` over a
+        // GROUP BY result folded every text position regardless of what
+        // the column declared, which is the defect 3b494b6e closed on the
+        // main scan path. The output schema is in scope here and carries
+        // the collation, so the mask needs no new plumbing.
         out_rows = crate::select::dedup_rows(
             out_rows,
-            crate::select::FoldSpec::dialect(engine.is_some_and(|e| e.backslash_escapes)),
+            crate::select::FoldSpec::of(
+                engine.is_some_and(|e| e.backslash_escapes),
+                &crate::select::fold_mask_of_columns(&columns),
+            ),
         );
     }
 
@@ -4038,6 +4046,19 @@ fn build_synth_schema(
             // `__grp_0` with no collation, and the group-by ordering silently
             // stays byte-wise.
             col.collation_name = src.and_then(|sc| sc.collation_name.clone());
+            // v7.38.14 — and the collation ENUM, which is a different field
+            // and the one every MySQL text comparison actually reads. The
+            // note above carried the NAME and stopped, exactly as round 688
+            // did in `join.rs::build_combined_schema`; both left the enum
+            // behind, and `ColumnSchema::new` defaults it to `Binary`, which
+            // downstream reads as "byte-wise ON PURPOSE" rather than as
+            // "unknown". So a `__grp_j` column claimed to be an explicit
+            // binary column and `SELECT DISTINCT ... GROUP BY` stopped
+            // folding. Sixth field through this hole, second site with the
+            // identical shape.
+            if let Some(sc) = src {
+                col.collation = sc.collation;
+            }
         }
         synth_schema.push(col);
     }
@@ -4422,11 +4443,29 @@ fn project_groups(
                 let name = alias
                     .clone()
                     .unwrap_or_else(|| crate::select::default_output_name(expr, mysql));
-                Ok(ColumnSchema::new(
-                    name,
-                    agg_or_group_type(&rewritten, synth_schema),
-                    true,
-                ))
+                // v7.38.14 — the type is looked up in the synthetic schema
+                // here; the COLLATION has to travel by the same route or the
+                // output column claims `ColumnSchema::new`'s default, which
+                // is `Binary` and reads downstream as "byte-wise on
+                // purpose". That is what made `SELECT DISTINCT ... GROUP BY`
+                // stop folding: the de-duplication asked the output schema
+                // and the output schema had forgotten.
+                //
+                // Third site with this exact shape in one release, after
+                // `join.rs::build_combined_schema` and `synth_schema` above.
+                // Each one hand-picks which attributes survive; none picks
+                // all of them. See S4 of the v7.38.14 roadmap.
+                let mut col =
+                    ColumnSchema::new(name, agg_or_group_type(&rewritten, synth_schema), true);
+                if let Expr::Column(c) = &rewritten
+                    && let Some(sc) = synth_schema
+                        .iter()
+                        .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                {
+                    col.collation = sc.collation;
+                    col.collation_name.clone_from(&sc.collation_name);
+                }
+                Ok(col)
             }
         })
         .collect::<Result<_, _>>()?;
