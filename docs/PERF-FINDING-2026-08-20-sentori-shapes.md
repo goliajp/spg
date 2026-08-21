@@ -829,3 +829,57 @@ own run-to-run variance, which is why the verdict flickers.
 
 An instrument now exists that does not flicker: `/tmp/leg.sh` measures
 exactly this shape at 1-2 % spread, median-of-9 after 3 warm runs.
+
+---
+
+## v7.38.13 — chasing the flickering cell found a bigger, steadier loss
+
+Attacking the standing `distinct then order` cell started with the
+three-way control it needed: the shape, the same shape without
+DISTINCT, and **PostgreSQL's other spelling of the same answer**.
+Same box, same table, both servers over the wire, median-of-7:
+
+| shape | SPG | PG18 |
+|---|---:|---:|
+| `SELECT DISTINCT k … ORDER BY k` | 95.2 | 103.0 |
+| `SELECT k … ORDER BY k` | 59.9 | 86.2 |
+| `SELECT k … GROUP BY k ORDER BY k` | **155.7** | **111.3** |
+
+Two things fall out.
+
+**The flickering cell flickers because it is genuinely close.** On this
+box SPG *wins* it (95.2 vs 103.0); on mini SPG loses it (134 vs ~126).
+A verdict that changes sign with the machine is what "inside the
+variance" means, and it is why three releases have each spent a round
+re-proving the same negative.
+
+**The steady loss is the other spelling.** `GROUP BY k` with no
+aggregate in the select list returns the identical answer to
+`DISTINCT k` — verified, not assumed:
+
+```
+SPG distinct  93cd2385f5dda23129e88ce2de6e101f
+SPG groupby   93cd2385f5dda23129e88ce2de6e101f
+PG  distinct  93cd2385f5dda23129e88ce2de6e101f
+PG  groupby   93cd2385f5dda23129e88ce2de6e101f
+```
+
+Same answer, four ways. SPG takes **63 % longer** to produce it through
+its own GROUP BY path than through its own DISTINCT path, and **40 %
+longer than PostgreSQL** takes through either. The DISTINCT path
+already exists and already beats PG; the GROUP BY path carries
+aggregate machinery for zero aggregates.
+
+`group by then order` is not one of the sweep's ten shapes, so nothing
+gated it — which is the more useful finding of the two. The gated cell
+was a coin flip; this one is a real 40 % loss on a spelling customers
+write, and it was found only because the control set included the
+other way to ask the question.
+
+### Not yet done
+
+The rewrite (a bare `GROUP BY` whose select list is exactly the group
+keys is a DISTINCT) has to be gated tightly — no aggregates, no
+HAVING, no select-list expression that is not a group key — and
+measured on the full matrix like any shared-path change. Recorded
+here; not attempted in this round.
