@@ -2213,10 +2213,15 @@ where
                 // accent-aware fold; a PG `case_insensitive` column keeps
                 // its ASCII-only contract.
                 let fold = |v: Value<'static>| match v {
-                    Value::Text(s) if ctx.mysql_dialect => {
+                    // v7.38.16 — BpChar as well. `CASE` a few hundred
+                    // lines below already had the pair; this arm, which
+                    // is where `s >= 'DELTA'` and BETWEEN land, did not,
+                    // so a CHAR column compared by bytes AND kept its
+                    // padding.
+                    Value::Text(s) | Value::BpChar(s) if ctx.mysql_dialect => {
                         Value::text(spg_storage::mysql_compare_fold(&s))
                     }
-                    Value::Text(s) => Value::text(s.to_ascii_lowercase()),
+                    Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
                     other => other,
                 };
                 let r = fold(stack.pop().unwrap_or(Value::Null).into_owned());

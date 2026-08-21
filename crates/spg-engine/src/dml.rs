@@ -1414,7 +1414,8 @@ impl Engine {
                 .schema()
                 .columns
                 .clone();
-            if let Some((col_pos, key)) = try_pk_predicate(w, &schema_cols, stmt.table.as_str())
+            if let Some((col_pos, key)) =
+                try_pk_predicate(w, &schema_cols, stmt.table.as_str(), self.backslash_escapes)
                 && let Some(idx_name) = self
                     .active_catalog()
                     .get(&stmt.table)
@@ -3457,7 +3458,8 @@ impl Engine {
                 .schema()
                 .columns
                 .clone();
-            if let Some((col_pos, key)) = try_pk_predicate(w, &schema_cols, stmt.table.as_str())
+            if let Some((col_pos, key)) =
+                try_pk_predicate(w, &schema_cols, stmt.table.as_str(), self.backslash_escapes)
                 && let Some(idx_name) = self
                     .active_catalog()
                     .get(&stmt.table)

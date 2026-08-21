@@ -286,6 +286,15 @@ fn run_one_fixture_server(path: &Path, extended: bool, bin: &Path) -> FixtureRes
     for rec in &records {
         match rec {
             Record::Halt => break,
+            // This runner drives a PostgreSQL wire connection, which has
+            // no MySQL dialect to switch into. Stop rather than run the
+            // rest of the file under the wrong semantics — and count the
+            // remainder as skipped so the number says the file was not
+            // covered here, instead of passing quietly on nothing.
+            Record::Dialect(_) => {
+                result.skip += 1;
+                break;
+            }
             Record::Statement {
                 directive,
                 sql,

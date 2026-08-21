@@ -51,6 +51,16 @@ pub enum Record {
         expected: ExpectedQuery,
     },
     Halt,
+    /// `dialect mysql` / `dialect postgres` — switch the session's SQL
+    /// dialect for the rest of the file.
+    ///
+    /// Added in v7.38.16, because `corpus/mysql/` had been running in
+    /// PostgreSQL dialect since it was created: the runner had no notion
+    /// of a dialect at all, so those files were asserting that MySQL
+    /// SYNTAX is accepted and nothing about MySQL SEMANTICS. A silent
+    /// wrong answer under MySQL's folding collation could not be written
+    /// down here, and one was found by hand instead.
+    Dialect(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,6 +152,23 @@ pub fn parse_str(text: &str) -> Result<Vec<Record>, ParseError> {
             } else {
                 pending_directive.skip = true;
             }
+            lines.next();
+            continue;
+        }
+
+        // dialect <mysql|postgres>
+        if let Some(rest) = trimmed.strip_prefix("dialect ") {
+            let mysql = match rest.trim() {
+                "mysql" | "mariadb" => true,
+                "postgres" | "postgresql" | "pg" => false,
+                other => {
+                    return Err(ParseError {
+                        line: _lineno + 1,
+                        message: format!("unknown dialect {other:?} (want mysql or postgres)"),
+                    });
+                }
+            };
+            out.push(Record::Dialect(mysql));
             lines.next();
             continue;
         }

@@ -2664,6 +2664,7 @@ impl Engine {
             table,
             alias_name,
             pos,
+            self.backslash_escapes,
         )
         .is_some()
     }
@@ -2695,6 +2696,7 @@ impl Engine {
             alias_name,
             &self.current_snapshot(),
             pos,
+            self.backslash_escapes,
         ) else {
             return Ok(None);
         };
@@ -2766,6 +2768,7 @@ impl Engine {
             alias_name,
             &snapshot,
             pos,
+            self.backslash_escapes,
             &mut |v: spg_storage::Value<'_>| {
                 if !wrote_header {
                     emit(crate::StreamItem::Header(&schema))?;
@@ -4509,6 +4512,7 @@ impl Engine {
             alias,
             self,
             cancel,
+            self.backslash_escapes,
         ) {
             return materialise_in_order(stmt, schema_cols, alias, &walked, self.backslash_escapes)
                 .map(Some);
@@ -6480,8 +6484,14 @@ impl Engine {
             return None;
         }
         let where_expr = stmt.where_.as_ref()?;
-        let count =
-            crate::index_access::try_range_count(where_expr, schema_cols, table, alias, snapshot)?;
+        let count = crate::index_access::try_range_count(
+            where_expr,
+            schema_cols,
+            table,
+            alias,
+            snapshot,
+            self.backslash_escapes,
+        )?;
         let columns = alloc::vec![ColumnSchema::new(
             "count".to_string(),
             spg_storage::DataType::BigInt,
