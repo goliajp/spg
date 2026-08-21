@@ -125,6 +125,28 @@ surface and removes the shape that kept losing it.
   text form the way UUID and bytea already did at that site.
 
 
+- **`EXPLAIN` named an index the query does not use, and before that
+  claimed there was none.** It asked one question — the btree door — and
+  a jsonb containment goes through another, so a query that really did
+  use its GIN index printed `Seq Scan`.
+
+  That is not cosmetic. A read-only survey of this engine reported, from
+  these plans, that no GIN index is ever chosen by the planner. Timed at
+  10,000 rows against 100,000 the containment is *flat* (0.003 ms both)
+  where a real sequential scan is linear (0.105 → 1.222 ms): the index
+  was working the whole time, the plan said otherwise, and a real
+  investigation went the wrong way on it.
+
+  Fixing the node without fixing the name lookup only moved the lie —
+  the plan then named the table's **primary key** as the index serving
+  `@>`. A plan that names the wrong index is worse than one that says
+  `Seq Scan`, because it looks like it was checked.
+
+  Still honest about what it cannot do: a full-text `@@` match needs a
+  catalog and an evaluation context this node does not build, so that
+  one still prints `Seq Scan`.
+
+
 ### Testing
 
 - The reference containers moved off ports inside the ephemeral range.
