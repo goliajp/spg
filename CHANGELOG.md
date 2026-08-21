@@ -8,6 +8,146 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased] — 7.38.14
+
+One theme: **a declared collation reaches every comparison path, and the
+answer stops depending on how the query is written.** 7.38.13 taught
+`DISTINCT` and `ORDER BY` to honour one; this release finishes the
+surface and removes the shape that kept losing it.
+
+### Fixed
+
+- **A join ignored the collation entirely, and which way it was wrong
+  depended on the predicate's shape.** `l JOIN r ON l.s = r.s` over
+  case-insensitive columns returned **no rows at all** where MySQL 9.7.1
+  returns every one — a silently *empty* result, which reads as "no
+  data" rather than as an error and so goes unreported.
+
+  Two independent causes, found one after the other:
+
+  1. A join's combined schema is rebuilt column by column, and the
+     rebuild carried the collation *name* but not the collation itself.
+     `ColumnSchema::new` defaults that field to `Binary`, which every
+     text comparison downstream reads as "byte-wise **on purpose**" —
+     so a lost declaration presented as a deliberate one and the fold
+     was switched off for the whole join.
+  2. An equality conjunct is lifted out of the `ON` clause and becomes a
+     **hash key**. A key is hashed, not compared, so the fold has to
+     happen in the *encoding* or it does not happen at all: `'a'` and
+     `'A'` land in different buckets and the rows never meet. This is
+     why three separate fixes to the comparator changed nothing.
+
+  Two separate places lift an equality into a join key — `ON` conjuncts
+  and ANSI-89 `WHERE` conjuncts — and each decided the question its own
+  way. They share one function now. Teaching only the first of them, as
+  an intermediate build did, left `FROM l, r WHERE l.s = r.s` answering
+  `0` while `JOIN … ON` answered correctly: the same query, the same
+  data, two spellings, two answers.
+
+- **Six more de-duplication sites folded every text value regardless of
+  what the column declared** — `DISTINCT` over a window projection,
+  `unnest`, `generate_series`, `jsonb_each_text`, a derived row set, and
+  over a `GROUP BY` result. The mask was in scope at every one of them.
+
+- **`UNION`, `INTERSECT` and `EXCEPT` did the same.** The previous
+  release recorded this site as one where no output columns were in
+  scope to build a mask from; they were in scope all along. What was
+  missing is that the branches' schemas did not carry the collation, so
+  a mask built from them would have called every column byte-wise and
+  looked like it worked.
+
+- **A collation stopped at the first function call.** Equality
+  recognised a bare column and nothing else, so `GREATEST(s,'A') = 'A'`
+  and `CONCAT(s,'') = 'A'` folded a byte-wise column's values away. The
+  expression-level derivation this needs already existed and `ORDER BY`
+  had used it for many releases; equality had not.
+
+- **`CASE x WHEN v` compared bytes in one implementation and folded in
+  the other.** The compiled form and the interpreted form of the same
+  expression disagreed, so the answer depended on whether the query
+  happened to compile.
+
+- **A temporary relation reported itself in `public`.** The objects have
+  been correctly session-scoped for many releases — this was never a
+  lifetime bug — but `pg_class.relnamespace` was a literal at five
+  emission sites, so a schema-diff or migration tool reading the catalog
+  could not tell a temporary object from a permanent one. PostgreSQL 18
+  answers `pg_temp_N`, and so does SPG now, with the matching
+  `pg_namespace` row so the join resolves rather than silently dropping
+  the relation.
+
+### Changed
+
+- **Twenty-one places built an output column from a projected one, with
+  three different ideas of which attributes to carry.** Six copied enum
+  identity, the collation name and the MySQL fractional-seconds
+  precision; ten copied the first and last but not the name; five copied
+  nothing. None copied the collation itself.
+
+  That is the shape behind five separate defects — enum identity, MySQL
+  fsp, the PostgreSQL collation name, projection fold-exemption, and the
+  collation — and this release alone found four sites dropping the last
+  of them. There is now one conversion, and a `rederive` constructor
+  beside it for the sites that re-describe a stored column.
+
+  A test guards it that does **not** check a list of fields, because a
+  list is exactly what goes stale: it sets every attribute away from its
+  default, re-derives, and compares the whole thing. A field added and
+  forgotten fails there rather than in a customer's query.
+
+### Performance
+
+- **`SELECT DISTINCT k … ORDER BY k` may now take the streaming sort
+  lane.** Three sort lanes declined `DISTINCT` outright, and the reason
+  was structural: the seen-set holds indices into a fully materialised
+  vector, which a lane that hands rows away as it produces them cannot
+  offer.
+
+  Sorting removes the need for a seen-set. When the sort key determines
+  the projected row, every duplicate is *adjacent* to its twin by the
+  time rows are emitted, so one comparison with the previous row
+  replaces a hash table of every row seen — PostgreSQL's own
+  Unique-over-Sort plan, which is what this shape has been measured
+  against all along.
+
+  The gate is narrow on purpose: `ORDER BY a` over a projection of
+  `a, b` does not place duplicates of the *pair* adjacent, so the
+  projected set and the `ORDER BY` set must be equal, never merely
+  overlapping.
+
+- **`INSERT … SELECT` could not produce a `tsvector`** — the ordinary
+  way to populate a full-text column from existing rows. Worse than the
+  refusal was its advice: it said to add an explicit cast to the inner
+  `SELECT`, and adding one changed nothing, because the value already
+  had the target type. An error that tells you to do the thing you just
+  did sends the reader hunting for a mistake they did not make. It now
+  says what is true, and `tsvector` round-trips through its canonical
+  text form the way UUID and bytea already did at that site.
+
+
+### Testing
+
+- The reference containers moved off ports inside the ephemeral range.
+  One had already been taken — by an unrelated project's database — and
+  a differential harness that connects to a stranger and treats the
+  answers as the oracle is worse than one that does not run.
+- Every differential run now prints which collation it answered under.
+  The harness's byte-wise pin is deliberate, but nothing said so, and
+  nothing said what follows from it: this harness cannot observe MySQL's
+  *default* collation, so a fixture that wants that behaviour has to
+  declare it on the column.
+- `suite.sh --result` reported every in-flight run as dead. Its liveness
+  probe looked for a process name the launcher never creates. The
+  direction of that lie is the problem — a healthy run reported as dead
+  invites killing it and starting over.
+- The commit budget rejected a change for costing what a base-crate
+  change costs. Measured before adjusting: an unmodified tree plus a
+  *comment* on the storage crate ran the same step in 441.6 s against a
+  336 s budget. A budget a no-op cannot clear is measuring the
+  workspace, not the change.
+
+---
+
 ## [7.38.13] — 2026-08-21
 
 Three shapes that paid for machinery they never used, and two silent
