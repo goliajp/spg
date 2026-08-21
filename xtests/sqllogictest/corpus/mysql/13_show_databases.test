@@ -1,5 +1,7 @@
 # v7.17.0 Phase 3.P0-58 — MySQL SHOW DATABASES / SHOW SCHEMAS.
 
+dialect mysql
+
 query T rowsort
 SHOW DATABASES
 ----

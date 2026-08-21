@@ -7,6 +7,8 @@
 # duplicates coexist, which MySQL would reject.
 
 # Inline UNIQUE on a ci column rejects case-variant inserts.
+dialect mysql
+
 statement ok
 CREATE TABLE names (s TEXT COLLATE "case_insensitive" NOT NULL UNIQUE)
 
@@ -23,12 +25,35 @@ INSERT INTO names VALUES ('foo')
 statement ok
 INSERT INTO names VALUES ('bar'), ('Baz')
 
-# Binary collation (default) keeps case-sensitive UNIQUE.
+# v7.38.17 — this section used to read "Binary collation (default) keeps
+# case-sensitive UNIQUE" and expected all three spellings to insert.
+# That is PostgreSQL's default, and this file lives under `mysql/`. It
+# only ever passed because the whole directory was running in PG dialect;
+# the day it entered the dialect its name claims, the premise failed.
+#
+# MySQL's default is `utf8mb4_0900_ai_ci`, which folds. Measured on
+# 9.7.1: `INSERT INTO bin_names VALUES ('Foo'),('FOO'),('foo')` on a
+# default-collation UNIQUE column is
+# `ERROR 1062: Duplicate entry 'FOO' for key 'bin_names.s'`.
 statement ok
 CREATE TABLE bin_names (s TEXT NOT NULL UNIQUE)
 
-statement ok
+statement error
 INSERT INTO bin_names VALUES ('Foo'), ('FOO'), ('foo')
+
+# Byte-wise UNIQUE under MySQL takes an explicit collation. Measured on
+# 9.7.1: with `COLLATE utf8mb4_bin` all three rows insert and the table
+# holds 3.
+statement ok
+CREATE TABLE bin2 (s TEXT COLLATE utf8mb4_bin NOT NULL UNIQUE)
+
+statement ok
+INSERT INTO bin2 VALUES ('Foo'), ('FOO'), ('foo')
+
+query I
+SELECT count(*) FROM bin2
+----
+3
 
 # Composite UNIQUE applies per-column collation.
 statement ok
@@ -61,6 +86,9 @@ DROP TABLE IF EXISTS names CASCADE
 
 statement ok
 DROP TABLE IF EXISTS bin_names CASCADE
+
+statement ok
+DROP TABLE IF EXISTS bin2 CASCADE
 
 statement ok
 DROP TABLE IF EXISTS composite CASCADE

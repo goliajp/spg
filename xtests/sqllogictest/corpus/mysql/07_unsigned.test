@@ -2,6 +2,8 @@
 # consumed and discarded the keyword silently; now negative
 # INSERT / UPDATE values are rejected.
 
+dialect mysql
+
 statement ok
 CREATE TABLE t (id INT UNSIGNED NOT NULL)
 

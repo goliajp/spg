@@ -18,6 +18,8 @@
 #   INTERSECT        1            2
 #   EXCEPT           1            0
 
+dialect mysql
+
 statement ok
 SET sql_mode = 'STRICT_TRANS_TABLES'
 

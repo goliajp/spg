@@ -32,6 +32,27 @@ pub struct RunOutcome {
     pub pass: usize,
     pub fail: usize,
     pub skip: usize,
+    /// v7.38.17 — was the session ever in MySQL semantics, OBSERVED from
+    /// the engine after each record rather than parsed from a directive.
+    /// `SET sql_mode` switches dialect too, so the directive is not the
+    /// whole story and a harness that reads it reports the wrong mode.
+    pub entered_mysql: bool,
+    /// Did it ever run a record in PostgreSQL semantics? A file can be
+    /// both, and "both" is a thing a reader needs told.
+    pub entered_postgres: bool,
+    /// v7.38.17 — was there ever a moment when the session was in MySQL
+    /// semantics AND some table carried an index?
+    ///
+    /// This is the axis pair v7.38.16's four wrong answers lived in, and
+    /// before that release the intersection was EMPTY across the whole
+    /// corpus. The collation fixtures from 7.38.13 and 7.38.14 exercise
+    /// the comparison paths — join ON, DISTINCT, set operations,
+    /// expressions — and not one of them ever builds an index, so the
+    /// indexed paths were never reached under MySQL by anything. Not a
+    /// forgotten case: the two axes never met.
+    ///
+    /// Observed from the catalog, not counted out of the SQL text.
+    pub mysql_with_index: bool,
     pub per_record: Vec<Outcome>,
     /// r1052 (S2.3) — pg_regress-style unified diff blocks, one per
     /// failing query record, ready to concatenate into `slt.diffs`.
@@ -85,6 +106,14 @@ impl Runner {
         let mut out = RunOutcome::default();
         for record in records {
             let outcome = self.run_one(record);
+            if self.engine.in_mysql_dialect() {
+                out.entered_mysql = true;
+                if !out.mysql_with_index && self.any_table_has_index() {
+                    out.mysql_with_index = true;
+                }
+            } else {
+                out.entered_postgres = true;
+            }
             match &outcome {
                 Outcome::Pass => out.pass += 1,
                 Outcome::Fail(_) => out.fail += 1,
@@ -143,6 +172,21 @@ impl Runner {
     /// still present when it ends is a cleanup the author forgot; a
     /// leak is a WARNING, not a failure (checklist S2.4), but it is
     /// named so it gets fixed instead of compounding.
+    /// Does any user table in this session carry an index right now?
+    ///
+    /// Asked of the catalog rather than counted out of the SQL, because
+    /// "does this file build an index" and "is an index present when the
+    /// query runs" are different questions and only the second one is
+    /// the axis that matters.
+    fn any_table_has_index(&self) -> bool {
+        self.engine
+            .catalog()
+            .table_names()
+            .iter()
+            .filter_map(|n| self.engine.catalog().get(n))
+            .any(|t| !t.indices().is_empty())
+    }
+
     pub fn leftover_objects(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         for (kind, sql) in [

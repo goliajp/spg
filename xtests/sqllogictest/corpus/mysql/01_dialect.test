@@ -4,6 +4,8 @@
 # - AUTO_INCREMENT column attribute
 
 # Backtick-quoted identifiers (same semantics as PG `"..."`).
+dialect mysql
+
 statement ok
 CREATE TABLE `Users` (`id` INT NOT NULL, `name` TEXT NOT NULL)
 

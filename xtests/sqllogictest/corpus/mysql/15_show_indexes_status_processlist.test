@@ -1,5 +1,7 @@
 # v7.17.0 Phase 3.P0-60..P0-62 — SHOW INDEXES / STATUS / VARIABLES / PROCESSLIST.
 
+dialect mysql
+
 statement ok
 CREATE TABLE t (id INT NOT NULL, name TEXT NOT NULL)
 

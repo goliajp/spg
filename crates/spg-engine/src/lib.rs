@@ -2486,6 +2486,18 @@ impl Engine {
     /// flips it back through the normal SET path. Clearing the plan cache
     /// mirrors [`set_current_session`] — the same SQL text lexes
     /// differently once the flag moves.
+    /// Is this session in MySQL dialect right now?
+    ///
+    /// v7.38.17 — a test harness cannot take a file's word for which
+    /// dialect it runs in. `SET sql_mode = 'STRICT_TRANS_TABLES'` puts a
+    /// session into MySQL semantics mid-file, so six corpus files were
+    /// entering MySQL through a door no directive named, and a harness
+    /// that read the directive reported them as PostgreSQL. Ask the
+    /// session, do not parse the script.
+    pub fn in_mysql_dialect(&self) -> bool {
+        self.backslash_escapes
+    }
+
     pub fn set_backslash_escapes(&mut self, flag: bool) {
         if flag != self.backslash_escapes {
             self.backslash_escapes = flag;

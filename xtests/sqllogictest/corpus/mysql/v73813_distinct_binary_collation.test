@@ -16,6 +16,8 @@
 
 # Declare the session's dialect the way a mysqldump would, as the
 # neighbouring fixtures do.
+dialect mysql
+
 statement ok
 SET sql_mode = 'STRICT_TRANS_TABLES'
 

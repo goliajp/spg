@@ -5,6 +5,8 @@
 # procedure runtime so the body has no behavioural effect.
 
 # Empty body.
+dialect mysql
+
 statement ok
 CREATE PROCEDURE noop() BEGIN END
 

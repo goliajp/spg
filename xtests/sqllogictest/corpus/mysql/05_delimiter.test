@@ -4,6 +4,8 @@
 # bodies load without parser noise. SPG processes one statement
 # at a time so the actual terminator switching is moot.
 
+dialect mysql
+
 statement ok
 DELIMITER //
 

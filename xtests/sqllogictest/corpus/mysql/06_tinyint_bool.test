@@ -3,6 +3,8 @@
 # maps TINYINT(1) to bit/bool. Pre-4.3 SPG classified it as
 # SmallInt (i16); now it classifies as BOOL.
 
+dialect mysql
+
 statement ok
 CREATE TABLE t (id INT NOT NULL, active TINYINT(1) NOT NULL)
 
