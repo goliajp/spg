@@ -1,0 +1,64 @@
+# v7.38.18 — `pg_stats`, and `pg_statistic` telling the truth.
+#
+# `pg_statistic` emitted one all-zero row per column of every table,
+# analysed or not. So a test could assert a row count from it and pass
+# without ANALYZE having run — and one did: the S10 pin written an hour
+# earlier said "two columns analysed is two rows of statistics", above a
+# comment reading "'It returned OK' is not evidence that it did
+# anything". It was counting the stub.
+#
+# It reads the real store now, and a column ANALYZE has not visited has
+# no row, as in PostgreSQL.
+#
+# `pg_stats` — the readable view, and the one a person actually types to
+# ask whether ANALYZE did anything — did not exist at all. PG 18.4's
+# seventeen columns in its order; the arrays SPG does not model are
+# NULL, which says "not modelled" rather than "zero".
+#
+# Expectations from a PG 18.4 run over the same 100 rows: `k` distinct
+# in every row, `s` three values.
+
+statement ok
+CREATE TABLE ps (k INT, s TEXT)
+
+statement ok
+INSERT INTO ps SELECT g, 'v' || (g % 3)::text FROM generate_series(1,100) g
+
+# Before ANALYZE there is nothing to report — this is the assertion the
+# old stub could not make.
+query I
+SELECT count(*) FROM pg_stats WHERE tablename = 'ps'
+----
+0
+
+query I
+SELECT count(*) FROM pg_statistic WHERE starelid = (SELECT oid FROM pg_class WHERE relname = 'ps')
+----
+0
+
+statement ok
+ANALYZE ps
+
+# `n_distinct` follows PG's sign convention: a positive number is a
+# count, -1 means every row differs.
+query TTTRR
+SELECT schemaname, tablename, attname, null_frac, n_distinct FROM pg_stats WHERE tablename = 'ps' ORDER BY attname
+----
+public
+ps
+k
+0
+-1
+public
+ps
+s
+0
+3
+
+query I
+SELECT count(*) FROM pg_statistic WHERE starelid = (SELECT oid FROM pg_class WHERE relname = 'ps')
+----
+2
+
+statement ok
+DROP TABLE ps

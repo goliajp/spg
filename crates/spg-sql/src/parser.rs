@@ -875,6 +875,8 @@ const SYNTHESISED_PG_CATALOGS: &[&str] = &[
     "pg_largeobject_metadata",
     "pg_statistic",
     "pg_statistic_ext",
+    // v7.38.18 — the readable view over pg_statistic.
+    "pg_stats",
     "pg_subscription",
     "pg_tables",
     "pg_tablespace",

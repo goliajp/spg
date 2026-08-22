@@ -1098,10 +1098,20 @@ impl Engine {
                         crate::system_catalog::synth_pg_statistic_ext(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
+                // v7.38.18 — pg_catalog.pg_stats, the readable view.
+                "__spg_pg_stats" => {
+                    let (schema, rows) = crate::system_catalog::synth_pg_stats(
+                        self.active_catalog(),
+                        &self.statistics,
+                    );
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
                 // v7.37.24 (24.15) — pg_catalog.pg_statistic.
                 "__spg_pg_statistic" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_statistic(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_statistic(
+                        self.active_catalog(),
+                        &self.statistics,
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.22 (22.20) — pg_catalog.pg_stat_progress_vacuum.

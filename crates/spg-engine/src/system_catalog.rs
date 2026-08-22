@@ -1668,7 +1668,92 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
 ///   * stanullfrac (Float) — fraction of NULLs
 ///   * stawidth (Int) — avg byte width
 ///   * stadistinct (Float) — distinct estimate
-pub(crate) fn synth_pg_statistic(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+/// v7.38.18 — `pg_catalog.pg_stats`, the readable view over
+/// [`synth_pg_statistic`] and the one a person actually types to ask
+/// whether `ANALYZE` did anything.
+///
+/// PostgreSQL 18.4's column list, in its order. The bounds and
+/// most-common arrays are NULL until SPG carries them here — the
+/// three columns that answer the usual question (`attname`,
+/// `null_frac`, `n_distinct`) are real, and a NULL says "not
+/// modelled" rather than "zero", which is the difference between
+/// admitting a gap and reporting a wrong number.
+pub(crate) fn synth_pg_stats(
+    cat: &Catalog,
+    stats: &crate::statistics::Statistics,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("tablename", DataType::Text, false),
+        ColumnSchema::new("attname", DataType::Text, false),
+        ColumnSchema::new("inherited", DataType::Bool, false),
+        ColumnSchema::new("null_frac", DataType::Float, false),
+        ColumnSchema::new("avg_width", DataType::Int, false),
+        ColumnSchema::new("n_distinct", DataType::Float, false),
+        ColumnSchema::new("most_common_vals", DataType::Text, true),
+        ColumnSchema::new("most_common_freqs", DataType::Text, true),
+        ColumnSchema::new("histogram_bounds", DataType::Text, true),
+        ColumnSchema::new("correlation", DataType::Float, true),
+        ColumnSchema::new("most_common_elems", DataType::Text, true),
+        ColumnSchema::new("most_common_elem_freqs", DataType::Text, true),
+        ColumnSchema::new("elem_count_histogram", DataType::Text, true),
+        ColumnSchema::new("range_length_histogram", DataType::Text, true),
+        ColumnSchema::new("range_empty_frac", DataType::Float, true),
+        ColumnSchema::new("range_bounds_histogram", DataType::Text, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for name in cat.visible_table_names() {
+        if crate::is_internal_table_name(&name) {
+            continue;
+        }
+        let Some(t) = cat.get(&name) else {
+            continue;
+        };
+        let row_count = t.rows().len();
+        #[allow(clippy::cast_precision_loss)]
+        for col in &t.schema().columns {
+            let Some(cs) = stats.get(&name, &col.name) else {
+                continue;
+            };
+            let distinct = if row_count > 0 && cs.n_distinct as usize == row_count {
+                -1.0
+            } else {
+                cs.n_distinct as f64
+            };
+            // The histogram SPG really has, rendered as PG renders it.
+            let bounds = if cs.histogram_bounds.is_empty() {
+                Value::Null
+            } else {
+                Value::text(alloc::format!("{{{}}}", cs.histogram_bounds.join(",")))
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::text("public"),
+                Value::text(name.clone()),
+                Value::text(col.name.clone()),
+                Value::Bool(false),
+                Value::Float(f64::from(cs.null_frac)),
+                Value::Int(0),
+                Value::Float(distinct),
+                Value::Null,
+                Value::Null,
+                bounds,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]));
+        }
+    }
+    (schema, rows)
+}
+
+pub(crate) fn synth_pg_statistic(
+    cat: &Catalog,
+    stats: &crate::statistics::Statistics,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("starelid", DataType::BigInt, false),
         ColumnSchema::new("staattnum", DataType::SmallInt, false),
@@ -1686,16 +1771,40 @@ pub(crate) fn synth_pg_statistic(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         let Some(t) = cat.get(&name) else {
             continue;
         };
-        #[allow(clippy::cast_possible_wrap)]
-        for (i, _col) in t.schema().columns.iter().enumerate() {
+        // v7.38.18 — the REAL statistics, and only for columns ANALYZE
+        // has actually visited.
+        //
+        // This emitted one all-zero row per column of every table,
+        // analysed or not. A test could therefore assert a row count
+        // from it and pass without ANALYZE having run — and one did:
+        // the S10 pin written an hour earlier said "two columns
+        // analysed is two rows of statistics", above a comment reading
+        // "'It returned OK' is not evidence that it did anything". It
+        // was counting the stub.
+        //
+        // PostgreSQL has no row here for an un-analysed column, and
+        // neither do we now. `stadistinct` follows PG's sign
+        // convention: a positive number is a count, a negative one is
+        // the ratio to the row count, and -1 means every value differs.
+        #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+        for (i, col) in t.schema().columns.iter().enumerate() {
+            let Some(cs) = stats.get(&name, &col.name) else {
+                continue;
+            };
             let attnum = (i + 1) as i16;
+            let row_count = t.rows().len();
+            let distinct = if row_count > 0 && cs.n_distinct as usize == row_count {
+                -1.0
+            } else {
+                cs.n_distinct as f64
+            };
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(starelid),
                 Value::SmallInt(attnum),
                 Value::Bool(false),
-                Value::Float(0.0),
+                Value::Float(f64::from(cs.null_frac)),
                 Value::Int(0),
-                Value::Float(0.0),
+                Value::Float(distinct),
             ]));
         }
         starelid = starelid.saturating_add(1);
@@ -10521,6 +10630,9 @@ pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_policy", 3256),
     ("pg_proc", 1255),
     ("pg_statistic", 2619),
+    // v7.38.18 — the readable view over `pg_statistic`, and the one a
+    // person actually types. OID from a PG 18.4 catalog.
+    ("pg_stats", 12053),
     ("pg_statistic_ext", 3381),
     ("pg_tablespace", 1213),
     ("pg_trigger", 2620),
@@ -10581,7 +10693,8 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_operator" => synth_pg_operator(cat).0,
         "pg_policy" => synth_pg_policy(cat).0,
         "pg_proc" => synth_pg_proc(cat).0,
-        "pg_statistic" => synth_pg_statistic(cat).0,
+        "pg_statistic" => synth_pg_statistic(cat, &crate::statistics::Statistics::new()).0,
+        "pg_stats" => synth_pg_stats(cat, &crate::statistics::Statistics::new()).0,
         "pg_statistic_ext" => synth_pg_statistic_ext(cat).0,
         "pg_tablespace" => synth_pg_tablespace(cat).0,
         "pg_trigger" => synth_pg_trigger(cat).0,
