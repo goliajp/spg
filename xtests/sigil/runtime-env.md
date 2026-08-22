@@ -12,13 +12,31 @@
 > claim was simply untrue. It had not drifted (8 symbols, 8 rows), so it
 > cost nothing; it was one edit away from costing something.
 >
-> **`exercised` is measured, not asserted**: it says whether the name
-> appears anywhere under `crates/*/tests`, `xtests`, `scripts` or
-> `.github`. `no` means nothing in this repository ever sets it, so the
-> switch's non-default path has never run here. That is a statement about
-> evidence, not about whether the switch works.
+> **`exercised` is measured AND asserted** (v7.38.18): it says whether
+> the name appears OUTSIDE A COMMENT under `crates/*/tests`, `xtests`,
+> `scripts` or `.github`, and `the_exercised_column_says_what_the_
+> repository_does` fails when this table disagrees with the repository.
+> `no` means nothing here ever sets it, so the switch's non-default path
+> has never run in this tree. That is a statement about evidence, not
+> about whether the switch works.
 >
-> Today: **83 switches, 52 exercised, 31 not.**
+> Evidence inside a `#[cfg(test)]` module in `src` counts too, which
+> is how the four PG-spelled aliases stopped reading `no`: the module
+> that pins them, `env_knob_tests`, sits in the middle of
+> `crates/spg-server/src/main.rs` rather than under `tests/`.
+>
+> Two words of that moved and both were load-bearing. **Asserted**: the
+> column was hand-maintained prose, so it could say `yes` about a switch
+> nothing ran and no one would learn — the same shape as the header
+> below it claiming a CI lint that did not exist. **Outside a comment**:
+> `e2e_timeouts.rs` opens with `//! - SPG_QUERY_TIMEOUT_MS: a
+> long-running scan is cancelled`, and the test under it sets no such
+> variable — it uses `SET statement_timeout`. The column read `yes` on
+> the strength of a sentence. Four rows were wrong once measured: two
+> claimed `yes` for a name that appears only in a doc comment, two
+> claimed `no` for a switch that tests really do set.
+>
+> Today: **83 switches, 56 exercised, 27 not.**
 > Adding a switch means adding a row in the same commit.
 
 | switch | first read site | exercised |
@@ -28,18 +46,18 @@
 | `SPG_ADMIN_USER` | `crates/spg-server/src/main.rs:3376` | yes |
 | `SPG_AUDIT` | `crates/spg-server/src/main.rs:854` | yes |
 | `SPG_AUTOVACUUM` | `crates/spg-server/src/main.rs:1625` | **no** |
-| `SPG_AUTOVACUUM_NAPTIME` | `crates/spg-server/src/main.rs:1146` | **no** |
+| `SPG_AUTOVACUUM_NAPTIME` | `crates/spg-server/src/main.rs:1146` | yes |
 | `SPG_AUTOVACUUM_NAPTIME_MS` | `crates/spg-server/src/autovacuum.rs:45` | yes |
 | `SPG_AUTO_ANALYZE_INTERVAL_MS` | `crates/spg-server/src/main.rs:1146` | yes |
 | `SPG_COMMIT_DELAY_US` | `crates/spg-server/src/wal.rs:660` | yes |
-| `SPG_COMMIT_GROUP_MAX` | `crates/spg-server/src/wal.rs:645` | yes |
+| `SPG_COMMIT_GROUP_MAX` | `crates/spg-server/src/wal.rs:645` | **no** |
 | `SPG_COMMIT_TRACE` | `crates/spg-server/src/main.rs:301` | **no** |
 | `SPG_COMPACTION_TARGET_SEGMENT_BYTES` | `crates/spg-server/src/commands.rs:273` | **no** |
 | `SPG_COMPRESSION_MIN_BYTES` | `crates/spg-server/src/wal.rs:205` | **no** |
 | `SPG_DATA_SYNC_RETRY` | `crates/spg-embedded/src/lib.rs:1616` | **no** |
 | `SPG_DB` | `crates/spg-server/src/main.rs:853` | yes |
 | `SPG_DISABLE_WAL_PREFLIGHT` | `crates/spg-server/src/main.rs:1700` | yes |
-| `SPG_EMBEDDED_CHECKPOINT_BYTES` | `crates/spg-embedded/src/lib.rs:323` | yes |
+| `SPG_EMBEDDED_CHECKPOINT_BYTES` | `crates/spg-embedded/src/lib.rs:323` | **no** |
 | `SPG_EMBEDDED_CHECKPOINT_SECONDS` | `crates/spg-embedded/src/lib.rs:336` | **no** |
 | `SPG_FAIL_AUDIT_AT` | `crates/spg-server/src/main.rs:3299` | yes |
 | `SPG_FAIL_FSYNC_AT` | `crates/spg-server/src/main.rs:1702` | yes |
@@ -55,7 +73,7 @@
 | `SPG_HTTP_ADDR` | `crates/spg-server/src/main.rs:2086` | yes |
 | `SPG_IDLE_TIMEOUT_SEC` | `crates/spg-server/src/main.rs:867` | yes |
 | `SPG_LOG_FORMAT` | `crates/spg-server/src/observability.rs:148` | yes |
-| `SPG_LOG_MIN_DURATION` | `crates/spg-server/src/main.rs:1150` | **no** |
+| `SPG_LOG_MIN_DURATION` | `crates/spg-server/src/main.rs:1150` | yes |
 | `SPG_MATVIEW_TRACE` | `crates/spg-server/src/pgwire.rs:2432` | **no** |
 | `SPG_MAX_CONNECTIONS` | `crates/spg-server/src/main.rs:861` | yes |
 | `SPG_MAX_QUERY_BYTES` | `crates/spg-server/src/main.rs:864` | yes |
@@ -72,7 +90,7 @@
 | `SPG_PGWIRE_TIMING` | `crates/spg-server/src/pgwire.rs:2508` | **no** |
 | `SPG_PGWIRE_TRACE` | `crates/spg-server/src/pgwire.rs:2528` | **no** |
 | `SPG_PG_ADDR` | `crates/spg-server/src/main.rs:2059` | yes |
-| `SPG_PITR_ARCHIVE_CMD` | `crates/spg-embedded/src/lib.rs:1296` | **no** |
+| `SPG_PITR_ARCHIVE_CMD` | `crates/spg-embedded/src/lib.rs:1296` | yes |
 | `SPG_PITR_RETENTION_CHECK_SEC` | `crates/spg-embedded/src/lib.rs:1288` | **no** |
 | `SPG_PITR_RETENTION_HOURS` | `crates/spg-embedded/src/lib.rs:1281` | **no** |
 | `SPG_PLAN_CACHE_MAX` | `crates/spg-server/src/main.rs:1782` | **no** |
@@ -88,9 +106,9 @@
 | `SPG_SEGMENT_COMPRESSION` | `crates/spg-server/src/freezer.rs:388` | **no** |
 | `SPG_SHUTDOWN_DEADLINE_SEC` | `crates/spg-server/src/main.rs:898` | yes |
 | `SPG_SLOW_QUERY_LOG_MS` | `crates/spg-server/src/main.rs:892` | yes |
-| `SPG_SLOW_QUERY_THRESHOLD_MS` | `crates/spg-server/src/main.rs:1150` | **no** |
-| `SPG_SQLX_INLINE_BUDGET_MS` | `crates/spg-sqlx/src/connection.rs:415` | **no** |
-| `SPG_STATEMENT_TIMEOUT` | `crates/spg-server/src/main.rs:1141` | **no** |
+| `SPG_SLOW_QUERY_THRESHOLD_MS` | `crates/spg-server/src/main.rs:1150` | yes |
+| `SPG_SQLX_INLINE_BUDGET_MS` | `crates/spg-sqlx/src/connection.rs:415` | yes |
+| `SPG_STATEMENT_TIMEOUT` | `crates/spg-server/src/main.rs:1141` | yes |
 | `SPG_SYNCHRONOUS_COMMIT` | `crates/spg-server/src/wal.rs:56` | yes |
 | `SPG_TEMP_DIR` | `crates/spg-server/src/tempstore.rs:31` | **no** |
 | `SPG_TLS_CERT` | `crates/spg-server/src/mysqlwire.rs:442` | yes |

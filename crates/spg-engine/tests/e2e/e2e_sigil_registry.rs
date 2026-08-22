@@ -126,6 +126,215 @@ fn registered(root: &Path, rel: &str) -> BTreeSet<String> {
     out
 }
 
+/// v7.38.18 — read the `exercised` column as the table states it, so
+/// the claim can be compared with what the repository actually does.
+/// Returns `(name, claimed_exercised)` for each row of the table.
+fn exercised_claims(root: &Path, rel: &str) -> Vec<(String, bool)> {
+    let text = std::fs::read_to_string(root.join(rel))
+        .unwrap_or_else(|e| panic!("{rel} must exist and be readable: {e}"));
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("| `SPG_") {
+            continue;
+        }
+        let cells: Vec<&str> = line.trim_matches('|').split('|').collect();
+        if cells.len() < 3 {
+            continue;
+        }
+        let name = cells[0].trim().trim_matches('`').to_string();
+        let claim = cells[2].trim().trim_matches('*').trim();
+        out.push((name, claim.eq_ignore_ascii_case("yes")));
+    }
+    out
+}
+
+fn names_it(line: &str, name: &str) -> bool {
+    // Whole-name matches only. `SPG_AUTOVACUUM` is a prefix of
+    // `SPG_AUTOVACUUM_NAPTIME_MS`, so a plain `contains` reported three
+    // switches as exercised on the strength of a longer switch's name.
+    let mut from = 0;
+    while let Some(off) = line[from..].find(name) {
+        let at = from + off;
+        let after = line[at + name.len()..].chars().next();
+        let ok = after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+        if ok {
+            return true;
+        }
+        from = at + name.len();
+    }
+    false
+}
+
+/// Does anything in this repository outside the register itself set or
+/// name this switch, in code rather than in prose?
+///
+/// v7.38.18 — two rules, and both were learned the hard way.
+///
+/// **Not in prose.** The register's header used to say `exercised`
+/// means "the name appears anywhere under crates/*/tests, xtests,
+/// scripts or .github", and by that rule a switch named only in a doc
+/// comment counted. `SPG_QUERY_TIMEOUT_MS` was the case in point:
+/// `e2e_timeouts.rs` opens with `//! - SPG_QUERY_TIMEOUT_MS: a
+/// long-running scan is cancelled`, and the test under it never sets
+/// the variable — it uses `SET statement_timeout`.
+///
+/// **Inside `#[cfg(test)]` counts.** Evidence does not only live under
+/// `tests/`. `crates/spg-server/src/main.rs` holds `mod env_knob_tests`
+/// in the middle of the file, and the switches it pins would have read
+/// `no` forever. The region runs by brace depth from the `mod` line
+/// following the attribute, and `the_scanner_can_see_both_kinds_of_
+/// evidence` below fails if that tracking breaks.
+fn exercised_in_repo(root: &Path, name: &str) -> bool {
+    fn scan_file(text: &str, name: &str, tests_only: bool) -> bool {
+        let mut depth: i32 = -1; // -1 = outside any #[cfg(test)] module
+        let mut armed = false;
+        for line in text.lines() {
+            let t = line.trim_start();
+            if tests_only {
+                if depth < 0 {
+                    if t.starts_with("#[cfg(test)]") {
+                        armed = true;
+                    } else if !t.is_empty() {
+                        // The attribute must open a MODULE, and the
+                        // module line must be the very next one. Most
+                        // `#[cfg(test)]` in this tree sit on functions
+                        // and fields; arming until the next `mod` line
+                        // anywhere below opened a region over ordinary
+                        // code — `crates/spg-embedded/src/lib.rs` has
+                        // eight such attributes before its test module,
+                        // and a production `env::var` 1,700 lines later
+                        // was read as evidence.
+                        depth = i32::from(armed && t.starts_with("mod ")) - 1;
+                        armed = false;
+                    }
+                }
+                if depth < 0 {
+                    continue;
+                }
+                depth += line.matches('{').count() as i32;
+                depth -= line.matches('}').count() as i32;
+                if depth <= 0 {
+                    depth = -1;
+                }
+            }
+            if t.starts_with("//") || t.starts_with('#') || t.starts_with('*') {
+                continue;
+            }
+            if names_it(line, name) {
+                return true;
+            }
+        }
+        false
+    }
+    fn scan(dir: &Path, name: &str, tests_only: bool) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            // The register describes itself, and so does this file:
+            // reading either back would make a row its own evidence.
+            // `SPG_EMBEDDED_CHECKPOINT_BYTES` reported as exercised the
+            // moment it was named in an assertion below, which is a
+            // scanner agreeing with the sentence that configured it.
+            if path.ends_with("sigil") || path.ends_with("e2e_sigil_registry.rs") {
+                continue;
+            }
+            if path.is_dir() {
+                if scan(&path, name, tests_only) {
+                    return true;
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path)
+                && scan_file(&text, name, tests_only)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    for rel in ["xtests", "scripts", ".github"] {
+        if scan(&root.join(rel), name, false) {
+            return true;
+        }
+    }
+    let Ok(crates) = std::fs::read_dir(root.join("crates")) else {
+        return false;
+    };
+    for c in crates.flatten() {
+        if scan(&c.path().join("tests"), name, false) || scan(&c.path().join("src"), name, true) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The scanner above decides 83 rows, so it gets its own pins.
+///
+/// Both directions, both with a named witness. If the `#[cfg(test)]`
+/// brace tracking breaks, the first assertion goes false and every
+/// switch pinned only by an in-file unit test quietly reads `no`.
+#[test]
+fn the_scanner_can_see_both_kinds_of_evidence() {
+    let root = repo_root();
+    assert!(
+        exercised_in_repo(&root, "SPG_STATEMENT_TIMEOUT"),
+        "SPG_STATEMENT_TIMEOUT is set by `mod env_knob_tests` inside \
+         crates/spg-server/src/main.rs — a #[cfg(test)] module in the \
+         middle of the file, not at its end"
+    );
+    assert!(
+        exercised_in_repo(&root, "SPG_SQLX_INLINE_BUDGET_MS"),
+        "SPG_SQLX_INLINE_BUDGET_MS is set by an ordinary integration test"
+    );
+    assert!(
+        !exercised_in_repo(&root, "SPG_COMMIT_GROUP_MAX"),
+        "SPG_COMMIT_GROUP_MAX appears in three test files and in every \
+         one of them it is a doc comment; counting it would be counting \
+         prose"
+    );
+    assert!(
+        !exercised_in_repo(&root, "SPG_NO_SUCH_SWITCH_ANYWHERE"),
+        "a name nothing mentions must not be found"
+    );
+}
+
+/// The `exercised` column is a measurement, so measure it.
+///
+/// It was hand-maintained prose until v7.38.18, which means it could
+/// say `yes` about a switch nothing ran and nobody would learn. That is
+/// the same shape as the header of `test-mode-gucs.md` claiming a CI
+/// lint that did not exist.
+#[test]
+fn the_exercised_column_says_what_the_repository_does() {
+    let root = repo_root();
+    let rel = "xtests/sigil/runtime-env.md";
+    let mut wrong: Vec<String> = Vec::new();
+    for (name, claimed) in exercised_claims(&root, rel) {
+        let actual = exercised_in_repo(&root, &name);
+        if actual != claimed {
+            wrong.push(alloc_line(&name, claimed, actual));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{rel} disagrees with the repository on {} switch(es):\n{}\n\
+         `exercised` means something outside a comment sets or names it \
+         under crates/*/tests, xtests, scripts or .github.",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+fn alloc_line(name: &str, claimed: bool, actual: bool) -> String {
+    let word = |b: bool| if b { "yes" } else { "no" };
+    format!(
+        "  {name}: table says {}, repository says {}",
+        word(claimed),
+        word(actual)
+    )
+}
+
 #[test]
 fn every_test_mode_switch_is_in_the_sigil_index() {
     let root = repo_root();

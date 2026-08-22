@@ -79,6 +79,35 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **The runtime-switch register's `exercised` column was prose, and it
+  was wrong about six switches.** It is checked now, against what the
+  repository actually does, and the rule it is checked by moved twice.
+
+  A name in a *comment* is not evidence. `e2e_timeouts.rs` opens with
+  `//! - SPG_QUERY_TIMEOUT_MS: a long-running scan is cancelled` and the
+  test under it sets no such variable — it uses `SET statement_timeout`.
+  The column read `yes` on the strength of a sentence. Two rows claimed
+  `yes` that way; two more claimed `no` for switches tests really set.
+
+  Evidence inside a `#[cfg(test)]` module in `src` *is* evidence — the
+  module that pins the PG-spelled aliases sits in the middle of
+  `spg-server/src/main.rs`, not under `tests/`. The scanner has its own
+  pins, in both directions with named witnesses, because it decides 83
+  rows: it counted a production `env::var` 1,700 lines below an
+  attribute that was on a static rather than a module, and it counted a
+  switch as exercised the moment an assertion mentioned it by name.
+
+- **The three PG-spelled environment names had nothing behind them.**
+  `SPG_STATEMENT_TIMEOUT`, `SPG_AUTOVACUUM_NAPTIME` and
+  `SPG_LOG_MIN_DURATION` exist so an operator migrating from PostgreSQL
+  can write the name they already know. All three were listed as
+  unexercised: a typo in either column of the alias table would have
+  meant a deployer setting `SPG_STATEMENT_TIMEOUT=50` got no timeout and
+  no complaint. The mapping is pinned now, including that each name
+  reaches its OWN switch and no other, that the PG spelling wins when
+  both are set, and that an empty value falls through rather than
+  overriding with nothing.
+
 - **A MySQL warning never expired, so it eventually described the wrong
   statement.** `SHOW WARNINGS` in v7.38.17 kept the last warning it had
   seen until another one replaced it. An application that inserted, then
