@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|---|
 | `15_regressions` | 104 | 0 | 0 | 100.0% | postgres × 7 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 370 | 0 | 0 | 100.0% | mysql × 23 |
+| `mysql` | 387 | 4 | 0 | 99.0% | mysql × 24 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -25,6 +25,14 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |  |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% | postgres × 33 |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% | postgres × 1 |
+
+## Top fail patterns
+
+| count | pattern |
+|---|---|
+| 1 | `record 11: row mismatch | expected:` |
+| 1 | `record 12: row mismatch | expected:` |
+| 1 | `record 13: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -86,6 +94,7 @@ Per-corpus pass / fail / skip:
 | `13_show_databases.test` | 3 | 0 | 0 | mysql |
 | `14_mixed_type_compare.test` | 16 | 0 | 0 | mysql |
 | `14_show_create_table.test` | 4 | 0 | 0 | mysql |
+| `15_pad_by_collation_name.test` | 17 | 4 | 0 | mysql |
 | `15_show_indexes_status_processlist.test` | 10 | 0 | 0 | mysql |
 | `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
 | `v73813_distinct_binary_collation.test` | 32 | 0 | 0 | mysql |
@@ -93,6 +102,13 @@ Per-corpus pass / fail / skip:
 | `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |
 | `v73814_join_collation.test` | 23 | 0 | 0 | mysql |
 | `v73814_setop_collation.test` | 21 | 0 | 0 | mysql |
+
+<details><summary>`15_pad_by_collation_name.test` fail snippets</summary>
+
+- record 11: row mismatch |   expected: ["3"] |   actual:   ["4"]
+- record 12: row mismatch |   expected: ["2"] |   actual:   ["1"]
+- record 13: row mismatch |   expected: ["2"] |   actual:   ["3"]
+</details>
 
 ### `pg_regress/`
 

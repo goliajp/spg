@@ -1,0 +1,107 @@
+# v7.38.18 — the pad attribute belongs to the collation NAME.
+#
+# SPG read a collation name for whether to FOLD and never for whether to
+# PAD, so `utf8mb4_bin` and `utf8mb4_general_ci` gave the wrong answer
+# for trailing spaces while `utf8mb4_0900_ai_ci` gave the right one.
+#
+# The rule is measured, not inferred. Over every collation both oracles
+# list — 286 names on MySQL 9.7.2 and 552 on MariaDB 12.3.2, 838 in all
+# — `NO PAD` holds exactly when the name is `binary`, or contains
+# `_0900_`, or contains `nopad`. Zero counter-examples on either engine.
+#
+# `utf8mb4_bin` is the one worth staring at: it is byte-wise AND
+# `PAD SPACE` in BOTH engines. "Byte-wise" and "padding counts" are
+# different questions and no single flag can say it, which is why this
+# stayed wrong through four releases that each fixed something else
+# about collations.
+#
+# rows 'alpha', 'alpha  ', 'Beta', 'beta'; both engines agree per name:
+#
+#   utf8mb4_0900_ai_ci   NO PAD      COUNT(DISTINCT) 3   WHERE = 1
+#   utf8mb4_bin          PAD SPACE                   3               2
+#   utf8mb4_general_ci   PAD SPACE                   2               2
+#   utf8mb4_unicode_ci   PAD SPACE                   2               2
+#   utf8mb4_0900_bin     NO PAD                      4               1
+
+dialect mysql
+
+statement ok
+CREATE TABLE pn_a (s VARCHAR(32) COLLATE utf8mb4_0900_ai_ci)
+
+statement ok
+CREATE TABLE pn_b (s VARCHAR(32) COLLATE utf8mb4_bin)
+
+statement ok
+CREATE TABLE pn_c (s VARCHAR(32) COLLATE utf8mb4_general_ci)
+
+statement ok
+CREATE TABLE pn_d (s VARCHAR(32) COLLATE utf8mb4_0900_bin)
+
+statement ok
+INSERT INTO pn_a VALUES ('alpha'),('alpha  '),('Beta'),('beta')
+
+statement ok
+INSERT INTO pn_b VALUES ('alpha'),('alpha  '),('Beta'),('beta')
+
+statement ok
+INSERT INTO pn_c VALUES ('alpha'),('alpha  '),('Beta'),('beta')
+
+statement ok
+INSERT INTO pn_d VALUES ('alpha'),('alpha  '),('Beta'),('beta')
+
+# Folds case, does not pad.
+query I
+SELECT count(DISTINCT s) FROM pn_a
+----
+3
+
+query I
+SELECT count(*) FROM pn_a WHERE s = 'alpha'
+----
+1
+
+# Byte-wise AND padding: 'Beta' and 'beta' stay apart, 'alpha' and
+# 'alpha  ' come together. Neither half alone produces 3 and 2.
+query I
+SELECT count(DISTINCT s) FROM pn_b
+----
+3
+
+query I
+SELECT count(*) FROM pn_b WHERE s = 'alpha'
+----
+2
+
+# Folds and pads: everything but 'Beta'/'beta' collapses to one.
+query I
+SELECT count(DISTINCT s) FROM pn_c
+----
+2
+
+query I
+SELECT count(*) FROM pn_c WHERE s = 'alpha'
+----
+2
+
+# Neither: four values, one match.
+query I
+SELECT count(DISTINCT s) FROM pn_d
+----
+4
+
+query I
+SELECT count(*) FROM pn_d WHERE s = 'alpha'
+----
+1
+
+statement ok
+DROP TABLE pn_a
+
+statement ok
+DROP TABLE pn_b
+
+statement ok
+DROP TABLE pn_c
+
+statement ok
+DROP TABLE pn_d
