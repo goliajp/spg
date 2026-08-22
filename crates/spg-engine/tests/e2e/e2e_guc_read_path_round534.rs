@@ -136,26 +136,60 @@ fn round534_unknown_names_are_still_unknown() {
     assert!(e.execute("SET nosuchknob = 3").is_err());
 }
 
-/// `pg_settings` still lists only what SPG reads — round 474's decision,
-/// pinned so the divergence is deliberate rather than drift. It is the
-/// one place SPG answers differently from PG on purpose, and a client
-/// asking for a specific name gets the value either way.
+/// v7.38.18 (C5) — `pg_settings` lists what PG18 lists. This test used
+/// to pin the opposite ("still lists only what SPG reads — round 474's
+/// decision, pinned so the divergence is deliberate rather than drift"),
+/// and the divergence WAS deliberate. It was also inconsistent: for the
+/// same parameter on the same session, `SHOW archive_command` answered
+/// `''`, `SET archive_command = 'x'` answered "cannot be changed now",
+/// and `pg_settings` answered that no such parameter exists. Two
+/// surfaces said it was real and one said it was not.
+///
+/// So the row is not a new claim about what SPG acts on — `SHOW` was
+/// already making it. What separates a parameter SPG reads from one it
+/// merely reports is `source`, which is what PG uses for the same
+/// purpose.
 #[test]
-fn round534_pg_settings_stays_curated() {
+fn round534_pg_settings_reports_every_pg18_parameter() {
     let mut e = engine();
+    assert_eq!(text(&mut e, "SELECT count(*) FROM pg_settings"), "398");
+    // The one round 474 named as the case for staying curated.
     assert_eq!(
         text(
             &mut e,
-            "SELECT count(*) FROM pg_settings WHERE name = 'random_page_cost'"
-        ),
-        "0"
-    );
-    // The ones it does read are there.
-    assert_eq!(
-        text(
-            &mut e,
-            "SELECT count(*) FROM pg_settings WHERE name = 'work_mem'"
+            "SELECT count(*) FROM pg_settings WHERE name = 'enable_seqscan'"
         ),
         "1"
+    );
+    // A parameter SPG genuinely reads keeps its own value and rendering:
+    // PG reports `work_mem` as a bare count with a unit beside it.
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT setting, unit, vartype FROM pg_settings WHERE name = 'work_mem'"
+        ),
+        "4096|kB|integer"
+    );
+    // ...while `current_setting` keeps the human form. Both are PG's.
+    assert_eq!(text(&mut e, "SELECT current_setting('work_mem')"), "4MB");
+    // Nothing appears twice, which it did the first time this landed:
+    // a `SET` on a parameter outside SPG's own list was pushed as its
+    // own row on top of the PG18 one.
+    e.execute("SET random_page_cost = 3").unwrap();
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT count(*), max(setting), max(source) FROM pg_settings \
+             WHERE name = 'random_page_cost'"
+        ),
+        "1|3|session"
+    );
+    // And a name PG does not have is still not a row.
+    assert_eq!(
+        text(
+            &mut e,
+            "SELECT count(*) FROM pg_settings WHERE name = 'nosuchknob'"
+        ),
+        "0"
     );
 }

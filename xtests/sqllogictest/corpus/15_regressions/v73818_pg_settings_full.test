@@ -1,0 +1,107 @@
+# v7.38.18 (C5) — the three surfaces that report a configuration
+# parameter now agree, and they agree with PostgreSQL 18.4.
+#
+# Before this, for one parameter on one session:
+#
+#   SHOW archive_command                      -> ''  (it exists)
+#   SET archive_command = 'x'                 -> cannot be changed now
+#   pg_settings WHERE name='archive_command'  -> 0 rows (it does not)
+#
+# Two surfaces said the parameter was real and the third said it was
+# not, for 367 of PG's 398 names. Every expectation below was read from
+# a live PG 18.4.
+
+query I
+SELECT count(*) FROM pg_settings
+----
+398
+
+# The name round 474 chose as its example of a knob worth hiding. It was
+# never hidden — SHOW answered for it the whole time.
+query TTT
+SELECT name, setting, source FROM pg_settings WHERE name = 'enable_seqscan'
+----
+enable_seqscan
+on
+default
+
+query T
+SHOW enable_seqscan
+----
+on
+
+# What separates a parameter SPG acts on from one it merely reports is
+# `source`, which is the distinction PG draws with the same column.
+query TTT
+SELECT name, setting, source FROM pg_settings WHERE name = 'archive_command'
+----
+archive_command
+(empty)
+default
+
+# A default carrying a unit is rendered TWO ways by PG and both are
+# load-bearing: `pg_settings` reports the bare count beside its unit,
+# `current_setting` the human form. Collapsing them into one (which this
+# work did, briefly) makes `current_setting('max_wal_size')` answer 1024.
+query TTT
+SELECT setting, unit, vartype FROM pg_settings WHERE name = 'max_wal_size'
+----
+1024
+MB
+integer
+
+query T
+SELECT current_setting('max_wal_size')
+----
+1GB
+
+query TT
+SELECT setting, unit FROM pg_settings WHERE name = 'work_mem'
+----
+4096
+kB
+
+query T
+SELECT current_setting('work_mem')
+----
+4MB
+
+# PG's own one-line description, which `SHOW ALL` shows in its third
+# column. SPG used to put the CATEGORY there under a heading reading
+# `description`.
+query T
+SELECT short_desc FROM pg_settings WHERE name = 'enable_seqscan'
+----
+Enables the planner's use of sequential-scan plans.
+
+# A SET on a parameter outside SPG's own list produces ONE row, not two.
+# It produced two the first time this landed: the trailing "session-set
+# parameters we do not know about" loop no longer knew about them.
+statement ok
+SET random_page_cost = 3
+
+query TTT
+SELECT name, setting, source FROM pg_settings WHERE name = 'random_page_cost'
+----
+random_page_cost
+3
+session
+
+# And a name PG does not have is still not a row.
+query I
+SELECT count(*) FROM pg_settings WHERE name = 'nosuchknob'
+----
+0
+
+# PG 18.4 answers `SHOW is_superuser` and yet has NO pg_settings row for
+# it. That asymmetry is PG's, so it is SPG's: it was the single reason
+# SHOW ALL returned 399 where PG returns 398.
+query I
+SELECT count(*) FROM pg_settings WHERE name = 'is_superuser'
+----
+0
+
+query T
+SHOW is_superuser
+----
+on

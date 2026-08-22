@@ -1,0 +1,139 @@
+# v7.38.18 — two GIN indexes over the same column.
+#
+# The v7.38.16 ledger left this open with the note "the ambiguous case is
+# decided by index order. Not reached by any measured shape; recorded
+# rather than fixed." That is a worry, not a finding, and a worry with no
+# test under it is indistinguishable from a defect nobody has met yet.
+#
+# Measured: it does not reproduce. Selection is by the rendered
+# expression, so two text-search configurations are two different keys;
+# the anchor-column fallback requires `expression.is_none()`, so an
+# expression index cannot be reached by anchor at all. Creating the two
+# indexes in either order gives the same answers, and they are the
+# answers the same queries give with no index.
+#
+# This file exists so that stops being true silently. The queries below
+# were confirmed to take the seek (`idx_scan` counted one per query,
+# which is what v7.38.16 taught the GIN path to report).
+
+statement ok
+CREATE TABLE g2(id int, body text)
+
+statement ok
+INSERT INTO g2 VALUES (1,'the lazy dogs are running'), (2,'quick brown fox')
+
+# --- no index: the answers everything below must agree with ------------
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('english', body) @@ to_tsquery('english','lazy')
+----
+1
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dogs')
+----
+1
+
+# The stem is the whole point: `english` reduces both `dogs` and `dog` to
+# `dog`, `simple` reduces nothing. An index built under one config and
+# read under the other is how v7.38.16's GIN defect returned no rows.
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('english', body) @@ to_tsquery('english','dog')
+----
+1
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dog')
+----
+
+# --- english created first ---------------------------------------------
+
+statement ok
+CREATE INDEX g2_en ON g2 USING gin (to_tsvector('english', body))
+
+statement ok
+CREATE INDEX g2_si ON g2 USING gin (to_tsvector('simple', body))
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('english', body) @@ to_tsquery('english','lazy')
+----
+1
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dogs')
+----
+1
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('english', body) @@ to_tsquery('english','dog')
+----
+1
+
+query I
+SELECT id FROM g2 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dog')
+----
+
+# --- simple created first: same table, indexes in the other order ------
+
+statement ok
+CREATE TABLE g3(id int, body text)
+
+statement ok
+INSERT INTO g3 VALUES (1,'the lazy dogs are running'), (2,'quick brown fox')
+
+statement ok
+CREATE INDEX g3_si ON g3 USING gin (to_tsvector('simple', body))
+
+statement ok
+CREATE INDEX g3_en ON g3 USING gin (to_tsvector('english', body))
+
+query I
+SELECT id FROM g3 WHERE to_tsvector('english', body) @@ to_tsquery('english','dog')
+----
+1
+
+query I
+SELECT id FROM g3 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dog')
+----
+
+query I
+SELECT id FROM g3 WHERE to_tsvector('simple', body) @@ to_tsquery('simple','dogs')
+----
+1
+
+# --- a plain GIN and an expression GIN anchored on the same table ------
+
+statement ok
+CREATE TABLE g4(id int, v tsvector, body text)
+
+statement ok
+INSERT INTO g4 VALUES (1, to_tsvector('simple','the lazy dogs'), 'the lazy dogs')
+
+statement ok
+INSERT INTO g4 VALUES (2, to_tsvector('simple','quick brown fox'), 'quick brown fox')
+
+statement ok
+CREATE INDEX g4_v ON g4 USING gin (v)
+
+statement ok
+CREATE INDEX g4_b ON g4 USING gin (to_tsvector('english', body))
+
+query I
+SELECT id FROM g4 WHERE v @@ to_tsquery('simple','dogs')
+----
+1
+
+query I
+SELECT id FROM g4 WHERE to_tsvector('english', body) @@ to_tsquery('english','dog')
+----
+1
+
+statement ok
+DROP TABLE g4
+
+statement ok
+DROP TABLE g3
+
+statement ok
+DROP TABLE g2

@@ -724,18 +724,54 @@ impl Engine {
                     "Shows the current transaction's isolation level.",
                 )),
             ]));
-            rows.push(Row::new(alloc::vec![
-                Value::text(alloc::string::String::from("is_superuser")),
-                Value::text(alloc::string::String::from("on")),
-                Value::text(alloc::string::String::from("Reports superuser status.")),
-            ]));
+            // v7.38.18 (C5) — `is_superuser` is deliberately NOT here.
+            // PG 18.4 answers `SHOW is_superuser` with `on` and has no
+            // row for it in `pg_settings`, so `SHOW ALL` does not list
+            // it either — measured, and the single reason SPG returned
+            // 399 rows against PG's 398 after this list was completed.
+            // `SHOW is_superuser` still answers, below, exactly as PG's
+            // does.
+            // v7.38.18 (C5) — every parameter PG 18.4 has, and PG's own
+            // one-line description in the third column. It used to be
+            // thirty-three rows carrying the CATEGORY under a heading
+            // that says `description`, which is neither PG's count nor
+            // PG's content. SPG's own list wins where the two overlap,
+            // because its value for `work_mem` is the real one.
             for (n, boot, cat, _, _) in canon {
+                let d = crate::guc_catalog::guc_short_desc(n).unwrap_or(*cat);
                 rows.push(Row::new(alloc::vec![
                     Value::text(alloc::string::String::from(*n)),
                     Value::text(effective(n, boot)),
-                    Value::text(alloc::string::String::from(*cat)),
+                    Value::text(alloc::string::String::from(d)),
                 ]));
             }
+            for &(n, _, human, _, _, _, _, d) in crate::guc_catalog::PG_GUC_CONTEXTS {
+                if canon.iter().any(|(c, ..)| (*c).eq_ignore_ascii_case(n)) {
+                    continue;
+                }
+                // ...nor the two pushed above with live values. PG has
+                // rows for both, so without this `SHOW ALL` returned 400
+                // where PG returns 398, with two names twice.
+                if rows
+                    .iter()
+                    .take(1)
+                    .any(|r| matches!(&r.values[0], Value::Text(t) if t.eq_ignore_ascii_case(n)))
+                {
+                    continue;
+                }
+                rows.push(Row::new(alloc::vec![
+                    Value::text(alloc::string::String::from(n)),
+                    Value::text(effective(n, human)),
+                    Value::text(alloc::string::String::from(d)),
+                ]));
+            }
+            // PG lists them in name order and a client reading `SHOW ALL`
+            // as a table sees that order; the two lists above are each
+            // sorted but interleave.
+            rows.sort_by_key(|r| match &r.values[0] {
+                Value::Text(t) => alloc::string::String::from(t.as_ref()),
+                other => alloc::format!("{other:?}"),
+            });
             return Ok(QueryResult::Rows {
                 columns: cols,
                 rows,
