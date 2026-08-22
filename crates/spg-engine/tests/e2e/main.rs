@@ -33,6 +33,7 @@ mod e2e_alter_table_pg_dump_compat;
 mod e2e_alter_table_pg_only_residuals;
 mod e2e_alter_trigger_variants;
 mod e2e_alter_wider_pg_dump_compat;
+mod e2e_analyze_same_string;
 mod e2e_ansi89_join_round588;
 mod e2e_any_all_array_round597;
 mod e2e_any_all_unknown_array;

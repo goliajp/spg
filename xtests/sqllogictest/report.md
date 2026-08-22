@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 104 | 0 | 0 | 100.0% | postgres × 7 |
+| `15_regressions` | 109 | 0 | 0 | 100.0% | postgres × 8 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 406 | 0 | 0 | 100.0% | mysql × 25 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
@@ -38,6 +38,7 @@ Per-corpus pass / fail / skip:
 | `v73814_temp_namespace.test` | 10 | 0 | 0 | postgres |
 | `v73816_expression_index.test` | 37 | 0 | 0 | postgres |
 | `v73816_gin_expression.test` | 21 | 0 | 0 | postgres |
+| `v73818_analyze_same_query_string.test` | 5 | 0 | 0 | postgres |
 | `v73818_scalar_subquery_types.test` | 8 | 0 | 0 | postgres |
 
 ### `duckdb/`
