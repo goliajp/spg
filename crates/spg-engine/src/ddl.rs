@@ -1255,28 +1255,36 @@ impl Engine {
                 "collations are not supported by type {spelled}"
             )));
         }
-        // The declared-collation warnings mirror CREATE TABLE's (rounds
-        // 678/692): a performable name still compares ranges by bytes; a
-        // name this build cannot perform is recorded and byte-ordered.
-        // Warn-not-refuse is the round-670 zero-customer-change ruling.
+        // v7.38.18 (G2) — a collation PostgreSQL does not have is not a
+        // collation, and PG 18.4 says so: `collation "x" for encoding
+        // "UTF8" does not exist`. Round 670 chose warn-not-refuse under
+        // the zero-customer-change ruling, when this build could perform
+        // almost nothing and refusing would have failed working DDL.
+        // That calculus has inverted: 880 names are performable now, so
+        // the only ones refused here are the ones PG refuses too, and
+        // refusing is what keeps a customer's DDL behaving the same.
+        //
+        // The dialect decides, because MySQL's names are not in PG's
+        // catalogue and PG rejects them — measured on 18.4.
         if let Some((_, name)) = &collation
-            && !(name.eq_ignore_ascii_case("C")
-                || name.eq_ignore_ascii_case("POSIX")
-                || name.eq_ignore_ascii_case("default"))
+            && !crate::collate::is_known(name)
         {
-            if crate::collate::is_supported(name) {
-                self.warning(alloc::format!(
-                    "column \"{column}\" declares COLLATE \"{name}\"; SPG orders it by \
-                     \"{name}\", but RANGE COMPARISONS (BETWEEN, <, >) still compare by \
-                     bytes — they may return a different row set than \"{name}\" implies"
-                ));
-            } else {
-                self.warning(alloc::format!(
-                    "column \"{column}\" declares COLLATE \"{name}\", which this build \
-                     cannot perform; SPG records the declaration and orders this column \
-                     by bytes (the C collation)"
-                ));
-            }
+            return Err(crate::collate::unknown_collation_error(name));
+        }
+        // v7.38.18 — the warning that used to stand here said range
+        // comparisons "still compare by bytes". That stopped being true
+        // in this version: a declared collation reaches `<`, `BETWEEN`
+        // and the index keys, verified against PG 18.4. A warning that
+        // is false is worse than none, so only the unperformable case
+        // keeps one.
+        if let Some((_, name)) = &collation
+            && !crate::collate::is_supported(name)
+        {
+            self.warning(alloc::format!(
+                "column \"{column}\" declares COLLATE \"{name}\", which this build \
+                 cannot perform; SPG records the declaration and orders this column \
+                 by bytes (the C collation)"
+            ));
         }
         let mysql_dialect = self.backslash_escapes;
         // v7.39 — under in-place MVCC the row store carries tombstoned
@@ -3739,14 +3747,12 @@ impl Engine {
             // no column. That one is not wiring; it needs collation
             // derivation at a comparison, and `compare` is the dominant
             // cost of a scan, so it needs a bench with it.
-            if crate::collate::is_supported(name) {
-                self.warning(alloc::format!(
-                    "column \"{}\" declares COLLATE \"{name}\"; SPG orders it by \"{name}\", \
-                     but RANGE COMPARISONS (BETWEEN, <, >) still compare by bytes — \
-                     they may return a different row set than \"{name}\" implies",
-                    c.name
-                ));
-            } else {
+            if !crate::collate::is_known(name) {
+                // v7.38.18 (G2) — see the ALTER site: PG 18.4 refuses a
+                // name that is not in its catalogue, and so does this.
+                return Err(crate::collate::unknown_collation_error(name));
+            }
+            if !crate::collate::is_supported(name) {
                 self.warning(alloc::format!(
                     "column \"{}\" declares COLLATE \"{name}\", which this build cannot \
                      perform; SPG records the declaration and orders this column by bytes \

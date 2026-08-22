@@ -1403,6 +1403,12 @@ pub(crate) fn order_by_collations(
             // way to sort by a collation the column does not declare. It
             // needs no derivation: the name is written in the query.
             if let Some(name) = &o.collation {
+                // v7.38.18 (G2) — a name PG does not have is refused
+                // here too, with PG's own message. It used to be
+                // accepted and silently ordered by ICU's root fallback.
+                if !crate::collate::is_known(name) {
+                    return Err(crate::collate::unknown_collation_error(name));
+                }
                 return Ok(crate::collate::is_supported(name)
                     .then(|| crate::collate::Collated::resolve(name))
                     .flatten());

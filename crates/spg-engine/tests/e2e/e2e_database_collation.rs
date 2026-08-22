@@ -233,9 +233,18 @@ fn an_unperformable_collation_is_refused() {
         );
         assert_eq!(e.database_collation(), "C", "and nothing is recorded");
     }
-    // A well-formed tag with no ICU data behind it IS performable, as
-    // root. Recording it is honest: the comparator exists.
-    assert_eq!(e.set_database_collation("zz_ZZ").ok(), Some(true));
+    // v7.38.18 (G2) — and a well-formed tag PostgreSQL does not have is
+    // refused too, now that there is a catalogue to check against.
+    //
+    // This asserted the opposite when it was written, with a comment
+    // explaining that ICU falls back to the root collation for any
+    // language tag and that recording `zz_ZZ` was therefore honest
+    // because "the comparator exists". The comparator does exist; the
+    // COLLATION does not, and PostgreSQL 18.4 answers `collation
+    // "zz_ZZ" for encoding "UTF8" does not exist`. So does this now.
+    let err = format!("{:?}", e.set_database_collation("zz_ZZ").unwrap_err());
+    assert!(err.contains("does not exist"), "{err}");
+    assert_eq!(e.database_collation(), "C");
 }
 
 /// It survives a save/restore, and so do the answers.

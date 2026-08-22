@@ -1,0 +1,73 @@
+# v7.38.18 (G1/G2) — `pg_collation` answers for the collations SPG has,
+# and a name it does not have is refused.
+#
+# It listed three rows where PostgreSQL 18.4 lists 880, which made it
+# the surface `pg_settings` was earlier in this same version: a column
+# declared `COLLATE "en_US.utf8"` worked, `information_schema.columns`
+# reported the name, and the catalogue said no such collation existed.
+#
+# Every number below was read from PG 18.4.
+
+query I
+SELECT count(*) FROM pg_collation
+----
+880
+
+query TTI
+SELECT collname, collprovider, collencoding FROM pg_collation WHERE collname = 'en_US.utf8'
+----
+en_US.utf8
+c
+6
+
+query I
+SELECT count(*) FROM pg_collation WHERE collprovider = 'i'
+----
+871
+
+# The property the round-543 pin was written for, over the whole
+# catalogue rather than over the three rows it used to hold: a locale
+# name appears only for an ICU collation.
+query I
+SELECT count(*) FROM pg_collation WHERE collprovider = 'i' AND colllocale IS NULL
+----
+0
+
+query I
+SELECT count(*) FROM pg_collation WHERE collprovider = 'c' AND colllocale IS NOT NULL
+----
+0
+
+# --- G2: a name that is not there is not accepted anywhere -------------
+#
+# ICU falls back to the ROOT collation for any well-formed language tag,
+# so before this `zz_ZZ` was a perfectly acceptable collation everywhere
+# and silently ordered by root. PG 18.4 answers `collation "zz_ZZ" for
+# encoding "UTF8" does not exist`.
+
+query I
+SELECT count(*) FROM pg_collation WHERE collname = 'zz_ZZ'
+----
+0
+
+statement error
+CREATE TABLE zc(x text COLLATE "zz_ZZ")
+
+statement ok
+CREATE TABLE zc(x text)
+
+statement error
+SELECT x FROM zc ORDER BY x COLLATE "zz_ZZ"
+
+# ...and one that IS there still works, at both surfaces.
+statement ok
+CREATE TABLE zk(x text COLLATE "en_US.utf8")
+
+statement ok
+SELECT x FROM zk ORDER BY x COLLATE "en_US.utf8"
+
+statement ok
+DROP TABLE zk
+
+statement ok
+DROP TABLE zc

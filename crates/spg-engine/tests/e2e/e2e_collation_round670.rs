@@ -43,14 +43,43 @@ fn round670_spg_advertises_c_consistently() {
     );
     assert_eq!(one(&mut e, "SELECT datctype FROM pg_database LIMIT 1"), "C");
     assert_eq!(one(&mut e, "SELECT current_setting('lc_monetary')"), "C");
-    // And the catalog offers only the collations it can actually perform.
+    // And the catalogue offers the collations it can actually perform,
+    // which as of v7.38.18 is PostgreSQL 18.4's whole list rather than
+    // three names.
+    //
+    // This asserted `C,POSIX,default` when three rows were all there
+    // were, and the sentence above it — "the database is lying about
+    // itself in one of the places a client looks" — is exactly what the
+    // three rows had become: a column could be declared `COLLATE
+    // "en_US.utf8"`, `information_schema.columns` reported the name,
+    // and this catalogue said no such collation existed.
+    assert_eq!(one(&mut e, "SELECT count(*) FROM pg_collation"), "880");
+    for name in [
+        "C",
+        "POSIX",
+        "default",
+        "en_US.utf8",
+        "ucs_basic",
+        "pg_c_utf8",
+    ] {
+        assert_eq!(
+            one(&mut e, &alloc_q(name),),
+            "1",
+            "{name} must be in the catalogue"
+        );
+    }
+    // A name PostgreSQL does not have is not in it either.
     assert_eq!(
         one(
             &mut e,
-            "SELECT string_agg(collname, ',' ORDER BY collname) FROM pg_collation"
+            "SELECT count(*) FROM pg_collation WHERE collname = 'zz_ZZ'"
         ),
-        "C,POSIX,default"
+        "0"
     );
+}
+
+fn alloc_q(name: &str) -> String {
+    format!("SELECT count(*) FROM pg_collation WHERE collname = '{name}'")
 }
 
 /// Byte order, stated as a property rather than as a list of rows: an

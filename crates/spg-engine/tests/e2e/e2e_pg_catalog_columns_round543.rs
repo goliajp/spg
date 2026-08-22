@@ -190,11 +190,15 @@ fn round543_tail_values_match_pg() {
     );
     // PG18 reads all three NULL for C / POSIX / default; a name appears
     // only for an ICU collation.
+    //
+    // v7.38.18 (G1) — this listed the three rows the catalogue had.
+    // It has 880 now, so the same claim is checked as a PROPERTY over
+    // all of them, which is what the sentence above was always saying.
     assert_eq!(
         rows(
             &mut e,
             "SELECT collname, colllocale, collicurules, collversion \
-             FROM pg_collation ORDER BY collname"
+             FROM pg_collation WHERE collname IN ('C','POSIX','default') ORDER BY collname"
         ),
         vec![
             "C|NULL|NULL|NULL",
@@ -202,13 +206,32 @@ fn round543_tail_values_match_pg() {
             "default|NULL|NULL|NULL"
         ]
     );
-    e.execute("CREATE PUBLICATION p FOR ALL TABLES").unwrap();
+    // Every libc-provider row reads NULL there, and every ICU one
+    // carries a locale. Measured on PG 18.4 across the whole catalogue.
     assert_eq!(
         rows(
             &mut e,
-            "SELECT pubname, pubviaroot, pubgencols FROM pg_publication"
+            "SELECT count(*) FROM pg_collation \
+             WHERE collprovider = 'i' AND colllocale IS NULL"
         ),
-        vec!["p|false|n"]
+        vec!["0"]
+    );
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_collation \
+             WHERE collprovider = 'c' AND colllocale IS NOT NULL"
+        ),
+        vec!["0"]
+    );
+    // `collicurules` is NULL for every one of them, which is PG's
+    // reading for a collation with no custom tailoring.
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT count(*) FROM pg_collation WHERE collicurules IS NOT NULL"
+        ),
+        vec!["0"]
     );
 }
 

@@ -40,6 +40,29 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **`pg_collation` answers for the collations SPG has** — 880 rows where
+  it listed three. It had become what `pg_settings` was earlier in this
+  same version: a column declared `COLLATE "en_US.utf8"` worked,
+  `information_schema.columns` reported the name, and the catalogue said
+  no such collation existed. pg_dump's COLLATE restoration, psql's
+  `\dO` and an ORM binding a language-specific column all read it.
+
+  The candidate names are PostgreSQL 18.4's; the filter is SPG's. A row
+  here is a promise that `COLLATE <name>` will be honoured, so a name
+  this build cannot perform is not emitted.
+
+- **A collation that does not exist is refused, with PostgreSQL's
+  words.** ICU falls back to the root collation for any well-formed
+  language tag, so `zz_ZZ` and `kl_KL.no_such` were accepted as
+  collations everywhere — on a database, on a column, in an `ORDER BY`
+  key — and silently ordered by root. All three now answer `collation
+  "zz_ZZ" for encoding "UTF8" does not exist`, which is PG 18.4's.
+
+  The known set is SPG's rather than PostgreSQL's, and deliberately: it
+  includes MySQL's names, because SPG has those collations on the same
+  database through the other wire. Refusing them to a PostgreSQL session
+  would make a column declarable through one wire and not the other.
+
 - **A database can be created with a collation, and an undeclared text
   column inherits it.** SPG collated as `C` and nothing could say
   otherwise, so a customer moving off a stock PostgreSQL — `en_US.utf8`

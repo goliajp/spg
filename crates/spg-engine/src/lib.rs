@@ -44,6 +44,7 @@ mod cancel;
 mod clock;
 mod collate;
 mod collate_derive;
+mod collation_catalog;
 mod constfold;
 mod constraints;
 mod conversions;
@@ -2976,6 +2977,12 @@ impl Engine {
     /// # Errors
     /// When the database already has a different collation in force.
     pub fn set_database_collation(&mut self, name: &str) -> Result<bool, EngineError> {
+        // v7.38.18 (G2) — a name PostgreSQL does not have is not a
+        // collation. Before this, ICU's fallback to root made `zz_ZZ` a
+        // perfectly acceptable database collation.
+        if !crate::collate::is_known(name) {
+            return Err(crate::collate::unknown_collation_error(name));
+        }
         if !crate::collate::is_supported(name) {
             return Err(EngineError::Unsupported(alloc::format!(
                 "collation {name:?} is not one this build can perform; \

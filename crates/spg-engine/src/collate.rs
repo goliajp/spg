@@ -276,6 +276,51 @@ pub(crate) fn is_byte_wise(collation: &str) -> bool {
     spg_storage::collation_is_byte_wise(collation)
 }
 
+/// v7.38.18 (G2) — is there a collation by this name at all?
+///
+/// PostgreSQL validates against its catalogue and answers `collation
+/// "x" for encoding "UTF8" does not exist` for a name that is not in
+/// it. SPG could not: it handed the name to ICU, which falls back to
+/// the root collation for any well-formed language tag, so `zz_ZZ` and
+/// `kl_KL.no_such` were accepted as collations and silently ordered by
+/// root. The catalogue in `collation_catalog` is what makes the
+/// distinction possible.
+///
+/// The set is SPG's, not PostgreSQL's, and that is deliberate. MySQL's
+/// names (`utf8mb4_0900_ai_ci` and family) are not in PostgreSQL's
+/// catalogue and PG 18.4 rejects them — but SPG HAS those collations,
+/// on the same database, reachable through the MySQL wire. Refusing
+/// them to a PostgreSQL session would mean one database where a column
+/// can be declared through one wire and not the other, which is a
+/// divergence of its own. So the question is "does SPG have a collation
+/// by this name", and the answer is a superset of PostgreSQL's — never
+/// a wrong answer, only a name PG would not have accepted.
+pub(crate) fn is_known(name: &str) -> bool {
+    let n = name.trim();
+    if crate::collation_catalog::PG_COLLATIONS
+        .iter()
+        .any(|(_, c, ..)| c.eq_ignore_ascii_case(n))
+    {
+        return true;
+    }
+    let lower = n.to_ascii_lowercase();
+    // SPG's own spellings for the case-insensitive collation. They are
+    // not PostgreSQL's and PG would reject them, but SPG accepts them
+    // and has since v7.17 — this asks whether SPG HAS a collation by
+    // this name, and it does.
+    if lower == "case_insensitive" || lower == "nocase" {
+        return true;
+    }
+    lower == "binary" || lower.ends_with("_ci") || lower.ends_with("_cs") || lower.ends_with("_bin")
+}
+
+/// The message PostgreSQL 18.4 gives for a name that is not there.
+pub(crate) fn unknown_collation_error(name: &str) -> crate::EngineError {
+    crate::EngineError::Unsupported(alloc::format!(
+        "collation \"{name}\" for encoding \"UTF8\" does not exist"
+    ))
+}
+
 /// Whether this build can perform a collation by that name.
 pub(crate) fn is_supported(collation: &str) -> bool {
     compare(collation, "a", "b").is_some()

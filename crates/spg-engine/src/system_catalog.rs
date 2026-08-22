@@ -2023,51 +2023,46 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("collicurules", DataType::Text, true),
         ColumnSchema::new("collversion", DataType::Text, true),
     ];
-    // PG hard-codes OIDs 100 = default, 950 = C, 951 = POSIX.
-    let rows = alloc::vec![
-        Row::new(alloc::vec![
-            Value::BigInt(100),
-            Value::text("default"),
-            Value::BigInt(11),
-            Value::BigInt(10),
-            Value::text("d"),
-            Value::Bool(true),
-            Value::Int(-1),
-            Value::Null,
-            Value::Null,
-            Value::Null, // colllocale
-            Value::Null, // collicurules
-            Value::Null, // collversion
-        ]),
-        Row::new(alloc::vec![
-            Value::BigInt(950),
-            Value::text("C"),
-            Value::BigInt(11),
-            Value::BigInt(10),
-            Value::text("c"),
-            Value::Bool(true),
-            Value::Int(-1),
-            Value::text("C"),
-            Value::text("C"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]),
-        Row::new(alloc::vec![
-            Value::BigInt(951),
-            Value::text("POSIX"),
-            Value::BigInt(11),
-            Value::BigInt(10),
-            Value::text("c"),
-            Value::Bool(true),
-            Value::Int(-1),
-            Value::text("POSIX"),
-            Value::text("POSIX"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]),
-    ];
+    // v7.38.18 (G1) — every collation PG 18.4 publishes that this build
+    // can actually perform.
+    //
+    // Three rows stood here, and a column declared `COLLATE
+    // "en_US.utf8"` therefore worked while the catalogue said the
+    // collation did not exist — the same disagreement `pg_settings` had.
+    //
+    // The candidate list is PG's; the filter is ours. A name this build
+    // cannot perform is NOT emitted, because a row here is a promise
+    // that `COLLATE <name>` will be honoured, and `collate::is_supported`
+    // is the only thing that can keep it.
+    let rows: Vec<Row<'static>> = crate::collation_catalog::PG_COLLATIONS
+        .iter()
+        .filter(|(_, name, provider, ..)| {
+            // `default` names whatever the database was created with and
+            // is always performable; the rest have to answer for
+            // themselves.
+            *provider == "d" || crate::collate::is_supported(name)
+        })
+        .map(
+            |&(oid, name, provider, deterministic, encoding, cc, ct, loc, icurules, version)| {
+                let text =
+                    |v: Option<&str>| v.map_or(Value::Null, |s| Value::text::<String>(s.into()));
+                Row::new(alloc::vec![
+                    Value::BigInt(i64::from(oid)),
+                    Value::text::<String>(name.into()),
+                    Value::BigInt(11), // collnamespace — pg_catalog
+                    Value::BigInt(10), // collowner
+                    Value::text::<String>(provider.into()),
+                    Value::Bool(deterministic),
+                    Value::Int(encoding),
+                    text(cc),
+                    text(ct),
+                    text(loc),
+                    text(icurules),
+                    text(version),
+                ])
+            },
+        )
+        .collect();
     (schema, rows)
 }
 
