@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|---|
 | `15_regressions` | 96 | 0 | 0 | 100.0% | postgres × 6 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 346 | 8 | 0 | 97.7% | mysql × 22 |
+| `mysql` | 354 | 0 | 0 | 100.0% | mysql × 22 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -25,16 +25,6 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |  |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% | postgres × 33 |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% | postgres × 1 |
-
-## Top fail patterns
-
-| count | pattern |
-|---|---|
-| 1 | `record 26: row mismatch | expected:` |
-| 1 | `record 27: row mismatch | expected:` |
-| 1 | `record 3: row mismatch | expected:` |
-| 1 | `record 4: row mismatch | expected:` |
-| 1 | `record 5: row mismatch | expected:` |
 
 ## Per-file detail
 
@@ -91,29 +81,16 @@ Per-corpus pass / fail / skip:
 | `11_fulltext_gin_seek.test` | 10 | 0 | 0 | mysql |
 | `12_collation_index_agreement.test` | 38 | 0 | 0 | mysql |
 | `12_unique_collation.test` | 22 | 0 | 0 | mysql |
-| `13_pad_semantics.test` | 14 | 6 | 0 | mysql |
+| `13_pad_semantics.test` | 20 | 0 | 0 | mysql |
 | `13_show_databases.test` | 3 | 0 | 0 | mysql |
 | `14_show_create_table.test` | 4 | 0 | 0 | mysql |
 | `15_show_indexes_status_processlist.test` | 10 | 0 | 0 | mysql |
 | `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
-| `v73813_distinct_binary_collation.test` | 30 | 2 | 0 | mysql |
+| `v73813_distinct_binary_collation.test` | 32 | 0 | 0 | mysql |
 | `v73814_distinct_sources.test` | 15 | 0 | 0 | mysql |
 | `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |
 | `v73814_join_collation.test` | 23 | 0 | 0 | mysql |
 | `v73814_setop_collation.test` | 21 | 0 | 0 | mysql |
-
-<details><summary>`13_pad_semantics.test` fail snippets</summary>
-
-- record 3: row mismatch |   expected: ["1"] |   actual:   ["1", "2"]
-- record 4: row mismatch |   expected: ["1", "3", "4"] |   actual:   ["1", "2", "3", "4"]
-- record 5: row mismatch |   expected: ["3"] |   actual:   ["2"]
-</details>
-
-<details><summary>`v73813_distinct_binary_collation.test` fail snippets</summary>
-
-- record 26: row mismatch |   expected: ["3"] |   actual:   ["2"]
-- record 27: row mismatch |   expected: ["a", "a ", "bar"] |   actual:   ["a", "bar"]
-</details>
 
 ### `pg_regress/`
 
