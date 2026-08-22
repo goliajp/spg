@@ -111,6 +111,51 @@ pub(crate) fn sort_key(collation: &str, s: &str) -> Option<alloc::vec::Vec<u8>> 
     Some(key)
 }
 
+/// v7.38.18 — a collation resolved ONCE, for a comparator that will be
+/// called millions of times.
+///
+/// [`compare`] takes a NAME, and building the collator behind that name
+/// costs about ten times what the comparison does: measured over
+/// 100,000 comparisons, 52.9 ms building per call against 5.2 ms with
+/// one built in advance. A 400,000-row two-key `ORDER BY` builds
+/// millions of them, and the release sweep saw the whole cell go from
+/// matching PostgreSQL 18.4 to losing 1.5x when database-level
+/// collations arrived and that sort started taking this path.
+///
+/// So the sort resolves each key's collation before it starts and
+/// carries this instead of the name. `None` inside means byte order,
+/// which is `C` and the `_bin` family — they need no collator and this
+/// keeps the branch out of the inner loop.
+pub(crate) struct Collated {
+    collator: Option<icu_collator::CollatorBorrowed<'static>>,
+}
+
+impl Collated {
+    /// `None` when this build cannot perform the name, which leaves the
+    /// caller on byte order — the same answer [`compare`] gives.
+    pub(crate) fn resolve(name: &str) -> Option<Self> {
+        if is_byte_wise(name) {
+            return Some(Self { collator: None });
+        }
+        let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
+        let prefs = icu_collator::CollatorPreferences::from(&locale);
+        let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
+        Some(Self {
+            collator: Some(collator),
+        })
+    }
+
+    /// The same ordering [`compare`] produces, tiebreak included.
+    pub(crate) fn compare(&self, a: &str, b: &str) -> Ordering {
+        match &self.collator {
+            // PG's locale collations are deterministic, so a collation
+            // tie is broken by the bytes — see `compare`.
+            Some(c) => c.compare(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes())),
+            None => a.as_bytes().cmp(b.as_bytes()),
+        }
+    }
+}
+
 /// The options PG's collations behave under.
 ///
 /// v7.39 (round 683) — `AlternateHandling::Shifted`, and it is not a

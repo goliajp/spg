@@ -1098,12 +1098,12 @@ pub(crate) enum OrderKey {
 fn order_key_elem_cmp_in(
     a: &OrderKey,
     b: &OrderKey,
-    collation: Option<&str>,
+    collation: Option<&crate::collate::Collated>,
 ) -> core::cmp::Ordering {
-    if let (OrderKey::Text(x), OrderKey::Text(y), Some(c)) = (a, b, collation)
-        && let Some(ord) = crate::collate::compare(c, x, y)
-    {
-        return ord;
+    // v7.38.18 — resolved once by `order_by_collations`, not per call.
+    // Building the collator here cost ten times the comparison.
+    if let (OrderKey::Text(x), OrderKey::Text(y), Some(c)) = (a, b, collation) {
+        return c.compare(x, y);
     }
     order_key_elem_cmp(a, b)
 }
@@ -1279,7 +1279,7 @@ pub(crate) fn partial_sort_tagged_in(
     tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     keep: Option<usize>,
     descs: &[bool],
-    collations: &[Option<alloc::string::String>],
+    collations: &[Option<crate::collate::Collated>],
 ) {
     let cmp = |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| {
         cmp_multi_key_in(&a.0, &b.0, descs, collations)
@@ -1366,7 +1366,7 @@ pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) 
 pub(crate) fn sort_by_keys_in(
     tagged: &mut [(Vec<OrderKey>, Row)],
     descs: &[bool],
-    collations: &[Option<alloc::string::String>],
+    collations: &[Option<crate::collate::Collated>],
 ) {
     tagged.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, descs, collations));
 }
@@ -1379,7 +1379,7 @@ pub(crate) fn sort_by_keys_in(
 pub(crate) fn order_by_collations(
     order_by: &[spg_sql::ast::OrderBy],
     ctx: &EvalContext,
-) -> Result<alloc::vec::Vec<Option<alloc::string::String>>, crate::EngineError> {
+) -> Result<alloc::vec::Vec<Option<crate::collate::Collated>>, crate::EngineError> {
     // v7.39 (round 691) — a name written in the query that this build cannot
     // perform is refused, not dropped. Silently ignoring it is exactly the
     // defect F36 exists to close, and the parser refused it before the name
@@ -1403,7 +1403,9 @@ pub(crate) fn order_by_collations(
             // way to sort by a collation the column does not declare. It
             // needs no derivation: the name is written in the query.
             if let Some(name) = &o.collation {
-                return Ok(crate::collate::is_supported(name).then(|| name.clone()));
+                return Ok(crate::collate::is_supported(name)
+                    .then(|| crate::collate::Collated::resolve(name))
+                    .flatten());
             }
             // v7.39 (round 692) — DERIVED, not just "is it a bare column".
             // `ORDER BY upper(loc)` sorts by `loc`'s collation in PG, and
@@ -1428,11 +1430,14 @@ pub(crate) fn order_by_collations(
                 .catalog
                 .map(spg_storage::Catalog::db_collation)
                 .filter(|d| !crate::collate::is_byte_wise(d));
+            // v7.38.18 — resolved to a built collator here, once per
+            // query, because the comparator this feeds runs per
+            // comparison and building one costs ten times comparing.
             Ok(derived
                 .name()
                 .or(db)
                 .filter(|n| crate::collate::is_supported(n))
-                .map(alloc::string::ToString::to_string))
+                .and_then(crate::collate::Collated::resolve))
         })
         .collect()
 }
@@ -1543,11 +1548,11 @@ pub(crate) fn cmp_multi_key_in(
     a: &[OrderKey],
     b: &[OrderKey],
     descs: &[bool],
-    collations: &[Option<alloc::string::String>],
+    collations: &[Option<crate::collate::Collated>],
 ) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     for (i, (ka, kb)) in a.iter().zip(b.iter()).enumerate() {
-        let ord = order_key_elem_cmp_in(ka, kb, collations.get(i).and_then(|c| c.as_deref()));
+        let ord = order_key_elem_cmp_in(ka, kb, collations.get(i).and_then(Option::as_ref));
         let ord = if descs.get(i).copied().unwrap_or(false) {
             ord.reverse()
         } else {
@@ -1693,7 +1698,7 @@ pub(crate) fn build_order_keys_into(
 pub(crate) fn build_order_keys_bound(
     order_by: &[OrderBy],
     bound: &[Option<usize>],
-    collations: &[Option<alloc::string::String>],
+    collations: &[Option<crate::collate::Collated>],
     row: &Row<'static>,
     ctx: &EvalContext,
     keys: &mut Vec<OrderKey>,
