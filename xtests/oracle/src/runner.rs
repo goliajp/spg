@@ -180,7 +180,7 @@ fn run_one(
 ) -> Result<()> {
     let pair = naming::expected_paths(fixture, expected_root, oracle);
 
-    let spg_raw = run_on_spg(fixture)
+    let spg_raw = run_on_spg(fixture, oracle)
         .with_context(|| format!("SPG-side execution of {}", fixture.display()))?;
     let spg_canon = pipeline.apply(spg_raw);
 
@@ -246,8 +246,8 @@ fn run_one(
 /// Dump the canonicalised SPG output for a single fixture. Public
 /// entry for the `Cmd::Dump` subcommand. Useful when filling an
 /// EXPECTED FAILURE lock or bisecting an `adjust_*()` pipeline diff.
-pub fn dump_spg(fixture: &Path) -> Result<String> {
-    run_on_spg(fixture)
+pub fn dump_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
+    run_on_spg(fixture, oracle)
 }
 
 /// Execute a fixture on SPG using the embedded path.
@@ -259,7 +259,7 @@ pub fn dump_spg(fixture: &Path) -> Result<String> {
 /// in the psql-aligned shape (`col1 | col2 \n----+---- \n val1 | val2`)
 /// so the existing `AdjustWhitespace` pipeline step collapses any padding
 /// differences against the PG oracle baseline.
-fn run_on_spg(fixture: &Path) -> Result<String> {
+fn run_on_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
     use spg_engine::{Engine, QueryResult};
 
     // Resolve depd.* fixtures referenced via `-- oracle: depends X` in
@@ -272,6 +272,16 @@ fn run_on_spg(fixture: &Path) -> Result<String> {
         .ok_or_else(|| anyhow!("fixture {} has no parent dir", fixture.display()))?;
 
     let mut engine = Engine::new();
+    // v7.38.17 — run SPG in the DIALECT of the leg it is being compared
+    // against. This function took only the fixture, so every MySQL and
+    // MariaDB comparison this differ has ever made ran SPG in
+    // PostgreSQL semantics: the instrument whose entire purpose is to
+    // compare SPG against those two engines had never put SPG into
+    // either one's mode.
+    //
+    // It is the same failure as `corpus/mysql/` running in PostgreSQL
+    // dialect, in the tool built to catch what that corpus missed.
+    engine.set_backslash_escapes(matches!(oracle, Oracle::Mysql | Oracle::Mariadb));
     // v7.37.16 — two-way `SPG_MVCC_INPLACE` override (default is now
     // ON; `=0` runs the differential on the legacy path).
     match std::env::var("SPG_MVCC_INPLACE").ok().as_deref() {

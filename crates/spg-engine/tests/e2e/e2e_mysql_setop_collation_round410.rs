@@ -41,7 +41,9 @@ fn one_text(e: &mut Engine, sql: &str) -> String {
     }
 }
 
-/// UNION folds trailing spaces, case, and accents to one row.
+/// UNION folds case and accents. v7.38.17 — it does NOT fold trailing
+/// spaces: MySQL 9.7.2's default collation is NO PAD, so `'a'` and
+/// `'a '` survive a UNION as two rows. Measured, not reasoned.
 #[test]
 fn union_folds() {
     let mut e = mysql();
@@ -50,7 +52,7 @@ fn union_folds() {
             &mut e,
             "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a ') u"
         ),
-        1
+        2
     );
     assert_eq!(
         count(
@@ -66,12 +68,13 @@ fn union_folds() {
         ),
         1
     );
+    // v7.38.17 — two: 'a' and 'A' fold together, 'a  ' stands apart.
     assert_eq!(
         count(
             &mut e,
             "SELECT COUNT(*) FROM (SELECT 'a' x UNION SELECT 'a  ' UNION SELECT 'A') u"
         ),
-        1
+        2
     );
     // Genuinely different strings are still kept.
     assert_eq!(
@@ -105,9 +108,11 @@ fn distinct_intersect_except_fold() {
     e.execute("CREATE TABLE ps(v VARCHAR(10))").unwrap();
     e.execute("INSERT INTO ps VALUES('a'),('a '),('A'),('b')")
         .unwrap();
+    // v7.38.17 — three, not two: 'a' and 'A' fold together, `'a '` does
+    // not join them. MySQL 9.7.2 answers 3.
     assert_eq!(
         count(&mut e, "SELECT COUNT(*) FROM (SELECT DISTINCT v FROM ps) t"),
-        2
+        3
     );
     assert_eq!(
         count(
@@ -116,13 +121,15 @@ fn distinct_intersect_except_fold() {
         ),
         1
     );
-    // {a,a ,A,b} EXCEPT {a} folds a/a /A away -> only b.
+    // v7.38.17 — {a,a ,A,b} EXCEPT {a} removes 'a' and 'A' (case folds)
+    // and keeps 'a ' as well as 'b'. Measured on MySQL 9.7.2: two rows,
+    // `[a ]` and `[b]`.
     assert_eq!(
         count(
             &mut e,
             "SELECT COUNT(*) FROM (SELECT v FROM ps EXCEPT SELECT 'a') t"
         ),
-        1
+        2
     );
 }
 

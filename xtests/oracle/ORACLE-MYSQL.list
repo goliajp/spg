@@ -3,3 +3,4 @@
 # MySQL spells it JSON + JSON_CONTAINS() (dialect fixture pending).
 port.select_implicit.sql
 port.subquery_correlated_agg.sql
+orig.collation_pad_matrix.sql
