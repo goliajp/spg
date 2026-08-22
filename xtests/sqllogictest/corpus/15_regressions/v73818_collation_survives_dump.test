@@ -1,0 +1,99 @@
+# v7.38.18 — a column's collation has to survive a dump.
+#
+# `crates/spg-engine/src/dump.rs` never emitted `COLLATE`. A column
+# declared `COLLATE "en_US.utf8"` came back byte-ordered after a
+# dump/restore, so every `ORDER BY` on it silently changed answer —
+# `apple, DateStyle, Zebra` before, `DateStyle, Zebra, apple` after.
+#
+# The dump-compat gate could not see it: both sides of the round trip
+# lost the clause identically, so they agreed. Confirmed by ablation —
+# with the emission removed the restored table sorts by bytes.
+#
+# The expectations for the DECLARED column were read from PG 18.4 —
+# `apple client DateStyle Zebra`, one row under `< 'b'`, `min` of
+# `apple`, and `en_US.utf8` in information_schema, all four verbatim.
+#
+# The expectation for the UNDECLARED column beside it is SPG's, and it
+# is NOT PG's: that oracle's database collates as `en_US.utf8`, so its
+# undeclared column inherits the locale and sorts the same as the
+# declared one. SPG's database collates as `C` (`pg_database.datcollate`
+# says so and there is no way to say otherwise), so its undeclared
+# column sorts by bytes. That difference is real and it is recorded in
+# `docs/FINDING-2026-08-23-database-collation.md`; here it is only the
+# control, and it is the control precisely because it is what tells the
+# first result apart from a coincidence of this data.
+
+statement ok
+CREATE TABLE cd(x text COLLATE "en_US.utf8", y text)
+
+statement ok
+INSERT INTO cd VALUES ('Zebra','Zebra'), ('apple','apple'), ('DateStyle','DateStyle'), ('client','client')
+
+# The declared column collates as PG does...
+query T
+SELECT x FROM cd ORDER BY x
+----
+apple
+client
+DateStyle
+Zebra
+
+# ...and the undeclared one beside it does not. SPG's database collation
+# is `C`, so this is byte order. Read the note above before comparing
+# this block with PostgreSQL.
+query T
+SELECT y FROM cd ORDER BY y
+----
+DateStyle
+Zebra
+apple
+client
+
+# The comparison operators read it too, not only the sort.
+query I
+SELECT count(*) FROM cd WHERE x < 'b'
+----
+1
+
+query T
+SELECT min(x) FROM cd
+----
+apple
+
+# The sort INSIDE an aggregate reads it too. It did not until v7.38.18:
+# `min`/`max` had read the argument's collation since round 690 and the
+# statement's own ORDER BY had always read it, but `string_agg(x, ' '
+# ORDER BY x)` over the same column answered `DateStyle Zebra apple
+# client` — two orderings of one column in one query. Both values below
+# are PG 18.4's.
+query T
+SELECT string_agg(x, ' ' ORDER BY x) FROM cd
+----
+apple client DateStyle Zebra
+
+query T
+SELECT array_to_string(array_agg(x ORDER BY x), ' ') FROM cd
+----
+apple client DateStyle Zebra
+
+# ...and a window's ORDER BY, which already did.
+query TI
+SELECT x, row_number() OVER (ORDER BY x) FROM cd ORDER BY 2
+----
+apple
+1
+client
+2
+DateStyle
+3
+Zebra
+4
+
+# And the catalog says so, which is what a client reads back.
+query T
+SELECT collation_name FROM information_schema.columns WHERE table_name = 'cd' AND column_name = 'x'
+----
+en_US.utf8
+
+statement ok
+DROP TABLE cd

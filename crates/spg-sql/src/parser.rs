@@ -22632,10 +22632,23 @@ impl Parser {
                     "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
                 ) && !mysql_ci
                 {
+                    // v7.38.18 — the old message read "SPG orders text
+                    // by bytes (the C collation); locale collations are
+                    // not supported yet", and both halves were false by
+                    // the time it was read. This build performs locale
+                    // collations: declared on a column or written in an
+                    // ORDER BY key, `en_US.utf8` orders `apple, client,
+                    // DateStyle, Zebra` exactly as PG 18.4 does. What it
+                    // cannot do is carry a collation on an arbitrary
+                    // expression, because there is no `Expr::Collate` to
+                    // carry it — so say that, and say where the clause
+                    // does work rather than telling the reader to drop it.
                     return Err(self.err(alloc::format!(
-                        "COLLATE {cname:?}: SPG orders text by bytes (the C \
-                         collation); locale collations are not supported yet — \
-                         use COLLATE \"C\" or drop the clause"
+                        "COLLATE {cname:?} is not supported in this position: \
+                         SPG carries a collation on a column declaration and \
+                         on an ORDER BY key, not on an arbitrary expression. \
+                         Declare it on the column (`x text COLLATE \
+                         {cname:?}`) or move it into the ORDER BY key"
                     )));
                 }
                 continue;
