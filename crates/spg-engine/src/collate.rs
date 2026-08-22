@@ -73,6 +73,44 @@ pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     )
 }
 
+/// v7.38.18 (S0) — the ICU sort key for `s` under `collation`, as bytes
+/// that compare the way [`compare`] compares the strings themselves.
+///
+/// This is what lets a B-tree index carry a collation without the B-tree
+/// knowing about one. `spg-storage` is `no_std` and holds no collator;
+/// it orders `IndexKey` by the derived `Ord`. Handing it a sort key
+/// makes that byte comparison the collation's comparison.
+///
+/// The original string rides along after a NUL for the same reason
+/// [`compare`] falls back to it: PG's locale collations are
+/// deterministic, so two canonically-equivalent strings that ICU calls
+/// equal are still ordered by their bytes, and an index must agree with
+/// the scan on that too.
+///
+/// `None` for a collation this build cannot perform, which callers read
+/// as "do not build a collated key" rather than as "these are equal".
+pub(crate) fn sort_key(collation: &str, s: &str) -> Option<alloc::vec::Vec<u8>> {
+    let name = collation.trim();
+    let base = name.split(['.', '@']).next().unwrap_or(name);
+    if base.eq_ignore_ascii_case("C")
+        || base.eq_ignore_ascii_case("POSIX")
+        || base.eq_ignore_ascii_case("binary")
+        || base
+            .rsplit_once('_')
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
+    {
+        return None;
+    }
+    let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
+    let prefs = icu_collator::CollatorPreferences::from(&locale);
+    let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
+    let mut key: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    collator.write_sort_key_to(s, &mut key).ok()?;
+    key.push(0);
+    key.extend_from_slice(s.as_bytes());
+    Some(key)
+}
+
 /// The options PG's collations behave under.
 ///
 /// v7.39 (round 683) — `AlternateHandling::Shifted`, and it is not a
@@ -261,6 +299,36 @@ mod survey;
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// v7.38.18 (S0 feasibility) — the property the whole
+    /// collation-aware index key rests on: comparing two sort keys as
+    /// BYTES must give the same answer as `compare` gives on the strings.
+    /// If it does not, an index built from sort keys orders differently
+    /// from a scan, which is the defect this is meant to close.
+    #[test]
+    fn sort_key_bytes_order_the_way_compare_does() {
+        let words = [
+            "apple", "Apple", "APPLE", "Bob", "bob", "client", "DateStyle",
+            "Zebra", "zebra", "_under", "cherry", "de-luca", "deluca",
+            "O'Brien", "Obrien", "résumé", "resume", "Résumé", "1abc",
+            "", " ", "a", "A", "ä", "Ä", "z", "Z", "élan", "elan",
+        ];
+        for coll in ["en_US.utf8", "de_DE.utf8", "fr_FR.utf8"] {
+            for a in words {
+                for b in words {
+                    let by_compare = compare(coll, a, b).expect("supported");
+                    let ka = sort_key(coll, a).expect("supported");
+                    let kb = sort_key(coll, b).expect("supported");
+                    assert_eq!(
+                        ka.cmp(&kb),
+                        by_compare,
+                        "{coll}: {a:?} vs {b:?} — sort keys say {:?}, compare says {by_compare:?}",
+                        ka.cmp(&kb)
+                    );
+                }
+            }
+        }
+    }
+
     use alloc::vec;
     use alloc::vec::Vec;
 
