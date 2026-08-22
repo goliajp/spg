@@ -827,6 +827,7 @@ mod e2e_setseed;
 mod e2e_show_all;
 mod e2e_show_create_table_round358;
 mod e2e_show_pg_defaults;
+mod e2e_sigil_registry;
 mod e2e_signature_denials_round627;
 mod e2e_similar_to_escape;
 mod e2e_similar_to_operator;
