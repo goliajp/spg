@@ -2153,7 +2153,20 @@ fn collate_compare_hook(
             ),
         }));
     }
-    let ord = crate::collate::compare(derived.name()?, a, b)?;
+    // v7.38.18 (S2) — and the DATABASE's collation when neither side
+    // declares one, which is what an undeclared text column is compared
+    // under. `C` is byte order and resolves to `None`, so a database
+    // that never asked for a locale takes the same path it always did.
+    //
+    // Ordering only. Whether a comparison PADS is decided in
+    // `text_compare_of` from a MySQL collation NAME, and a PostgreSQL
+    // database collating as `en_US.utf8` does not pad — inheritance
+    // reaching that would make `'a' = 'a  '` true everywhere.
+    let db = ctx
+        .catalog
+        .map(spg_storage::Catalog::db_collation)
+        .filter(|d| !crate::collate::is_byte_wise(d));
+    let ord = crate::collate::compare(derived.name().or(db)?, a, b)?;
     let b = match op {
         BinOp::Lt => ord == core::cmp::Ordering::Less,
         BinOp::LtEq => ord != core::cmp::Ordering::Greater,

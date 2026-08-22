@@ -928,9 +928,14 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // v7.39 (round 550) — the replication-slot block (FILE_VERSION
         // 86), appended last; empty is a u32 zero count. THIRTEENTH.
         const EMPTY_REPLICATION_SLOT_BLOCK: usize = 4;
+        // v7.38.18 (S1) — the database-collation byte (FILE_VERSION 92),
+        // appended last; absent is a single zero tag. FOURTEENTH, and it
+        // caught this one on the first run too.
+        const EMPTY_DB_COLLATION_TAG: usize = 1;
         full.truncate(
             full.len()
                 - 4
+                - EMPTY_DB_COLLATION_TAG
                 - EMPTY_COMMENT_BLOCK
                 - EMPTY_NONTABLE_ACL_BLOCK
                 - EMPTY_RULE_BLOCK

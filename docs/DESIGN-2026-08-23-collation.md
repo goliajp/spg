@@ -99,6 +99,17 @@ missed optimisation rather than a wrong answer.
 
 ### S1 — the database's collation is persisted, and set once
 
+**Landed 2026-08-23.** `Catalog.db_collation`, FILE_VERSION 92, one tag
+byte plus the name. Absent reads as `C`, so an image from any earlier
+version loads unchanged — the v52-compatibility test caught the new byte
+on its first run, which is what it is for.
+
+`spg-server` reads `SPG_LC_COLLATE`, then `LC_ALL`, `LC_COLLATE`, `LANG`
+— POSIX's precedence and `initdb`'s — and records it on a database that
+does not have one. A database that does keeps it, silently; only a
+MISMATCH says anything, and it says it loudly, because the server has
+then been told one thing and the data on disk says another.
+
 Recorded in the catalog at creation. Sourced as `initdb` sources it:
 `LC_ALL`, then `LC_COLLATE`, then `LANG`; an explicit `CREATE DATABASE …
 LC_COLLATE` overrides. **Absent on disk means `C`**, which is what every
@@ -112,6 +123,28 @@ was created with, and that collation cannot move out from under it.
 
 ### S2 — an undeclared text column inherits it
 
+**Landed 2026-08-23**, at five comparators: the statement's own ORDER
+BY, an aggregate's ORDER BY, `min`/`max`, the interpreted comparison,
+and the compiled scan filter. The last of those was the one that needed
+`TextCompare` to grow a third field — it carried *fold* and *pad* and
+not *order*, so `WHERE x < 'b'` answered by bytes while `ORDER BY x`
+over the same column answered by the locale, inside one query. That
+type's own comment says it exists to stop the interpreted and compiled
+paths disagreeing.
+
+Two traps, both found by measurement rather than by reading:
+
+- **`byte_wise` must not suppress it.** That flag is true whenever a
+  column carries `Collation::Binary`, which is the struct's DEFAULT and
+  means *nothing was said about folding*. Letting it zero the ordering
+  made inheritance silently do nothing — the same misreading of the same
+  default that made `column_key_is_bytewise` drop three rows.
+- **The probe and the entries must agree on WHICH collation.** Storage
+  keys an inheriting column's index under the database collation;
+  `probe_key` read only the column's declared one. For one commit,
+  `x = 'apple'` on an indexed inheriting column returned nothing at
+  all.
+
 At comparison, sort and index-key time — **not** stamped onto the
 column, because PostgreSQL reports `collation_name` as NULL for an
 inheriting column and stamping would make SPG report a name where the
@@ -123,6 +156,14 @@ columns that declare a collation today to every text column in the
 database.
 
 ### S3 — refuse rather than guess
+
+**Landed 2026-08-23**, and narrower than it sounds. ICU falls back to
+the root collation for a well-formed language tag it has no data for, so
+`zz_ZZ` is accepted — this build really can perform it, as root. What is
+refused is a name that is not a language tag at all. PostgreSQL
+validates against its own catalogue and answers `collation "x" for
+encoding "UTF8" does not exist` for both kinds; SPG cannot tell them
+apart, because the parser has no collator to ask. Recorded, not fixed.
 
 If a build cannot perform the collation a database was created with,
 opening it fails loudly. Comparing by bytes instead would be answering

@@ -2958,6 +2958,37 @@ impl Engine {
         &mut self.catalog
     }
 
+    /// v7.38.18 (S1) — the collation this database was created with.
+    pub fn database_collation(&self) -> &str {
+        self.active_catalog().db_collation()
+    }
+
+    /// Record the collation this database is created with, once.
+    ///
+    /// The host calls this before the first table exists, from its
+    /// environment — `LC_ALL`, then `LC_COLLATE`, then `LANG`, the order
+    /// `initdb` reads them in. An existing database keeps what it was
+    /// created with and this answers `Ok(false)`; asking for a DIFFERENT
+    /// collation on a database that already has tables is an error, the
+    /// same one PostgreSQL gives, because every index key in it was
+    /// built under the collation it has.
+    ///
+    /// # Errors
+    /// When the database already has a different collation in force.
+    pub fn set_database_collation(&mut self, name: &str) -> Result<bool, EngineError> {
+        if !crate::collate::is_supported(name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "collation {name:?} is not one this build can perform; \
+                 a database created under it could not be read back"
+            )));
+        }
+        let changed = self
+            .catalog
+            .set_db_collation(name)
+            .map_err(EngineError::Storage)?;
+        Ok(changed)
+    }
+
     pub(crate) fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self
