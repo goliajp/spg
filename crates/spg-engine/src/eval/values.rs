@@ -18,7 +18,12 @@ pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value, mysql: bool) -> core::
     // collation compares by the folded form (case- and accent-insensitive,
     // PAD SPACE), matching ORDER BY / MIN / MAX.
     if mysql {
-        if let (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
+        // v7.38.17 — CHAR pads, TEXT does not.
+        if let (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
+            return spg_storage::mysql_compare_fold_char(x)
+                .cmp(&spg_storage::mysql_compare_fold_char(y));
+        }
+        if let (Value::Text(x), Value::Text(y)) = (a, b) {
             return spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y));
         }
     }

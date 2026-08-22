@@ -2218,7 +2218,11 @@ where
                     // is where `s >= 'DELTA'` and BETWEEN land, did not,
                     // so a CHAR column compared by bytes AND kept its
                     // padding.
-                    Value::Text(s) | Value::BpChar(s) if ctx.mysql_dialect => {
+                    // v7.38.17 — CHAR pads, TEXT does not.
+                    Value::BpChar(s) if ctx.mysql_dialect => {
+                        Value::text(spg_storage::mysql_compare_fold_char(&s))
+                    }
+                    Value::Text(s) if ctx.mysql_dialect => {
                         Value::text(spg_storage::mysql_compare_fold(&s))
                     }
                     Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
@@ -2646,8 +2650,12 @@ where
                             // case-insensitive column.
                             let folded = if *fold_operand {
                                 match (op_v, &when_v) {
-                                    (Value::Text(x), Value::Text(y))
-                                    | (Value::BpChar(x), Value::BpChar(y)) => Some((
+                                    // v7.38.17 — CHAR pads, TEXT does not.
+                                    (Value::BpChar(x), Value::BpChar(y)) => Some((
+                                        Value::text(spg_storage::mysql_compare_fold_char(x)),
+                                        Value::text(spg_storage::mysql_compare_fold_char(y)),
+                                    )),
+                                    (Value::Text(x), Value::Text(y)) => Some((
                                         Value::text(spg_storage::mysql_compare_fold(x)),
                                         Value::text(spg_storage::mysql_compare_fold(y)),
                                     )),

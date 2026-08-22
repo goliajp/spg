@@ -1,0 +1,125 @@
+# v7.38.17 — trailing spaces: MySQL says they count, MariaDB says they
+# do not, and SPG had been saying MariaDB's answer.
+#
+# `mysql_compare_fold` stripped trailing spaces before folding, and its
+# comment said why: "measured on MariaDB 11". That measurement was right
+# about MariaDB, whose default collation `utf8mb4_uca1400_ai_ci` is PAD
+# SPACE. SPG advertises `8.0.0-spg-v…` on the MySQL wire, and MySQL
+# 8.0's default `utf8mb4_0900_ai_ci` is NO PAD. The rule had been
+# calibrated against the engine we do not claim to be.
+#
+# Measured today against live containers, each engine in its OWN default
+# collation (the oracle images pin `utf8mb4_bin`, so a measurement that
+# forgets to declare shows neither engine's real behaviour):
+#
+#   rows 'alpha','alpha  ','Beta','beta'      MySQL 9.7.2   MariaDB 12.3.2
+#     WHERE s = 'alpha'                            1            1,2
+#     s IN ('alpha','beta')                      1,3,4        1,2,3,4
+#     COUNT(DISTINCT s)                            3             2
+#     GROUP BY s -> groups                         3             2
+#     JOIN ON v.s = r.s                       1/10, 2/20    all four
+#
+# SPG answered MariaDB's first four and MySQL's join — the same question
+# decided differently by two paths, which is the shape 7.38.13, 7.38.14
+# and 7.38.16 were each spent on. And `SELECT DISTINCT s` disagreed with
+# `count(DISTINCT s)` in the same session.
+#
+# CHAR is a separate question with the same answer in both engines: a
+# CHAR's trailing spaces are padding, which is a property of the TYPE.
+
+dialect mysql
+
+statement ok
+CREATE TABLE pv (k INT, s TEXT)
+
+statement ok
+INSERT INTO pv VALUES (1,'alpha'),(2,'alpha  '),(3,'Beta'),(4,'beta')
+
+# Trailing spaces are data: row 2 is not row 1.
+query I
+SELECT k FROM pv WHERE s = 'alpha' ORDER BY k
+----
+1
+
+query I
+SELECT k FROM pv WHERE s IN ('alpha','beta') ORDER BY k
+----
+1
+3
+4
+
+# Three paths, one question. They disagreed before this version.
+query I
+SELECT count(DISTINCT s) FROM pv
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT s FROM pv GROUP BY s) g
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT s FROM pv) d
+----
+3
+
+# Case still folds — this is NO PAD, not "no collation". Both 'Beta'
+# and 'beta' match; MySQL 9.7.2 answers 2 (I wrote 1 here from memory
+# and the runner caught it, which is the point of asking the oracle for
+# every number in this file).
+query I
+SELECT count(*) FROM pv WHERE s = 'BETA'
+----
+2
+
+statement ok
+CREATE TABLE pr (k INT, s TEXT)
+
+statement ok
+INSERT INTO pr VALUES (10,'alpha'),(20,'ALPHA  ')
+
+# The join pairs 'alpha' with 'alpha' and 'alpha  ' with 'ALPHA  ':
+# case folds, padding does not.
+query II
+SELECT pv.k, pr.k FROM pv JOIN pr ON pv.s = pr.s ORDER BY pv.k, pr.k
+----
+1
+10
+2
+20
+
+# CHAR: both engines ignore the padding, because it is the type's.
+statement ok
+CREATE TABLE pc (k INT, s CHAR(8))
+
+statement ok
+INSERT INTO pc VALUES (1,'alpha'),(2,'alpha  '),(3,'Beta'),(4,'beta')
+
+query I
+SELECT k FROM pc WHERE s = 'alpha' ORDER BY k
+----
+1
+2
+
+query I
+SELECT count(DISTINCT s) FROM pc
+----
+2
+
+# A CHAR compared against a literal that carries its own trailing
+# spaces: the CHAR's padding is stripped, the literal's is not, so this
+# finds nothing. MySQL 9.7.2 answers 0; MariaDB answers 1.
+query I
+SELECT count(*) FROM pc WHERE s = 'alpha  '
+----
+0
+
+statement ok
+DROP TABLE pv
+
+statement ok
+DROP TABLE pr
+
+statement ok
+DROP TABLE pc

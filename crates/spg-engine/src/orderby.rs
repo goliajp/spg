@@ -1748,11 +1748,16 @@ pub(crate) fn build_order_keys_bound(
             // fold used to swallow -- the column's declaration and an
             // explicit COLLATE in the query -- are both resolved into
             // `collations` before the scan starts.
-            let s = match v {
-                Value::Text(s) | Value::BpChar(s) => s.as_ref(),
+            // v7.38.17 — CHAR's padding is not data and TEXT's trailing
+            // spaces are, so the two types take different folds. Ordering
+            // has to agree with equality or a sort puts rows in an order
+            // the WHERE clause does not recognise.
+            let folded = match v {
+                Value::BpChar(s) => spg_storage::mysql_compare_fold_char(s),
+                Value::Text(s) => spg_storage::mysql_compare_fold(s),
                 _ => unreachable!("guarded by matches! above"),
             };
-            keys.push(OrderKey::Text(spg_storage::mysql_compare_fold(s)));
+            keys.push(OrderKey::Text(folded));
         } else {
             keys.push(value_to_order_key(v)?);
         }

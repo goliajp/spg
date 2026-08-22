@@ -7321,7 +7321,7 @@ fn encode_one_in(out: &mut String, v: &Value, mysql: bool) {
             return;
         }
         if let Value::BpChar(s) = v {
-            let folded = spg_storage::mysql_ci_fold(s.trim_end_matches(' '));
+            let folded = spg_storage::mysql_compare_fold_char(s);
             let _ = write!(out, "S{folded}|");
             return;
         }
@@ -7715,7 +7715,12 @@ fn extreme_cmp_in(
     // collation compares by the folded form (case- and accent-insensitive,
     // PAD SPACE), matching ORDER BY (round 411).
     if mysql {
-        if let (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
+        // v7.38.17 — CHAR pads, TEXT does not.
+        if let (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
+            return spg_storage::mysql_compare_fold_char(x)
+                .cmp(&spg_storage::mysql_compare_fold_char(y));
+        }
+        if let (Value::Text(x), Value::Text(y)) = (a, b) {
             return spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y));
         }
     }

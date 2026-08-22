@@ -945,9 +945,10 @@ fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
         // getting it: `s IN ('ALPHA','BETA')` on CHAR(8) answered 1 where
         // MySQL 9.7.1 answers 1,2. `eval/values.rs` had the pair right
         // and these two sites did not.
-        Value::Text(s) | Value::BpChar(s) if mysql => {
-            Value::text(spg_storage::mysql_compare_fold(&s))
-        }
+        // v7.38.17 — CHAR's padding is not data, TEXT's trailing
+        // spaces are. Two calls because they are two questions.
+        Value::BpChar(s) if mysql => Value::text(spg_storage::mysql_compare_fold_char(&s)),
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
         other => other,
     }
 }
@@ -4192,12 +4193,15 @@ fn eval_case_arm(
             Some(op_v) => {
                 let (l, r) = if ctx.mysql_dialect {
                     match (op_v, &when_value) {
-                        (Value::Text(x), Value::Text(y)) | (Value::BpChar(x), Value::BpChar(y)) => {
-                            (
-                                Value::text(spg_storage::mysql_compare_fold(x)),
-                                Value::text(spg_storage::mysql_compare_fold(y)),
-                            )
-                        }
+                        // v7.38.17 — CHAR pads, TEXT does not.
+                        (Value::BpChar(x), Value::BpChar(y)) => (
+                            Value::text(spg_storage::mysql_compare_fold_char(x)),
+                            Value::text(spg_storage::mysql_compare_fold_char(y)),
+                        ),
+                        (Value::Text(x), Value::Text(y)) => (
+                            Value::text(spg_storage::mysql_compare_fold(x)),
+                            Value::text(spg_storage::mysql_compare_fold(y)),
+                        ),
                         _ => (op_v.clone(), when_value),
                     }
                 } else {
