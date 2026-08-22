@@ -79,6 +79,24 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **An index on a column with a locale collation dropped rows.** A
+  column declared `COLLATE "en_US.utf8"`, five rows, `WHERE x > 'b'`:
+  PostgreSQL 18.4 answers `Bob client DateStyle Zebra` with an index and
+  without, SPG answered all four without one and `client` with one.
+  Three rows gone, silently, the moment an index existed.
+
+  `collate::column_key_is_bytewise` asked the dialect and the
+  `Collation` enum and never asked `collation_name`. A PostgreSQL column
+  with a locale collation stores `Collation::Binary` — the struct's
+  default, meaning *nothing was said about folding* — so under the PG
+  dialect the seek ran on byte keys while the predicate meant the
+  locale. The function's own documentation is about exactly this
+  failure; it had been written for the MySQL case only.
+
+  Such a column declines the seek and scans now, which is that
+  documentation's stated trade. `docs/DESIGN-2026-08-23-collation.md`
+  gives the seek back by carrying the collation in the key.
+
 - **A column's collation did not survive a dump.** `dump.rs` never
   emitted `COLLATE`, so a column declared `COLLATE "en_US.utf8"` came
   back byte-ordered after a dump/restore and every `ORDER BY` on it

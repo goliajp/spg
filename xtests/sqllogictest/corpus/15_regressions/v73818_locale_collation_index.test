@@ -1,0 +1,114 @@
+# v7.38.18 (S0) — an index on a column with a locale collation must not
+# change the answer.
+#
+# `collate::column_key_is_bytewise` asked the DIALECT and the `Collation`
+# enum and never asked `collation_name`. A PostgreSQL column declared
+# `COLLATE "en_US.utf8"` stores `Collation::Binary` — the struct's
+# default, meaning "nothing was said about folding" — so under the PG
+# dialect the seek ran on byte keys while the predicate meant the locale.
+#
+# Measured before the fix, five rows, `WHERE x > 'b'`:
+#
+#   PG 18.4, with an index and without   Bob client DateStyle Zebra
+#   SPG, no index                        Bob client DateStyle Zebra
+#   SPG, with an index                   client
+#
+# Three rows gone, silently. The function's own documentation is about
+# exactly this — "Answering `false` here costs a scan; the alternative
+# cost rows" — and it had been written for the MySQL case only.
+#
+# Every expectation below is PG 18.4's, taken with `enable_seqscan=off`
+# so the oracle really used its index too.
+#
+# The same table is asked twice: once with no index, once with one. Both
+# halves must agree, and that agreement is the test — a fixture that
+# only ran the indexed half would have passed before the fix as happily
+# as after it, since `client` is a perfectly plausible answer.
+
+statement ok
+CREATE TABLE lc(x text COLLATE "en_US.utf8")
+
+statement ok
+INSERT INTO lc VALUES ('Zebra'),('apple'),('DateStyle'),('client'),('Bob')
+
+query T
+SELECT x FROM lc WHERE x > 'b' ORDER BY x
+----
+Bob
+client
+DateStyle
+Zebra
+
+query T
+SELECT x FROM lc WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+client
+
+query T
+SELECT x FROM lc WHERE x IN ('Bob','zebra') ORDER BY x
+----
+Bob
+
+query T
+SELECT x FROM lc ORDER BY x LIMIT 2
+----
+apple
+Bob
+
+# --- now with an index over the same data ------------------------------
+
+statement ok
+CREATE INDEX lc_ix ON lc(x)
+
+query T
+SELECT x FROM lc WHERE x > 'b' ORDER BY x
+----
+Bob
+client
+DateStyle
+Zebra
+
+query T
+SELECT x FROM lc WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+client
+
+query T
+SELECT x FROM lc WHERE x = 'apple'
+----
+apple
+
+query T
+SELECT x FROM lc WHERE x IN ('Bob','zebra') ORDER BY x
+----
+Bob
+
+query T
+SELECT x FROM lc ORDER BY x LIMIT 2
+----
+apple
+Bob
+
+# A byte-wise column beside it keeps its seek: this fix declines the
+# index for LOCALE collations, not for every declared one.
+statement ok
+CREATE TABLE lb(x text COLLATE "C")
+
+statement ok
+INSERT INTO lb VALUES ('Zebra'),('apple'),('DateStyle'),('client'),('Bob')
+
+statement ok
+CREATE INDEX lb_ix ON lb(x)
+
+query T
+SELECT x FROM lb WHERE x > 'b' ORDER BY x
+----
+client
+
+statement ok
+DROP TABLE lb
+
+statement ok
+DROP TABLE lc
