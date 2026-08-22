@@ -227,23 +227,42 @@ fn main() -> ExitCode {
     // adding cases along either one would have found it.
     //
     // Counting cases cannot see that. Counting the intersection can.
-    let with_both: Vec<&FileReport> = groups
-        .iter()
-        .flat_map(|g| g.files.iter())
-        .filter(|f| f.mysql_with_index)
-        .collect();
-    println!(
-        "\nAXIS  mysql-semantics x index-present: {} file(s)",
-        with_both.len()
-    );
-    if with_both.is_empty() {
-        fail += 1;
-        println!(
-            "  EMPTY — no file runs a statement in MySQL semantics while an \
-             index exists. That intersection is where v7.38.16's four wrong \
-             answers were found; leaving it empty means they can come back \
-             unseen."
-        );
+    // Each entry is an axis PAIR that a real defect lived in, named with
+    // the release that found it. An entry earns its place by having cost
+    // something; the registry is not a wish list.
+    let axes: &[(&str, &str, fn(&FileReport) -> bool)] = &[
+        (
+            "mysql-semantics x index-present",
+            "v7.38.16: an indexed join returned the empty set; `s = 'ALPHA'` \
+             returned nothing; BETWEEN and ORDER BY LIMIT returned the wrong \
+             rows. All four needed both axes and the corpus had them in \
+             separate files.",
+            |f| f.mysql_with_index,
+        ),
+        (
+            "mysql-semantics x CHAR column",
+            "v7.38.16: `IN`, `>=` and BETWEEN on a CHAR column kept their \
+             case AND their padding, with no index involved — three sites \
+             folded Text and not BpChar.",
+            |f| f.mysql_with_char,
+        ),
+    ];
+    for (name, why, probe) in axes {
+        let n = groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .filter(|f| probe(f))
+            .count();
+        println!("\nAXIS  {name}: {n} file(s)");
+        if n == 0 {
+            fail += 1;
+            println!("  EMPTY — {why}");
+            println!(
+                "  A corpus can grow along either axis forever and never \
+                 cover this. Counting cases does not see it; counting the \
+                 intersection does."
+            );
+        }
     }
     println!("\nTOTAL          pass={pass} fail={fail} skip={skip}");
 
@@ -291,6 +310,8 @@ struct FileReport {
     /// v7.38.17 — did this file ever run a statement in MySQL semantics
     /// while an index existed? See `RunOutcome::mysql_with_index`.
     mysql_with_index: bool,
+    /// v7.38.17 — see `RunOutcome::mysql_with_char`.
+    mysql_with_char: bool,
     /// First few failures' short text. We don't dump every failure into the
     /// report — the top patterns are enough to drive v1.2 hot planning.
     fail_reasons: Vec<String>,
@@ -435,6 +456,7 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) 
                 skip: 0,
                 dialect: "unparsed",
                 mysql_with_index: false,
+                mysql_with_char: false,
                 fail_reasons: vec![format!("parse: {e}")],
             };
         }
@@ -500,6 +522,7 @@ fn run_one_file(path: &Path, diff_sink: &mut Vec<String>, claims: Option<&str>) 
         skip: outcome.skip,
         dialect: entered,
         mysql_with_index: outcome.mysql_with_index,
+        mysql_with_char: outcome.mysql_with_char,
         fail_reasons,
     }
 }

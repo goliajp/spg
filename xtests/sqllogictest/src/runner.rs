@@ -53,6 +53,15 @@ pub struct RunOutcome {
     ///
     /// Observed from the catalog, not counted out of the SQL text.
     pub mysql_with_index: bool,
+    /// v7.38.17 — MySQL semantics while a `CHAR(n)` column exists.
+    ///
+    /// The other axis pair v7.38.16 found empty. `CHAR` carries PAD
+    /// SPACE on top of the fold, and three comparison sites folded
+    /// `Value::Text` without `Value::BpChar`, so `IN`, `>=` and
+    /// `BETWEEN` on a CHAR column kept both their case and their
+    /// padding — with no index involved at all. Nothing in the corpus
+    /// put a CHAR column and MySQL semantics in the same file.
+    pub mysql_with_char: bool,
     pub per_record: Vec<Outcome>,
     /// r1052 (S2.3) — pg_regress-style unified diff blocks, one per
     /// failing query record, ready to concatenate into `slt.diffs`.
@@ -110,6 +119,9 @@ impl Runner {
                 out.entered_mysql = true;
                 if !out.mysql_with_index && self.any_table_has_index() {
                     out.mysql_with_index = true;
+                }
+                if !out.mysql_with_char && self.any_table_has_char_column() {
+                    out.mysql_with_char = true;
                 }
             } else {
                 out.entered_postgres = true;
@@ -185,6 +197,21 @@ impl Runner {
             .iter()
             .filter_map(|n| self.engine.catalog().get(n))
             .any(|t| !t.indices().is_empty())
+    }
+
+    /// Does any user table carry a `CHAR(n)` column right now?
+    fn any_table_has_char_column(&self) -> bool {
+        self.engine
+            .catalog()
+            .table_names()
+            .iter()
+            .filter_map(|n| self.engine.catalog().get(n))
+            .any(|t| {
+                t.schema()
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c.ty, spg_storage::DataType::Char(_)))
+            })
     }
 
     pub fn leftover_objects(&mut self) -> Vec<String> {
