@@ -10,6 +10,34 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Added
+
+- **MySQL warning diagnostics: `SHOW WARNINGS` and `@@warning_count`.**
+  Non-strict `sql_mode` bends a value that would not fit, and SPG has
+  bent it byte-for-byte correctly since v7.39 round 470 — `INSERT INTO w
+  (i, s) VALUES ('abc', 'toolong')` stores `0` and `'too'`, as MySQL
+  does. What was missing is that MySQL **tells you**. The change was
+  correct and silent, and silent is the worse half: an application that
+  checks after an insert had no way to learn its data had been altered.
+
+  Every code and wording is from a MySQL 9.7.2 run:
+
+  | statement | |
+  |---|---|
+  | `INSERT INTO w VALUES (1,'toolong')` | `1265 Data truncated for column 's' at row 1` |
+  | `INSERT INTO w VALUES ('abc','ok')` | `1366 Incorrect integer value: 'abc' for column 'i' at row 1` |
+  | `INSERT INTO w VALUES (99999999999,…)` | `1264 Out of range value for column 'i' at row 1` |
+  | `INSERT INTO w (s) VALUES ('ok')` | `1364 Field 'i' doesn't have a default value` |
+
+  Reading the area does not clear it; the next warning-generating
+  statement does, which is MySQL's rule. The area lives in the session
+  bag and swaps with it, because the server runs one engine for every
+  connection.
+
+  `SHOW WARNINGS` stays a MySQL surface: a PostgreSQL session still gets
+  the *unrecognized configuration parameter* error PG 18.4 gives, which
+  it briefly did not while this was being built.
+
 ### Fixed
 
 - **A scalar subquery returned the first character of a `CHAR(n)`.**

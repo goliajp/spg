@@ -4641,6 +4641,12 @@ impl Engine {
         // that raises it has no table name).
         let table = stmt.table.clone();
         self.bump_table_change(&table);
+        // v7.38.18 (C12) — MySQL clears the diagnostics area at the start
+        // of every statement that can produce warnings, so this is where
+        // the previous statement's warnings stop being visible. `SHOW
+        // WARNINGS` and `SELECT @@warning_count` do NOT clear it, which
+        // is why they are not on this path.
+        self.mysql_warnings.clear();
         self.exec_insert_inner(stmt)
             .map_err(|e| enrich_not_null(e, &table))
     }
@@ -4901,6 +4907,9 @@ impl Engine {
         // (immutable) table borrow.
         let overriding = stmt.overriding;
         let mut first_auto: Option<i64> = None;
+        // v7.38.18 (C12) — collected here, published to the session
+        // after the statement so `SHOW WARNINGS` can read it.
+        let mut stmt_warnings: Vec<crate::MysqlWarning> = Vec::new();
         let mut all_values = parse_insert_rows(
             table,
             Some(&cat_for_insert),
@@ -4921,6 +4930,7 @@ impl Engine {
             insert_non_strict,
             session_zone.as_ref(),
             Some(&insert_sess_bag),
+            &mut stmt_warnings,
         )?;
         // Stage 2 — FK enforcement on the immutable catalog.
         // Non-lexical lifetimes release the mutable borrow on
@@ -4938,6 +4948,8 @@ impl Engine {
         // legal PG sequence that used to fail here on the first INSERT.
         // (Placed after `table`'s borrow ends — the filter reads the
         // catalog again for the synthesised constraint name.)
+        // v7.38.18 (C12) — published once the table borrow above is done.
+        self.mysql_warnings.append(&mut stmt_warnings);
         let uniqueness: Vec<_> = if let Some(tx) = self.current_tx
             && let Some(st) = self.tx_catalogs.get(&tx)
         {
@@ -6989,6 +7001,10 @@ fn parse_insert_rows(
     // v7.39 (round 525) — and the session itself, for a column DEFAULT
     // that names one.
     insert_sess: Option<&crate::eval::DmlSession>,
+    // v7.38.18 (C12) — where the diagnostics go. MySQL bends a value
+    // in non-strict mode AND records what it bent; this function does
+    // the bending, so it is the one place that knows.
+    warnings_out: &mut Vec<crate::MysqlWarning>,
 ) -> Result<Vec<Vec<Value<'static>>>, EngineError> {
     use spg_sql::ast::Overriding;
     // v7.39 (round 523) — the session's date order, which the
@@ -7088,7 +7104,10 @@ fn parse_insert_rows(
             }
         }
     }
+    // MySQL numbers the rows of one statement from 1 in its warnings.
+    let mut row_no = 0usize;
     for tuple in rows {
+        row_no += 1;
         // v7.38 (read01 sweep) — with no explicit column list, PG lets a row
         // supply FEWER values than the table has columns; the trailing columns
         // take their DEFAULT (or NULL). A row is still rejected for supplying
@@ -7215,7 +7234,15 @@ fn parse_insert_rows(
                 // bend an explicit NULL, which MariaDB still rejects with
                 // 1048 whatever the mode.
                 let raw = if ignore || (non_strict && (omitted || !raw.is_null())) {
-                    crate::conversions::mysql_ignore_fit(raw, col)
+                    // v7.38.18 (C12) — bend it, and say what was bent.
+                    let before = raw.clone();
+                    let bent = crate::conversions::mysql_ignore_fit(raw, col);
+                    if let Some(w) =
+                        crate::conversions::mysql_fit_warning(&before, &bent, col, row_no, omitted)
+                    {
+                        warnings_out.push(w);
+                    }
+                    bent
                 } else {
                     raw
                 };
@@ -7301,8 +7328,16 @@ fn parse_insert_rows(
                 // v7.39 (round 470) — the positional path names every column,
                 // so nothing here is omitted and an explicit NULL stays an
                 // explicit NULL.
-                let raw = if ignore || (non_strict && !raw.is_null()) {
-                    crate::conversions::mysql_ignore_fit(raw, col)
+                let raw = if ignore || non_strict {
+                    // v7.38.18 (C12) — bend it, and say what was bent.
+                    let before = raw.clone();
+                    let bent = crate::conversions::mysql_ignore_fit(raw, col);
+                    if let Some(w) =
+                        crate::conversions::mysql_fit_warning(&before, &bent, col, row_no, false)
+                    {
+                        warnings_out.push(w);
+                    }
+                    bent
                 } else {
                     raw
                 };

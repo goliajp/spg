@@ -2995,6 +2995,73 @@ fn column_int_bounds(schema: &ColumnSchema) -> Option<(i128, i128)> {
 /// SPG cannot represent MySQL's answer (a `'0000-00-00'` zero date, an ENUM's
 /// empty error-member) the statement fails loudly rather than silently
 /// storing a value MySQL would not have stored.
+/// v7.38.18 (C12) — what MySQL would have said about a value that
+/// [`mysql_ignore_fit`] bent, or `None` if it did not bend it.
+///
+/// Derived from the before/after pair rather than reported out of the
+/// conversion, which stays a pure function of value and column.
+///
+/// Every code and every wording is from a MySQL 9.7.2 run, not from
+/// documentation — an application switching on an errno has to see the
+/// errno it would have seen:
+///
+/// ```text
+/// INSERT INTO w VALUES (1,'toolong')     1265 Data truncated for column 's' at row 1
+/// INSERT INTO w VALUES ('abc','ok')      1366 Incorrect integer value: 'abc' for column 'i' at row 1
+/// INSERT INTO w VALUES (99999999999,..)  1264 Out of range value for column 'i' at row 1
+/// INSERT INTO w (s) VALUES ('ok')        1364 Field 'i' doesn't have a default value
+/// ```
+pub(crate) fn mysql_fit_warning(
+    before: &Value<'_>,
+    after: &Value<'_>,
+    schema: &ColumnSchema,
+    row: usize,
+    omitted: bool,
+) -> Option<crate::MysqlWarning> {
+    if before == after {
+        return None;
+    }
+    let col = &schema.name;
+    // An omitted NOT NULL column is a different complaint from a value
+    // that would not fit.
+    if omitted || before.is_null() {
+        return Some(crate::MysqlWarning {
+            level: "Warning",
+            code: 1364,
+            message: alloc::format!("Field '{col}' doesn't have a default value"),
+        });
+    }
+    let numeric_col = matches!(
+        schema.ty,
+        DataType::SmallInt | DataType::Int | DataType::BigInt | DataType::Float | DataType::Real
+    );
+    if numeric_col {
+        // A string given to a numeric column is 1366; a number that did
+        // not fit its range is 1264.
+        return Some(if matches!(before, Value::Text(_) | Value::BpChar(_)) {
+            crate::MysqlWarning {
+                level: "Warning",
+                code: 1366,
+                message: alloc::format!(
+                    "Incorrect integer value: '{}' for column '{col}' at row {row}",
+                    crate::eval::value_to_text(before)
+                ),
+            }
+        } else {
+            crate::MysqlWarning {
+                level: "Warning",
+                code: 1264,
+                message: alloc::format!("Out of range value for column '{col}' at row {row}"),
+            }
+        });
+    }
+    Some(crate::MysqlWarning {
+        level: "Warning",
+        code: 1265,
+        message: alloc::format!("Data truncated for column '{col}' at row {row}"),
+    })
+}
+
 pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Value<'static> {
     if v.is_null() {
         if schema.nullable {
