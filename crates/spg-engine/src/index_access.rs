@@ -569,6 +569,8 @@ pub(crate) fn try_index_seek_positions(
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
                 || idx.expression.is_some()
+                // v7.38.18 (S0) — see `composite_has_collated_key`.
+                || composite_has_collated_key(table, idx, schema_cols)
             {
                 continue;
             }
@@ -1501,6 +1503,8 @@ pub(crate) fn try_index_seek<'a>(
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
                 || idx.expression.is_some()
+                // v7.38.18 (S0) — see `composite_has_collated_key`.
+                || composite_has_collated_key(table, idx, schema_cols)
             {
                 continue;
             }
@@ -2589,6 +2593,32 @@ fn collated_probe(coll: &str, value: &Value<'_>) -> Option<IndexKey> {
 /// Every seek asks this before using one.
 pub(crate) fn index_is_usable(table: &Table, idx: &spg_storage::Index) -> bool {
     table.index_collation(idx).is_none() || table.expr_index_is_complete(&idx.name)
+}
+
+/// v7.38.18 (S0) — does this COMPOSITE index have a key column whose
+/// probe would be built as an ICU sort key?
+///
+/// Its entries are tuples of raw cells, built by storage. `probe_key`
+/// encodes a locale-collated column's probe as a sort key, so the two
+/// would land in different spaces and the seek would find nothing —
+/// measured on the differential corpus, `WHERE id = 7 AND s = 'row7'`
+/// over `ix(id, s)`: PostgreSQL 18.4 answers 1 and SPG answered 0.
+///
+/// Declining costs a scan. Encoding the tuple's text components the same
+/// way is the fix that gives the seek back, and it is not done here.
+fn composite_has_collated_key(
+    table: &Table,
+    idx: &spg_storage::Index,
+    schema_cols: &[ColumnSchema],
+) -> bool {
+    if idx.extra_column_positions.is_empty() {
+        return false;
+    }
+    let db_coll = table.db_collation();
+    core::iter::once(idx.column_position)
+        .chain(idx.extra_column_positions.iter().copied())
+        .filter_map(|p| schema_cols.get(p))
+        .any(|c| collated_column(c, db_coll).is_some())
 }
 
 pub(crate) fn resolve_col_literal_pair(

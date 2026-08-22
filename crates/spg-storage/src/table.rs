@@ -1199,6 +1199,26 @@ impl Table {
         // Filtering here rather than at each of the dozen seeks is what
         // makes that safe by construction instead of by remembering.
         let usable = |i: &&Index| {
+            // v7.38.18 — an EXPRESSION index is not this column's index.
+            // Its tree holds `lower(s)`, not `s`, so a probe built from
+            // the column's own value asks it a question its keys cannot
+            // answer. Measured on a plain `C` database, before any of
+            // this version's collation work: three rows, `WHERE s =
+            // 'Row7'` answered 1, then `CREATE INDEX ix_expr ON
+            // ix((lower(s)))` and the same query answered 0. PG 18.4
+            // answers 1 both times, with `enable_seqscan=off` so it
+            // really used the index.
+            //
+            // v7.38.16 fixed this shape for GIN — "an index answered a
+            // question its keys could not answer, and the caller read
+            // the empty result as the answer" — and the B-tree copy of
+            // it was two lines away. The expression-index seek is a
+            // separate path (`try_expression_index_seek`) and keeps
+            // working; this only stops the EXPRESSION index from
+            // standing in for a COLUMN one.
+            if i.expression.is_some() {
+                return false;
+            }
             Self::index_collation_in(&self.schema, i, self.db_collation.as_deref().unwrap_or("C"))
                 .is_none()
                 || self.expr_index_complete.contains(&i.name)
@@ -1212,7 +1232,9 @@ impl Table {
             })
             .or_else(|| {
                 self.indices.iter().find(|i| {
-                    i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_))
+                    i.column_position == column_position
+                        && matches!(i.kind, IndexKind::Nsw(_))
+                        && i.expression.is_none()
                 })
             })
     }
@@ -2026,6 +2048,16 @@ impl Table {
         db: &'a str,
     ) -> Option<&'a str> {
         if idx.expression.is_some() {
+            return None;
+        }
+        // v7.38.18 (S0) — a COMPOSITE index keys on a tuple built from
+        // raw cells, and this crate builds that tuple. It is not a
+        // supplied-key index, so it must not be reported as one: doing
+        // so would put its entries in one space and its probes in
+        // another, and `WHERE id = 7 AND s = 'row7'` answered 0 where
+        // PG 18.4 answers 1. The engine's composite seek declines such
+        // an index instead, which costs a scan.
+        if !idx.extra_column_positions.is_empty() {
             return None;
         }
         let col = schema.columns.get(idx.column_position)?;

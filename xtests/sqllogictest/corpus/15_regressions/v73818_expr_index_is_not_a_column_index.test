@@ -1,0 +1,71 @@
+# v7.38.18 — an expression index must not stand in for a column index.
+#
+# This is a defect the SHIPPED build has, on a plain `C` database, with
+# no collation involved. Three rows:
+#
+#   WHERE s = 'Row7'                              1
+#   CREATE INDEX ix_expr ON ix((lower(s)))
+#   WHERE s = 'Row7'                              0     <-- one row gone
+#
+# `Table::index_on` returned the first B-tree whose `column_position`
+# matched, and an expression index carries the anchor column there. Its
+# tree holds `lower(s)`, so a probe built from the column's own value
+# asks it a question its keys cannot answer, and the empty answer reads
+# exactly like "no matching rows".
+#
+# v7.38.16 fixed this shape for GIN — "an index answered a question its
+# keys could not answer, and the caller read the empty result as the
+# answer" — and the B-tree copy of it was two lines away in the same
+# function.
+#
+# Expectations from PG 18.4 with `enable_seqscan=off`, so the oracle
+# really used its index: 1 before the index and 1 after.
+#
+# The lower-case row is the control. It matches by coincidence — its
+# value and `lower()` of it are the same string — so a fixture built
+# only from lower-case data passes with the defect present.
+
+statement ok
+CREATE TABLE ei(s text)
+
+statement ok
+INSERT INTO ei VALUES ('Row7'),('row8'),('ROW9')
+
+query I
+SELECT count(*) FROM ei WHERE s = 'Row7'
+----
+1
+
+statement ok
+CREATE INDEX ei_expr ON ei((lower(s)))
+
+query I
+SELECT count(*) FROM ei WHERE s = 'Row7'
+----
+1
+
+query I
+SELECT count(*) FROM ei WHERE s = 'row8'
+----
+1
+
+query I
+SELECT count(*) FROM ei WHERE s = 'ROW9'
+----
+1
+
+# The expression index itself still answers its own question, through
+# the seek written for it. This stops an EXPRESSION index standing in
+# for a COLUMN one; it does not retire the expression index.
+query I
+SELECT count(*) FROM ei WHERE lower(s) = 'row7'
+----
+1
+
+query I
+SELECT count(*) FROM ei WHERE lower(s) = 'row9'
+----
+1
+
+statement ok
+DROP TABLE ei

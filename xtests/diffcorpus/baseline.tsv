@@ -13,7 +13,7 @@
 12-domain-enum-range	0
 13-partition-inherit	2
 14-errors-sqlstate	6
-15-catalog	2
+15-catalog	0
 16-copy-prepare-cursor	0
 17-acl-rls-fts	2
 18-sqlstate	4

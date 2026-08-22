@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 202 | 0 | 0 | 100.0% | postgres × 14 |
+| `15_regressions` | 212 | 0 | 0 | 100.0% | postgres × 15 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 421 | 0 | 0 | 100.0% | mysql × 26 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
@@ -41,6 +41,7 @@ Per-corpus pass / fail / skip:
 | `v73818_analyze_same_query_string.test` | 5 | 0 | 0 | postgres |
 | `v73818_collated_index_is_used.test` | 13 | 0 | 0 | postgres |
 | `v73818_collation_survives_dump.test` | 11 | 0 | 0 | postgres |
+| `v73818_expr_index_is_not_a_column_index.test` | 10 | 0 | 0 | postgres |
 | `v73818_locale_collation_index.test` | 18 | 0 | 0 | postgres |
 | `v73818_pg_settings_full.test` | 14 | 0 | 0 | postgres |
 | `v73818_pg_stats.test` | 8 | 0 | 0 | postgres |

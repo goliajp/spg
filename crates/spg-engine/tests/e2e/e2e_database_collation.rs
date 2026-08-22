@@ -149,6 +149,50 @@ fn an_index_on_an_inheriting_column_agrees_with_the_scan() {
     );
 }
 
+/// A COMPOSITE index over an inheriting text column must not change the
+/// answer either.
+///
+/// Its entries are tuples of raw cells, built by storage, while
+/// `probe_key` encodes a locale-collated column's probe as an ICU sort
+/// key — two different spaces, and the seek finds nothing in the wrong
+/// one. The differential corpus caught this as `WHERE id = 7 AND s =
+/// 'row7'` answering 0 where PostgreSQL 18.4 answers 1.
+///
+/// Sixty rows, because the composite seek has a cost cap and a tiny
+/// table scans regardless: a fixture built on four rows passes with the
+/// defect present.
+#[test]
+fn a_composite_index_over_an_inheriting_column_agrees_with_the_scan() {
+    let mut e = Engine::new();
+    e.set_database_collation("en_US.utf8").unwrap();
+    e.execute("CREATE TABLE ci(id INT, s TEXT)").unwrap();
+    for i in 1..=60 {
+        e.execute(&format!("INSERT INTO ci VALUES ({i}, 'row{i}')"))
+            .unwrap();
+    }
+    let before = one(
+        &mut e,
+        "SELECT count(*) FROM ci WHERE id = 7 AND s = 'row7'",
+    );
+    assert_eq!(before, "BigInt(1)");
+    e.execute("CREATE INDEX ci_multi ON ci(id, s)").unwrap();
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT count(*) FROM ci WHERE id = 7 AND s = 'row7'"
+        ),
+        before,
+        "the composite index must not change the answer"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT count(*) FROM ci WHERE id = 40 AND s = 'row40'"
+        ),
+        "BigInt(1)"
+    );
+}
+
 /// Set once. PostgreSQL refuses `ALTER DATABASE … LC_COLLATE` and so
 /// does this, because every index key here was built under what it has.
 #[test]
