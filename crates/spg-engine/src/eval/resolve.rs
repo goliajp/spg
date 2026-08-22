@@ -137,9 +137,9 @@ pub(super) fn collation_fold_for_compare(
         // alpha/Beta/GAMMA/delta in CHAR(8), `s BETWEEN 'ALPHA' AND
         // 'DELTA'` answered 1,4 where MySQL answers 1,2,4 — 'Beta' lost
         // to case and 'delta   ' lost to its own padding.
-        Value::Text(s) | Value::BpChar(s) if mysql => {
-            Value::text(spg_storage::mysql_compare_fold(&s))
-        }
+        // v7.38.17 — see `mysql_compare_fold`: CHAR pads, TEXT does not.
+        Value::BpChar(s) if mysql => Value::text(spg_storage::mysql_compare_fold_char(&s)),
+        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
         Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
         other => other,
     };

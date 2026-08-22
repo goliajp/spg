@@ -8,6 +8,46 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Under MySQL, trailing spaces stopped counting — because the rule was
+  measured against MariaDB.** `'alpha'` and `'alpha  '` were the same
+  value to a comparison, a `DISTINCT`, a `GROUP BY` and an `IN` list.
+  The function that decided this stripped trailing spaces before
+  folding, and its own comment said why: *"measured on MariaDB 11"*.
+
+  MariaDB's default collation is PAD SPACE, so that measurement was
+  right about MariaDB. SPG advertises `8.0.0-spg-v…` on the MySQL wire,
+  and MySQL 8.0's default `utf8mb4_0900_ai_ci` is **NO PAD**. The rule
+  had been calibrated against the engine we do not claim to be.
+
+  Measured against live containers, each engine in its **own** default
+  collation, over rows `'alpha'`, `'alpha  '`, `'Beta'`, `'beta'`:
+
+  | | MySQL 9.7.2 | MariaDB 12.3.2 | SPG before |
+  |---|---|---|---|
+  | `WHERE s = 'alpha'` | 1 | 1,2 | 1,2 |
+  | `s IN ('alpha','beta')` | 1,3,4 | 1,2,3,4 | 1,2,3,4 |
+  | `COUNT(DISTINCT s)` | 3 | 2 | 2 |
+  | `GROUP BY s` groups | 3 | 2 | 2 |
+  | `JOIN ON v.s = r.s` | 1/10, 2/20 | all four | 1/10, 2/20 |
+
+  Note the last row: SPG answered MariaDB's question four times and
+  MySQL's once. `SELECT DISTINCT s` and `count(DISTINCT s)` disagreed
+  with each other in the same session. Eight of eight now match MySQL.
+
+- **`CHAR(n)` keeps its old answer, and now for a stated reason.** A
+  CHAR's trailing spaces are padding — a property of the TYPE, not the
+  collation — and MySQL and MariaDB agree about them. The fold is two
+  functions now, `mysql_compare_fold` for TEXT and
+  `mysql_compare_fold_char` for CHAR, so a site cannot pick the wrong
+  one by writing one name. Cross-type is measured too: `CHAR = 'alpha  '`
+  is 0 on MySQL, because only the CHAR side's padding is stripped.
+
+---
+
 ## [7.38.16] — 2026-08-22
 
 ### Fixed

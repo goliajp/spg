@@ -177,15 +177,25 @@ DROP TABLE ord_ci
 statement ok
 DROP TABLE ord_bin
 
-# Trailing spaces still PAD-SPACE-fold on the default column, and still
-# do not on the byte-wise one.
+# v7.38.17 — this said "trailing spaces still PAD-SPACE-fold on the
+# default column" and expected 2. That is MariaDB's rule. MySQL's
+# default `utf8mb4_0900_ai_ci` is NO PAD, and SPG advertises MySQL 8.0
+# on the wire, so `'a '` is a third value. Measured on 9.7.2:
+# `COUNT(*)` is 3 and the surviving values are `[a] [a ] [bar]`.
 statement ok
 INSERT INTO ci_t VALUES ('a ')
 
 query I
 SELECT COUNT(*) FROM (SELECT DISTINCT t FROM ci_t) g
 ----
-2
+3
+
+query T
+SELECT t FROM (SELECT DISTINCT t FROM ci_t) g ORDER BY t
+----
+a
+a 
+bar
 
 statement ok
 INSERT INTO bin_t VALUES ('a ')

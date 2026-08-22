@@ -10336,9 +10336,14 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
 /// keeps the byte-exact `value_cmp` path).
 fn mysql_dedup_fold(v: &Value) -> Option<String> {
     match v {
-        Value::Text(s) | Value::BpChar(s) => {
-            Some(spg_storage::mysql_ci_fold(s.trim_end_matches(' ')))
-        }
+        // v7.38.17 — CHAR's trailing spaces are padding; TEXT's are
+        // data. The comment above named `utf8mb4_uca1400_ai_ci`, which
+        // is MariaDB's default and PAD SPACE. SPG advertises MySQL 8.0,
+        // whose default is NO PAD, so `'alpha'` and `'alpha  '` are two
+        // rows to a `SELECT DISTINCT` and one to `count(DISTINCT)` was
+        // the same question answered twice.
+        Value::BpChar(s) => Some(spg_storage::mysql_compare_fold_char(s)),
+        Value::Text(s) => Some(spg_storage::mysql_compare_fold(s)),
         _ => None,
     }
 }

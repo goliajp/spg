@@ -1722,14 +1722,51 @@ pub fn mysql_ci_fold(s: &str) -> String {
     out
 }
 
-/// v7.39 (round 375) — the fold used to COMPARE / GROUP / de-dup text on
-/// the MySQL dialect. Its default collation is PAD SPACE: trailing spaces
-/// do not affect a comparison (`'a' = 'a '`, `'' = ' '`, measured on
-/// MariaDB 11), so they are stripped before the case/accent fold. Only
-/// literal spaces pad — a tab or other whitespace is significant — and
-/// this is NOT used by `LIKE`, whose pattern treats a trailing space
-/// literally.
+/// The fold used to COMPARE / GROUP / de-dup text on the MySQL dialect:
+/// case- and accent-insensitive, and **trailing spaces significant**.
+///
+/// v7.38.17 — this used to strip trailing spaces first, and its comment
+/// said why: "measured on MariaDB 11". MariaDB's default collation is
+/// PAD SPACE, so that measurement was right about MariaDB. SPG
+/// advertises `8.0.0-spg-v…` on the MySQL wire, and MySQL 8.0's default
+/// `utf8mb4_0900_ai_ci` is **NO PAD**. The rule had been calibrated
+/// against the engine we do not claim to be.
+///
+/// Measured today, MySQL 9.7.2 against MariaDB 12.3.2, each in its own
+/// default collation, over rows `'alpha'` and `'alpha  '`:
+///
+/// | | MySQL | MariaDB |
+/// |---|---|---|
+/// | `WHERE s = 'alpha'` | 1 | 1,2 |
+/// | `s IN ('alpha','beta')` | 1,3,4 | 1,2,3,4 |
+/// | `COUNT(DISTINCT s)` | 3 | 2 |
+/// | `GROUP BY s` groups | 3 | 2 |
+/// | `JOIN ON v.s = r.s` | 1/10, 2/20 | all four pairs |
+///
+/// SPG answered MariaDB's four and MySQL's join — the same question
+/// decided differently by two paths, which is the shape v7.38.13,
+/// v7.38.14 and v7.38.16 were each spent on.
+///
+/// `CHAR(n)` is a separate question and keeps its old answer: BOTH
+/// engines ignore a CHAR's trailing spaces, because that is a property
+/// of the TYPE rather than of the collation. Use
+/// [`mysql_compare_fold_char`] for a `BpChar` cell.
+///
+/// Only literal spaces ever padded — a tab is significant either way —
+/// and neither function is used by `LIKE`, whose pattern treats a
+/// trailing space literally.
 pub fn mysql_compare_fold(s: &str) -> String {
+    mysql_ci_fold(s)
+}
+
+/// [`mysql_compare_fold`] for a `CHAR(n)` cell, whose trailing spaces
+/// are padding rather than data.
+///
+/// Measured on both engines: over `'alpha'` and `'alpha  '` in a
+/// `CHAR(8)`, `WHERE s = 'alpha'` returns both rows and
+/// `COUNT(DISTINCT s)` is 2 (four rows folding to two values) — MySQL
+/// 9.7.2 and MariaDB 12.3.2 agree, unlike the VARCHAR case above.
+pub fn mysql_compare_fold_char(s: &str) -> String {
     mysql_ci_fold(s.trim_end_matches(' '))
 }
 
