@@ -392,6 +392,34 @@ fn main() {
             }
             let total = t_total.elapsed();
             println!("total {total:?} — report {}", report.display());
+            // v7.38.17 — name what did NOT run.
+            //
+            // `full` holds seven steps that nothing schedules: CI has a
+            // push job and a daily drop-in check and neither touches
+            // the tier, so those steps run only when a person types
+            // them. A release read a green `prerelease` and stopped
+            // there, which reads as "everything green" and is not.
+            //
+            // A total that cannot show what it excluded is a total that
+            // overstates — the same failure as a corpus summary that
+            // could not show the dialect its files ran in.
+            if tier != "full" {
+                let ran: std::collections::BTreeSet<&str> =
+                    tier_steps.iter().map(|s| s.name.as_str()).collect();
+                let skipped: Vec<&str> = m
+                    .tier("full")
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .filter(|n| !ran.contains(n))
+                    .collect();
+                if !skipped.is_empty() {
+                    println!(
+                        "NOT RUN ({} full-tier step(s), no schedule runs these): {}",
+                        skipped.len(),
+                        skipped.join(", ")
+                    );
+                }
+            }
             // v7.38.14 — the banded tier cap, measured rather than guessed.
             //
             // 480 s rejected a no-op: HEAD plus a COMMENT on `spg-storage`,
