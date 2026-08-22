@@ -242,6 +242,16 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     let mut roster = Roster::new();
     let port = roster.spawn_server("fver", &bin, &tmp, Duration::from_secs(15))?;
     let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite")?;
+    // The fixture's own name, so a failure sends the reader to the
+    // directory that actually failed. These messages said `v7.38.15`
+    // literally, which was the same aging lie as the path they came
+    // from — and an error naming the wrong artefact is worse than one
+    // naming none.
+    let fx = fixture
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
     let expected = std::fs::read_to_string(fixture.join("expected.txt"))
         .map_err(|e| format!("expected.txt: {e}"))?;
     for line in expected.lines() {
@@ -255,7 +265,7 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
         };
         let r = conn.simple_query(&sql)?;
         if let Some(e) = r.error {
-            return Err(format!("v7.38.15 fixture: {sql}: {e}"));
+            return Err(format!("{fx} fixture: {sql}: {e}"));
         }
         let got = r
             .rows
@@ -265,7 +275,7 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
             .unwrap_or_default();
         if got != want {
             return Err(format!(
-                "v7.38.15 fixture: {key}: want {want}, got {got} — the previous \
+                "{fx} fixture: {key}: want {want}, got {got} — the previous \
                  release's data did not survive the current binary"
             ));
         }
@@ -275,12 +285,7 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     // Name the fixture that was opened. The old line said "v7.38.15"
     // whatever ran, which is how a report keeps announcing coverage a
     // step no longer has.
-    let opened = fixture
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("?")
-        .to_string();
-    Ok(format!("{smoke}; {opened} dir direct-open verified"))
+    Ok(format!("{smoke}; {fx} dir direct-open verified"))
 }
 
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
