@@ -1,0 +1,87 @@
+# v7.38.18 (C12) — the LIFETIME of MySQL's diagnostics area.
+#
+# 16_warning_diagnostics pinned what a warning says. This pins how long
+# it stays true, which is the half that was wrong: SPG published a
+# warning and then never took it back, so a client checking after the
+# wrong statement was told its data had been bent when it had not.
+#
+# Every expectation below was read from MySQL 9 (spg-bench-mysql) on
+# 2026-08-23. The shape is not "clear on entry" — that would make the
+# first read answer 0 and lose the warning entirely. A statement
+# replaces the visible set when it ENDS, and the statements that read
+# the area replace nothing, which is why two reads in a row agree.
+
+dialect mysql
+
+statement ok
+SET sql_mode=''
+
+statement ok
+CREATE TABLE wl(a tinyint)
+
+statement ok
+INSERT INTO wl VALUES (999),(1000)
+
+# The reading statement sees the INSERT's two.
+query I
+SELECT @@warning_count
+----
+2
+
+# ...and then its own, which are none. This is the line that fails if
+# the area is cleared on entry instead of published on exit: it would
+# read 0 above and 0 here, agreeing by accident.
+query I
+SELECT @@warning_count
+----
+0
+
+statement ok
+INSERT INTO wl VALUES (999),(1000)
+
+# SHOW does not publish, so it does not consume. Twice in a row, same
+# answer, and SHOW WARNINGS between them changes nothing.
+query I
+SHOW COUNT(*) WARNINGS
+----
+2
+
+query I
+SHOW COUNT(*) WARNINGS
+----
+2
+
+query TIT
+SHOW WARNINGS
+----
+Warning
+1264
+Out of range value for column 'a' at row 1
+Warning
+1264
+Out of range value for column 'a' at row 2
+
+query I
+SHOW COUNT(*) WARNINGS
+----
+2
+
+# An ordinary statement that warns about nothing still publishes its
+# empty area, and the INSERT's warnings stop being visible.
+query I
+SELECT 1
+----
+1
+
+query I
+SHOW COUNT(*) WARNINGS
+----
+0
+
+query I
+SELECT count(*) FROM wl
+----
+4
+
+statement ok
+DROP TABLE wl

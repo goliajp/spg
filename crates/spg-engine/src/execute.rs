@@ -757,6 +757,25 @@ impl Engine {
         // keep getting that: a compatibility surface that leaks into
         // the other dialect is a divergence of its own, and I put one
         // there for a few minutes before checking.
+        // v7.38.18 (C12) — `SHOW COUNT(*) WARNINGS`, the size of that
+        // same diagnostics area. MySQL 9 answers it with one row of one
+        // column NAMED `@@session.warning_count`, which is the name a
+        // client library keys on; the parser folds the whole phrase to
+        // this one sentinel so no GUC can collide with it. Same dialect
+        // gate as `SHOW WARNINGS` above, for the same reason.
+        if self.backslash_escapes && name.eq_ignore_ascii_case("count(*) warnings") {
+            let cols = alloc::vec![ColumnSchema::new(
+                alloc::string::String::from("@@session.warning_count"),
+                spg_storage::DataType::BigInt,
+                false
+            )];
+            let n = i64::try_from(self.mysql_warnings.len()).unwrap_or(i64::MAX);
+            return Ok(QueryResult::Rows {
+                columns: cols,
+                rows: alloc::vec![Row::new(alloc::vec![Value::BigInt(n)])],
+            });
+        }
+
         if self.backslash_escapes && name.eq_ignore_ascii_case("warnings") {
             let cols = alloc::vec![
                 ColumnSchema::new(
@@ -1502,7 +1521,50 @@ impl Engine {
         result
     }
 
+    /// v7.38.18 (C12) — the one gate MySQL's diagnostics area passes
+    /// through. Every statement runs inside this; the body below is the
+    /// dispatch itself.
     pub(crate) fn dispatch_stmt_inner(
+        &mut self,
+        stmt: Statement,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        // v7.38.18 (C12) — MySQL's diagnostics area belongs to ONE
+        // statement, and a read returns the PREVIOUS statement's.
+        // Measured on MySQL 9, after an INSERT that bends two values:
+        //
+        //   SELECT @@warning_count      -> 2   (the INSERT's)
+        //   SELECT @@warning_count      -> 0   (the first SELECT's own)
+        //   SHOW COUNT(*) WARNINGS      -> unchanged; reads do not publish
+        //
+        // So the visible set is replaced when a statement ENDS, not
+        // when it starts — clearing on entry would make the first read
+        // answer 0 and lose the warning entirely. Readers publish
+        // nothing, which is why two reads in a row agree.
+        //
+        // Without any of this the warnings never expire, and a client
+        // that checks after the wrong statement is told its data was
+        // bent when it was not — worse than silence, because it is a
+        // claim. I shipped exactly that a few hours ago; it took
+        // writing `SHOW COUNT(*) WARNINGS` to notice.
+        //
+        // Same place as the NOTICE clear below, and for the same
+        // reason: the one point the simple-query and prepared paths
+        // both pass through.
+        let publishes_warnings = !matches!(&stmt, Statement::ShowParameter(n)
+            if n.eq_ignore_ascii_case("warnings")
+                || n.eq_ignore_ascii_case("count(*) warnings"));
+        if publishes_warnings {
+            self.mysql_stmt_warnings.clear();
+        }
+        let result = self.dispatch_stmt_body(stmt, cancel);
+        if publishes_warnings {
+            self.mysql_warnings = core::mem::take(&mut self.mysql_stmt_warnings);
+        }
+        result
+    }
+
+    fn dispatch_stmt_body(
         &mut self,
         stmt: Statement,
         cancel: CancelToken<'_>,

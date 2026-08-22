@@ -35,18 +35,22 @@ SELECT @@warning_count
 ----
 1
 
-# Asking twice does not clear it.
+# Asking twice does NOT give the same answer, and this line was wrong
+# in v7.38.17: it read `1`, which was SPG's behaviour rather than
+# MySQL's. MySQL 9 answers 0 — the first SELECT published its own
+# (empty) diagnostics area on the way out, so the second sees that.
+# The lifetime rules live in 17_warning_area_lifetime.test; this file
+# now just has to stop asserting the opposite of them.
 query I
 SELECT @@warning_count
 ----
-1
+0
 
+# Same reason: the INSERT's warning stopped being visible two
+# statements ago. Verified against MySQL 9 — it prints nothing here.
 query TIT
 SHOW WARNINGS
 ----
-Warning
-1265
-Data truncated for column 's' at row 1
 
 statement ok
 INSERT INTO wd VALUES ('abc','ok')

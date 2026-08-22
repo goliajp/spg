@@ -40,6 +40,12 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **`SHOW COUNT(*) WARNINGS`** — MySQL's spelling for the size of the
+  diagnostics area. One row, one column, named `@@session.warning_count`
+  the way MySQL 9 names it, because that is the name a client keys on.
+  MySQL-dialect only: PostgreSQL 18.4 answers the phrase with
+  `syntax error at or near "("` and a PG session keeps getting that.
+
 - **`pg_stats`** — the readable view over `pg_statistic`, and the one a
   person types to ask whether `ANALYZE` did anything. PostgreSQL 18.4's
   seventeen columns in its order. The arrays SPG does not model are
@@ -57,6 +63,25 @@ the current build; this file is a release-organized view.
   testable over the same wire: SPG reads the name.
 
 ### Fixed
+
+- **A MySQL warning never expired, so it eventually described the wrong
+  statement.** `SHOW WARNINGS` in v7.38.17 kept the last warning it had
+  seen until another one replaced it. An application that inserted, then
+  ran something else, then checked, was told its data had been bent —
+  when the bending had happened two statements earlier and the statement
+  it was asking about was clean. Silence would have been better; this
+  was a claim.
+
+  MySQL's actual rule is narrower than "clear it each time", and getting
+  that wrong loses the warning altogether: a read returns the PREVIOUS
+  statement's area, and only statements that do not read it replace what
+  is visible. Measured on MySQL 9 after an INSERT that bends two values,
+  `SELECT @@warning_count` answers 2 and then 0, while two
+  `SHOW COUNT(*) WARNINGS` in a row both answer 2.
+
+  A test of ours asserted the opposite — "asking twice does not clear
+  it" — because it was written from SPG's behaviour rather than from
+  MySQL's. It says 0 now, which is what the oracle says.
 
 - **`pg_statistic` reported a stub, and a test of ours believed it.** It
   emitted one all-zero row per column of every table, analysed or not,

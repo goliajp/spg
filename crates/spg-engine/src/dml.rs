@@ -4641,12 +4641,6 @@ impl Engine {
         // that raises it has no table name).
         let table = stmt.table.clone();
         self.bump_table_change(&table);
-        // v7.38.18 (C12) — MySQL clears the diagnostics area at the start
-        // of every statement that can produce warnings, so this is where
-        // the previous statement's warnings stop being visible. `SHOW
-        // WARNINGS` and `SELECT @@warning_count` do NOT clear it, which
-        // is why they are not on this path.
-        self.mysql_warnings.clear();
         self.exec_insert_inner(stmt)
             .map_err(|e| enrich_not_null(e, &table))
     }
@@ -4948,8 +4942,12 @@ impl Engine {
         // legal PG sequence that used to fail here on the first INSERT.
         // (Placed after `table`'s borrow ends — the filter reads the
         // catalog again for the synthesised constraint name.)
-        // v7.38.18 (C12) — published once the table borrow above is done.
-        self.mysql_warnings.append(&mut stmt_warnings);
+        // v7.38.18 (C12) — into the STATEMENT's area, not the visible
+        // one. `dispatch_stmt_inner` swaps it into view when the
+        // statement ends, which is what makes a read return the
+        // previous statement's warnings the way MySQL 9 does.
+        // (Placed once the table borrow above is done.)
+        self.mysql_stmt_warnings.append(&mut stmt_warnings);
         let uniqueness: Vec<_> = if let Some(tx) = self.current_tx
             && let Some(st) = self.tx_catalogs.get(&tx)
         {
