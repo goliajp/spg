@@ -629,6 +629,18 @@ struct AggSpec {
     /// ordered collection aggregates (`array_agg(x ORDER BY enum_col)`).
     /// Parallel to `order_by`; all-None when no key is enum-typed.
     order_enum_labels: Vec<Option<Vec<String>>>,
+    /// v7.38.18 — per-ORDER-BY-key declared collation, for the ordered
+    /// collection aggregates. Parallel to `order_by`, resolved the same
+    /// way and for the same reason as `order_enum_labels` beside it.
+    ///
+    /// `min`/`max` have read the argument's collation since round 690
+    /// (`arg_collation`), and so does the statement's own ORDER BY, but
+    /// the sort INSIDE an aggregate did not: on a column declared
+    /// `COLLATE "en_US.utf8"`, `SELECT x FROM t ORDER BY x` answered
+    /// `apple, client, DateStyle, Zebra` while `string_agg(x, ' ' ORDER
+    /// BY x)` over the same column answered `DateStyle Zebra apple
+    /// client`. Two orderings of one column in one query.
+    order_collations: Vec<Option<alloc::string::String>>,
 }
 
 /// Output of running the aggregate path. Schema describes one row per
@@ -1002,6 +1014,33 @@ pub(crate) fn run(
                 .and_then(|sc| sc.collation_name.clone())
                 .filter(|n| crate::collate::is_supported(n));
         }
+    }
+
+    // v7.38.18 — the same fact for each ORDER BY key of an ordered
+    // collection aggregate. Outside the enum resolver below for the
+    // reason the loop above is: that one only runs when the catalog
+    // holds an enum type, and a collation has nothing to do with enums.
+    for spec in &mut agg_specs {
+        if spec.order_by.is_empty() {
+            continue;
+        }
+        spec.order_collations = spec
+            .order_by
+            .iter()
+            .map(|o| {
+                // A bare column key carries its collation; an expression
+                // produces a new value and has none, the same limit
+                // `min`/`max` has over an expression argument.
+                let Expr::Column(c) = &o.expr else {
+                    return None;
+                };
+                schema_cols
+                    .iter()
+                    .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                    .and_then(|sc| sc.collation_name.clone())
+                    .filter(|n| crate::collate::is_supported(n))
+            })
+            .collect();
     }
 
     // v7.39 (enum order knife) — resolve enum member-order metadata once
@@ -3227,6 +3266,7 @@ fn accumulate_groups(
                                 cmp_order_keys(
                                     &spec.order_by,
                                     &spec.order_enum_labels,
+                                    &spec.order_collations,
                                     &keys,
                                     bk,
                                     ctx.mysql_dialect,
@@ -3693,6 +3733,7 @@ fn accumulate_groups(
                                 cmp_order_keys(
                                     &spec.order_by,
                                     &spec.order_enum_labels,
+                                    &spec.order_collations,
                                     &keys,
                                     bk,
                                     ctx.mysql_dialect,
@@ -3970,6 +4011,7 @@ fn accumulate_groups(
                             cmp_order_keys(
                                 &spec.order_by,
                                 &spec.order_enum_labels,
+                                &spec.order_collations,
                                 &keys,
                                 bk,
                                 ctx.mysql_dialect,
@@ -4109,6 +4151,7 @@ fn build_synth_schema(
 fn cmp_order_keys(
     order_by: &[spg_sql::ast::OrderBy],
     order_enum_labels: &[Option<Vec<String>>],
+    order_collations: &[Option<alloc::string::String>],
     a: &[Value<'static>],
     b: &[Value<'static>],
     mysql: bool,
@@ -4131,7 +4174,18 @@ fn cmp_order_keys(
         // even under the folding MySQL dialect, so a per-key BINARY
         // coercion turns folding back off for that key alone.
         let fold = mysql && !crate::eval::is_binary_coerced(&o.expr);
-        let cmp = crate::order_by_value_cmp_in(o.desc, o.nulls_first, &a[k], &b[k], fold);
+        // v7.38.18 — the key's declared collation, so the sort inside an
+        // aggregate orders a collated column the way the statement's own
+        // ORDER BY orders it.
+        let coll = order_collations.get(k).and_then(Option::as_deref);
+        let cmp = crate::orderby::order_by_value_cmp_coll(
+            o.desc,
+            o.nulls_first,
+            &a[k],
+            &b[k],
+            fold,
+            coll,
+        );
         if cmp != core::cmp::Ordering::Equal {
             return cmp;
         }
@@ -4262,6 +4316,7 @@ fn finalize_synth_rows(
                     cmp_order_keys(
                         ob,
                         &agg_specs[i].order_enum_labels,
+                        &agg_specs[i].order_collations,
                         &st.item_keys[x * kw..(x + 1) * kw],
                         &st.item_keys[y * kw..(y + 1) * kw],
                         ctx.mysql_dialect,
@@ -4333,6 +4388,7 @@ fn finalize_synth_rows(
                     direct_arg_vals[i].as_ref(),
                     &direct_extra_vals[i],
                     &agg_specs[i].order_by,
+                    &agg_specs[i].order_collations,
                     ctx.mysql_dialect,
                 )?
             } else {
@@ -4386,6 +4442,7 @@ fn finalize_one_group(
                 cmp_order_keys(
                     ob,
                     &agg_specs[i].order_enum_labels,
+                    &agg_specs[i].order_collations,
                     &st.item_keys[x * kw..(x + 1) * kw],
                     &st.item_keys[y * kw..(y + 1) * kw],
                     ctx.mysql_dialect,
@@ -5110,6 +5167,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                         enum_labels: None,
                         arg_collation: None,
                         order_enum_labels: Vec::new(),
+                        order_collations: Vec::new(),
                         name: canonical.clone(),
                         arg,
                         arg2: if agg_uses_second_arg(&canonical) {
@@ -5174,6 +5232,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     enum_labels: None,
                     arg_collation: None,
                     order_enum_labels: Vec::new(),
+                    order_collations: Vec::new(),
                     name: canonical,
                     arg: arg.clone(),
                     arg2: arg2.clone(),
@@ -5254,6 +5313,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                     enum_labels: None,
                     arg_collation: None,
                     order_enum_labels: Vec::new(),
+                    order_collations: Vec::new(),
                     name: "array_agg".to_string(),
                     arg: Some(arg.clone()),
                     arg2: None,
@@ -6291,6 +6351,7 @@ fn finalize_ordered_set(
     direct: Option<&Value>,
     direct_extra: &[Value<'static>],
     order_by: &[spg_sql::ast::OrderBy],
+    order_collations: &[Option<alloc::string::String>],
     mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
     let fraction = direct;
@@ -6366,6 +6427,7 @@ fn finalize_ordered_set(
                     cmp_order_keys(
                         order_by,
                         &[],
+                        order_collations,
                         &st.item_keys[i * kw..(i + 1) * kw],
                         &hv,
                         mysql,
@@ -6400,6 +6462,7 @@ fn finalize_ordered_set(
                             cmp_order_keys(
                                 order_by,
                                 &[],
+                                order_collations,
                                 &st.item_keys[x * kw..(x + 1) * kw],
                                 &st.item_keys[y * kw..(y + 1) * kw],
                                 mysql,

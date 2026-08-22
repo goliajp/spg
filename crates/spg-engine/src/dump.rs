@@ -39,6 +39,22 @@ impl Engine {
                 if let Some(e) = &c.user_enum_type {
                     line = format!("  {} {}", quote_ident(&c.name), quote_ident(e));
                 }
+                // v7.38.18 — the column's collation. It was never
+                // emitted, so a column declared `COLLATE "en_US.utf8"`
+                // came back byte-ordered after a dump/restore and every
+                // `ORDER BY` on it silently changed answer. The
+                // dump-compat gate could not see it: both sides of the
+                // round trip lost it identically.
+                //
+                // `C` is skipped because it is what a column with no
+                // clause already gets, and PostgreSQL does not print it
+                // either.
+                if let Some(coll) = &c.collation_name
+                    && !coll.eq_ignore_ascii_case("C")
+                    && !coll.eq_ignore_ascii_case("default")
+                {
+                    line.push_str(&format!(" COLLATE {}", quote_ident(coll)));
+                }
                 if !c.nullable {
                     line.push_str(" NOT NULL");
                 }

@@ -1983,11 +1983,28 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
 /// PG's collation list. ORMs that bind TEXT columns to a
 /// language-specific collation read this at handshake to map
 /// names → OIDs. SPG ships the three PG-standard collations
-/// (`default` / `C` / `POSIX`) — every TEXT column uses
-/// `default` so column-level COLLATE clauses parse but don't
-/// alter sort order. v7.37.x doesn't yet support per-locale
-/// ICU collations; the view shape lets monitoring queries +
-/// pg_dump's COLLATE-restoration query both resolve.
+/// (`default` / `C` / `POSIX`); the view shape lets monitoring
+/// queries and pg_dump's COLLATE-restoration query resolve.
+///
+/// v7.38.18 — the two sentences that used to follow are gone
+/// because both had become false. They read "every TEXT column
+/// uses `default` so column-level COLLATE clauses parse but
+/// don't alter sort order" and "v7.37.x doesn't yet support
+/// per-locale ICU collations". Measured on this build: a column
+/// declared `COLLATE "en_US.utf8"` orders `apple, client,
+/// DateStyle, Zebra` — PG 18.4's answer to the character — and
+/// `<`, `min()` and `information_schema.columns` all agree with
+/// it. `collate.rs` carries a full ICU collator calibrated
+/// against PG over all 880 of its collation names.
+///
+/// What remains true is that this TABLE still lists three rows
+/// where PG lists 880, so a client that looks a collation up by
+/// name is told it does not exist while the engine performs it.
+/// That is the same disagreement `pg_settings` had, recorded
+/// rather than fixed here: PG's set is its host's locales, and
+/// listing that container's 880 would claim SPG has exactly
+/// those. Naming what this build can perform needs a source for
+/// the candidate names, which is its own piece of work.
 pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),

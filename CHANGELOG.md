@@ -79,6 +79,40 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A column's collation did not survive a dump.** `dump.rs` never
+  emitted `COLLATE`, so a column declared `COLLATE "en_US.utf8"` came
+  back byte-ordered after a dump/restore and every `ORDER BY` on it
+  silently changed answer — `apple, DateStyle, Zebra` before,
+  `DateStyle, Zebra, apple` after. The dump-compat gate could not see
+  it: both sides of the round trip lost the clause identically, so they
+  agreed. Confirmed by ablation.
+
+- **The sort INSIDE an aggregate ignored the column's collation.**
+  `min`/`max` have read it since round 690 and the statement's own
+  `ORDER BY` always did, but `string_agg(x, ' ' ORDER BY x)` and
+  `array_agg(x ORDER BY x)` over a collated column answered in byte
+  order — two orderings of one column in one query. Both match
+  PostgreSQL 18.4 now, as does the window `ORDER BY` that already did.
+
+- **Two statements in the source had gone false about collations.**
+  `pg_collation`'s comment said "column-level COLLATE clauses parse but
+  don't alter sort order" and "v7.37.x doesn't yet support per-locale
+  ICU collations"; the parser's error said "SPG orders text by bytes
+  (the C collation); locale collations are not supported yet". This
+  build performs them: a column declared `COLLATE "en_US.utf8"` orders
+  `apple, client, DateStyle, Zebra`, which is PostgreSQL's answer, and
+  `<`, `min()` and `information_schema.columns` all agree. What SPG
+  cannot do is carry a collation on an arbitrary expression, so the
+  refusal says that and names the two positions where the clause works.
+
+  The database-level collation is a wider matter and is written up
+  rather than changed: `docs/FINDING-2026-08-23-database-collation.md`.
+  `pg_database.datcollate` is fixed at `C` and `CREATE DATABASE ...
+  LC_COLLATE` is accepted and ignored, so an undeclared text column
+  sorts by bytes where a stock PostgreSQL sorts by locale. Closing it
+  touches index key order on disk, which makes it a decision rather
+  than a fix.
+
 - **The runtime-switch register's `exercised` column was prose, and it
   was wrong about six switches.** It is checked now, against what the
   repository actually does, and the rule it is checked by moved twice.

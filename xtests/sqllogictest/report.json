@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 160, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 171, "fail": 0, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -15,6 +15,8 @@
         { "file": "v73816_gin_expression.test", "pass": 21, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "v73818_analyze_same_query_string.test", "pass": 5, "fail": 0, "skip": 0, "dialect": "postgres",
+          "fail_reasons": [] },
+        { "file": "v73818_collation_survives_dump.test", "pass": 11, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "v73818_pg_settings_full.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },

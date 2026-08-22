@@ -66,21 +66,68 @@ fn round670_text_orders_by_bytes() {
     assert_eq!(one(&mut e, "SELECT 'B' < 'a' COLLATE \"C\""), "true");
 }
 
-/// Where SPG cannot perform a collation it says so rather than pretending.
-/// These two paths already refuse; the ledger's F36 records the DDL paths
-/// that do not, which is the part that lets a dump restore clean and then
-/// answer differently.
+/// Where SPG cannot carry a collation it says where it CAN, rather than
+/// telling the reader it orders by bytes.
+///
+/// v7.38.18 — this test used to require the words "orders text by bytes"
+/// and "not supported yet", and the message said both. By the time it
+/// was read, both were false: this build performs locale collations,
+/// and a column declared `COLLATE "en_US.utf8"` orders `apple, client,
+/// DateStyle, Zebra` — PG 18.4's answer, with `<`, `min()` and
+/// `information_schema.columns` all agreeing. What SPG cannot do is
+/// carry a collation on an arbitrary expression, because there is no
+/// `Expr::Collate` to carry it.
+///
+/// The intent behind the old assertion survives and is what the second
+/// half checks: a refusal must read as a GAP with somewhere else to go,
+/// not as a rule about how SPG sorts. The ledger's F36 records the DDL
+/// paths that accept what this one refuses.
 #[test]
-fn round670_a_locale_collation_is_refused_where_it_is_asked_for() {
+fn round670_a_locale_collation_is_refused_where_it_cannot_be_carried() {
     let mut e = Engine::new();
     let msg = err(&mut e, "SELECT 'a' < 'B' COLLATE \"en_US\"");
-    assert!(msg.contains("orders text by bytes"), "{msg}");
     assert!(
-        msg.contains("not supported yet"),
-        "the refusal should say it is a gap, not a rule: {msg}"
+        msg.contains("not supported in this position"),
+        "the refusal is about the POSITION, not about SPG's sort order: {msg}"
+    );
+    assert!(
+        msg.contains("column declaration") && msg.contains("ORDER BY key"),
+        "the refusal should name where the clause does work: {msg}"
+    );
+    assert!(
+        !msg.contains("orders text by bytes"),
+        "SPG performs locale collations; saying otherwise sends the \
+         reader to `COLLATE \"C\"` for a problem they do not have: {msg}"
     );
 
     e.execute("CREATE TABLE ct(name TEXT)").unwrap();
     let msg = err(&mut e, "CREATE INDEX ON ct (name COLLATE \"en_US\")");
-    assert!(msg.contains("orders text by bytes"), "{msg}");
+    assert!(msg.contains("not supported in this position"), "{msg}");
+}
+
+/// The half the message now points at: declared on a column, a locale
+/// collation is performed, and it is performed the way PG performs it.
+///
+/// Every value here was read from PG 18.4 with the same declaration.
+#[test]
+fn round670_a_declared_locale_collation_is_performed() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE cl(x TEXT COLLATE \"en_US.utf8\", y TEXT)")
+        .unwrap();
+    e.execute("INSERT INTO cl VALUES ('Zebra','Zebra'),('apple','apple'),('DateStyle','DateStyle'),('client','client')")
+        .unwrap();
+    assert_eq!(
+        one(&mut e, "SELECT string_agg(x, ' ' ORDER BY x) FROM cl"),
+        "apple client DateStyle Zebra"
+    );
+    assert_eq!(one(&mut e, "SELECT min(x) FROM cl"), "apple");
+    assert_eq!(one(&mut e, "SELECT count(*) FROM cl WHERE x < 'b'"), "1");
+    // The column beside it, with no clause, still sorts by bytes --
+    // SPG's DATABASE collation is `C`. PG 18.4 disagrees here and only
+    // here, because that oracle's database collates as `en_US.utf8`;
+    // see docs/FINDING-2026-08-23-database-collation.md.
+    assert_eq!(
+        one(&mut e, "SELECT string_agg(y, ' ' ORDER BY y) FROM cl"),
+        "DateStyle Zebra apple client"
+    );
 }
