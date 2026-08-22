@@ -168,21 +168,69 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// wire smoke below, PLUS the previous release's data directory opened
 /// directly by the CURRENT binary and verified row-for-row.
 ///
-/// The fixture (`xtests/compat-datadirs/v7.38.15/`) was captured by
-/// the v7.38.15 tag's own binary: 500 rows across nine types, two
-/// indexes, deletes and updates, statement-level WAL (there is no db
-/// file; replay IS the open). `expected.txt` holds counts and an md5
-/// over an ordered projection, so a silently thinner replay cannot
-/// pass. Older fixtures stay on disk beside it (S3.2).
+/// The fixture is captured by each release tag's own binary: 500 rows
+/// across nine types, two indexes, deletes and updates, statement-level
+/// WAL (there is no db file; replay IS the open). `expected.txt` holds
+/// counts and an md5 over an ordered projection, so a silently thinner
+/// replay cannot pass. Older fixtures stay on disk beside it (S3.2).
+///
+/// v7.38.17 — WHICH fixture is chosen, rather than a hard-coded path.
+/// It read `v7.38.15` literally, so every release captured a fixture
+/// (the S3.2 protocol) that nothing then opened, and the step's name --
+/// "the PREVIOUS release's data directory" -- aged into a lie the day
+/// 7.38.16 shipped. Newest fixture wins, current version excluded: a
+/// build opening its own fixture is not a cross-version test.
 ///
 /// # Errors
-/// Any probe or any fixture assertion failing, named.
+/// Any probe or any fixture assertion failing, named. No usable fixture
+/// is an error too: silently having nothing to open is how this step
+/// would stop testing anything at all.
+/// The newest `xtests/compat-datadirs/vX.Y.Z` that is not this
+/// workspace's own version.
+fn newest_prior_datadir(root: &Path) -> Result<std::path::PathBuf, String> {
+    let current = std::fs::read_to_string(root.join("Cargo.toml"))
+        .map_err(|e| format!("read Cargo.toml: {e}"))?
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("version")
+                .and_then(|r| r.split('"').nth(1))
+                .map(str::to_string)
+        })
+        .ok_or("no workspace version in Cargo.toml")?;
+    let dir = root.join("xtests/compat-datadirs");
+    let mut best: Option<(Vec<u32>, std::path::PathBuf)> = None;
+    for e in std::fs::read_dir(&dir)
+        .map_err(|e| format!("read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+    {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(ver) = name.strip_prefix('v') else {
+            continue;
+        };
+        if ver == current || !e.path().join("expected.txt").exists() {
+            continue;
+        }
+        let parts: Vec<u32> = ver.split('.').filter_map(|p| p.parse().ok()).collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        if best.as_ref().is_none_or(|(b, _)| parts > *b) {
+            best = Some((parts, e.path()));
+        }
+    }
+    best.map(|(_, p)| p).ok_or_else(|| {
+        format!(
+            "no data-directory fixture older than {current} under {} — the \
+             cross-version open has nothing to open",
+            dir.display()
+        )
+    })
+}
+
 pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     let smoke = ironrule_smoke(root, runid)?;
-    let fixture = root.join("xtests/compat-datadirs/v7.38.15");
-    if !fixture.join("expected.txt").exists() {
-        return Err(format!("fixture missing: {}", fixture.display()));
-    }
+    let fixture = newest_prior_datadir(root)?;
     let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-fver"));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("mkdir: {e}"))?;
@@ -224,7 +272,15 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     }
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok(format!("{smoke}; v7.38.15 dir direct-open verified"))
+    // Name the fixture that was opened. The old line said "v7.38.15"
+    // whatever ran, which is how a report keeps announcing coverage a
+    // step no longer has.
+    let opened = fixture
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("?")
+        .to_string();
+    Ok(format!("{smoke}; {opened} dir direct-open verified"))
 }
 
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
@@ -824,4 +880,72 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(verdict)
+}
+
+#[cfg(test)]
+mod datadir_choice_tests {
+    use std::path::Path;
+
+    /// v7.38.17 — the cross-version open picks the newest fixture that
+    /// is NOT this build's own version.
+    ///
+    /// It used to be a hard-coded `v7.38.15`, so every release captured
+    /// a fixture the S3.2 protocol asked for and nothing ever opened,
+    /// and the step's summary line announced `v7.38.15` whatever it had
+    /// actually done. The assertion here is the RULE, not a literal, so
+    /// it keeps meaning something after the next release.
+    #[test]
+    fn newest_prior_fixture_excludes_the_current_version() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let current = std::fs::read_to_string(root.join("Cargo.toml"))
+            .expect("Cargo.toml")
+            .lines()
+            .find_map(|l| {
+                l.trim()
+                    .strip_prefix("version")
+                    .and_then(|r| r.split('"').nth(1))
+                    .map(str::to_string)
+            })
+            .expect("workspace version");
+
+        let chosen = super::newest_prior_datadir(&root).expect("a prior fixture must exist");
+        let name = chosen.file_name().and_then(|s| s.to_str()).unwrap();
+
+        assert_ne!(
+            name,
+            format!("v{current}"),
+            "a build opening its own fixture is not a cross-version test"
+        );
+
+        // And it must be the newest of the ones that qualify, compared
+        // numerically: `v7.38.9` sorts after `v7.38.15` as a string, and
+        // a lexical pick would quietly test an ancient directory.
+        let parts = |n: &str| -> Vec<u32> {
+            n.trim_start_matches('v')
+                .split('.')
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        };
+        let chosen_v = parts(name);
+        for e in std::fs::read_dir(root.join("xtests/compat-datadirs"))
+            .expect("fixture dir")
+            .filter_map(Result::ok)
+        {
+            let other = e.file_name().to_string_lossy().to_string();
+            if other == format!("v{current}") || !e.path().join("expected.txt").exists() {
+                continue;
+            }
+            let v = parts(&other);
+            if v.len() == 3 {
+                assert!(
+                    v <= chosen_v,
+                    "{other} is newer than the chosen {name} — the pick is not the newest"
+                );
+            }
+        }
+    }
 }
