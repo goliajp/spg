@@ -9059,8 +9059,24 @@ impl Engine {
         // v7.39 (round 525) — and the session: a joined SELECT's WHERE is
         // the same predicate the unjoined shape carries.
         let joined_sess = self.dml_session();
+        // v7.38.18 — and the DIALECT. This context carried the catalog and
+        // the session and not the one field that decides how text
+        // compares, so a joined row was evaluated in PostgreSQL
+        // semantics inside a MySQL session.
+        //
+        // It showed up only where the two sides had DIFFERENT text types:
+        // `a.c = b.s` with `c CHAR(8)` and `s TEXT` answered false, and a
+        // join on it returned no rows, while `a.c = b.c` and `a.s = b.s`
+        // were fine and the same comparison inside one table was fine.
+        // Same-type pairs agree byte-for-byte after an ASCII lowercase,
+        // so the wrong semantics were invisible until a CHAR's padding
+        // had to be stripped and PostgreSQL's arm does not strip it.
+        //
+        // `with_engine` is what sets it; the next line already reaches
+        // for `self.backslash_escapes`, so the dialect was in hand.
         let ctx = EvalContext::new(combined_schema, None)
             .with_catalog(self.active_catalog())
+            .with_engine(self)
             .with_session(&joined_sess);
         let projection =
             build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
@@ -9211,8 +9227,24 @@ impl Engine {
         // v7.39 (round 525) — and the session: a joined SELECT's WHERE is
         // the same predicate the unjoined shape carries.
         let joined_sess = self.dml_session();
+        // v7.38.18 — and the DIALECT. This context carried the catalog and
+        // the session and not the one field that decides how text
+        // compares, so a joined row was evaluated in PostgreSQL
+        // semantics inside a MySQL session.
+        //
+        // It showed up only where the two sides had DIFFERENT text types:
+        // `a.c = b.s` with `c CHAR(8)` and `s TEXT` answered false, and a
+        // join on it returned no rows, while `a.c = b.c` and `a.s = b.s`
+        // were fine and the same comparison inside one table was fine.
+        // Same-type pairs agree byte-for-byte after an ASCII lowercase,
+        // so the wrong semantics were invisible until a CHAR's padding
+        // had to be stripped and PostgreSQL's arm does not strip it.
+        //
+        // `with_engine` is what sets it; the next line already reaches
+        // for `self.backslash_escapes`, so the dialect was in hand.
         let ctx = EvalContext::new(combined_schema, None)
             .with_catalog(self.active_catalog())
+            .with_engine(self)
             .with_session(&joined_sess);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.

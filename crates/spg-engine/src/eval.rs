@@ -4193,15 +4193,20 @@ fn eval_case_arm(
             Some(op_v) => {
                 let (l, r) = if ctx.mysql_dialect {
                     match (op_v, &when_value) {
-                        // v7.38.17 — CHAR pads, TEXT does not.
-                        (Value::BpChar(x), Value::BpChar(y)) => (
-                            Value::text(spg_storage::mysql_compare_fold_char(x)),
-                            Value::text(spg_storage::mysql_compare_fold_char(y)),
-                        ),
-                        (Value::Text(x), Value::Text(y)) => (
-                            Value::text(spg_storage::mysql_compare_fold(x)),
-                            Value::text(spg_storage::mysql_compare_fold(y)),
-                        ),
+                        // v7.38.18 — fold each side on its OWN type. This
+                        // pair match missed `CASE <char col> WHEN
+                        // '<literal>'`: a BpChar against a Text is neither
+                        // arm, so it compared bytes with the CHAR still
+                        // padded and answered ELSE.
+                        (x, y)
+                            if spg_storage::mysql_fold_value(x).is_some()
+                                && spg_storage::mysql_fold_value(y).is_some() =>
+                        {
+                            (
+                                Value::text(spg_storage::mysql_fold_value(x).unwrap()),
+                                Value::text(spg_storage::mysql_fold_value(y).unwrap()),
+                            )
+                        }
                         _ => (op_v.clone(), when_value),
                     }
                 } else {

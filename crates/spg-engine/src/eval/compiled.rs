@@ -2650,15 +2650,18 @@ where
                             // case-insensitive column.
                             let folded = if *fold_operand {
                                 match (op_v, &when_v) {
-                                    // v7.38.17 — CHAR pads, TEXT does not.
-                                    (Value::BpChar(x), Value::BpChar(y)) => Some((
-                                        Value::text(spg_storage::mysql_compare_fold_char(x)),
-                                        Value::text(spg_storage::mysql_compare_fold_char(y)),
-                                    )),
-                                    (Value::Text(x), Value::Text(y)) => Some((
-                                        Value::text(spg_storage::mysql_compare_fold(x)),
-                                        Value::text(spg_storage::mysql_compare_fold(y)),
-                                    )),
+                                    // v7.38.18 — each side on its OWN type;
+                                    // see `mysql_fold_value`. The pair match
+                                    // missed a CHAR against a literal.
+                                    (x, y)
+                                        if spg_storage::mysql_fold_value(x).is_some()
+                                            && spg_storage::mysql_fold_value(y).is_some() =>
+                                    {
+                                        Some((
+                                            Value::text(spg_storage::mysql_fold_value(x).unwrap()),
+                                            Value::text(spg_storage::mysql_fold_value(y).unwrap()),
+                                        ))
+                                    }
                                     _ => None,
                                 }
                             } else {

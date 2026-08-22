@@ -7715,13 +7715,12 @@ fn extreme_cmp_in(
     // collation compares by the folded form (case- and accent-insensitive,
     // PAD SPACE), matching ORDER BY (round 411).
     if mysql {
-        // v7.38.17 — CHAR pads, TEXT does not.
-        if let (Value::BpChar(x), Value::BpChar(y)) = (a, b) {
-            return spg_storage::mysql_compare_fold_char(x)
-                .cmp(&spg_storage::mysql_compare_fold_char(y));
-        }
-        if let (Value::Text(x), Value::Text(y)) = (a, b) {
-            return spg_storage::mysql_compare_fold(x).cmp(&spg_storage::mysql_compare_fold(y));
+        // v7.38.18 — each side on its own type; see `mysql_fold_value`.
+        if let (Some(x), Some(y)) = (
+            spg_storage::mysql_fold_value(a),
+            spg_storage::mysql_fold_value(b),
+        ) {
+            return x.cmp(&y);
         }
     }
     value_cmp(a, b)

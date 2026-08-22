@@ -1,0 +1,105 @@
+# v7.38.18 — a joined row was evaluated in PostgreSQL semantics inside a
+# MySQL session.
+#
+# Five places built the context for a joined row — three in `join.rs`,
+# two in `select.rs` — and every one of them attached the catalog and
+# the session and left off the one field that decides how text compares.
+# The line right after one of them already reached for the dialect, so
+# it was in hand.
+#
+# It stayed invisible while the two sides had the SAME text type,
+# because same-type values agree byte-for-byte once both are lowercased.
+# It showed the moment a `CHAR`'s padding had to be stripped and
+# PostgreSQL's arm does not strip it: `a.c = b.s` answered false and a
+# join on it returned no rows, while `a.c = b.c` and `a.s = b.s` were
+# fine and the same comparison inside ONE table was fine.
+#
+# A second cause sat behind it. Several comparison sites matched
+# `(Text, Text) | (BpChar, BpChar)` and folded a PAIR, so a CHAR against
+# a VARCHAR or against a literal was neither shape and fell through to a
+# byte compare. Whether trailing spaces count is a property of each
+# side's OWN type, so the pair was never the right unit; those sites
+# fold each value separately now.
+#
+# Every expectation is MySQL 9.7.2's own answer at its default
+# collation.
+
+dialect mysql
+
+statement ok
+CREATE TABLE mx_a (k INT, c CHAR(8), s VARCHAR(32))
+
+statement ok
+CREATE TABLE mx_b (k INT, c CHAR(8), s VARCHAR(32))
+
+statement ok
+INSERT INTO mx_a VALUES (1,'alpha','alpha'),(2,'Beta','Beta')
+
+statement ok
+INSERT INTO mx_b VALUES (10,'ALPHA','ALPHA'),(20,'beta','beta')
+
+# CHAR joined to VARCHAR, both directions.
+query II
+SELECT mx_a.k, mx_b.k FROM mx_a JOIN mx_b ON mx_a.c = mx_b.s ORDER BY mx_a.k, mx_b.k
+----
+1
+10
+2
+20
+
+query II
+SELECT mx_a.k, mx_b.k FROM mx_a JOIN mx_b ON mx_a.s = mx_b.c ORDER BY mx_a.k, mx_b.k
+----
+1
+10
+2
+20
+
+# The bare cross product, which is where the context was built.
+query I
+SELECT count(*) FROM mx_a, mx_b WHERE mx_a.c = mx_b.s
+----
+2
+
+# Same-type pairs were always right; they are here to catch a fix that
+# trades one for the other.
+query I
+SELECT count(*) FROM mx_a, mx_b WHERE mx_a.c = mx_b.c
+----
+2
+
+query I
+SELECT count(*) FROM mx_a, mx_b WHERE mx_a.s = mx_b.s
+----
+2
+
+# Subquery shapes over the same mix.
+query I
+SELECT k FROM mx_a WHERE c IN (SELECT s FROM mx_b) ORDER BY k
+----
+1
+2
+
+query I
+SELECT k FROM mx_a WHERE EXISTS (SELECT 1 FROM mx_b WHERE mx_b.s = mx_a.c) ORDER BY k
+----
+1
+2
+
+query I
+SELECT k FROM mx_b WHERE mx_b.s = (SELECT c FROM mx_a WHERE k=1)
+----
+10
+
+# A CHAR column against a literal in CASE — the pair-matching site.
+query T
+SELECT CASE mx_a.c WHEN 'ALPHA' THEN 'hit' ELSE 'miss' END FROM mx_a ORDER BY mx_a.k
+----
+hit
+miss
+
+statement ok
+DROP TABLE mx_a
+
+statement ok
+DROP TABLE mx_b

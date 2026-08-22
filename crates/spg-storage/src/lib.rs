@@ -1759,6 +1759,28 @@ pub fn mysql_compare_fold(s: &str) -> String {
     mysql_ci_fold(s)
 }
 
+/// The comparison form of one text value under the MySQL default
+/// collation, or `None` for a value that is not text.
+///
+/// v7.38.18 — one function, applied to each side SEPARATELY, because
+/// the pair is not the unit. Several sites matched
+/// `(Text, Text) | (BpChar, BpChar)` and folded a pair; a CHAR compared
+/// against a VARCHAR or against a literal is neither shape, so it fell
+/// through and was compared by bytes — with the CHAR still carrying its
+/// padding. `CASE c WHEN 'ALPHA'` on a `CHAR(8)` holding `'alpha'`
+/// answered ELSE where MySQL 9.7.2 answers the branch.
+///
+/// Folding per value also states the rule correctly: whether trailing
+/// spaces count is a property of EACH side's own type, so a pair whose
+/// sides differ has two answers rather than one.
+pub fn mysql_fold_value(v: &Value<'_>) -> Option<String> {
+    match v {
+        Value::BpChar(s) => Some(mysql_compare_fold_char(s)),
+        Value::Text(s) => Some(mysql_compare_fold(s)),
+        _ => None,
+    }
+}
+
 /// [`mysql_compare_fold`] for a `CHAR(n)` cell, whose trailing spaces
 /// are padding rather than data.
 ///

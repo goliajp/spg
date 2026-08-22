@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 96, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 104, "fail": 0, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -13,6 +13,8 @@
         { "file": "v73816_expression_index.test", "pass": 37, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "v73816_gin_expression.test", "pass": 21, "fail": 0, "skip": 0, "dialect": "postgres",
+          "fail_reasons": [] },
+        { "file": "v73818_scalar_subquery_types.test", "pass": 8, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] }
       ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
@@ -60,7 +62,7 @@
         { "file": "21_order_by_desc.test", "pass": 9, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] }
       ] },
-    { "name": "mysql", "pass": 354, "fail": 0, "skip": 0,
+    { "name": "mysql", "pass": 369, "fail": 1, "skip": 0,
       "files": [
         { "file": "01_dialect.test", "pass": 16, "fail": 0, "skip": 0, "dialect": "mysql",
           "fail_reasons": [] },
@@ -90,6 +92,8 @@
           "fail_reasons": [] },
         { "file": "13_show_databases.test", "pass": 3, "fail": 0, "skip": 0, "dialect": "mysql",
           "fail_reasons": [] },
+        { "file": "14_mixed_type_compare.test", "pass": 15, "fail": 1, "skip": 0, "dialect": "mysql",
+          "fail_reasons": ["record 13: row mismatch |   expected: [\"hit\", \"miss\"] |   actual:   [\"miss\", \"miss\"]"] },
         { "file": "14_show_create_table.test", "pass": 4, "fail": 0, "skip": 0, "dialect": "mysql",
           "fail_reasons": [] },
         { "file": "15_show_indexes_status_processlist.test", "pass": 10, "fail": 0, "skip": 0, "dialect": "mysql",
