@@ -461,6 +461,54 @@ else
 fi
 
 
+
+echo "=== MariaDB dialect panel ==="
+
+# v7.38.18 — MariaDB gets its OWN expectations, not a second name for
+# the MySQL ones. The two engines disagree about trailing spaces: MySQL
+# 8.0's default collation is NO PAD, MariaDB's `utf8mb4_uca1400_ai_ci`
+# is PAD SPACE, so `'alpha'` and `'alpha  '` are two values to one and
+# one value to the other.
+#
+# A MariaDB dump DECLARES its collation, which is what makes this
+# testable through the same wire: SPG reads the name. Every expectation
+# below is MariaDB 12.3.2's own answer at that collation.
+maria_case() {
+  local name="$1" sql="$2" want="$3" got
+  got="$($MYSQL_CLI -e "$sql" 2>/dev/null | tr '\t' ',' | paste -sd';' - | tr -d '\r')"
+  if [ "$got" = "$want" ]; then
+    echo "[maria] ok   $name"
+    PASS_COUNT=$((PASS_COUNT+1))
+    CASES+=("mariadb.$name|PASS|")
+  else
+    echo "[maria] FAIL $name — want '$want', got '$got'"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    CASES+=("mariadb.$name|FAIL|want '$want', got '$got'")
+  fi
+}
+
+if $MYSQL_CLI -e "SELECT 1" >/dev/null 2>&1; then
+  $MYSQL_CLI -e "CREATE TABLE md (k INT, s TEXT COLLATE utf8mb4_uca1400_ai_ci)" >/dev/null 2>&1
+  $MYSQL_CLI -e "INSERT INTO md VALUES (1,'alpha'),(2,'alpha  '),(3,'Beta'),(4,'beta')" >/dev/null 2>&1
+
+  # Case folds on both engines...
+  maria_case "case folds" "SELECT k FROM md WHERE s = 'ALPHA' ORDER BY k" "1;2"
+  # ...and so do trailing spaces here, which is where MariaDB parts from
+  # MySQL: the same query on a MySQL-default column answers 1 alone.
+  maria_case "trailing space folds" "SELECT count(DISTINCT s) FROM md" "2"
+
+  $MYSQL_CLI -e "CREATE INDEX md_s ON md (s)" >/dev/null 2>&1
+  maria_case "indexed equality" "SELECT k FROM md WHERE s = 'ALPHA' ORDER BY k" "1;2"
+  maria_case "indexed IN" "SELECT k FROM md WHERE s IN ('ALPHA','BETA') ORDER BY k" "1;2;3;4"
+  maria_case "indexed ORDER BY" "SELECT k FROM md ORDER BY s LIMIT 2" "1;2"
+
+  $MYSQL_CLI -e "DROP TABLE md" >/dev/null 2>&1
+else
+  echo "[maria] FAIL wire did not answer on port $MYPORT"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("mariadb.wire|FAIL|no answer on port $MYPORT")
+fi
+
 FIXTURE_REPORT=""
 if [ "${#FIXTURES[@]}" -gt 0 ]; then
   echo ""
