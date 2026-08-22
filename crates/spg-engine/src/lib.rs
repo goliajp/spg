@@ -1103,6 +1103,16 @@ pub struct Engine {
     /// connection and per-connection state that does not swap leaks
     /// across them.
     mysql_warnings: Vec<MysqlWarning>,
+
+    /// v7.38.18 (C12) — the diagnostics area of the statement that is
+    /// running RIGHT NOW, which is not the one a read returns. MySQL 9
+    /// answers `SELECT @@warning_count` with the PREVIOUS statement's
+    /// count and only then replaces the visible set with its own (a
+    /// second read in a row therefore answers 0). Producers fill this;
+    /// [`Engine::dispatch_stmt_inner`] publishes it into
+    /// `mysql_warnings` when the statement ends. Never live across
+    /// statements, so it is not part of [`SessionBag`].
+    mysql_stmt_warnings: Vec<MysqlWarning>,
     /// v7.39 (round 306) — the live session's open large-object
     /// descriptors, swapped in and out with the rest of its bag.
     pub(crate) lo_descriptors: BTreeMap<i32, LargeObjectDescriptor>,
@@ -1575,6 +1585,7 @@ impl Engine {
             backslash_escapes: false,
             mysql_strict: true,
             mysql_warnings: Vec::new(),
+            mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2100,6 +2111,7 @@ impl Engine {
             backslash_escapes: false,
             mysql_strict: true,
             mysql_warnings: Vec::new(),
+            mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2240,6 +2252,7 @@ impl Engine {
                     backslash_escapes: false,
                     mysql_strict: true,
                     mysql_warnings: Vec::new(),
+                    mysql_stmt_warnings: Vec::new(),
                     lo_descriptors: BTreeMap::new(),
                     lo_next_fd: 0,
                     prepared_statements: alloc::collections::BTreeMap::new(),

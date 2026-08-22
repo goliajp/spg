@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|---|
 | `15_regressions` | 117 | 0 | 0 | 100.0% | postgres × 9 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 406 | 0 | 0 | 100.0% | mysql × 25 |
+| `mysql` | 421 | 0 | 0 | 100.0% | mysql × 26 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -92,6 +92,7 @@ Per-corpus pass / fail / skip:
 | `15_show_indexes_status_processlist.test` | 10 | 0 | 0 | mysql |
 | `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
 | `16_warning_diagnostics.test` | 15 | 0 | 0 | mysql |
+| `17_warning_area_lifetime.test` | 15 | 0 | 0 | mysql |
 | `v73813_distinct_binary_collation.test` | 32 | 0 | 0 | mysql |
 | `v73814_distinct_sources.test` | 15 | 0 | 0 | mysql |
 | `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |

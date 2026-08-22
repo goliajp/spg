@@ -2736,6 +2736,40 @@ impl Parser {
                     // to ShowParameter("all") — the engine returns
                     // the curated parameter inventory.
                     Token::All => "all".to_string(),
+                    // v7.38.18 (C12) — `SHOW COUNT(*) WARNINGS`, MySQL's
+                    // spelling for the size of the diagnostics area.
+                    // MySQL-dialect only: PostgreSQL 18.4 answers this
+                    // phrase with `syntax error at or near "("`, and a
+                    // PG session must keep getting exactly that rather
+                    // than a message about an unknown parameter.
+                    // `COUNT` arrives as a bare ident; the `(*)` and the
+                    // trailing keyword are consumed here so the whole
+                    // form reaches the engine as one parameter name.
+                    Token::Ident(ref c)
+                        if self.mysql_dialect
+                            && c.eq_ignore_ascii_case("count")
+                            && matches!(self.peek(), Token::LParen) =>
+                    {
+                        self.advance();
+                        if matches!(self.peek(), Token::Star) {
+                            self.advance();
+                        }
+                        if matches!(self.peek(), Token::RParen) {
+                            self.advance();
+                        }
+                        match self.advance() {
+                            Token::Ident(w) if w.eq_ignore_ascii_case("warnings") => {
+                                return Ok(Statement::ShowParameter(
+                                    "count(*) warnings".to_string(),
+                                ));
+                            }
+                            other => {
+                                return Err(self.err(format!(
+                                    "expected WARNINGS after SHOW COUNT(*), got {other:?}"
+                                )));
+                            }
+                        }
+                    }
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
                         return Err(self.err(format!(
