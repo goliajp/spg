@@ -40,6 +40,11 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **`pg_stats`** — the readable view over `pg_statistic`, and the one a
+  person types to ask whether `ANALYZE` did anything. PostgreSQL 18.4's
+  seventeen columns in its order. The arrays SPG does not model are
+  NULL, which says *not modelled* rather than *zero*.
+
 - **A MariaDB acceptance panel, with its own expectations.** The
   drop-in harness covers all three engines we claim to drop in for now.
   MariaDB is not a second name for the MySQL cases: the two disagree
@@ -52,6 +57,19 @@ the current build; this file is a release-organized view.
   testable over the same wire: SPG reads the name.
 
 ### Fixed
+
+- **`pg_statistic` reported a stub, and a test of ours believed it.** It
+  emitted one all-zero row per column of every table, analysed or not,
+  so a query could count rows from it and learn nothing. PostgreSQL has
+  no row there for an un-analysed column, and neither do we now; the
+  values come from the store `ANALYZE` actually fills.
+
+  This matters beyond the view. The `ANALYZE` fix in this same release
+  is pinned by a test asserting "two columns analysed is two rows of
+  statistics", written under a comment reading *"'It returned OK' is not
+  evidence that it did anything"*. It was counting the stub, and passed
+  without `ANALYZE` having run. It discriminates now: zero before,
+  two after.
 
 - **`IN` ignored the collation's padding rule.** `t IN ('ALPHA')` on a
   `utf8mb4_uca1400_ai_ci` column — what a MariaDB dump declares — missed

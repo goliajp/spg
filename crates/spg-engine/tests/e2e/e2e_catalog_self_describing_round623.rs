@@ -166,7 +166,10 @@ fn round623_pg_attribute_describes_the_catalogs() {
         // 7.38.1 S5.1/S5.2 — 27 to 32: pg_opclass, pg_opfamily,
         // pg_amop, pg_amproc and pg_extension joined the wall (the
         // pg_dump campaign).
-        vec!["32"]
+        // v7.38.18 — 32 to 33: `pg_stats` joined it. The view a person
+        // types to ask whether ANALYZE did anything did not exist, and
+        // `pg_statistic` underneath it was reporting a stub.
+        vec!["33"]
     );
 }
 
