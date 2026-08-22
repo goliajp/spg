@@ -45,7 +45,21 @@ compares SPG against that oracle, and the two differ on exactly this
 difference has been sitting in `baseline.tsv` as an unexplained count
 since the file was written.
 
-## Why it is not fixed here
+## Closed the same day
+
+`docs/DESIGN-2026-08-23-collation.md` has the decision and the build
+order. The short version: **PostgreSQL does not allow a live database's
+collation to change**, which removes the hazard the three options below
+were weighed against, and makes the answer a fourth thing — set it at
+creation from the environment, persist it, never move it.
+
+Absent on disk means `C`, so every database written by every earlier
+version keeps exactly the answers it had and rebuilds nothing.
+
+The three options below are left as written, because the reasoning that
+rejected them is the reasoning that found the fourth.
+
+## Why it was not fixed in the same breath
 
 Changing the default changes **index key order on disk**. Every B-tree
 in every existing database was built byte-ordered; a database that
