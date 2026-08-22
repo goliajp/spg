@@ -117,6 +117,60 @@ fn pg_options() -> icu_collator::options::CollatorOptions {
 /// The same test `compare` applies before it reaches ICU, exposed so that
 /// callers deciding whether to fold ask one question with one answer
 /// rather than re-deriving the name rules each time.
+/// How a text comparison behaves under one collation: two independent
+/// bits that no single flag can express.
+///
+/// v7.38.18 — `utf8mb4_bin` is byte-wise AND `PAD SPACE`;
+/// `utf8mb4_0900_ai_ci` folds case and does NOT pad;
+/// `utf8mb4_0900_bin` does neither. Deciding them together, once, is
+/// what keeps the comparison path and the compiled path from
+/// disagreeing — which is the shape of most of what v7.38.13 through
+/// v7.38.18 were spent on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextCompare {
+    /// Fold case and accents.
+    pub fold_case: bool,
+    /// Trailing spaces do not count.
+    pub pads: bool,
+}
+
+impl TextCompare {
+    /// Does this collation change a comparison at all? A byte-wise,
+    /// non-padding collation is plain `memcmp` and needs no fold step.
+    pub const fn is_plain_bytes(self) -> bool {
+        !self.fold_case && !self.pads
+    }
+}
+
+/// Do trailing spaces count in a comparison under this collation?
+///
+/// v7.38.18 — the pad attribute is a property of the collation NAME,
+/// and SPG read a name for whether to FOLD and never for whether to
+/// PAD. `utf8mb4_bin` and `utf8mb4_general_ci` are PAD SPACE in BOTH
+/// engines, which is the part that is easy to get backwards: byte-wise
+/// does not mean padding counts.
+///
+/// The rule is measured, not inferred. Over every collation both
+/// oracles list — 286 names on MySQL 9.7.2 and 552 on MariaDB 12.3.2,
+/// 838 in all — `NO PAD` holds exactly when the name is `binary`, or
+/// contains `_0900_`, or contains `nopad`. **Zero counter-examples on
+/// either engine.**
+///
+/// `None` — nothing declared — is the session default, and SPG
+/// advertises `8.0.0-spg-v…` on the MySQL wire, so that is MySQL 8.0's
+/// `utf8mb4_0900_ai_ci`: NO PAD.
+pub(crate) fn pads_space(collation: Option<&str>) -> bool {
+    let Some(name) = collation else {
+        return false;
+    };
+    let n = name.trim();
+    if n.eq_ignore_ascii_case("binary") {
+        return false;
+    }
+    let lower = n.to_ascii_lowercase();
+    !(lower.contains("_0900_") || lower.contains("nopad"))
+}
+
 pub(crate) fn is_byte_wise(collation: &str) -> bool {
     let name = collation.trim();
     let base = name.split(['.', '@']).next().unwrap_or(name);

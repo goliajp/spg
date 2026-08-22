@@ -61,6 +61,60 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
     }
 }
 
+/// The declared collation NAME of a column reference, resolved the same
+/// way [`column_collation`] resolves the enum.
+///
+/// v7.38.18 — the enum answers whether a column FOLDS; only the name
+/// answers whether it PADS, and the two are independent:
+/// `utf8mb4_bin` is byte-wise AND `PAD SPACE`, which is the
+/// combination easiest to get backwards.
+pub(crate) fn column_collation_name(e: &Expr, ctx: &EvalContext<'_>) -> Option<String> {
+    let Expr::Column(c) = e else {
+        return None;
+    };
+    let ends_with_dot_name = |s: &str| {
+        s.len() > c.name.len()
+            && s.ends_with(c.name.as_str())
+            && s.as_bytes()[s.len() - c.name.len() - 1] == b'.'
+    };
+    ctx.columns
+        .iter()
+        .find(|s| s.name == c.name || ends_with_dot_name(&s.name))
+        .and_then(|s| s.collation_name.clone())
+}
+
+/// How this comparison's collation behaves — fold and pad, decided
+/// together and once.
+///
+/// v7.38.18 — the comparison has ONE collation, taken from whichever
+/// side declares one (a literal declares none and takes the column's,
+/// which is what makes `WHERE bin_col = 'alpha'` match a row holding
+/// `'alpha  '` on both engines). `BINARY x` and an explicitly byte-wise
+/// column suppress the case fold but NOT the padding rule, because
+/// those are different questions about the same collation.
+pub(crate) fn text_compare_of(
+    lhs: &Expr,
+    rhs: &Expr,
+    ctx: &EvalContext<'_>,
+) -> crate::collate::TextCompare {
+    let byte_wise = is_binary_coerced(lhs)
+        || is_binary_coerced(rhs)
+        || operand_is_binary_column(lhs, ctx)
+        || operand_is_binary_column(rhs, ctx);
+    let ci = matches!(
+        column_collation(lhs, ctx),
+        Some(spg_storage::Collation::CaseInsensitive)
+    ) || matches!(
+        column_collation(rhs, ctx),
+        Some(spg_storage::Collation::CaseInsensitive)
+    );
+    let name = column_collation_name(lhs, ctx).or_else(|| column_collation_name(rhs, ctx));
+    crate::collate::TextCompare {
+        fold_case: !byte_wise && (ci || ctx.mysql_dialect),
+        pads: crate::collate::pads_space(name.as_deref()),
+    }
+}
+
 /// v7.17.0 Phase 2.5 — if the comparison op is text-equality and
 /// either operand references a CaseInsensitive column, return
 /// ASCII-folded copies of both Text values; otherwise pass
@@ -117,33 +171,37 @@ pub(super) fn collation_fold_for_compare(
     // dialect fold is suppressed when either side is binary-coerced.
     // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin` column
     // (stored `Binary`) is byte-wise even under the dialect.
-    let any_binary = is_binary_coerced(lhs)
-        || is_binary_coerced(rhs)
-        || operand_is_binary_column(lhs, ctx)
-        || operand_is_binary_column(rhs, ctx);
-    let mysql = ctx.mysql_dialect && !any_binary;
-    let lhs_col = column_collation(lhs, ctx);
-    let rhs_col = column_collation(rhs, ctx);
-    let ci = matches!(lhs_col, Some(spg_storage::Collation::CaseInsensitive))
-        || matches!(rhs_col, Some(spg_storage::Collation::CaseInsensitive));
-    if !ci && !mysql {
+    // v7.38.18 — one resolver for both bits; the compiled path uses the
+    // same one, so the two cannot drift.
+    let tc = text_compare_of(lhs, rhs, ctx);
+    if tc.is_plain_bytes() {
         return (l, r);
     }
-    // A PG `case_insensitive` column keeps its ASCII-only contract; the
-    // MySQL session uses the full accent-aware fold measured in P1.
-    let fold = |v: Value<'static>| match v {
-        // v7.38.16 — BpChar as well as Text. A CHAR column compared with
-        // `>=` or BETWEEN kept its byte order and its padding: over
-        // alpha/Beta/GAMMA/delta in CHAR(8), `s BETWEEN 'ALPHA' AND
-        // 'DELTA'` answered 1,4 where MySQL answers 1,2,4 — 'Beta' lost
-        // to case and 'delta   ' lost to its own padding.
-        // v7.38.17 — see `mysql_compare_fold`: CHAR pads, TEXT does not.
-        Value::BpChar(s) if mysql => Value::text(spg_storage::mysql_compare_fold_char(&s)),
-        Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
-        Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
-        other => other,
+    let fold_one = |v: Value<'static>| -> Value<'static> {
+        // A CHAR's padding belongs to the TYPE — both engines ignore it
+        // whatever the collation says. A TEXT's belongs to the
+        // collation, which `tc.pads` carries.
+        let (text, pad) = match v {
+            Value::BpChar(s) => (s.into_owned(), true),
+            Value::Text(s) => (s.into_owned(), tc.pads),
+            other => return other,
+        };
+        let base = if pad {
+            text.trim_end_matches(' ')
+        } else {
+            text.as_str()
+        };
+        Value::text(if tc.fold_case {
+            if ctx.mysql_dialect {
+                spg_storage::mysql_ci_fold(base)
+            } else {
+                base.to_ascii_lowercase()
+            }
+        } else {
+            alloc::string::ToString::to_string(base)
+        })
     };
-    (fold(l), fold(r))
+    (fold_one(l), fold_one(r))
 }
 
 /// v7.32 (P4 borrow channel) — borrowed-or-owned evaluation. A bare

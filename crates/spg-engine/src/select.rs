@@ -800,7 +800,11 @@ impl Engine {
             // already built.
             out_rows = dedup_rows(
                 out_rows,
-                FoldSpec::of(self.backslash_escapes, &fold_mask(&projection)),
+                FoldSpec::of_masks(
+                    self.backslash_escapes,
+                    &fold_mask(&projection),
+                    &pad_mask(&projection),
+                ),
             );
         }
         apply_offset_and_limit(&mut out_rows, stmt.offset_literal(), stmt.limit_literal());
@@ -3963,7 +3967,11 @@ impl Engine {
             // new plumbing -- it was simply never asked for.
             projected_rows = dedup_rows(
                 projected_rows,
-                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+                FoldSpec::of_masks(
+                    scan_ctx.mysql_dialect,
+                    &fold_mask(&projection),
+                    &pad_mask(&projection),
+                ),
             );
         }
         // LIMIT / OFFSET — apply at the tail.
@@ -4188,7 +4196,11 @@ impl Engine {
             // new plumbing -- it was simply never asked for.
             projected_rows = dedup_rows(
                 projected_rows,
-                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+                FoldSpec::of_masks(
+                    scan_ctx.mysql_dialect,
+                    &fold_mask(&projection),
+                    &pad_mask(&projection),
+                ),
             );
         }
         if let Some(offset) = stmt.offset_literal() {
@@ -5688,7 +5700,11 @@ impl Engine {
             // new plumbing -- it was simply never asked for.
             projected_rows = dedup_rows(
                 projected_rows,
-                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+                FoldSpec::of_masks(
+                    scan_ctx.mysql_dialect,
+                    &fold_mask(&projection),
+                    &pad_mask(&projection),
+                ),
             );
         }
         if let Some(offset) = stmt.offset_literal() {
@@ -5966,7 +5982,11 @@ impl Engine {
             // new plumbing -- it was simply never asked for.
             projected_rows = dedup_rows(
                 projected_rows,
-                FoldSpec::of(scan_ctx.mysql_dialect, &fold_mask(&projection)),
+                FoldSpec::of_masks(
+                    scan_ctx.mysql_dialect,
+                    &fold_mask(&projection),
+                    &pad_mask(&projection),
+                ),
             );
         }
         if let Some(offset) = stmt.offset_literal() {
@@ -9682,6 +9702,12 @@ pub(crate) struct ProjectedItem {
     /// "exempt" for every projected expression that is not a column.
     /// This field states the question it answers.
     pub(crate) fold_exempt: bool,
+    /// v7.38.18 — does this column's collation make trailing spaces
+    /// insignificant? A separate question from `fold_exempt`:
+    /// `utf8mb4_bin` is fold-exempt AND pads, `utf8mb4_0900_ai_ci`
+    /// folds and does not. Read off the same column, at the same
+    /// place, so the two masks cannot drift apart.
+    pub(crate) pads: bool,
 }
 
 impl ProjectedItem {
@@ -10128,7 +10154,7 @@ fn norm_hash_values(
         // would scatter equal rows across buckets and stop de-duplicating
         // at all; the hash and the comparator have to read the same mask.
         if fold.folds(i)
-            && let Some(folded) = mysql_dedup_fold(v)
+            && let Some(folded) = mysql_dedup_fold(v, fold.pads_at(i))
         {
             folded.hash(&mut h);
             continue;
@@ -10366,7 +10392,7 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
 /// collapse to one row, exactly as GROUP BY already folds its keys. Returns
 /// the folded comparison key for a text value, None for anything else (which
 /// keeps the byte-exact `value_cmp` path).
-fn mysql_dedup_fold(v: &Value) -> Option<String> {
+fn mysql_dedup_fold(v: &Value, pads: bool) -> Option<String> {
     match v {
         // v7.38.17 — CHAR's trailing spaces are padding; TEXT's are
         // data. The comment above named `utf8mb4_uca1400_ai_ci`, which
@@ -10374,7 +10400,10 @@ fn mysql_dedup_fold(v: &Value) -> Option<String> {
         // whose default is NO PAD, so `'alpha'` and `'alpha  '` are two
         // rows to a `SELECT DISTINCT` and one to `count(DISTINCT)` was
         // the same question answered twice.
+        // v7.38.18 — a CHAR's padding is the TYPE's and never counts; a
+        // TEXT's is the collation's, which `pads` carries per position.
         Value::BpChar(s) => Some(spg_storage::mysql_compare_fold_char(s)),
+        Value::Text(s) if pads => Some(spg_storage::mysql_compare_fold_char(s)),
         Value::Text(s) => Some(spg_storage::mysql_compare_fold(s)),
         _ => None,
     }
@@ -10423,17 +10452,45 @@ pub static DISTINCT_DUP_DROPPED: core::sync::atomic::AtomicU64 =
 pub(crate) struct FoldSpec<'c> {
     mysql: bool,
     binary: &'c [bool],
+    /// v7.38.18 — the padding mask, in lockstep with `binary`. Read the
+    /// note on `folds`: a hash and its comparator must consult the same
+    /// masks or equal rows scatter across buckets.
+    pads: &'c [bool],
 }
 
 impl<'c> FoldSpec<'c> {
     /// No column information — every Text position folds under MySQL.
     pub(crate) const fn dialect(mysql: bool) -> Self {
-        Self { mysql, binary: &[] }
+        Self {
+            mysql,
+            binary: &[],
+            pads: &[],
+        }
     }
 
     /// The mask read off the output columns.
     pub(crate) fn of(mysql: bool, binary: &'c [bool]) -> Self {
-        Self { mysql, binary }
+        Self {
+            mysql,
+            binary,
+            pads: &[],
+        }
+    }
+
+    /// The masks read off the output columns — fold-exemption AND
+    /// padding, which are different questions about the same collation.
+    pub(crate) fn of_masks(mysql: bool, binary: &'c [bool], pads: &'c [bool]) -> Self {
+        Self {
+            mysql,
+            binary,
+            pads,
+        }
+    }
+
+    /// Does position `i` treat trailing spaces as insignificant?
+    #[inline]
+    fn pads_at(&self, i: usize) -> bool {
+        self.pads.get(i).copied().unwrap_or(false)
     }
 
     /// Does position `i` fold?
@@ -10449,6 +10506,12 @@ impl<'c> FoldSpec<'c> {
 /// projection rebuilds that schema through `ColumnSchema::new`, whose
 /// collation default is `Binary` — a mask built from it would mark
 /// EVERY column byte-wise and stop DISTINCT folding at all.
+/// The padding mask for a projection, read off the same items as
+/// [`fold_mask`] so the two cannot come from different places.
+pub(crate) fn pad_mask(projection: &[ProjectedItem]) -> alloc::vec::Vec<bool> {
+    projection.iter().map(|p| p.pads).collect()
+}
+
 pub(crate) fn fold_mask(projection: &[ProjectedItem]) -> alloc::vec::Vec<bool> {
     projection.iter().map(|p| p.fold_exempt).collect()
 }
@@ -10467,6 +10530,16 @@ pub(crate) fn fold_mask(projection: &[ProjectedItem]) -> alloc::vec::Vec<bool> {
 /// DEFAULT, so a schema rebuilt without carrying the field reads as
 /// "byte-wise on purpose" here. That is a real trap and it has caught
 /// five fields so far; it is why S4 of this release exists.
+/// v7.38.18 — the padding mask from output columns, the sibling of
+/// [`fold_mask_of_columns`]. Whether a column folds and whether it
+/// pads are different questions about the same collation.
+pub(crate) fn pad_mask_of_columns(columns: &[ColumnSchema]) -> alloc::vec::Vec<bool> {
+    columns
+        .iter()
+        .map(|c| crate::collate::pads_space(c.collation_name.as_deref()))
+        .collect()
+}
+
 pub(crate) fn fold_mask_of_columns(columns: &[ColumnSchema]) -> alloc::vec::Vec<bool> {
     columns
         .iter()
@@ -10489,7 +10562,10 @@ pub(crate) fn values_eq_norm(
     a.len() == b.len()
         && a.iter().zip(b).enumerate().all(|(i, (x, y))| {
             if fold.folds(i)
-                && let (Some(fx), Some(fy)) = (mysql_dedup_fold(x), mysql_dedup_fold(y))
+                && let (Some(fx), Some(fy)) = (
+                    mysql_dedup_fold(x, fold.pads_at(i)),
+                    mysql_dedup_fold(y, fold.pads_at(i)),
+                )
             {
                 return fx == fy;
             }
@@ -11130,6 +11206,7 @@ pub(crate) fn build_projection_hiding_tail(
                         mysql_fsp: col.mysql_fsp,
                         collation_name: col.collation_name.clone(),
                         fold_exempt: matches!(col.collation, spg_storage::Collation::Binary),
+                        pads: crate::collate::pads_space(col.collation_name.as_deref()),
                     });
                 }
             }
@@ -11167,6 +11244,7 @@ pub(crate) fn build_projection_hiding_tail(
                         mysql_fsp: col.mysql_fsp,
                         collation_name: col.collation_name.clone(),
                         fold_exempt: matches!(col.collation, spg_storage::Collation::Binary),
+                        pads: crate::collate::pads_space(col.collation_name.as_deref()),
                     });
                 }
                 if matched == 0 {
@@ -11198,6 +11276,7 @@ pub(crate) fn build_projection_hiding_tail(
                         // v7.38.13 — and its byte-wise-ness. This is the
                         // site `SELECT DISTINCT t FROM t` arrives at.
                         fold_exempt: matches!(sch.collation, spg_storage::Collation::Binary),
+                        pads: crate::collate::pads_space(sch.collation_name.as_deref()),
                     });
                 } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
                     let output_name = alias
@@ -11205,6 +11284,10 @@ pub(crate) fn build_projection_hiding_tail(
                         .unwrap_or_else(|| default_output_name(expr, mysql));
                     out.push(ProjectedItem {
                         expr: expr.clone(),
+                        // v7.38.18 — a projected EXPRESSION has no column collation
+                        // to read, so it takes the session default, which is MySQL
+                        // 8.0's `utf8mb4_0900_ai_ci`: NO PAD.
+                        pads: false,
                         output_name,
                         ty: shape.ty,
                         // v7.39 (round 258) — a projected EXPRESSION keeps its
@@ -11243,6 +11326,10 @@ pub(crate) fn build_projection_hiding_tail(
                         .unwrap_or_else(|| default_output_name(expr, mysql));
                     out.push(ProjectedItem {
                         expr: expr.clone(),
+                        // v7.38.18 — a projected EXPRESSION has no column collation
+                        // to read, so it takes the session default, which is MySQL
+                        // 8.0's `utf8mb4_0900_ai_ci`: NO PAD.
+                        pads: false,
                         output_name,
                         // A user ENUM has no DataType of its own, so
                         // `describe_expr` cannot type `'ok'::mood` and the

@@ -1256,9 +1256,10 @@ pub(crate) fn run(
         // the collation, so the mask needs no new plumbing.
         out_rows = crate::select::dedup_rows(
             out_rows,
-            crate::select::FoldSpec::of(
+            crate::select::FoldSpec::of_masks(
                 engine.is_some_and(|e| e.backslash_escapes),
                 &crate::select::fold_mask_of_columns(&columns),
+                &crate::select::pad_mask_of_columns(&columns),
             ),
         );
     }
@@ -2327,12 +2328,28 @@ fn accumulate_groups(
         && !group_exprs
             .iter()
             .any(|e| crate::eval::is_binary_coerced(e));
+    // v7.38.18 — the padding mask, built beside the fold mask off the
+    // same argument column so the two cannot come from different places.
+    let distinct_pads: Vec<bool> = arg_pos
+        .iter()
+        .map(|&p| {
+            p.and_then(|i| schema_cols.get(i))
+                .is_some_and(|c| crate::collate::pads_space(c.collation_name.as_deref()))
+        })
+        .collect();
+    let distinct_fold_case: Vec<bool> = arg_pos.iter().map(|&p| !is_binary_key_col(p)).collect();
     let distinct_fold: Vec<bool> = agg_specs
         .iter()
         .enumerate()
         .map(|(i, spec)| {
+            // v7.38.18 — a byte-wise column still needs this step when
+            // its collation PADS. `utf8mb4_bin` folds no case and
+            // ignores trailing spaces, which is one flag short of what
+            // a single boolean can say; the pad mask beside this one
+            // carries the second half and the fold is skipped by
+            // `distinct_fold_case` below.
             ctx.mysql_dialect
-                && !is_binary_key_col(arg_pos[i])
+                && (!is_binary_key_col(arg_pos[i]) || distinct_pads[i])
                 && !spec
                     .arg
                     .as_ref()
@@ -3247,7 +3264,20 @@ fn accumulate_groups(
                         // v7.39 (round 370, M4 P4a) — but an explicit
                         // `COLLATE utf8mb4_bin` column de-dups byte-wise.
                         if distinct_fold[i] {
-                            let k = spg_storage::mysql_compare_fold(s);
+                            // v7.38.18 — and pad when the argument's
+                            // collation says trailing spaces do not
+                            // count. `utf8mb4_general_ci` folds AND
+                            // pads; `utf8mb4_0900_ai_ci` only folds.
+                            let base = if distinct_pads[i] {
+                                s.trim_end_matches(' ')
+                            } else {
+                                s.as_ref()
+                            };
+                            let k = if distinct_fold_case[i] {
+                                spg_storage::mysql_ci_fold(base)
+                            } else {
+                                alloc::string::ToString::to_string(base)
+                            };
                             if entry.1[i].seen.contains(k.as_str()) {
                                 continue;
                             }
