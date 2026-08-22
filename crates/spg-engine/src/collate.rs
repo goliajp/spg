@@ -289,6 +289,31 @@ pub(crate) fn column_key_is_bytewise(col: &spg_storage::ColumnSchema, mysql: boo
     if matches!(col.collation, spg_storage::Collation::CaseInsensitive) {
         return false;
     }
+    // v7.38.18 (S0) — and a DECLARED locale collation is neither byte
+    // order nor a case fold, which this asked about for two versions
+    // without ever asking about the name.
+    //
+    // The enum answers whether a column FOLDS. A PG column declared
+    // `COLLATE "en_US.utf8"` stores `Collation::Binary` — the struct's
+    // default, meaning "nothing was said about folding" — and under the
+    // PG dialect `!mysql` made that byte-wise. So the seek ran on byte
+    // keys while the predicate meant the locale, and the table above is
+    // what that costs. Measured, five rows, `WHERE x > 'b'` on a column
+    // declared `en_US.utf8`: PG 18.4 answers `Bob client DateStyle
+    // Zebra` with an index and without; SPG answered all four without
+    // and `client` with. Three rows gone.
+    //
+    // Answering `false` sends it back to the scan, which is this
+    // function's own stated trade. `docs/DESIGN-2026-08-23-collation.md`
+    // S0 gives the key back its seek by carrying the collation IN the
+    // key; until that lands, correct and slower.
+    if col
+        .collation_name
+        .as_deref()
+        .is_some_and(|n| !is_byte_wise(n))
+    {
+        return false;
+    }
     !mysql || matches!(col.collation, spg_storage::Collation::Binary)
 }
 
@@ -307,10 +332,35 @@ mod tests {
     #[test]
     fn sort_key_bytes_order_the_way_compare_does() {
         let words = [
-            "apple", "Apple", "APPLE", "Bob", "bob", "client", "DateStyle",
-            "Zebra", "zebra", "_under", "cherry", "de-luca", "deluca",
-            "O'Brien", "Obrien", "résumé", "resume", "Résumé", "1abc",
-            "", " ", "a", "A", "ä", "Ä", "z", "Z", "élan", "elan",
+            "apple",
+            "Apple",
+            "APPLE",
+            "Bob",
+            "bob",
+            "client",
+            "DateStyle",
+            "Zebra",
+            "zebra",
+            "_under",
+            "cherry",
+            "de-luca",
+            "deluca",
+            "O'Brien",
+            "Obrien",
+            "résumé",
+            "resume",
+            "Résumé",
+            "1abc",
+            "",
+            " ",
+            "a",
+            "A",
+            "ä",
+            "Ä",
+            "z",
+            "Z",
+            "élan",
+            "elan",
         ];
         for coll in ["en_US.utf8", "de_DE.utf8", "fr_FR.utf8"] {
             for a in words {
