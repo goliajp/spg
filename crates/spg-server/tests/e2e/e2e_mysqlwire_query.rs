@@ -1092,3 +1092,107 @@ fn a_disconnect_under_autocommit_off_rolls_back() {
     }
     panic!("an uncommitted write survived the disconnect");
 }
+
+/// v7.38.17 — the same four questions v7.38.16 answered wrongly, asked
+/// over the wire a MySQL client actually speaks.
+///
+/// Those four were found with an in-process probe, and the corpus could
+/// not ask them at all: `corpus/mysql/` ran in PostgreSQL dialect from
+/// the day it was created. The corpus can ask now, but it asks
+/// in-process, and this project has been caught twice building something
+/// its probe could not reach. So the questions are asked here too, on
+/// the protocol path, where the release gate runs them.
+///
+/// Every expectation is MySQL 9.7.1's own answer at its default
+/// collation `utf8mb4_0900_ai_ci`, read from the oracle:
+///
+///   s = 'ALPHA'                       1
+///   s IN ('ALPHA','BETA')             1,2
+///   s BETWEEN 'ALPHA' AND 'DELTA'     1,2,4
+///   ORDER BY s LIMIT 2                1,2
+///   a JOIN b ON a.s = b.s             1/10, 2/20
+///
+/// An index must not change any of them. Before v7.38.16 the first two
+/// returned NOTHING with an index present and the join returned the
+/// empty set.
+#[test]
+fn an_index_does_not_change_the_answer_over_the_mysql_wire() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+
+    let col = |rows: Vec<Vec<Option<String>>>| -> Vec<String> {
+        rows.into_iter()
+            .map(|r| r[0].clone().unwrap_or_else(|| "NULL".into()))
+            .collect()
+    };
+
+    for stage in ["no index", "indexed"] {
+        exec_ok(&mut s, "DROP TABLE IF EXISTS mw");
+        exec_ok(&mut s, "CREATE TABLE mw (k INT, s TEXT)");
+        exec_ok(
+            &mut s,
+            "INSERT INTO mw VALUES (1,'alpha'),(2,'Beta'),(3,'GAMMA'),(4,'delta')",
+        );
+        if stage == "indexed" {
+            exec_ok(&mut s, "CREATE INDEX mw_s ON mw (s)");
+        }
+
+        assert_eq!(
+            col(query_rows(&mut s, "SELECT k FROM mw WHERE s = 'ALPHA'")),
+            vec!["1"],
+            "{stage}: equality folds in MySQL; 9.7.1 answers 1"
+        );
+        assert_eq!(
+            col(query_rows(
+                &mut s,
+                "SELECT k FROM mw WHERE s IN ('ALPHA','BETA') ORDER BY k"
+            )),
+            vec!["1", "2"],
+            "{stage}: IN folds too; 9.7.1 answers 1,2"
+        );
+        assert_eq!(
+            col(query_rows(
+                &mut s,
+                "SELECT k FROM mw WHERE s BETWEEN 'ALPHA' AND 'DELTA' ORDER BY k"
+            )),
+            vec!["1", "2", "4"],
+            "{stage}: 9.7.1 answers 1,2,4"
+        );
+        assert_eq!(
+            col(query_rows(&mut s, "SELECT k FROM mw ORDER BY s LIMIT 2")),
+            vec!["1", "2"],
+            "{stage}: ordering folds, so the byte order is the wrong order"
+        );
+    }
+
+    // The join, which is where this defect took its worst shape: an
+    // inner join returned no rows at all, and only when an index existed.
+    for stage in ["no index", "indexed"] {
+        exec_ok(&mut s, "DROP TABLE IF EXISTS ja");
+        exec_ok(&mut s, "DROP TABLE IF EXISTS jb");
+        exec_ok(&mut s, "CREATE TABLE ja (k INT, s TEXT)");
+        exec_ok(&mut s, "CREATE TABLE jb (k INT, s TEXT)");
+        exec_ok(&mut s, "INSERT INTO ja VALUES (1,'alpha'),(2,'Beta')");
+        exec_ok(&mut s, "INSERT INTO jb VALUES (10,'ALPHA'),(20,'beta')");
+        if stage == "indexed" {
+            exec_ok(&mut s, "CREATE INDEX ja_s ON ja (s)");
+            exec_ok(&mut s, "CREATE INDEX jb_s ON jb (s)");
+        }
+        let pairs: Vec<String> = query_rows(
+            &mut s,
+            "SELECT ja.k, jb.k FROM ja JOIN jb ON ja.s = jb.s ORDER BY ja.k",
+        )
+        .into_iter()
+        .map(|r| format!("{}/{}", r[0].clone().unwrap(), r[1].clone().unwrap()))
+        .collect();
+        assert_eq!(
+            pairs,
+            vec!["1/10", "2/20"],
+            "{stage}: 9.7.1 matches both pairs on a folding collation"
+        );
+    }
+
+    exec_ok(&mut s, "DROP TABLE IF EXISTS mw");
+    exec_ok(&mut s, "DROP TABLE IF EXISTS ja");
+    exec_ok(&mut s, "DROP TABLE IF EXISTS jb");
+}

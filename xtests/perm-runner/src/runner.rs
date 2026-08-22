@@ -286,14 +286,38 @@ fn run_one_fixture_server(path: &Path, extended: bool, bin: &Path) -> FixtureRes
     for rec in &records {
         match rec {
             Record::Halt => break,
-            // This runner drives a PostgreSQL wire connection, which has
-            // no MySQL dialect to switch into. Stop rather than run the
-            // rest of the file under the wrong semantics — and count the
-            // remainder as skipped so the number says the file was not
-            // covered here, instead of passing quietly on nothing.
-            Record::Dialect(_) => {
-                result.skip += 1;
-                break;
+            // v7.38.17 — the dialect is a SESSION property, not a
+            // protocol one. This runner drives a PostgreSQL wire
+            // connection, and a PostgreSQL connection can still ask for
+            // MySQL semantics: `SET sql_mode` is exactly the switch a
+            // mysqldump preamble uses, and `session.rs:277` honours it
+            // whichever wire it arrives on.
+            //
+            // This used to skip the rest of the file, which was a small
+            // instance of the disease this whole change is about — a
+            // skip that reads as coverage. Running it here is the
+            // "MySQL semantics over a wire" axis, and the defects worth
+            // catching there are engine-level: the packet layer has its
+            // own eleven tests.
+            Record::Dialect(mysql) => {
+                let sql = if *mysql {
+                    "SET sql_mode = 'STRICT_TRANS_TABLES'"
+                } else {
+                    // PostgreSQL's own switch for the same session
+                    // property. `sql_mode = 'NO_BACKSLASH_ESCAPES'`
+                    // would also land here, but it announces a MySQL
+                    // client and carries strictness with it; a file
+                    // asking for PostgreSQL should not have to.
+                    "SET standard_conforming_strings = on"
+                };
+                match run(&mut conn, sql) {
+                    Ok(r) if r.error.is_none() => result.pass += 1,
+                    Ok(r) => fail(
+                        &mut result,
+                        format!("dialect switch rejected: {:?}", r.error),
+                    ),
+                    Err(e) => fail(&mut result, format!("wire: {e}")),
+                }
             }
             Record::Statement {
                 directive,
