@@ -569,15 +569,34 @@ pub(crate) fn try_index_seek_positions(
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
                 || idx.expression.is_some()
-                // v7.38.18 (S0) — see `composite_has_collated_key`.
-                || composite_has_collated_key(table, idx, schema_cols)
             {
                 continue;
             }
             let mut prefix: Vec<IndexKey> = Vec::new();
+            let mut cut_by_collation = false;
             for pos in core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
             {
+                // v7.38.18 (G3) — a component whose column collates by a
+                // locale stops the prefix HERE, rather than
+                // disqualifying the whole index.
+                //
+                // A composite tree holds tuples of raw cells, built by
+                // storage, while `probe_key` encodes such a column's
+                // probe as an ICU sort key: two spaces, and the seek
+                // looks in the wrong one. This version first declined
+                // the index outright, which cost a full scan for `WHERE
+                // id = 7 AND s = 'row7'` when `id` alone narrows it to
+                // one row. Seeking the components that CAN be probed and
+                // letting the caller re-check the rest is what
+                // PostgreSQL does with a component it cannot use.
+                if schema_cols
+                    .get(pos)
+                    .is_some_and(|c| collated_column(c, db_coll).is_some())
+                {
+                    cut_by_collation = true;
+                    break;
+                }
                 match eq_keys.iter().find(|(c, _)| *c == pos) {
                     Some((_, k)) => prefix.push(k.clone()),
                     None => break,
@@ -591,7 +610,10 @@ pub(crate) fn try_index_seek_positions(
             // caps like the range walk (never materialise more than the
             // competition or a quarter of the table), with a small floor
             // so tiny tables still seek (rows/4 of a 1-row table is 0).
-            let locs = if prefix.len() == 1 + idx.extra_column_positions.len() {
+            // A prefix cut short by a collated component is never the
+            // whole tuple, however many components it holds.
+            let locs = if !cut_by_collation && prefix.len() == 1 + idx.extra_column_positions.len()
+            {
                 Some(idx.lookup_eq_multi(&prefix).to_vec())
             } else {
                 let multi_cap = best
@@ -1503,15 +1525,34 @@ pub(crate) fn try_index_seek<'a>(
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
                 || idx.expression.is_some()
-                // v7.38.18 (S0) — see `composite_has_collated_key`.
-                || composite_has_collated_key(table, idx, schema_cols)
             {
                 continue;
             }
             let mut prefix: Vec<IndexKey> = Vec::new();
+            let mut cut_by_collation = false;
             for pos in core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
             {
+                // v7.38.18 (G3) — a component whose column collates by a
+                // locale stops the prefix HERE, rather than
+                // disqualifying the whole index.
+                //
+                // A composite tree holds tuples of raw cells, built by
+                // storage, while `probe_key` encodes such a column's
+                // probe as an ICU sort key: two spaces, and the seek
+                // looks in the wrong one. This version first declined
+                // the index outright, which cost a full scan for `WHERE
+                // id = 7 AND s = 'row7'` when `id` alone narrows it to
+                // one row. Seeking the components that CAN be probed and
+                // letting the caller re-check the rest is what
+                // PostgreSQL does with a component it cannot use.
+                if schema_cols
+                    .get(pos)
+                    .is_some_and(|c| collated_column(c, db_coll).is_some())
+                {
+                    cut_by_collation = true;
+                    break;
+                }
                 match eq_keys.iter().find(|(c, _)| *c == pos) {
                     Some((_, k)) => prefix.push(k.clone()),
                     None => break,
@@ -1525,7 +1566,10 @@ pub(crate) fn try_index_seek<'a>(
             // caps like the range walk (never materialise more than the
             // competition or a quarter of the table), with a small floor
             // so tiny tables still seek (rows/4 of a 1-row table is 0).
-            let locs = if prefix.len() == 1 + idx.extra_column_positions.len() {
+            // A prefix cut short by a collated component is never the
+            // whole tuple, however many components it holds.
+            let locs = if !cut_by_collation && prefix.len() == 1 + idx.extra_column_positions.len()
+            {
                 Some(idx.lookup_eq_multi(&prefix).to_vec())
             } else {
                 let multi_cap = best
@@ -2595,31 +2639,6 @@ pub(crate) fn index_is_usable(table: &Table, idx: &spg_storage::Index) -> bool {
     table.index_collation(idx).is_none() || table.expr_index_is_complete(&idx.name)
 }
 
-/// v7.38.18 (S0) — does this COMPOSITE index have a key column whose
-/// probe would be built as an ICU sort key?
-///
-/// Its entries are tuples of raw cells, built by storage. `probe_key`
-/// encodes a locale-collated column's probe as a sort key, so the two
-/// would land in different spaces and the seek would find nothing —
-/// measured on the differential corpus, `WHERE id = 7 AND s = 'row7'`
-/// over `ix(id, s)`: PostgreSQL 18.4 answers 1 and SPG answered 0.
-///
-/// Declining costs a scan. Encoding the tuple's text components the same
-/// way is the fix that gives the seek back, and it is not done here.
-fn composite_has_collated_key(
-    table: &Table,
-    idx: &spg_storage::Index,
-    schema_cols: &[ColumnSchema],
-) -> bool {
-    if idx.extra_column_positions.is_empty() {
-        return false;
-    }
-    let db_coll = table.db_collation();
-    core::iter::once(idx.column_position)
-        .chain(idx.extra_column_positions.iter().copied())
-        .filter_map(|p| schema_cols.get(p))
-        .any(|c| collated_column(c, db_coll).is_some())
-}
 
 pub(crate) fn resolve_col_literal_pair(
     col_side: &Expr,

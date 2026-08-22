@@ -164,6 +164,12 @@ the current build; this file is a release-organized view.
   two spaces, and the seek looked in the wrong one. Introduced by the
   work above and caught by the corpus before it left the branch.
 
+  The first fix declined such an index outright, which was correct and
+  cost a full scan for `WHERE id = 7 AND s = 'row7'` — a predicate `id`
+  alone narrows to one row. The prefix stops at the collated component
+  instead and the caller re-checks the rest, which is what PostgreSQL
+  does with a component it cannot use.
+
 - **An index on a column with a locale collation dropped rows.** A
   column declared `COLLATE "en_US.utf8"`, five rows, `WHERE x > 'b'`:
   PostgreSQL 18.4 answers `Bob client DateStyle Zebra` with an index and
