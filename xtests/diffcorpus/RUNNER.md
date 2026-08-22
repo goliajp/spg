@@ -52,7 +52,20 @@ all four values — but its database-level collation is fixed at `C` and
 nothing can change it.
 
 That is a real divergence and a wide one, written up with its options in
-`docs/FINDING-2026-08-23-database-collation.md`. It stays in the
-baseline as a NUMBER only because the file has no room for a reason;
-this paragraph is the reason, and the number should go to 0 when the
-finding is closed rather than being re-baselined again.
+`docs/FINDING-2026-08-23-database-collation.md`.
+
+**It reached 0 the same day**, by closing the finding rather than by
+being re-baselined again — which is what the sentence that used to end
+this section asked for. `spg-server` now records the database collation
+from its environment, so the differ's SPG runs with the same
+`en_US.utf8` its oracle container has, and `ORDER BY 1` over those three
+parameter names agrees.
+
+The run that closed it also turned `10-index` from 0 to 2, which is the
+other half of why this file is worth reading. That was a NEW silent
+wrong answer — `WHERE id = 7 AND s = 'row7'` over a composite index
+answering 0 — and chasing it found a SECOND one that the shipped build
+already had, with no collation involved: an expression index standing in
+for a column index, so `WHERE s = 'Row7'` lost its row the moment
+`CREATE INDEX ON ix((lower(s)))` existed. Both are fixed and pinned; the
+corpus is what noticed.

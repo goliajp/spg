@@ -103,6 +103,31 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **An expression index stood in for a column index, and a row went
+  missing.** This one the shipped build already had, on a plain `C`
+  database, with no collation involved:
+
+  ```
+  WHERE s = 'Row7'                          1
+  CREATE INDEX ix_expr ON ix((lower(s)))
+  WHERE s = 'Row7'                          0
+  ```
+
+  `Table::index_on` returned the first B-tree whose `column_position`
+  matched, and an expression index carries the anchor column there. Its
+  tree holds `lower(s)`, so a probe built from the column's own value
+  asked it a question its keys could not answer — and v7.38.16 fixed
+  that exact shape for GIN, two lines away in the same function.
+
+  Found by chasing a deviation the differential corpus reported, not by
+  a report. The lower-case rows in most fixtures match by coincidence,
+  which is why it survived: `lower('row8')` is `'row8'`.
+
+- **A composite index over a collated column found nothing.** Its
+  entries are tuples of raw cells and the probe was an ICU sort key —
+  two spaces, and the seek looked in the wrong one. Introduced by the
+  work above and caught by the corpus before it left the branch.
+
 - **An index on a column with a locale collation dropped rows.** A
   column declared `COLLATE "en_US.utf8"`, five rows, `WHERE x > 'b'`:
   PostgreSQL 18.4 answers `Bob client DateStyle Zebra` with an index and
