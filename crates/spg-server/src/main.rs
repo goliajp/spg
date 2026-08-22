@@ -1082,6 +1082,89 @@ mod env_knob_tests {
         assert_eq!(resolve(Some("250")), Some(250), "a value is itself");
     }
 
+    /// v7.38.18 — the three PG-spelled env names are a promise, and
+    /// nothing was checking it.
+    ///
+    /// `SPG_STATEMENT_TIMEOUT`, `SPG_AUTOVACUUM_NAPTIME` and
+    /// `SPG_LOG_MIN_DURATION` exist so an operator migrating from
+    /// PostgreSQL can write the name they already know. All three were
+    /// listed as unexercised in `xtests/sigil/runtime-env.md`: no test,
+    /// script or workflow named them outside a comment. A typo in either
+    /// column of the ALIAS table would have meant a deployer setting
+    /// `SPG_STATEMENT_TIMEOUT=50` got no timeout, and got no complaint
+    /// either.
+    ///
+    /// This pins the MAPPING. That the resolved key then does something
+    /// is a separate fact, held by `e2e_query_ns_budget.rs`, which
+    /// spawns a server with `SPG_QUERY_TIMEOUT_MS` and watches a query
+    /// die. The two together are the promise; neither alone is.
+    #[test]
+    fn the_pg_spelled_env_names_resolve_to_the_switches_they_promise() {
+        use super::env_resolve_with;
+        let only =
+            |k: &'static str, v: &'static str| move |q: &str| (q == k).then(|| v.to_string());
+
+        // Each PG name reaches the SPG switch it is documented to reach.
+        assert_eq!(
+            env_resolve_with("SPG_QUERY_TIMEOUT_MS", only("SPG_STATEMENT_TIMEOUT", "50")),
+            Some("50".into())
+        );
+        assert_eq!(
+            env_resolve_with(
+                "SPG_AUTO_ANALYZE_INTERVAL_MS",
+                only("SPG_AUTOVACUUM_NAPTIME", "60000")
+            ),
+            Some("60000".into())
+        );
+        assert_eq!(
+            env_resolve_with(
+                "SPG_SLOW_QUERY_THRESHOLD_MS",
+                only("SPG_LOG_MIN_DURATION", "250")
+            ),
+            Some("250".into())
+        );
+
+        // ...and not some other switch. Without this the test would pass
+        // on an alias table that mapped every PG name to one key.
+        assert_eq!(
+            env_resolve_with(
+                "SPG_SLOW_QUERY_THRESHOLD_MS",
+                only("SPG_STATEMENT_TIMEOUT", "50")
+            ),
+            None
+        );
+
+        // The PG spelling wins when both are set, which is the migration
+        // direction the doc commits to.
+        assert_eq!(
+            env_resolve_with("SPG_QUERY_TIMEOUT_MS", |q: &str| match q {
+                "SPG_STATEMENT_TIMEOUT" => Some("50".into()),
+                "SPG_QUERY_TIMEOUT_MS" => Some("9999".into()),
+                _ => None,
+            }),
+            Some("50".into())
+        );
+
+        // An empty PG-spelled value is not a value: it falls through
+        // rather than overriding the SPG-spelled one with nothing.
+        assert_eq!(
+            env_resolve_with("SPG_QUERY_TIMEOUT_MS", |q: &str| match q {
+                "SPG_STATEMENT_TIMEOUT" => Some(String::new()),
+                "SPG_QUERY_TIMEOUT_MS" => Some("9999".into()),
+                _ => None,
+            }),
+            Some("9999".into())
+        );
+
+        // A switch with no alias still reads itself, and an unset one is
+        // still None.
+        assert_eq!(
+            env_resolve_with("SPG_ADDR", only("SPG_ADDR", "127.0.0.1:0")),
+            Some("127.0.0.1:0".into())
+        );
+        assert_eq!(env_resolve_with("SPG_ADDR", |_: &str| None), None);
+    }
+
     /// r1017 — the OTHER slow-query knob, and the one that had no off
     /// switch at all.
     ///
@@ -1130,6 +1213,19 @@ mod env_knob_tests {
 /// / `parse_env_usize` + any future `_string` variant) inherit
 /// resolution automatically.
 fn env_resolve(env_key: &str) -> Option<String> {
+    env_resolve_with(env_key, |k| env::var(k).ok())
+}
+
+/// v7.38.18 — the mapping, separated from the environment so it can be
+/// tested without mutating a process-global.
+///
+/// These three names are a promise to an operator migrating from
+/// PostgreSQL, and until now nothing in this repository named them
+/// outside a comment: the runtime-switch register listed all three as
+/// unexercised. A typo on either side of the table would have meant a
+/// deployer setting `SPG_STATEMENT_TIMEOUT` got no timeout at all, with
+/// nothing to say so.
+fn env_resolve_with(env_key: &str, get: impl Fn(&str) -> Option<String>) -> Option<String> {
     // PG-spelled alias → SPG-spelled current key. PG-spelled wins
     // when set on the assumption that an operator who wrote the
     // PG-style name was doing so deliberately.
@@ -1152,13 +1248,13 @@ fn env_resolve(env_key: &str) -> Option<String> {
     // Prefer the PG-spelled alias when its mapping owns this key.
     for (pg_name, spg_name) in ALIASES {
         if *spg_name == env_key
-            && let Ok(v) = env::var(pg_name)
+            && let Some(v) = get(pg_name)
             && !v.is_empty()
         {
             return Some(v);
         }
     }
-    env::var(env_key).ok()
+    get(env_key)
 }
 
 /// v5.1: parse `SPG_PRELOAD_COLD_SEGMENT` into a list of
