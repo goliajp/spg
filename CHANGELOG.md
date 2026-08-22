@@ -40,6 +40,21 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **`pg_settings` reports every parameter PostgreSQL 18.4 has**, and so
+  does `SHOW ALL` — 398 where SPG listed 31 and 33. A client that
+  enumerates settings saw a server that looked unconfigured.
+
+  The row is not a new claim about what SPG acts on. `SHOW
+  archive_command` already answered `''` and `SET archive_command = 'x'`
+  already answered *cannot be changed now*; only `pg_settings` said the
+  parameter did not exist, which made it the one surface of three that
+  disagreed. What separates a parameter SPG reads from one it merely
+  reports is `source` — `default` against `session` — which is the
+  distinction PostgreSQL draws with the same column.
+
+  `SHOW ALL`'s third column is called `description` and now holds one:
+  PostgreSQL's own one-line text. It used to hold the category.
+
 - **`SHOW COUNT(*) WARNINGS`** — MySQL's spelling for the size of the
   diagnostics area. One row, one column, named `@@session.warning_count`
   the way MySQL 9 names it, because that is the name a client keys on.

@@ -131,15 +131,24 @@ fn round474_synchronous_commit_is_readable_where_it_is_settable() {
 }
 
 #[test]
-fn round474_a_knob_spg_ignores_is_not_advertised() {
-    // `enable_seqscan` is validated by SET and never read. Listing it would
-    // tell a tuning tool that turning it does something.
+fn round474_a_knob_spg_ignores_reports_as_a_default() {
+    // This asserted 0 until v7.38.18, with the reason "listing it would
+    // tell a tuning tool that turning it does something". `SHOW
+    // enable_seqscan` was answering `on` the whole time, so the tool
+    // could already be told — only the enumeration hid it, and hiding it
+    // there put `pg_settings` 367 rows short of PG18.
+    //
+    // What honestly separates a knob SPG reads from one it does not is
+    // `source`: `default` here, `session` once a SET lands, which is the
+    // same distinction PG draws.
     let mut e = Engine::new();
     assert_eq!(
         scalar(
             &mut e,
-            "SELECT count(*) FROM pg_settings WHERE name = 'enable_seqscan'"
+            "SELECT count(*), max(setting), max(source) FROM pg_settings \
+             WHERE name = 'enable_seqscan'"
         ),
-        "0"
+        "1|on|default"
     );
+    assert_eq!(scalar(&mut e, "SHOW enable_seqscan"), "on");
 }

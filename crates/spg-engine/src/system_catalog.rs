@@ -9621,6 +9621,52 @@ pub(crate) fn synth_pg_timezone_abbrevs(engine: &Engine) -> (Vec<ColumnSchema>, 
 /// tools read `pg_settings` to discover server-side configuration.
 /// SPG surfaces every session_param + a small set of canonical PG
 /// defaults so the pre-flight queries match.
+/// v7.38.18 (C5) — one `pg_settings` row for a parameter whose metadata
+/// came from PG 18.4 rather than from SPG's own list. Its boot value is
+/// already in PG's raw reporting form and its unit is PG's, so it skips
+/// the human-form conversion the canonical rows go through.
+fn pg_guc_row(
+    name: &str,
+    boot: &str,
+    cat: &str,
+    vartype: &str,
+    context: &str,
+    unit: &str,
+    desc: &str,
+    overridden: Option<String>,
+) -> Row<'static> {
+    let source = if overridden.is_some() {
+        "session"
+    } else {
+        "default"
+    };
+    let setting = overridden.unwrap_or_else(|| boot.into());
+    let unit = if unit.is_empty() {
+        Value::Null
+    } else {
+        Value::text::<String>(unit.into())
+    };
+    Row::new(alloc::vec![
+        Value::text::<String>(name.into()),
+        Value::text(setting),
+        unit,
+        Value::text::<String>(cat.into()),
+        Value::text::<String>(desc.into()),
+        Value::Null, // extra_desc
+        Value::text::<String>(context.into()),
+        Value::text::<String>(vartype.into()),
+        Value::text::<String>(source.into()),
+        Value::Null, // min_val
+        Value::Null, // max_val
+        Value::Null, // enumvals
+        Value::text::<String>(boot.into()),
+        Value::text::<String>(boot.into()), // reset_val = boot_val
+        Value::Null,                        // sourcefile
+        Value::Null,                        // sourceline
+        Value::Bool(false),                 // pending_restart
+    ])
+}
+
 pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.38 (read01 P3.22) — PG 18's full 17-column pg_settings shape so
     // admin tools that filter on context / vartype / source (pgAdmin's
@@ -9697,10 +9743,51 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
     for &(name, val, cat, vartype, context) in defaults {
         push(name, val, cat, vartype, context);
     }
+    // v7.38.18 (C5) — and every other parameter PG 18.4 has. Until now
+    // this list stopped at the ones SPG reads, so `pg_settings` held 31
+    // rows against PG's 398 and a client that enumerated settings saw a
+    // server that looked unconfigured.
+    //
+    // The row is not a new claim. `SHOW archive_command` already
+    // answered `''` and `SET archive_command = 'x'` already answered
+    // "cannot be changed now" — only `pg_settings` said the parameter
+    // did not exist, which made it the one surface out of three that
+    // disagreed. `source` is what separates the two groups: a parameter
+    // SPG reads and a session has set reads `session`, everything else
+    // reads `default`, exactly as in PG.
+    //
+    // Metadata (context, boot value, vartype, category, unit) comes from
+    // a live PG 18.4; `canonical_gucs` above wins wherever the two
+    // overlap, because SPG's own value for `work_mem` is the true one.
+    for &(name, context, _human, vartype, cat, unit, boot, desc) in
+        crate::guc_catalog::PG_GUC_CONTEXTS
+    {
+        if defaults
+            .iter()
+            .any(|(n, ..)| (*n).eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let overridden = engine
+            .session_params
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone());
+        rows.push(pg_guc_row(
+            name, boot, cat, vartype, context, unit, desc, overridden,
+        ));
+    }
     // Session-set params not in the canonical list get their own rows;
     // vartype is inferred from the value and source is always "session".
     for (k, v) in &engine.session_params {
         if defaults.iter().any(|(n, ..)| (*n).eq_ignore_ascii_case(k)) {
+            continue;
+        }
+        // v7.38.18 (C5) — and not a second row for one PG18 knows about
+        // either. This loop used to see every name outside SPG's own
+        // thirty-one as unknown; now that the PG18 table is reported
+        // too, `SET random_page_cost = 3` produced the parameter twice.
+        if crate::guc_catalog::guc_context(k).is_some() {
             continue;
         }
         // v7.39 (GUC knife 2) — customised (dotted) parameters are NOT

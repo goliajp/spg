@@ -1,6 +1,6 @@
 {
   "groups": [
-    { "name": "15_regressions", "pass": 117, "fail": 0, "skip": 0,
+    { "name": "15_regressions", "pass": 160, "fail": 0, "skip": 0,
       "files": [
         { "file": "v73813_bare_group_by.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -16,9 +16,13 @@
           "fail_reasons": [] },
         { "file": "v73818_analyze_same_query_string.test", "pass": 5, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
+        { "file": "v73818_pg_settings_full.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
+          "fail_reasons": [] },
         { "file": "v73818_pg_stats.test", "pass": 8, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "v73818_scalar_subquery_types.test", "pass": 8, "fail": 0, "skip": 0, "dialect": "postgres",
+          "fail_reasons": [] },
+        { "file": "v73818_two_gin_indexes.test", "pass": 29, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] }
       ] },
     { "name": "duckdb", "pass": 170, "fail": 0, "skip": 0,
