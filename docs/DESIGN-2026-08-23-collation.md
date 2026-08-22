@@ -92,10 +92,19 @@ correct answer — ablating it turns seven pinned cases red, all with
 empty results.
 
 Seeking works for equality, `IN` and range bounds, all through the one
-`probe_key` funnel so they cannot disagree with each other. The
-top-N ORDER BY walk is still declined for a collated column: the tree
-now walks in the locale's order so it could be allowed, and that is a
-missed optimisation rather than a wrong answer.
+`probe_key` funnel so they cannot disagree with each other. `idx_scan`
+rises for each of them, which is how the fixtures know the index was
+read rather than skipped.
+
+The top-N ORDER BY walk admits a collated column too — its tree walks in
+the locale's order now, so the ordering it contributes is the right one.
+Whether that walk is TAKEN for a given query is not something this
+measurement could see: `try_pk_walk_top_n` never calls
+`note_index_scan`, so `idx_scan` reads the same whether it ran or not,
+and an INT column reads identically. An earlier draft of this file said
+the walk was "still declined for a collated column" — that sentence was
+written from a probe that cannot reach the path, and it is withdrawn
+rather than restated the other way.
 
 ### S1 — the database's collation is persisted, and set once
 
