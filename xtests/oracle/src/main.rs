@@ -78,6 +78,10 @@ enum Cmd {
     Dump {
         /// Path to the fixture .sql file.
         fixture: std::path::PathBuf,
+        /// Which leg's dialect to run SPG in — the output differs, and
+        /// a lock filled from the wrong one locks the wrong thing.
+        #[arg(long, default_value = "pg18")]
+        oracle: dialect::Oracle,
     },
     /// Print a recap of the last run.
     Report,
@@ -120,8 +124,10 @@ fn main() -> Result<()> {
             Ok(())
         }
         Cmd::SelfDiff => self_diff::run(&cli.corpus),
-        Cmd::Dump { fixture } => {
-            let raw = runner::dump_spg(&fixture)?;
+        Cmd::Dump { fixture, oracle } => {
+            // v7.38.17 — a dump is only useful if it shows the SPG that
+            // the comparison will see, and that depends on the leg.
+            let raw = runner::dump_spg(&fixture, oracle)?;
             print!("{raw}");
             Ok(())
         }

@@ -147,11 +147,21 @@ name = "perm-matrix"
 impl = "internal"
 budget_s = 3600
 
+# v7.38.17 — promoted from `full`, which nothing runs automatically, to
+# the tier that gates a release. Measured end to end: 101 s for all
+# three legs including `docker compose up --wait` and teardown, against
+# a prerelease tier that already takes ~30 min. The budget is the
+# measured time with room, not the old 3600.
+#
+# It is worth gating now because it can finally see something: until
+# this version the runner put SPG in PostgreSQL dialect on every leg,
+# so the MySQL and MariaDB comparisons had never once run SPG in MySQL
+# semantics.
 [[step]]
-tier = "full"
+tier = "prerelease"
 name = "oracle-three"
 impl = "internal"
-budget_s = 3600
+budget_s = 420
 
 [[step]]
 tier = "full"

@@ -1,17 +1,32 @@
-//! read01 round 375 (MySQL differential) — the MySQL default collation
-//! is PAD SPACE: trailing spaces are ignored when text is COMPARED,
-//! GROUPED, de-duped or sorted (but NOT in LIKE, and NOT under BINARY).
+//! read01 round 375, re-measured in v7.38.17 — trailing spaces on the
+//! MySQL default collation.
 //!
-//! MariaDB 11: `'a' = 'a '` and `'' = ' '` are both 1, `'a' < 'a '` is 0
-//! (they compare equal), and a UNIQUE / GROUP BY / DISTINCT collapses
-//! `'a'` with `'a '`. SPG compared byte-wise, so `WHERE t = 'a'` missed
-//! the space-padded rows and `COUNT(DISTINCT t)` counted them separately.
-//! `LIKE` treats a trailing space literally (`'a ' LIKE 'a'` is 0), and
-//! `BINARY` / a `utf8mb4_bin` column force a byte-wise compare — both
-//! keep the space significant. Storage is untouched: `LENGTH('a ')` is
-//! still 2.
+//! This file used to open "the MySQL default collation is PAD SPACE",
+//! and it ended "Every expectation is copied from a MariaDB 11 run".
+//! Both sentences were true separately and wrong together: MariaDB's
+//! default (`utf8mb4_uca1400_ai_ci`) is PAD SPACE, MySQL 8.0's
+//! (`utf8mb4_0900_ai_ci`) is NO PAD, and SPG advertises `8.0.0-spg-v…`
+//! on the MySQL wire. The pins had been calibrated against the engine
+//! we do not claim to be.
 //!
-//! Every expectation is copied from a MariaDB 11 run.
+//! Re-measured on MySQL 9.7.2 in `utf8mb4_0900_ai_ci`, every one of them
+//! inverts:
+//!
+//!     'a' = 'a '            0   (was pinned 1)
+//!     '' = ' '              0   (was pinned 1)
+//!     'a' < 'a '            1   (was pinned 0)
+//!     WHERE t = 'a'         1   (was pinned 3)
+//!     COUNT(DISTINCT t)     4   (was pinned 2)
+//!     GROUP BY t -> groups  4   (was pinned 2)
+//!     UNIQUE accepts 'a '   yes (was pinned: rejected)
+//!
+//! What did NOT move: a non-trailing space is still significant, a tab
+//! is not a pad, `LIKE` still treats a trailing space literally, and
+//! storage is untouched — `LENGTH('a ')` is 2.
+//!
+//! `CHAR(n)` is a different question with a different answer; see
+//! `mysql_compare_fold_char`. Both engines ignore a CHAR's padding
+//! because that is a property of the type.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -41,15 +56,16 @@ fn count(e: &mut Engine, sql: &str) -> i64 {
     }
 }
 
-/// Trailing spaces are ignored in a comparison.
+/// Trailing spaces are DATA in a comparison — MySQL 9.7.2, NO PAD.
 #[test]
 fn comparison_ignores_trailing_spaces() {
     let mut e = mysql();
-    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a '"), Value::Bool(true));
-    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a  '"), Value::Bool(true));
-    assert_eq!(scalar(&mut e, "SELECT '' = ' '"), Value::Bool(true));
-    // …but a padded value still orders equal, not less.
-    assert_eq!(scalar(&mut e, "SELECT 'a' < 'a '"), Value::Bool(false));
+    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a '"), Value::Bool(false));
+    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a  '"), Value::Bool(false));
+    assert_eq!(scalar(&mut e, "SELECT '' = ' '"), Value::Bool(false));
+    // A padded value is GREATER, not equal: the shorter string sorts
+    // first once its trailing spaces stop being ignored.
+    assert_eq!(scalar(&mut e, "SELECT 'a' < 'a '"), Value::Bool(true));
     // A non-trailing space is significant.
     assert_eq!(scalar(&mut e, "SELECT 'a' < 'a b'"), Value::Bool(true));
     // Only spaces pad — a tab is significant.
@@ -63,24 +79,28 @@ fn where_distinct_group_collapse_padding() {
     e.execute("CREATE TABLE s (t VARCHAR(10))").unwrap();
     e.execute("INSERT INTO s VALUES ('a'),('a '),('a  '),('b')")
         .unwrap();
-    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM s WHERE t = 'a'"), 3);
-    assert_eq!(count(&mut e, "SELECT COUNT(DISTINCT t) FROM s"), 2);
+    // 'a', 'a ', 'a  ' and 'b' are four values to MySQL 9.7.2.
+    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM s WHERE t = 'a'"), 1);
+    assert_eq!(count(&mut e, "SELECT COUNT(DISTINCT t) FROM s"), 4);
     assert_eq!(
         count(
             &mut e,
             "SELECT COUNT(*) FROM (SELECT t FROM s GROUP BY t) g"
         ),
-        2
+        4
     );
 }
 
-/// A UNIQUE constraint treats `'a'` and `'a '` as the same key.
+/// A UNIQUE constraint treats `'a'` and `'a '` as DIFFERENT keys.
+/// MySQL 9.7.2 accepts both and the table holds two rows.
 #[test]
 fn unique_collapses_padding() {
     let mut e = mysql();
     e.execute("CREATE TABLE u (t VARCHAR(10) UNIQUE)").unwrap();
     e.execute("INSERT INTO u VALUES ('a')").unwrap();
-    assert!(e.execute("INSERT INTO u VALUES ('a ')").is_err());
+    e.execute("INSERT INTO u VALUES ('a ')")
+        .expect("'a ' is not 'a' under NO PAD");
+    assert_eq!(count(&mut e, "SELECT COUNT(*) FROM u"), 2);
 }
 
 /// LIKE and BINARY keep the trailing space significant.

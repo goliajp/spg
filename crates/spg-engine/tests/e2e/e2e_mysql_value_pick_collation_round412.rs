@@ -85,7 +85,9 @@ fn greatest_least_folds() {
     );
 }
 
-/// CASE op WHEN v folds text (case, accent, trailing space).
+/// CASE op WHEN v folds text (case and accent). v7.38.17 — NOT trailing
+/// space: MySQL 9.7.2's default collation is NO PAD, so `CASE 'A '
+/// WHEN 'a'` misses while `CASE 'A' WHEN 'a'` still hits.
 #[test]
 fn case_when_folds() {
     let mut e = mysql();
@@ -108,7 +110,7 @@ fn case_when_folds() {
             &mut e,
             "SELECT CASE 'A ' WHEN 'a' THEN 'match' ELSE 'no' END"
         ),
-        "match"
+        "no"
     );
     // A downstream WHEN branch also folds.
     assert_eq!(
