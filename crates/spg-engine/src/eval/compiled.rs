@@ -2246,6 +2246,30 @@ where
                 };
                 let r = fold_one(stack.pop().unwrap_or(Value::Null).into_owned());
                 let l = fold_one(stack.pop().unwrap_or(Value::Null).into_owned());
+                // v7.38.18 (S2) — order by the LOCALE when the
+                // comparison has one. `apply_binary` compares text by
+                // bytes, which is right for `C` and wrong for every
+                // other collation; without this a scan filter answered
+                // `x < 'b'` by bytes while `ORDER BY x` over the same
+                // column answered by the locale.
+                if let (Value::Text(a), Value::Text(b)) = (&l, &r)
+                    && let Some(ord) = tc.compare(a.as_ref(), b.as_ref())
+                {
+                    let verdict = match op {
+                        BinOp::Lt => ord == core::cmp::Ordering::Less,
+                        BinOp::LtEq => ord != core::cmp::Ordering::Greater,
+                        BinOp::Gt => ord == core::cmp::Ordering::Greater,
+                        BinOp::GtEq => ord != core::cmp::Ordering::Less,
+                        BinOp::Eq => ord == core::cmp::Ordering::Equal,
+                        BinOp::NotEq => ord != core::cmp::Ordering::Equal,
+                        _ => {
+                            stack.push(apply_binary(*op, l, r)?);
+                            continue;
+                        }
+                    };
+                    stack.push(Value::Bool(verdict));
+                    continue;
+                }
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::Unary(op) => {

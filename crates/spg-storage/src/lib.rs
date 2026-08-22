@@ -1776,6 +1776,33 @@ pub fn collation_is_byte_wise(collation: &str) -> bool {
             .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
 }
 
+/// v7.38.18 (S0/S2) — does an index on a column of this collation key
+/// by an ICU SORT KEY rather than by the raw text?
+///
+/// True for a locale collation (`en_US.utf8`, `de_DE`), which orders by
+/// rules a byte comparison cannot express.
+///
+/// False for byte-wise names, and false for MySQL's folding collations
+/// (`utf8mb4_0900_ai_ci` and family). Those fold rather than collate,
+/// and the engine has folded them since v7.37 — routing them here made
+/// an indexed `s = 'ALPHA'` over the MySQL wire answer nothing where
+/// MySQL 9.7.1 answers one row, because ICU at PG's strength does not
+/// call `ALPHA` and `alpha` equal.
+///
+/// One owner for the same reason the byte-wise question has one: the
+/// engine builds the PROBE and this crate builds the ENTRIES, and a
+/// probe built in another space finds nothing — which reads exactly
+/// like "no matching rows".
+pub fn collation_uses_sort_key(collation: &str) -> bool {
+    if collation_is_byte_wise(collation) {
+        return false;
+    }
+    let name = collation.trim();
+    let base = name.split(['.', '@']).next().unwrap_or(name);
+    let lower = base.to_ascii_lowercase();
+    !(lower.ends_with("_ci") || lower.ends_with("_cs"))
+}
+
 pub fn mysql_compare_fold(s: &str) -> String {
     mysql_ci_fold(s)
 }
@@ -4547,6 +4574,16 @@ pub fn brin_scalar(v: &Value<'_>) -> Option<i64> {
 #[derive(Debug, Clone)]
 pub struct Table {
     schema: TableSchema,
+    /// v7.38.18 (S2) — the DATABASE's collation, copied in by the
+    /// catalog that owns this table.
+    ///
+    /// A text column that declares no collation inherits it, which is
+    /// what PostgreSQL does and what `information_schema.columns`
+    /// reports as NULL. Runtime only, never serialised: it belongs to
+    /// the catalog, and a table that has been handed around outside one
+    /// falls back to `C`, which is the answer for every database written
+    /// before this existed.
+    db_collation: Option<String>,
     /// v7.38.16 — names of the expression indexes whose B-tree currently
     /// holds keys derived from the EXPRESSION.
     ///
@@ -4918,6 +4955,21 @@ pub struct Catalog {
     ///
     /// Value: (plugin, slot_type). `plugin` is empty for a physical slot.
     replication_slots: BTreeMap<String, (String, String)>,
+    /// v7.38.18 (S1) — the collation this database was CREATED with, and
+    /// the one every text column that declares none is compared under.
+    ///
+    /// `None` means `C`, which is what every database written by every
+    /// earlier version was built with — so an upgrade changes no answer
+    /// and rebuilds no index. That is the whole migration story, and it
+    /// is why this is an `Option` rather than a `String` defaulting to
+    /// `"C"`.
+    ///
+    /// Set once, at creation, and never after. PostgreSQL refuses
+    /// `ALTER DATABASE … LC_COLLATE` and the reason is the one that
+    /// matters here too: every index key in this database was built
+    /// under this collation, so it cannot move out from under them.
+    /// See `docs/DESIGN-2026-08-23-collation.md`.
+    db_collation: Option<String>,
     /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
     /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
     /// reference these by name via
@@ -5580,6 +5632,7 @@ impl Catalog {
             comments: BTreeMap::new(),
             db_role_settings: BTreeMap::new(),
             replication_slots: BTreeMap::new(),
+            db_collation: None,
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
@@ -6159,6 +6212,40 @@ impl Catalog {
     }
 
     #[must_use]
+    /// v7.38.18 (S1) — the collation this database was created with.
+    /// `"C"` when nothing was recorded, which is what an older catalog
+    /// and a default `initdb`-less start both mean.
+    pub fn db_collation(&self) -> &str {
+        self.db_collation.as_deref().unwrap_or("C")
+    }
+
+    /// Record the creation collation. Refused once one is set, because
+    /// every index key already in this database was built under it —
+    /// the same refusal PostgreSQL gives `ALTER DATABASE … LC_COLLATE`,
+    /// and for the same reason.
+    ///
+    /// `Ok(false)` when the value asked for is the one already in force,
+    /// so a host that passes its environment on every start is not an
+    /// error.
+    pub fn set_db_collation(&mut self, name: &str) -> Result<bool, StorageError> {
+        if self.db_collation.as_deref() == Some(name) {
+            return Ok(false);
+        }
+        if self.db_collation.is_none() && name.eq_ignore_ascii_case("C") {
+            return Ok(false);
+        }
+        if self.db_collation.is_some() || !self.tables.is_empty() {
+            return Err(StorageError::Corrupt(format!(
+                "database collation is already {:?} and cannot be changed; \
+                 PostgreSQL refuses this too, because every index key here \
+                 was built under it",
+                self.db_collation()
+            )));
+        }
+        self.db_collation = Some(name.into());
+        Ok(true)
+    }
+
     pub const fn replication_slots(&self) -> &BTreeMap<String, (String, String)> {
         &self.replication_slots
     }
@@ -6622,7 +6709,11 @@ impl Catalog {
         }
         let idx = self.tables.len();
         let name = schema.name.clone();
-        self.tables.push(Table::new(schema));
+        let mut t = Table::new(schema);
+        // v7.38.18 (S2) — the table inherits the database's collation,
+        // which is what its undeclared text columns compare under.
+        t.set_db_collation(self.db_collation());
+        self.tables.push(t);
         self.by_name.insert(name.clone(), idx);
         // v7.39 (round 496) — see `dirty_tables`.
         self.dirty_tables.insert(name);
@@ -8991,7 +9082,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 91;
+const FILE_VERSION: u8 = 92;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -10359,6 +10450,15 @@ impl Catalog {
             write_str(&mut out, plugin);
             write_str(&mut out, slot_type);
         }
+        // v7.38.18 (S1) — the database collation (FILE_VERSION 92+).
+        // Absent on an older image, which reads back as `C`.
+        match &self.db_collation {
+            None => out.push(0),
+            Some(c) => {
+                out.push(1);
+                write_str(&mut out, c);
+            }
+        }
         let crc = spg_crypto::crc32c::crc32c(&out);
         write_u32(&mut out, crc);
         out
@@ -10887,6 +10987,43 @@ impl Catalog {
                 let slot_type = cur.read_str()?;
                 cat.replication_slots.insert(name, (plugin, slot_type));
             }
+        }
+        // v7.38.18 (S1) — the database collation (FILE_VERSION 92+).
+        if version >= 92 {
+            match cur.read_u8()? {
+                0 => {}
+                1 => cat.db_collation = Some(cur.read_str()?),
+                other => {
+                    return Err(StorageError::Corrupt(format!(
+                        "db_collation tag: unknown byte {other}"
+                    )));
+                }
+            }
+        }
+        // v7.38.18 (S3) — a database created under a collation this
+        // build cannot perform does not open.
+        //
+        // Falling back to bytes would answer with a different comparator
+        // than every index key in it was built under, which is the one
+        // failure this whole layer exists to prevent — and it would do
+        // it silently, since a byte-ordered answer looks exactly like a
+        // correct one. The check is a NAME classification here; the
+        // engine, which owns the collator, verifies it can actually
+        // perform the name before recording it.
+        if let Some(c) = &cat.db_collation
+            && c.trim().is_empty()
+        {
+            return Err(StorageError::Corrupt(format!(
+                "database collation is recorded as {c:?}, which names nothing"
+            )));
+        }
+        // v7.38.18 (S2) — and every table read back learns it, because a
+        // table decides for itself which of its indexes key under a
+        // collation. Done here rather than per-table in the loop above
+        // because the byte that says so is written after the tables.
+        let db_coll = cat.db_collation().to_string();
+        for t in &mut cat.tables {
+            t.set_db_collation(&db_coll);
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
         // preceding byte; verify it before accepting the snapshot. Older

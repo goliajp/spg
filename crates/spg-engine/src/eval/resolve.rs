@@ -83,6 +83,37 @@ pub(crate) fn column_collation_name(e: &Expr, ctx: &EvalContext<'_>) -> Option<S
         .and_then(|s| s.collation_name.clone())
 }
 
+/// v7.38.18 (S2) — the collation this column is ORDERED under: its own
+/// when it declares one, the database's otherwise.
+///
+/// Separate from [`column_collation_name`], and the separation is
+/// load-bearing. That one also answers whether the comparison PADS,
+/// which is a MySQL property of a MySQL collation name. A PostgreSQL
+/// database collating as `en_US.utf8` does not pad — `'a' = 'a  '` is
+/// false there — and feeding the inherited name to `pads_space` would
+/// have made it true for every text column in the database. Inheritance
+/// reaches ordering; it does not reach padding.
+pub(crate) fn column_ordering_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<String> {
+    if let Some(declared) = column_collation_name(e, ctx) {
+        return Some(declared);
+    }
+    let Expr::Column(_) = e else {
+        return None;
+    };
+    // v7.38.18 (S2) — not under MySQL. The database collation is a
+    // PostgreSQL concept; a MySQL session's text columns carry their own
+    // collation names and their own model, and a server that happens to
+    // run with `LANG=en_US.UTF-8` must not change what MySQL answers.
+    if ctx.mysql_dialect {
+        return None;
+    }
+    // The CATALOG, not the engine: a scan filter's context carries the
+    // catalog and not always the engine, and this must answer the same
+    // there as in a projection or the two disagree inside one query.
+    let db = ctx.catalog?.db_collation();
+    (!crate::collate::is_byte_wise(db)).then(|| db.into())
+}
+
 /// How this comparison's collation behaves — fold and pad, decided
 /// together and once.
 ///
@@ -109,9 +140,27 @@ pub(crate) fn text_compare_of(
         Some(spg_storage::Collation::CaseInsensitive)
     );
     let name = column_collation_name(lhs, ctx).or_else(|| column_collation_name(rhs, ctx));
+    // v7.38.18 (S2) — the ordering collation is asked SEPARATELY, and
+    // the separation is the point: `pads` is a MySQL property of a MySQL
+    // collation NAME, and a PostgreSQL database collating as
+    // `en_US.utf8` does not pad. Feeding the inherited name to
+    // `pads_space` would have made `'a' = 'a  '` true for every text
+    // column in such a database.
+    let order = column_ordering_collation(lhs, ctx)
+        .or_else(|| column_ordering_collation(rhs, ctx))
+        .filter(|n| !crate::collate::is_byte_wise(n) && crate::collate::is_supported(n));
     crate::collate::TextCompare {
         fold_case: !byte_wise && (ci || ctx.mysql_dialect),
         pads: crate::collate::pads_space(name.as_deref()),
+        // v7.38.18 (S2) — `byte_wise` must NOT zero this. It is true
+        // whenever a column carries `Collation::Binary`, which is the
+        // struct's DEFAULT and means "nothing was said about folding",
+        // not "compare me by bytes" — the same reading that made
+        // `column_key_is_bytewise` drop three rows from an index. What
+        // `byte_wise` legitimately suppresses is the case FOLD; an
+        // explicit byte-wise collation NAME is what suppresses ordering,
+        // and the filter above already drops those.
+        order,
     }
 }
 

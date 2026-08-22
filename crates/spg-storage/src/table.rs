@@ -13,6 +13,7 @@ impl Table {
     pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,
+            db_collation: None,
             expr_index_complete: alloc::collections::BTreeSet::new(),
             rel_id: crate::row_header::RelId::UNASSIGNED,
             rows: PersistentVec::new(),
@@ -1198,7 +1199,8 @@ impl Table {
         // Filtering here rather than at each of the dozen seeks is what
         // makes that safe by construction instead of by remembering.
         let usable = |i: &&Index| {
-            Self::index_collation_of(&self.schema, i).is_none()
+            Self::index_collation_in(&self.schema, i, self.db_collation.as_deref().unwrap_or("C"))
+                .is_none()
                 || self.expr_index_complete.contains(&i.name)
         };
         self.indices
@@ -1311,10 +1313,14 @@ impl Table {
         // before the loop borrows `indices` mutably. An expression
         // index and a locale-collated column index are the same
         // mechanism from here on.
+        let db_coll = self.db_collation.as_deref().unwrap_or("C");
         let supplied_slots: Vec<bool> = self
             .indices
             .iter()
-            .map(|i| i.expression.is_some() || Self::index_collation_of(&self.schema, i).is_some())
+            .map(|i| {
+                i.expression.is_some()
+                    || Self::index_collation_in(&self.schema, i, db_coll).is_some()
+            })
             .collect();
         for (slot, idx) in self.indices.iter_mut().enumerate() {
             // What this index reads for this row: the expression's value
@@ -1668,7 +1674,12 @@ impl Table {
         // `expr_index_complete`, which is what makes every read path
         // decline it until the engine refreshes it — the same path an
         // expression index takes from birth.
-        let collated = Self::index_collation_of(&self.schema, &idx).is_some();
+        let collated = Self::index_collation_in(
+            &self.schema,
+            &idx,
+            self.db_collation.as_deref().unwrap_or("C"),
+        )
+        .is_some();
         if let IndexKind::BTree(map) = &mut idx.kind
             && !collated
         {
@@ -1974,7 +1985,11 @@ impl Table {
     /// the index keys on its column's own value, which is the ordinary
     /// case and stays free.
     pub fn index_collation(&self, idx: &Index) -> Option<&str> {
-        Self::index_collation_of(&self.schema, idx)
+        Self::index_collation_in(
+            &self.schema,
+            idx,
+            self.db_collation.as_deref().unwrap_or("C"),
+        )
     }
 
     /// The same question against a schema alone, for the callers that
@@ -1982,6 +1997,33 @@ impl Table {
     pub(crate) fn index_collation_of<'a>(
         schema: &'a crate::TableSchema,
         idx: &Index,
+    ) -> Option<&'a str> {
+        Self::index_collation_in(schema, idx, "C")
+    }
+
+    /// v7.38.18 (S2) — the database collation in force for this table,
+    /// which is what its undeclared text columns are compared under and
+    /// what its indexes on them key under. `"C"` when none was set.
+    pub fn db_collation(&self) -> &str {
+        self.db_collation.as_deref().unwrap_or("C")
+    }
+
+    /// v7.38.18 (S2) — set by the catalog that owns this table.
+    pub fn set_db_collation(&mut self, name: &str) {
+        self.db_collation = if name.eq_ignore_ascii_case("C") {
+            None
+        } else {
+            Some(name.into())
+        };
+    }
+
+    /// The same question with the DATABASE's collation supplied, for S2:
+    /// a text column that declares nothing inherits it, so an index on
+    /// such a column keys under it too.
+    pub(crate) fn index_collation_in<'a>(
+        schema: &'a crate::TableSchema,
+        idx: &Index,
+        db: &'a str,
     ) -> Option<&'a str> {
         if idx.expression.is_some() {
             return None;
@@ -1993,9 +2035,21 @@ impl Table {
         ) {
             return None;
         }
+        // v7.38.18 (S2) — a MySQL column is not a candidate for
+        // inheritance. Its `Collation::CaseInsensitive` says the engine
+        // FOLDS it, which is MySQL's model and not a locale's, and the
+        // database collation is a PostgreSQL concept. A test server
+        // started with `LANG=en_US.UTF-8` — which is most of them —
+        // otherwise routed every MySQL text column into the ICU path,
+        // and an indexed `s = 'ALPHA'` answered nothing where MySQL
+        // 9.7.1 answers one row.
+        if matches!(col.collation, crate::Collation::CaseInsensitive) {
+            return None;
+        }
         col.collation_name
             .as_deref()
-            .filter(|n| !crate::collation_is_byte_wise(n))
+            .or(Some(db))
+            .filter(|n| crate::collation_uses_sort_key(n))
     }
 
     /// Does this index's key come from the caller rather than from the
@@ -2040,7 +2094,12 @@ impl Table {
         // Both take their keys from the caller; neither can be rebuilt
         // from the cells this crate can see.
         if self.indices[pos].expression.is_none()
-            && Self::index_collation_of(&self.schema, &self.indices[pos]).is_none()
+            && Self::index_collation_in(
+                &self.schema,
+                &self.indices[pos],
+                self.db_collation.as_deref().unwrap_or("C"),
+            )
+            .is_none()
         {
             return Ok(false);
         }
@@ -2154,8 +2213,12 @@ impl Table {
             .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
             .filter(|i| !self.expr_index_complete.contains(&i.name))
             .filter_map(|i| {
-                Self::index_collation_of(&self.schema, i)
-                    .map(|c| (i.name.clone(), i.column_position, c.into()))
+                Self::index_collation_in(
+                    &self.schema,
+                    i,
+                    self.db_collation.as_deref().unwrap_or("C"),
+                )
+                .map(|c| (i.name.clone(), i.column_position, c.into()))
             })
             .collect()
     }

@@ -40,6 +40,30 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **A database can be created with a collation, and an undeclared text
+  column inherits it.** SPG collated as `C` and nothing could say
+  otherwise, so a customer moving off a stock PostgreSQL — `en_US.utf8`
+  on Debian — got a different row order from every `ORDER BY` over text,
+  every `min`/`max`, and every range comparison, silently. It was the
+  widest divergence in `FINDING-2026-08-23-database-collation.md` and
+  the design that closes it is `DESIGN-2026-08-23-collation.md`.
+
+  `spg-server` reads `SPG_LC_COLLATE`, then `LC_ALL`, `LC_COLLATE`,
+  `LANG` — POSIX's precedence and `initdb`'s — and records it on a
+  database that has none. **An existing database keeps `C` and rebuilds
+  nothing**: absent on disk means `C`, which is what every database
+  written by every earlier version was built under.
+
+  Set once, never after, which is PostgreSQL's own refusal
+  (`ALTER DATABASE … LC_COLLATE` errors there) and what makes the index
+  keys sound. Inheritance is resolved rather than stamped, so
+  `information_schema.columns.collation_name` still reports NULL for an
+  inheriting column, as PostgreSQL reports it. It reaches ORDERING and
+  not padding: `'a' = 'a  '` stays false. It does not reach the MySQL
+  dialect at all — those columns carry their own collation model, and a
+  server that happens to run with `LANG=en_US.UTF-8` must not change
+  what MySQL answers.
+
 - **`pg_settings` reports every parameter PostgreSQL 18.4 has**, and so
   does `SHOW ALL` — 398 where SPG listed 31 and 33. A client that
   enumerates settings saw a server that looked unconfigured.

@@ -7579,8 +7579,12 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         Value::Xid(u32::try_from(engine.vacuum_oldest_active()).unwrap_or(u32::MAX)),
         Value::BigInt(1),    // datminmxid — SPG has no multixact
         Value::BigInt(1663), // dattablespace — pg_default
-        Value::text("C"),
-        Value::text("C"),
+        // v7.38.18 (S1) — what this database was actually created with,
+        // not the constant `C` that stood here while there was no way to
+        // create it with anything else. A client reads these to decide
+        // how the server sorts.
+        Value::text::<String>(engine.database_collation().into()),
+        Value::text::<String>(engine.database_collation().into()),
         Value::Null, // datlocale
         Value::Null, // daticurules
         Value::Null, // datcollversion

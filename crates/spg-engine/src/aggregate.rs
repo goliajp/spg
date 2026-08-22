@@ -998,6 +998,12 @@ pub(crate) fn run(
     validate_agg_arities(stmt, &agg_specs)?;
     validate_within_group(&agg_specs, schema_cols, stmt.group_by.as_deref())?;
 
+    // v7.38.18 (S2) — the database's collation, for the columns that
+    // declare none. `None` when it is byte order, which is every
+    // database written before this existed.
+    let db_collation: Option<&str> = catalog
+        .map(spg_storage::Catalog::db_collation)
+        .filter(|d| !crate::collate::is_byte_wise(d));
     // v7.39 (round 690) — resolve the argument's declared collation for
     // `min`/`max`. This rides beside `enum_labels` in `AggSpec` but NOT
     // inside its resolver loop: that loop only runs when the catalog holds
@@ -1012,6 +1018,10 @@ pub(crate) fn run(
                 .iter()
                 .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
                 .and_then(|sc| sc.collation_name.clone())
+                // v7.38.18 (S2) — the database's when the column
+                // declares none. `C` filters out below, so nothing moves
+                // for a database that has not asked for a locale.
+                .or_else(|| db_collation.map(alloc::string::String::from))
                 .filter(|n| crate::collate::is_supported(n));
         }
     }
@@ -1038,6 +1048,7 @@ pub(crate) fn run(
                     .iter()
                     .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
                     .and_then(|sc| sc.collation_name.clone())
+                    .or_else(|| db_collation.map(alloc::string::String::from))
                     .filter(|n| crate::collate::is_supported(n))
             })
             .collect();

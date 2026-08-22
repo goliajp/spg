@@ -36,7 +36,7 @@
 > claimed `yes` for a name that appears only in a doc comment, two
 > claimed `no` for a switch that tests really do set.
 >
-> Today: **83 switches, 56 exercised, 27 not.**
+> Today: **84 switches, 57 exercised, 27 not.**
 > Adding a switch means adding a row in the same commit.
 
 | switch | first read site | exercised |
@@ -72,6 +72,7 @@
 | `SPG_HOT_TIER_BYTES` | `crates/spg-server/src/main.rs:1707` | yes |
 | `SPG_HTTP_ADDR` | `crates/spg-server/src/main.rs:2086` | yes |
 | `SPG_IDLE_TIMEOUT_SEC` | `crates/spg-server/src/main.rs:867` | yes |
+| `SPG_LC_COLLATE` | `crates/spg-server/src/main.rs:2036` | yes |
 | `SPG_LOG_FORMAT` | `crates/spg-server/src/observability.rs:148` | yes |
 | `SPG_LOG_MIN_DURATION` | `crates/spg-server/src/main.rs:1150` | yes |
 | `SPG_MATVIEW_TRACE` | `crates/spg-server/src/pgwire.rs:2432` | **no** |

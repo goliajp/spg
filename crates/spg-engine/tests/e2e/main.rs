@@ -211,6 +211,7 @@ mod e2e_current_catalog_role;
 mod e2e_current_setting;
 mod e2e_current_setting_missing;
 mod e2e_cursor_round218;
+mod e2e_database_collation;
 mod e2e_date_add_subtract;
 mod e2e_date_bin;
 mod e2e_date_compiled_round595;

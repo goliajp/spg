@@ -164,19 +164,35 @@ fn pg_options() -> icu_collator::options::CollatorOptions {
 /// what keeps the comparison path and the compiled path from
 /// disagreeing — which is the shape of most of what v7.38.13 through
 /// v7.38.18 were spent on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextCompare {
     /// Fold case and accents.
     pub fold_case: bool,
     /// Trailing spaces do not count.
     pub pads: bool,
+    /// v7.38.18 (S2) — the LOCALE this comparison orders under, when it
+    /// is not byte order.
+    ///
+    /// Fold and pad are the two bits this struct carried; ordering is a
+    /// third thing and it was missing. Without it a scan filter compared
+    /// `x < 'b'` by bytes while `ORDER BY x` over the same column
+    /// compared by the locale — the exact disagreement between the
+    /// interpreted and compiled paths this type's own comment says it
+    /// exists to prevent.
+    pub order: Option<alloc::string::String>,
 }
 
 impl TextCompare {
     /// Does this collation change a comparison at all? A byte-wise,
     /// non-padding collation is plain `memcmp` and needs no fold step.
-    pub const fn is_plain_bytes(self) -> bool {
-        !self.fold_case && !self.pads
+    pub fn is_plain_bytes(&self) -> bool {
+        !self.fold_case && !self.pads && self.order.is_none()
+    }
+
+    /// Compare two strings under it, or `None` when this collation adds
+    /// no ordering of its own and the caller's byte comparison stands.
+    pub fn compare(&self, a: &str, b: &str) -> Option<core::cmp::Ordering> {
+        compare(self.order.as_deref()?, a, b)
     }
 }
 

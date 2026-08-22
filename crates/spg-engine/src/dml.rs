@@ -1414,12 +1414,19 @@ impl Engine {
                 .schema()
                 .columns
                 .clone();
-            if let Some((col_pos, key)) =
-                try_pk_predicate(w, &schema_cols, stmt.table.as_str(), self.backslash_escapes)
-                && let Some(idx_name) = self
-                    .active_catalog()
-                    .get(&stmt.table)
-                    .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
+            if let Some((col_pos, key)) = try_pk_predicate(
+                w,
+                &schema_cols,
+                stmt.table.as_str(),
+                self.backslash_escapes,
+                // v7.38.18 (S2) — this table's database collation.
+                self.active_catalog()
+                    .get(stmt.table.as_str())
+                    .map_or("C", spg_storage::Table::db_collation),
+            ) && let Some(idx_name) = self
+                .active_catalog()
+                .get(&stmt.table)
+                .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
             {
                 // Promote may be a no-op (key is hot-only or absent);
                 // we don't care about the return value here — the
@@ -3458,12 +3465,19 @@ impl Engine {
                 .schema()
                 .columns
                 .clone();
-            if let Some((col_pos, key)) =
-                try_pk_predicate(w, &schema_cols, stmt.table.as_str(), self.backslash_escapes)
-                && let Some(idx_name) = self
-                    .active_catalog()
-                    .get(&stmt.table)
-                    .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
+            if let Some((col_pos, key)) = try_pk_predicate(
+                w,
+                &schema_cols,
+                stmt.table.as_str(),
+                self.backslash_escapes,
+                // v7.38.18 (S2) — this table's database collation.
+                self.active_catalog()
+                    .get(stmt.table.as_str())
+                    .map_or("C", spg_storage::Table::db_collation),
+            ) && let Some(idx_name) = self
+                .active_catalog()
+                .get(&stmt.table)
+                .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
             {
                 cold_shadow_count = self
                     .active_catalog_mut()

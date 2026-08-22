@@ -1082,6 +1082,82 @@ mod env_knob_tests {
         assert_eq!(resolve(Some("250")), Some(250), "a value is itself");
     }
 
+    /// v7.38.18 (S1) — `SPG_LC_COLLATE` and the locale variables it sits
+    /// in front of.
+    ///
+    /// This decides how a customer's database sorts every text column
+    /// that declares no collation of its own, which makes it the widest
+    /// switch in the register. It arrived unexercised, like the three
+    /// PG-spelled aliases above it and for the same reason: the code
+    /// that reads it is a `main.rs` free function with no seam.
+    ///
+    /// So the ORDER is the seam. `initdb` reads `LC_ALL`, then
+    /// `LC_COLLATE`, then `LANG`, which is POSIX's precedence, and
+    /// `SPG_LC_COLLATE` goes in front so a deployer can say it without
+    /// touching the process locale.
+    #[test]
+    fn the_locale_variables_are_read_in_initdbs_order() {
+        use super::pick_collation_env;
+
+        let only = |k: &'static str| move |q: &str| (q == k).then(|| "en_US.utf8".to_string());
+        for k in ["SPG_LC_COLLATE", "LC_ALL", "LC_COLLATE", "LANG"] {
+            assert_eq!(
+                pick_collation_env(only(k)).as_deref(),
+                Some("en_US.utf8"),
+                "{k} alone must be read"
+            );
+        }
+
+        // Precedence, stated as a chain: each name beats every name
+        // after it. Without this the test would pass on an
+        // implementation that read them in any order at all.
+        let all = |q: &str| match q {
+            "SPG_LC_COLLATE" => Some("aa".to_string()),
+            "LC_ALL" => Some("bb".to_string()),
+            "LC_COLLATE" => Some("cc".to_string()),
+            "LANG" => Some("dd".to_string()),
+            _ => None,
+        };
+        assert_eq!(pick_collation_env(all).as_deref(), Some("aa"));
+        assert_eq!(
+            pick_collation_env(|q: &str| match q {
+                "LC_ALL" => Some("bb".to_string()),
+                "LC_COLLATE" => Some("cc".to_string()),
+                "LANG" => Some("dd".to_string()),
+                _ => None,
+            })
+            .as_deref(),
+            Some("bb")
+        );
+        assert_eq!(
+            pick_collation_env(|q: &str| match q {
+                "LC_COLLATE" => Some("cc".to_string()),
+                "LANG" => Some("dd".to_string()),
+                _ => None,
+            })
+            .as_deref(),
+            Some("cc")
+        );
+
+        // An empty or blank value is not a value: a container that
+        // exports `LANG=` must fall through to the next name, not
+        // record the empty string as a collation.
+        assert_eq!(
+            pick_collation_env(|q: &str| match q {
+                "LC_ALL" => Some("   ".to_string()),
+                "LANG" => Some("en_US.utf8".to_string()),
+                _ => None,
+            })
+            .as_deref(),
+            Some("en_US.utf8")
+        );
+
+        // Nothing set leaves the database at `C`, which is every
+        // container that sets no locale and every database written
+        // before this existed.
+        assert_eq!(pick_collation_env(|_: &str| None), None);
+    }
+
     /// v7.38.18 — the three PG-spelled env names are a promise, and
     /// nothing was checking it.
     ///
@@ -2000,7 +2076,7 @@ fn restore_engine(
     cold_segment_paths: &mut BTreeMap<u32, PathBuf>,
 ) -> std::io::Result<(Engine, u64)> {
     let mut manifest_wal_baseline: u64 = 0;
-    let engine = match db_path {
+    let mut engine = match db_path {
         Some(p) if p.exists() => {
             let bytes = fs::read(p)?;
             let path_str = p.display();
@@ -2032,7 +2108,52 @@ fn restore_engine(
         }
         None => Engine::new(),
     };
+    apply_database_collation(&mut engine);
     Ok((engine, manifest_wal_baseline))
+}
+
+/// v7.38.18 (S1) — the first of the locale variables that names
+/// something, separated from the environment so the ORDER can be tested.
+///
+/// `SPG_LC_COLLATE` first, so a deployer can say it without touching the
+/// process locale; then `LC_ALL`, `LC_COLLATE`, `LANG`, which is POSIX's
+/// precedence and `initdb`'s. A blank value is not a value — a container
+/// that exports `LANG=` falls through rather than recording an empty
+/// string as a collation.
+fn pick_collation_env(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["SPG_LC_COLLATE", "LC_ALL", "LC_COLLATE", "LANG"]
+        .into_iter()
+        .find_map(|k| get(k).filter(|v| !v.trim().is_empty()))
+}
+
+/// v7.38.18 (S1) — record the collation a NEW database is created with.
+///
+/// Read the way `initdb` reads it: `SPG_LC_COLLATE` first, so a deployer
+/// can say it without touching the process locale, then `LC_ALL`,
+/// `LC_COLLATE`, `LANG` — POSIX's own precedence, and the environment a
+/// stock PostgreSQL would have been initialised from on the same host.
+///
+/// A database that already has one keeps it, silently, because that is
+/// what its index keys were built under. Only a MISMATCH is worth
+/// saying anything about, and it is worth saying loudly: the server has
+/// been told one thing and the data on disk says another.
+///
+/// An unset environment leaves `C`, which is every database written
+/// before this existed and every container that sets no locale.
+fn apply_database_collation(engine: &mut Engine) {
+    let Some(name) = pick_collation_env(|k| env::var(k).ok()) else {
+        return;
+    };
+    let name = name.trim();
+    match engine.set_database_collation(name) {
+        Ok(true) => eprintln!("spg-server: database collation {name:?}"),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "spg-server: keeping the database collation it was created with \
+             ({:?}); {name:?} was asked for and refused: {e}",
+            engine.database_collation()
+        ),
+    }
 }
 
 /// v7.33 (D) — replay the WAL onto the loaded snapshot, split out of

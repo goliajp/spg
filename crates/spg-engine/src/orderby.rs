@@ -1419,8 +1419,18 @@ pub(crate) fn order_by_collations(
                     "collation mismatch between implicit collations \"{a}\" and \"{b}\""
                 )));
             }
+            // v7.38.18 (S2) — and when nothing was declared anywhere,
+            // the DATABASE's collation, which is what an undeclared text
+            // column is compared under. `C` resolves to `None` and keeps
+            // the byte-order path exactly as it was, which is what makes
+            // every database written before this one unaffected.
+            let db = ctx
+                .catalog
+                .map(spg_storage::Catalog::db_collation)
+                .filter(|d| !crate::collate::is_byte_wise(d));
             Ok(derived
                 .name()
+                .or(db)
                 .filter(|n| crate::collate::is_supported(n))
                 .map(alloc::string::ToString::to_string))
         })

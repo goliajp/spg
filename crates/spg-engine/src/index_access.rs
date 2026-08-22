@@ -204,7 +204,7 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     // sort keys, so the walk comes out in the LOCALE's order, which is
     // the order the query asked for. That is the one thing a walk
     // contributes, and now it contributes the right one.
-    if collated_column(schema_cols.get(col_pos)?).is_none()
+    if collated_column(schema_cols.get(col_pos)?, table.db_collation()).is_none()
         && !crate::collate::column_key_is_bytewise(schema_cols.get(col_pos)?, mysql)
     {
         return None;
@@ -425,6 +425,9 @@ pub(crate) fn try_index_seek_positions(
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
 ) -> Option<Vec<usize>> {
+    // v7.38.18 (S2) — the collation an undeclared text column is
+    // compared under, and so the one its index keys under.
+    let db_coll = table.db_collation();
     // v7.37.16 — two-sided range (BETWEEN) position seek, mirroring the
     // SELECT path's try_range_seek (same parse, same rows/4 selectivity
     // cap so a wide range still seq-scans). Must run BEFORE the AND
@@ -464,7 +467,7 @@ pub(crate) fn try_index_seek_positions(
     // passes the cap would outrank an equality that returns a single row.
     let seek_cap = table.rows().len() / 4;
     if let Some((col_pos, lo, hi)) =
-        parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql)
+        parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql, db_coll)
     {
         // `break 'range` = this range is not usable; fall through to the
         // recursion and the equality paths below.
@@ -540,7 +543,7 @@ pub(crate) fn try_index_seek_positions(
                 && let Some((col_pos, value)) =
                     resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
                         .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
-                && let Some(key) = probe_key(schema_cols, col_pos, &value, mysql)
+                && let Some(key) = probe_key(schema_cols, col_pos, &value, mysql, db_coll)
             {
                 if !eq_cols.contains(&col_pos) {
                     eq_keys.push((col_pos, key.clone()));
@@ -617,7 +620,14 @@ pub(crate) fn try_index_seek_positions(
         // equalities.
         let mut range_bounds: Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> = Vec::new();
         for c in &conjuncts {
-            let _ = collect_range_bounds(c, schema_cols, table_alias, &mut range_bounds, mysql);
+            let _ = collect_range_bounds(
+                c,
+                schema_cols,
+                table_alias,
+                &mut range_bounds,
+                mysql,
+                db_coll,
+            );
         }
         let cap = best
             .map(|(n, _)| n)
@@ -740,7 +750,7 @@ pub(crate) fn try_index_seek_positions(
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
-    let key = probe_key(schema_cols, col_pos, &value, mysql)?;
+    let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
     let locators = idx.lookup_eq(&key);
     let mut out = Vec::with_capacity(locators.len());
     for loc in locators {
@@ -782,6 +792,7 @@ fn parse_one_sided_range(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    db_coll: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
     let Expr::Binary { lhs, op, rhs } = e else {
         return None;
@@ -795,7 +806,7 @@ fn parse_one_sided_range(
         } else {
             return None;
         };
-    let key = probe_key(schema_cols, col_pos, &value, mysql)?;
+    let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
     let bounds = match op {
         BinOp::Gt => (Bound::Excluded(key), Bound::Unbounded),
         BinOp::GtEq => (Bound::Included(key), Bound::Unbounded),
@@ -838,9 +849,17 @@ fn parse_range_candidates(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    db_coll: &str,
 ) -> Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
     let mut out = Vec::new();
-    collect_range_bounds(where_expr, schema_cols, table_alias, &mut out, mysql);
+    collect_range_bounds(
+        where_expr,
+        schema_cols,
+        table_alias,
+        &mut out,
+        mysql,
+        db_coll,
+    );
     // v7.39 (enum order knife) — the index orders enum labels
     // lexicographically but PG's enum order is the catalog member order, so
     // a range walk would under-select and the caller's WHERE re-eval cannot
@@ -862,9 +881,17 @@ fn parse_range_bounds_exact(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    db_coll: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
     let mut out = Vec::new();
-    if !collect_range_bounds(where_expr, schema_cols, table_alias, &mut out, mysql) {
+    if !collect_range_bounds(
+        where_expr,
+        schema_cols,
+        table_alias,
+        &mut out,
+        mysql,
+        db_coll,
+    ) {
         return None; // something in there was not a range on any column
     }
     if out.len() != 1 {
@@ -889,6 +916,7 @@ fn collect_range_bounds(
     table_alias: &str,
     out: &mut Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)>,
     mysql: bool,
+    db_coll: &str,
 ) -> bool {
     if let Expr::Binary {
         lhs,
@@ -898,11 +926,12 @@ fn collect_range_bounds(
     {
         // Both sides, and both walked: a residual on one does not stop the
         // other from contributing a usable bound.
-        let l = collect_range_bounds(lhs, schema_cols, table_alias, out, mysql);
-        let r = collect_range_bounds(rhs, schema_cols, table_alias, out, mysql);
+        let l = collect_range_bounds(lhs, schema_cols, table_alias, out, mysql, db_coll);
+        let r = collect_range_bounds(rhs, schema_cols, table_alias, out, mysql, db_coll);
         return l && r;
     }
-    let Some((col, lo, hi)) = parse_one_sided_range(e, schema_cols, table_alias, mysql) else {
+    let Some((col, lo, hi)) = parse_one_sided_range(e, schema_cols, table_alias, mysql, db_coll)
+    else {
         return false;
     };
     if let Some(slot) = out.iter_mut().find(|(c, _, _)| *c == col) {
@@ -1123,7 +1152,9 @@ pub(crate) fn index_only_precheck<'t>(
     Bound<IndexKey>,
     &'t spg_storage::Index,
 )> {
-    let (col_pos, lo, hi) = parse_index_only_bounds(where_expr, schema_cols, table_alias, mysql)?;
+    let db_coll = table.db_collation();
+    let (col_pos, lo, hi) =
+        parse_index_only_bounds(where_expr, schema_cols, table_alias, mysql, db_coll)?;
     if col_pos != projected {
         return None;
     }
@@ -1169,10 +1200,12 @@ fn parse_index_only_bounds(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    db_coll: &str,
 ) -> Option<(usize, Bound<IndexKey>, Bound<IndexKey>)> {
     // Exact, not permissive: this path answers from index keys and never
     // looks at the row, so a residual conjunct would go unapplied.
-    if let Some(r) = parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql) {
+    if let Some(r) = parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql, db_coll)
+    {
         return Some(r);
     }
     let Expr::Binary {
@@ -1190,7 +1223,7 @@ fn parse_index_only_bounds(
     if value.is_null() {
         return None;
     }
-    let key = probe_key(schema_cols, col_pos, &value, mysql)?;
+    let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
     Some((col_pos, Bound::Included(key.clone()), Bound::Included(key)))
 }
 
@@ -1215,11 +1248,12 @@ fn try_range_seek<'a>(
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    let db_coll = table.db_collation();
     // r1038 — EXACT: see the note in `try_index_seek_positions`. The AND
     // recursion in `try_index_seek` retries each conjunct alone, so a
     // one-sided range beside a non-range conjunct still reaches the index
     // — without letting a merely-cap-passing range outrank an equality.
-    let candidates = parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql);
+    let candidates = parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql, db_coll);
     // Selectivity cap: the caller still materialises + re-evals every candidate
     // this returns, so the index range scan only pays off when the range is a
     // small fraction of the table. Empirically ~50%-selective ranges regress
@@ -1277,7 +1311,8 @@ pub(crate) fn whole_predicate_is_one_range(
     table_alias: &str,
     mysql: bool,
 ) -> bool {
-    parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql)
+    let db_coll = table.db_collation();
+    parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql, db_coll)
         .is_some_and(|(col, _, _)| table.index_on(col).is_some())
 }
 
@@ -1309,7 +1344,10 @@ pub(crate) fn count_indexed_range_capped(
     mysql: bool,
 ) -> Option<u64> {
     let cap = table.rows().len() / 4;
-    for (col_pos, lo, hi) in parse_range_candidates(where_expr, schema_cols, table_alias, mysql) {
+    let db_coll = table.db_collation();
+    for (col_pos, lo, hi) in
+        parse_range_candidates(where_expr, schema_cols, table_alias, mysql, db_coll)
+    {
         let Some(idx) = table.index_on(col_pos) else {
             continue;
         };
@@ -1341,9 +1379,11 @@ pub(crate) fn try_range_count(
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
 ) -> Option<i64> {
+    let db_coll = table.db_collation();
     // Exact: the tally IS the answer, so a residual conjunct would make it
     // wrong. See `parse_range_bounds_exact`.
-    let (col_pos, lo, hi) = parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql)?;
+    let (col_pos, lo, hi) =
+        parse_range_bounds_exact(where_expr, schema_cols, table_alias, mysql, db_coll)?;
     let idx = table.index_on(col_pos)?;
     let locators = idx.lookup_range_capped(bound_as_ref(&lo), bound_as_ref(&hi), usize::MAX)?;
     let mut count: i64 = 0;
@@ -1369,6 +1409,9 @@ pub(crate) fn try_index_seek<'a>(
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    // v7.38.18 (S2) — the collation an undeclared text column is
+    // compared under, and so the one its index keys under.
+    let db_coll = table.db_collation();
     // v7.38 (perf) — a range predicate (`col BETWEEN a AND b`, `col > x`) walks
     // the index range instead of full-scanning. Tried before the `AND` recurse
     // so a two-sided BETWEEN is caught as one range; a mixed predicate like
@@ -1432,7 +1475,7 @@ pub(crate) fn try_index_seek<'a>(
                 && let Some((col_pos, value)) =
                     resolve_col_literal_pair(cl, cr, schema_cols, table_alias)
                         .or_else(|| resolve_col_literal_pair(cr, cl, schema_cols, table_alias))
-                && let Some(key) = probe_key(schema_cols, col_pos, &value, mysql)
+                && let Some(key) = probe_key(schema_cols, col_pos, &value, mysql, db_coll)
             {
                 if !eq_cols.contains(&col_pos) {
                     eq_keys.push((col_pos, key.clone()));
@@ -1503,7 +1546,14 @@ pub(crate) fn try_index_seek<'a>(
         // equalities on the same count (see the positions variant).
         let mut range_bounds: Vec<(usize, Bound<IndexKey>, Bound<IndexKey>)> = Vec::new();
         for c in &conjuncts {
-            let _ = collect_range_bounds(c, schema_cols, table_alias, &mut range_bounds, mysql);
+            let _ = collect_range_bounds(
+                c,
+                schema_cols,
+                table_alias,
+                &mut range_bounds,
+                mysql,
+                db_coll,
+            );
         }
         let cap = best
             .map(|(n, _)| n)
@@ -1663,7 +1713,7 @@ pub(crate) fn try_index_seek<'a>(
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
     let idx = table.index_on(col_pos)?;
-    let key = probe_key(schema_cols, col_pos, &value, mysql)?;
+    let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
     let locators = idx.lookup_eq(&key);
     let table_name = table.schema().name.as_str();
     // v5.1: each locator dispatches to either the hot tier (zero-
@@ -1715,6 +1765,9 @@ fn try_inlist_seek<'a>(
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
 ) -> Option<Vec<Cow<'a, Row<'static>>>> {
+    // v7.38.18 (S2) — the collation an undeclared text column is
+    // compared under, and so the one its index keys under.
+    let db_coll = table.db_collation();
     let Expr::InList {
         expr,
         list,
@@ -1758,7 +1811,7 @@ fn try_inlist_seek<'a>(
             return None;
         };
         let v = literal_as_column_value(l, col, col_pos)?;
-        keys.push(probe_key(schema_cols, col_pos, &v, mysql)?);
+        keys.push(probe_key(schema_cols, col_pos, &v, mysql, db_coll)?);
     }
     let table_name = table.schema().name.as_str();
     let mut out: Vec<Cow<'a, Row>> = Vec::new();
@@ -2367,6 +2420,10 @@ pub(crate) fn try_pk_predicate(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    // v7.38.18 (S2) — the collation an undeclared text column is
+    // compared under, and so the one its index keys under. Passed in
+    // here: this helper never sees the table.
+    db_coll: &str,
 ) -> Option<(usize, IndexKey)> {
     let Expr::Binary {
         lhs,
@@ -2378,7 +2435,7 @@ pub(crate) fn try_pk_predicate(
     };
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
-    let key = probe_key(schema_cols, col_pos, &value, mysql)?;
+    let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
     Some((col_pos, key))
 }
 
@@ -2455,6 +2512,7 @@ fn probe_key(
     col_pos: usize,
     value: &Value<'_>,
     mysql: bool,
+    db_coll: &str,
 ) -> Option<IndexKey> {
     let col = schema_cols.get(col_pos)?;
     // v7.38.18 (S0) — a locale-collated column's tree holds ICU sort
@@ -2466,7 +2524,7 @@ fn probe_key(
     // The tree being COMPLETE is the caller's question, not this one's:
     // see `index_is_usable`. An empty tree reads as no rows, which is
     // the failure this whole layer exists to prevent.
-    if let Some(coll) = collated_column(col) {
+    if let Some(coll) = collated_column(col, db_coll) {
         return collated_probe(&coll, value);
     }
     // The one place a probe is built is the one place to ask whether a
@@ -2481,7 +2539,7 @@ fn probe_key(
 
 /// v7.38.18 (S0) — this column's collation when its index keys under
 /// one, i.e. when it is text and the collation is not byte order.
-fn collated_column(col: &ColumnSchema) -> Option<alloc::string::String> {
+fn collated_column(col: &ColumnSchema, db_coll: &str) -> Option<alloc::string::String> {
     if !matches!(
         col.ty,
         spg_storage::DataType::Text
@@ -2490,9 +2548,21 @@ fn collated_column(col: &ColumnSchema) -> Option<alloc::string::String> {
     ) {
         return None;
     }
+    // v7.38.18 (S2) — the column's own, or the DATABASE's when it
+    // declares none. This must give the same answer as
+    // `Table::index_collation` gives on the storage side, because that
+    // one built the entries and this one builds the probe. They
+    // disagreed for exactly one commit, and the symptom was `x =
+    // 'apple'` returning nothing at all.
+    // Same exclusion `Table::index_collation` makes, and it has to be
+    // the same or the probe lands in a different space from the entries.
+    if matches!(col.collation, spg_storage::Collation::CaseInsensitive) {
+        return None;
+    }
     col.collation_name
         .as_deref()
-        .filter(|n| !crate::collate::is_byte_wise(n))
+        .or(Some(db_coll))
+        .filter(|n| spg_storage::collation_uses_sort_key(n))
         .map(alloc::string::String::from)
 }
 
