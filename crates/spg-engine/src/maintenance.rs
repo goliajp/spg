@@ -98,14 +98,26 @@ impl Engine {
         }
         let names: Vec<String> = if let Some(name) = target {
             // Verify the table exists; surface a clear error if not.
-            if self.catalog.get(name).is_none() {
+            // v7.38.18 (S10) — the ACTIVE catalog, which includes the
+            // open transaction's shadow. A multi-statement simple query
+            // is an implicit transaction, so
+            //
+            //   CREATE TABLE t (k INT); INSERT INTO t VALUES (1); ANALYZE t;
+            //
+            // sent as ONE string answered `relation "t" does not exist`
+            // — while the INSERT in the same string had just succeeded.
+            // Seven other statement kinds in that position were already
+            // right; `ANALYZE` read the committed catalog alone.
+            if self.active_catalog().get(name).is_none() {
                 return Err(EngineError::Storage(StorageError::TableNotFound {
                     name: name.to_string(),
                 }));
             }
             alloc::vec![name.to_string()]
         } else {
-            self.catalog
+            // Same reason: a bare ANALYZE must cover the tables this
+            // transaction created, not only the committed ones.
+            self.active_catalog()
                 .table_names()
                 .into_iter()
                 .filter(|n| !is_internal_table_name(n))
@@ -117,7 +129,7 @@ impl Engine {
             self.analyze_one_table(table_name)?;
             // v7.39 (pg_stat knife C) — stamp last_analyze.
             if let Some(us) = now_us
-                && let Some(t) = self.catalog.get_mut(table_name)
+                && let Some(t) = self.active_catalog_mut().get_mut(table_name)
             {
                 t.stamp_analyze(us);
             }
@@ -149,13 +161,20 @@ impl Engine {
     /// that have been DROP-ed between ANALYZEs don't leave stale
     /// rows.
     fn analyze_one_table(&mut self, table_name: &str) -> Result<(), EngineError> {
-        let table = self.catalog.get(table_name).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: table_name.to_string(),
-            })
-        })?;
-        let schema = table.schema().clone();
-        let row_count = table.rows().len();
+        // v7.38.18 (S10) — take what this pass needs and release the
+        // catalog borrow. `active_catalog()` borrows the whole engine
+        // (it may hand back the transaction's shadow), where the old
+        // `self.catalog` borrowed one field, and the statistics store
+        // below is mutated through `self`.
+        let (schema, rows) = {
+            let table = self.active_catalog().get(table_name).ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: table_name.to_string(),
+                })
+            })?;
+            (table.schema().clone(), table.rows().clone())
+        };
+        let row_count = rows.len();
         // For each column, collect (sorted) non-NULL textual values
         // + count NULLs; then ask `statistics::build_histogram` to
         // produce the 101 bounds and `estimate_n_distinct` the
@@ -169,7 +188,7 @@ impl Engine {
             }
             let mut non_null_values: Vec<Value<'static>> = Vec::with_capacity(row_count);
             let mut nulls: u64 = 0;
-            for row in table.rows() {
+            for row in rows.iter() {
                 match row.values.get(col_pos) {
                     Some(Value::Null) | None => nulls += 1,
                     Some(v) => non_null_values.push(v.clone()),

@@ -1,0 +1,43 @@
+# v7.38.18 (S10) — `ANALYZE` could not see a table created earlier in
+# the same query string.
+#
+#   CREATE TABLE t (k INT); INSERT INTO t VALUES (1); ANALYZE t;
+#
+# sent as ONE simple-query string answered `relation "t" does not
+# exist` — while the INSERT in that same string had just succeeded, and
+# PostgreSQL 18.4 answers `ANALYZE`.
+#
+# A multi-statement simple query is an implicit transaction, so the new
+# table lives in the transaction's shadow catalog. `exec_analyze` read
+# the COMMITTED catalog alone, in four places. Seven other statement
+# kinds in that position — SELECT, UPDATE, CREATE INDEX, ALTER TABLE,
+# TRUNCATE, DELETE, DROP — were already right, which is why this looked
+# like a quirk of ANALYZE rather than a class.
+#
+# Measured for each of the eight before the fix, with a FRESH table name
+# per case: reusing one hid the bug entirely, because the second run
+# found the table already committed.
+#
+# The corpus runner sends statements one at a time, so the shape that
+# broke lives in `e2e_analyze_same_string` on the wire. What this file
+# pins is the other half: that ANALYZE does the WORK, rather than
+# merely not raising.
+
+statement ok
+CREATE TABLE az (a INT, b TEXT)
+
+statement ok
+INSERT INTO az VALUES (1,'x'),(2,'y')
+
+statement ok
+ANALYZE az
+
+# Two columns analysed, two rows of statistics. "It returned OK" is not
+# evidence that it did anything.
+query I
+SELECT count(*) FROM pg_statistic WHERE starelid = (SELECT oid FROM pg_class WHERE relname = 'az')
+----
+2
+
+statement ok
+DROP TABLE az

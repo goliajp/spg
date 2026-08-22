@@ -40,6 +40,25 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`ANALYZE` could not see a table created earlier in the same query
+  string.** Sent as one simple-query string,
+
+  ```sql
+  CREATE TABLE t (k INT); INSERT INTO t VALUES (1); ANALYZE t;
+  ```
+
+  answered `relation "t" does not exist` — while the `INSERT` in that
+  same string had just succeeded, and PostgreSQL 18.4 answers `ANALYZE`.
+
+  A multi-statement simple query is an implicit transaction, so the new
+  table lives in the transaction's shadow catalog; `exec_analyze` read
+  the committed catalog alone, in four places. Seven other statement
+  kinds in that position were already right — `SELECT`, `UPDATE`,
+  `DELETE`, `CREATE INDEX`, `ALTER TABLE`, `TRUNCATE`, `DROP` — which is
+  why it looked like a quirk of `ANALYZE` rather than a class. Each was
+  measured with a **fresh** table name: reusing one hid the defect
+  entirely, because the second run found the table already committed.
+
 - **A scalar subquery returned the first character of a `CHAR(n)`.**
   `SELECT (SELECT c FROM t WHERE k=1)` over a `CHAR(8)` holding
   `'alpha'` answered `'a'`. Silently, and on **both** wires.
