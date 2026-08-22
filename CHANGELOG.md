@@ -103,6 +103,19 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A collated sort built a collator per comparison.** `collate::compare`
+  takes a NAME and built the collator behind it on every call, so a
+  400,000-row two-key `ORDER BY` built millions of them. Measured over
+  100,000 comparisons: **52.9 ms** building per call against **5.2 ms**
+  with one built in advance — ten times the cost, and none of it in
+  ICU's comparison.
+
+  It only became visible when database-level collations arrived and text
+  sorts started taking this path: the release sweep went from 64 cells
+  and no losses to one cell losing 1.5×. The sort now resolves each
+  key's collation once, before it starts, and carries the built collator
+  instead of the name. Over 200,000 rows: **1,715 ms → 216 ms**.
+
 - **An expression index stood in for a column index, and a row went
   missing.** This one the shipped build already had, on a plain `C`
   database, with no collation involved:
