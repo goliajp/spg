@@ -4,9 +4,9 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 96 | 0 | 0 | 100.0% | postgres × 6 |
+| `15_regressions` | 104 | 0 | 0 | 100.0% | postgres × 7 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 354 | 0 | 0 | 100.0% | mysql × 22 |
+| `mysql` | 369 | 1 | 0 | 99.7% | mysql × 23 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -26,6 +26,12 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% | postgres × 33 |
 | `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% | postgres × 1 |
 
+## Top fail patterns
+
+| count | pattern |
+|---|---|
+| 1 | `record 13: row mismatch | expected:` |
+
 ## Per-file detail
 
 ### `15_regressions/`
@@ -38,6 +44,7 @@ Per-corpus pass / fail / skip:
 | `v73814_temp_namespace.test` | 10 | 0 | 0 | postgres |
 | `v73816_expression_index.test` | 37 | 0 | 0 | postgres |
 | `v73816_gin_expression.test` | 21 | 0 | 0 | postgres |
+| `v73818_scalar_subquery_types.test` | 8 | 0 | 0 | postgres |
 
 ### `duckdb/`
 
@@ -83,6 +90,7 @@ Per-corpus pass / fail / skip:
 | `12_unique_collation.test` | 22 | 0 | 0 | mysql |
 | `13_pad_semantics.test` | 20 | 0 | 0 | mysql |
 | `13_show_databases.test` | 3 | 0 | 0 | mysql |
+| `14_mixed_type_compare.test` | 15 | 1 | 0 | mysql |
 | `14_show_create_table.test` | 4 | 0 | 0 | mysql |
 | `15_show_indexes_status_processlist.test` | 10 | 0 | 0 | mysql |
 | `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
@@ -91,6 +99,11 @@ Per-corpus pass / fail / skip:
 | `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |
 | `v73814_join_collation.test` | 23 | 0 | 0 | mysql |
 | `v73814_setop_collation.test` | 21 | 0 | 0 | mysql |
+
+<details><summary>`14_mixed_type_compare.test` fail snippets</summary>
+
+- record 13: row mismatch |   expected: ["hit", "miss"] |   actual:   ["miss", "miss"]
+</details>
 
 ### `pg_regress/`
 

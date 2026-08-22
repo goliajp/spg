@@ -54,6 +54,36 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
             scale,
         },
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
+        // v7.38.18 — `CHAR(n)` needs its width, and the catch-all below
+        // cannot carry it. That arm re-types a value through its
+        // PostgreSQL type NAME, and the name for `Char(8)` is `char`,
+        // which parses back as `Char(1)`: a scalar subquery over a
+        // `CHAR(8)` holding `'alpha'` returned `'a'`. Silently, and on
+        // both wires — PostgreSQL 18.4 answers `alpha`, and so did a
+        // direct SELECT, a derived table, a CTE, a UNION and `max()`.
+        // Only the scalar-subquery path went through the name.
+        //
+        // Both copies of this conversion get the arm. One would have
+        // been the same defect at the other site.
+        // v7.38.18 — and `BIT(n)` for the same reason, one step worse:
+        // its name resolved to `bit varying`, which the cast target did
+        // not accept, so a scalar subquery over a bit column FAILED
+        // rather than answering wrongly. `bit(n)` rebuilds it exactly,
+        // width and all.
+        ref bits @ Value::BitString { nbits, .. } => {
+            let text = crate::eval::value_to_text(bits);
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(text))),
+                target: spg_sql::ast::CastTarget::Named(alloc::format!("bit({nbits})")),
+            });
+        }
+        Value::BpChar(t) => {
+            let n = t.chars().count();
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(t.into_owned()))),
+                target: spg_sql::ast::CastTarget::Named(alloc::format!("char({n})")),
+            });
+        }
         Value::Bool(b) => Literal::Bool(b),
         // v7.39 (read01 round 54) — the oid-shaped catalog scalars. A subquery
         // like `WHERE indrelid IN (SELECT 't'::regclass)` used to die on
@@ -268,6 +298,36 @@ pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineE
         }
         Value::Float(x) => Literal::Float(x),
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
+        // v7.38.18 — `CHAR(n)` needs its width, and the catch-all below
+        // cannot carry it. That arm re-types a value through its
+        // PostgreSQL type NAME, and the name for `Char(8)` is `char`,
+        // which parses back as `Char(1)`: a scalar subquery over a
+        // `CHAR(8)` holding `'alpha'` returned `'a'`. Silently, and on
+        // both wires — PostgreSQL 18.4 answers `alpha`, and so did a
+        // direct SELECT, a derived table, a CTE, a UNION and `max()`.
+        // Only the scalar-subquery path went through the name.
+        //
+        // Both copies of this conversion get the arm. One would have
+        // been the same defect at the other site.
+        // v7.38.18 — and `BIT(n)` for the same reason, one step worse:
+        // its name resolved to `bit varying`, which the cast target did
+        // not accept, so a scalar subquery over a bit column FAILED
+        // rather than answering wrongly. `bit(n)` rebuilds it exactly,
+        // width and all.
+        ref bits @ Value::BitString { nbits, .. } => {
+            let text = crate::eval::value_to_text(bits);
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(text))),
+                target: spg_sql::ast::CastTarget::Named(alloc::format!("bit({nbits})")),
+            });
+        }
+        Value::BpChar(t) => {
+            let n = t.chars().count();
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(t.into_owned()))),
+                target: spg_sql::ast::CastTarget::Named(alloc::format!("char({n})")),
+            });
+        }
         Value::Bool(b) => Literal::Bool(b),
         // v7.39 (read01 round 54) — the oid-shaped catalog scalars. A subquery
         // like `WHERE indrelid IN (SELECT 't'::regclass)` used to die on

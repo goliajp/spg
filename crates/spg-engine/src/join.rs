@@ -1476,8 +1476,14 @@ impl Engine {
         // current_setting('app.tenant')` failed on the joined shape while
         // working on the unjoined one.
         let join_sess = self.dml_session();
+        // v7.38.18 — the dialect belongs on this context too. Three
+        // sites here and two in `select.rs` attached the catalog and the
+        // session and left off the one field that decides how text
+        // compares, so a joined row was evaluated in PostgreSQL
+        // semantics inside a MySQL session.
         let ctx = EvalContext::new(&combined_schema, None)
             .with_catalog(self.active_catalog())
+            .with_engine(self)
             .with_session(&join_sess);
         if joined.is_empty() {
             // Joinless FROM: the primary rows ARE the combined rows —
@@ -3594,8 +3600,14 @@ impl Engine {
         // current_setting('app.tenant')` failed on the joined shape while
         // working on the unjoined one.
         let join_sess = self.dml_session();
+        // v7.38.18 — the dialect belongs on this context too. Three
+        // sites here and two in `select.rs` attached the catalog and the
+        // session and left off the one field that decides how text
+        // compares, so a joined row was evaluated in PostgreSQL
+        // semantics inside a MySQL session.
         let ctx = EvalContext::new(&combined_schema, None)
             .with_catalog(self.active_catalog())
+            .with_engine(self)
             .with_session(&join_sess);
         let left_arity = primary_cols.len();
         let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
@@ -3974,8 +3986,14 @@ impl Engine {
         // current_setting('app.tenant')` failed on the joined shape while
         // working on the unjoined one.
         let join_sess = self.dml_session();
+        // v7.38.18 — the dialect belongs on this context too. Three
+        // sites here and two in `select.rs` attached the catalog and the
+        // session and left off the one field that decides how text
+        // compares, so a joined row was evaluated in PostgreSQL
+        // semantics inside a MySQL session.
         let ctx = EvalContext::new(&combined_schema, None)
             .with_catalog(self.active_catalog())
+            .with_engine(self)
             .with_session(&join_sess);
         // Hash-joinable left = right equality pairs from ON; anything
         // else stays as a residual conjunct on the candidate row.

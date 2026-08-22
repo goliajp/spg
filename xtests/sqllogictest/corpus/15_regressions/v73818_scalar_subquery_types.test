@@ -1,0 +1,57 @@
+# v7.38.18 — a scalar subquery returned the FIRST CHARACTER of a
+# `CHAR(n)`, and failed outright on a `BIT(n)`.
+#
+# `SELECT (SELECT c8 FROM t WHERE k=1)` over a `CHAR(8)` holding
+# `'alpha'` answered `'a'`. Silently, and on both wires. A direct
+# SELECT, a derived table, a CTE, a UNION and `max()` were all correct
+# — only the scalar-subquery path was wrong, because only it goes
+# through a conversion that re-types the value by its PostgreSQL type
+# NAME. The name for `Char(8)` is `char`, which parses back as
+# `Char(1)`, and the width was gone.
+#
+# `BIT(4)` took the same path and its name resolved to `bit varying`,
+# which the cast target would not accept, so that one raised
+# "subquery result type bit varying not yet materialisable" instead of
+# answering wrongly.
+#
+# Every expectation is PostgreSQL 18.4's own answer.
+
+statement ok
+CREATE TABLE sq (k INT, c8 CHAR(8), v VARCHAR(32), b BIT(4))
+
+statement ok
+INSERT INTO sq VALUES (1,'alpha','alpha',B'1011')
+
+# The value survives, padding and all — `length` is 5 because PG counts
+# a bpchar's significant characters.
+query T
+SELECT '[' || (SELECT c8 FROM sq WHERE k=1) || ']'
+----
+[alpha]
+
+query I
+SELECT length((SELECT c8 FROM sq WHERE k=1))
+----
+5
+
+# `IN (SELECT <char col>)` was empty for the same reason.
+query I
+SELECT count(*) FROM sq WHERE 'alpha' IN (SELECT c8 FROM sq)
+----
+1
+
+# A CHAR from a subquery compared against a VARCHAR column: the CHAR's
+# padding is not data, so they are equal.
+query I
+SELECT count(*) FROM sq WHERE v = (SELECT c8 FROM sq WHERE k=1)
+----
+1
+
+# The bit column raised rather than answered.
+query T
+SELECT (SELECT b FROM sq WHERE k=1)::text
+----
+1011
+
+statement ok
+DROP TABLE sq

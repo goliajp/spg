@@ -8,6 +8,50 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A scalar subquery returned the first character of a `CHAR(n)`.**
+  `SELECT (SELECT c FROM t WHERE k=1)` over a `CHAR(8)` holding
+  `'alpha'` answered `'a'`. Silently, and on **both** wires.
+
+  A direct SELECT, a derived table, a CTE, a UNION and `max()` were all
+  correct — only the scalar-subquery path was wrong, because only it
+  goes through a conversion that re-types the value by its PostgreSQL
+  type NAME. The name for `Char(8)` is `char`, which parses back as
+  `Char(1)`, and the width was gone. `IN (SELECT <char col>)` returned
+  nothing for the same reason.
+
+  A `BIT(n)` took the same path one step worse: its name resolved to
+  `bit varying`, which the cast target would not accept, so that one
+  raised *"subquery result type bit varying not yet materialisable"*
+  instead of answering wrongly. Both now carry their width in the cast
+  target, which rebuilds the value and its type exactly. The other eight
+  types we measured through this path were already correct.
+
+- **A joined row was evaluated in PostgreSQL semantics inside a MySQL
+  session.** Five places built the context for a joined row — three in
+  `join.rs`, two in `select.rs` — and each attached the catalog and the
+  session and left off the one field that decides how text compares.
+
+  It stayed invisible while both sides had the same text type, because
+  same-type values agree byte-for-byte once lowercased. It appeared the
+  moment a `CHAR`'s padding had to be stripped: `a.c = b.s` with
+  `c CHAR(8)` and `s VARCHAR` answered false and a join on it returned
+  **no rows**, while `a.c = b.c`, `a.s = b.s` and the same comparison
+  inside one table were all fine.
+
+- **Several comparison sites folded a PAIR rather than each value.**
+  They matched `(Text, Text) | (BpChar, BpChar)`, so a `CHAR` against a
+  `VARCHAR` or against a literal was neither shape and fell through to a
+  byte compare: `CASE c WHEN 'ALPHA'` on a `CHAR(8)` holding `'alpha'`
+  took the ELSE branch. Whether trailing spaces count is a property of
+  each side's own type, so the pair was never the right unit. One
+  helper, applied per value, replaces all four sites.
+
+---
+
 ## [7.38.17] — 2026-08-22
 
 ### Fixed
