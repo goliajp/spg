@@ -23,8 +23,11 @@
 #     test runner (cargo / npm / pytest / mvn), point the app's DB
 #     URL at the SPG container, run the user's own test suite, fold
 #     the pass/fail into the same report.
-#   * --dialect mysql|mariadb panels: SPG_MYSQLWIRE_ADDR-enabled
-#     entry point.
+#   * --dialect mariadb panel. The MySQL one LANDED in v7.38.17 (see
+#     "MySQL dialect panel" below); MariaDB needs its own expectations,
+#     because the two engines' default collations disagree about
+#     trailing spaces and this file must not assume one answer covers
+#     both.
 #
 # Usage:
 #
@@ -91,8 +94,19 @@ if [ "$NO_PULL" -eq 0 ]; then
   }
 fi
 
-echo "[setup] starting $CONTAINER_NAME on host port $PORT"
-docker run --rm -d --name "$CONTAINER_NAME" -p "$PORT:5432" "$IMAGE" >/dev/null || {
+# v7.38.17 — the MySQL wire is served too, so the panels below can ask
+# a MySQL client the same questions a psql client gets asked.
+#
+# The header of this file has listed `--dialect mysql|mariadb panels` as
+# a Phase 2 idea since v7.18. It was a line in a wish list, and reading
+# it as a capability is how the instrument plan for this version
+# mis-sized the work: nothing implemented it, and `grep -- --dialect`
+# matched only the comment.
+MYPORT="$((PORT + 1000))"
+echo "[setup] starting $CONTAINER_NAME on host port $PORT (mysql wire $MYPORT)"
+docker run --rm -d --name "$CONTAINER_NAME" \
+  -e SPG_MYSQLWIRE_ADDR="0.0.0.0:3307" \
+  -p "$PORT:5432" -p "$MYPORT:3307" "$IMAGE" >/dev/null || {
   echo "harness error: docker run failed" >&2
   exit 2
 }
@@ -374,6 +388,62 @@ run_case_expect "round26.backfill_desc_limit_top_end" \
   "5:a@x"
 
 # --- Fixture mode — apply each --fixture SQL file as a single chunk ---
+
+echo "=== MySQL dialect panel ==="
+
+# v7.38.17 — a drop-in claim covers three engines and this harness
+# probed one. These cases are the ones v7.38.16 and v7.38.17 were
+# spent on, asked over the wire a MySQL client actually speaks;
+# every expectation is MySQL 9.7.2's own answer at its default
+# collation, read from the oracle.
+MYSQL_CLI="docker run --rm -i --network host spg-oracle-mysql:v7.38 mysql -h 127.0.0.1 -P $MYPORT -u spg -N"
+
+my_case() {
+  local name="$1" sql="$2" want="$3" got
+  got="$($MYSQL_CLI -e "$sql" 2>/dev/null | tr '\t' ',' | paste -sd';' - | tr -d '\r')"
+  if [ "$got" = "$want" ]; then
+    echo "[mysql] ok   $name"
+    PASS_COUNT=$((PASS_COUNT+1))
+    CASES+=("mysql.$name|PASS|")
+  else
+    echo "[mysql] FAIL $name — want '$want', got '$got'"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    CASES+=("mysql.$name|FAIL|want '$want', got '$got'")
+  fi
+}
+
+if $MYSQL_CLI -e "SELECT 1" >/dev/null 2>&1; then
+  my_case "wire answers" "SELECT 1" "1"
+
+  $MYSQL_CLI -e "CREATE TABLE dp (k INT, s TEXT)" >/dev/null 2>&1
+  $MYSQL_CLI -e "INSERT INTO dp VALUES (1,'alpha'),(2,'alpha  '),(3,'Beta'),(4,'beta')" >/dev/null 2>&1
+
+  # The collation folds case...
+  my_case "case folds" "SELECT k FROM dp WHERE s = 'ALPHA'" "1"
+  # ...and does NOT fold trailing spaces (NO PAD).
+  my_case "trailing space is data" "SELECT count(DISTINCT s) FROM dp" "3"
+
+  # An index must not change any of it.
+  $MYSQL_CLI -e "CREATE INDEX dp_s ON dp (s)" >/dev/null 2>&1
+  my_case "indexed equality" "SELECT k FROM dp WHERE s = 'ALPHA'" "1"
+  my_case "indexed IN" "SELECT k FROM dp WHERE s IN ('ALPHA','BETA') ORDER BY k" "1;3;4"
+  my_case "indexed ORDER BY" "SELECT k FROM dp ORDER BY s LIMIT 2" "1;2"
+
+  # The join, which is where this class took its worst shape.
+  $MYSQL_CLI -e "CREATE TABLE dq (k INT, s TEXT)" >/dev/null 2>&1
+  $MYSQL_CLI -e "INSERT INTO dq VALUES (10,'ALPHA'),(20,'beta')" >/dev/null 2>&1
+  $MYSQL_CLI -e "CREATE INDEX dq_s ON dq (s)" >/dev/null 2>&1
+  my_case "indexed join" "SELECT dp.k, dq.k FROM dp JOIN dq ON dp.s = dq.s ORDER BY dp.k, dq.k" "1,10;3,20;4,20"
+
+  $MYSQL_CLI -e "DROP TABLE dp" >/dev/null 2>&1
+  $MYSQL_CLI -e "DROP TABLE dq" >/dev/null 2>&1
+else
+  echo "[mysql] FAIL wire did not answer on port $MYPORT"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("mysql.wire|FAIL|no answer on port $MYPORT")
+fi
+
+
 FIXTURE_REPORT=""
 if [ "${#FIXTURES[@]}" -gt 0 ]; then
   echo ""
