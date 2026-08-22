@@ -2654,6 +2654,13 @@ impl Engine {
             // source column that its own maintenance path already reads.
             crate::expr_index::refresh(table)?;
         }
+        // v7.38.18 (S0) — and a locale-collated column index, for the
+        // same reason: `Table::add_index` deliberately leaves its tree
+        // EMPTY because only this crate can encode ICU sort keys, so
+        // without this the index would exist, be skipped by every seek
+        // (`Table::index_on` declines an incomplete one), and cost
+        // maintenance for nothing.
+        crate::expr_index::refresh(table)?;
         // v7.9.29 — persist `is_unique` flag on the storage Index.
         // Combined with `partial_predicate`, INSERT enforcement
         // checks that no other row whose predicate evaluates true

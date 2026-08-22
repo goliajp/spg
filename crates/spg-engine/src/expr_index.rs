@@ -25,13 +25,30 @@ use spg_storage::{Table, Value};
 /// column of its own.
 pub(crate) struct ExprKeyPlan {
     exprs: Vec<Option<spg_sql::ast::Expr>>,
+    /// v7.38.18 (S0) — slot-parallel too: the collation an index keys
+    /// under when it keys on a column that collates by a locale. The two
+    /// are exclusive by construction (`Table::index_collation` answers
+    /// `None` for an index that has an expression).
+    collations: Vec<Option<alloc::string::String>>,
+    /// Slot-parallel key column position, for the collated slots.
+    key_columns: Vec<usize>,
 }
 
 impl ExprKeyPlan {
     /// `None` when the table has no expression index — the ordinary case,
     /// and the one that must stay free.
     pub(crate) fn for_table(table: &Table) -> Result<Option<Self>, EngineError> {
-        if !table.indices().iter().any(|i| i.expression.is_some()) {
+        // v7.38.18 (S0) — a locale-collated column index takes a supplied
+        // key too, so the plan has to cover it or its slot arrives empty
+        // and the index retires on the first insert.
+        let collations: Vec<Option<alloc::string::String>> = table
+            .indices()
+            .iter()
+            .map(|i| table.index_collation(i).map(alloc::string::String::from))
+            .collect();
+        if !table.indices().iter().any(|i| i.expression.is_some())
+            && collations.iter().all(Option::is_none)
+        {
             return Ok(None);
         }
         let mut exprs = Vec::with_capacity(table.indices().len());
@@ -47,7 +64,12 @@ impl ExprKeyPlan {
             };
             exprs.push(parsed);
         }
-        Ok(Some(Self { exprs }))
+        let key_columns: Vec<usize> = table.indices().iter().map(|i| i.column_position).collect();
+        Ok(Some(Self {
+            exprs,
+            collations,
+            key_columns,
+        }))
     }
 
     /// The expression values for one row, slot-parallel to
@@ -65,7 +87,15 @@ impl ExprKeyPlan {
             values: values.to_vec(),
         };
         let mut out = Vec::with_capacity(self.exprs.len());
-        for expr in &self.exprs {
+        for (slot, expr) in self.exprs.iter().enumerate() {
+            // v7.38.18 (S0) — the collated slot: this column's value
+            // encoded as an ICU sort key, which is what makes the
+            // byte-ordered B-tree order it by the locale.
+            if let Some(Some(coll)) = self.collations.get(slot) {
+                let pos = self.key_columns[slot];
+                out.push(collated_key(coll, values.get(pos)));
+                continue;
+            }
             out.push(match expr {
                 Some(e) => {
                     let v = eval::eval_expr(e, &row, ctx)
@@ -79,6 +109,23 @@ impl ExprKeyPlan {
     }
 }
 
+/// v7.38.18 (S0) — one collated index key: the ICU sort key of a text
+/// value under `coll`, as `Value::Bytes`, which storage turns into
+/// `IndexKey::Bytes` and its B-tree then orders by the locale.
+///
+/// `None` for NULL (a NULL enters no entry), for a non-text value, and
+/// for a collation this build cannot perform — the last of which retires
+/// the index rather than filling it with keys of the wrong shape, which
+/// is the same choice the expression path makes.
+fn collated_key(coll: &str, v: Option<&Value<'static>>) -> Option<Value<'static>> {
+    let text = match v? {
+        Value::Text(t) => t.as_ref(),
+        Value::BpChar(t) => t.as_ref(),
+        _ => return None,
+    };
+    crate::collate::sort_key(coll, text).map(|k| Value::Bytes(alloc::borrow::Cow::Owned(k)))
+}
+
 /// Bring every unusable expression index on `table` back into service by
 /// evaluating its expression over every stored row.
 ///
@@ -86,6 +133,21 @@ impl ExprKeyPlan {
 /// there is nothing to do: the common table reports no stale index and
 /// this returns without touching a row.
 pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
+    // v7.38.18 (S0) — the collated column indexes first: they are the
+    // same mechanism, and `add_index` deliberately leaves theirs empty
+    // because this crate is the only one that can encode their keys.
+    for (name, pos, coll) in table.stale_collated_indices() {
+        let mut keys: Vec<Option<Value<'static>>> = Vec::with_capacity(table.stored_row_count());
+        for i in 0..table.stored_row_count() {
+            let Some(values) = table.row_values_at(i) else {
+                return Ok(());
+            };
+            keys.push(collated_key(&coll, values.get(pos)));
+        }
+        table
+            .rebuild_expression_index(&name, &keys)
+            .map_err(EngineError::Storage)?;
+    }
     let stale = table.stale_expression_indices();
     if stale.is_empty() {
         return Ok(());
@@ -151,7 +213,10 @@ pub(crate) fn refresh_named(
     let Some(table) = engine_catalog.get_mut(name) else {
         return Ok(());
     };
-    if table.stale_expression_indices().is_empty() {
+    // v7.38.18 (S0) — a stale COLLATED index counts as stale too, or it
+    // stays empty after the UPDATE that retired it and every seek
+    // against it answers no rows.
+    if table.stale_expression_indices().is_empty() && table.stale_collated_indices().is_empty() {
         return Ok(());
     }
     refresh(table)
@@ -174,8 +239,14 @@ pub(crate) fn rebuild_all(cat: &mut spg_storage::Catalog) {
         .table_names()
         .into_iter()
         .filter(|n| {
-            cat.get(n)
-                .is_some_and(|t| !t.stale_expression_indices().is_empty())
+            cat.get(n).is_some_and(|t| {
+                // v7.38.18 (S0) — the collated column indexes rebuild at
+                // open for the same reason the expression ones do: the
+                // completeness flag is not persisted, deliberately,
+                // because a catalog written by any earlier version holds
+                // keys of the wrong kind under this name.
+                !t.stale_expression_indices().is_empty() || !t.stale_collated_indices().is_empty()
+            })
         })
         .collect();
     for name in names {

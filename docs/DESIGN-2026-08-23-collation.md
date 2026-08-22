@@ -82,6 +82,21 @@ comparing sort keys as bytes gives the same answer as `compare` on all
 A byte-wise column keeps `IndexKey::Text(v)` — byte-identical to today,
 so no index that exists now changes.
 
+**Landed 2026-08-23.** The keys go through the channel expression
+indexes already use: the engine supplies them, `Table::add_index` leaves
+a collated tree EMPTY because only the engine can encode ICU sort keys,
+and `Table::index_on` declines an unfilled one. That decline lives in
+one place rather than at each of the dozen seeks, because an empty tree
+answers no rows to everything and that is indistinguishable from a
+correct answer — ablating it turns seven pinned cases red, all with
+empty results.
+
+Seeking works for equality, `IN` and range bounds, all through the one
+`probe_key` funnel so they cannot disagree with each other. The
+top-N ORDER BY walk is still declined for a collated column: the tree
+now walks in the locale's order so it could be allowed, and that is a
+missed optimisation rather than a wrong answer.
+
 ### S1 — the database's collation is persisted, and set once
 
 Recorded in the catalog at creation. Sourced as `initdb` sources it:

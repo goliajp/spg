@@ -200,7 +200,13 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     // 1,2 there and this walk answered 2,3. Ordering is the one thing a
     // walk contributes, so when it is the wrong ordering there is nothing
     // left to keep.
-    if !crate::collate::column_key_is_bytewise(schema_cols.get(col_pos)?, mysql) {
+    // v7.38.18 (S0) — a locale-collated column's tree is keyed by ICU
+    // sort keys, so the walk comes out in the LOCALE's order, which is
+    // the order the query asked for. That is the one thing a walk
+    // contributes, and now it contributes the right one.
+    if collated_column(schema_cols.get(col_pos)?).is_none()
+        && !crate::collate::column_key_is_bytewise(schema_cols.get(col_pos)?, mysql)
+    {
         return None;
     }
     // v7.38.1 (L12) — a composite B-tree leading on the ORDER BY column
@@ -1741,16 +1747,18 @@ fn try_inlist_seek<'a>(
     // And the same question the equality seek asks: a byte probe cannot
     // answer a folded comparison. `s IN ('ALPHA','BETA')` is 1,2 in
     // MySQL and was nothing at all here.
-    if !crate::collate::column_key_is_bytewise(col, mysql) {
-        return None;
-    }
+    // v7.38.18 (S0) — through the same funnel as the equality probe and
+    // the range bounds, so a collated column's IN list is encoded the
+    // way its entries were. Building the key here with
+    // `from_value_for_column` was a fourth copy of that decision and
+    // would have probed a sort-key tree with raw text.
     let mut keys: Vec<IndexKey> = Vec::with_capacity(list.len());
     for e in list {
         let Expr::Literal(l) = e else {
             return None;
         };
         let v = literal_as_column_value(l, col, col_pos)?;
-        keys.push(IndexKey::from_value_for_column(&v, col.ty)?);
+        keys.push(probe_key(schema_cols, col_pos, &v, mysql)?);
     }
     let table_name = table.schema().name.as_str();
     let mut out: Vec<Cow<'a, Row>> = Vec::new();
@@ -2449,6 +2457,18 @@ fn probe_key(
     mysql: bool,
 ) -> Option<IndexKey> {
     let col = schema_cols.get(col_pos)?;
+    // v7.38.18 (S0) — a locale-collated column's tree holds ICU sort
+    // keys, so the probe is encoded the same way and the seek answers
+    // the same question the scan would. This is the ONE funnel for both
+    // equality probes and range bounds, so encoding it here is what
+    // makes `x = 'apple'` and `x > 'b'` agree with each other.
+    //
+    // The tree being COMPLETE is the caller's question, not this one's:
+    // see `index_is_usable`. An empty tree reads as no rows, which is
+    // the failure this whole layer exists to prevent.
+    if let Some(coll) = collated_column(col) {
+        return collated_probe(&coll, value);
+    }
     // The one place a probe is built is the one place to ask whether a
     // byte probe can answer the question at all. Under MySQL a text
     // comparison folds case and this B-tree does not, so declining here
@@ -2457,6 +2477,48 @@ fn probe_key(
         return None;
     }
     IndexKey::from_value_for_column(value, col.ty)
+}
+
+/// v7.38.18 (S0) — this column's collation when its index keys under
+/// one, i.e. when it is text and the collation is not byte order.
+fn collated_column(col: &ColumnSchema) -> Option<alloc::string::String> {
+    if !matches!(
+        col.ty,
+        spg_storage::DataType::Text
+            | spg_storage::DataType::Varchar(_)
+            | spg_storage::DataType::Char(_)
+    ) {
+        return None;
+    }
+    col.collation_name
+        .as_deref()
+        .filter(|n| !crate::collate::is_byte_wise(n))
+        .map(alloc::string::String::from)
+}
+
+/// The probe for a collated tree: the same ICU sort key the entries were
+/// built from. `None` for a non-text value or an unperformable
+/// collation, which declines the seek rather than probing in the wrong
+/// space — a probe of the wrong shape finds nothing, and nothing reads
+/// exactly like "no matching rows".
+fn collated_probe(coll: &str, value: &Value<'_>) -> Option<IndexKey> {
+    let text = match value {
+        Value::Text(t) => t.as_ref(),
+        Value::BpChar(t) => t.as_ref(),
+        _ => return None,
+    };
+    crate::collate::sort_key(coll, text).map(IndexKey::Bytes)
+}
+
+/// v7.38.18 (S0) — may this index be READ right now?
+///
+/// A collated index's tree is filled by the engine, not by storage, so
+/// between `CREATE INDEX` and the refresh that fills it — and after any
+/// row rewrite that retires it — it is EMPTY. Reading an empty tree
+/// returns no rows, which is indistinguishable from a correct answer.
+/// Every seek asks this before using one.
+pub(crate) fn index_is_usable(table: &Table, idx: &spg_storage::Index) -> bool {
+    table.index_collation(idx).is_none() || table.expr_index_is_complete(&idx.name)
 }
 
 pub(crate) fn resolve_col_literal_pair(

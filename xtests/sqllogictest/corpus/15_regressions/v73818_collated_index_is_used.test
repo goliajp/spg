@@ -1,0 +1,81 @@
+# v7.38.18 (S0) — a collated index that is actually USED must give the
+# scan's answer.
+#
+# `v73818_locale_collation_index.test` pins the same agreement on six
+# rows, where every seek is declined by the cost cap and both halves are
+# really scans. That file proves the answers; this one proves them at a
+# size where the index is read — `idx_scan` rises for the equality, the
+# IN list and the BETWEEN on this table, and the answers do not move.
+#
+# The index holds ICU sort keys, which only the engine can produce, so
+# `Table::add_index` leaves its tree EMPTY and `Table::index_on` declines
+# an unfilled one. An empty tree answers no rows to everything, which is
+# indistinguishable from a correct answer — the reason that decline lives
+# in one place rather than at each of the dozen seeks.
+
+statement ok
+CREATE TABLE lcs(x text COLLATE "en_US.utf8")
+
+statement ok
+INSERT INTO lcs VALUES ('Zebra'),('apple'),('DateStyle'),('client'),('Bob'),('mid'),('zz000'),('zz001'),('zz002'),('zz003'),('zz004'),('zz005'),('zz006'),('zz007'),('zz008'),('zz009'),('zz010'),('zz011'),('zz012'),('zz013'),('zz014'),('zz015'),('zz016'),('zz017'),('zz018'),('zz019'),('zz020'),('zz021'),('zz022'),('zz023'),('zz024'),('zz025'),('zz026'),('zz027'),('zz028'),('zz029'),('zz030'),('zz031'),('zz032'),('zz033'),('zz034'),('zz035'),('zz036'),('zz037'),('zz038'),('zz039'),('zz040'),('zz041'),('zz042'),('zz043'),('zz044'),('zz045'),('zz046'),('zz047'),('zz048'),('zz049'),('zz050'),('zz051'),('zz052'),('zz053'),('zz054'),('zz055'),('zz056'),('zz057'),('zz058'),('zz059'),('zz060'),('zz061'),('zz062'),('zz063'),('zz064'),('zz065'),('zz066'),('zz067'),('zz068'),('zz069'),('zz070'),('zz071'),('zz072'),('zz073'),('zz074'),('zz075'),('zz076'),('zz077'),('zz078'),('zz079'),('zz080'),('zz081'),('zz082'),('zz083'),('zz084'),('zz085'),('zz086'),('zz087'),('zz088'),('zz089'),('zz090'),('zz091'),('zz092'),('zz093'),('zz094'),('zz095'),('zz096'),('zz097'),('zz098'),('zz099'),('zz100'),('zz101'),('zz102'),('zz103'),('zz104'),('zz105'),('zz106'),('zz107'),('zz108'),('zz109'),('zz110'),('zz111'),('zz112'),('zz113'),('zz114'),('zz115'),('zz116'),('zz117'),('zz118'),('zz119'),('zz120'),('zz121'),('zz122'),('zz123'),('zz124'),('zz125'),('zz126'),('zz127'),('zz128'),('zz129'),('zz130'),('zz131'),('zz132'),('zz133'),('zz134'),('zz135'),('zz136'),('zz137'),('zz138'),('zz139'),('zz140'),('zz141'),('zz142'),('zz143'),('zz144'),('zz145'),('zz146'),('zz147'),('zz148'),('zz149'),('zz150'),('zz151'),('zz152'),('zz153'),('zz154'),('zz155'),('zz156'),('zz157'),('zz158'),('zz159'),('zz160'),('zz161'),('zz162'),('zz163'),('zz164'),('zz165'),('zz166'),('zz167'),('zz168'),('zz169'),('zz170'),('zz171'),('zz172'),('zz173'),('zz174'),('zz175'),('zz176'),('zz177'),('zz178'),('zz179'),('zz180'),('zz181'),('zz182'),('zz183'),('zz184'),('zz185'),('zz186'),('zz187'),('zz188'),('zz189'),('zz190'),('zz191'),('zz192'),('zz193'),('zz194'),('zz195'),('zz196'),('zz197'),('zz198'),('zz199'),('zz200'),('zz201'),('zz202'),('zz203'),('zz204'),('zz205'),('zz206'),('zz207'),('zz208'),('zz209'),('zz210'),('zz211'),('zz212'),('zz213'),('zz214'),('zz215'),('zz216'),('zz217'),('zz218'),('zz219'),('zz220'),('zz221'),('zz222'),('zz223'),('zz224'),('zz225'),('zz226'),('zz227'),('zz228'),('zz229'),('zz230'),('zz231'),('zz232'),('zz233'),('zz234'),('zz235'),('zz236'),('zz237'),('zz238'),('zz239'),('zz240'),('zz241'),('zz242'),('zz243'),('zz244'),('zz245'),('zz246'),('zz247'),('zz248'),('zz249'),('zz250'),('zz251'),('zz252'),('zz253'),('zz254'),('zz255'),('zz256'),('zz257'),('zz258'),('zz259'),('zz260'),('zz261'),('zz262'),('zz263'),('zz264'),('zz265'),('zz266'),('zz267'),('zz268'),('zz269'),('zz270'),('zz271'),('zz272'),('zz273'),('zz274'),('zz275'),('zz276'),('zz277'),('zz278'),('zz279'),('zz280'),('zz281'),('zz282'),('zz283'),('zz284'),('zz285'),('zz286'),('zz287'),('zz288'),('zz289'),('zz290'),('zz291'),('zz292'),('zz293'),('zz294'),('zz295'),('zz296'),('zz297'),('zz298'),('zz299'),('zz300'),('zz301'),('zz302'),('zz303'),('zz304'),('zz305'),('zz306'),('zz307'),('zz308'),('zz309'),('zz310'),('zz311'),('zz312'),('zz313'),('zz314'),('zz315'),('zz316'),('zz317'),('zz318'),('zz319'),('zz320'),('zz321'),('zz322'),('zz323'),('zz324'),('zz325'),('zz326'),('zz327'),('zz328'),('zz329'),('zz330'),('zz331'),('zz332'),('zz333'),('zz334'),('zz335'),('zz336'),('zz337'),('zz338'),('zz339'),('zz340'),('zz341'),('zz342'),('zz343'),('zz344'),('zz345'),('zz346'),('zz347'),('zz348'),('zz349'),('zz350'),('zz351'),('zz352'),('zz353'),('zz354'),('zz355'),('zz356'),('zz357'),('zz358'),('zz359'),('zz360'),('zz361'),('zz362'),('zz363'),('zz364'),('zz365'),('zz366'),('zz367'),('zz368'),('zz369'),('zz370'),('zz371'),('zz372'),('zz373'),('zz374'),('zz375'),('zz376'),('zz377'),('zz378'),('zz379'),('zz380'),('zz381'),('zz382'),('zz383'),('zz384'),('zz385'),('zz386'),('zz387'),('zz388'),('zz389'),('zz390'),('zz391'),('zz392'),('zz393'),('zz394'),('zz395'),('zz396'),('zz397'),('zz398'),('zz399')
+
+statement ok
+CREATE INDEX lcs_ix ON lcs(x)
+
+query T
+SELECT x FROM lcs WHERE x = 'apple'
+----
+apple
+
+query T
+SELECT x FROM lcs WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+client
+
+query T
+SELECT x FROM lcs WHERE x IN ('Bob','zebra','DateStyle') ORDER BY x
+----
+Bob
+DateStyle
+
+# The rows added after the index exists are maintained incrementally
+# through the same supplied-key channel, not by a rebuild.
+statement ok
+INSERT INTO lcs VALUES ('Charlie'),('bravo')
+
+query T
+SELECT x FROM lcs WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+bravo
+Charlie
+client
+
+# An UPDATE rewrites rows and retires the index; the next statement that
+# needs it refreshes it. Without that, this answers nothing at all.
+statement ok
+UPDATE lcs SET x = 'Delta' WHERE x = 'bravo'
+
+# `Delta` is NOT in `[b, d]`: it folds to `delta`, which is past `d`.
+# This expectation read `Bob Charlie client Delta` when it was written
+# from reasoning; PG 18.4 says `Bob Charlie client` and SPG already
+# agreed. Written from the oracle now, like the rest.
+query T
+SELECT x FROM lcs WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+Charlie
+client
+
+statement ok
+DELETE FROM lcs WHERE x = 'Charlie'
+
+query T
+SELECT x FROM lcs WHERE x BETWEEN 'b' AND 'd' ORDER BY x
+----
+Bob
+client
+
+statement ok
+DROP TABLE lcs

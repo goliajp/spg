@@ -93,9 +93,11 @@ the current build; this file is a release-organized view.
   locale. The function's own documentation is about exactly this
   failure; it had been written for the MySQL case only.
 
-  Such a column declines the seek and scans now, which is that
-  documentation's stated trade. `docs/DESIGN-2026-08-23-collation.md`
-  gives the seek back by carrying the collation in the key.
+  Such a column's index now carries the collation IN its key — the ICU
+  sort key, which makes the byte-ordered B-tree order by the locale —
+  so the seek is back rather than traded for a scan. Equality, `IN` and
+  range bounds all go through one funnel, so they cannot disagree with
+  each other. `docs/DESIGN-2026-08-23-collation.md` has the design.
 
 - **A column's collation did not survive a dump.** `dump.rs` never
   emitted `COLLATE`, so a column declared `COLLATE "en_US.utf8"` came
