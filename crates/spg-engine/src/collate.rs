@@ -210,14 +210,9 @@ pub(crate) fn pads_space(collation: Option<&str>) -> bool {
 }
 
 pub(crate) fn is_byte_wise(collation: &str) -> bool {
-    let name = collation.trim();
-    let base = name.split(['.', '@']).next().unwrap_or(name);
-    base.eq_ignore_ascii_case("C")
-        || base.eq_ignore_ascii_case("POSIX")
-        || base.eq_ignore_ascii_case("binary")
-        || base
-            .rsplit_once('_')
-            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
+    // v7.38.18 (S0) — one owner, and it is storage, because storage has
+    // to ask the same question about an index's column.
+    spg_storage::collation_is_byte_wise(collation)
 }
 
 /// Whether this build can perform a collation by that name.
@@ -307,13 +302,6 @@ pub(crate) fn column_key_is_bytewise(col: &spg_storage::ColumnSchema, mysql: boo
     // function's own stated trade. `docs/DESIGN-2026-08-23-collation.md`
     // S0 gives the key back its seek by carrying the collation IN the
     // key; until that lands, correct and slower.
-    if col
-        .collation_name
-        .as_deref()
-        .is_some_and(|n| !is_byte_wise(n))
-    {
-        return false;
-    }
     !mysql || matches!(col.collation, spg_storage::Collation::Binary)
 }
 

@@ -1189,9 +1189,25 @@ impl Table {
         // falls back to the hot-tier row scan instead of trying
         // to use BRIN for an equality lookup (which would always
         // return an empty slice and look like "no rows matched").
+        // v7.38.18 (S0) — and skip a locale-collated index whose tree is
+        // not filled yet, for the reason the comment above gives about
+        // BRIN. Such a tree is keyed by ICU sort keys that only the
+        // engine can produce, so between `CREATE INDEX` and the refresh
+        // that fills it — and after any row rewrite that retires it — it
+        // is EMPTY, and an empty tree answers no rows to everything.
+        // Filtering here rather than at each of the dozen seeks is what
+        // makes that safe by construction instead of by remembering.
+        let usable = |i: &&Index| {
+            Self::index_collation_of(&self.schema, i).is_none()
+                || self.expr_index_complete.contains(&i.name)
+        };
         self.indices
             .iter()
-            .find(|i| i.column_position == column_position && matches!(i.kind, IndexKind::BTree(_)))
+            .find(|i| {
+                i.column_position == column_position
+                    && matches!(i.kind, IndexKind::BTree(_))
+                    && usable(i)
+            })
             .or_else(|| {
                 self.indices.iter().find(|i| {
                     i.column_position == column_position && matches!(i.kind, IndexKind::Nsw(_))
@@ -1291,12 +1307,21 @@ impl Table {
         // here and struck from `expr_index_complete` after the loop, which
         // holds `self.indices` mutably.
         let mut went_stale: Vec<String> = Vec::new();
+        // v7.38.18 (S0) — which slots take a supplied key, decided
+        // before the loop borrows `indices` mutably. An expression
+        // index and a locale-collated column index are the same
+        // mechanism from here on.
+        let supplied_slots: Vec<bool> = self
+            .indices
+            .iter()
+            .map(|i| i.expression.is_some() || Self::index_collation_of(&self.schema, i).is_some())
+            .collect();
         for (slot, idx) in self.indices.iter_mut().enumerate() {
             // What this index reads for this row: the expression's value
             // when it keys on one, the leading column's cell otherwise.
             // `None` means the caller could not supply it, and the index
             // drops out of service rather than take a wrong entry.
-            let supplied = if idx.expression.is_some() {
+            let supplied = if supplied_slots[slot] {
                 match expr_values.and_then(|vs| vs.get(slot)) {
                     Some(v) => v.as_ref(),
                     None => {
@@ -1637,7 +1662,16 @@ impl Table {
             }
         })?;
         let mut idx = Index::new_btree(name, column_position);
-        if let IndexKind::BTree(map) = &mut idx.kind {
+        // v7.38.18 (S0) — a locale-collated column's tree cannot be
+        // filled from the raw cells: its keys are ICU sort keys and this
+        // crate holds no collator. Create it EMPTY and leave it out of
+        // `expr_index_complete`, which is what makes every read path
+        // decline it until the engine refreshes it — the same path an
+        // expression index takes from birth.
+        let collated = Self::index_collation_of(&self.schema, &idx).is_some();
+        if let IndexKind::BTree(map) = &mut idx.kind
+            && !collated
+        {
             for (i, row) in self.rows.iter().enumerate() {
                 if let Some(key) = IndexKey::from_value(&row.values[column_position]) {
                     if let Some(entries) = map.get_mut(&key) {
@@ -1923,6 +1957,54 @@ impl Table {
         self.expr_index_complete.clear();
     }
 
+    /// v7.38.18 (S0) — the collation an index's keys are built under,
+    /// when that is not byte order.
+    ///
+    /// A B-tree here orders `IndexKey` by a derived `Ord`, which for
+    /// text is byte order. A column that collates by a LOCALE cannot key
+    /// on its raw text, then: the tree would order the entries one way
+    /// and the scan would answer another, and a range seek would return
+    /// a subset. Measured before this existed, on a column declared
+    /// `COLLATE "en_US.utf8"`: `WHERE x > 'b'` gave four rows scanning
+    /// and one row seeking.
+    ///
+    /// So such an index takes a SUPPLIED key, exactly as an expression
+    /// index does — the engine holds the collator, encodes the ICU sort
+    /// key, and this crate stores the bytes it is handed. `None` means
+    /// the index keys on its column's own value, which is the ordinary
+    /// case and stays free.
+    pub fn index_collation(&self, idx: &Index) -> Option<&str> {
+        Self::index_collation_of(&self.schema, idx)
+    }
+
+    /// The same question against a schema alone, for the callers that
+    /// already hold `self.indices` mutably.
+    pub(crate) fn index_collation_of<'a>(
+        schema: &'a crate::TableSchema,
+        idx: &Index,
+    ) -> Option<&'a str> {
+        if idx.expression.is_some() {
+            return None;
+        }
+        let col = schema.columns.get(idx.column_position)?;
+        if !matches!(
+            col.ty,
+            crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)
+        ) {
+            return None;
+        }
+        col.collation_name
+            .as_deref()
+            .filter(|n| !crate::collation_is_byte_wise(n))
+    }
+
+    /// Does this index's key come from the caller rather than from the
+    /// row's own cell? True for an expression index and for one whose
+    /// column collates by a locale; the two are the same mechanism.
+    pub fn index_needs_supplied_key(&self, idx: &Index) -> bool {
+        idx.expression.is_some() || self.index_collation(idx).is_some()
+    }
+
     /// Is this expression index's B-tree currently keyed by its
     /// expression's value, and therefore safe to look up in?
     ///
@@ -1954,7 +2036,12 @@ impl Table {
         let Some(pos) = self.indices.iter().position(|i| i.name == name) else {
             return Ok(false);
         };
-        if self.indices[pos].expression.is_none() {
+        // v7.38.18 (S0) — an expression index or a locale-collated one.
+        // Both take their keys from the caller; neither can be rebuilt
+        // from the cells this crate can see.
+        if self.indices[pos].expression.is_none()
+            && Self::index_collation_of(&self.schema, &self.indices[pos]).is_none()
+        {
             return Ok(false);
         }
         // Empty the index, then re-enter every row through the ordinary
@@ -2049,6 +2136,28 @@ impl Table {
             }
             _ => {}
         }
+    }
+
+    /// v7.38.18 (S0) — the LOCALE-COLLATED column indexes that are not
+    /// currently usable, as `(index name, column position, collation)`.
+    ///
+    /// Sibling of [`Table::stale_expression_indices`] and consumed by the
+    /// same refresh: the engine reads the column, encodes each value as
+    /// an ICU sort key, and hands the keys back to
+    /// [`Table::rebuild_expression_index`]. The two lists are separate
+    /// because an expression index names an expression to re-parse and
+    /// this one names a column and a collation, which is a different
+    /// question with the same answer shape.
+    pub fn stale_collated_indices(&self) -> Vec<(String, usize, String)> {
+        self.indices
+            .iter()
+            .filter(|i| matches!(i.kind, IndexKind::BTree(_)))
+            .filter(|i| !self.expr_index_complete.contains(&i.name))
+            .filter_map(|i| {
+                Self::index_collation_of(&self.schema, i)
+                    .map(|c| (i.name.clone(), i.column_position, c.into()))
+            })
+            .collect()
     }
 
     /// The expression indexes that are not currently usable, with the

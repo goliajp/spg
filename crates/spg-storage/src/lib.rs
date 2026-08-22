@@ -1755,6 +1755,27 @@ pub fn mysql_ci_fold(s: &str) -> String {
 /// Only literal spaces ever padded — a tab is significant either way —
 /// and neither function is used by `LIKE`, whose pattern treats a
 /// trailing space literally.
+/// Whether a collation of this NAME orders by bytes.
+///
+/// v7.38.18 (S0) — pure string classification, and it lives here because
+/// storage has to ask it: an index whose column collates by a locale
+/// cannot key on the raw text, and the write path is here. The engine's
+/// `collate::is_byte_wise` delegates to this one, for the reason the SQL
+/// type spellings have one owner.
+///
+/// `C`, `POSIX`, MySQL's `binary` and every `_bin` family member. The
+/// encoding suffix rides along: PG publishes `C.utf8` beside `C`.
+pub fn collation_is_byte_wise(collation: &str) -> bool {
+    let name = collation.trim();
+    let base = name.split(['.', '@']).next().unwrap_or(name);
+    base.eq_ignore_ascii_case("C")
+        || base.eq_ignore_ascii_case("POSIX")
+        || base.eq_ignore_ascii_case("binary")
+        || base
+            .rsplit_once('_')
+            .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("bin"))
+}
+
 pub fn mysql_compare_fold(s: &str) -> String {
     mysql_ci_fold(s)
 }
