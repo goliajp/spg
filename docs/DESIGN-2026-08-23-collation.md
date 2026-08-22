@@ -191,6 +191,33 @@ the one thing this whole design exists to prevent.
 - **A deployer who wants byte order**: `LC_COLLATE=C`, one variable, the
   same one PostgreSQL reads.
 
+## What it cost, measured
+
+The release sweep is the judge, and it took three runs to get a verdict
+worth having.
+
+| run | verdict |
+|---|---|
+| S0 alone | 64 cells, 0 losses |
+| S0+S1+S2+S3 | `biz` red — the corpus found two silent wrong answers |
+| after those | `perf-sweep` red — `400000 two keys`, 1.5× |
+| after the collator hoist | **64 cells, 0 losses, 9 steps green** |
+
+The perf loss was not ICU. `collate::compare` takes a name and built the
+collator behind it on every call, so a 400,000-row two-key sort built
+millions of them: 52.9 ms per 100,000 comparisons against 5.2 ms with
+one built in advance. Resolving it once per query took an in-process
+200,000-row sort from 1,715 ms to 216 ms.
+
+About 1.3× remains against PostgreSQL 18.4 **in-process** (216 ms
+against 163-166 ms), and the next step would be PostgreSQL's own: a
+precomputed sort key per row, with `collate::sort_key` and
+`OrderKey::Bytes` both already in place. It is not taken, because the
+cell it would target no longer loses. The in-process number and the
+sweep's number are not the same measurement, and optimising against the
+one the gate does not judge is the failure the methodology doc opens
+with.
+
 ## Why not the other two options
 
 **Change the default and rebuild on upgrade.** Every index in every
