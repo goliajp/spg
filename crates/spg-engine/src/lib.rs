@@ -727,6 +727,23 @@ pub struct CatalogSnapshot {
 /// are untouched — and swaps the whole bag when the caller announces a
 /// different session. Embedded hosts never announce one and stay on
 /// session 0 forever, exactly as before.
+/// v7.38.18 (C12) — one row of MySQL's diagnostics area.
+///
+/// The three columns `SHOW WARNINGS` returns, and the numbers are
+/// MySQL's own: `1265` for a truncated value, `1366` for an integer
+/// column given something that is not one. Measured on 9.7.2 rather
+/// than looked up, because an errno a client switches on has to be
+/// the errno it would have seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MysqlWarning {
+    /// `Warning`, `Error` or `Note` — the `Level` column.
+    pub level: &'static str,
+    /// MySQL's error code.
+    pub code: u16,
+    /// The message, worded as MySQL words it.
+    pub message: String,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SessionBag {
     pub(crate) session_params: BTreeMap<String, String>,
@@ -738,6 +755,22 @@ pub(crate) struct SessionBag {
     /// it off and a value that would otherwise raise is bent to fit
     /// instead — the same conversion `INSERT IGNORE` uses.
     pub(crate) mysql_strict: bool,
+    /// v7.38.18 (C12) — the MySQL diagnostics area: what the last
+    /// warning-generating statement bent, ready for `SHOW WARNINGS`
+    /// and `@@warning_count`.
+    ///
+    /// The value-bending half has been byte-for-byte MySQL's since
+    /// v7.39 round 470 — `INSERT INTO t (i, s) VALUES ('abc', 'toolong')`
+    /// stores `0` and `'too'` exactly as MySQL 9.7.2 does. What was
+    /// missing is that MySQL TELLS you: `Warning 1265 Data truncated
+    /// for column 's' at row 1`. An application that checks
+    /// `@@warning_count` after an insert had no way to learn that its
+    /// data had been changed.
+    ///
+    /// Cleared by the next statement that can produce warnings, which
+    /// is MySQL's rule; `SHOW WARNINGS` and `SELECT @@warning_count`
+    /// read it without clearing.
+    pub(crate) mysql_warnings: Vec<MysqlWarning>,
     pub(crate) prepared_statements: BTreeMap<String, PreparedSqlStatement>,
     /// v7.39 (round 499) — the value `nextval` last returned IN THIS
     /// SESSION, per sequence, and which sequence that was.
@@ -1064,6 +1097,12 @@ pub struct Engine {
     backslash_escapes: bool,
     /// v7.39 (round 470) — see [`SessionBag::mysql_strict`].
     mysql_strict: bool,
+    /// v7.38.18 (C12) — see [`SessionBag::mysql_warnings`]. Lives on
+    /// the Engine like every other live-session field and swaps with
+    /// the bag, because the server runs ONE Engine for every
+    /// connection and per-connection state that does not swap leaks
+    /// across them.
+    mysql_warnings: Vec<MysqlWarning>,
     /// v7.39 (round 306) — the live session's open large-object
     /// descriptors, swapped in and out with the rest of its bag.
     pub(crate) lo_descriptors: BTreeMap<i32, LargeObjectDescriptor>,
@@ -1535,6 +1574,7 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
+            mysql_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2059,6 +2099,7 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
+            mysql_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
             lo_next_fd: 0,
             prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2198,6 +2239,7 @@ impl Engine {
                     current_tx: None,
                     backslash_escapes: false,
                     mysql_strict: true,
+                    mysql_warnings: Vec::new(),
                     lo_descriptors: BTreeMap::new(),
                     lo_next_fd: 0,
                     prepared_statements: alloc::collections::BTreeMap::new(),
@@ -2323,6 +2365,7 @@ impl Engine {
             session_params: core::mem::take(&mut self.session_params),
             backslash_escapes: self.backslash_escapes,
             mysql_strict: self.mysql_strict,
+            mysql_warnings: core::mem::take(&mut self.mysql_warnings),
             prepared_statements: core::mem::take(&mut self.prepared_statements),
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
             lo_next_fd: self.lo_next_fd,
@@ -2344,6 +2387,7 @@ impl Engine {
         self.session_params = incoming.session_params;
         self.backslash_escapes = incoming.backslash_escapes;
         self.mysql_strict = incoming.mysql_strict;
+        self.mysql_warnings = incoming.mysql_warnings;
         self.prepared_statements = incoming.prepared_statements;
         self.lo_descriptors = incoming.lo_descriptors;
         self.lo_next_fd = incoming.lo_next_fd;
@@ -3108,6 +3152,22 @@ pub struct MemoryStats {
 /// analysed.
 const fn is_internal_table_name(_name: &str) -> bool {
     false
+}
+
+impl Engine {
+    /// v7.38.18 (C12) — how many warnings the last warning-generating
+    /// statement produced: `@@warning_count`, and what a wire shim
+    /// reports in its OK packet.
+    #[must_use]
+    pub fn mysql_warning_count(&self) -> usize {
+        self.mysql_warnings.len()
+    }
+
+    /// The diagnostics area itself, for `SHOW WARNINGS`.
+    #[must_use]
+    pub fn mysql_warnings(&self) -> &[MysqlWarning] {
+        &self.mysql_warnings
+    }
 }
 
 #[cfg(test)]

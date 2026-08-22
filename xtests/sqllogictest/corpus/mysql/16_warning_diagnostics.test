@@ -1,0 +1,95 @@
+# v7.38.18 (C12) — MySQL's diagnostics area.
+#
+# Non-strict `sql_mode` bends a value that would not fit, and SPG has
+# bent it byte-for-byte correctly since v7.39 round 470: `INSERT INTO w
+# (i, s) VALUES ('abc', 'toolong')` stores `0` and `'too'`, exactly as
+# MySQL 9.7.2 does.
+#
+# What was missing is that MySQL TELLS you. An application that checks
+# `@@warning_count` after an insert had no way to learn that its data
+# had been changed on the way in — the change was correct AND silent,
+# which is the worse half of that pair.
+#
+# Every code and wording below is from a 9.7.2 run at `sql_mode=''`:
+#
+#   INSERT INTO w VALUES (1,'toolong')    1265 Data truncated for column 's' at row 1
+#   INSERT INTO w VALUES ('abc','ok')     1366 Incorrect integer value: 'abc' for column 'i' at row 1
+#   INSERT INTO w VALUES (99999999999,..) 1264 Out of range value for column 'i' at row 1
+#
+# Reading the area does not clear it; the next warning-generating
+# statement does.
+
+dialect mysql
+
+statement ok
+SET sql_mode = ''
+
+statement ok
+CREATE TABLE wd (i INT, s VARCHAR(3))
+
+statement ok
+INSERT INTO wd VALUES (1,'toolong')
+
+query I
+SELECT @@warning_count
+----
+1
+
+# Asking twice does not clear it.
+query I
+SELECT @@warning_count
+----
+1
+
+query TIT
+SHOW WARNINGS
+----
+Warning
+1265
+Data truncated for column 's' at row 1
+
+statement ok
+INSERT INTO wd VALUES ('abc','ok')
+
+query TIT
+SHOW WARNINGS
+----
+Warning
+1366
+Incorrect integer value: 'abc' for column 'i' at row 1
+
+statement ok
+INSERT INTO wd VALUES (99999999999,'ok')
+
+query TIT
+SHOW WARNINGS
+----
+Warning
+1264
+Out of range value for column 'i' at row 1
+
+# A statement that bends nothing clears the area.
+statement ok
+INSERT INTO wd VALUES (5,'ok')
+
+query I
+SELECT @@warning_count
+----
+0
+
+# And the values really were bent — the diagnostics describe something
+# that happened.
+query IT
+SELECT i, s FROM wd ORDER BY i, s
+----
+0
+ok
+1
+too
+5
+ok
+2147483647
+ok
+
+statement ok
+DROP TABLE wd

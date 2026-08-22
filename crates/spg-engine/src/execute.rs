@@ -741,6 +741,57 @@ impl Engine {
                 rows,
             });
         }
+        // v7.38.18 (C12) — `SHOW WARNINGS`, MySQL's diagnostics area.
+        //
+        // Non-strict `sql_mode` bends a value that would not fit — the
+        // bending has been byte-for-byte MySQL's since v7.39 round 470
+        // — and MySQL TELLS you it did. Until now SPG bent the value
+        // silently, so an application that checks after an insert had
+        // no way to learn its data had been changed.
+        //
+        // Three columns, named and ordered as MySQL returns them.
+        // Reading does not clear: only the next warning-generating
+        // statement does.
+        // MySQL-only. PostgreSQL 18.4 answers `ERROR: unrecognized
+        // configuration parameter "warnings"`, and a PG session must
+        // keep getting that: a compatibility surface that leaks into
+        // the other dialect is a divergence of its own, and I put one
+        // there for a few minutes before checking.
+        if self.backslash_escapes && name.eq_ignore_ascii_case("warnings") {
+            let cols = alloc::vec![
+                ColumnSchema::new(
+                    alloc::string::String::from("Level"),
+                    spg_storage::DataType::Text,
+                    false
+                ),
+                ColumnSchema::new(
+                    alloc::string::String::from("Code"),
+                    spg_storage::DataType::Int,
+                    false
+                ),
+                ColumnSchema::new(
+                    alloc::string::String::from("Message"),
+                    spg_storage::DataType::Text,
+                    false
+                ),
+            ];
+            let rows: Vec<Row> = self
+                .mysql_warnings
+                .iter()
+                .map(|w| {
+                    Row::new(alloc::vec![
+                        Value::text(w.level),
+                        Value::Int(i32::from(w.code)),
+                        Value::text(w.message.clone()),
+                    ])
+                })
+                .collect();
+            return Ok(QueryResult::Rows {
+                columns: cols,
+                rows,
+            });
+        }
+
         let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
             "transaction_isolation" => {
                 alloc::string::String::from(self.current_isolation_level.as_pg_str())

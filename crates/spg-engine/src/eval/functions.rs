@@ -15552,6 +15552,18 @@ fn apply_function_dispatch(
             {
                 return Ok(Value::text(v.clone()));
             }
+            // v7.38.18 (C12) — `@@warning_count` is LIVE, not a constant
+            // like the rest of this table, so it returns before it. Both
+            // copies of this table get it: one would have been the same
+            // defect at the other spelling.
+            //
+            // MySQL clears the diagnostics area at the start of the next
+            // warning-generating statement; reading it here does not, so
+            // a client may ask twice.
+            if lname == "warning_count" {
+                let n = ctx.engine.map_or(0, crate::Engine::mysql_warning_count);
+                return Ok(Value::BigInt(n as i64));
+            }
             let val = match lname.as_str() {
                 // MySQL-side variables a connector asks for. `autocommit`
                 // is 1 until the session says otherwise; the wire keeps
@@ -15651,6 +15663,18 @@ fn apply_function_dispatch(
                 && let Some(v) = gucs.get(lname.as_str())
             {
                 return Ok(Value::text(v.clone()));
+            }
+            // v7.38.18 (C12) — `@@warning_count` is LIVE, not a constant
+            // like the rest of this table, so it returns before it. Both
+            // copies of this table get it: one would have been the same
+            // defect at the other spelling.
+            //
+            // MySQL clears the diagnostics area at the start of the next
+            // warning-generating statement; reading it here does not, so
+            // a client may ask twice.
+            if lname == "warning_count" {
+                let n = ctx.engine.map_or(0, crate::Engine::mysql_warning_count);
+                return Ok(Value::BigInt(n as i64));
             }
             let val = match lname.as_str() {
                 "server_version" => "18.4 (SPG-compat)",
