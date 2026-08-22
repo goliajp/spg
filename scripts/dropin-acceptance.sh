@@ -396,7 +396,15 @@ echo "=== MySQL dialect panel ==="
 # spent on, asked over the wire a MySQL client actually speaks;
 # every expectation is MySQL 9.7.2's own answer at its default
 # collation, read from the oracle.
-MYSQL_CLI="docker run --rm -i --network host spg-oracle-mysql:v7.38 mysql -h 127.0.0.1 -P $MYPORT -u spg -N"
+# v7.38.18 — the OFFICIAL client image, pulled like `postgres:16-alpine`
+# beside it. The first version of this panel used
+# `spg-oracle-mysql:v7.38`, which the oracle compose builds LOCALLY: it
+# worked on two of my machines and failed in CI, where that image does
+# not exist. A check that silently depends on something only present
+# where its author sits is the very defect this release spent itself
+# on, committed by the person fixing it.
+MYSQL_CLIENT_IMAGE="mysql:8.4"
+MYSQL_CLI="docker run --rm -i --network host $MYSQL_CLIENT_IMAGE mysql -h 127.0.0.1 -P $MYPORT -u spg -N"
 
 my_case() {
   local name="$1" sql="$2" want="$3" got
@@ -412,7 +420,16 @@ my_case() {
   fi
 }
 
-if $MYSQL_CLI -e "SELECT 1" >/dev/null 2>&1; then
+# Two different failures deserve two different messages: a client we
+# could not obtain is a HARNESS problem, and a wire that did not
+# answer is a PRODUCT problem. Reporting both as "wire did not
+# answer" is how a red turns into a shrug.
+if ! docker image inspect "$MYSQL_CLIENT_IMAGE" >/dev/null 2>&1 \
+   && ! docker pull -q "$MYSQL_CLIENT_IMAGE" >/dev/null 2>&1; then
+  echo "[mysql] FAIL harness could not obtain $MYSQL_CLIENT_IMAGE"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("mysql.client-image|FAIL|could not pull $MYSQL_CLIENT_IMAGE")
+elif $MYSQL_CLI -e "SELECT 1" >/dev/null 2>&1; then
   my_case "wire answers" "SELECT 1" "1"
 
   $MYSQL_CLI -e "CREATE TABLE dp (k INT, s TEXT)" >/dev/null 2>&1

@@ -82,7 +82,13 @@ pub(crate) enum Step {
     /// Comparison whose operands referenced a CaseInsensitive
     /// column: ASCII-fold Text operands first (decided at compile
     /// time; the interpreter re-decides per row).
-    BinaryCi(BinOp),
+    /// v7.38.18 — the comparison's collation decides TWO things and the
+    /// step carries both: whether to fold (that is why this variant
+    /// exists) and whether trailing spaces count. `utf8mb4_bin` is
+    /// byte-wise AND `PAD SPACE`; `utf8mb4_0900_ai_ci` folds and does
+    /// NOT pad. One flag cannot say that, so `pads` is resolved once at
+    /// compile time from the collation NAME, next to the fold decision.
+    BinaryCi(BinOp, crate::collate::TextCompare),
     Unary(UnOp),
     IsNull {
         negated: bool,
@@ -807,8 +813,14 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // comparison, so it needs the CI step too (the step chooses
             // the accent-aware fold at run time).
             let ci = ci || (cmp && super::resolve::mysql_text_fold_applies(lhs, rhs, ctx));
-            steps.push(if ci {
-                Step::BinaryCi(*op)
+            // v7.38.18 — the same resolver the interpreted path uses.
+            // A byte-wise collation that PADS still needs the step: it
+            // does not fold case, but trailing spaces do not count.
+            let tc = super::resolve::text_compare_of(lhs, rhs, ctx);
+            steps.push(if cmp && !tc.is_plain_bytes() {
+                Step::BinaryCi(*op, tc)
+            } else if ci {
+                Step::BinaryCi(*op, tc)
             } else {
                 Step::Binary(*op)
             });
@@ -2208,28 +2220,32 @@ where
                 let r = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
             }
-            Step::BinaryCi(op) => {
-                // v7.39 (round 364, M4 P2) — the MySQL session uses the
-                // accent-aware fold; a PG `case_insensitive` column keeps
-                // its ASCII-only contract.
-                let fold = |v: Value<'static>| match v {
-                    // v7.38.16 — BpChar as well. `CASE` a few hundred
-                    // lines below already had the pair; this arm, which
-                    // is where `s >= 'DELTA'` and BETWEEN land, did not,
-                    // so a CHAR column compared by bytes AND kept its
-                    // padding.
-                    // v7.38.17 — CHAR pads, TEXT does not.
-                    Value::BpChar(s) if ctx.mysql_dialect => {
-                        Value::text(spg_storage::mysql_compare_fold_char(&s))
-                    }
-                    Value::Text(s) if ctx.mysql_dialect => {
-                        Value::text(spg_storage::mysql_compare_fold(&s))
-                    }
-                    Value::Text(s) | Value::BpChar(s) => Value::text(s.to_ascii_lowercase()),
-                    other => other,
+            Step::BinaryCi(op, tc) => {
+                // v7.38.18 — fold and pad are two bits, resolved once at
+                // compile time by `text_compare_of` and carried here.
+                let fold_one = |v: Value<'static>| -> Value<'static> {
+                    let (text, pad) = match v {
+                        Value::BpChar(s) => (s.into_owned(), true),
+                        Value::Text(s) => (s.into_owned(), tc.pads),
+                        other => return other,
+                    };
+                    let base = if pad {
+                        text.trim_end_matches(' ')
+                    } else {
+                        text.as_str()
+                    };
+                    Value::text(if tc.fold_case {
+                        if ctx.mysql_dialect {
+                            spg_storage::mysql_ci_fold(base)
+                        } else {
+                            base.to_ascii_lowercase()
+                        }
+                    } else {
+                        alloc::string::ToString::to_string(base)
+                    })
                 };
-                let r = fold(stack.pop().unwrap_or(Value::Null).into_owned());
-                let l = fold(stack.pop().unwrap_or(Value::Null).into_owned());
+                let r = fold_one(stack.pop().unwrap_or(Value::Null).into_owned());
+                let l = fold_one(stack.pop().unwrap_or(Value::Null).into_owned());
                 stack.push(apply_binary(*op, l, r)?);
             }
             Step::Unary(op) => {
