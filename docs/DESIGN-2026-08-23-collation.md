@@ -209,14 +209,33 @@ millions of them: 52.9 ms per 100,000 comparisons against 5.2 ms with
 one built in advance. Resolving it once per query took an in-process
 200,000-row sort from 1,715 ms to 216 ms.
 
-About 1.3× remains against PostgreSQL 18.4 **in-process** (216 ms
-against 163-166 ms), and the next step would be PostgreSQL's own: a
+About 1.3× remains against PostgreSQL 18.4 **in-process** (228 ms
+against 163-166 ms). The obvious next step is PostgreSQL's own — a
 precomputed sort key per row, with `collate::sort_key` and
-`OrderKey::Bytes` both already in place. It is not taken, because the
-cell it would target no longer loses. The in-process number and the
-sweep's number are not the same measurement, and optimising against the
-one the gate does not judge is the failure the methodology doc opens
-with.
+`OrderKey::Bytes` both already in place — and pricing it before building
+it says it does not reach:
+
+| over 200,000 values | |
+|---|---|
+| building sort keys | 138 ms |
+| 200,000 byte comparisons | 0.28 ms |
+| 200,000 ICU comparisons | 9.9 ms |
+
+A 200,000-row sort makes about 3.5 million comparisons, so ICU costs
+~175 ms of it and sort keys would cost 138 ms to build plus ~5 ms to
+compare: **143 ms**, an 18% saving on the collated part, landing near
+196 ms against PostgreSQL's 163-166. Still behind, in exchange for
+changing the external sort's serialisation, the top-N trim and the
+dedup paths.
+
+PostgreSQL's advantage is not the full sort key. It is the **abbreviated
+key**: the leading eight bytes packed into an integer, compared as an
+integer, with the full comparison only on a tie. That needs a TRUNCATED
+build, and `icu_collator::write_sort_key_to` writes the whole key.
+
+So this is recorded rather than attempted. The sweep cell it would
+target does not lose, and the measurement says the cheap version would
+not close the gap even if it did.
 
 ## Why not the other two options
 
