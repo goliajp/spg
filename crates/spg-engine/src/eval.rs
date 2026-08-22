@@ -937,7 +937,7 @@ fn is_numeric_type(t: spg_storage::DataType) -> bool {
 /// session's default-collation comparison: text folds (accent- and
 /// case-insensitive), everything else is itself. Used by IN and LIKE,
 /// whose comparisons do not pass through `collation_fold_for_compare`.
-fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
+fn mysql_collation_key(v: Value<'static>, mysql: bool, pads: bool) -> Value<'static> {
     match v {
         // v7.38.16 — BpChar too. `mysql_compare_fold` trims trailing
         // spaces before folding, which is the PAD SPACE half of the same
@@ -947,7 +947,13 @@ fn mysql_collation_key(v: Value<'static>, mysql: bool) -> Value<'static> {
         // and these two sites did not.
         // v7.38.17 — CHAR's padding is not data, TEXT's trailing
         // spaces are. Two calls because they are two questions.
+        // v7.38.18 — and the collation's padding rule. A CHAR's padding
+        // is the type's and never counts; a TEXT's is the collation's.
+        // `t IN ('ALPHA')` on a `utf8mb4_uca1400_ai_ci` column — what a
+        // MariaDB dump declares — missed the row holding `'alpha  '`,
+        // which MariaDB 12.3.2 matches.
         Value::BpChar(s) if mysql => Value::text(spg_storage::mysql_compare_fold_char(&s)),
+        Value::Text(s) if mysql && pads => Value::text(spg_storage::mysql_compare_fold_char(&s)),
         Value::Text(s) if mysql => Value::text(spg_storage::mysql_compare_fold(&s)),
         other => other,
     }
@@ -4316,13 +4322,16 @@ fn eval_in_list_arm(
         && !resolve::operand_is_binary_column(expr, ctx)
         && !resolve::is_binary_coerced(expr)
         && !list.iter().any(|i| resolve::is_binary_coerced(i));
-    let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, in_fold);
+    // v7.38.18 — the membership test has ONE collation, the needle's,
+    // and its NAME decides whether trailing spaces count.
+    let in_pads = crate::collate::pads_space(resolve::column_collation_name(expr, ctx).as_deref());
+    let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, in_fold, in_pads);
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null && !list.is_empty();
     let mut matched = false;
     if !needle_null {
         for item in list {
-            let v = mysql_collation_key(eval_expr(item, row, ctx)?, in_fold);
+            let v = mysql_collation_key(eval_expr(item, row, ctx)?, in_fold, in_pads);
             if matches!(v, Value::Null) {
                 saw_null = true;
                 continue;

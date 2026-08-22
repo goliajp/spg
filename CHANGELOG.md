@@ -38,7 +38,26 @@ the current build; this file is a release-organized view.
   the *unrecognized configuration parameter* error PG 18.4 gives, which
   it briefly did not while this was being built.
 
+### Added
+
+- **A MariaDB acceptance panel, with its own expectations.** The
+  drop-in harness covers all three engines we claim to drop in for now.
+  MariaDB is not a second name for the MySQL cases: the two disagree
+  about trailing spaces, because MySQL 8.0's default collation is
+  `NO PAD` and MariaDB's `utf8mb4_uca1400_ai_ci` is `PAD SPACE`. So
+  `'alpha'` and `'alpha  '` are two values to one engine and one value
+  to the other, and the panel asserts each engine's own answer.
+
+  A MariaDB dump *declares* its collation, which is what makes this
+  testable over the same wire: SPG reads the name.
+
 ### Fixed
+
+- **`IN` ignored the collation's padding rule.** `t IN ('ALPHA')` on a
+  `utf8mb4_uca1400_ai_ci` column — what a MariaDB dump declares — missed
+  a row holding `'alpha  '`, which MariaDB 12.3.2 matches. The
+  membership test has one collation, the needle's, and its name decides
+  whether trailing spaces count. Found by building the panel above.
 
 - **`ANALYZE` could not see a table created earlier in the same query
   string.** Sent as one simple-query string,
