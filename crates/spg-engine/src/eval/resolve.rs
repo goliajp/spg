@@ -223,7 +223,29 @@ pub(super) fn collation_fold_for_compare(
     // v7.38.18 — one resolver for both bits; the compiled path uses the
     // same one, so the two cannot drift.
     let tc = text_compare_of(lhs, rhs, ctx);
-    if tc.is_plain_bytes() {
+    // v7.38.19 — folding is for CASE and PADDING. An ordering collation
+    // needs neither, and asking `is_plain_bytes()` -- which also answers
+    // false when an ORDER is declared -- sent every comparison under a
+    // locale database collation down the folding path below, where each
+    // side is copied into a fresh String that the fold then leaves
+    // exactly as it found it.
+    //
+    // Two allocations and two copies per row, to change nothing. On a
+    // 200,000-row table:
+    //
+    //   database collation C             kind = 'click'    3.5 ms
+    //   database collation en_US.UTF-8   kind = 'click'   58.5 ms
+    //   PostgreSQL 18.4, en_US.utf8                        2.0 ms
+    //
+    // Seventeen times slower than SPG's own byte path and thirty times
+    // slower than the engine we stand in for, on the most ordinary
+    // predicate there is. It shipped in v7.38.18 with the database
+    // collation, and the perf gate could not see it: all sixty-four
+    // cells of the sweep run under `C`.
+    //
+    // The ordering that `order` describes is applied by
+    // `collate::compare` at the comparison itself, not by this fold.
+    if !tc.fold_case && !tc.pads {
         return (l, r);
     }
     let fold_one = |v: Value<'static>| -> Value<'static> {

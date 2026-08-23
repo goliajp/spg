@@ -88,7 +88,23 @@ pub(crate) enum Step {
     /// byte-wise AND `PAD SPACE`; `utf8mb4_0900_ai_ci` folds and does
     /// NOT pad. One flag cannot say that, so `pads` is resolved once at
     /// compile time from the collation NAME, next to the fold decision.
-    BinaryCi(BinOp, crate::collate::TextCompare),
+    /// v7.38.19 — the third field is the collator, RESOLVED ONCE at
+    /// compile time.
+    ///
+    /// The run-time arm called `collate::compare(name, a, b)`, and that
+    /// function parses the locale string and builds a whole ICU
+    /// `Collator` on **every call** — so once per row. It is the same
+    /// defect v7.38.18 fixed for sorting, where `Collated` was
+    /// introduced for exactly this reason and the scan-filter path was
+    /// never connected to it.
+    ///
+    /// Measured, 200,000 rows, `WHERE kind < 'd'`, interleaved on one
+    /// box: SPG 62.5 ms against PostgreSQL 18.4's 3.25 ms.
+    BinaryCi(
+        BinOp,
+        crate::collate::TextCompare,
+        Option<alloc::sync::Arc<crate::collate::Collated>>,
+    ),
     Unary(UnOp),
     IsNull {
         negated: bool,
@@ -817,10 +833,56 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // A byte-wise collation that PADS still needs the step: it
             // does not fold case, but trailing spaces do not count.
             let tc = super::resolve::text_compare_of(lhs, rhs, ctx);
-            steps.push(if cmp && !tc.is_plain_bytes() {
-                Step::BinaryCi(*op, tc)
+            // v7.38.19 — `BinaryCi` exists to FOLD: case, and padding.
+            // An ordering collation needs neither, and asking
+            // `is_plain_bytes()` -- which also answers false when an
+            // ORDER is declared -- emitted it for every text comparison
+            // in a database with a locale collation. Its `fold_one` then
+            // copied each side into a fresh String per row and left it
+            // exactly as it found it.
+            //
+            // Two allocations and two copies per row, to change nothing.
+            // Interleaved A/B on one box, 200,000 rows,
+            // `WHERE kind = 'click'`:
+            //
+            //   database collation C              2.177-3.086 ms
+            //   database collation en_US.UTF-8   58.292-76.242 ms
+            //   PostgreSQL 18.4, en_US.utf8       1.487-4.391 ms
+            //
+            // Twenty-six times SPG's own byte path, and thirty times the
+            // engine we stand in for, on the most ordinary predicate
+            // there is. It shipped in v7.38.18 with the database
+            // collation, and the perf gate could not see it: all
+            // sixty-four cells of the sweep run under `C`.
+            //
+            // ORDERING still needs the step: `BinaryCi` does double duty,
+            // folding AND routing to the collator, so `<` under a locale
+            // collation must keep it or it falls back to byte order. The
+            // first version of this change did exactly that, and the
+            // pins written for the database collation caught it in the
+            // same minute: `WHERE x < 'b'` returned `client` where it
+            // owes `Bob Charlie client Zebra`.
+            //
+            // EQUALITY is the case that can skip it, and it can skip it
+            // for a reason rather than for speed: PostgreSQL's locale
+            // collations are DETERMINISTIC, which means two strings that
+            // compare equal are byte-identical. The collator cannot
+            // change the answer, so asking it is pure cost. A
+            // non-deterministic collation is SPG's MySQL
+            // case-insensitive one, and that sets `fold_case`, so it
+            // takes the branch above.
+            let orders = tc.order.is_some();
+            let ordering_op = matches!(op, BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq);
+            let needs_fold = tc.fold_case || tc.pads || (orders && ordering_op);
+            let collated = tc
+                .order
+                .as_deref()
+                .and_then(crate::collate::Collated::resolve)
+                .map(alloc::sync::Arc::new);
+            steps.push(if cmp && needs_fold {
+                Step::BinaryCi(*op, tc, collated)
             } else if ci {
-                Step::BinaryCi(*op, tc)
+                Step::BinaryCi(*op, tc, collated)
             } else {
                 Step::Binary(*op)
             });
@@ -2220,7 +2282,7 @@ where
                 let r = stack.pop().unwrap_or(Value::Null).into_owned();
                 stack.push(apply_binary(*op, l, r)?);
             }
-            Step::BinaryCi(op, tc) => {
+            Step::BinaryCi(op, tc, collated) => {
                 // v7.38.18 — fold and pad are two bits, resolved once at
                 // compile time by `text_compare_of` and carried here.
                 let fold_one = |v: Value<'static>| -> Value<'static> {
@@ -2253,7 +2315,10 @@ where
                 // `x < 'b'` by bytes while `ORDER BY x` over the same
                 // column answered by the locale.
                 if let (Value::Text(a), Value::Text(b)) = (&l, &r)
-                    && let Some(ord) = tc.compare(a.as_ref(), b.as_ref())
+                    && let Some(ord) = collated
+                        .as_ref()
+                        .map(|c| c.compare(a.as_ref(), b.as_ref()))
+                        .or_else(|| tc.compare(a.as_ref(), b.as_ref()))
                 {
                     let verdict = match op {
                         BinOp::Lt => ord == core::cmp::Ordering::Less,
