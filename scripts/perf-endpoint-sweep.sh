@@ -186,6 +186,46 @@ verify_typed_predicates() { # $1=uri $2=table
 SPG_WM='SET work_mem = 4096'
 PG_WM="SET work_mem='4MB'"
 
+# v7.38.19 — a THIRD fixture, for the sort panel, and it is separate for
+# the same reason the typed one is: widening `sweep_N` would move every
+# existing cell's timing, and the panel's value is that a number means
+# what it meant last time.
+#
+# What it is for: `pad` is `repeat(chr(97+(g%26)), 200)` — twenty-six
+# distinct values, each two hundred identical characters. A sort over it
+# is decided by the first byte, and any key that looks at a prefix would
+# look spectacular on it while proving nothing about a real workload.
+# It is also two hundred bytes, so it exercises only the heap arm of the
+# sort key and never the inline one.
+#
+# So this table carries text that is DISTINCT per row, in both regimes:
+#
+#   s_short   nine bytes  — fits a sort key inline
+#   s_long    ~192 bytes  — does not, and no two rows share a prefix
+#
+# A sort attack judged on `pad` alone is a sort attack judged on a
+# degenerate case.
+setup_sort_table() { # $1=uri $2=table $3=rows
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "DROP TABLE IF EXISTS $2" \
+    -c "CREATE TABLE $2 (id INT PRIMARY KEY, s_short TEXT, s_long TEXT)" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "INSERT INTO $2 SELECT g,
+          'k' || lpad(((g::bigint*7919)%$3)::text, 8, '0'),
+          md5(g::text) || md5((g*3)::text) || md5((g*7)::text) ||
+          md5((g*11)::text) || md5((g*13)::text) || md5((g*17)::text)
+        FROM generate_series(1,$3) g" >/dev/null 2>&1
+  local got
+  got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
+  [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
+  # Rule 2 again, one level down: a fixture built to be VARIED that turns
+  # out not to be is worse than the one it replaced, because the panel
+  # would then claim to cover a case it does not.
+  local distinct
+  distinct="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(DISTINCT s_long) FROM $2")"
+  [[ "${distinct}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${distinct} distinct s_long, wanted $3 — the fixture is not varied" >&2; exit 2; }
+}
+
 # v7.38.19 — the SORT panel, verdicted separately from the shapes above.
 #
 # Every ORDER BY shape in `SHAPES` returns its rows, and at 400,000 rows
@@ -213,10 +253,16 @@ PG_WM="SET work_mem='4MB'"
 # run for months without anyone acting.
 SORT_CEILING="${SORT_CEILING:-3.0}"
 SORT_SHAPES=(
-  'sort only, text|SELECT count(*) FROM (SELECT pad FROM @T@ ORDER BY pad) z'
   'sort only, int|SELECT count(*) FROM (SELECT k FROM @T@ ORDER BY k) z'
   'sort only, two keys|SELECT count(*) FROM (SELECT k FROM @T@ ORDER BY k, id) z'
-  'sort only, distinct text|SELECT count(*) FROM (SELECT DISTINCT pad FROM @T@ ORDER BY pad) z'
+  # `pad`: twenty-six values of two hundred identical characters. Kept
+  # because it is what the existing ORDER BY cells project, so its cost
+  # is part of theirs -- but it is the degenerate case and is labelled.
+  'sort only, text (26 values)|SELECT count(*) FROM (SELECT pad FROM @T@ ORDER BY pad) z'
+  # The varied fixture, both key regimes.
+  'sort only, short text distinct|SELECT count(*) FROM (SELECT s_short FROM @S@ ORDER BY s_short) z'
+  'sort only, long text distinct|SELECT count(*) FROM (SELECT s_long FROM @S@ ORDER BY s_long) z'
+  'sort only, long text top-N|SELECT count(*) FROM (SELECT s_long FROM @S@ ORDER BY s_long LIMIT 10) z'
 )
 
 SHAPES=(
@@ -338,8 +384,12 @@ echo "sort panel — the sort alone, ratio against PG18, ceiling ${SORT_CEILING}
 SORT_WORST=0
 SORT_OVER=0
 BIG="sweep_$(set -- ${SIZES}; for x in "$@"; do :; done; echo "$x")"
+BIGN="$(set -- ${SIZES}; for x in "$@"; do :; done; echo "$x")"
+SORTT="sortfix_${BIGN}"
+setup_sort_table "${SPG_URI}" "${SORTT}" "${BIGN}"
+setup_sort_table "${PG_URI}"  "${SORTT}" "${BIGN}"
 for entry in "${SORT_SHAPES[@]}"; do
-  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${BIG}}"
+  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${BIG}}"; sql="${sql//@S@/${SORTT}}"
   s=(); g=()
   for ((i = 0; i < N; i++)); do
     if (( i % 2 == 0 )); then

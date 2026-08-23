@@ -118,16 +118,40 @@ bytes, far past the fifteen that fit inline, so every one of the 400,000
 keys is a heap allocation. The 28 % this version won was on short keys,
 measured on a different table, and both statements are true at once.
 
-**What is owed next**, stated so the next attack does not restart from a
-guess: a sort key for a long string that does not copy the string.
-PostgreSQL's answer is the abbreviated key — a few leading bytes that
-settle most comparisons, with the full value consulted only on a tie.
-SPG's `Collated` already builds ICU sort keys for the collated case; the
-byte-wise case has no equivalent. Note before attacking: this fixture's
-`pad` has only twenty-six distinct values, each two hundred identical
-characters, so an abbreviated key would look spectacular here and prove
-nothing about a real workload. Any attack needs a fixture with varied
-text first.
+### The varied fixture, and how it reversed the finding
+
+The warning above was that `pad` — twenty-six values of two hundred
+identical characters — is degenerate, and that any attack needed varied
+text first. A third fixture now carries text that is DISTINCT per row in
+both key regimes: `s_short` at nine bytes, which fits a sort key inline,
+and `s_long` at ~192 bytes of concatenated md5, which does not and shares
+no prefix with its neighbours. 400,000 rows, ratio against PG 18.4:
+
+| cell | SPG | PG 18.4 | |
+|---|---|---|---|
+| sort only, int | 54.8 ms | 60.4 | 0.91x — SPG ahead |
+| sort only, two keys | 132.2 ms | 69.9 | 1.89x behind |
+| sort only, text (26 values) | 185.4 ms | 82.4 | **2.25x behind** |
+| sort only, short text distinct | 218.5 ms | **528.7** | **0.41x — SPG 2.4x ahead** |
+| sort only, long text distinct | 346.5 ms | 221.8 | 1.56x behind |
+| sort only, long text top-N | 16.9 ms | 11.7 | 1.45x behind |
+
+**On distinct short text SPG is more than twice as fast as PostgreSQL**,
+and its WORST cell is the degenerate one. So the attack this document
+named — "a sort key for a long string that does not copy the string" —
+is aimed at the wrong thing.
+
+The gap is not long keys. It is **many EQUAL keys**: the cell where
+400,000 rows carry twenty-six distinct values is 2.25x, while the same
+length with every value distinct is 1.56x and nine bytes distinct is a
+win. What is slow is what SPG does when the comparison does not
+separate — the tie path — and `two keys` at 1.89x points the same way,
+since its first key ties constantly.
+
+That is the next decomposition, and it exists as a statement only because
+the fixture was changed first. The previous version of this section would
+have sent an attack at an abbreviated key, measured it on `pad`, and
+reported a large win that meant nothing.
 
 Second coverage gap, recorded here because it is the same disease as the
 first: **the sweep never sorts a TEXT column.** Its shapes order by `k
