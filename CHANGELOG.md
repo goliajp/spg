@@ -227,6 +227,35 @@ Four gates gained the ability to see something they had claimed to check.
   index-entry builder and the index probe each constructed a whole ICU
   collator per call.
 
+### Still open, named with what closing them would cost
+
+`docs/RECORDED_DELTAS.md` now carries a **condition** for every open row
+rather than a verdict, because a register that says "open" without saying
+what open costs makes every reader repeat the same investigation. The
+three were re-measured against PostgreSQL 18.4 on the day this shipped
+and all three still reproduce, which is the property the register exists
+to have — one of its rows was stated backwards when it was created.
+
+- **`pg_typeof(x::cstring)` reads `text`.** `cstring` is a pseudo-type;
+  PostgreSQL refuses `CREATE TABLE t(c cstring)` itself, and the value
+  round-trips as text on both engines. Closing it means a `DataType`
+  variant that exists to be reported and never to hold a value — and
+  v7.37.26 measured what a new variant on a hot enum costs: `IndexKey`
+  went 32 bytes to 48 and two queries with no numeric column paid 7–8 %.
+  Condition: close it when the variant can be added without widening the
+  enum.
+
+- **`'infinity'::interval` is refused.** Not the subtraction edge case
+  its marker describes — SPG's `Interval` has no infinite value at all,
+  and the subtraction error is one symptom. A type-level change.
+
+- **Timestamps in the last 29 years PostgreSQL accepts.** Bisected: SPG
+  reaches year 294247, PostgreSQL 294276. `i64::MAX` microseconds from
+  1970 lands in 294247.02, and PostgreSQL counts from 2000 — **the delta
+  is the difference between two epochs**, not a bound anyone chose.
+  Moving the epoch would rewrite every stored and encoded timestamp to
+  buy twenty-nine years nobody reaches. Condition: **do not**.
+
 ### Still open, named rather than left out
 
 - **Sorting a collated text column is 1.67x behind PostgreSQL** after the
