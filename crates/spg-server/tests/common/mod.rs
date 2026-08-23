@@ -479,7 +479,7 @@ pub fn wait_until(budget: std::time::Duration, mut cond: impl FnMut() -> bool) -
 /// v7.38.19 — the base every test scratch directory hangs off.
 ///
 /// 161 files across this workspace build a unique path under
-/// `std::env::temp_dir()` per run and none of them removes it. On the
+/// `std::env::temp_dir().join("spg-tests")` per run and none of them removes it. On the
 /// machine this was found on, `$TMPDIR` had reached **61,708 entries and
 /// 30 GB** — and it was not only disk. `spg-server` swept that directory
 /// at every start, so one `readdir` took **95 seconds** and every server

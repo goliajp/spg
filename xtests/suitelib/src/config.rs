@@ -309,7 +309,7 @@ mod recorded_delta_register {
 
 /// v7.38.19 — a test's scratch directory belongs under one root.
 ///
-/// 161 files built a unique path under `std::env::temp_dir()` per run
+/// 161 files built a unique path under `std::env::temp_dir().join("spg-tests")` per run
 /// and none removed it. On the machine this was found on `$TMPDIR` had
 /// reached 61,708 entries and 30 GB — and it was not only disk:
 /// `spg-server` swept that directory at every start, so one `readdir`
@@ -319,7 +319,7 @@ mod recorded_delta_register {
 ///
 /// They now go under `$TMPDIR/spg-tests/`, which makes the mess
 /// removable in one pass. This keeps it that way: a bare
-/// `std::env::temp_dir()` in a test is red.
+/// `std::env::temp_dir().join("spg-tests")` in a test is red.
 #[cfg(test)]
 mod test_scratch_root {
     use std::path::{Path, PathBuf};
@@ -363,16 +363,34 @@ mod test_scratch_root {
                 let Ok(text) = std::fs::read_to_string(&p) else {
                     continue;
                 };
-                for (i, line) in text.lines().enumerate() {
+                // v7.38.19 — the shared root may sit on the same line or
+                // on the next, because rustfmt breaks a long chain:
+                //
+                //     let dir = std::env::temp_dir()
+                //         .join("spg-tests")
+                //         .join(format!(…));
+                //
+                // The first version compared only the rest of the same
+                // line and called that correct code a violation. The
+                // second version fixed the multi-line case and stopped
+                // seeing the single-line one — caught by running BOTH
+                // negative controls, which is the only reason this
+                // paragraph is not describing a checker that passes
+                // everything.
+                //
+                // So: join the call's line with the one after it and look
+                // once. Two forms, one test.
+                let lines: Vec<&str> = text.lines().collect();
+                let needle = concat!("env::temp", "_dir()");
+                for (i, line) in lines.iter().enumerate() {
                     let t = line.trim_start();
-                    if t.starts_with("//") || t.starts_with("///") {
+                    if t.starts_with("//") || !t.contains(needle) || t.contains("tmp_base") {
                         continue;
                     }
-                    let needle = concat!("env::temp", "_dir()");
-                    if let Some(rest) = t.split_once(needle).map(|(_, r)| r)
-                        && !rest.trim_start().starts_with(".join(\"spg-tests\")")
-                        && !t.contains("tmp_base")
-                    {
+                    let next = lines.get(i + 1).map_or("", |l| l.trim());
+                    let after = t.split_once(needle).map_or("", |(_, r)| r);
+                    let joined = format!("{after} {next}");
+                    if !joined.trim_start().starts_with(".join(\"spg-tests\")") {
                         offenders.push(format!("{}:{}", p.display(), i + 1));
                     }
                 }
