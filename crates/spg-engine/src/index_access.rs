@@ -476,20 +476,31 @@ pub(crate) fn try_index_seek_positions(
         // `break 'range` = this range is not usable; fall through to the
         // recursion and the equality paths below.
         'range: {
-            let Some(idx) = table.index_on(col_pos) else {
-                break 'range;
+            let keep = |l: spg_storage::RowLocator| match l {
+                spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+                // A cold locator makes the whole seek bail below; keep
+                // it so that decision is reached rather than silently
+                // dropping it here.
+                spg_storage::RowLocator::Cold { .. } => true,
             };
-            let Some(locators) =
-                idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap, |l| {
-                    match l {
-                        spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
-                        // A cold locator makes the whole seek bail below; keep
-                        // it so that decision is reached rather than silently
-                        // dropping it here.
-                        spg_storage::RowLocator::Cold { .. } => true,
-                    }
-                })
-            else {
+            // v7.38.19 — see the rows variant: a composite index's
+            // leading column answers a range too.
+            let walked = match table.index_on(col_pos) {
+                Some(idx) => {
+                    idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), seek_cap, keep)
+                }
+                None => try_leading_composite_range(
+                    table,
+                    schema_cols,
+                    col_pos,
+                    bound_as_ref(&lo),
+                    bound_as_ref(&hi),
+                    seek_cap,
+                    db_coll,
+                    keep,
+                ),
+            };
+            let Some(locators) = walked else {
                 break 'range;
             };
             let mut out = Vec::with_capacity(locators.len());
@@ -777,9 +788,22 @@ pub(crate) fn try_index_seek_positions(
     }
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
-    let idx = table.index_on(col_pos)?;
     let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
-    let locators = idx.lookup_eq(&key);
+    // v7.38.19 — see the rows variant: same choice, same reason.
+    let composite;
+    let locators: &spg_storage::posting::PostingList = match table.index_on(col_pos) {
+        Some(idx) => idx.lookup_eq(&key),
+        None => {
+            composite = spg_storage::posting::PostingList::from(try_leading_composite_prefix(
+                table,
+                schema_cols,
+                col_pos,
+                &key,
+                db_coll,
+            )?);
+            &composite
+        }
+    };
     let mut out = Vec::with_capacity(locators.len());
     for loc in locators {
         match *loc {
@@ -797,6 +821,103 @@ pub(crate) fn try_index_seek_positions(
     // v7.39 (pg_stat knife B) — one index scan.
     table.note_index_scan(out.len() as u64);
     Some(out)
+}
+
+/// v7.38.19 — the composite B-tree whose LEADING column is `col_pos`,
+/// walked by that one component.
+///
+/// `Table::index_on` answers only with `IndexKind::BTree`, so until this
+/// version a bare `WHERE lead = <lit>` saw no index at all when the only
+/// one covering that column was composite — and full-scanned. The walk
+/// itself is not new: the `AND` branch above has composed prefixes out of
+/// several equalities since v7.38.1. What was missing is that a predicate
+/// with ONE equality never entered that branch, so a one-component prefix
+/// was the only prefix the engine could not take.
+///
+/// Measured on sentori's `events (project_id, kind)` at 200k rows:
+/// `project_id = 99`, which matches nothing, cost 3.7 ms against
+/// PostgreSQL 18's 0.22. Not because it read the matching rows — there
+/// were none — but because it read all of them.
+///
+/// The result is a CANDIDATE set like every other seek here: the caller
+/// re-applies the whole predicate per row.
+fn try_leading_composite_prefix(
+    table: &Table,
+    schema_cols: &[ColumnSchema],
+    col_pos: usize,
+    key: &IndexKey,
+    db_coll: &str,
+) -> Option<Vec<spg_storage::RowLocator>> {
+    // A collated leading column keys the tree in a space this probe is
+    // not built in — the two-spaces problem v7.38.18 (G3) handled inside
+    // the AND branch by stopping the prefix at that component. Stopping
+    // at the FIRST component leaves no prefix at all, so decline and let
+    // the scan answer it correctly.
+    if schema_cols
+        .get(col_pos)
+        .is_some_and(|c| collated_column(c, db_coll).is_some())
+    {
+        return None;
+    }
+    // The same bargain the prefix walk makes everywhere: never
+    // materialise more than a quarter of the table, or the seek costs
+    // more than the scan it replaces. The floor keeps tiny tables
+    // seekable (rows/4 of a 3-row table is 0).
+    let cap = (table.rows().len() / 4).max(64);
+    let mut best: Option<Vec<spg_storage::RowLocator>> = None;
+    for idx in table.indices() {
+        if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
+            || idx.column_position != col_pos
+            || idx.partial_predicate.is_some()
+            || idx.expression.is_some()
+        {
+            continue;
+        }
+        if let Some(locs) = idx.lookup_prefix_capped_by(core::slice::from_ref(key), cap, |_| true)
+            && best.as_ref().is_none_or(|b| locs.len() < b.len())
+        {
+            best = Some(locs);
+        }
+    }
+    best
+}
+
+/// v7.38.19 — the range twin of [`try_leading_composite_prefix`].
+///
+/// Same defect, same shape: with only `(project_id, kind)` present,
+/// `project_id > 90` read all 200,000 rows to return none of them.
+fn try_leading_composite_range(
+    table: &Table,
+    schema_cols: &[ColumnSchema],
+    col_pos: usize,
+    lo: Bound<&IndexKey>,
+    hi: Bound<&IndexKey>,
+    cap: usize,
+    db_coll: &str,
+    keep: impl Fn(spg_storage::RowLocator) -> bool + Copy,
+) -> Option<Vec<spg_storage::RowLocator>> {
+    if schema_cols
+        .get(col_pos)
+        .is_some_and(|c| collated_column(c, db_coll).is_some())
+    {
+        return None;
+    }
+    let mut best: Option<Vec<spg_storage::RowLocator>> = None;
+    for idx in table.indices() {
+        if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
+            || idx.column_position != col_pos
+            || idx.partial_predicate.is_some()
+            || idx.expression.is_some()
+        {
+            continue;
+        }
+        if let Some(locs) = idx.lookup_leading_range_capped_by(lo, hi, cap, keep)
+            && best.as_ref().is_none_or(|b| locs.len() < b.len())
+        {
+            best = Some(locs);
+        }
+    }
+    best
 }
 
 /// v7.38 (perf, index range scan) — flip a comparison operator for the
@@ -1294,15 +1415,28 @@ fn try_range_seek<'a>(
     // which is the measurement the old two-sided-only rule was guessing at.
     let cap = table.rows().len() / 4;
     let (col_pos, lo, hi) = candidates?;
-    let idx = table.index_on(col_pos)?;
+    let keep = |l: spg_storage::RowLocator| match l {
+        spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
+        spg_storage::RowLocator::Cold { .. } => true,
+    };
     // v7.39 (round 490) — drop the dead versions inside the walk. This loop
     // already tested `is_row_visible` and skipped; doing it one level down
     // means the cap stops counting them too (see `lookup_range_capped_by`).
-    let locators =
-        idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, |l| match l {
-            spg_storage::RowLocator::Hot(i) => table.is_row_visible(i, snapshot),
-            spg_storage::RowLocator::Cold { .. } => true,
-        })?;
+    // v7.38.19 — and when the only index covering this column is a
+    // composite one, walk its leading component instead of scanning.
+    let locators = match table.index_on(col_pos) {
+        Some(idx) => idx.lookup_range_capped_by(bound_as_ref(&lo), bound_as_ref(&hi), cap, keep)?,
+        None => try_leading_composite_range(
+            table,
+            schema_cols,
+            col_pos,
+            bound_as_ref(&lo),
+            bound_as_ref(&hi),
+            cap,
+            db_coll,
+            keep,
+        )?,
+    };
     let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(locators.len());
     for loc in &locators {
         match *loc {
@@ -1764,9 +1898,28 @@ pub(crate) fn try_index_seek<'a>(
     }
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
-    let idx = table.index_on(col_pos)?;
     let key = probe_key(schema_cols, col_pos, &value, mysql, db_coll)?;
-    let locators = idx.lookup_eq(&key);
+    // v7.38.19 — a single-column index answers directly; otherwise the
+    // leading column of a composite one is walked by prefix. Note the
+    // ORDER: `index_on` deliberately refuses a composite (its keys are
+    // tuples, and a one-component `lookup_eq` against them answers
+    // nothing while looking like "no rows matched" — the shape this
+    // codebase has been bitten by twice), so the composite is asked
+    // through the primitive built for tuples instead.
+    let composite;
+    let locators: &spg_storage::posting::PostingList = match table.index_on(col_pos) {
+        Some(idx) => idx.lookup_eq(&key),
+        None => {
+            composite = spg_storage::posting::PostingList::from(try_leading_composite_prefix(
+                table,
+                schema_cols,
+                col_pos,
+                &key,
+                db_coll,
+            )?);
+            &composite
+        }
+    };
     let table_name = table.schema().name.as_str();
     // v5.1: each locator dispatches to either the hot tier (zero-
     // copy borrow of `table.rows()[i]`) or a cold-tier segment
@@ -1839,7 +1992,14 @@ fn try_inlist_seek<'a>(
         return None;
     }
     let col_pos = schema_cols.iter().position(|s| s.name == c.name)?;
-    let idx = table.index_on(col_pos)?;
+    // v7.38.19 — a composite index's leading column answers an IN list
+    // too, and for the same reason it answers an equality: the list is
+    // N equalities. Measured with only `(project_id, kind)` present,
+    // `project_id IN (98, 99)` — matching nothing — cost 3.578 ms
+    // against PostgreSQL's 0.215. Given a single-column index the same
+    // query took 0.192, which is what says the list was never the
+    // problem.
+    let single = table.index_on(col_pos);
     // Every element must be a literal; bail (full scan) otherwise.
     //
     // r1039 — through the SAME resolver the equality seek uses. This
@@ -1868,7 +2028,18 @@ fn try_inlist_seek<'a>(
     let table_name = table.schema().name.as_str();
     let mut out: Vec<Cow<'a, Row>> = Vec::new();
     for key in &keys {
-        for loc in idx.lookup_eq(key) {
+        let composite;
+        let locators: &spg_storage::posting::PostingList =
+            match single {
+                Some(idx) => idx.lookup_eq(key),
+                None => {
+                    composite = spg_storage::posting::PostingList::from(
+                        try_leading_composite_prefix(table, schema_cols, col_pos, key, db_coll)?,
+                    );
+                    &composite
+                }
+            };
+        for loc in locators {
             match *loc {
                 spg_storage::RowLocator::Hot(i) => {
                     // Phase C.3 step 2c — MVCC read gate. No-op today.

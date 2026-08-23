@@ -3835,6 +3835,65 @@ impl Index {
         Some(out)
     }
 
+    /// v7.38.19 — a RANGE on the composite tree's leading column.
+    ///
+    /// Tuples order lexicographically, so every key whose first
+    /// component is `x` sorts at or after the one-element tuple `[x]`
+    /// and before `[x']` for any larger `x'`. That makes a leading-
+    /// column range one contiguous run, walked exactly like the
+    /// single-column range walk — the only difference is that the
+    /// comparison is against `k[0]` rather than the whole key.
+    ///
+    /// Without this, `WHERE project_id > 90` on a table whose only
+    /// index was `(project_id, kind)` read every row: 4.067 ms against
+    /// PostgreSQL 18's 0.220, on a predicate matching nothing. The same
+    /// query with a single-column index took 0.165, which is what says
+    /// the range was never the problem.
+    pub fn lookup_leading_range_capped_by(
+        &self,
+        lo: core::ops::Bound<&IndexKey>,
+        hi: core::ops::Bound<&IndexKey>,
+        cap: usize,
+        keep: impl Fn(RowLocator) -> bool,
+    ) -> Option<Vec<RowLocator>> {
+        let IndexKind::BTreeMulti(m) = &self.kind else {
+            return None;
+        };
+        // The start of the run. An EXCLUDED lower bound cannot be
+        // handed to the map as-is: `[x]` sorts BEFORE `[x, y]`, so
+        // excluding `[x]` would still admit every tuple that begins
+        // with `x`. Start at `[x]` included and drop those tuples by
+        // the per-key test below, which compares the component.
+        let lo_key: Option<alloc::boxed::Box<[IndexKey]>> = match lo {
+            core::ops::Bound::Included(k) | core::ops::Bound::Excluded(k) => {
+                Some(alloc::vec![k.clone()].into_boxed_slice())
+            }
+            core::ops::Bound::Unbounded => None,
+        };
+        let start = match &lo_key {
+            Some(k) => core::ops::Bound::Included(k),
+            None => core::ops::Bound::Unbounded,
+        };
+        let mut out: Vec<RowLocator> = Vec::new();
+        for (k, locs) in m.range(start, core::ops::Bound::Unbounded) {
+            let Some(first) = k.first() else { continue };
+            match lo {
+                core::ops::Bound::Excluded(b) if first == b => continue,
+                _ => {}
+            }
+            match hi {
+                core::ops::Bound::Included(b) if first > b => break,
+                core::ops::Bound::Excluded(b) if first >= b => break,
+                _ => {}
+            }
+            out.extend(locs.iter().copied().filter(|l| keep(*l)));
+            if out.len() > cap {
+                return None;
+            }
+        }
+        Some(out)
+    }
+
     /// v7.39 (round 560) — the index range as (key, locator) pairs.
     ///
     /// `lookup_range_capped_by` throws the KEY away and returns only
