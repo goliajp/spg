@@ -44,7 +44,7 @@
 > claimed `yes` for a name that appears only in a doc comment, two
 > claimed `no` for a switch that tests really do set.
 >
-> Today: **84 switches, 60 exercised, 24 not.**
+> Today: **85 switches, 61 exercised, 24 not.**
 > Adding a switch means adding a row in the same commit.
 
 | switch | first read site | exercised |
@@ -77,6 +77,7 @@
 | `SPG_FREEZER_DISABLE` | `crates/spg-server/src/freezer.rs:66` | yes |
 | `SPG_FREEZER_TICK_MS` | `crates/spg-server/src/freezer.rs:67` | yes |
 | `SPG_FREEZER_WORKERS` | `crates/spg-server/src/freezer.rs:77` | yes |
+| `SPG_HBA_FILE` | `crates/spg-server/src/main.rs:2036` | yes |
 | `SPG_HOT_TIER_BYTES` | `crates/spg-server/src/main.rs:1707` | yes |
 | `SPG_HTTP_ADDR` | `crates/spg-server/src/main.rs:2086` | yes |
 | `SPG_IDLE_TIMEOUT_SEC` | `crates/spg-server/src/main.rs:867` | yes |

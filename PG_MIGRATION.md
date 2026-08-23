@@ -525,8 +525,8 @@ maintained search vectors run unmodified.
 | `ts_rank(vec, query)` / `ts_rank_cd(vec, query)` | ✅ v7.12.2 | Weight × occurrence sum normalised by `1 + ln(unique_terms)`; `cd` adds cover-density factor |
 | `CREATE INDEX … USING GIN (tsvector_col)` | ✅ v7.12.3 | Real posting-list inverted index — replaces the v7.9.26b BTree fallback. `@@` query planner picks it automatically; `Term` / `And` / `Or` accelerated, `Not` / `Phrase` fall through to full scan |
 | `CREATE INDEX … USING GIN (non_tsvector_col)` | ✅ v7.9.26b | Loads as BTree fallback on the leading column so `pg_dump` JSONB-GIN scripts still load |
-| `ts_headline` / `ts_lexize` / other display-side FTS funcs | ⚠️ | `ts_headline` works; `ts_lexize` does not — see below |
-| Spanish / French / German / non-English config | ❌ | `simple` and `english` only, still. Measured v7.38.18: `to_tsvector('french', …)` errors |
+| `ts_headline` / `ts_lexize` / other display-side FTS funcs | ⚠️ | `ts_headline` works, in every configuration; `ts_lexize` does not |
+| Spanish / French / German text-search configs | ✅ | v7.38.18. Snowball's stemmer and stopword list for each, verified word-for-word against PG 18.4 over 6,120 words. Other languages (portuguese, russian, …) still error with the list of what is there |
 | Trigram (`pg_trgm` extension) | ✅ | `similarity()` and the operators work (was ❌ — no longer a parse-only no-op) |
 
 ### PL/pgSQL triggers
@@ -574,7 +574,7 @@ clean_text` runs end-to-end.
 | `CREATE USER`/`DROP USER` | ✅ | |
 | Roles (`admin` / `readwrite` / `readonly`) | ✅ | Three built-in roles, not arbitrary `CREATE ROLE` |
 | `GRANT` / `REVOKE` on tables | ✅ | Table-level grants work (was ❌ — not role-level only) |
-| `pg_hba.conf` style auth rules | ❌ | Single password / role per session |
+| `pg_hba.conf` style auth rules | ✅ | v7.38.18. `SPG_HBA_FILE` names the file; `local`/`host`/`hostssl`/`hostnossl`, `all` or a named database/user, an address/prefix, and `trust`/`reject`/`scram-sha-256`/`password`. First match decides and a `reject` above a permissive line wins, as in PG. A file that will not parse refuses the start |
 
 ### Replication
 
