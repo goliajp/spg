@@ -121,7 +121,32 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sweep"));
     let _ = std::fs::remove_dir_all(&tmp);
     let mut roster = Roster::new();
-    let port = roster.spawn_server_on("sweep-leg", &bin, &tmp, Duration::from_secs(20), bind)?;
+    // v7.38.19 — DECLARE the baseline leg's collation instead of
+    // inheriting the machine's.
+    //
+    // The testbed exports `LANG=en_US.UTF-8` and `LC_ALL=en_US.UTF-8`, so
+    // this leg has been running under a LOCALE collation while every
+    // comment about the sweep says it runs under `C`. Two consequences,
+    // and the second is worse than the first:
+    //
+    //   * the sixty-four cells were measuring the collated path, not the
+    //     byte one, and their history is read as the byte one
+    //   * the locale panel added earlier in this very version was
+    //     comparing en_US against en_US -- **the same thing to itself**
+    //     -- and reported `losses=0` for it
+    //
+    // The panel added to catch a collation regression could not have
+    // caught one. `SPG_LC_COLLATE=C` is now explicit, which is the same
+    // rule the three-engine differential learned in v7.38.16: state what
+    // you are measuring rather than letting the host decide.
+    let port = roster.spawn_server_env(
+        "sweep-leg",
+        &bin,
+        &tmp,
+        Duration::from_secs(20),
+        bind,
+        &[("SPG_LC_COLLATE", "C")],
+    )?;
     let spg_uri = format!("postgres://bench:bench@{host}:{port}/bench");
     // Both legs must answer before anything is timed (r1041).
     for uri in [&pg_uri, &spg_uri] {

@@ -67,6 +67,18 @@ PSQL="${PSQL:-psql}"
 [[ -n "${SPG_URI}" ]] || { echo "fatal: SPG_URI must be set (both legs run psql — rule 1)" >&2; exit 2; }
 
 echo "load before: $(uptime)"
+# v7.38.19 — say which collation each leg is serving.
+#
+# The testbed exports LANG and LC_ALL, so the leg the gate called its `C`
+# baseline had been running under en_US for as long as the gate has run
+# on it, and nothing printed said so. A panel comparing "locale against
+# C" was comparing en_US against en_US and reporting no losses. A number
+# whose conditions are not printed is a number nobody can check.
+for leg_uri in "${SPG_URI}" "${PG_URI}"; do
+  leg_coll="$("${PSQL}" --no-psqlrc -X -q -t -A "${leg_uri}" \
+    -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>/dev/null | head -1)"
+  echo "leg $(host_of "${leg_uri}"):$(printf '%s' "${leg_uri}" | sed 's|.*:||;s|/.*||') collation: ${leg_coll:-<unknown>}"
+done
 
 # r1022 — the two legs must reach the client over the SAME route, and this
 # refuses to score them when the URIs say they do not.
