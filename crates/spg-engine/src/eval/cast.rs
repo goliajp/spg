@@ -1091,16 +1091,45 @@ pub fn cast_value_ref_in(
             // v7.39 (read01 pseudotypes.c) — `::cstring` is PG's I/O-form
             // pseudotype: text in, text out (cstring_in/out are identity).
             // SPG carries it as text; pg_typeof(cstring) reading "text" is
-            // a recorded delta alongside the literal projection OIDs.
+            // a recorded delta (RD-1) alongside the literal projection OIDs.
             // v7.39 (read01 xid8funcs.c) — `::xid` (32-bit, wrapping) and
             // `::xid8` (64-bit, full) parse an integer text and render it
             // back verbatim. SPG carries them as BigInt.
             if name.eq_ignore_ascii_case("xid") || name.eq_ignore_ascii_case("xid8") {
                 return Ok(match v {
                     Value::Null => Value::Null,
-                    Value::SmallInt(n) => Value::BigInt(i64::from(n)),
-                    Value::Int(n) => Value::BigInt(i64::from(n)),
-                    Value::BigInt(n) => Value::BigInt(n),
+                    // v7.38.19 (RD-11) — PostgreSQL refuses EVERY integer
+                    // type here, for both names, and SPG accepted them.
+                    // Measured on PG 18.4:
+                    //
+                    //   SELECT 1::xid8            cannot cast type integer to xid8
+                    //   SELECT 1::bigint::xid8    cannot cast type bigint to xid8
+                    //   SELECT 1::bigint::xid     cannot cast type bigint to xid
+                    //   SELECT '1'::text::xid8    1
+                    //
+                    // Only the text form is a cast; the integer form is
+                    // not, because a transaction id is not a number you
+                    // may arrive at by arithmetic.
+                    //
+                    // This is the direction that matters most: SPG
+                    // accepting what PG rejects means code PG would have
+                    // stopped runs here, and the difference surfaces
+                    // somewhere else, later. It was found by re-measuring
+                    // the recorded delta two lines above -- which had
+                    // never mentioned it.
+                    Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "cannot cast type {} to {}",
+                                match v {
+                                    Value::SmallInt(_) => "smallint",
+                                    Value::Int(_) => "integer",
+                                    _ => "bigint",
+                                },
+                                name.to_ascii_lowercase()
+                            ),
+                        });
+                    }
                     Value::Text(s) => {
                         let t = s.trim();
                         match t.parse::<u64>() {

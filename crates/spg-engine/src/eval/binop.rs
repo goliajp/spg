@@ -1723,7 +1723,7 @@ fn apply_binary_calendar(
             // v7.39 (read01 timestamp.c) — like-signed infinities cannot
             // subtract (PG "interval out of range"); mixed-sign needs an
             // interval infinity SPG's Interval can't represent yet
-            // (recorded delta) so it errors the same way.
+            // (recorded delta RD-2) so it errors the same way.
             let a_inf = *a == i64::MAX || *a == i64::MIN;
             let b_inf = *b == i64::MAX || *b == i64::MIN;
             if a_inf || b_inf {
@@ -2055,9 +2055,15 @@ pub(crate) fn add_interval_to_micros(
         })?;
     // v7.39 (read01 timestamp.c) — PG's lower bound (4714-11-24 BC,
     // Unix-epoch microseconds); arithmetic below it errors like PG.
-    // The upper bound is i64 itself (checked adds above) — SPG's
-    // 1970-based clock ends ~30 years before PG's 2000-based ceiling,
-    // a recorded delta at the extreme fringe.
+    //
+    // v7.38.19 — this said the delta was at the LOWER end, "~30 years
+    // before PG's 2000-based ceiling", and re-measuring it found the
+    // opposite. `'4714-11-24 BC'::timestamp` is accepted by both, byte
+    // for byte. It is the UPPER bound that differs, and by far more than
+    // thirty years: PG accepts `'294276-12-31 23:59:59'::timestamp` and
+    // SPG answers `date/time field value out of range`. Recorded delta
+    // RD-3; the sentence it replaces had been wrong since it was
+    // written, which is what a claim nobody re-measures becomes.
     const TS_MIN: i64 = -210_866_803_200_000_000;
     if out < TS_MIN {
         return Err(EvalError::TypeMismatch {
