@@ -526,7 +526,7 @@ maintained search vectors run unmodified.
 | `CREATE INDEX … USING GIN (tsvector_col)` | ✅ v7.12.3 | Real posting-list inverted index — replaces the v7.9.26b BTree fallback. `@@` query planner picks it automatically; `Term` / `And` / `Or` accelerated, `Not` / `Phrase` fall through to full scan |
 | `CREATE INDEX … USING GIN (non_tsvector_col)` | ✅ v7.9.26b | Loads as BTree fallback on the leading column so `pg_dump` JSONB-GIN scripts still load |
 | `ts_headline` / `ts_lexize` / other display-side FTS funcs | ⚠️ | `ts_headline` works, in every configuration; `ts_lexize` does not |
-| Spanish / French / German text-search configs | ✅ | v7.38.18. Snowball's stemmer and stopword list for each, verified word-for-word against PG 18.4 over 6,120 words. Other languages (portuguese, russian, …) still error with the list of what is there |
+| Spanish / French / German text-search configs | ✅ | v7.38.18. Snowball's stemmer and stopword list for each, verified word-for-word against PG 18.4 over 6,057 words (from corpora of 6,183 lines; stopwords and multi-lexeme words are not stemming questions). Other languages (portuguese, russian, …) still error with the list of what is there |
 | Trigram (`pg_trgm` extension) | ✅ | `similarity()` and the operators work (was ❌ — no longer a parse-only no-op) |
 
 ### PL/pgSQL triggers
