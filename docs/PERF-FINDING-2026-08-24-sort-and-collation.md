@@ -153,6 +153,49 @@ the fixture was changed first. The previous version of this section would
 have sent an attack at an abbreviated key, measured it on `pad`, and
 reported a large win that meant nothing.
 
+### The tie hypothesis, also refuted
+
+Held to the same standard as the one before it. One table, 400,000 rows,
+three text columns of controlled cardinality — so the row width, the
+engine state and the run window are identical across the three and only
+the number of distinct values moves:
+
+| column | distinct values | SPG | PG 18.4 | |
+|---|---|---|---|---|
+| 200 bytes, 4 values | 4 | 159.5 ms | 141.1 | 1.13x behind |
+| 200 bytes, shared 190-char prefix | 5,200 | 293.4 ms | **3380.6** | **0.09x — SPG 11x ahead** |
+| 64 bytes, all distinct | 400,000 | 314.4 ms | 402.1 | 0.78x — SPG ahead |
+
+Four distinct values is *more* degenerate than `pad`'s twenty-six and SPG
+is 1.13x, not 2.25x. And where every key shares a 190-character prefix —
+the case an abbreviated key handles worst — SPG is **eleven times faster
+than PostgreSQL**.
+
+So the tie path is not it either. Within one table, across three orders
+of magnitude of cardinality, SPG is level or far ahead.
+
+### Where that leaves it
+
+Three hypotheses, three refutations, each by a fixture built to test it:
+
+1. *long text keys are slow* — refuted: distinct short text is a 2.4x win,
+   distinct long text 1.56x
+2. *many equal keys are slow* — refuted: four distinct values is 1.13x
+3. *the tie path is slow* — refuted: a shared 190-character prefix is an
+   11x win
+
+What remains is one cell — the sweep's own `pad` at 2.25x — and its
+difference from every controlled measurement above is the table, not the
+data: `sweep_N` is `(id INT PRIMARY KEY, k INT, pad TEXT)` and the
+projection materialises 400,000 × 200 bytes. **Cross-table comparison is
+not evidence**, which is why the numbers above were taken within one
+table, and it is also why the `pad` cell cannot be read as "sorting is
+2.25x behind".
+
+The ceiling gate stays: it catches that cell getting worse, which is a
+thing worth catching. What it does not do any more is imply a general
+sort gap, because three attempts to find one all measured the opposite.
+
 Second coverage gap, recorded here because it is the same disease as the
 first: **the sweep never sorts a TEXT column.** Its shapes order by `k
 INT`, `n NUMERIC` and `b BYTEA`. The text ordering path — the one this
