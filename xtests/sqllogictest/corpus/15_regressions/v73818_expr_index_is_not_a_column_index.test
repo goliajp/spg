@@ -1,7 +1,22 @@
 # v7.38.18 — an expression index must not stand in for a column index.
 #
-# This is a defect the SHIPPED build has, on a plain `C` database, with
-# no collation involved. Three rows:
+# This is a defect two SHIPPED builds have, on a plain `C` database, with
+# no collation involved. Measured by running the shape below against
+# every published image in turn: 7.38.6 through 7.38.15 answer 1,
+# **7.38.16 and 7.38.17 answer 0**, and this build answers 1 again.
+#
+# 7.38.16 is where an expression index began holding the EXPRESSION's
+# values instead of the anchor column's. Before that the tree held the
+# column's own values, so handing it to a column probe still answered
+# correctly — which is why fifteen releases look clean and the fix that
+# improved the index is what exposed the lookup behind it.
+#
+# The first note here said "the shipped build has", singular and
+# undated, which is a claim about every release ever made. It was
+# written from reading the code rather than from running the images, and
+# it was wrong.
+#
+# Three rows:
 #
 #   WHERE s = 'Row7'                              1
 #   CREATE INDEX ix_expr ON ix((lower(s)))
