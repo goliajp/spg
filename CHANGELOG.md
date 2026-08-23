@@ -37,9 +37,6 @@ the current build; this file is a release-organized view.
   `SHOW WARNINGS` stays a MySQL surface: a PostgreSQL session still gets
   the *unrecognized configuration parameter* error PG 18.4 gives, which
   it briefly did not while this was being built.
-
-### Added
-
 - **Every comment form each dialect has**, including the two where the
   two dialects disagree about the same input.
 
