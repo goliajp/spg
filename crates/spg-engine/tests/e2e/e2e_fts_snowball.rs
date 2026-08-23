@@ -31,6 +31,42 @@ fn gold(name: &str) -> Vec<(String, String)> {
         .collect()
 }
 
+/// How many words each corpus actually puts to the engine, after the
+/// stopwords and the multi-lexeme entries `gold` drops.
+///
+/// v7.38.18 — these are pinned because a customer letter quoted them
+/// and got them wrong. It said "6,120 words -- 1,874 Spanish, 2,229
+/// French, 2,017 German", and two of those three were FILE LINE COUNTS
+/// while the third was a compared-word count. The total matched neither
+/// reading: the files hold 6,183 lines and the comparison sees 6,057.
+///
+/// A number that appears in something we send someone has to be
+/// asserted somewhere, or it is a number that was true once.
+const GOLD_COUNTS: [(&str, usize); 3] =
+    [
+    ("spanish.tsv", 1847),
+    ("french.tsv", 2193),
+    ("german.tsv", 2017),
+];
+
+#[test]
+fn the_gold_corpora_are_the_size_the_documents_claim() {
+    let total: usize = GOLD_COUNTS
+        .iter()
+        .map(|(f, want)| {
+            let got = gold(f).len();
+            assert_eq!(
+                got, *want,
+                "{f}: the corpus compares {got} words, the documents say {want} \
+                 -- update CHANGELOG.md, PG_MIGRATION.md and the customer letter \
+                 together with this constant"
+            );
+            got
+        })
+        .sum();
+    assert_eq!(total, 6057, "the total quoted in the documents");
+}
+
 fn check(config: &str, file: &str) {
     let mut e = spg_engine::Engine::new();
     let rows = gold(file);

@@ -84,7 +84,16 @@ the current build; this file is a release-organized view.
 - **The `spanish`, `french` and `german` text-search configurations.**
   Snowball's stemmer and stopword list for each, implemented from the
   published algorithms and verified word for word against PostgreSQL
-  18.4 over **6,120 words** — 1,874 Spanish, 2,229 French, 2,017 German.
+  18.4 over **6,057 words** — 1,847 Spanish, 2,193 French, 2,017 German,
+  from corpora of 6,183 lines. The difference is stopwords and words
+  that tokenise into more than one lexeme, which are not stemming
+  questions and which the comparison skips.
+
+  The first draft of this line said 6,120 / 1,874 / 2,229 / 2,017. Two
+  of those were file line counts and one was a compared-word count, and
+  the total matched neither reading. The three counts are now asserted
+  by the test that reads the corpora, so a figure in a letter cannot
+  drift from the corpus it describes.
   `to_tsvector`, `to_tsquery` and `ts_headline` all follow the
   configuration.
 
