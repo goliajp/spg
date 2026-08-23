@@ -409,6 +409,8 @@ mod e2e_join_expr_key_round719;
 mod e2e_join_group_by_key_round621;
 mod e2e_join_side_filter_round574;
 mod e2e_json_arrayagg;
+mod e2e_json_contains_scan;
+mod e2e_json_exists_scan;
 mod e2e_json_extract_path;
 mod e2e_json_family_round14;
 mod e2e_json_family_round76;

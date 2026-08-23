@@ -1431,6 +1431,24 @@ fn cast_is_identity_for(v: &Value<'_>, target: &spg_sql::ast::CastTarget) -> boo
 pub(crate) fn fully_compilable(e: &Expr) -> bool {
     match e {
         Expr::Literal(_) | Expr::Column(_) => true,
+        // v7.38.19 — an all-literal array folds to one `Step::Lit` at
+        // compile time (the constant arm in `compile_expr`), so it costs
+        // nothing per row. Leaving it off this list kept the WHOLE
+        // predicate containing it off the compiled path, and the
+        // interpreter rebuilt the array -- a `Vec` and a `String` per
+        // element -- for every row.
+        //
+        // Measured on 200,000 rows of sentori's `events`:
+        //
+        //     traits ?  'plan'                 10.103 ms
+        //     traits ?| 'plan'                 10.388     (bare TEXT, same)
+        //     traits ?| ARRAY['plan']          26.227     (one element)
+        //     traits ?| ARRAY['x','plan']      39.626
+        //     traits ?| ARRAY['x','y','plan']  45.403
+        //
+        // 35-65 ns per ELEMENT per row, and the second line is what says
+        // the operator was never the cost.
+        Expr::Array(items) if items.iter().all(constant_expr) => true,
         Expr::Binary { lhs, rhs, .. } => fully_compilable(lhs) && fully_compilable(rhs),
         Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => fully_compilable(expr),
         // I2: an InList is compilable ONLY when it becomes a real

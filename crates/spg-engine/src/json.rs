@@ -870,6 +870,153 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
 ///   - Objects: every (key, value) in rhs exists in lhs with a
 ///     containing value
 ///   - Arrays: every element in rhs has a containing element in lhs
+/// v7.38.19 — does the top level carry this key, answered by walking
+/// the bytes instead of building a document.
+///
+/// `?`, `?|` and `?&` each called `parse` on the left side, which
+/// allocates every key and every value of the whole document in order
+/// to answer whether ONE key is present. The accessor beside them
+/// (`->`, `->>`) has scanned bytes since v7.38.9 and skips validating a
+/// value that came out of storage; the existence operators were reading
+/// the same column and paying a document for it.
+///
+/// Measured on 25,000 rows of an 885-byte document with 41 keys:
+/// `d ? 'target'` took 246.591 ms against PostgreSQL 18's 2.291. On
+/// sentori's own four-key `traits`, 200,000 rows, 44.0 against 6.097 --
+/// and `traits->>'plan'`, which finds the same key AND copies the value
+/// out, took 14.137. Locating cost three times what locating and
+/// copying cost.
+///
+/// `None` = the top level is not a shape `?` can be true of, which the
+/// callers answer as false.
+///
+/// PostgreSQL's `?` tests three shapes: an object's KEYS, an array's
+/// string ELEMENTS, and a bare string. All three are here.
+fn scan_has_key(src: &str, key: &str) -> Option<bool> {
+    let mut found = [false];
+    scan_mark_keys(src, &KeyList::One(key), &mut found)?;
+    Some(found[0])
+}
+
+/// v7.38.19 — one walk of the document, marking every key asked about.
+///
+/// `?|` and `?&` first went through `scan_has_key` once per key, which
+/// walked the whole document that many times. On sentori's `traits`,
+/// 200,000 rows, `?| ARRAY['x','plan']` cost 41.891 ms against
+/// PostgreSQL 18's 7.546 — where a single `?` cost 9.749 against 6.763.
+/// Two keys, two walks, and it showed.
+///
+/// Stops as soon as every key asked about has been found, which is what
+/// makes the single-key case still cheap.
+fn scan_mark_keys(src: &str, keys: &KeyList<'_>, found: &mut [bool]) -> Option<()> {
+    debug_assert_eq!(keys.len(), found.len());
+    // Counted from what is still wanted, so a caller that pre-marked
+    // some positions (NULL elements name no key) is not waiting on them.
+    let mut outstanding = found.iter().filter(|f| !**f).count();
+    let mut mark = |tok: &str, found: &mut [bool], outstanding: &mut usize| {
+        for n in 0..keys.len() {
+            if !found[n]
+                && let Some(k) = keys.get(n)
+                && key_token_eq(tok, k)
+            {
+                found[n] = true;
+                *outstanding -= 1;
+            }
+        }
+    };
+    if outstanding == 0 {
+        return Some(());
+    }
+    let b = src.as_bytes();
+    let mut i = skip_ws_at(b, 0);
+    match b.get(i)? {
+        b'{' => {
+            i += 1;
+            loop {
+                i = skip_ws_at(b, i);
+                match b.get(i)? {
+                    b'}' => return Some(()),
+                    b'"' => {}
+                    _ => return None,
+                }
+                let key_end = scan_string(b, i)?;
+                mark(src.get(i..key_end)?, found, &mut outstanding);
+                if outstanding == 0 {
+                    return Some(());
+                }
+                i = skip_ws_at(b, key_end);
+                if b.get(i) != Some(&b':') {
+                    return None;
+                }
+                i = skip_ws_at(b, i + 1);
+                i = skip_ws_at(b, scan_value(b, i)?);
+                match b.get(i)? {
+                    b',' => i += 1,
+                    b'}' => return Some(()),
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            i += 1;
+            loop {
+                i = skip_ws_at(b, i);
+                if b.get(i) == Some(&b']') {
+                    return Some(());
+                }
+                let start = i;
+                let end = scan_value(b, i)?;
+                // Only a STRING element can satisfy `?`; a nested
+                // object or number never does, however it compares as
+                // text.
+                if b.get(start) == Some(&b'"') {
+                    mark(src.get(start..end)?, found, &mut outstanding);
+                    if outstanding == 0 {
+                        return Some(());
+                    }
+                }
+                i = skip_ws_at(b, end);
+                match b.get(i)? {
+                    b',' => i += 1,
+                    b']' => return Some(()),
+                    _ => return None,
+                }
+            }
+        }
+        b'"' => {
+            let end = scan_string(b, i)?;
+            mark(src.get(i..end)?, found, &mut outstanding);
+            Some(())
+        }
+        _ => Some(()),
+    }
+}
+
+/// The left side of an existence operator, validated only when it did
+/// not come out of storage -- the same bargain `path_get` makes, and
+/// for the same reason: a `Value::Json` was canonicalised on the way
+/// in, so re-parsing it per row proves something already known.
+fn existence_lhs<'a>(lhs: &'a Value, op: &str) -> Result<Option<&'a str>, EvalError> {
+    let src = match lhs {
+        Value::Json(s) | Value::Text(s) => s.as_ref(),
+        Value::Null => return Ok(None),
+        other => {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "JSON {op}: left side must be JSON or TEXT, got {}",
+                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                ),
+            });
+        }
+    };
+    if !matches!(lhs, Value::Json(_)) {
+        parse(src).map_err(|e| EvalError::TypeMismatch {
+            detail: alloc::format!("invalid JSON on left of {op}: {e}"),
+        })?;
+    }
+    Ok(Some(src))
+}
+
 /// v7.37.6-A — PG `jsonb ? text`. Returns BOOL: true iff the key
 /// exists at the top level of the document.
 ///   - Object: true iff `key` is a member name.
@@ -878,17 +1025,8 @@ pub fn path_walk(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'stati
 ///   - Other scalars / null: false.
 /// NULL on either side → NULL (SQL 3VL).
 pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
-    let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_ref(),
-        Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "JSON ?: left side must be JSON or TEXT, got {}",
-                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                ),
-            });
-        }
+    let Some(lhs_text) = existence_lhs(lhs, "?")? else {
+        return Ok(Value::Null);
     };
     let key = match rhs {
         Value::Text(s) => s.as_ref(),
@@ -902,10 +1040,7 @@ pub fn key_exists(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError>
             });
         }
     };
-    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON on left of ?: {e}"),
-    })?;
-    Ok(Value::Bool(node_has_key(&doc, key)))
+    Ok(Value::Bool(scan_has_key(lhs_text, key).unwrap_or(false)))
 }
 
 fn node_has_key(v: &JsonValue, key: &str) -> bool {
@@ -919,68 +1054,112 @@ fn node_has_key(v: &JsonValue, key: &str) -> bool {
     }
 }
 
-/// Helper for `?|` / `?&` — extract a Vec of keys from either a
-/// TEXT[] Value or a single TEXT Value (PG accepts both).
-fn collect_keys(v: &Value) -> Result<Option<Vec<String>>, EvalError> {
+/// v7.38.19 — the keys of `?|` / `?&` without owning any of them.
+///
+/// The code this replaced cloned every element into a fresh `String`,
+/// and both operators call it PER ROW with the same constant array. On
+/// a two-element array over 200,000 rows that is 600,000 allocations
+/// for a question about two keys.
+///
+/// The first attempt at this measured WORSE than what it replaced —
+/// 49.059 ms against 41.891 — because it traded one walk of the
+/// document per key for two fresh `Vec`s per row. Walks are cheap and
+/// allocations are not; this borrows, and the marks live on the stack.
+enum KeyList<'a> {
+    One(&'a str),
+    Many(&'a [Option<alloc::string::String>]),
+}
+
+impl KeyList<'_> {
+    fn len(&self) -> usize {
+        match self {
+            KeyList::One(_) => 1,
+            KeyList::Many(items) => items.len(),
+        }
+    }
+
+    /// `None` = this position holds SQL NULL, which names no key.
+    fn get(&self, n: usize) -> Option<&str> {
+        match self {
+            KeyList::One(k) => (n == 0).then_some(*k),
+            KeyList::Many(items) => items.get(n)?.as_deref(),
+        }
+    }
+}
+
+/// PG accepts both `TEXT[]` and a bare `TEXT` on the right of `?|`/`?&`.
+fn borrow_keys<'a>(v: &'a Value, op: &str) -> Result<Option<KeyList<'a>>, EvalError> {
     match v {
         Value::Null => Ok(None),
-        Value::TextArray(items) => Ok(Some(items.iter().filter_map(|x| x.clone()).collect())),
-        Value::Text(s) => Ok(Some(alloc::vec![s.to_string()])),
+        Value::TextArray(items) => Ok(Some(KeyList::Many(items))),
+        Value::Text(s) => Ok(Some(KeyList::One(s.as_ref()))),
         other => Err(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "JSON ?|/?&: right side must be TEXT[] or TEXT, got {}",
+                "JSON {op}: right side must be TEXT[] or TEXT, got {}",
                 crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         }),
     }
 }
 
+/// Marks for up to this many keys live on the stack. Past it the answer
+/// is one `Vec` for the row rather than one allocation per key.
+const INLINE_KEY_MARKS: usize = 32;
+
+fn any_or_all_keys(lhs_text: &str, keys: &KeyList<'_>, want_all: bool) -> bool {
+    let n = keys.len();
+    if n == 0 {
+        // `?&` of nothing is vacuously true and `?|` of nothing false.
+        // PostgreSQL 18.4 agrees on both.
+        return want_all;
+    }
+    let mut inline = [false; INLINE_KEY_MARKS];
+    let mut spilled;
+    let found: &mut [bool] = if n <= INLINE_KEY_MARKS {
+        &mut inline[..n]
+    } else {
+        spilled = alloc::vec![false; n];
+        &mut spilled
+    };
+    // A NULL element names no key, and PostgreSQL IGNORES it rather
+    // than failing to find it: `?& ARRAY['a',NULL]` is true, and so is
+    // `?& ARRAY[NULL]`. Marking it keeps it from holding the walk open;
+    // the `any` test below excludes it so it satisfies nothing.
+    for (n, mark) in found.iter_mut().enumerate() {
+        if keys.get(n).is_none() {
+            *mark = true;
+        }
+    }
+    let _ = scan_mark_keys(lhs_text, keys, found);
+    if want_all {
+        found.iter().all(|f| *f)
+    } else {
+        (0..n).any(|i| keys.get(i).is_some() && found[i])
+    }
+}
+
 /// v7.37.6-A — PG `jsonb ?| text[]`. Returns BOOL: true iff any one
 /// of the listed keys exists at the top level.
 pub fn keys_any(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
-    let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_ref(),
-        Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "JSON ?|: left side must be JSON or TEXT, got {}",
-                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                ),
-            });
-        }
-    };
-    let Some(keys) = collect_keys(rhs)? else {
+    let Some(lhs_text) = existence_lhs(lhs, "?|")? else {
         return Ok(Value::Null);
     };
-    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON on left of ?|: {e}"),
-    })?;
-    Ok(Value::Bool(keys.iter().any(|k| node_has_key(&doc, k))))
+    let Some(keys) = borrow_keys(rhs, "?|")? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Bool(any_or_all_keys(lhs_text, &keys, false)))
 }
 
 /// v7.37.6-A — PG `jsonb ?& text[]`. Returns BOOL: true iff every
 /// one of the listed keys exists at the top level.
 pub fn keys_all(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
-    let lhs_text = match lhs {
-        Value::Json(s) | Value::Text(s) => s.as_ref(),
-        Value::Null => return Ok(Value::Null),
-        other => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!(
-                    "JSON ?&: left side must be JSON or TEXT, got {}",
-                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                ),
-            });
-        }
-    };
-    let Some(keys) = collect_keys(rhs)? else {
+    let Some(lhs_text) = existence_lhs(lhs, "?&")? else {
         return Ok(Value::Null);
     };
-    let doc = parse(lhs_text).map_err(|e| EvalError::TypeMismatch {
-        detail: alloc::format!("invalid JSON on left of ?&: {e}"),
-    })?;
-    Ok(Value::Bool(keys.iter().all(|k| node_has_key(&doc, k))))
+    let Some(keys) = borrow_keys(rhs, "?&")? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Bool(any_or_all_keys(lhs_text, &keys, true)))
 }
 
 pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
@@ -1008,6 +1187,12 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
             });
         }
     };
+    // The bytes-only answer first: it decides the common shape without
+    // building either document. A `None` falls through to the trees,
+    // which stay the authority on everything it declines.
+    if let Some(verdict) = contains_flat_text(lhs_text, rhs_text) {
+        return Ok(Value::Bool(verdict));
+    }
     let rhs_doc = parse(rhs_text).map_err(|e| EvalError::TypeMismatch {
         detail: alloc::format!("invalid JSON on right of @>: {e}"),
     })?;
@@ -1057,6 +1242,117 @@ pub fn contains(lhs: &Value, rhs: &Value) -> Result<Value<'static>, EvalError> {
 /// Declines on anything else: a non-object left, an object-or-array
 /// value on the right (where containment is recursive and not equality),
 /// or a located slice that will not parse.
+/// v7.38.19 — flat containment answered from both documents' BYTES.
+///
+/// v7.38.9 stopped building a tree for the LEFT document, which is the
+/// big one. What stayed was a tree for the RIGHT — a CONSTANT in every
+/// `WHERE … @> '{…}'` there is — rebuilt on every matched row, plus one
+/// more parse per located value on the left.
+///
+/// `@>` rides the GIN index, so what shows is the recheck per MATCHED
+/// row. On sentori's 200,000-row `events`:
+///
+/// ```text
+/// traits @> '{"plan":"pro"}'                 66,667 rows   18.713 ms   PG 8.193
+/// traits @> '{"plan":"pro","country":"jp"}'  16,667 rows    8.154      PG 4.387
+/// … plus "version":"7"                            0 rows    0.631      PG 0.808
+/// ```
+///
+/// The last line is what named it: with nothing to recheck we are
+/// FASTER than PostgreSQL. The whole gap is per-matched-row, and it
+/// grew by about 70 ns for each key added to the constant — two
+/// allocations a key, which is what building a document costs.
+///
+/// `None` = not a shape this can decide; the caller builds the trees.
+///
+/// Byte equality is only value equality for tokens that denote
+/// themselves. `'{"a":1.00}'::jsonb @> '{"a":1.0}'` is TRUE in
+/// PostgreSQL 18.4 and the two tokens differ, because jsonb numbers
+/// compare numerically while keeping the scale they were written with —
+/// so numbers are handed to the parser. A string carrying an escape is
+/// refused for the same reason from the other direction: `"\u0078"` and
+/// `"x"` are the same string, and only one of them is what canonical
+/// jsonb stores.
+fn token_denotes_itself(tok: &str) -> bool {
+    match tok.as_bytes().first() {
+        Some(b'"') => !tok.as_bytes().contains(&b'\\'),
+        _ => matches!(tok, "true" | "false" | "null"),
+    }
+}
+
+/// The RHS was validated before this path existed, and an operator that
+/// used to reject `'{"a":1} garbage'` must go on rejecting it. The walk
+/// stops at the closing brace, so the tail is checked explicitly rather
+/// than left to a parser that is no longer run.
+fn only_whitespace_after(b: &[u8], i: usize) -> bool {
+    skip_ws_at(b, i) >= b.len()
+}
+
+fn contains_flat_text(lhs_text: &str, rhs_text: &str) -> Option<bool> {
+    let rb = rhs_text.as_bytes();
+    let lb = lhs_text.as_bytes();
+    if lb.get(skip_ws_at(lb, 0)) != Some(&b'{') {
+        return None;
+    }
+    let mut i = skip_ws_at(rb, 0);
+    if rb.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        i = skip_ws_at(rb, i);
+        match rb.get(i)? {
+            b'}' => return only_whitespace_after(rb, i + 1).then_some(true),
+            b'"' => {}
+            _ => return None,
+        }
+        let key_end = scan_string(rb, i)?;
+        let key_tok = rhs_text.get(i..key_end)?;
+        // An escaped key is decoded rather than refused: it is the
+        // LOOKUP, not a comparison, so no canonical form is assumed.
+        let key_owned;
+        let key: &str = match key_tok
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .filter(|inner| !inner.as_bytes().contains(&b'\\'))
+        {
+            Some(plain) => plain,
+            None => {
+                key_owned = decode_string_token(key_tok)?;
+                &key_owned
+            }
+        };
+        i = skip_ws_at(rb, key_end);
+        if rb.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_ws_at(rb, i + 1);
+        let val_start = i;
+        let val_end = scan_value(rb, i)?;
+        let want = rhs_text.get(val_start..val_end)?;
+        if !token_denotes_itself(want) {
+            return None;
+        }
+        match locate_member(lhs_text, key) {
+            None => return Some(false),
+            Some(got) => {
+                if !token_denotes_itself(got) {
+                    return None;
+                }
+                if got != want {
+                    return Some(false);
+                }
+            }
+        }
+        i = skip_ws_at(rb, val_end);
+        match rb.get(i)? {
+            b',' => i += 1,
+            b'}' => return only_whitespace_after(rb, i + 1).then_some(true),
+            _ => return None,
+        }
+    }
+}
+
 fn contains_flat_object(lhs_text: &str, rhs_doc: &JsonValue) -> Option<bool> {
     let JsonValue::Object(members) = rhs_doc else {
         return None;
