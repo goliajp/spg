@@ -744,7 +744,28 @@ impl Engine {
             // joinfold, aggregate) continue to construct without
             // catalog access; catalog-aware builtins return NULL
             // there per documented contract.
-            .with_catalog(&self.catalog)
+            //
+            // v7.38.19 — the ACTIVE catalog, not the committed one.
+            //
+            // A multi-statement simple query is an implicit transaction,
+            // so a function created earlier in the string lives in the
+            // transaction's shadow catalog. Reading the committed one
+            // meant `CREATE FUNCTION f() …; SELECT f()` answered
+            // `function f() does not exist` while the CREATE in that same
+            // string had just succeeded, and PostgreSQL 18.4 answers `1`.
+            //
+            // `CREATE TABLE t(…); SELECT count(*) FROM t` in the same
+            // position was already right, which is why this looked like
+            // an array-return defect when it surfaced: it was found while
+            // re-verifying a customer's ledger entry that said
+            // `RETURNS bigint[]` had been fixed in v7.37.25. Run on its
+            // own it is fixed; run beside its own CREATE it was not, and
+            // the ledger's probe had been the two-statement form.
+            //
+            // Ninth member of the family v7.38.18 documented for
+            // `ANALYZE` -- eight statement kinds read the active catalog
+            // there and one did not.
+            .with_catalog(self.active_catalog())
             // v7.38 (read01 P5.24) — thread the host CSPRNG so gen_random_bytes
             // / gen_salt use real entropy instead of the predictable PRNG.
             .with_salt_fn(self.salt_fn)
