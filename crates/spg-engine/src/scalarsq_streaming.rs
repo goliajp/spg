@@ -329,7 +329,13 @@ impl Engine {
         let schema_cols = &table.schema().columns;
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let ctx = self.ev_ctx(schema_cols, Some(alias));
-        let projection = build_projection(&stmt.items, schema_cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            schema_cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // v7.37.42 (docker-fair SCALARSQ attack 2) — pre-resolve every
         // projection item that's a bare `Expr::Column` to a direct
         // position into `row.values`. The hot loop then short-circuits

@@ -2756,9 +2756,37 @@ fn command_tag(sql: &str, affected: usize) -> String {
         // the object keyword; USER tags as ROLE (PG's alias), MATERIALIZED
         // as MATERIALIZED VIEW. CREATE MATERIALIZED VIEW is a recorded
         // delta: PG tags it SELECT <n> (the materialised row count).
-        first @ ("CREATE" | "ALTER" | "DROP") => {
-            let object = sql.trim_start().split_ascii_whitespace().skip(1).find(|w| {
-                !w.eq_ignore_ascii_case("unique")
+        // A `CREATE` whose text contains `AS` may be a CTAS or a
+        // materialized view, and those two do not tag like the DDL
+        // around them. Parsing is the only way to tell `CREATE TABLE t
+        // AS SELECT` from `CREATE TABLE t (a int)` without guessing, and
+        // the `AS` test keeps the cost off every other CREATE.
+        "CREATE"
+            if sql
+                .split_ascii_whitespace()
+                .any(|w| w.eq_ignore_ascii_case("as")) =>
+        {
+            match spg_sql::parser::parse_statement(sql) {
+                Ok(stmt @ spg_sql::ast::Statement::CreateMaterializedView(_)) => {
+                    command_tag_for_ast(&stmt, affected)
+                }
+                _ => command_tag_ddl_object(sql, "CREATE"),
+            }
+        }
+        first @ ("CREATE" | "ALTER" | "DROP") => command_tag_ddl_object(sql, first),
+        "TRUNCATE" => "TRUNCATE TABLE".to_string(),
+        "REFRESH" => "REFRESH MATERIALIZED VIEW".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// PG's DDL tags are "<VERB> <OBJECT>"; scan past the modifiers to the
+/// object keyword. Split out of `command_tag` so the CTAS arm above can
+/// fall back to it.
+fn command_tag_ddl_object(sql: &str, first: &str) -> String {
+    {
+        let object = sql.trim_start().split_ascii_whitespace().skip(1).find(|w| {
+            !w.eq_ignore_ascii_case("unique")
                     && !w.eq_ignore_ascii_case("or")
                     && !w.eq_ignore_ascii_case("replace")
                     && !w.eq_ignore_ascii_case("temp")
@@ -2772,39 +2800,35 @@ fn command_tag(sql: &str, affected: usize) -> String {
                     // as CREATE TRIGGER in PG; skip the CONSTRAINT modifier so
                     // the object keyword (TRIGGER) is what's found.
                     && !w.eq_ignore_ascii_case("constraint")
-            });
-            const OBJECTS: &[&str] = &[
-                "TABLE",
-                "INDEX",
-                "VIEW",
-                "SEQUENCE",
-                "SCHEMA",
-                "TYPE",
-                "EXTENSION",
-                "DOMAIN",
-                "TRIGGER",
-                "FUNCTION",
-                "DATABASE",
-                "PUBLICATION",
-                "SUBSCRIPTION",
-                "POLICY",
-                "ROLE",
-            ];
-            match object {
-                Some(w) if w.eq_ignore_ascii_case("user") => format!("{first} ROLE"),
-                Some(w) if w.eq_ignore_ascii_case("materialized") && first != "CREATE" => {
-                    format!("{first} MATERIALIZED VIEW")
-                }
-                Some(w) => match OBJECTS.iter().find(|o| w.eq_ignore_ascii_case(o)) {
-                    Some(o) => format!("{first} {o}"),
-                    None => first.to_string(),
-                },
-                None => first.to_string(),
+        });
+        const OBJECTS: &[&str] = &[
+            "TABLE",
+            "INDEX",
+            "VIEW",
+            "SEQUENCE",
+            "SCHEMA",
+            "TYPE",
+            "EXTENSION",
+            "DOMAIN",
+            "TRIGGER",
+            "FUNCTION",
+            "DATABASE",
+            "PUBLICATION",
+            "SUBSCRIPTION",
+            "POLICY",
+            "ROLE",
+        ];
+        match object {
+            Some(w) if w.eq_ignore_ascii_case("user") => format!("{first} ROLE"),
+            Some(w) if w.eq_ignore_ascii_case("materialized") && first != "CREATE" => {
+                format!("{first} MATERIALIZED VIEW")
             }
+            Some(w) => match OBJECTS.iter().find(|o| w.eq_ignore_ascii_case(o)) {
+                Some(o) => format!("{first} {o}"),
+                None => first.to_string(),
+            },
+            None => first.to_string(),
         }
-        "TRUNCATE" => "TRUNCATE TABLE".to_string(),
-        "REFRESH" => "REFRESH MATERIALIZED VIEW".to_string(),
-        other => other.to_string(),
     }
 }
 
@@ -4419,6 +4443,29 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         // count, no leading OID field.
         Statement::Merge(_) => format!("MERGE {affected}"),
         Statement::CreateTable(_) => "CREATE TABLE".to_string(),
+        // v7.38.19 — CTAS and CREATE MATERIALIZED VIEW tag as `SELECT
+        // <n>`, because a driver reads the tag to learn how many rows a
+        // statement wrote. SPG answered `CREATE TABLE`, so every CTAS
+        // reported zero rows written; the table was right and the count
+        // was not, and nothing said so.
+        //
+        // Measured on PG 18.4, all five forms, because the two that are
+        // NOT `SELECT <n>` are the ones reasoning would have missed:
+        //
+        //   CREATE TABLE t AS SELECT …                 SELECT 3
+        //   CREATE TABLE t AS SELECT … WITH NO DATA    CREATE TABLE AS
+        //   SELECT … INTO t                            SELECT 3
+        //   CREATE MATERIALIZED VIEW m AS SELECT …     SELECT 3
+        //   CREATE MATERIALIZED VIEW m AS … NO DATA    CREATE MATERIALIZED VIEW
+        //
+        // Reported by sentori against 7.38.18 (their §2.1). They named
+        // the first; the differential found the other four, including
+        // that SPG was tagging a materialized view a bare `CREATE`.
+        Statement::CreateMaterializedView(m) => match (m.as_plain_table, m.with_data) {
+            (_, true) => format!("SELECT {affected}"),
+            (true, false) => "CREATE TABLE AS".to_string(),
+            (false, false) => "CREATE MATERIALIZED VIEW".to_string(),
+        },
         Statement::DropTable { .. } => "DROP TABLE".to_string(),
         Statement::AlterTable(_) => "ALTER TABLE".to_string(),
         Statement::CreateIndex(_) => "CREATE INDEX".to_string(),
@@ -9045,6 +9092,48 @@ mod tests {
 
     #[test]
     fn command_tag_derives_verb_from_ast_not_first_word() {
+        // v7.38.19 — the five forms that materialise rows, each measured
+        // on PG 18.4 rather than reasoned about. Two of them are NOT
+        // `SELECT <n>`, which is the reason to measure: `WITH NO DATA`
+        // writes nothing, so PG names the object instead of a count.
+        //
+        // sentori reported the first against 7.38.18 (their §2.1); the
+        // differential found the rest, including that a materialized
+        // view was tagging as a bare `CREATE`.
+        assert_eq!(
+            command_tag("CREATE TABLE t AS SELECT * FROM src", 3),
+            "SELECT 3"
+        );
+        assert_eq!(
+            command_tag("CREATE TABLE t AS SELECT * FROM src WHERE false", 0),
+            "SELECT 0"
+        );
+        assert_eq!(
+            command_tag("CREATE TABLE t AS SELECT * FROM src WITH NO DATA", 0),
+            "CREATE TABLE AS"
+        );
+        assert_eq!(
+            command_tag("CREATE MATERIALIZED VIEW m AS SELECT * FROM src", 3),
+            "SELECT 3"
+        );
+        assert_eq!(
+            command_tag(
+                "CREATE MATERIALIZED VIEW m AS SELECT * FROM src WITH NO DATA",
+                0
+            ),
+            "CREATE MATERIALIZED VIEW"
+        );
+        // The negative control: an ordinary CREATE still tags as itself,
+        // including one whose text contains the word `as` in a column
+        // name, which is what routes it through the parser.
+        assert_eq!(command_tag("CREATE TABLE t (a int)", 0), "CREATE TABLE");
+        assert_eq!(command_tag("CREATE TABLE t (as_of int)", 0), "CREATE TABLE");
+        assert_eq!(command_tag("CREATE INDEX i ON t (a)", 0), "CREATE INDEX");
+        assert_eq!(
+            command_tag("CREATE VIEW v AS SELECT * FROM t", 0),
+            "CREATE VIEW"
+        );
+
         // v7.38 (read01 P3.27) — plain statements tag off the first word.
         assert_eq!(command_tag("INSERT INTO t VALUES (1)", 1), "INSERT 0 1");
         assert_eq!(command_tag("UPDATE t SET x = 1", 4), "UPDATE 4");
@@ -9097,10 +9186,14 @@ mod tests {
             command_tag("DROP MATERIALIZED VIEW m", 0),
             "DROP MATERIALIZED VIEW"
         );
-        // CREATE MATERIALIZED VIEW is a recorded delta (PG: SELECT <n>).
+        // v7.38.19 — this pinned `CREATE`, under a comment that said in
+        // the same breath what PG answers: "a recorded delta (PG: SELECT
+        // <n>)". A divergence written down and then asserted as the
+        // expected value is a defect with a test defending it, and this
+        // one survived because the note read like a decision.
         assert_eq!(
             command_tag("CREATE MATERIALIZED VIEW m AS SELECT 1", 0),
-            "CREATE"
+            "SELECT 0"
         );
         assert_eq!(
             command_tag("CREATE EXTENSION pgcrypto", 0),

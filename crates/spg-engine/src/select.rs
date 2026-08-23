@@ -734,6 +734,7 @@ impl Engine {
             alias,
             self.backslash_escapes,
             window_nodes.len(),
+            Some(self.active_catalog()),
         )?;
         let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(n_rows);
         // v7.39 (round 592) — the extended row (input columns plus the window
@@ -2418,6 +2419,7 @@ impl Engine {
                         schema_cols,
                         table_alias,
                         self.backslash_escapes,
+                        Some(self.active_catalog()),
                     )
                     .ok()
                     .and_then(|p| p.into_iter().next())
@@ -3859,8 +3861,13 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection =
-            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &schema_cols,
+            &alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         // v7.19 P5 — Set-Returning-Function in projection
@@ -4113,8 +4120,13 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection =
-            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &schema_cols,
+            &alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // v7.39 (round 621) — and here, for the same reason.
         let srf_idxs = self.srf_target_idxs(&projection);
         let mut src_of_row: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
@@ -5643,8 +5655,13 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection =
-            build_projection(&stmt.items, &schema_cols, &alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &schema_cols,
+            &alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
             alloc::vec::Vec::with_capacity(filtered.len());
         for row in &filtered {
@@ -5877,8 +5894,13 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
         // Projection.
-        let projection =
-            build_projection(&stmt.items, &schema_cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &schema_cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // v7.39 (round 621) — a target-list SRF expands here too. This tail
         // serves VALUES, a derived table and `ROWS FROM (…)`, and knew nothing
         // about them: `SELECT unnest(ARRAY[1,2]), x FROM (VALUES (3),(4)) v(x)`
@@ -6046,7 +6068,13 @@ impl Engine {
             )?;
             return self.finish_agg_result(agg, stmt, CancelToken::none());
         }
-        let projection = build_projection(&stmt.items, &empty_schema, "", self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &empty_schema,
+            "",
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // `SELECT … WHERE cond` with no FROM — the one conceptual
         // row survives only when the condition is true (previously
         // the WHERE was silently ignored: `SELECT 1 WHERE false`
@@ -6845,7 +6873,13 @@ impl Engine {
         let ctx = self
             .ev_ctx(schema_cols, Some(alias))
             .with_sample_rng(&sample_cell);
-        let projection = build_projection(&stmt.items, schema_cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            schema_cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // v7.19 P5 — single-table SELECT path for SRF
         // `SELECT unnest(arr) FROM t` shape. Detect a top-level
         // unnest in the projection list. When present, the
@@ -7586,7 +7620,13 @@ impl Engine {
         let ctx = EvalContext::new(&cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&sess);
-        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let order_by = stmt.order_by.clone();
         // The same one-shot resolution the general path does (round
         // 582): each ORDER BY column is bound once, not once per row.
@@ -7943,7 +7983,13 @@ impl Engine {
         let ctx = EvalContext::new(&cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&sess);
-        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         emit(crate::StreamItem::Header(&columns))?;
         let bound_pos: Vec<Option<usize>> = projection
@@ -8251,7 +8297,13 @@ impl Engine {
         let ctx = EvalContext::new(&cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&sess);
-        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         let bound_pos: Vec<Option<usize>> = projection
             .iter()
@@ -8526,7 +8578,13 @@ impl Engine {
         let ctx = EvalContext::new(&cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&sess);
-        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let order_by = stmt.order_by.clone();
         // The same one-shot resolution the general path does (round
         // 582): each ORDER BY column is bound once, not once per row.
@@ -8770,7 +8828,13 @@ impl Engine {
         let ctx = EvalContext::new(&cols, Some(alias))
             .with_catalog(self.active_catalog())
             .with_session(&sess);
-        let projection = build_projection(&stmt.items, &cols, alias, self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            &cols,
+            alias,
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
 
         let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
         emit(crate::StreamItem::Header(&columns))?;
@@ -9108,8 +9172,13 @@ impl Engine {
             .with_catalog(self.active_catalog())
             .with_engine(self)
             .with_session(&joined_sess);
-        let projection =
-            build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            combined_schema,
+            "",
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // Every projection item must be a bound qualified column —
         // anything that needs `eval_expr_with_correlated` keeps the
         // materialising path.
@@ -9312,8 +9381,13 @@ impl Engine {
             return self.finish_agg_result(agg, stmt, cancel);
         }
 
-        let projection =
-            build_projection(&stmt.items, combined_schema, "", self.backslash_escapes)?;
+        let projection = build_projection(
+            &stmt.items,
+            combined_schema,
+            "",
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         // v7.39 (round 734) — a set-returning projection over a JOIN.
         // This executor's projection loop treats every item as a scalar,
         // so `SELECT unnest(ARRAY[a.id, b.g]) FROM a JOIN b …` died with
@@ -11134,8 +11208,9 @@ pub(crate) fn build_projection(
     schema_cols: &[ColumnSchema],
     table_alias: &str,
     mysql: bool,
+    cat: Option<&Catalog>,
 ) -> Result<Vec<ProjectedItem>, EngineError> {
-    build_projection_hiding_tail(items, schema_cols, table_alias, mysql, 0)
+    build_projection_hiding_tail(items, schema_cols, table_alias, mysql, 0, cat)
 }
 
 /// v7.39 (round 592) — `build_projection` with the last `hidden_tail` columns
@@ -11158,6 +11233,16 @@ pub(crate) fn build_projection_hiding_tail(
     table_alias: &str,
     mysql: bool,
     hidden_tail: usize,
+    // v7.38.19 — the catalog, so a user-defined function's DECLARED
+    // return type reaches the projection. Without it `describe_expr`
+    // cannot type `f_sql()` and the column falls back to text, which is
+    // what psql reads to decide alignment: `SELECT 7::bigint, f_sql()`
+    // right-aligned one cell and left-aligned the other while both held
+    // a bigint. Reported by sentori against 7.38.18 (their §2.2), who
+    // also established that the EXECUTOR was never confused -- CTAS off
+    // the same expression gives a bigint column, and arithmetic on it
+    // works. Only the type travelling in the RowDescription was wrong.
+    cat: Option<&Catalog>,
 ) -> Result<Vec<ProjectedItem>, EngineError> {
     let visible = schema_cols.len().saturating_sub(hidden_tail);
     // v7.39 (round 462) — a join's combined schema qualifies every column
@@ -11288,7 +11373,7 @@ pub(crate) fn build_projection_hiding_tail(
                         fold_exempt: matches!(sch.collation, spg_storage::Collation::Binary),
                         pads: crate::collate::pads_space(sch.collation_name.as_deref()),
                     });
-                } else if let Some(shape) = describe::describe_expr(expr, schema_cols) {
+                } else if let Some(shape) = describe::describe_expr_in(expr, schema_cols, cat) {
                     let output_name = alias
                         .clone()
                         .unwrap_or_else(|| default_output_name(expr, mysql));
