@@ -1,7 +1,7 @@
 # SPG drop-in acceptance report
 
-- image: `goliakk/spg:7.37.15`
-- panel cases: 57  (pass 57  / fail 0)
+- image: `goliakk/spg:7.38.18`
+- panel cases: 71  (pass 71  / fail 0)
 
 **Verdict: PASS — every probed PG dialect feature lands on this SPG image.**
 
@@ -66,9 +66,23 @@
 | `round20.aggregate_group_composite` | ✅ | |
 | `round26.backfill_keyset_offset_skips_orphan` | ✅ | |
 | `round26.backfill_desc_limit_top_end` | ✅ | |
+| `mysql.wire answers` | ✅ | |
+| `mysql.case folds` | ✅ | |
+| `mysql.trailing space is data` | ✅ | |
+| `mysql.indexed equality` | ✅ | |
+| `mysql.indexed IN` | ✅ | |
+| `mysql.indexed ORDER BY` | ✅ | |
+| `mysql.indexed join` | ✅ | |
+| `mariadb.case folds` | ✅ | |
+| `mariadb.trailing space folds` | ✅ | |
+| `mariadb.indexed equality` | ✅ | |
+| `mariadb.indexed IN` | ✅ | |
+| `mariadb.indexed ORDER BY` | ✅ | |
+| `fixture.mailrs-pg-extensions.sql` | ✅ | |
+| `fixture.mailrs-init-schema-v1.7.142.sql` | ✅ | |
 
 ## Reproducer
 
 ```bash
-scripts/dropin-acceptance.sh --image goliakk/spg:7.37.15 --port 25433
+scripts/dropin-acceptance.sh --image goliakk/spg:7.38.18 --port 25433
 ```
