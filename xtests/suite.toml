@@ -3,7 +3,22 @@
 # Flat [[step]] list; file order IS execution order within a tier.
 # `impl = "external"` runs `cmd` as a shell command; "internal" names a
 # suite-run built-in (errors "not wired" until its checklist item).
-# Budgets are provisional until CP0 calibrates them from BASELINE.
+# Budgets WERE provisional "until CP0 calibrates them from BASELINE",
+# and CP0 never ran. They stayed guesses through every release since,
+# and the guesses were wrong in both directions: `gates` was over budget
+# on every prerelease run for months -- 665-743s against 480 -- while
+# `perf-sweep` was given 900s for a step that takes 182, and `ironrules`
+# 120s for one that takes half a second. A tripwire set five times too
+# high catches nothing; one set permanently too low is reported, ignored,
+# and teaches the reader to skip the line.
+#
+# v7.38.18 calibrated the prerelease tier from ten recorded runs on the
+# testbed (2026-08-23). Each budget below is the observed maximum times
+# roughly 1.5, and the observations are written beside it so the next
+# calibration compares against numbers rather than starting over. The
+# `unit` figure ignores one 660s run: that was the first build after a
+# workspace version bump, a full rebuild, and an occasional cold-build
+# overrun is exactly what "recorded, not blocking" is for.
 
 [suite]
 current_pin_prefix = "pin_v738_"
@@ -63,35 +78,40 @@ tier = "prerelease"
 name = "lint"
 impl = "external"
 cmd = "scripts/gate.sh lint"
-budget_s = 240
+# observed 120 / 138 / 220 (min/med/max, n=6)
+budget_s = 330
 
 [[step]]
 tier = "prerelease"
 name = "unit"
 impl = "external"
 cmd = "scripts/gate.sh unit"
-budget_s = 300
+# observed 290 / 329 / 340 warm (n=6; one 660s cold rebuild excluded)
+budget_s = 510
 
 [[step]]
 tier = "prerelease"
 name = "e2e"
 impl = "external"
 cmd = "scripts/gate.sh e2e"
-budget_s = 360
+# observed 297 / 320 / 494 (n=6)
+budget_s = 480
 
 [[step]]
 tier = "prerelease"
 name = "gates"
 impl = "external"
 cmd = "scripts/gate.sh gates"
-budget_s = 480
+# observed 665 / 696 / 743 (n=6) -- was 480, over on every run
+budget_s = 1080
 
 [[step]]
 tier = "prerelease"
 name = "biz"
 impl = "external"
 cmd = "scripts/gate.sh biz"
-budget_s = 300
+# observed 343 / 348 / 376 (n=5)
+budget_s = 540
 # S4.6 — biz (embedded corpus + compat, no suite ports) and dogfood
 # (embedded replay, no ports) overlap safely; ~real CPU overlap.
 group = "corpus"
@@ -101,20 +121,23 @@ tier = "prerelease"
 name = "dogfood"
 impl = "external"
 cmd = "scripts/gate.sh dogfood"
-budget_s = 240
+# observed 110 / 158 / 177 (n=6)
+budget_s = 270
 group = "corpus"
 
 [[step]]
 tier = "prerelease"
 name = "perf-sweep"
 impl = "internal"
-budget_s = 900
+# observed 138 / 148 / 182 (n=4) -- was 900; the third control leg costs ~34s
+budget_s = 300
 
 [[step]]
 tier = "prerelease"
 name = "ironrules"
 impl = "internal"
-budget_s = 120
+# observed 0.3 / 0.5 / 0.5 (n=4) -- was 120
+budget_s = 60
 
 # ── full ──────────────────────────────────────────────────────────────
 
@@ -161,7 +184,8 @@ budget_s = 3600
 tier = "prerelease"
 name = "oracle-three"
 impl = "internal"
-budget_s = 420
+# observed 101 / 104 / 108 (n=4) -- was 420
+budget_s = 180
 
 [[step]]
 tier = "full"
