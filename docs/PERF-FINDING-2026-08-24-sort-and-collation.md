@@ -248,3 +248,33 @@ person finds the condition rather than the conclusion.
 
 **Sentori is not affected**, and by luck rather than design: their
 production is `postgres:18-alpine`, which sorts by bytes too.
+
+## 4. What the sort key costs in memory
+
+Reported because this project treats memory as a face of performance
+rather than a separate budget, and because a 20 % speed-up quoted without
+its cost is half a measurement.
+
+Same two release binaries, same box, 200,000 rows of md5 text under
+`en_US.UTF-8`, RSS of the server process read before and after one
+`ORDER BY`:
+
+| | before the sort | after | growth |
+|---|---|---|---|
+| without sort keys | 158 MB | 237 MB | **78 MB** |
+| with sort keys | 158 MB | 255 MB | **96 MB** |
+
+**+18 MB, or 23 % more peak, for 20 % less time.** The keys are ICU's
+bytes plus a NUL plus the original string, so they are strictly larger
+than the text they replace; 200,000 of them is the 18 MB.
+
+That trade is defensible here — the sweep's RSS ceiling is 4 GB and the
+sort panel's peak is far below it — but it is a trade, and the next
+person choosing whether to widen a sort key should see the number rather
+than infer it.
+
+The first attempt to measure this reported `0 MB` for both binaries. The
+`pgrep` pattern did not match, so `ps -o rss= -p ''` failed and the
+arithmetic ran on an empty string. **A broken instrument and a real zero
+look identical**, which is why the corrected run prints the pid and the
+row count beside the numbers.
