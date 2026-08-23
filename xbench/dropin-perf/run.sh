@@ -128,8 +128,35 @@ seed() { # $1=uri $2=label
 # executions on a laptop spread 9-25%; min-of-three spreads 1-2%, which
 # is the difference between resolving a 10% change and not.
 time_one() { # $1=uri $2=sql
-  "$PSQL" --no-psqlrc -X -q -t -A "$1" -c '\timing on' -c "$2" -c "$2" -c "$2" 2>&1 |
-    grep -E '^Time:' | sed 's/Time: //; s/ ms//' | sort -g | head -1
+  local t
+  t="$("$PSQL" --no-psqlrc -X -q -t -A "$1" -c '\timing on' -c "$2" -c "$2" -c "$2" 2>&1 |
+    grep -E '^Time:' | sed 's/Time: //; s/ ms//' | sort -g | head -1)"
+  # v7.38.19 — an empty timing is a BROKEN RUN, not a fast one.
+  #
+  # Without this the function returned "" whenever the pipeline produced
+  # nothing -- a psql that could not connect, a `\timing` line that
+  # never arrived, a missing tool in the pipe -- and every cell then
+  # printed `-  -  -  unresolved  clean`. A table of dashes reporting a
+  # clean control is indistinguishable from a run where nothing
+  # separated, which is the failure this whole harness exists to avoid
+  # making elsewhere.
+  #
+  # Found by running the harness under a deliberately stripped PATH: the
+  # cause turned out to be the test rig's own missing `grep`, and the
+  # harness reported eight clean unresolved cells about it.
+  if [[ -z "${t}" || ! "${t}" =~ ^[0-9] ]]; then
+    echo "fatal: no timing came back from ${1}." >&2
+    echo "       The statement was: ${2}" >&2
+    echo "       An empty timing is a broken run, not a fast one -- refusing" >&2
+    echo "       to print a table of dashes and call its control clean." >&2
+    # Every call site is a command substitution, so a plain `exit` here
+    # would end the subshell and leave the run walking. The first draft
+    # of this guard did exactly that: it printed the refusal above and
+    # then printed the table of dashes anyway, exit 0. Signal the script.
+    kill -s TERM $$
+    exit 2
+  fi
+  printf '%s' "${t}"
 }
 lo() { printf '%s\n' "$@" | sort -g | head -1; }
 hi() { printf '%s\n' "$@" | sort -g | tail -1; }
@@ -149,7 +176,12 @@ echo "profile:   $PROFILE"
 echo "candidate: $CAND"
 echo "reference: $REF  (control = a second container on the same image)"
 echo "rounds:    N=$N, each sample min-of-3, legs interleaved with a rotating start"
-echo "load before: $(uptime)"
+# v7.38.19 — `uptime` is not on every container's PATH, and this line is
+# context rather than a measurement, so its absence must not stop a run.
+# Found by listing what the script actually calls after the README
+# claimed it needed three commands: it calls ten.
+load_line() { command -v uptime >/dev/null 2>&1 && uptime || echo "(uptime unavailable)"; }
+echo "load before: $(load_line)"
 
 boot "${NAMES[0]}" "$CAND" "$CAND_PORT"
 boot "${NAMES[1]}" "$REF"  "$REF_PORT"
@@ -205,7 +237,7 @@ if [ "$CELLS" -ne "$EXPECTED" ]; then
 fi
 
 echo
-echo "load after: $(uptime)"
+echo "load after: $(load_line)"
 echo "cells=$CELLS candidate_slower=$SLOWER candidate_faster=$FASTER control_false_differences=$CONTROL_DIFFS"
 if [ "$CONTROL_DIFFS" -gt 0 ]; then
   echo "The control leg — the reference image compared against itself — reported"
