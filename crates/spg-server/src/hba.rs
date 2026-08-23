@@ -90,9 +90,8 @@ pub struct Hba {
 fn parse_net(tok: &str) -> Option<(IpAddr, u8)> {
     // `samehost` and `samenet` need the server's own addresses, which
     // this does not have; `all` is everything.
-    match tok.to_ascii_lowercase().as_str() {
-        "all" => return Some((IpAddr::from([0u8, 0, 0, 0]), 0)),
-        _ => {}
+    if tok.eq_ignore_ascii_case("all") {
+        return Some((IpAddr::from([0u8, 0, 0, 0]), 0));
     }
     let (addr, bits) = tok.split_once('/')?;
     let ip: IpAddr = addr.parse().ok()?;
