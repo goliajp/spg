@@ -161,6 +161,7 @@ mod e2e_flusher_idle_gate_round176;
 )]
 mod e2e_freezer;
 mod e2e_fsync_fail_round190;
+mod e2e_function_visible_same_query;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
