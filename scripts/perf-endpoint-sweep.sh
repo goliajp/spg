@@ -74,11 +74,28 @@ echo "load before: $(uptime)"
 # on it, and nothing printed said so. A panel comparing "locale against
 # C" was comparing en_US against en_US and reporting no losses. A number
 # whose conditions are not printed is a number nobody can check.
-for leg_uri in "${SPG_URI}" "${PG_URI}"; do
-  leg_coll="$("${PSQL}" --no-psqlrc -X -q -t -A "${leg_uri}" \
-    -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>/dev/null | head -1)"
-  echo "leg $(host_of "${leg_uri}"):$(printf '%s' "${leg_uri}" | sed 's|.*:||;s|/.*||') collation: ${leg_coll:-<unknown>}"
-done
+#
+# And CHECKED, not only printed. Three times in this version an
+# instrument printed something true and nothing compared it to what was
+# expected, so the expectation is stated here: `EXPECT_SPG_COLLATE`
+# defaults to `C` because that is what every cell's history was measured
+# under, and a leg serving something else is a run whose numbers are not
+# comparable to the ones before it.
+EXPECT_SPG_COLLATE="${EXPECT_SPG_COLLATE:-C}"
+leg_collation() {
+  "${PSQL}" --no-psqlrc -X -q -t -A "$1" \
+    -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>/dev/null | head -1
+}
+spg_coll="$(leg_collation "${SPG_URI}")"
+pg_coll="$(leg_collation "${PG_URI}")"
+echo "leg SPGS collation: ${spg_coll:-<unknown>}   leg PG18 collation: ${pg_coll:-<unknown>}"
+if [[ "${spg_coll}" != "${EXPECT_SPG_COLLATE}" ]]; then
+  echo "fatal: the SPGS leg serves collation ${spg_coll:-<unknown>}, expected ${EXPECT_SPG_COLLATE}." >&2
+  echo "       Every cell's history was measured under ${EXPECT_SPG_COLLATE}; a leg serving" >&2
+  echo "       something else produces numbers that cannot be compared to them. Pass" >&2
+  echo "       EXPECT_SPG_COLLATE to say you meant it." >&2
+  exit 2
+fi
 
 # r1022 — the two legs must reach the client over the SAME route, and this
 # refuses to score them when the URIs say they do not.
