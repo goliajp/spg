@@ -174,7 +174,9 @@ pub fn create_run() -> Result<Box<dyn TempRun>, TempStoreError> {
 pub fn create_run_in(dir: &Path) -> Result<FileRun, TempStoreError> {
     fs::create_dir_all(dir).map_err(|e| io_err("creating temp dir", &e))?;
     let serial = RUN_SERIAL.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("{RUN_PREFIX}{}-{serial}.run", std::process::id()));
+    let rd = run_dir(dir);
+    let _ = fs::create_dir_all(&rd);
+    let path = rd.join(format!("{RUN_PREFIX}{}-{serial}.run", std::process::id()));
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -195,9 +197,34 @@ pub fn create_run_in(dir: &Path) -> Result<FileRun, TempStoreError> {
 /// Remove run files this process cannot own — anything matching the run
 /// prefix whose pid is not ours. Called once at startup; a `kill -9`
 /// leaves files that no `Drop` will ever reach.
+/// v7.38.19 — read SPG's OWN run directory, not the whole temp
+/// directory.
+///
+/// This scanned everything in `$TMPDIR` at every server start, so the
+/// cost of starting SPG was the size of a directory SPG does not own. On
+/// the machine this was found on that directory held 61,708 entries and
+/// 30 GB, and one `readdir` over it took **95 seconds** — so every
+/// server start, including every one an e2e test spawns, waited a minute
+/// and a half before it could listen. The failures that produces read
+/// exactly like a busy machine: `EWOULDBLOCK` on a socket read, "server
+/// didn't publish native listen addr within Ns".
+///
+/// The entries were `spg-e2e-*`, `spg-cli-*` and friends — this
+/// project's own tests, which build a unique path per run under
+/// `std::env::temp_dir()` and never remove it. `sweep_orphans` could
+/// never have collected them: it only removes `spg-sort-*`. So the sweep
+/// paid for reading tens of thousands of files it was not allowed to
+/// touch.
+///
+/// Confining the run files to a subdirectory bounds the scan by what SPG
+/// itself wrote, whatever else lives in the temp directory.
+pub fn run_dir(base: &Path) -> PathBuf {
+    base.join("spg-run")
+}
+
 pub fn sweep_orphans(dir: &Path) -> usize {
     let mine = format!("{RUN_PREFIX}{}-", std::process::id());
-    let Ok(entries) = fs::read_dir(dir) else {
+    let Ok(entries) = fs::read_dir(run_dir(dir)) else {
         return 0;
     };
     let mut removed = 0;

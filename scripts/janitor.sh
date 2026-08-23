@@ -87,4 +87,32 @@ if [[ -d target ]]; then
     fi
 fi
 
+# ── 4. $TMPDIR — the test suite's own leak ───────────────────────────
+#
+# v7.38.19. 160 test files build a unique path under
+# `std::env::temp_dir()` per run and none of them removes it. On the
+# machine this was found on that had reached **61,708 entries and 30 GB**,
+# and it was not only disk: `spg-server` swept that directory at every
+# start, so one `readdir` over it took **95 seconds** and every server an
+# e2e test spawned waited a minute and a half before it could listen. The
+# failures read exactly like a busy machine -- `EWOULDBLOCK`, "server
+# didn't publish native listen addr within Ns" -- which is what they were
+# put down to.
+#
+# The server no longer scans it (its run files moved into `spg-run/`), so
+# this is now about disk. Names are `spg-*` and every one is a test
+# artifact; a day old is well past any run that could still want one.
+TMP="${TMPDIR:-/tmp}"
+leaked=$(find "$TMP" -maxdepth 1 -name 'spg-*' -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+if [[ "${leaked:-0}" -gt 0 ]]; then
+    if [[ "$DRY" == 1 ]]; then
+        say "would remove $leaked leaked spg-* temp entries older than a day from $TMP"
+    else
+        find "$TMP" -maxdepth 1 -name 'spg-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+        say "removed $leaked leaked spg-* temp entries older than a day from $TMP"
+    fi
+else
+    say "no leaked spg-* temp entries older than a day"
+fi
+
 say "done$( [[ $DRY == 1 ]] && echo ' (dry run)' )"
