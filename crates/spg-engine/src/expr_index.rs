@@ -93,7 +93,10 @@ impl ExprKeyPlan {
             // byte-ordered B-tree order it by the locale.
             if let Some(Some(coll)) = self.collations.get(slot) {
                 let pos = self.key_columns[slot];
-                out.push(collated_key(coll, values.get(pos)));
+                out.push(
+                    crate::collate::Collated::resolve(coll)
+                        .and_then(|c| collated_key(&c, values.get(pos))),
+                );
                 continue;
             }
             out.push(match expr {
@@ -117,13 +120,25 @@ impl ExprKeyPlan {
 /// for a collation this build cannot perform — the last of which retires
 /// the index rather than filling it with keys of the wrong shape, which
 /// is the same choice the expression path makes.
-fn collated_key(coll: &str, v: Option<&Value<'static>>) -> Option<Value<'static>> {
+/// v7.38.19 — takes the RESOLVED collation, not its name.
+///
+/// It took a `&str` and called `collate::sort_key`, which parses the
+/// locale and builds a whole ICU collator on every call. Both callers
+/// run it per ROW — one builds an index entry for every stored row, the
+/// other every key of a rebuild — so a collated index cost one collator
+/// construction per row. Same defect the scan filter had, in two more
+/// paths that were never connected to `Collated`.
+fn collated_key(
+    c: &crate::collate::Collated,
+    v: Option<&Value<'static>>,
+) -> Option<Value<'static>> {
     let text = match v? {
         Value::Text(t) => t.as_ref(),
         Value::BpChar(t) => t.as_ref(),
         _ => return None,
     };
-    crate::collate::sort_key(coll, text).map(|k| Value::Bytes(alloc::borrow::Cow::Owned(k)))
+    c.sort_key_of(text)
+        .map(|k| Value::Bytes(alloc::borrow::Cow::Owned(k)))
 }
 
 /// Bring every unusable expression index on `table` back into service by
@@ -137,12 +152,16 @@ pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
     // same mechanism, and `add_index` deliberately leaves theirs empty
     // because this crate is the only one that can encode their keys.
     for (name, pos, coll) in table.stale_collated_indices() {
+        // Resolved ONCE for the whole rebuild rather than once per row.
+        let Some(resolved) = crate::collate::Collated::resolve(&coll) else {
+            continue;
+        };
         let mut keys: Vec<Option<Value<'static>>> = Vec::with_capacity(table.stored_row_count());
         for i in 0..table.stored_row_count() {
             let Some(values) = table.row_values_at(i) else {
                 return Ok(());
             };
-            keys.push(collated_key(&coll, values.get(pos)));
+            keys.push(collated_key(&resolved, values.get(pos)));
         }
         table
             .rebuild_expression_index(&name, &keys)
