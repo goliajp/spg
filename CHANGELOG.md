@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.18] — 2026-08-23
 
 ### Added
 
@@ -201,6 +201,40 @@ the current build; this file is a release-organized view.
   testable over the same wire: SPG reads the name.
 
 ### Fixed
+
+- **The precommit budgets were measuring the build cache.** They are
+  hard — a step over budget fails the commit — and they claim to measure
+  the change. `slt-smoke` is `cargo run -q -p sqllogictest`: the corpus
+  it runs is **1.5-2.0 s** for all 413 cases, measured twice warm, while
+  the step itself has been anywhere from 0.8 s to 19.7 s depending on
+  whether something had already built the workspace in debug. At a 15 s
+  budget that split ran straight through the middle.
+
+  It failed this release's own release commit, which touched
+  `CHANGELOG.md` and nothing else: its affected-crate steps correctly
+  skipped while the rebuild left by the three commits before it landed
+  on this one. The band that widens these budgets is computed from the
+  diff; the cost comes from the cache, and those are different
+  questions.
+
+  The tier now compiles **once, before anything is timed**, and that
+  compile is in neither a step budget nor the tier total — printed
+  separately, because a total that cannot show what it excluded is a
+  total that overstates. This is v7.38.14's finding one level down: that
+  release banded the *tier* cap after a no-op change could not clear it,
+  and left the per-step budgets flat, measuring exactly what it had just
+  said not to measure.
+
+- **The prerelease budgets had never been calibrated.** The manifest said
+  they were "provisional until CP0 calibrates them from BASELINE" and CP0
+  never ran, so every number was a guess — wrong in both directions.
+  `gates` was over budget on **every** prerelease run for months (665-743 s
+  against 480), while `perf-sweep` had 900 s for a step that takes 182 and
+  `ironrules` 120 s for one that takes half a second. A tripwire set five
+  times too high catches nothing; one set permanently too low is reported,
+  ignored, and teaches the reader to skip the line. Each is now the
+  observed maximum times roughly 1.5 over ten recorded runs, with the
+  observations written beside it.
 
 - **The perf sweep's control leg was decoration, and it mis-called a
   cell.** The header has said since round 885 that the same-binary
