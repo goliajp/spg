@@ -174,6 +174,44 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **The perf sweep's control leg was decoration, and it mis-called a
+  cell.** The header has said since round 885 that the same-binary
+  control's differing-cell count *is* the run's resolution, and that
+  cells inside that resolution report `unresolved`. The code did
+  neither: the control ran at one row count, after every size had
+  finished — a different window from the cells it was meant to qualify —
+  and its number was printed and dropped.
+
+  A prerelease run called `two keys` at 1,000 rows a LOSS on a 27
+  microsecond separation, 0.708-0.935 ms against 0.609-0.681, while its
+  control reported a clean floor from that later, calmer window. The box
+  had been at load 6.8 and the whole 1,000-row band was inflated with
+  it. Re-measured exclusive at N=25: **0.524-0.645 against PG18's
+  0.516-0.718** — no gap.
+
+  Every cell now carries its own control leg, timed between the other
+  two with the starting leg rotating each round. Where the binary
+  separates from *itself*, that cell's verdict is withdrawn and the
+  control's range printed beside it; the summary line carries
+  `withdrawn=`, so a clean sweep cannot be quoted without saying how
+  much of it was unreadable. No threshold was introduced — a chosen
+  microsecond floor is tunable until the inconvenient cell passes.
+
+- **The gate's cross-version open only ever made a one-release hop.**
+  The step that opens a released data directory with the new binary
+  picked the *newest* previous release, which is the hop least likely to
+  break: it is almost always the same `FILE_VERSION` on both sides. This
+  release moves `FILE_VERSION` 91 → 92 for the database collation, and
+  an installation several releases back makes exactly the jump nothing
+  checked. It now opens the oldest fixture as well as the newest and
+  names both in the verdict.
+
+- **The acceptance report at the repository root was written by hand.**
+  It said `goliakk/spg:7.37.15` and `panel cases: 57` while the panel
+  had been 66 of 66 for several releases. A tracked file whose freshness
+  depends on someone remembering is a stale file; the release now writes
+  it from the versioned report it already produces.
+
 - **`SPG_FREEZER_DISABLE=false` disabled the freezer.** SPG read a
   boolean switch two ways: `SPG_AUTOVACUUM` took `0`, `false` or `off`
   as off, while four others took only `0` — so every other spelling,
