@@ -278,11 +278,7 @@ fn step1(cs: &mut Vec<char>, r1: usize, r2: usize, rv: usize) -> bool {
     // out: `bâtiment` stems to `bât` on PG 18.4, not `bâti`.
     for s in ["ments", "ment"] {
         let l = s.chars().count();
-        if ends_with(cs, s)
-            && cs.len() > l
-            && is_vowel(cs[cs.len() - l - 1])
-            && cs.len() - l - 1 >= rv
-        {
+        if ends_with(cs, s) && cs.len() > l && is_vowel(cs[cs.len() - l - 1]) && cs.len() - l > rv {
             cut(cs, s);
             // ...and then the `i`-verb rule gets its turn, which is the
             // half a reading of the algorithm alone would miss. Asked

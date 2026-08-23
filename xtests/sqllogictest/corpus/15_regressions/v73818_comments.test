@@ -1,0 +1,62 @@
+# v7.38.18 — every comment form each dialect has, including the two
+# where the two dialects disagree on the SAME input.
+#
+# Measured on PostgreSQL 18.4 and MySQL 9 before any of this was
+# written:
+#
+#   SELECT /* a /* b */ c */ 1     PG 18.4: 1     MySQL: syntax error
+#   SELECT /* a /* b */ 1          PG 18.4: error MySQL 9: 1
+#   SELECT 1 # x                   PG 18.4: column "x" does not exist
+#                                  MySQL 9: 1
+#
+# PostgreSQL's block comments NEST; MySQL's do not, so its first `*/`
+# closes. There is no reading that satisfies both, which is why the
+# dialect flag decides.
+#
+# This file is the PG half; `mysql/18_comments.test` is the other.
+
+query I
+SELECT 1 -- a trailing line comment
+----
+1
+
+query I
+SELECT /* a block comment */ 1
+----
+1
+
+query I
+SELECT /* a
+multi-line
+comment */ 1
+----
+1
+
+# PG's comments nest, three deep. This was a syntax error before
+# v7.38.18: the lexer closed at the first `*/` and the rest of the line
+# became stray tokens.
+query I
+SELECT /* a /* b */ c */ 1
+----
+1
+
+query I
+SELECT /* a /* b /* c */ d */ e */ 1
+----
+1
+
+# ...and an unterminated nest is still an error, which is what makes
+# the nesting real rather than a lexer that ignores `/*`.
+statement error
+SELECT /* a /* b */ 1
+
+# A dollar-quoted body is not comment territory.
+query T
+SELECT $$ /* not a comment $$
+----
+ /* not a comment 
+
+# `#` is NOT a comment in PostgreSQL — it reads as a column reference,
+# which is what PG 18.4 answers with `column "x" does not exist`.
+statement error
+SELECT 1 # x

@@ -40,6 +40,29 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **Every comment form each dialect has**, including the two where the
+  two dialects disagree about the same input.
+
+  PostgreSQL's block comments **nest**; MySQL's do not. Measured before
+  anything was written: `SELECT /* a /* b */ c */ 1` is `1` on PG 18.4
+  and a syntax error on MySQL 9, and `SELECT /* a /* b */ 1` is the
+  other way round. There is no reading that satisfies both, so the
+  dialect decides — and SPG had neither, treating the first `*/` as the
+  close and erroring on what followed.
+
+  `#` to end of line is a comment in MySQL and a column reference in
+  PostgreSQL (`column "x" does not exist`, which is what SPG already
+  answered in both). It is a comment in the MySQL dialect now.
+
+  `/*! STRAIGHT_JOIN */`, `/*! FORCE INDEX (…) */` and `/*+ BKA(t) */`
+  parse and are ignored. MySQL EXECUTES what is inside `/*! … */`, so
+  SPG lexes it as SQL and a hint SPG's planner does not have was a
+  syntax error; a body made only of hints is skipped instead, which is
+  the reading MySQL gives a hint of its own it has retired. **A body
+  that is real SQL is still executed** — `SELECT 1 /*!40000 , 2 */`
+  answers two rows — because every mysqldump depends on it, and too
+  wide a rule here would silently drop half a dump.
+
 - **`pg_hba.conf`-style host-based authentication.** `SPG_HBA_FILE`
   names a file in PostgreSQL's own format:
 

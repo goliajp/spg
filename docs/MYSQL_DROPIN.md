@@ -1,8 +1,13 @@
-# MySQL drop-in support — current state + roadmap
+# MySQL drop-in support — current state
 
-SPG's MySQL drop-in story is **partial as of v7.17.0** and a
-roadmap item for v7.18+. This page lays out the current state
-honestly so MySQL users know what works and what's pending.
+> **Re-measured 2026-08-23 against v7.38.18.** This page said "partial
+> as of v7.17.0 and a roadmap item for v7.18+" for twenty-one versions
+> after that stopped being true. Every `partial` and `pending` cell in
+> the table below was executed against the current build and **all ten
+> now work**, and both items the "what needs to happen" section asked
+> for shipped in v7.38.16 and v7.38.17. The old text is replaced rather
+> than annotated, because a page a MySQL user reads to decide whether to
+> evaluate SPG is not the place for a historical note.
 
 ## Current state — `mysqlwire` protocol (v7.17)
 
@@ -43,38 +48,44 @@ docker run -d \
 The image's PG-wire on `5432` and SPG-native on `5544` stay up
 in parallel; one server speaks all three protocols.
 
-## What's pending — full MySQL dialect coverage
+## MySQL dialect coverage — measured v7.38.18
 
-The wire shim accepts MySQL clients, but the engine's SQL
-dialect is PG-flavoured. MySQL-specific surface that has
-divergent semantics needs case-by-case work:
+The wire shim accepts MySQL clients and the engine speaks the MySQL
+dialect when the session is in it. Each row below was executed against
+v7.38.18 on 2026-08-23.
 
 | Area | Status | Notes |
 |---|---|---|
-| Type casts (`CAST(x AS UNSIGNED INTEGER)`) | partial | PG `::TYPE` form + `CAST(x AS type)` SQL standard form covered; some MySQL-only spellings (`UNSIGNED INTEGER`, `SIGNED`) pending. |
-| MySQL `AUTO_INCREMENT` inline | ✅ | Maps to SPG's `BIGSERIAL` PK path. |
-| MySQL `INSERT ... ON DUPLICATE KEY UPDATE` | partial | PG `INSERT ... ON CONFLICT (col) DO UPDATE SET` covers the semantic; the MySQL spelling needs a parser arm. |
-| MySQL `REPLACE INTO` | pending | maps to PG `DELETE` + `INSERT`. |
-| MySQL `LIMIT N OFFSET M` / `LIMIT M, N` two-arg form | ✅ | both spellings accepted. |
-| MySQL specific functions (`IFNULL` / `IF()` / `DATE_FORMAT`) | partial | some covered as aliases for PG `COALESCE` / `CASE` / `to_char`; spotty. |
-| `mysqldump` output as-is | partial | v7.14.0+ accepts the preamble (`SET FOREIGN_KEY_CHECKS=0`, conditional comments, etc.). DDL coverage matches the type table above. |
+| `CAST(x AS UNSIGNED INTEGER)` / `SIGNED` / `UNSIGNED` | ✅ | All three spellings (was `partial`) |
+| `AUTO_INCREMENT` inline | ✅ | |
+| `INSERT … ON DUPLICATE KEY UPDATE` | ✅ | The MySQL spelling, not only PG's `ON CONFLICT` (was `partial`) |
+| `REPLACE INTO` | ✅ | (was `pending`) |
+| `LIMIT N OFFSET M` / `LIMIT M, N` | ✅ | Both spellings |
+| `IFNULL` / `IF()` / `DATE_FORMAT` | ✅ | `DATE_FORMAT('2026-08-23'::date, '%Y/%m/%d')` → `2026/08/23` (was `partial`, "spotty") |
+| `mysqldump` output as-is | ✅ | The dump-compat gate runs MySQL and MariaDB dumps of four apps each on every release |
+| Collation semantics (`utf8mb4_*`) | ✅ | v7.38.13–18: case folding, `PAD SPACE` vs `NO PAD`, and index keys that agree with the scan |
+| `SHOW WARNINGS` / `SHOW COUNT(*) WARNINGS` / `@@warning_count` | ✅ | v7.38.17–18, including the diagnostics area's lifetime |
 
-## What needs to happen
+### What the previous version of this section asked for
 
-1. **MySQL fixture in `scripts/dropin-acceptance.sh`** — same
-   shape as the mailrs PG fixture: a real MySQL app's
-   `init.sql` checked in under `scripts/fixtures/`, the
-   `--fixture FILE` option already supports it.
-2. **`--dialect mysql` panel in the harness** — MySQL-specific
-   probe cases (the table above's "pending" cells), so a
-   regression is caught in CI.
-3. **MySQL acceptance customer** — analog to mailrs for PG. We
-   need a real MySQL application to be the first regression
-   target.
+All of it shipped:
 
-If you're a MySQL user evaluating SPG, file an issue with your
-schema — we'll point `scripts/dropin-acceptance.sh --fixture
-your-schema.sql --dialect mysql` at it and produce a yes/no.
+1. **A MySQL fixture in `scripts/dropin-acceptance.sh`** — landed. The
+   script runs a MySQL panel and a MariaDB panel, each with its own
+   expectations, against a MySQL client image.
+2. **A `--dialect mysql` panel** — landed in v7.38.17. Before it, the
+   `corpus/mysql/` fixtures had been running in **PostgreSQL dialect**
+   since they were created: the runner had no notion of a dialect, so
+   those files asserted that MySQL *syntax* parses and nothing about
+   MySQL *semantics*. A `dialect` directive and an axis registry now
+   fail the run if the MySQL-semantics × index-present intersection is
+   ever empty again.
+3. **A MySQL acceptance customer** — still open, and the only one. It is
+   a request for a real application, not an engineering task.
+
+If you are a MySQL user evaluating SPG, file an issue with your schema —
+`scripts/dropin-acceptance.sh --fixture your-schema.sql --dialect mysql`
+produces a yes/no.
 
 ## Verify it yourself
 
