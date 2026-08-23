@@ -1018,6 +1018,89 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 /// matches PG's default C / binary collation (SPG's collations are
 /// byte-order). NULLs continue to ride the `Num(±INFINITY)` sentinel
 /// the builders emit, so NULLS FIRST/LAST placement is unchanged.
+/// v7.38.19 — a sort key's text, without a heap allocation when it fits.
+///
+/// `OrderKey::Text` held a `String`, so ordering 200,000 rows by a text
+/// column made 200,000 allocations and 200,000 frees. A leaf-symbol
+/// profile of exactly that sort put the allocator level with the work it
+/// was there to do: `_xzm_free` and `_free` together at 229 samples
+/// against `_platform_memcmp`'s 205.
+///
+/// Inline capacity is 15 bytes and the heap arm is `Box<str>` rather
+/// than `String`, both for the same reason: the whole type must stay
+/// within the 24 bytes a `String` occupied, or `OrderKey` grows from 32
+/// bytes to 48 and every sort in the engine pays for a change that was
+/// meant to help one. v7.37.26 did exactly that to `IndexKey` -- 32 to
+/// 48 bytes -- and two queries with no numeric column in them paid 7-8%.
+///
+/// The ordering is the bytes, in both arms and across them, which is
+/// what `Ord` on `str` gives and what the hand-written comparator below
+/// already assumed.
+#[derive(Clone)]
+pub(crate) enum CompactText {
+    Inline(u8, [u8; 15]),
+    Heap(alloc::boxed::Box<str>),
+}
+
+impl CompactText {
+    pub(crate) fn new(s: &str) -> Self {
+        let b = s.as_bytes();
+        if b.len() <= 15 {
+            let mut buf = [0u8; 15];
+            buf[..b.len()].copy_from_slice(b);
+            // The length is stored, not inferred from a NUL: a key may
+            // legitimately contain one, and inferring would silently
+            // truncate it.
+            Self::Inline(b.len() as u8, buf)
+        } else {
+            Self::Heap(s.into())
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            // Built from a `&str`, so the bytes are valid UTF-8 by
+            // construction; the slice is a prefix of one, which UTF-8
+            // guarantees is itself valid only when cut at a boundary --
+            // and `new` copies whole strings, never cuts.
+            Self::Inline(n, buf) => core::str::from_utf8(&buf[..*n as usize]).unwrap_or(""),
+            Self::Heap(s) => s,
+        }
+    }
+}
+
+impl From<&str> for CompactText {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl PartialEq for CompactText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for CompactText {}
+
+impl PartialOrd for CompactText {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CompactText {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl core::fmt::Debug for CompactText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub(crate) enum OrderKey {
     /// v7.37.16 — NULL sentinels. Historically NULL packed as `Num(±INF)`,
@@ -1035,7 +1118,7 @@ pub(crate) enum OrderKey {
     /// values past 2^53 (`9007199254740993` == `9007199254740992` as f64),
     /// giving a wrong ORDER BY. i128 holds every such value exactly.
     Int(i128),
-    Text(alloc::string::String),
+    Text(CompactText),
     /// v7.37 — byte-orderable key for types PG sorts byte-wise but that
     /// have no meaningful f64 projection: bytea, uuid, macaddr(8), inet/cidr
     /// (encoded `[family, addr.., bits]`). Sorts after finite Num / Text in
@@ -1103,7 +1186,7 @@ fn order_key_elem_cmp_in(
     // v7.38.18 — resolved once by `order_by_collations`, not per call.
     // Building the collator here cost ten times the comparison.
     if let (OrderKey::Text(x), OrderKey::Text(y), Some(c)) = (a, b, collation) {
-        return c.compare(x, y);
+        return c.compare(x.as_str(), y.as_str());
     }
     order_key_elem_cmp(a, b)
 }
@@ -1778,7 +1861,7 @@ pub(crate) fn build_order_keys_bound(
                 Value::Text(s) => spg_storage::mysql_compare_fold(s),
                 _ => unreachable!("guarded by matches! above"),
             };
-            keys.push(OrderKey::Text(folded));
+            keys.push(OrderKey::Text(CompactText::new(&folded)));
         } else {
             keys.push(value_to_order_key(v)?);
         }
@@ -2169,5 +2252,67 @@ mod inline_int_key_sort_tests {
             })
             .collect();
         assert_eq!(keys, vec![0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod compact_text_pins {
+    use super::{CompactText, OrderKey};
+
+    /// v7.38.19 — the size is the whole reason the type is shaped this
+    /// way. `OrderKey` is 32 bytes because `Int(i128)` forces align 16;
+    /// a text payload wider than a `String`'s 24 bytes takes it to 48
+    /// and every sort in the engine pays. v7.37.26 did exactly that to
+    /// `IndexKey` and two queries with no numeric column paid 7-8%.
+    #[test]
+    fn the_key_did_not_grow() {
+        assert_eq!(core::mem::size_of::<CompactText>(), 24);
+        assert_eq!(core::mem::size_of::<OrderKey>(), 32);
+    }
+
+    /// Ordering is the bytes, in both arms and ACROSS them: a short key
+    /// and a long one must compare as their text, not as their storage.
+    #[test]
+    fn both_arms_order_as_text() {
+        let short = CompactText::new("apple");
+        let long = CompactText::new("apple pie with a very long name");
+        assert!(matches!(short, CompactText::Inline(..)));
+        assert!(matches!(long, CompactText::Heap(_)));
+        assert!(short < long);
+        assert!(long > short);
+        assert_eq!(short, CompactText::new("apple"));
+        assert_ne!(short, long);
+
+        // The boundary, from both sides.
+        let at = CompactText::new(&"x".repeat(15));
+        let over = CompactText::new(&"x".repeat(16));
+        assert!(matches!(at, CompactText::Inline(..)));
+        assert!(matches!(over, CompactText::Heap(_)));
+        assert!(at < over);
+        assert_eq!(at.as_str().len(), 15);
+        assert_eq!(over.as_str().len(), 16);
+
+        // A key may contain a NUL, so the length is stored rather than
+        // inferred from the buffer's zero bytes.
+        let nul = CompactText::new("a\0b");
+        assert_eq!(nul.as_str(), "a\0b");
+        assert_eq!(nul.as_str().len(), 3);
+        assert!(CompactText::new("a\0a") < nul);
+
+        // Empty, and multi-byte UTF-8 that straddles the boundary.
+        assert_eq!(CompactText::new("").as_str(), "");
+        // Five CJK characters are exactly fifteen bytes and fit; six do
+        // not. The first draft of this test asserted the five-character
+        // one was on the heap, which is the arithmetic the inline arm is
+        // there to get right.
+        let cjk_fit = CompactText::new("日本語です");
+        assert_eq!(cjk_fit.as_str(), "日本語です");
+        assert!(matches!(cjk_fit, CompactText::Inline(15, _)));
+        let cjk = CompactText::new("日本語ですね");
+        assert_eq!(cjk.as_str(), "日本語ですね");
+        assert!(matches!(cjk, CompactText::Heap(_)));
+        let cjk_short = CompactText::new("日本語");
+        assert_eq!(cjk_short.as_str(), "日本語");
+        assert!(matches!(cjk_short, CompactText::Inline(..)));
     }
 }
