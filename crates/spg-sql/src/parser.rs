@@ -1866,6 +1866,32 @@ impl Parser {
         }
     }
 
+    /// v7.38.19 — the database name a `CREATE DATABASE` names, skipping
+    /// an `IF NOT EXISTS`. Consumes only the name; the collation scanner
+    /// runs after it and eats the rest.
+    fn scan_database_name(&mut self) -> Option<String> {
+        // The caller has only PEEKED at `DATABASE`; step past it, or the
+        // first identifier found is the keyword itself. It was, and
+        // `pg_database` listed a database called `database`.
+        if matches!(self.peek(), Token::Ident(w) | Token::QuotedIdent(w) if w.eq_ignore_ascii_case("database"))
+        {
+            self.advance();
+        }
+        for kw in ["if", "not", "exists"] {
+            if matches!(self.peek(), Token::Ident(w) | Token::QuotedIdent(w) if w.eq_ignore_ascii_case(kw))
+            {
+                self.advance();
+            }
+        }
+        match self.peek().clone() {
+            Token::Ident(w) | Token::QuotedIdent(w) => {
+                self.advance();
+                Some(w)
+            }
+            _ => None,
+        }
+    }
+
     /// v7.38.18 — consume to the statement boundary like
     /// `consume_until_statement_boundary`, but pick out the collation a
     /// `CREATE DATABASE` asked for on the way.
@@ -4963,6 +4989,13 @@ impl Parser {
                 // this one is named. Still a no-op otherwise — SPG is
                 // single-database.
                 let is_database = s.eq_ignore_ascii_case("database");
+                // The name is the first token after DATABASE, past an
+                // `IF NOT EXISTS`.
+                let name = if is_database {
+                    self.scan_database_name()
+                } else {
+                    None
+                };
                 let collation = if is_database {
                     self.scan_database_collation_until_boundary()
                 } else {
@@ -4973,6 +5006,7 @@ impl Parser {
                     return Ok(Statement::NoOpPreventedInTransaction {
                         what: String::from("CREATE DATABASE"),
                         collation,
+                        name,
                     });
                 }
                 Ok(Statement::Empty)

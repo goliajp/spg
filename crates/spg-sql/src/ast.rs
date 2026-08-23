@@ -235,6 +235,10 @@ pub enum Statement {
         /// `LOCALE` and `LC_COLLATE` both land here; `LC_CTYPE` does
         /// not, because SPG has no separate ctype.
         collation: Option<String>,
+        /// v7.38.19 — the database's name, so `pg_database` can list one
+        /// that was created and can be connected to. It was thrown away
+        /// with the rest of the statement.
+        name: Option<String>,
     },
     /// v7.39 (round 696) — statements SPG performs nothing for, but whose
     /// OPERAND PG validates before performing nothing either.
