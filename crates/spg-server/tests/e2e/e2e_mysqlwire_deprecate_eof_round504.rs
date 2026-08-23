@@ -42,7 +42,7 @@ const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
 
 fn unique_tmpdir(label: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
+    let p = crate::common::tmp_base().join(format!(
         "spg-e2e-{label}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()

@@ -40,7 +40,7 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("spg-async-commit-{tag}-{nanos}"));
+    let p = crate::common::tmp_base().join(format!("spg-async-commit-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

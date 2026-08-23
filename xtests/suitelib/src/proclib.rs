@@ -533,7 +533,9 @@ mod tests {
         // So the test's verdict depended on the machine's /tmp rather than on
         // the code, which is the property a test must not have. It blocked a
         // release train to say so.
-        let data_dir = std::env::temp_dir().join(alloc_probe_dir_name());
+        let data_dir = std::env::temp_dir()
+            .join("spg-tests")
+            .join(alloc_probe_dir_name());
         std::fs::create_dir_all(&data_dir).expect("probe dir");
         r.procs.push(Proc {
             name: "sleeper".into(),

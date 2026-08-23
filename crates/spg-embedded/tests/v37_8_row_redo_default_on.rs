@@ -36,7 +36,9 @@ fn tmpdir(suffix: &str) -> std::path::PathBuf {
         .unwrap()
         .as_nanos();
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("spg-v37_8-{suffix}-{pid}-{nanos}"));
+    let dir = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-v37_8-{suffix}-{pid}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

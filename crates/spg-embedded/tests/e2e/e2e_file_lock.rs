@@ -9,7 +9,9 @@ fn tmpdb(label: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("spg-lock-{label}-{nanos}"));
+    let dir = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-lock-{label}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("spg.db")
 }

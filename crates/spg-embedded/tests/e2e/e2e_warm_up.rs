@@ -62,7 +62,7 @@ fn open_path_returns_a_server_ready_catalog_without_client_warmup() {
     // serve. This test pins that contract: open + immediate query
     // succeeds and the cold-tier auto-warm path runs without panic
     // even on an empty catalog.
-    let tmp = std::env::temp_dir().join(format!(
+    let tmp = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-warm-open-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

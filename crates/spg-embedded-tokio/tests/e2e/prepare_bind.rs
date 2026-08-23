@@ -75,7 +75,7 @@ async fn async_clone_handle_concurrent_binds() {
 #[tokio::test]
 async fn async_prepare_dml_persists_via_wal() {
     use std::path::PathBuf;
-    let mut p: PathBuf = std::env::temp_dir();
+    let mut p: PathBuf = std::env::temp_dir().join("spg-tests");
     let nanos: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)

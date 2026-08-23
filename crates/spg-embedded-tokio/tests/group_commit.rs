@@ -17,7 +17,9 @@ fn unique_dir(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let p = std::env::temp_dir().join(format!("spg-gc-{}-{name}-{nanos}", std::process::id()));
+    let p = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-gc-{}-{name}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

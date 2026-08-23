@@ -47,7 +47,7 @@ fn unique_tmpdir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("spg-chaos-{tag}-{nanos}"));
+    let p = crate::common::tmp_base().join(format!("spg-chaos-{tag}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

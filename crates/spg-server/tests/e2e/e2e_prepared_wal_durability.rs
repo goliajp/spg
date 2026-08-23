@@ -31,7 +31,7 @@ fn unique_tmpdir() -> PathBuf {
     // the other's database mid-run.
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
-    let p = std::env::temp_dir().join(format!(
+    let p = crate::common::tmp_base().join(format!(
         "spg-prepared-wal-{}-{nanos}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)

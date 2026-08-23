@@ -21,7 +21,9 @@ fn unique_tmpdir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("spg-e2e-wal-lint-{label}-{nanos}"));
+    let p = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-e2e-wal-lint-{label}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

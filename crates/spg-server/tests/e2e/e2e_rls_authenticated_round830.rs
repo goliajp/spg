@@ -150,7 +150,7 @@ fn spawn(label: &str) -> (common::ChildGuard, common::ServerAddrs) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir: PathBuf = std::env::temp_dir().join(format!("spg-e2e-rlsauth-{label}-{nanos}"));
+    let dir: PathBuf = crate::common::tmp_base().join(format!("spg-e2e-rlsauth-{label}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     let (raw, addrs) = common::ServerBuilder::new()
         .arg_path(&dir.join("spg.db"))

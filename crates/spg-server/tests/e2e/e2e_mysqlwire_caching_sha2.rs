@@ -26,7 +26,7 @@ fn unique_tmpdir(label: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     let pid = std::process::id();
-    let p = std::env::temp_dir().join(format!("spg-e2e-mysqlwire-sha2-{label}-{pid}-{nanos}"));
+    let p = crate::common::tmp_base().join(format!("spg-e2e-mysqlwire-sha2-{label}-{pid}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }

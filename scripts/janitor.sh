@@ -103,16 +103,30 @@ fi
 # this is now about disk. Names are `spg-*` and every one is a test
 # artifact; a day old is well past any run that could still want one.
 TMP="${TMPDIR:-/tmp}"
-leaked=$(find "$TMP" -maxdepth 1 -name 'spg-*' -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+# v7.38.19 — the tests' scratch now lands under one directory, so this is
+# a single removal rather than a scan of tens of thousands of entries by
+# prefix. The prefix sweep stays for what earlier versions left behind.
+for base in "$TMP/spg-tests"; do
+    [[ -d "$base" ]] || continue
+    n=$(find "$base" -maxdepth 1 -mindepth 1 -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+    [[ "${n:-0}" -gt 0 ]] || { say "no test scratch older than a day under $base"; continue; }
+    if [[ "$DRY" == 1 ]]; then
+        say "would remove $n test scratch entries older than a day from $base"
+    else
+        find "$base" -maxdepth 1 -mindepth 1 -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+        say "removed $n test scratch entries older than a day from $base"
+    fi
+done
+leaked=$(find "$TMP" -maxdepth 1 -name 'spg-*' ! -name 'spg-tests' ! -name 'spg-run' -mtime +1 2>/dev/null | wc -l | tr -d ' ')
 if [[ "${leaked:-0}" -gt 0 ]]; then
     if [[ "$DRY" == 1 ]]; then
-        say "would remove $leaked leaked spg-* temp entries older than a day from $TMP"
+        say "would remove $leaked pre-v7.38.19 spg-* temp entries older than a day from $TMP"
     else
-        find "$TMP" -maxdepth 1 -name 'spg-*' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
-        say "removed $leaked leaked spg-* temp entries older than a day from $TMP"
+        find "$TMP" -maxdepth 1 -name 'spg-*' ! -name 'spg-tests' ! -name 'spg-run' -mtime +1 -exec rm -rf {} + 2>/dev/null || true
+        say "removed $leaked pre-v7.38.19 spg-* temp entries older than a day from $TMP"
     fi
 else
-    say "no leaked spg-* temp entries older than a day"
+    say "no pre-v7.38.19 spg-* temp entries older than a day"
 fi
 
 say "done$( [[ $DRY == 1 ]] && echo ' (dry run)' )"

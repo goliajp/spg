@@ -12,7 +12,7 @@
 use spg_embedded::Database;
 
 fn tmp() -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
+    let p = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-sync-commit-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -475,3 +475,30 @@ pub fn wait_until(budget: std::time::Duration, mut cond: impl FnMut() -> bool) -
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }
+
+/// v7.38.19 — the base every test scratch directory hangs off.
+///
+/// 161 files across this workspace build a unique path under
+/// `std::env::temp_dir()` per run and none of them removes it. On the
+/// machine this was found on, `$TMPDIR` had reached **61,708 entries and
+/// 30 GB** — and it was not only disk. `spg-server` swept that directory
+/// at every start, so one `readdir` took **95 seconds** and every server
+/// an e2e test spawned waited a minute and a half before it could
+/// listen. The failures that produces read exactly like a busy machine:
+/// `EWOULDBLOCK` on a socket read, "server didn't publish native listen
+/// addr within Ns".
+///
+/// The server no longer scans `$TMPDIR` (its run files moved into
+/// `spg-run/`), so what is left is the mess itself. Putting every test's
+/// scratch under one directory does not stop the tests leaking — that
+/// needs 161 edits with a guard type, and the common shape here is a
+/// helper that CREATES the directory and returns a path INSIDE it, so a
+/// drop guard would delete it before the caller could use it. What this
+/// does do is make the mess removable in one `rm -rf`, and keep it out
+/// of a directory the rest of the machine reads.
+#[must_use]
+pub fn tmp_base() -> std::path::PathBuf {
+    let p = std::env::temp_dir().join("spg-tests");
+    let _ = std::fs::create_dir_all(&p);
+    p
+}

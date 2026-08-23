@@ -60,7 +60,7 @@ fn with_transaction_returns_body_value() {
 
 #[test]
 fn with_transaction_works_on_persistent_db() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-embed-tx-persist-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -95,7 +95,7 @@ fn rolled_back_transaction_stays_rolled_back_after_reopen() {
     // path was covered, the durable one (snapshot + WAL replay after
     // a reopen) was not — and the file-backed pool is exactly what a
     // cutover production box runs.
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-embed-tx-rollback-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -135,7 +135,7 @@ fn committed_transaction_survives_process_crash() {
     // be durable the moment commit returns — not only after a
     // graceful Drop/checkpoint. `mem::forget` skips Drop, simulating
     // SIGKILL; the reopen must replay the committed writes from WAL.
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-embed-tx-crash-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -166,7 +166,7 @@ fn savepoint_rollback_shapes_the_replayed_transaction() {
     // replayed transaction matches what the engine committed. The
     // surviving row carries a ';' inside a string literal to pin the
     // record's script-splitting on replay.
-    let dir = std::env::temp_dir().join(format!(
+    let dir = std::env::temp_dir().join("spg-tests").join(format!(
         "spg-embed-tx-savepoint-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

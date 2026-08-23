@@ -61,7 +61,9 @@ fn fresh_db_path(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("spg-tomb-recovery-{tag}-{nanos}"));
+    let dir = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-tomb-recovery-{tag}-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("spg.db");
     (dir, db_path)

@@ -29,7 +29,7 @@ fn metrics_tracks_inserts() {
 
 #[test]
 fn metrics_persistent_flag_set_on_open_path() {
-    let mut p = std::env::temp_dir();
+    let mut p = std::env::temp_dir().join("spg-tests");
     let nanos: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -62,7 +62,7 @@ fn memory_stats_wal_bucket_none_in_memory_some_on_disk() {
     let mem = Database::open_in_memory();
     assert_eq!(mem.memory_stats().wal_bytes, None);
 
-    let mut p = std::env::temp_dir();
+    let mut p = std::env::temp_dir().join("spg-tests");
     let nanos: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
