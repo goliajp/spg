@@ -27,8 +27,32 @@ fn io_err(what: &str, e: &std::io::Error) -> TempStoreError {
 /// Where runs live: `SPG_TEMP_DIR` when set, else the OS temp dir.
 /// Kept as a function rather than a cached path so a test can point the
 /// variable somewhere else between engines.
+/// v7.38.18 (G5) — the switch this reads, named once.
+///
+/// It lives here rather than beside the server's other switch names
+/// because this module is also compiled into the e2e test binary, which
+/// has a different crate root. See `AUTOVACUUM_ENV` in `main.rs` for
+/// why the name is a const at all.
+pub const TEMP_DIR_ENV: &str = "SPG_TEMP_DIR";
+
 pub fn temp_dir() -> PathBuf {
-    std::env::var_os("SPG_TEMP_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
+    temp_dir_from(std::env::var_os(TEMP_DIR_ENV))
+}
+
+/// v7.38.18 (G5) — the placement decision, separated from the
+/// environment so it can be tested.
+///
+/// The comment above has said since round 787 that this is "kept as a
+/// function rather than a cached path so a test can point the variable
+/// somewhere else". No such test existed: `SPG_TEMP_DIR` was one of the
+/// twenty-seven switches the register listed as exercised by nothing.
+///
+/// It decides where a spilling sort writes, which is a disk an operator
+/// chose — a deployer who points it at a data volume and is silently
+/// ignored fills the wrong one.
+pub fn temp_dir_from(raw: Option<std::ffi::OsString>) -> PathBuf {
+    raw.filter(|v| !v.is_empty())
+        .map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
 /// How much a run buffers before it touches the file, in either

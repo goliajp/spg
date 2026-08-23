@@ -2505,7 +2505,9 @@ fn lock_wait_deadline(
 /// bool load per message.
 fn timing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SPG_PGWIRE_TIMING").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| {
+        crate::env_bool(std::env::var("SPG_PGWIRE_TIMING").ok().as_deref()).unwrap_or(false)
+    })
 }
 
 fn timing_record(start: Option<std::time::Instant>) {
@@ -2525,7 +2527,9 @@ fn timing_record(start: Option<std::time::Instant>) {
 
 fn trace_frontend_message(msg_type: u8, body: &[u8], tx_state: u8) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("SPG_PGWIRE_TRACE").is_ok_and(|v| v != "0")) {
+    if !*ON.get_or_init(|| {
+        crate::env_bool(std::env::var("SPG_PGWIRE_TRACE").ok().as_deref()).unwrap_or(false)
+    }) {
         return;
     }
     // Parse is `name NUL sql NUL …`, so the interesting text is the SECOND

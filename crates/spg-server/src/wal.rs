@@ -467,7 +467,11 @@ pub(crate) fn wal_sync(f: &std::fs::File) -> std::io::Result<()> {
     {
         static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let force_full =
-            *FULL.get_or_init(|| std::env::var("SPG_WAL_FULLFSYNC").is_ok_and(|v| v != "0"));
+            // v7.38.18 (G5) — one reading for every boolean switch:
+            // `false` used to mean ON here, because only `0` was off.
+            *FULL.get_or_init(|| {
+                crate::wal_fullfsync_from(std::env::var(crate::WAL_FULLFSYNC_ENV).ok().as_deref())
+            });
         if !force_full {
             use std::os::fd::AsRawFd as _;
             // libc has no F_BARRIERFSYNC constant; Apple's fcntl.h says 85.

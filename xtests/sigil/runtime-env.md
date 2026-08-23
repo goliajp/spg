@@ -20,6 +20,14 @@
 > has never run in this tree. That is a statement about evidence, not
 > about whether the switch works.
 >
+> v7.38.18 — a switch is a NAME and a decision, and the name is the
+> half a test forgets. The four durability switches below were pinned
+> by tests of their decisions that never mentioned which variable
+> reaches one, and this column correctly went on reading `no`: a typo
+> in `env::var("SPG_AUTOVAKUUM")` is silent, because the variable an
+> operator sets is simply never found. Each call site reads a named
+> const now, and the tests assert the const.
+>
 > Evidence inside a `#[cfg(test)]` module in `src` counts too, which
 > is how the four PG-spelled aliases stopped reading `no`: the module
 > that pins them, `env_knob_tests`, sits in the middle of
@@ -36,7 +44,7 @@
 > claimed `yes` for a name that appears only in a doc comment, two
 > claimed `no` for a switch that tests really do set.
 >
-> Today: **84 switches, 57 exercised, 27 not.**
+> Today: **84 switches, 60 exercised, 24 not.**
 > Adding a switch means adding a row in the same commit.
 
 | switch | first read site | exercised |
@@ -45,7 +53,7 @@
 | `SPG_ADMIN_PASSWORD` | `crates/spg-server/src/main.rs:3370` | yes |
 | `SPG_ADMIN_USER` | `crates/spg-server/src/main.rs:3376` | yes |
 | `SPG_AUDIT` | `crates/spg-server/src/main.rs:854` | yes |
-| `SPG_AUTOVACUUM` | `crates/spg-server/src/main.rs:1625` | **no** |
+| `SPG_AUTOVACUUM` | `crates/spg-server/src/main.rs:1625` | yes |
 | `SPG_AUTOVACUUM_NAPTIME` | `crates/spg-server/src/main.rs:1146` | yes |
 | `SPG_AUTOVACUUM_NAPTIME_MS` | `crates/spg-server/src/autovacuum.rs:45` | yes |
 | `SPG_AUTO_ANALYZE_INTERVAL_MS` | `crates/spg-server/src/main.rs:1146` | yes |
@@ -111,12 +119,12 @@
 | `SPG_SQLX_INLINE_BUDGET_MS` | `crates/spg-sqlx/src/connection.rs:415` | yes |
 | `SPG_STATEMENT_TIMEOUT` | `crates/spg-server/src/main.rs:1141` | yes |
 | `SPG_SYNCHRONOUS_COMMIT` | `crates/spg-server/src/wal.rs:56` | yes |
-| `SPG_TEMP_DIR` | `crates/spg-server/src/tempstore.rs:31` | **no** |
+| `SPG_TEMP_DIR` | `crates/spg-server/src/tempstore.rs:31` | yes |
 | `SPG_TLS_CERT` | `crates/spg-server/src/mysqlwire.rs:442` | yes |
 | `SPG_TLS_KEY` | `crates/spg-server/src/mysqlwire.rs:443` | yes |
 | `SPG_WAL` | `crates/spg-server/src/main.rs:855` | yes |
 | `SPG_WAL_COMPRESSION` | `crates/spg-server/src/wal.rs:226` | yes |
-| `SPG_WAL_FULLFSYNC` | `crates/spg-server/src/wal.rs:470` | **no** |
+| `SPG_WAL_FULLFSYNC` | `crates/spg-server/src/wal.rs:470` | yes |
 | `SPG_WAL_HASH` | `crates/spg-embedded/src/lib.rs:1940` | **no** |
 | `SPG_WAL_LEVEL` | `crates/spg-server/src/main.rs:2550` | yes |
 | `SPG_WAL_MIN_FREE_BYTES` | `crates/spg-server/src/main.rs:897` | yes |
