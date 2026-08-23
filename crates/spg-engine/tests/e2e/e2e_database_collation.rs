@@ -195,7 +195,10 @@ fn a_composite_index_over_an_inheriting_column_agrees_with_the_scan() {
     // seek that narrowed by `id` alone and forgot to re-check `s` would
     // answer 1 here.
     assert_eq!(
-        one(&mut e, "SELECT count(*) FROM ci WHERE id = 7 AND s = 'nope'"),
+        one(
+            &mut e,
+            "SELECT count(*) FROM ci WHERE id = 7 AND s = 'nope'"
+        ),
         "BigInt(0)"
     );
     // v7.38.18 (G3) — and it SEEKS rather than scanning. The first fix
@@ -203,10 +206,22 @@ fn a_composite_index_over_an_inheriting_column_agrees_with_the_scan() {
     // cost a full scan for a predicate `id` alone narrows to one row.
     // The prefix stops at the collated component instead, and the caller
     // re-checks the rest.
-    let before = one(&mut e, "SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ci'");
-    let _ = one(&mut e, "SELECT count(*) FROM ci WHERE id = 7 AND s = 'row7'");
-    let after = one(&mut e, "SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ci'");
-    assert_ne!(before, after, "the composite index must be read, not skipped");
+    let before = one(
+        &mut e,
+        "SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ci'",
+    );
+    let _ = one(
+        &mut e,
+        "SELECT count(*) FROM ci WHERE id = 7 AND s = 'row7'",
+    );
+    let after = one(
+        &mut e,
+        "SELECT idx_scan FROM pg_stat_user_tables WHERE relname = 'ci'",
+    );
+    assert_ne!(
+        before, after,
+        "the composite index must be read, not skipped"
+    );
 }
 
 /// Set once. PostgreSQL refuses `ALTER DATABASE … LC_COLLATE` and so

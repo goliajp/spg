@@ -2639,7 +2639,6 @@ pub(crate) fn index_is_usable(table: &Table, idx: &spg_storage::Index) -> bool {
     table.index_collation(idx).is_none() || table.expr_index_is_complete(&idx.name)
 }
 
-
 pub(crate) fn resolve_col_literal_pair(
     col_side: &Expr,
     lit_side: &Expr,

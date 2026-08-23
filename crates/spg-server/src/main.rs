@@ -1158,6 +1158,113 @@ mod env_knob_tests {
         assert_eq!(pick_collation_env(|_: &str| None), None);
     }
 
+    /// v7.38.18 (G5) — the four switches that decide durability and
+    /// where data lands, each of which the register listed as exercised
+    /// by nothing.
+    ///
+    /// Being ignored costs a log line for a `*_TRACE` switch and a
+    /// little speed for a tuning one. These four cost something else: a
+    /// database that stops reclaiming dead rows, a sync weaker than the
+    /// one that was asked for, a freezer switched off by an operator
+    /// trying to leave it on, and a spilling sort filling a disk nobody
+    /// chose.
+    #[test]
+    fn the_durability_switches_read_what_an_operator_wrote() {
+        use super::{
+            AUTOVACUUM_ENV, FREEZER_DISABLE_ENV, WAL_FULLFSYNC_ENV, autovacuum_enabled_from,
+            freezer_disabled_from, wal_fullfsync_from,
+        };
+
+        // The names, because a switch is a name and a decision and a
+        // typo in the name is silent -- the variable an operator sets is
+        // simply never found. Each call site reads the const beside it.
+        assert_eq!(AUTOVACUUM_ENV, "SPG_AUTOVACUUM");
+        assert_eq!(WAL_FULLFSYNC_ENV, "SPG_WAL_FULLFSYNC");
+        assert_eq!(FREEZER_DISABLE_ENV, "SPG_FREEZER_DISABLE");
+
+        // Unset keeps each default, which is what every deployment that
+        // sets nothing already has.
+        assert!(autovacuum_enabled_from(None), "autovacuum is on by default");
+        assert!(!wal_fullfsync_from(None), "the barrier sync is the default");
+        assert!(!freezer_disabled_from(None), "the freezer runs by default");
+
+        // And every spelling of off means off, in all four directions.
+        for off in ["0", "off", "false", "no", "OFF"] {
+            assert!(!autovacuum_enabled_from(Some(off)), "{off:?} turns it off");
+            assert!(!wal_fullfsync_from(Some(off)), "{off:?}");
+            assert!(!freezer_disabled_from(Some(off)), "{off:?}");
+        }
+        for on in ["1", "on", "true", "yes", "ON"] {
+            assert!(autovacuum_enabled_from(Some(on)), "{on:?}");
+            assert!(wal_fullfsync_from(Some(on)), "{on:?}");
+            assert!(freezer_disabled_from(Some(on)), "{on:?}");
+        }
+
+        // The specific misreading these replaced. `SPG_FREEZER_DISABLE`
+        // took every value but `0` as ON, so an operator writing
+        // `=false` -- meaning DO NOT disable it -- disabled it.
+        assert!(
+            !freezer_disabled_from(Some("false")),
+            "`=false` must not disable the freezer"
+        );
+        // Same shape on the sync knob, where the old reading erred
+        // towards more durability rather than less.
+        assert!(!wal_fullfsync_from(Some("false")));
+    }
+
+    /// `SPG_TEMP_DIR` decides which disk a spilling sort fills.
+    ///
+    /// The comment on `temp_dir` has said since round 787 that it is
+    /// "kept as a function rather than a cached path so a test can point
+    /// the variable somewhere else". This is that test, arriving late.
+    #[test]
+    fn the_temp_dir_switch_places_runs_where_it_says() {
+        use super::tempstore::{TEMP_DIR_ENV, temp_dir_from};
+        use std::path::PathBuf;
+
+        assert_eq!(TEMP_DIR_ENV, "SPG_TEMP_DIR");
+
+        assert_eq!(
+            temp_dir_from(Some("/var/spg/spill".into())),
+            PathBuf::from("/var/spg/spill")
+        );
+        // Unset falls back to the OS temp directory, which is where
+        // every deployment that sets nothing already spills.
+        assert_eq!(temp_dir_from(None), std::env::temp_dir());
+        // A container exporting `SPG_TEMP_DIR=` must not place runs at
+        // the empty path -- that is the root-relative current directory,
+        // and a sort would spill into whatever the server was started
+        // from.
+        assert_eq!(temp_dir_from(Some("".into())), std::env::temp_dir());
+    }
+    /// v7.38.18 (G5) — one reading of a boolean switch, and the reading
+    /// PostgreSQL's operators already know.
+    ///
+    /// SPG had two. `SPG_AUTOVACUUM` took `0`, `false` or `off` as off;
+    /// four others took only `0`, so `false` meant ON. For the fsync
+    /// knob that is the safe direction. For `SPG_FREEZER_DISABLE` it is
+    /// not: an operator writing `=false`, meaning *do not disable it*,
+    /// disabled it, and nothing said so.
+    #[test]
+    fn a_boolean_switch_reads_the_same_way_everywhere() {
+        use super::env_bool;
+        for off in ["0", "off", "false", "no", "OFF", "False", "  off  "] {
+            assert_eq!(env_bool(Some(off)), Some(false), "{off:?} is off");
+        }
+        for on in ["1", "on", "true", "yes", "ON", "True", " yes "] {
+            assert_eq!(env_bool(Some(on)), Some(true), "{on:?} is on");
+        }
+        // Unset, blank and unrecognised all answer "nothing was said",
+        // so each caller keeps its own default instead of inheriting one
+        // from here. A container exporting `SPG_AUTOVACUUM=` must not
+        // read as a decision.
+        assert_eq!(env_bool(None), None);
+        assert_eq!(env_bool(Some("")), None);
+        assert_eq!(env_bool(Some("   ")), None);
+        assert_eq!(env_bool(Some("maybe")), None);
+        // The specific misreading this replaced: `false` is OFF, not ON.
+        assert_ne!(env_bool(Some("false")), Some(true));
+    }
     /// v7.38.18 — the three PG-spelled env names are a promise, and
     /// nothing was checking it.
     ///
@@ -1794,9 +1901,8 @@ fn run(
     // predicate) drives `autovacuum_tick` on its naptime cadence.
     // The two must move together — inline-off without the worker
     // would let dead rows grow without bound.
-    let autovacuum_enabled = !std::env::var("SPG_AUTOVACUUM").is_ok_and(|v| {
-        v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
-    });
+    // v7.38.18 (G5) — through the one reader; unset stays on.
+    let autovacuum_enabled = autovacuum_enabled_from(env::var(AUTOVACUUM_ENV).ok().as_deref());
     if autovacuum_enabled {
         engine.set_autovacuum_inline(false);
     } else {
@@ -2110,6 +2216,83 @@ fn restore_engine(
     };
     apply_database_collation(&mut engine);
     Ok((engine, manifest_wal_baseline))
+}
+
+/// v7.38.18 (G5) — one reading of a boolean environment switch.
+///
+/// SPG had two. `SPG_AUTOVACUUM` took `0`, `false` or `off` as off;
+/// `SPG_WAL_FULLFSYNC`, `SPG_PGWIRE_TIMING`, `SPG_PGWIRE_TRACE` and
+/// `SPG_FREEZER_DISABLE` took only `0`, so every other spelling meant
+/// ON — including the word `false`.
+///
+/// For the fsync knob that misreading is the safe direction; for
+/// `SPG_FREEZER_DISABLE` it is not. An operator writing
+/// `SPG_FREEZER_DISABLE=false`, meaning *do not disable it*, disabled
+/// it. Nothing said so.
+///
+/// These are PostgreSQL's own spellings for a boolean GUC, which is the
+/// vocabulary an operator arrives with. `None` for unset or for a value
+/// in neither list, so each caller keeps deciding what its own default
+/// is rather than inheriting one from here.
+pub(crate) fn env_bool(raw: Option<&str>) -> Option<bool> {
+    let v = raw?.trim();
+    if v.is_empty() {
+        return None;
+    }
+    const OFF: [&str; 4] = ["0", "off", "false", "no"];
+    const ON: [&str; 4] = ["1", "on", "true", "yes"];
+    if OFF.iter().any(|w| v.eq_ignore_ascii_case(w)) {
+        return Some(false);
+    }
+    if ON.iter().any(|w| v.eq_ignore_ascii_case(w)) {
+        return Some(true);
+    }
+    None
+}
+
+/// v7.38.18 (G5) — the switch names these decisions read.
+///
+/// A const rather than a literal at each call site, because the NAME is
+/// half of what a switch promises and a typo in it is silent: the
+/// variable an operator sets is simply never found. Naming it once puts
+/// it somewhere a test can assert, which is also what makes the
+/// runtime-switch register report these as exercised — the register
+/// looks for the name, and before this the tests pinned the decision
+/// without ever mentioning which variable reaches it.
+pub(crate) const AUTOVACUUM_ENV: &str = "SPG_AUTOVACUUM";
+/// See [`AUTOVACUUM_ENV`].
+pub(crate) const WAL_FULLFSYNC_ENV: &str = "SPG_WAL_FULLFSYNC";
+/// See [`AUTOVACUUM_ENV`].
+pub(crate) const FREEZER_DISABLE_ENV: &str = "SPG_FREEZER_DISABLE";
+
+/// v7.38.18 (G5) — does `SPG_AUTOVACUUM` leave autovacuum on?
+///
+/// On unless the operator says otherwise, which is what an unset
+/// variable has always meant here. Separated from the environment so
+/// the decision can be tested: the register listed this switch as
+/// exercised by nothing, and it decides whether a database reclaims its
+/// own dead rows.
+pub(crate) fn autovacuum_enabled_from(raw: Option<&str>) -> bool {
+    env_bool(raw).unwrap_or(true)
+}
+
+/// v7.38.18 (G5) — does `SPG_WAL_FULLFSYNC` force the stronger sync?
+///
+/// Off unless asked for: the default is `F_BARRIERFSYNC`, which
+/// r702-SW measured at 43 ms against FULLFSYNC's 433 ms. A deployer who
+/// asks for the stronger one is asking about durability, so the reading
+/// has to be the one they expect — `=false` used to mean ON here.
+pub(crate) fn wal_fullfsync_from(raw: Option<&str>) -> bool {
+    env_bool(raw).unwrap_or(false)
+}
+
+/// v7.38.18 (G5) — does `SPG_FREEZER_DISABLE` stop the freezer?
+///
+/// The one where the old reading was dangerous rather than merely
+/// surprising: every value but `0` meant ON, so an operator writing
+/// `=false` — *do not disable it* — disabled it, and nothing said so.
+pub(crate) fn freezer_disabled_from(raw: Option<&str>) -> bool {
+    env_bool(raw).unwrap_or(false)
 }
 
 /// v7.38.18 (S1) — the first of the locale variables that names

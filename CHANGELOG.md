@@ -126,6 +126,18 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`SPG_FREEZER_DISABLE=false` disabled the freezer.** SPG read a
+  boolean switch two ways: `SPG_AUTOVACUUM` took `0`, `false` or `off`
+  as off, while four others took only `0` — so every other spelling,
+  the word `false` included, meant ON. An operator writing
+  `SPG_FREEZER_DISABLE=false`, meaning *do not disable it*, disabled it,
+  and nothing said so.
+
+  One reader now, with PostgreSQL's own spellings (`0`/`off`/`false`/`no`
+  against `1`/`on`/`true`/`yes`, case-insensitive, blank means nothing
+  was said). `SPG_WAL_FULLFSYNC`, `SPG_PGWIRE_TIMING` and
+  `SPG_PGWIRE_TRACE` read the same way as a result.
+
 - **A collated sort built a collator per comparison.** `collate::compare`
   takes a NAME and built the collator behind it on every call, so a
   400,000-row two-key `ORDER BY` built millions of them. Measured over
