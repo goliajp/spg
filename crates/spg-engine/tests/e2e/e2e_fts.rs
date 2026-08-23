@@ -18,6 +18,15 @@ fn ok(e: &mut Engine, sql: &str) {
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
 }
 
+/// v7.38.18 — the first value as a plain string, for the comparisons
+/// whose expectations were read off `psql`.
+fn text_of(e: &mut Engine, sql: &str) -> String {
+    match first_value(e, sql) {
+        Value::Text(t) => t.to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn first_value(e: &mut Engine, sql: &str) -> Value<'static> {
     let r = e
         .execute(sql)
@@ -78,14 +87,61 @@ fn to_tsvector_null_text_is_null() {
 
 #[test]
 fn to_tsvector_rejects_unsupported_config() {
+    // v7.38.18 — `spanish` used to be the example of an unsupported
+    // config. It is implemented now, from Snowball's published
+    // algorithm and verified word-for-word against PG 18.4 over 1,847
+    // words, so the example moved to one that really is not there.
     let mut e = eng();
-    let err = e
-        .execute("SELECT to_tsvector('spanish', 'hola mundo')")
-        .expect_err("spanish must error");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("not implemented") && msg.contains("spanish"),
-        "expected unsupported-config error, got: {msg}"
+    for cfg in ["portuguese", "russian", "no_such_config"] {
+        let err = e
+            .execute(&format!("SELECT to_tsvector('{cfg}', 'hola mundo')"))
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("not implemented") && msg.contains(cfg),
+            "expected unsupported-config error for {cfg}, got: {msg}"
+        );
+    }
+}
+
+/// v7.38.18 — and the Spanish configuration answers as PG 18.4 does.
+/// Every value here was read from the oracle.
+#[test]
+fn spanish_matches_pg() {
+    let mut e = eng();
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT to_tsvector('spanish', 'los gatos pequeños cantaban rápidamente')::text"
+        ),
+        "'cant':4 'gat':2 'pequeñ':3 'rapid':5"
+    );
+    // `los` and `las` are stopwords and drop out, while the position
+    // they occupied still counts -- `ciudad` is at 2, not 1.
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT to_tsvector('spanish', 'las ciudades grandes')::text"
+        ),
+        "'ciudad':2 'grand':3"
+    );
+    assert_eq!(
+        text_of(&mut e, "SELECT to_tsquery('spanish','gatos')::text"),
+        "'gat'"
+    );
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT (to_tsvector('spanish','los gatos') @@ to_tsquery('spanish','gato'))::text"
+        ),
+        "true"
+    );
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT ts_headline('spanish','el gato negro', to_tsquery('spanish','gato'))"
+        ),
+        "el <b>gato</b> negro"
     );
 }
 

@@ -30,9 +30,50 @@ pub enum TsConfig {
     /// `english` / `pg_catalog.english` — lowercase + split +
     /// stopword drop + Porter v1 stem.
     English,
+    /// v7.38.18 — `spanish`: lowercase + split + Snowball's 313-word
+    /// Spanish stopword list + the Snowball Spanish stem.
+    Spanish,
 }
 
 impl TsConfig {
+    /// v7.38.18 — does this configuration stem at all?
+    ///
+    /// The four places that decide stopwords and stemming used to ask
+    /// `config.stems()`, a two-valued question.
+    /// Adding a language to an enum those read as a boolean would have
+    /// made it tokenise without dropping a stopword and without
+    /// stemming — silently, since every token still comes out.
+    pub const fn stems(self) -> bool {
+        !matches!(self, Self::Simple)
+    }
+
+    /// This configuration's stopword list, or `None` when it has none.
+    pub fn stopwords(self) -> Option<&'static [&'static str]> {
+        match self {
+            Self::Simple => None,
+            Self::English => None, // its own list, see `is_english_stopword`
+            Self::Spanish => Some(crate::fts_stop::ES_STOP),
+        }
+    }
+
+    /// Is `w` a stopword under this configuration?
+    pub fn is_stopword(self, w: &str) -> bool {
+        match self {
+            Self::Simple => false,
+            Self::English => is_english_stopword(w),
+            Self::Spanish => crate::fts_stop::is_stop(crate::fts_stop::ES_STOP, w),
+        }
+    }
+
+    /// The stem `w` reduces to under this configuration.
+    pub fn stem(self, w: &str) -> String {
+        match self {
+            Self::Simple => String::from(w),
+            Self::English => porter_stem(w),
+            Self::Spanish => crate::fts_es::stem_es(w),
+        }
+    }
+
     /// Resolve a PG text-search config name. The PG-qualified
     /// form `pg_catalog.<name>` is accepted too. Returns `None`
     /// for any other name so the caller can produce a clear
@@ -42,6 +83,10 @@ impl TsConfig {
         match bare.to_ascii_lowercase().as_str() {
             "simple" => Some(Self::Simple),
             "english" => Some(Self::English),
+            // v7.38.18 — Snowball's other three, each implemented from
+            // the published algorithm and verified word-for-word
+            // against PG 18.4. See `fts_es` / `fts_fr` / `fts_de`.
+            "spanish" => Some(Self::Spanish),
             _ => None,
         }
     }
@@ -60,7 +105,7 @@ pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
     // config alone could not give: a tag or an entity maps to nothing
     // and so never reaches the index, and a number under the `english`
     // configuration goes to `simple` rather than through the stemmer.
-    let english = matches!(config, TsConfig::English);
+    let english = config.stems();
     for token in tokenize_typed(text) {
         let Some(dict) = token.ty.dictionary(english) else {
             continue;
@@ -69,14 +114,14 @@ pub fn to_tsvector(config: TsConfig, text: &str) -> Vec<TsLexeme> {
         let lex = match dict {
             TsDict::Simple => folded,
             TsDict::EnglishStem => {
-                if is_english_stopword(&folded) {
+                if config.is_stopword(&folded) {
                     // PG drops stopwords from the vector but
                     // still increments position so phrase
                     // distances stay meaningful.
                     position = position.saturating_add(1).min(16383);
                     continue;
                 }
-                porter_stem(&folded)
+                config.stem(&folded)
             }
         };
         if lex.is_empty() {
@@ -235,7 +280,7 @@ pub fn to_tsquery(config: TsConfig, text: &str) -> Result<TsQueryAst, EvalError>
     // lexeme no vector ever contains. A tree that is ALL stopwords is
     // left as parsed (PG returns an empty tsquery there — an empty-tree
     // representation SPG doesn't have; recorded residual).
-    if matches!(config, TsConfig::English)
+    if config.stems()
         && let Some(pruned) = prune_stopword_terms(&ast)
     {
         ast = pruned;
@@ -294,6 +339,7 @@ fn stem_tsquery_in_place(ast: &mut TsQueryAst, config: TsConfig) {
             *word = match config {
                 TsConfig::Simple => lower,
                 TsConfig::English => porter_stem(&lower),
+                TsConfig::Spanish => crate::fts_es::stem_es(&lower),
             };
         }
         TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
@@ -310,7 +356,7 @@ fn stem_tsquery_in_place(ast: &mut TsQueryAst, config: TsConfig) {
 
 fn collect_lexemes(config: TsConfig, text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    let english = matches!(config, TsConfig::English);
+    let english = config.stems();
     for token in tokenize_typed(text) {
         let Some(dict) = token.ty.dictionary(english) else {
             continue;
@@ -319,10 +365,10 @@ fn collect_lexemes(config: TsConfig, text: &str) -> Vec<String> {
         match dict {
             TsDict::Simple => out.push(folded),
             TsDict::EnglishStem => {
-                if is_english_stopword(&folded) {
+                if config.is_stopword(&folded) {
                     continue;
                 }
-                let stemmed = porter_stem(&folded);
+                let stemmed = config.stem(&folded);
                 if !stemmed.is_empty() {
                     out.push(stemmed);
                 }
@@ -388,7 +434,7 @@ fn fold_phrase(lexs: &[String]) -> TsQueryAst {
 fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)> {
     let mut out: Vec<(String, u16)> = Vec::new();
     let mut position: u16 = 0;
-    let english = matches!(config, TsConfig::English);
+    let english = config.stems();
     for token in tokenize_typed(text) {
         let Some(dict) = token.ty.dictionary(english) else {
             continue;
@@ -397,11 +443,11 @@ fn collect_lexemes_positioned(config: TsConfig, text: &str) -> Vec<(String, u16)
         let lex = match dict {
             TsDict::Simple => folded,
             TsDict::EnglishStem => {
-                if is_english_stopword(&folded) {
+                if config.is_stopword(&folded) {
                     position = position.saturating_add(1).min(16383);
                     continue;
                 }
-                porter_stem(&folded)
+                config.stem(&folded)
             }
         };
         if lex.is_empty() {
@@ -1714,6 +1760,7 @@ fn step5b(b: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
