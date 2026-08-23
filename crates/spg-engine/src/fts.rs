@@ -36,6 +36,9 @@ pub enum TsConfig {
     /// v7.38.18 — `french`: Snowball's 155-word French stopword list +
     /// the Snowball French stem.
     French,
+    /// v7.38.18 — `german`: Snowball's 231-word German stopword list +
+    /// the Snowball German stem.
+    German,
 }
 
 impl TsConfig {
@@ -57,6 +60,7 @@ impl TsConfig {
             Self::English => None, // its own list, see `is_english_stopword`
             Self::Spanish => Some(crate::fts_stop::ES_STOP),
             Self::French => Some(crate::fts_stop::FR_STOP),
+            Self::German => Some(crate::fts_stop::DE_STOP),
         }
     }
 
@@ -67,6 +71,7 @@ impl TsConfig {
             Self::English => is_english_stopword(w),
             Self::Spanish => crate::fts_stop::is_stop(crate::fts_stop::ES_STOP, w),
             Self::French => crate::fts_stop::is_stop(crate::fts_stop::FR_STOP, w),
+            Self::German => crate::fts_stop::is_stop(crate::fts_stop::DE_STOP, w),
         }
     }
 
@@ -77,6 +82,7 @@ impl TsConfig {
             Self::English => porter_stem(w),
             Self::Spanish => crate::fts_es::stem_es(w),
             Self::French => crate::fts_fr::stem_fr(w),
+            Self::German => crate::fts_de::stem_de(w),
         }
     }
 
@@ -94,6 +100,7 @@ impl TsConfig {
             // against PG 18.4. See `fts_es` / `fts_fr` / `fts_de`.
             "spanish" => Some(Self::Spanish),
             "french" => Some(Self::French),
+            "german" => Some(Self::German),
             _ => None,
         }
     }
@@ -348,6 +355,7 @@ fn stem_tsquery_in_place(ast: &mut TsQueryAst, config: TsConfig) {
                 TsConfig::English => porter_stem(&lower),
                 TsConfig::Spanish => crate::fts_es::stem_es(&lower),
                 TsConfig::French => crate::fts_fr::stem_fr(&lower),
+                TsConfig::German => crate::fts_de::stem_de(&lower),
             };
         }
         TsQueryAst::And(a, b) | TsQueryAst::Or(a, b) => {
