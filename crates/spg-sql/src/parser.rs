@@ -700,6 +700,11 @@ struct Parser {
     /// predicates in. parse_bare_select save/restores around its
     /// FROM+WHERE so nested selects only drain their own.
     pending_sample_preds: Vec<Expr>,
+    /// v7.38.19 — the target of a `SELECT … INTO <table>`, carried out
+    /// of `parse_bare_select` (which returns a `SelectStatement` and has
+    /// nowhere to put it) to the caller that lowers the pair to the CTAS
+    /// node. `bool` is `TEMP`.
+    pending_select_into: Option<(String, bool)>,
     /// v7.39 (round 691) — collation lowering channel, the same shape as
     /// `pending_sample_preds` above. `expr COLLATE "name"` is ORDERING
     /// information, and `ast::OrderBy` is where this parser keeps ordering
@@ -999,6 +1004,7 @@ impl Parser {
             pos: 0,
             nest_depth: 0,
             pending_sample_preds: Vec::new(),
+            pending_select_into: None,
             suppress_in_tail: false,
             last_consumed: 0,
             src: None,
@@ -12319,8 +12325,27 @@ impl Parser {
         // get a fresh bare-select parse and may not have their own ORDER
         // BY / LIMIT.
         let mut head = self.parse_bare_select()?;
+        let into = self.pending_select_into.take();
         self.parse_setop_chain_into(&mut head)?;
         self.parse_select_tail_into(&mut head)?;
+        // v7.38.19 — `SELECT … INTO t` lowers to the SAME node as
+        // `CREATE TABLE t AS SELECT …`, which is what a comment in
+        // `ast.rs` has claimed since v7.38 and what only CTAS actually
+        // did. The tail (ORDER BY / LIMIT) is parsed first so it belongs
+        // to the body, as it does in PostgreSQL.
+        if let Some((name, temporary)) = into {
+            return Ok(Statement::CreateMaterializedView(
+                crate::ast::CreateMaterializedViewStatement {
+                    temporary,
+                    name,
+                    if_not_exists: false,
+                    columns: Vec::new(),
+                    body: head,
+                    with_data: true,
+                    as_plain_table: true,
+                },
+            ));
+        }
         Ok(Statement::Select(head))
     }
 
@@ -13406,6 +13431,62 @@ impl Parser {
             Vec::new()
         };
         let mut items = self.parse_select_list()?;
+        // v7.38.19 — `SELECT … INTO <table>`, PostgreSQL's other spelling
+        // of CTAS. It sits exactly here in PG's grammar, right after the
+        // target list.
+        //
+        // A comment in `ast.rs` has said since v7.38 that CTAS and
+        // `SELECT INTO` lower to the same node. Only CTAS ever did:
+        // `SELECT i INTO t FROM src` answered `syntax error at or near
+        // "INTO"`, which the differential found while measuring what
+        // PostgreSQL tags each of the five materialising forms with. A
+        // comment describing a capability the code does not have is the
+        // defect this version has been finding all day, and this is the
+        // one it found in the parser.
+        //
+        // `INTO` is captured rather than consumed here: the name has to
+        // travel out of a function that returns a `SelectStatement`, and
+        // the caller lowers the whole thing to the CTAS node.
+        if matches!(self.peek(), Token::Into) {
+            self.advance();
+            // `TEMP` / `TEMPORARY` / `UNLOGGED` / `TABLE` are modifiers on
+            // the target, not part of its name. SPG has one storage
+            // class, so `UNLOGGED` is accepted and means nothing, which
+            // is what it already means on `CREATE TABLE`.
+            let mut temporary = false;
+            loop {
+                match self.peek().clone() {
+                    Token::Ident(w) | Token::QuotedIdent(w)
+                        if w.eq_ignore_ascii_case("temp")
+                            || w.eq_ignore_ascii_case("temporary") =>
+                    {
+                        temporary = true;
+                        self.advance();
+                    }
+                    Token::Ident(w) | Token::QuotedIdent(w)
+                        if w.eq_ignore_ascii_case("unlogged") =>
+                    {
+                        self.advance();
+                    }
+                    Token::Table => {
+                        self.advance();
+                    }
+                    _ => break,
+                }
+            }
+            let name = match self.peek().clone() {
+                Token::Ident(w) | Token::QuotedIdent(w) => {
+                    self.advance();
+                    w
+                }
+                other => {
+                    return Err(self.err(alloc::format!(
+                        "expected a table name after SELECT … INTO, got {other:?}"
+                    )));
+                }
+            };
+            self.pending_select_into = Some((name, temporary));
+        }
         // Scope the TABLESAMPLE lowering channel to this SELECT:
         // stash whatever an enclosing select accumulated, collect
         // our own FROM's predicates, restore after the combine.

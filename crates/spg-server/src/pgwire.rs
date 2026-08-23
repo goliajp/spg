@@ -697,7 +697,19 @@ fn handle_pg_simple_query(
                 || ci_contains(b, b" for share")
                 || ci_contains(b, b" for no key update")
                 || ci_contains(b, b" for key share");
-            if !sql_has_sequence_mutator(b) && !wants_locks {
+            // v7.38.19 — `SELECT … INTO t` CREATES A TABLE. It is the
+            // third member of the family this guard already knows: a
+            // statement that starts with `SELECT` and is not a read.
+            // `FOR UPDATE` and `nextval` are the other two, and each was
+            // found the same way -- by something being silently wrong
+            // rather than by the classifier being reviewed.
+            //
+            // Without it the parser's new `SELECT … INTO` support
+            // reached the read-only path and answered `statement
+            // requires a write lock`, which is at least loud; the
+            // sequence case was silent.
+            let writes_into = ci_contains(b, b" into ");
+            if !sql_has_sequence_mutator(b) && !wants_locks && !writes_into {
                 Some(())
             } else {
                 None
@@ -2436,6 +2448,18 @@ fn execute_with_role(
             || ci_contains(b, b" for share")
             || ci_contains(b, b" for no key update")
             || ci_contains(b, b" for key share")
+            // v7.38.19 — `SELECT … INTO t` CREATES A TABLE. Third member
+            // of the family this list already holds, and found the same
+            // way as the other two: by something being wrong, not by the
+            // list being reviewed. The sequence calls answered from a
+            // stub; `FOR UPDATE` was silently ignored; this one at least
+            // failed loudly, with an internal message about a write
+            // lock, for a statement PostgreSQL answers `SELECT 3`.
+            //
+            // Only from `SELECT`, and only as a whole word: `SHOW` has
+            // no INTO form, `SELECT into_col FROM t` is a read, and so
+            // is `SELECT x FROM points_into`.
+            || (lower_first == "select" && contains_word_into(b))
         {
             is_read = false;
         }
@@ -2750,6 +2774,16 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "WITH" | "MERGE" => spg_sql::parser::parse_statement(sql)
             .map(|stmt| command_tag_for_ast(&stmt, affected))
             .unwrap_or(first),
+        // v7.38.19 — `SELECT … INTO t` is named by what it DID, like a
+        // data-modifying CTE. The arm below this one is
+        // `other => other.to_string()`, so a SELECT-first statement that
+        // returns a command rather than rows was tagged the bare word
+        // `SELECT` -- no count -- where PostgreSQL answers `SELECT 3`.
+        // The `CREATE TABLE … AS` spelling of the same statement was
+        // already right, so the two spellings disagreed.
+        "SELECT" if contains_word_into(sql.as_bytes()) => spg_sql::parser::parse_statement(sql)
+            .map(|stmt| command_tag_for_ast(&stmt, affected))
+            .unwrap_or(first),
         // v7.39 (read01 utils/adt) — PG's DDL tags are "<VERB> <OBJECT>"
         // (CREATE TABLE / DROP INDEX / ALTER TYPE ...). Scan past the
         // modifier words (UNIQUE / OR REPLACE / TEMP / IF EXISTS ...) to
@@ -2783,6 +2817,24 @@ fn command_tag(sql: &str, affected: usize) -> String {
 /// PG's DDL tags are "<VERB> <OBJECT>"; scan past the modifiers to the
 /// object keyword. Split out of `command_tag` so the CTAS arm above can
 /// fall back to it.
+/// Whole-word `INTO`, for the `SELECT … INTO` write classification
+/// above. A substring test would take `SELECT x FROM points_into` for a
+/// write.
+fn contains_word_into(b: &[u8]) -> bool {
+    let n = b.len();
+    let word = |i: usize| -> bool {
+        (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            && (i + 4 == n || !(b[i + 4].is_ascii_alphanumeric() || b[i + 4] == b'_'))
+    };
+    (0..n.saturating_sub(3)).any(|i| {
+        b[i].eq_ignore_ascii_case(&b'i')
+            && b[i + 1].eq_ignore_ascii_case(&b'n')
+            && b[i + 2].eq_ignore_ascii_case(&b't')
+            && b[i + 3].eq_ignore_ascii_case(&b'o')
+            && word(i)
+    })
+}
+
 fn command_tag_ddl_object(sql: &str, first: &str) -> String {
     {
         let object = sql.trim_start().split_ascii_whitespace().skip(1).find(|w| {
