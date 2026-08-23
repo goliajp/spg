@@ -8,6 +8,163 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+Everything here came out of one customer report and the audit it started.
+Three of the four defects sentori named were the ones they could see; the
+rest of this is what was behind them, and most of it was found by an
+instrument being asked to prove it could see what it claimed to check.
+
+### Added
+
+- **`SELECT … INTO t`** — PostgreSQL's other spelling of `CREATE TABLE …
+  AS`. A comment has said since v7.38 that the two lower to the same
+  node; only one ever did, and `SELECT i INTO t FROM src` answered
+  `syntax error at or near "INTO"`.
+
+  It took three layers, and every one was a classifier deciding "is this
+  a read" from the first word: the parser, `pgwire`'s `is_read` (which
+  already carried two exceptions for the same reason — `nextval`
+  answering from a stub, `FOR UPDATE` silently ignored in autocommit),
+  and the command tag, whose last arm returns the first word, so the
+  statement was tagged the bare word `SELECT` with no count. `CREATE
+  TABLE … AS` was right at all three, so the two spellings of one
+  statement disagreed about all three. All four spellings now match
+  PG 18.4 exactly.
+
+### Fixed
+
+- **A locale database collation cost 26x on the most ordinary
+  predicate**, and it shipped in v7.38.18. `WHERE kind = 'click'` over
+  200,000 rows: 2.2–3.1 ms under `C`, **58.3–76.2 ms** under
+  `en_US.UTF-8`, against PostgreSQL 18.4's 1.5–4.4.
+
+  Two causes, both work done per row that belongs once per query. The
+  folding step was emitted for every text comparison whenever a collation
+  declared an ORDER, and then copied each side into a fresh String and
+  left it exactly as it found it. And `collate::compare` parsed the
+  locale and built a whole ICU collator **on every call** — the same
+  defect v7.38.18 fixed for sorting, where `Collated` was introduced for
+  exactly this and the scan-filter path was never connected to it.
+
+  Equality now skips the fold, for a reason rather than for speed:
+  PostgreSQL's locale collations are deterministic, so two strings that
+  compare equal are byte-identical and the collator cannot change the
+  answer. Ordering keeps the collator, resolved once. After: text
+  equality 2.6 ms, ordering `<` 62.5 → 15.3, the customer's dashboard
+  shape 16.6 → 10.8.
+
+  The first version of the fix skipped the step entirely and the pins
+  written for the database collation caught it in the same minute:
+  `WHERE x < 'b'` returned one row where it owes four.
+
+- **CTAS reported writing no rows.** PG answers `CREATE TABLE t AS SELECT
+  …` with `SELECT <n>`, and a driver reads the tag to learn how many rows
+  it wrote. Measured on PG 18.4, all five materialising forms, because
+  the two that are NOT `SELECT <n>` are the ones reasoning would have
+  missed — `WITH NO DATA` names the object instead. SPG got all five
+  wrong, and an existing test PINNED one of them under a comment reading
+  "a recorded delta (PG: SELECT <n>)": the right answer and the wrong
+  assertion in the same breath.
+
+- **A user-defined function's column travelled as text.** `SELECT
+  7::bigint, f_sql()` right-aligned one cell and left-aligned the other,
+  on the same value — psql aligns from the RowDescription. The executor
+  was never confused; only the type on the wire was. `build_projection`
+  called the catalog-less type walker, and the user-function arm is the
+  one arm that needs a catalog.
+
+- **A statement-resolved call lost its column name.** `nextval`,
+  `setval`, the `pg_advisory_*` family and the `lo_*` family are
+  evaluated by a pre-pass that replaces the call with the literal it
+  produced, and a literal has no name to figure out. Every one of them
+  came back as `?column?` where PostgreSQL answers the function's name.
+  Found by re-measuring a "recorded delta" comment that had described a
+  different divergence and never mentioned this one.
+
+- **`pg_advisory_unlock` did not warn**, where PostgreSQL does.
+
+- **`SELECT 1::xid8` returned `1`** where PostgreSQL answers `cannot cast
+  type integer to xid8`. **SPG accepting what PG rejects is the worse
+  direction** — code PG would have stopped runs here, and the difference
+  surfaces somewhere else, later. Nobody had recorded it; it surfaced
+  because the comment two lines above it was being re-measured.
+
+- **`CREATE DATABASE dd` left `pg_database` listing one row.** `dd`
+  connected and answered `current_database()` and was absent from the
+  catalogue, which `psql \l`, a migration tool's "does this database
+  exist" and a backup script that enumerates all read. Reported by
+  sentori. The catalogue now lists every name the server answers to, and
+  a collation applied by any of them says so rather than changing text
+  comparison silently.
+
+- **Starting the server cost the size of a directory it does not own.**
+  It swept all of `$TMPDIR` at every start; on the machine this was found
+  on that directory held 61,708 entries and 30 GB, and one `readdir` took
+  **95 seconds**. Every server an e2e test spawned waited a minute and a
+  half before it could listen, and the failures read exactly like a busy
+  machine. The run files moved into their own subdirectory, which bounds
+  the scan by what SPG wrote.
+
+  The entries were this project's own tests: 161 files build a unique
+  path under `std::env::temp_dir()` per run and none removes it. They now
+  land under one root, the janitor removes it wholesale, and a gate keeps
+  it that way.
+
+- **The precommit budgets were measuring the build cache**, and they are
+  hard — over budget fails the commit. The corpus behind `slt-smoke` is
+  1.5–2.0 s; the step has been anywhere from 0.8 s to 19.7 depending on
+  whether something had already built the workspace. It failed a
+  CHANGELOG-only commit. The tier now compiles once before anything is
+  timed, outside every budget and the tier total, and prints what that
+  cost.
+
+- **The prerelease budgets had never been calibrated.** The manifest said
+  "provisional until CP0 calibrates them from BASELINE" and CP0 never
+  ran: `gates` was over budget on every run for months while `perf-sweep`
+  had five times the time it needs. Recalibrated from ten recorded runs,
+  with the observations written beside each number.
+
+### Instruments
+
+Four gates gained the ability to see something they had claimed to check.
+
+- **The perf sweep's control leg was decoration.** Its header has said
+  since round 885 that the control's differing-cell count IS the run's
+  resolution and that cells inside it report `unresolved`. The code did
+  neither: the control ran at one row count, after every size had
+  finished, and its number was printed and dropped. A prerelease run
+  called a cell a LOSS on a 27-microsecond separation. Every cell now
+  carries its own control leg, timed between the other two, and a cell
+  where the binary separates from itself has its verdict withdrawn.
+
+- **The sweep ran entirely under `C`**, which is why a 26x regression
+  shipped. A locale-collation panel now runs beside it, measured against
+  the same binary under `C` — same box, same window, so the machine's
+  speed cancels.
+
+- **The sweep's ORDER BY cells were measuring the transfer.** All eight
+  return their rows, and at 400,000 rows of text the wire encoding
+  dominates; the sort inside was never visible. And no shape sorted TEXT
+  at all. A sort panel isolates the sort with `count(*)`, on a fixture
+  built to be varied — because the existing one has twenty-six values of
+  two hundred identical characters, and an attack measured on it would
+  report a large win that meant nothing.
+
+- **A register for known divergences.** Seventeen comments said "we know
+  this differs from PostgreSQL"; there was no list, and not one had been
+  re-measured since the day it was written. Re-measuring the nine in
+  `crates/*/src` found one that no longer reproduced, one stated
+  backwards, one already closed, two open, three unprovable as written —
+  and the `xid8` one above, which nobody had recorded. The gate now
+  checks both directions: a marker with no row is red, a row whose marker
+  has gone is red.
+
+- **The gate's cross-version open made a one-release hop**, which is the
+  hop least likely to break. It now opens the oldest fixture as well.
+
+---
+
 ## [7.38.18] — 2026-08-23
 
 ### Added
