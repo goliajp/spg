@@ -646,6 +646,7 @@ mod e2e_only_in_from_round644;
 mod e2e_operator_precedence_round760;
 mod e2e_operator_resolution_round238;
 mod e2e_operator_surface_round508;
+mod e2e_or_union_seek;
 mod e2e_order_key_bound_round582;
 mod e2e_orderby_implicit_label_round185;
 mod e2e_orderby_legality_round232;
