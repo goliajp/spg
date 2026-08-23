@@ -52,6 +52,18 @@ last twenty-nine of two hundred and ninety-four thousand years are out of
 range" are different claims, and only the second one tells a reader
 whether to care.
 
+**And the twenty-nine years are arithmetic, not a constant anyone
+chose.** `i64::MAX` microseconds from 1970 lands in year 294247.02; SPG
+counts from 1970 and PostgreSQL from 2000, so PostgreSQL's identical
+64-bit counter reaches thirty years further. The whole delta is the
+difference between two epochs.
+
+That closes the question of whether it is cheap to fix: it is not a bound
+to raise, it is the representation. Moving the epoch would rewrite every
+stored timestamp and every encoded one on the wire, to buy twenty-nine
+years nobody will reach — which is why this row's condition is simply
+**do not**.
+
 ### RD-2, priced
 
 `'infinity'::interval` is refused outright — `invalid input syntax` —
