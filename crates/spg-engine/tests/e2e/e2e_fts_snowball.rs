@@ -42,8 +42,7 @@ fn gold(name: &str) -> Vec<(String, String)> {
 ///
 /// A number that appears in something we send someone has to be
 /// asserted somewhere, or it is a number that was true once.
-const GOLD_COUNTS: [(&str, usize); 3] =
-    [
+const GOLD_COUNTS: [(&str, usize); 3] = [
     ("spanish.tsv", 1847),
     ("french.tsv", 2193),
     ("german.tsv", 2017),
