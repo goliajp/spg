@@ -2086,6 +2086,17 @@ fn run(
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
     eprintln!("spg-server: listening on {local}{auth_msg}");
+    // After replay, so it is the collation this server will actually
+    // serve rather than the one it was told about at startup.
+    {
+        let c = state
+            .engine
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .database_collation()
+            .to_string();
+        eprintln!("spg-server: database collation {c:?}");
+    }
 
     spawn_optional_listeners(&state);
 
@@ -2370,7 +2381,15 @@ fn apply_database_collation(engine: &mut Engine) {
     };
     let name = name.trim();
     match engine.set_database_collation(name) {
-        Ok(true) => eprintln!("spg-server: database collation {name:?}"),
+        // v7.38.18 — this used to announce the collation here, and the
+        // announcement could stop being true before the server took a
+        // connection: replay of a `CREATE DATABASE … LC_COLLATE` runs
+        // after this and replaces it while the database is still empty.
+        // Measured: a start under `LANG=en_US.UTF-8` printed
+        // `database collation "en_US.UTF-8"` and then served
+        // `de_DE.utf8`. The effective one is reported once, below
+        // `listening on`, where nothing can move it afterwards.
+        Ok(true) => {}
         Ok(false) => {}
         Err(e) => eprintln!(
             "spg-server: keeping the database collation it was created with \

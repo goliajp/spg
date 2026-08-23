@@ -6246,6 +6246,34 @@ impl Catalog {
         Ok(true)
     }
 
+    /// The user said so, in SQL: `CREATE DATABASE … LC_COLLATE 'x'`.
+    ///
+    /// Differs from [`Self::set_db_collation`] in one way, and the
+    /// difference is the whole point: this REPLACES a collation the
+    /// database already has, as long as no table has been created yet.
+    /// The refusal in `set_db_collation` exists because index keys were
+    /// built under the old collation — with no tables, none were.
+    ///
+    /// The case it is for: a server stamps the container's `LANG` on a
+    /// fresh database at startup, and the customer's bootstrap script
+    /// then says `CREATE DATABASE app LC_COLLATE 'de_DE.utf8'`. What the
+    /// script asked for beats what the container happened to export.
+    ///
+    /// `Ok(false)` when a table already exists — the caller warns rather
+    /// than failing, because PostgreSQL would have made a SEPARATE
+    /// database here and returned success, and failing a bootstrap
+    /// script is a customer change.
+    pub fn declare_db_collation(&mut self, name: &str) -> bool {
+        if self.db_collation.as_deref() == Some(name) {
+            return true;
+        }
+        if !self.tables.is_empty() {
+            return false;
+        }
+        self.db_collation = Some(name.into());
+        true
+    }
+
     pub const fn replication_slots(&self) -> &BTreeMap<String, (String, String)> {
         &self.replication_slots
     }

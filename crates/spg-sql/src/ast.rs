@@ -224,6 +224,17 @@ pub enum Statement {
     /// to refuse the right ones.
     NoOpPreventedInTransaction {
         what: String,
+        /// v7.38.18 — `CREATE DATABASE … LC_COLLATE 'de_DE.utf8'` is in
+        /// every PostgreSQL bootstrap script there is, and SPG threw the
+        /// whole statement away. Being single-database makes the NAME a
+        /// no-op; it does not make the collation one, and a database
+        /// that quietly sorts by the container's `LANG` instead of the
+        /// one the script asked for is a silent difference in every
+        /// `ORDER BY` it will ever run.
+        ///
+        /// `LOCALE` and `LC_COLLATE` both land here; `LC_CTYPE` does
+        /// not, because SPG has no separate ctype.
+        collation: Option<String>,
     },
     /// v7.39 (round 696) — statements SPG performs nothing for, but whose
     /// OPERAND PG validates before performing nothing either.
@@ -5391,7 +5402,7 @@ impl fmt::Display for Statement {
                 }
                 f.write_str(name)
             }
-            Self::NoOpPreventedInTransaction { what } => f.write_str(what),
+            Self::NoOpPreventedInTransaction { what, .. } => f.write_str(what),
             Self::SetConstraints { names, deferred } => {
                 f.write_str("SET CONSTRAINTS ")?;
                 if names.is_empty() {

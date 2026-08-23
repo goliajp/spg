@@ -1866,6 +1866,45 @@ impl Parser {
         }
     }
 
+    /// v7.38.18 — consume to the statement boundary like
+    /// `consume_until_statement_boundary`, but pick out the collation a
+    /// `CREATE DATABASE` asked for on the way.
+    ///
+    /// `LC_COLLATE 'de_DE.utf8'` and `LOCALE 'de_DE.utf8'` both count;
+    /// `LC_CTYPE` does not, because SPG has no separate ctype and
+    /// pretending to honour it would be the more misleading answer. An
+    /// `=` between the keyword and the value is optional, as in PG.
+    ///
+    /// The whole statement used to be thrown away. Being single-database
+    /// makes the NAME a no-op; it does not make the collation one.
+    fn scan_database_collation_until_boundary(&mut self) -> Option<String> {
+        let mut want_value = false;
+        let mut found: Option<String> = None;
+        loop {
+            let tok = self.peek().clone();
+            match &tok {
+                Token::Semicolon | Token::Eof => break,
+                Token::Ident(w) | Token::QuotedIdent(w)
+                    if w.eq_ignore_ascii_case("lc_collate") || w.eq_ignore_ascii_case("locale") =>
+                {
+                    want_value = true;
+                }
+                Token::Eq if want_value => {}
+                Token::String(v) if want_value => {
+                    found = Some(v.clone());
+                    want_value = false;
+                }
+                Token::Ident(v) | Token::QuotedIdent(v) if want_value => {
+                    found = Some(v.clone());
+                    want_value = false;
+                }
+                _ => want_value = false,
+            }
+            self.advance();
+        }
+        found
+    }
+
     /// v7.22 (round-13 T2) — consume to the statement boundary like
     /// `consume_until_statement_boundary`, but pick out the sequence
     /// name on the way: either `SEQUENCE NAME <ident>` (identity
@@ -4924,10 +4963,16 @@ impl Parser {
                 // this one is named. Still a no-op otherwise — SPG is
                 // single-database.
                 let is_database = s.eq_ignore_ascii_case("database");
-                self.consume_until_statement_boundary();
+                let collation = if is_database {
+                    self.scan_database_collation_until_boundary()
+                } else {
+                    self.consume_until_statement_boundary();
+                    None
+                };
                 if is_database {
                     return Ok(Statement::NoOpPreventedInTransaction {
                         what: String::from("CREATE DATABASE"),
+                        collation,
                     });
                 }
                 Ok(Statement::Empty)

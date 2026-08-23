@@ -130,7 +130,26 @@ the current build; this file is a release-organized view.
 
   `spg-server` reads `SPG_LC_COLLATE`, then `LC_ALL`, `LC_COLLATE`,
   `LANG` — POSIX's precedence and `initdb`'s — and records it on a
-  database that has none. **An existing database keeps `C` and rebuilds
+  database that has none.
+
+  **`CREATE DATABASE app LC_COLLATE 'de_DE.utf8'` sets it too**, and
+  this nearly shipped without doing so. SPG is single-database, so the
+  statement had been parsed and thrown away whole since v7.14, and the
+  `LC_COLLATE` on it went with the rest of the tokens; every test behind
+  the claim above went through the Rust API instead. That statement is
+  in every PostgreSQL bootstrap script there is, and a database sorting
+  by the container's `LANG` rather than by what the script asked for
+  gives a different answer to every `ORDER BY` it will ever run. What
+  the script says now wins over the environment, while the database is
+  still empty; once a table exists the statement warns and succeeds,
+  because PostgreSQL would have created a separate database here and
+  returned success, and failing a bootstrap script is a customer change.
+  `LOCALE` is accepted as the other spelling, with or without `=`.
+
+  The startup line that announced the collation moved below `listening
+  on` for the same reason it was found: it printed the environment's
+  value and then served the replayed one. Measured — a start under
+  `LANG=en_US.UTF-8` printed `en_US.UTF-8` and served `de_DE.utf8`. **An existing database keeps `C` and rebuilds
   nothing**: absent on disk means `C`, which is what every database
   written by every earlier version was built under.
 
