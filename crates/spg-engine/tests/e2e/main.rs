@@ -1260,6 +1260,7 @@ mod e2e_split_part;
 mod e2e_sql_funcs;
 mod e2e_sqrt;
 mod e2e_srf_unnest_projection;
+mod e2e_statement_resolved_call_names;
 mod e2e_string_agg;
 mod e2e_strpos;
 mod e2e_subquery_pg_differential;

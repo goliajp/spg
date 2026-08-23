@@ -2585,8 +2585,23 @@ impl Engine {
         }
     }
 
-    /// Release one level. False when this session does not hold it —
-    /// PG answers false and emits a warning; SPG answers false.
+    /// Release one level, `false` when this session does not hold it.
+    ///
+    /// v7.38.19 — and warn when it does not, which PostgreSQL does and
+    /// this did not. Measured on PG 18.4:
+    ///
+    /// ```text
+    /// WARNING:  you don't own a lock of type ExclusiveLock
+    ///  pg_advisory_unlock
+    ///  f
+    /// ```
+    ///
+    /// The comment here used to record the missing warning as a delta
+    /// and leave it. Measuring the delta to close it turned up a second
+    /// one it had never mentioned: the column was called `?column?`
+    /// rather than `pg_advisory_unlock`, and so was every other
+    /// statement-resolved call. A recorded delta says what someone
+    /// noticed, not what is true.
     pub(crate) fn advisory_unlock(&mut self, key: i64) -> bool {
         let me = self.current_session;
         match self.advisory_locks.get_mut(&key) {
@@ -2597,7 +2612,12 @@ impl Engine {
                 }
                 true
             }
-            _ => false,
+            _ => {
+                self.warning(alloc::string::String::from(
+                    "you don't own a lock of type ExclusiveLock",
+                ));
+                false
+            }
         }
     }
 
