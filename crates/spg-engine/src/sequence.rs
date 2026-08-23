@@ -148,7 +148,43 @@ impl Engine {
     ) -> Result<(), EngineError> {
         for item in &mut s.items {
             match item {
-                spg_sql::ast::SelectItem::Expr { expr, .. } => {
+                spg_sql::ast::SelectItem::Expr { expr, alias } => {
+                    // v7.38.19 — name the column BEFORE the rewrite, or the
+                    // name goes with the node.
+                    //
+                    // This pass replaces a `nextval(...)` / `setval(...)` /
+                    // `pg_advisory_lock(...)` / `lo_*(...)` call with the
+                    // literal it evaluated to, and a literal has no name to
+                    // figure out. So `SELECT nextval('s')` came back as
+                    // `?column?` where PostgreSQL says `nextval` -- measured
+                    // on PG 18.4 across the family. An ORM or a driver that
+                    // reads column names got `?column?` for every one of
+                    // them.
+                    //
+                    // Found by pulling on a different thread: a "recorded
+                    // delta" comment said `pg_advisory_unlock` differs from
+                    // PG only in a missing WARNING. Measuring it showed the
+                    // NAME was wrong too, and that the name was wrong for
+                    // the whole statement-resolved family.
+                    if alias.is_none()
+                        && let Some(n) = spg_sql::ast::figure_column_name(expr)
+                    {
+                        let before = core::mem::replace(
+                            expr,
+                            spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Null),
+                        );
+                        let mut e = before;
+                        self.resolve_sequence_calls_in_expr(&mut e)?;
+                        // Only claim the name when the rewrite actually
+                        // happened; otherwise the ordinary naming path is
+                        // still in charge and adding an alias here would
+                        // change what `*`-expansion and DISTINCT see.
+                        if spg_sql::ast::figure_column_name(&e).is_none() {
+                            *alias = Some(n);
+                        }
+                        *expr = e;
+                        continue;
+                    }
                     self.resolve_sequence_calls_in_expr(expr)?;
                 }
                 spg_sql::ast::SelectItem::Wildcard

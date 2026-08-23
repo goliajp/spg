@@ -18,13 +18,20 @@ fn round786_run_round_trips_and_cleans_up() {
     // an observation that is only stable on a quiet machine.
     let dir = std::env::temp_dir().join(format!("spg-t35-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let before = std::fs::read_dir(&dir).unwrap().count();
+    // v7.38.19 — the run files live in `<dir>/spg-run/` now, so the
+    // server's startup sweep reads only what SPG wrote rather than all of
+    // `$TMPDIR`. This test counts the directory the runs are IN; counting
+    // the parent would count the `spg-run` directory itself and read its
+    // creation as a leaked file.
+    let rd = crate::tempstore_shim::run_dir(&dir);
+    let count = |p: &std::path::Path| std::fs::read_dir(p).map(Iterator::count).unwrap_or(0);
+    let before = count(&rd);
     let mut run = crate::tempstore_shim::create_run_in(&dir).expect("factory");
     run.append(b"hello ").unwrap();
     run.append(b"world").unwrap();
     assert_eq!(run.bytes_written(), 11);
     // The file exists while the run is alive.
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before + 1);
+    assert_eq!(count(&rd), before + 1);
 
     run.seal().unwrap();
     let mut got = Vec::new();
@@ -41,7 +48,7 @@ fn round786_run_round_trips_and_cleans_up() {
     drop(run);
     // Dropping removes the backing file — a cancelled query must not
     // leave scratch behind.
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+    assert_eq!(count(&rd), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
