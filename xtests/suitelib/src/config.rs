@@ -186,3 +186,123 @@ mod tests {
         }
     }
 }
+
+/// v7.38.19 — the recorded-delta register, checked in both directions.
+///
+/// A "recorded delta" is a comment saying *we know this differs from
+/// PostgreSQL and here is why*. There were seventeen of them and no
+/// list, so nobody could read them all, and not one had been
+/// re-measured since the day it was written.
+///
+/// Re-measuring the nine in `crates/*/src` against a live PG 18.4 found
+/// one that no longer reproduced, one stated backwards, one already
+/// closed, two open — and one nobody had recorded at all, in the
+/// direction that matters most: SPG accepting `1::xid8` where PG
+/// rejects it.
+///
+/// So the register is not documentation, it is a gate. A marker with no
+/// row is red; a row whose marker has gone is red. A delta that cannot
+/// be forgotten is one somebody eventually closes.
+#[cfg(test)]
+mod recorded_delta_register {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    /// Every `RD-n` a source comment claims, from the crates' `src/`
+    /// trees only: a test may quote a delta while discussing it.
+    fn ids_in_source(root: &Path) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.filter_map(Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    // `src` only — tests discuss deltas without owning them.
+                    if p.file_name().is_some_and(|n| n == "tests" || n == "target") {
+                        continue;
+                    }
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    let Ok(text) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    for line in text.lines() {
+                        let t = line.trim_start();
+                        if !t.starts_with("//") {
+                            continue;
+                        }
+                        let mut rest = t;
+                        while let Some(i) = rest.find("RD-") {
+                            rest = &rest[i + 3..];
+                            let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                            if !n.is_empty() {
+                                out.insert(format!("RD-{n}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn ids_in_register(root: &Path) -> BTreeSet<String> {
+        let text = std::fs::read_to_string(root.join("docs/RECORDED_DELTAS.md"))
+            .expect("docs/RECORDED_DELTAS.md must exist");
+        let mut out = BTreeSet::new();
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("| RD-") {
+            rest = &rest[i + 5..];
+            let n: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            if !n.is_empty() {
+                out.insert(format!("RD-{n}"));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_marker_has_a_row_and_every_row_has_a_marker() {
+        let root = root();
+        let src = ids_in_source(&root);
+        let reg = ids_in_register(&root);
+        assert!(!src.is_empty(), "no RD- markers found — the scan is broken");
+
+        let unlisted: Vec<&String> = src.difference(&reg).collect();
+        assert!(
+            unlisted.is_empty(),
+            "a source comment records these deltas and docs/RECORDED_DELTAS.md \
+             does not list them: {unlisted:?}. Measure both engines and add a row."
+        );
+
+        // The other direction. A row whose marker has gone means the
+        // delta was closed and the register kept announcing it — which
+        // is how the compatibility matrix came to carry twenty-one
+        // crosses for code that worked.
+        let orphaned: Vec<&String> = reg
+            .difference(&src)
+            .filter(|id| {
+                // Rows under "corrected by measurement" and "not
+                // previously recorded" describe deltas with no marker on
+                // purpose; they carry their own ids and are listed here.
+                !matches!(id.as_str(), "RD-7" | "RD-8" | "RD-9" | "RD-10" | "RD-11")
+            })
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "docs/RECORDED_DELTAS.md lists these deltas and no source comment \
+             records them: {orphaned:?}. If they were closed, delete the rows."
+        );
+    }
+}

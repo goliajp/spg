@@ -292,7 +292,7 @@ impl Engine {
             // UPDATEs, the paired new-version insert is dropped too —
             // otherwise the row duplicates. (First-committer-wins
             // approximation of PG's EvalPlanQual re-check: the tx's
-            // UPDATE ends up matching zero rows. Recorded delta: PG
+            // UPDATE ends up matching zero rows. Recorded delta RD-4: PG
             // re-applies the update to the winner's new version.)
             // A tombstone target absent from the fresh base is NOT a
             // conflict when this same tx inserted it (insert-then-delete

@@ -884,7 +884,7 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
 /// peak and SPG does not meter one, and a number that was not measured
 /// is worse than none.
 ///
-/// v7.37 (round 884) — a KNOWN DIVERGENCE, recorded here because round
+/// v7.37 (round 884) — a KNOWN DIVERGENCE (RD-5), recorded here because round
 /// 882 created it. A single-table `ORDER BY` served over the wire now
 /// goes through the bounded sorter and can spill (26 runs and 86 MB on a
 /// 400k-row sort at `work_mem = 4MB`, counted in

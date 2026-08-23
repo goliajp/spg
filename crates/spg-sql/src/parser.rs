@@ -358,7 +358,13 @@ fn bits_literal_to_bytea_expr(bits: &str) -> Expr {
 /// Resolve a lexer `Token::Numeric` into its literal. PG semantics: a dotted
 /// or over-i64 literal is exact NUMERIC; scientific notation is NUMERIC too
 /// (expanded to the plain decimal form); only a fractional depth beyond SPG's
-/// scale width (u8) falls back to double precision (recorded delta).
+/// scale width (u8) falls back to double precision.
+///
+/// v7.38.19 — that sentence used to end "(recorded delta)". Measured
+/// against PG 18.4: a literal with 300 fractional digits round-trips
+/// identically on both engines, so whatever the note described is gone.
+/// It is RD-7 in `docs/RECORDED_DELTAS.md`, under "corrected by
+/// measurement" rather than under "open".
 /// Kept out of the parse_expr recursion frame — see the call site.
 #[inline(never)]
 fn numeric_token_to_literal(s: String) -> Result<Literal, String> {
@@ -420,7 +426,7 @@ fn is_json_to_record_name(s: &str) -> bool {
         // v7.39 (read01 jsonfuncs.c) — the populate family with an AS
         // column-definition list desugars identically (the record base
         // argument only carries the type; a non-NULL base's field
-        // defaults are a recorded delta).
+        // defaults are a recorded delta, RD-6).
         || s.eq_ignore_ascii_case("json_populate_record")
         || s.eq_ignore_ascii_case("jsonb_populate_record")
         || s.eq_ignore_ascii_case("json_populate_recordset")
@@ -3956,7 +3962,7 @@ impl Parser {
                 // 7.38.1 S5.2 — PG `SET [SESSION] AUTHORIZATION
                 // { DEFAULT | <role> }`. pg_dump's ACL section switches
                 // to the object owner with it. SPG maps it onto the
-                // session-role machinery (recorded delta: PG moves
+                // session-role machinery (recorded delta RD-10: PG moves
                 // session_user too; SPG moves the effective role).
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
                     if s.eq_ignore_ascii_case("authorization"))
