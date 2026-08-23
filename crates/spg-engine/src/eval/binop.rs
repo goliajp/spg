@@ -2064,6 +2064,13 @@ pub(crate) fn add_interval_to_micros(
     // SPG answers `date/time field value out of range`. Recorded delta
     // RD-3; the sentence it replaces had been wrong since it was
     // written, which is what a claim nobody re-measures becomes.
+    // v7.38.19 — the upper bound was bisected and its cause found, so
+    // nobody has to do it again: SPG accepts to year 294247,
+    // PostgreSQL to 294276, and `i64::MAX` microseconds from 1970 lands
+    // in year 294247.02. SPG counts from 1970 and PostgreSQL from 2000,
+    // so PostgreSQL's identical 64-bit counter reaches thirty years
+    // further. The delta IS the epoch difference — not a bound to raise.
+    // RD-3 in docs/RECORDED_DELTAS.md, where the condition is `do not`.
     const TS_MIN: i64 = -210_866_803_200_000_000;
     if out < TS_MIN {
         return Err(EvalError::TypeMismatch {
