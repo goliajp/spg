@@ -87,11 +87,47 @@ existed to do — `_xzm_free` and `_free` at 229 samples against
 `_platform_memcmp`'s 205. `CompactText` stores fifteen bytes inline and
 took it from 72.4 ms to 52.2.
 
-**The text sort is the next decomposition**, at 2.43x on the sweep's own
-fixture, and it starts from these numbers rather than from a fresh guess.
-Two profiling attempts produced nothing usable — the first returned
-almost no resolvable user-space symbols, the second spent its whole
-window building the fixture — so the profile is still owed.
+### The text sort, decomposed
+
+The profile that was owed, taken against a `release-dbg` build on a
+fixture verified at 400,000 rows first — the two earlier attempts failed
+because one had no resolvable symbols and the other spent its window
+building the table, and a third failed before that because the fixture
+generator overflowed `int4` at `g*7919` and left the table EMPTY. That
+last one is the trap the sweep script already documents in its own
+comment, walked into by hand.
+
+| symbol | samples |
+|---|---|
+| `_free` + `_xzm_free` | **738** |
+| `_platform_memcmp` | 455 |
+| `orderby::cmp_multi_key_in` | 374 |
+| `orderby::order_key_elem_cmp` | 153 |
+| `CompactText::cmp` | 142 |
+| `run_single_table_scan` | 71 |
+| `quicksort` + `drift::sort` | 110 |
+
+The allocator is the largest category, larger than the comparisons and
+larger than the comparator. **It is not the key vectors**: that path
+already recycles them through a `key_pool`. It is the keys' own copies of
+the strings.
+
+And the fixture is the reason `CompactText` does nothing here: the
+sweep's `pad` column is `repeat(chr(97+(g%26)), 200)` — two hundred
+bytes, far past the fifteen that fit inline, so every one of the 400,000
+keys is a heap allocation. The 28 % this version won was on short keys,
+measured on a different table, and both statements are true at once.
+
+**What is owed next**, stated so the next attack does not restart from a
+guess: a sort key for a long string that does not copy the string.
+PostgreSQL's answer is the abbreviated key — a few leading bytes that
+settle most comparisons, with the full value consulted only on a tie.
+SPG's `Collated` already builds ICU sort keys for the collated case; the
+byte-wise case has no equivalent. Note before attacking: this fixture's
+`pad` has only twenty-six distinct values, each two hundred identical
+characters, so an abbreviated key would look spectacular here and prove
+nothing about a real workload. Any attack needs a fixture with varied
+text first.
 
 Second coverage gap, recorded here because it is the same disease as the
 first: **the sweep never sorts a TEXT column.** Its shapes order by `k
