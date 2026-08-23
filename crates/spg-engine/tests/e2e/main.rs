@@ -153,6 +153,7 @@ mod e2e_common_type_unification;
 mod e2e_compaction;
 mod e2e_compiled_expr;
 mod e2e_composite_identity_round307;
+mod e2e_composite_leading_seek;
 mod e2e_composite_round263;
 mod e2e_composite_round56;
 mod e2e_composite_row_to_json;
