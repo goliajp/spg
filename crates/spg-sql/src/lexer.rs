@@ -2016,6 +2016,78 @@ fn lex_number(s: &str, mysql: bool) -> Result<(Token, usize), LexErrorKind> {
     }
 }
 
+/// v7.38.18 — the index of the `*/` that closes a comment body starting
+/// at `from`, or `None` when it never closes.
+fn find_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Is this `/*! … */` body made only of optimiser hints?
+///
+/// A hint is a bare word, or a word with a parenthesised argument, and
+/// nothing else — `STRAIGHT_JOIN`, `SQL_NO_CACHE`,
+/// `MAX_EXECUTION_TIME(1000)`. A body with a comma, an operator or a
+/// keyword SPG knows is real SQL and goes to the parser, which is what
+/// `/*!40000 , 2 */` in a mysqldump relies on.
+fn body_is_only_hints(body: &[u8]) -> bool {
+    let text = core::str::from_utf8(body).unwrap_or("");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // v7.38.18 — SEVERAL words, because a hint can be more than one:
+    // `FORCE INDEX (PRIMARY)`, `SQL_SMALL_RESULT`, `STRAIGHT_JOIN`. The
+    // first version accepted one word plus an optional argument and
+    // `FORCE INDEX (…)` stayed a syntax error.
+    let mut chars = trimmed.chars().peekable();
+    let mut saw_word = false;
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            saw_word = true;
+            while chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
+            {
+                chars.next();
+            }
+            // An optional parenthesised argument, which may be
+            // separated by a space: `FORCE INDEX (PRIMARY)` is a hint
+            // and `FORCE INDEX(PRIMARY)` is the same hint. Peeking for
+            // `(` without skipping the space left the first one a
+            // syntax error while the second parsed.
+            while chars.peek().is_some_and(|n| n.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek() == Some(&'(') {
+                let mut depth = 0usize;
+                for n in chars.by_ref() {
+                    if n == '(' {
+                        depth += 1;
+                    } else if n == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        return false;
+    }
+    saw_word
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2366,76 +2438,4 @@ mod tests {
         let toks = tokenize(r"E'it''s ok'").expect("E-string lexes");
         assert_eq!(toks, vec![Token::String("it's ok".into()), Token::Eof]);
     }
-}
-
-/// v7.38.18 — the index of the `*/` that closes a comment body starting
-/// at `from`, or `None` when it never closes.
-fn find_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut i = from;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Is this `/*! … */` body made only of optimiser hints?
-///
-/// A hint is a bare word, or a word with a parenthesised argument, and
-/// nothing else — `STRAIGHT_JOIN`, `SQL_NO_CACHE`,
-/// `MAX_EXECUTION_TIME(1000)`. A body with a comma, an operator or a
-/// keyword SPG knows is real SQL and goes to the parser, which is what
-/// `/*!40000 , 2 */` in a mysqldump relies on.
-fn body_is_only_hints(body: &[u8]) -> bool {
-    let text = core::str::from_utf8(body).unwrap_or("");
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    // v7.38.18 — SEVERAL words, because a hint can be more than one:
-    // `FORCE INDEX (PRIMARY)`, `SQL_SMALL_RESULT`, `STRAIGHT_JOIN`. The
-    // first version accepted one word plus an optional argument and
-    // `FORCE INDEX (…)` stayed a syntax error.
-    let mut chars = trimmed.chars().peekable();
-    let mut saw_word = false;
-    while let Some(c) = chars.next() {
-        if c.is_whitespace() {
-            continue;
-        }
-        if c.is_ascii_alphabetic() || c == '_' {
-            saw_word = true;
-            while chars
-                .peek()
-                .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
-            {
-                chars.next();
-            }
-            // An optional parenthesised argument, which may be
-            // separated by a space: `FORCE INDEX (PRIMARY)` is a hint
-            // and `FORCE INDEX(PRIMARY)` is the same hint. Peeking for
-            // `(` without skipping the space left the first one a
-            // syntax error while the second parsed.
-            while chars.peek().is_some_and(|n| n.is_whitespace()) {
-                chars.next();
-            }
-            if chars.peek() == Some(&'(') {
-                let mut depth = 0usize;
-                for n in chars.by_ref() {
-                    if n == '(' {
-                        depth += 1;
-                    } else if n == ')' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-        return false;
-    }
-    saw_word
 }
