@@ -24,12 +24,35 @@ cannot be forgotten is a delta someone will eventually close.
 
 | id | where | PostgreSQL 18.4 | SPG | measured |
 |---|---|---|---|---|
-| RD-1 | `eval/cast.rs` — `pg_typeof(x::cstring)` | `cstring` | `text` | 2026-08-23 |
+| RD-1 | `eval/cast.rs` — `pg_typeof(x::cstring)` | `cstring` | `text` | 2026-08-24 |
 | RD-2 | `eval/binop.rs` — `'infinity'::timestamp - '-infinity'::timestamp` | `infinity` | `ERROR: interval out of range` | 2026-08-23 |
 | RD-3 | `eval/binop.rs` — `'294276-12-31 23:59:59'::timestamp` | accepted | `ERROR: date/time field value out of range` | 2026-08-23 |
 | RD-4 | `transaction.rs` — a concurrent UPDATE's re-check | re-applies to the winner's new version (EvalPlanQual) | the UPDATE matches zero rows | not re-measured; needs two live sessions |
 | RD-5 | `explain.rs` — `EXPLAIN (ANALYZE, BUFFERS)` sort line | reports a peak | SPG does not meter one | not re-measured; a number that was not measured is worse than none |
 | RD-6 | `parser.rs` — `json_populate_record` with a non-NULL record base | takes the base's field values as defaults | the base carries only the type | not re-measured; needs a composite fixture |
+
+### RD-1, priced
+
+Re-measured 2026-08-24 and still open. What closing it would take, so the
+next reader finds the cost rather than re-deriving it:
+
+`cstring` is a PostgreSQL **pseudo-type** — `CREATE TABLE t(c cstring)`
+is refused by PostgreSQL itself with *column "c" has pseudo-type
+cstring*. Its only observable behaviour is what `pg_typeof` says: the
+value round-trips as text on both engines and `'a'::cstring || 'b'` is
+`ab` on both.
+
+So closing it means adding a `DataType` variant that exists to be
+reported and never to hold a value. This version measured what a new
+variant costs when the enum is copied on a hot path: v7.37.26 took
+`IndexKey` from 32 bytes to 48 and two queries with no numeric column in
+them paid 7–8 %. `DataType` is copied more, not less.
+
+**The condition, not the conclusion:** close RD-1 when a `DataType`
+variant can be added without widening the enum — or when the reporting
+path can carry a pseudo-type name beside the type rather than inside it.
+Until then the divergence is one word in `pg_typeof` and the fix is a tax
+on every query.
 
 ## Corrected by measurement
 
