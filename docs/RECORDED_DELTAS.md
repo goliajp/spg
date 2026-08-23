@@ -26,10 +26,44 @@ cannot be forgotten is a delta someone will eventually close.
 |---|---|---|---|---|
 | RD-1 | `eval/cast.rs` — `pg_typeof(x::cstring)` | `cstring` | `text` | 2026-08-24 |
 | RD-2 | `eval/binop.rs` — `'infinity'::timestamp - '-infinity'::timestamp` | `infinity` | `ERROR: interval out of range` | 2026-08-23 |
-| RD-3 | `eval/binop.rs` — `'294276-12-31 23:59:59'::timestamp` | accepted | `ERROR: date/time field value out of range` | 2026-08-23 |
+| RD-3 | `eval/binop.rs` — timestamps in the last 29 years PostgreSQL accepts | up to year **294276** | up to year **294247** | 2026-08-24 |
 | RD-4 | `transaction.rs` — a concurrent UPDATE's re-check | re-applies to the winner's new version (EvalPlanQual) | the UPDATE matches zero rows | not re-measured; needs two live sessions |
 | RD-5 | `explain.rs` — `EXPLAIN (ANALYZE, BUFFERS)` sort line | reports a peak | SPG does not meter one | not re-measured; a number that was not measured is worse than none |
 | RD-6 | `parser.rs` — `json_populate_record` with a non-NULL record base | takes the base's field values as defaults | the base carries only the type | not re-measured; needs a composite fixture |
+
+### RD-3, bisected
+
+The original comment said SPG's clock "ends ~30 years before PG's
+ceiling" and put the difference at the LOWER bound; v7.38.19 corrected
+the direction. Bisecting the upper bound on 2026-08-24 shows the comment
+had the *magnitude* right all along:
+
+| | last year accepted |
+|---|---|
+| SPG | **294247** |
+| PostgreSQL 18.4 | **294276** |
+
+Twenty-nine years, at the far end of a range no calendar reaches. Both
+engines accept `99999-12-31` and both refuse `294277-01-01`; the whole
+divergence is the sliver between.
+
+Recorded at this precision because "a timestamp is out of range" and "the
+last twenty-nine of two hundred and ninety-four thousand years are out of
+range" are different claims, and only the second one tells a reader
+whether to care.
+
+### RD-2, priced
+
+`'infinity'::interval` is refused outright — `invalid input syntax` —
+where PostgreSQL 18.4 answers `infinity` with `pg_typeof` `interval`. So
+this is not a subtraction edge case as the comment frames it: SPG's
+`Interval` has no infinite value at all, and the subtraction error is one
+symptom of that.
+
+Closing it means adding infinity to the `Interval` representation and
+then teaching every arithmetic, comparison, formatting and encoding path
+about it. That is a type-level change, not a fix at the site the marker
+sits on, which is why the marker points at a symptom.
 
 ### RD-1, priced
 
