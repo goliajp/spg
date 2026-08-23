@@ -2136,7 +2136,11 @@ impl Engine {
                     "database \"{name}\" does not exist"
                 )))
             }
-            Statement::NoOpPreventedInTransaction { what, collation } => {
+            Statement::NoOpPreventedInTransaction {
+                what,
+                collation,
+                name,
+            } => {
                 self.require_no_transaction_block(&what)?;
                 // v7.38.18 — the NAME is a no-op here; the collation is
                 // not. A bootstrap script that says `LC_COLLATE
@@ -2144,9 +2148,37 @@ impl Engine {
                 // has a different answer to every ORDER BY it runs, and
                 // nothing told it so.
                 let mut modified_catalog = false;
+                // v7.38.19 — record the name, so `pg_database` can list a
+                // database that was just created and can be connected to.
+                // sentori reported both halves of this against 7.38.18:
+                // `dd` answered `current_database()` and was absent from
+                // the catalogue, which is what `psql \l`, a migration
+                // tool's "does this database exist", and a backup script
+                // that enumerates all read.
+                if let Some(n) = &name
+                    && self.active_catalog_mut().record_created_database(n)
+                {
+                    modified_catalog = true;
+                }
                 if let Some(c) = collation {
                     if self.declare_database_collation(&c)? {
                         modified_catalog = true;
+                        // v7.38.19 — and say so. SPG serves ONE database
+                        // and answers to any name, so a collation asked
+                        // for by any name is server-wide; under
+                        // PostgreSQL's model nothing a CREATE DATABASE
+                        // does can reach an existing database, and
+                        // sentori watched a statement naming `dd` change
+                        // how `d` compares text. The behaviour is what
+                        // being single-database means and cannot be
+                        // fixed without a second database; being silent
+                        // about it can be.
+                        self.warning(alloc::format!(
+                            "SPG serves one database and answers to any name, so \
+                             collation {c:?} now applies to this database too. \
+                             PostgreSQL would have created a separate one; here \
+                             the names are aliases onto the same storage"
+                        ));
                     } else {
                         self.warning(alloc::format!(
                             "collation {c:?} was not applied: this database \

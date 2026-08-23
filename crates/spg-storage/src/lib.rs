@@ -4970,6 +4970,20 @@ pub struct Catalog {
     /// under this collation, so it cannot move out from under them.
     /// See `docs/DESIGN-2026-08-23-collation.md`.
     db_collation: Option<String>,
+    /// v7.38.19 — every name a `CREATE DATABASE` has asked for.
+    ///
+    /// SPG serves one database and answers to any name, so the statement
+    /// has always been a no-op for naming. `pg_database` then listed one
+    /// row -- whatever name the current session connected with -- so a
+    /// database that had just been created, and could be connected to,
+    /// was absent from the catalogue. `psql \l`, a migration tool asking
+    /// "does this database exist", and a backup script that enumerates
+    /// all read that table.
+    ///
+    /// Reported by sentori against 7.38.18. Runtime only, like
+    /// `db_collation`: the statement is audited whenever it records a
+    /// name, so replay rebuilds the set.
+    created_databases: alloc::collections::BTreeSet<String>,
     /// v7.37.42-T2 ζ-B — catalogued user-defined COMPOSITE types
     /// (`CREATE TYPE name AS (field_name field_type, …)`). Columns
     /// reference these by name via
@@ -5633,6 +5647,7 @@ impl Catalog {
             db_role_settings: BTreeMap::new(),
             replication_slots: BTreeMap::new(),
             db_collation: None,
+            created_databases: alloc::collections::BTreeSet::new(),
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
         }
@@ -6272,6 +6287,16 @@ impl Catalog {
         }
         self.db_collation = Some(name.into());
         true
+    }
+
+    /// Record a name a `CREATE DATABASE` asked for; `true` when new.
+    pub fn record_created_database(&mut self, name: &str) -> bool {
+        self.created_databases.insert(name.to_string())
+    }
+
+    /// The names `CREATE DATABASE` has been asked for.
+    pub const fn created_databases(&self) -> &alloc::collections::BTreeSet<String> {
+        &self.created_databases
     }
 
     pub const fn replication_slots(&self) -> &BTreeMap<String, (String, String)> {

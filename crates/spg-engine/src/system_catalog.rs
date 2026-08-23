@@ -7549,42 +7549,67 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("datcollversion", DataType::Text, true),
         ColumnSchema::new("datacl", DataType::Text, true),
     ];
-    let rows = alloc::vec![Row::new(alloc::vec![
-        Value::BigInt(16384),
-        // The name `current_database()` answers, read from the same place
-        // it reads, so the two cannot drift apart again.
-        Value::text(
-            engine
-                .session_params
-                .get("spg.database")
-                .cloned()
-                .unwrap_or_else(|| alloc::string::String::from("spg")),
-        ),
-        Value::BigInt(10),
-        Value::Int(6), // UTF8
-        // 'c' = libc provider, which is what SPG's C collation is.
-        Value::text("c"),
-        Value::Bool(false), // datistemplate
-        Value::Bool(true),  // datallowconn
-        Value::Bool(false), // dathasloginevt
-        Value::Int(-1),     // datconnlimit — unlimited
-        // The real MVCC floor, not a placeholder: this is the number a
-        // wraparound monitor is watching, and SPG has one to give.
-        // v7.39 (round 640) — an `xid`, same as pg_class.relfrozenxid.
-        Value::Xid(u32::try_from(engine.vacuum_oldest_active()).unwrap_or(u32::MAX)),
-        Value::BigInt(1),    // datminmxid — SPG has no multixact
-        Value::BigInt(1663), // dattablespace — pg_default
-        // v7.38.18 (S1) — what this database was actually created with,
-        // not the constant `C` that stood here while there was no way to
-        // create it with anything else. A client reads these to decide
-        // how the server sorts.
-        Value::text::<String>(engine.database_collation().into()),
-        Value::text::<String>(engine.database_collation().into()),
-        Value::Null, // datlocale
-        Value::Null, // daticurules
-        Value::Null, // datcollversion
-        Value::Null, // datacl
-    ])];
+    // v7.38.19 — every name this server answers to, not only the one the
+    // asking session connected with.
+    //
+    // SPG serves one database and accepts any name for it, so a
+    // `CREATE DATABASE dd` succeeds and `dd` connects — and this table
+    // listed exactly one row, whichever name the current session used.
+    // A database that had just been created and could be connected to
+    // was absent from the catalogue. `psql \l`, a migration tool asking
+    // "does this database exist", and a backup script that enumerates
+    // all read this table. Reported by sentori against 7.38.18.
+    //
+    // The names are aliases onto one database, so every row carries the
+    // same collation and the same frozen xid. That is the honest
+    // rendering of what SPG is; showing one row was not.
+    let connected = engine
+        .session_params
+        .get("spg.database")
+        .cloned()
+        .unwrap_or_else(|| alloc::string::String::from("spg"));
+    let mut names: alloc::vec::Vec<alloc::string::String> = alloc::vec![connected.clone()];
+    for n in engine.catalog.created_databases() {
+        if !names.iter().any(|k| k == n) {
+            names.push(n.clone());
+        }
+    }
+    let rows = names
+        .into_iter()
+        .enumerate()
+        .map(|(i, dbname)| {
+            Row::new(alloc::vec![
+                Value::BigInt(16384 + i as i64),
+                // The name `current_database()` answers, read from the same place
+                // it reads, so the two cannot drift apart again.
+                Value::text(dbname),
+                Value::BigInt(10),
+                Value::Int(6), // UTF8
+                // 'c' = libc provider, which is what SPG's C collation is.
+                Value::text("c"),
+                Value::Bool(false), // datistemplate
+                Value::Bool(true),  // datallowconn
+                Value::Bool(false), // dathasloginevt
+                Value::Int(-1),     // datconnlimit — unlimited
+                // The real MVCC floor, not a placeholder: this is the number a
+                // wraparound monitor is watching, and SPG has one to give.
+                // v7.39 (round 640) — an `xid`, same as pg_class.relfrozenxid.
+                Value::Xid(u32::try_from(engine.vacuum_oldest_active()).unwrap_or(u32::MAX)),
+                Value::BigInt(1),    // datminmxid — SPG has no multixact
+                Value::BigInt(1663), // dattablespace — pg_default
+                // v7.38.18 (S1) — what this database was actually created with,
+                // not the constant `C` that stood here while there was no way to
+                // create it with anything else. A client reads these to decide
+                // how the server sorts.
+                Value::text::<String>(engine.database_collation().into()),
+                Value::text::<String>(engine.database_collation().into()),
+                Value::Null, // datlocale
+                Value::Null, // daticurules
+                Value::Null, // datcollversion
+                Value::Null, // datacl
+            ])
+        })
+        .collect();
     (schema, rows)
 }
 

@@ -48,7 +48,10 @@ fn seeded(collation: Option<&str>) -> Engine {
 #[test]
 fn a_c_database_is_byte_ordered_exactly_as_before() {
     let mut e = seeded(None);
-    assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database"), "C");
+    assert_eq!(
+        one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
+        "C"
+    );
     assert_eq!(
         one(&mut e, "SELECT string_agg(x, ' ' ORDER BY x) FROM t"),
         "Bob Zebra apple client"
@@ -68,7 +71,7 @@ fn a_c_database_is_byte_ordered_exactly_as_before() {
 fn an_undeclared_column_inherits_the_database_collation() {
     let mut e = seeded(Some("en_US.utf8"));
     assert_eq!(
-        one(&mut e, "SELECT datcollate FROM pg_database"),
+        one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
         "en_US.utf8"
     );
     // ORDER BY, through the statement's own sort...
@@ -237,7 +240,7 @@ fn the_database_collation_is_set_once() {
     // passes its environment on every start must not fail on restart.
     assert_eq!(e.set_database_collation("en_US.utf8").ok(), Some(false));
     assert_eq!(
-        one(&mut e, "SELECT datcollate FROM pg_database"),
+        one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
         "en_US.utf8"
     );
 }
@@ -319,7 +322,7 @@ mod create_database_lc_collate {
         e.execute("CREATE DATABASE app LC_COLLATE 'de_DE.utf8'")
             .unwrap();
         assert_eq!(
-            one(&mut e, "SELECT datcollate FROM pg_database"),
+            one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
             "de_DE.utf8"
         );
         // And it reaches ordering, which is the only reason to want it.
@@ -343,7 +346,7 @@ mod create_database_lc_collate {
             let mut e = Engine::new();
             e.execute(sql).unwrap();
             assert_eq!(
-                one(&mut e, "SELECT datcollate FROM pg_database"),
+                one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
                 "de_DE.utf8",
                 "{sql}"
             );
@@ -356,7 +359,10 @@ mod create_database_lc_collate {
     fn a_statement_without_a_collation_changes_nothing() {
         let mut e = Engine::new();
         e.execute("CREATE DATABASE app").unwrap();
-        assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database"), "C");
+        assert_eq!(
+            one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
+            "C"
+        );
         assert_eq!(one(&mut e, "SELECT ('B' < 'a')"), "Bool(true)");
     }
 
@@ -371,7 +377,86 @@ mod create_database_lc_collate {
         e.execute("CREATE TABLE t(x TEXT)").unwrap();
         e.execute("CREATE DATABASE app LC_COLLATE 'de_DE.utf8'")
             .expect("must not fail a bootstrap script");
-        assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database"), "C");
+        assert_eq!(
+            one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
+            "C"
+        );
+    }
+
+    /// v7.38.19 — the created name reaches `pg_database`.
+    ///
+    /// sentori reported this against 7.38.18: `CREATE DATABASE dd`
+    /// succeeded, `dd` connected and answered `current_database()`, and
+    /// the catalogue listed one row — whichever name the asking session
+    /// had used. `psql \l`, a migration tool asking "does this database
+    /// exist", and a backup script that enumerates all read that table.
+    #[test]
+    fn a_created_database_is_listed_in_the_catalogue() {
+        let mut e = Engine::new();
+        e.execute("CREATE DATABASE dd LC_COLLATE 'de_DE.utf8'")
+            .unwrap();
+        let listed = one(
+            &mut e,
+            "SELECT string_agg(datname, ',' ORDER BY datname) FROM pg_database",
+        );
+        assert!(
+            listed.contains("dd"),
+            "pg_database must list the database just created: {listed}"
+        );
+        // The names are aliases onto one database, so both rows carry the
+        // same collation. Saying otherwise would be a second lie.
+        assert_eq!(
+            one(&mut e, "SELECT count(DISTINCT datcollate) FROM pg_database"),
+            "BigInt(1)"
+        );
+    }
+
+    /// A `CREATE DATABASE` with no collation still records its name: the
+    /// catalogue question is independent of the collation one.
+    #[test]
+    fn the_name_is_recorded_even_without_a_collation() {
+        let mut e = Engine::new();
+        e.execute("CREATE DATABASE plain").unwrap();
+        let listed = one(
+            &mut e,
+            "SELECT string_agg(datname, ',' ORDER BY datname) FROM pg_database",
+        );
+        assert!(listed.contains("plain"), "{listed}");
+        // And nothing about the collation moved.
+        assert_eq!(
+            one(&mut e, "SELECT DISTINCT datcollate FROM pg_database"),
+            "C"
+        );
+    }
+
+    /// The name is the database's, not the keyword's. It was the
+    /// keyword: `scan_database_name` was called with the parser still
+    /// sitting on `DATABASE`, and `pg_database` listed a database called
+    /// `database`.
+    #[test]
+    fn the_recorded_name_is_not_the_keyword() {
+        let mut e = Engine::new();
+        e.execute("CREATE DATABASE dd").unwrap();
+        let listed = one(
+            &mut e,
+            "SELECT string_agg(datname, ',' ORDER BY datname) FROM pg_database",
+        );
+        assert!(!listed.contains("database"), "{listed}");
+        assert!(listed.contains("dd"), "{listed}");
+        // A quoted name keeps its spelling.
+        e.execute("CREATE DATABASE \"Mixed\"").unwrap();
+        let listed = one(
+            &mut e,
+            "SELECT string_agg(datname, ',' ORDER BY datname) FROM pg_database",
+        );
+        assert!(listed.contains("Mixed"), "{listed}");
+
+        // Not tested here: `CREATE DATABASE IF NOT EXISTS`. PostgreSQL 18
+        // answers it `syntax error at or near \"NOT\"` -- it is MySQL's
+        // spelling -- so asserting SPG accepts it would be asserting a
+        // behaviour the engine we stand in for does not have. The
+        // keyword-skipping in `scan_database_name` stays for the MySQL
+        // dialect's sake and is covered by the name above.
     }
 
     /// A name PostgreSQL does not have is refused here too, rather than
