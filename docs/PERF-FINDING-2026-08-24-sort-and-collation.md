@@ -200,3 +200,51 @@ Second coverage gap, recorded here because it is the same disease as the
 first: **the sweep never sorts a TEXT column.** Its shapes order by `k
 INT`, `n NUMERIC` and `b BYTEA`. The text ordering path — the one this
 version changed twice — has no cell at all.
+
+## 3. The image's default collation is not the reference image's
+
+Found while checking whether §1's twenty-six-fold fix helps the
+customer's numbers. It does not, and the reason is worth more than the
+answer.
+
+`goliakk/spg` starts a fresh database under `C`, because the image sets
+no locale. So the collation work in v7.38.18 and the fix in v7.38.19
+change nothing for anyone running the stock image — they are for
+deployments that set `LANG`, `LC_ALL` or `SPG_LC_COLLATE`.
+
+Which raises the question the collation feature was built to answer. The
+same three rows, inserted and ordered on each image:
+
+| image | `datcollate` says | it actually sorts |
+|---|---|---|
+| `postgres:18` (glibc) | `en_US.utf8` | `apple, Bob, Zebra` |
+| `postgres:18-alpine` (musl) | `en_US.utf8` | `Bob, Zebra, apple` |
+| `goliakk/spg:7.38.18` | `C` | `Bob, Zebra, apple` |
+
+The alpine image **declares a locale it does not perform** — musl has no
+locale data, so `en_US.utf8` behaves as `C` there. SPG matches alpine and
+differs from the Debian image, which is the one `postgres:18` resolves
+to.
+
+**A customer moving off the standard PostgreSQL image gets a different
+row order from SPG, silently.** That is the divergence v7.38.18's feature
+exists to close, still open one level up: the capability shipped and the
+image does not use it.
+
+### Why this version does not flip it
+
+Setting `LANG=en_US.UTF-8` in the image would close it, and would hand
+every customer the ordering cost measured in §1: `<` on a text column is
+15.3 ms against PostgreSQL's 3.29, and `ORDER BY` over one is 100.5
+against 20.9. Equality is level after this version's fix; ordering is
+not.
+
+So the order is: close the ordering gap, then flip the default. Flipping
+first would trade a silent wrong answer for a loud slow one, and the
+customer did not ask for either.
+
+Stated so it is a decision rather than an oversight, and so the next
+person finds the condition rather than the conclusion.
+
+**Sentori is not affected**, and by luck rather than design: their
+production is `postgres:18-alpine`, which sorts by bytes too.
