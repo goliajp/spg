@@ -146,8 +146,15 @@ group = "corpus"
 tier = "prerelease"
 name = "perf-sweep"
 impl = "internal"
-# observed 138 / 148 / 182 (n=4) -- was 900; the third control leg costs ~34s
-budget_s = 300
+# observed 138 / 148 / 182 (n=4) with one SPG leg; the third control leg
+# costs ~34s. v7.38.19 added a SECOND panel -- a locale-collation leg
+# measured against the C leg, at the largest row count only -- because
+# all sixty-four cells of the first panel run under `C` and could not
+# see a factor-of-twenty-six regression that shipped in v7.38.18.
+# Re-calibrate from a run once the two-panel figure has been recorded a
+# few times; 600 is the observed maximum plus room for the new panel,
+# not a measurement of it.
+budget_s = 600
 
 [[step]]
 tier = "prerelease"

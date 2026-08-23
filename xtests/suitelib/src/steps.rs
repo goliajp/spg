@@ -137,6 +137,53 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
             "PSQL='{psql}' PG_URI='{pg_uri}' SPG_URI='{spg_uri}' bash scripts/perf-endpoint-sweep.sh"
         ),
     );
+    // v7.38.19 — a second SPG leg, under a LOCALE database collation,
+    // measured against the first.
+    //
+    // Every one of the sixty-four cells above runs under `C`, so the
+    // sweep could not see what a declared collation costs -- and what it
+    // cost was a factor of twenty-six on `WHERE kind = 'click'` over
+    // 200,000 rows, shipped in v7.38.18 and found only when a customer's
+    // slowest shape was pulled apart by hand.
+    //
+    // Comparing SPG-under-a-locale against SPG-under-C rather than
+    // against PostgreSQL is deliberate: it is the same binary on the
+    // same box in the same window, so the machine's speed cancels and
+    // what is left is the question worth asking -- does declaring a
+    // collation change the COST CLASS of an ordinary query. The script's
+    // own control leg and its refusal to call an unresolved difference
+    // both apply unchanged, because it is the same script.
+    let locale_out = (|| -> Result<String, String> {
+        let tmp2 = crate::proclib::run_tmp_dir(&format!("{runid}-sweep-locale"));
+        let _ = std::fs::remove_dir_all(&tmp2);
+        let mut roster2 = Roster::new();
+        let port2 = roster2.spawn_server_env(
+            "sweep-leg-locale",
+            &bin,
+            &tmp2,
+            Duration::from_secs(20),
+            bind,
+            &[("SPG_LC_COLLATE", "en_US.utf8")],
+        )?;
+        let locale_uri = format!("postgres://bench:bench@{host}:{port2}/bench");
+        sh(
+            root,
+            &format!("{psql} --no-psqlrc -X -q -tA '{locale_uri}' -c 'SELECT 1'"),
+        )
+        .map_err(|e| format!("locale leg {locale_uri} not answering: {e}"))?;
+        // `SIZES` trimmed to the largest band only: the question is a
+        // cost CLASS, which the widest row count answers most clearly,
+        // and the whole panel twice would not fit the tier's budget.
+        let r = sh(
+            root,
+            &format!(
+                "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000                  bash scripts/perf-endpoint-sweep.sh"
+            ),
+        );
+        roster2.reap_all();
+        let _ = std::fs::remove_dir_all(&tmp2);
+        r
+    })();
     // D20 — the sweep leg's peak RSS goes into the account, and the
     // manifest ceiling has teeth at reap.
     let ceiling = std::fs::read_to_string(root.join("xtests/suite.toml"))
@@ -157,11 +204,31 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         .find(|l| l.contains("losses="))
         .unwrap_or("(no verdict line)")
         .to_string();
-    if verdict.contains("losses=0") {
-        Ok(format!("{verdict}; peak rss: {}", peak_note.join(", ")))
-    } else {
-        Err(format!("sweep verdict: {verdict}"))
+    if !verdict.contains("losses=0") {
+        return Err(format!("sweep verdict: {verdict}"));
     }
+    // The locale panel's verdict, read the same way and held to the same
+    // bar. A loss here means declaring a collation changed an ordinary
+    // query's cost class beyond what the run's own control can explain.
+    let locale_verdict = locale_out
+        .map(|t| {
+            t.lines()
+                .rev()
+                .find(|l| l.contains("losses="))
+                .unwrap_or("(no verdict line)")
+                .to_string()
+        })
+        .unwrap_or_else(|e| format!("locale leg failed: {e}"));
+    if !locale_verdict.contains("losses=0") {
+        return Err(format!(
+            "locale-collation panel: {locale_verdict} — a declared collation \
+             changed the cost class against the same binary under `C`"
+        ));
+    }
+    Ok(format!(
+        "{verdict}; locale panel {locale_verdict}; peak rss: {}",
+        peak_note.join(", ")
+    ))
 }
 
 /// `ironrules` (S1.3) — the prerelease tier's standing-rule step: the
