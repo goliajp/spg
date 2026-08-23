@@ -187,7 +187,17 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
 /// would stop testing anything at all.
 /// The newest `xtests/compat-datadirs/vX.Y.Z` that is not this
 /// workspace's own version.
-fn newest_prior_datadir(root: &Path) -> Result<std::path::PathBuf, String> {
+/// The oldest and the newest data-directory fixture older than the
+/// workspace version.
+///
+/// v7.38.18 — this returned only the newest, and so the cross-version
+/// open only ever exercised a one-release hop. That is the hop least
+/// likely to break: it is the same `FILE_VERSION` almost every time.
+/// This release moved `FILE_VERSION` 91 -> 92 for the database
+/// collation, and the customer this was written for is eleven releases
+/// back — the jump the step could not see was exactly the one being
+/// promised to them in writing.
+fn prior_datadirs(root: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     let current = std::fs::read_to_string(root.join("Cargo.toml"))
         .map_err(|e| format!("read Cargo.toml: {e}"))?
         .lines()
@@ -200,6 +210,7 @@ fn newest_prior_datadir(root: &Path) -> Result<std::path::PathBuf, String> {
         .ok_or("no workspace version in Cargo.toml")?;
     let dir = root.join("xtests/compat-datadirs");
     let mut best: Option<(Vec<u32>, std::path::PathBuf)> = None;
+    let mut worst: Option<(Vec<u32>, std::path::PathBuf)> = None;
     for e in std::fs::read_dir(&dir)
         .map_err(|e| format!("read {}: {e}", dir.display()))?
         .filter_map(Result::ok)
@@ -216,32 +227,49 @@ fn newest_prior_datadir(root: &Path) -> Result<std::path::PathBuf, String> {
             continue;
         }
         if best.as_ref().is_none_or(|(b, _)| parts > *b) {
-            best = Some((parts, e.path()));
+            best = Some((parts.clone(), e.path()));
+        }
+        if worst.as_ref().is_none_or(|(w, _)| parts < *w) {
+            worst = Some((parts, e.path()));
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| {
-        format!(
+    let (Some((_, newest)), Some((_, oldest))) = (best, worst) else {
+        return Err(format!(
             "no data-directory fixture older than {current} under {} — the \
              cross-version open has nothing to open",
             dir.display()
-        )
-    })
+        ));
+    };
+    // One entry when they are the same directory, so the caller opens it
+    // once and the report does not claim two hops it did not make.
+    if oldest == newest {
+        return Ok(vec![newest]);
+    }
+    Ok(vec![oldest, newest])
 }
 
 pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
     let smoke = ironrule_smoke(root, runid)?;
-    let fixture = newest_prior_datadir(root)?;
-    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-fver"));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).map_err(|e| format!("mkdir: {e}"))?;
-    // The server mutates its dir; always open a COPY.
-    for f in ["audit", "wal", "wal.cluster_id"] {
-        std::fs::copy(fixture.join(f), tmp.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+    let mut opened = Vec::new();
+    for fixture in prior_datadirs(root)? {
+        opened.push(open_datadir_fixture(root, &fixture, runid)?);
     }
-    let bin = root.join("target/release/spg-server");
-    let mut roster = Roster::new();
-    let port = roster.spawn_server("fver", &bin, &tmp, Duration::from_secs(15))?;
-    let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite")?;
+    // Name every fixture that was opened. The old line said "v7.38.15"
+    // whatever ran, which is how a report keeps announcing coverage a
+    // step no longer has.
+    Ok(format!(
+        "{smoke}; {} dir direct-open verified",
+        opened.join(" + ")
+    ))
+}
+
+/// Open one released data directory with the binary being released, and
+/// check every count and checksum the fixture recorded.
+fn open_datadir_fixture(
+    root: &Path,
+    fixture: &Path,
+    runid: &str,
+) -> Result<String, String> {
     // The fixture's own name, so a failure sends the reader to the
     // directory that actually failed. These messages said `v7.38.15`
     // literally, which was the same aging lie as the path they came
@@ -252,6 +280,17 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
         .and_then(|s| s.to_str())
         .unwrap_or("?")
         .to_string();
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-fver-{fx}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("mkdir: {e}"))?;
+    // The server mutates its dir; always open a COPY.
+    for f in ["audit", "wal", "wal.cluster_id"] {
+        std::fs::copy(fixture.join(f), tmp.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+    }
+    let bin = root.join("target/release/spg-server");
+    let mut roster = Roster::new();
+    let port = roster.spawn_server("fver", &bin, &tmp, Duration::from_secs(15))?;
+    let mut conn = crate::wireclient::Conn::connect(port, "suite", "suite")?;
     let expected = std::fs::read_to_string(fixture.join("expected.txt"))
         .map_err(|e| format!("expected.txt: {e}"))?;
     for line in expected.lines() {
@@ -275,17 +314,14 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
             .unwrap_or_default();
         if got != want {
             return Err(format!(
-                "{fx} fixture: {key}: want {want}, got {got} — the previous \
+                "{fx} fixture: {key}: want {want}, got {got} — that \
                  release's data did not survive the current binary"
             ));
         }
     }
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);
-    // Name the fixture that was opened. The old line said "v7.38.15"
-    // whatever ran, which is how a report keeps announcing coverage a
-    // step no longer has.
-    Ok(format!("{smoke}; {fx} dir direct-open verified"))
+    Ok(fx)
 }
 
 /// `ironrule-smoke` — the fastest wire-level pins of standing rules:
@@ -917,14 +953,17 @@ mod datadir_choice_tests {
             })
             .expect("workspace version");
 
-        let chosen = super::newest_prior_datadir(&root).expect("a prior fixture must exist");
-        let name = chosen.file_name().and_then(|s| s.to_str()).unwrap();
+        let chosen = super::prior_datadirs(&root).expect("a prior fixture must exist");
+        let last = chosen.last().expect("at least one fixture");
+        let name = last.file_name().and_then(|s| s.to_str()).unwrap();
 
-        assert_ne!(
-            name,
-            format!("v{current}"),
-            "a build opening its own fixture is not a cross-version test"
-        );
+        for c in &chosen {
+            assert_ne!(
+                c.file_name().and_then(|s| s.to_str()).unwrap(),
+                format!("v{current}"),
+                "a build opening its own fixture is not a cross-version test"
+            );
+        }
 
         // And it must be the newest of the ones that qualify, compared
         // numerically: `v7.38.9` sorts after `v7.38.15` as a string, and
@@ -936,6 +975,13 @@ mod datadir_choice_tests {
                 .collect()
         };
         let chosen_v = parts(name);
+        let oldest_name = chosen
+            .first()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        let oldest_v = parts(&oldest_name);
         for e in std::fs::read_dir(root.join("xtests/compat-datadirs"))
             .expect("fixture dir")
             .filter_map(Result::ok)
@@ -950,7 +996,50 @@ mod datadir_choice_tests {
                     v <= chosen_v,
                     "{other} is newer than the chosen {name} — the pick is not the newest"
                 );
+                assert!(
+                    v >= oldest_v,
+                    "{other} is older than the chosen {oldest_name} — the pick is not the oldest"
+                );
             }
+        }
+    }
+
+    /// v7.38.18 — the step used to open ONE fixture, the newest, which
+    /// is the hop least likely to break: it is almost always the same
+    /// `FILE_VERSION` on both sides. The far hop is the one a customer
+    /// several releases back actually makes, and it was uncovered.
+    #[test]
+    fn cross_version_open_covers_both_ends() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let chosen = super::prior_datadirs(&root).expect("a prior fixture must exist");
+        let names: Vec<String> = chosen
+            .iter()
+            .map(|p| p.file_name().and_then(|s| s.to_str()).unwrap().to_string())
+            .collect();
+        let parts = |n: &str| -> Vec<u32> {
+            n.trim_start_matches('v')
+                .split('.')
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        };
+        // Two ends, unless the corpus holds exactly one directory.
+        let dirs = std::fs::read_dir(root.join("xtests/compat-datadirs"))
+            .expect("fixture dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().join("expected.txt").exists())
+            .count();
+        if dirs > 1 {
+            assert_eq!(names.len(), 2, "expected the oldest and the newest, got {names:?}");
+            assert!(
+                parts(&names[0]) < parts(&names[1]),
+                "the oldest must come first: {names:?}"
+            );
+        } else {
+            assert_eq!(names.len(), 1);
         }
     }
 }
