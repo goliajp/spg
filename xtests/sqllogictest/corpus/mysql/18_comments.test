@@ -1,0 +1,136 @@
+# v7.38.18 — the MySQL half of the comment forms.
+#
+# Every expectation read from MySQL 9 (spg-bench-mysql) on 2026-08-23.
+# The two that differ from PostgreSQL are the point of the file:
+# `#` is a comment here and a column reference there, and a block
+# comment closes at its FIRST `*/` here and nests there.
+
+dialect mysql
+
+query I
+SELECT 1 # a hash comment
+----
+1
+
+query I
+SELECT 1 -- a line comment
+----
+1
+
+query I
+SELECT /* a block comment */ 1
+----
+1
+
+# MySQL does not nest: the first `*/` closes, so the inner `/*` is just
+# text inside the comment.
+query I
+SELECT /* a /* b */ 1
+----
+1
+
+# `/*! … */` is executable in MySQL — the body IS the SQL.
+query I
+SELECT 1 /*!40000 , 2 */
+----
+1
+2
+
+# ...but a body that is only an optimiser hint names something SPG's
+# planner does not have, and is skipped rather than parsed. It used to
+# be a syntax error; MySQL 9 answers 1.
+query I
+SELECT /*! STRAIGHT_JOIN */ 1
+----
+1
+
+query I
+SELECT /*! SQL_NO_CACHE */ 1
+----
+1
+
+# `/*+ … */` is MySQL 8's optimiser hint, a comment to anyone who does
+# not implement it.
+query I
+SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1
+----
+1
+
+# A hint can be more than one word, with or without a space before its
+# argument. MySQL 9 accepts `FORCE INDEX (PRIMARY)` -- it answers "Key
+# 'PRIMARY' doesn't exist", which is the planner talking, so the syntax
+# went through.
+statement ok
+CREATE TABLE hh(a int)
+
+statement ok
+INSERT INTO hh VALUES (1)
+
+query I
+SELECT a FROM hh /*! FORCE INDEX (hh_a) */
+----
+1
+
+query I
+SELECT /*!50000 SQL_SMALL_RESULT */ a FROM hh
+----
+1
+
+# --- and the negative control -----------------------------------------
+#
+# The skip is for bodies made ONLY of hints. A body that is real SQL is
+# still executed, which is what every mysqldump depends on: too wide a
+# rule here would silently drop half a dump's statements.
+
+query II
+SELECT 1 /*!40000 , 2 */
+----
+1
+2
+
+query I
+SELECT a FROM hh /*!40000 WHERE a = 1 */
+----
+1
+
+statement ok
+/*!40000 ALTER TABLE hh DISABLE KEYS */
+
+statement ok
+/*!40014 SET @X=1 */
+
+statement ok
+DROP TABLE hh
+
+# The preamble every mysqldump opens with, statement for statement.
+statement ok
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */
+
+statement ok
+/*!40101 SET NAMES utf8mb4 */
+
+statement ok
+/*!40103 SET TIME_ZONE='+00:00' */
+
+statement ok
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */
+
+statement ok
+CREATE TABLE dmp (id int NOT NULL AUTO_INCREMENT, s text, PRIMARY KEY (id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+
+statement ok
+/*!40000 ALTER TABLE dmp DISABLE KEYS */
+
+statement ok
+INSERT INTO dmp (s) VALUES ('a')
+
+statement ok
+/*!40000 ALTER TABLE dmp ENABLE KEYS */
+
+query I
+SELECT count(*) FROM dmp # how many
+----
+1
+
+statement ok
+DROP TABLE dmp

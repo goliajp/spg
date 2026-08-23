@@ -477,6 +477,20 @@ pub fn tokenize_with_offsets(
                     i += 1;
                 }
             }
+            // v7.38.18 — `#` to end of line, in the MySQL dialect only.
+            //
+            // MySQL 9 answers `SELECT 1 # hash comment` with `1`; PG
+            // 18.4 answers `column "x" does not exist`, which is what
+            // SPG already did in both dialects. So this is a dialect
+            // split rather than a fix: a MySQL session gains the
+            // comment, a PostgreSQL session keeps the error. A
+            // mysqldump carries these.
+            b'#' if backslash_escapes => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
             b'/' if peek_eq(bytes, i + 1, b'*') => {
                 let start = i;
                 // v7.14.0 — MySQL versioned conditional comment
@@ -498,16 +512,66 @@ pub fn tokenize_with_offsets(
                     if j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                         j += 1;
                     }
+                    // v7.38.18 — a body made ONLY of optimiser hints is
+                    // skipped whole.
+                    //
+                    // MySQL executes what is inside `/*! … */`, so SPG
+                    // lexes it as SQL — and `SELECT /*! STRAIGHT_JOIN */ 1`
+                    // was therefore a syntax error, because SPG has no
+                    // such keyword. MySQL 9 answers `1`. A hint is a
+                    // planner instruction, not a statement: the right
+                    // reading of one SPG does not implement is to
+                    // ignore it, which is what MySQL does for a hint
+                    // its own planner has retired.
+                    if let Some(end) = find_comment_end(bytes, j)
+                        && body_is_only_hints(&bytes[j..end])
+                    {
+                        i = end + 2;
+                        continue;
+                    }
                     i = j;
+                    continue;
+                }
+                // v7.38.18 — `/*+ … */`, MySQL 8's optimiser hint. It
+                // is a comment to everyone who does not implement the
+                // hint, which is SPG.
+                if peek_eq(bytes, i + 2, b'+') {
+                    let Some(end) = find_comment_end(bytes, i + 3) else {
+                        return Err(LexError {
+                            kind: LexErrorKind::UnterminatedBlockComment,
+                            pos: start,
+                        });
+                    };
+                    i = end + 2;
                     continue;
                 }
                 i += 2;
                 let mut closed = false;
+                // v7.38.18 — PostgreSQL's block comments NEST and
+                // MySQL's do not, and the two rules disagree on the
+                // same input. `SELECT /* a /* b */ c */ 1` is `1` on PG
+                // 18.4 and a syntax error here; `SELECT /* a /* b */ 1`
+                // is `1` on MySQL 9, where the first `*/` closes it.
+                // Both were measured before this was written.
+                //
+                // The dialect flag SPG already threads for backslash
+                // escapes picks the rule, because there is no reading
+                // that satisfies both.
+                let mut depth = 1usize;
                 while i + 1 < bytes.len() {
+                    if !backslash_escapes && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                        continue;
+                    }
                     if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                         i += 2;
-                        closed = true;
-                        break;
+                        depth -= 1;
+                        if depth == 0 {
+                            closed = true;
+                            break;
+                        }
+                        continue;
                     }
                     i += 1;
                 }
@@ -2302,4 +2366,76 @@ mod tests {
         let toks = tokenize(r"E'it''s ok'").expect("E-string lexes");
         assert_eq!(toks, vec![Token::String("it's ok".into()), Token::Eof]);
     }
+}
+
+/// v7.38.18 — the index of the `*/` that closes a comment body starting
+/// at `from`, or `None` when it never closes.
+fn find_comment_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Is this `/*! … */` body made only of optimiser hints?
+///
+/// A hint is a bare word, or a word with a parenthesised argument, and
+/// nothing else — `STRAIGHT_JOIN`, `SQL_NO_CACHE`,
+/// `MAX_EXECUTION_TIME(1000)`. A body with a comma, an operator or a
+/// keyword SPG knows is real SQL and goes to the parser, which is what
+/// `/*!40000 , 2 */` in a mysqldump relies on.
+fn body_is_only_hints(body: &[u8]) -> bool {
+    let text = core::str::from_utf8(body).unwrap_or("");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // v7.38.18 — SEVERAL words, because a hint can be more than one:
+    // `FORCE INDEX (PRIMARY)`, `SQL_SMALL_RESULT`, `STRAIGHT_JOIN`. The
+    // first version accepted one word plus an optional argument and
+    // `FORCE INDEX (…)` stayed a syntax error.
+    let mut chars = trimmed.chars().peekable();
+    let mut saw_word = false;
+    while let Some(c) = chars.next() {
+        if c.is_whitespace() {
+            continue;
+        }
+        if c.is_ascii_alphabetic() || c == '_' {
+            saw_word = true;
+            while chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
+            {
+                chars.next();
+            }
+            // An optional parenthesised argument, which may be
+            // separated by a space: `FORCE INDEX (PRIMARY)` is a hint
+            // and `FORCE INDEX(PRIMARY)` is the same hint. Peeking for
+            // `(` without skipping the space left the first one a
+            // syntax error while the second parsed.
+            while chars.peek().is_some_and(|n| n.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek() == Some(&'(') {
+                let mut depth = 0usize;
+                for n in chars.by_ref() {
+                    if n == '(' {
+                        depth += 1;
+                    } else if n == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        return false;
+    }
+    saw_word
 }

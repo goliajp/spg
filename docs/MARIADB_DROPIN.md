@@ -1,4 +1,9 @@
-# MariaDB drop-in support — current state + roadmap
+# MariaDB drop-in support — current state
+
+> **Re-measured 2026-08-23 against v7.38.18**, twenty-four versions
+> after the `v7.14.0` this page was written at. Seven of the eight
+> `partial` / `pending` cells now work; the one that does not is named
+> below with what it errors on.
 
 MariaDB shares MySQL's wire protocol (with extensions);
 SPG's `mysqlwire` shim accepts MariaDB clients out of the
@@ -33,10 +38,10 @@ attention:
 | Feature | Status | Notes |
 |---|---|---|
 | `SEQUENCE` objects + `NEXTVAL` / `LASTVAL` / `SETVAL` | ✅ | SPG ships PG-flavoured sequences (v7.17), MariaDB syntax accepted. |
-| MariaDB JSON functions (`JSON_EXTRACT`, `JSON_VALUE`) | partial | PG JSONB operator surface (`->`, `->>`, `#>`, `@>`, `?`) covers most usage; the MariaDB function spellings need parser arms case-by-case. |
+| MariaDB JSON functions (`JSON_EXTRACT`, `JSON_VALUE`) | ✅ | Both spellings, beside the PG JSONB operators. Measured v7.38.18 (was `partial`) |
 | `WITH RECURSIVE` CTE | ✅ | PG-shape implementation works. |
-| MariaDB-specific storage engines (`Aria`, `InnoDB`, etc.) | pending | The wire-level statement is parsed; the engine-level storage choice is a no-op (SPG has one engine). MariaDB schema dumps that name an engine load cleanly. |
-| `pg_dump` equivalent (`mariadb-dump`) output as-is | partial | v7.14.0+ accepts most preamble; specific edge cases (regex character classes inside `WHERE`, vendor-specific hint comments) need fixtures to find. |
+| MariaDB-specific storage engines (`Aria`, `InnoDB`, etc.) | ✅ | `ENGINE=` is accepted and is a no-op — SPG has one engine. Measured for `InnoDB` and `Aria` (was `pending`) |
+| `mariadb-dump` output as-is | ✅ | The dump-compat gate runs MariaDB dumps of four apps on every release, and a regex character class inside `WHERE` (`s REGEXP '^[a-c]+$'`) works — that half of the old note is closed. Vendor hint comments (`/*! STRAIGHT_JOIN */`, `/*! FORCE INDEX (…) */`, `/*+ BKA(t) */`) parse and are ignored as of v7.38.18 — a hint names something SPG's planner does not have, so ignoring it is the reading MySQL itself gives a retired hint. A `/*! … */` body that is real SQL is still executed, which is what a dump depends on. |
 
 ## Roadmap
 

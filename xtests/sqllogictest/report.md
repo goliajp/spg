@@ -4,9 +4,9 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 225 | 0 | 0 | 100.0% | postgres × 16 |
+| `15_regressions` | 233 | 0 | 0 | 100.0% | postgres × 17 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 421 | 0 | 0 | 100.0% | mysql × 26 |
+| `mysql` | 449 | 0 | 0 | 100.0% | mysql × 27 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -41,6 +41,7 @@ Per-corpus pass / fail / skip:
 | `v73818_analyze_same_query_string.test` | 5 | 0 | 0 | postgres |
 | `v73818_collated_index_is_used.test` | 13 | 0 | 0 | postgres |
 | `v73818_collation_survives_dump.test` | 11 | 0 | 0 | postgres |
+| `v73818_comments.test` | 8 | 0 | 0 | postgres |
 | `v73818_expr_index_is_not_a_column_index.test` | 10 | 0 | 0 | postgres |
 | `v73818_locale_collation_index.test` | 18 | 0 | 0 | postgres |
 | `v73818_pg_collation.test` | 13 | 0 | 0 | postgres |
@@ -100,6 +101,7 @@ Per-corpus pass / fail / skip:
 | `16_info_schema_mysql.test` | 14 | 0 | 0 | mysql |
 | `16_warning_diagnostics.test` | 15 | 0 | 0 | mysql |
 | `17_warning_area_lifetime.test` | 15 | 0 | 0 | mysql |
+| `18_comments.test` | 28 | 0 | 0 | mysql |
 | `v73813_distinct_binary_collation.test` | 32 | 0 | 0 | mysql |
 | `v73814_distinct_sources.test` | 15 | 0 | 0 | mysql |
 | `v73814_expr_collation.test` | 16 | 0 | 0 | mysql |
