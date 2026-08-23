@@ -182,6 +182,72 @@ fn a_function_created_in_the_same_query_string_is_visible() {
     );
 }
 
+/// v7.38.19 — the whole family, enumerated rather than waited for.
+///
+/// The function case was the NINTH thing found this way: v7.38.18 fixed
+/// `ANALYZE` and recorded that seven other statement kinds in the same
+/// position were already right. Each of those was found by something
+/// being wrong, one at a time.
+///
+/// So the rest of the family is listed here instead. Every one of these
+/// creates an object and uses it inside ONE simple query, and every one
+/// was measured against PostgreSQL 18.4 before being written down. They
+/// all passed on the day this was written — which is the point: the next
+/// one to break has a test rather than a customer.
+#[test]
+fn every_object_created_in_one_query_string_is_visible_to_the_rest() {
+    let (_child, addrs) = spawn("famvis");
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    // Two tables and a join — this one reads the catalog through the
+    // join reorderer, which is a different path from the scan.
+    assert_eq!(
+        one_value(
+            &mut s,
+            "CREATE TABLE j1(i int); CREATE TABLE j2(i int); \
+             INSERT INTO j1 VALUES (1),(2); INSERT INTO j2 VALUES (2),(3); \
+             SELECT count(*) FROM j1 JOIN j2 ON j1.i=j2.i"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one_value(
+            &mut s,
+            "CREATE TABLE v1(i int); INSERT INTO v1 VALUES (1); \
+             CREATE VIEW vv AS SELECT i FROM v1; SELECT count(*) FROM vv"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one_value(
+            &mut s,
+            "CREATE TABLE ix2(i int); INSERT INTO ix2 VALUES (1),(2); \
+             CREATE INDEX ix2_i ON ix2(i); SELECT count(*) FROM ix2 WHERE i=2"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one_value(
+            &mut s,
+            "CREATE TYPE mood2 AS ENUM ('a','b'); CREATE TABLE mt(m mood2); \
+             INSERT INTO mt VALUES ('a'); SELECT count(*) FROM mt"
+        ),
+        "1"
+    );
+    assert_eq!(
+        one_value(&mut s, "CREATE SEQUENCE sq9; SELECT nextval('sq9')"),
+        "1"
+    );
+    assert_eq!(
+        one_value(
+            &mut s,
+            "CREATE DOMAIN pos AS int CHECK (VALUE > 0); CREATE TABLE dt(a pos); \
+             INSERT INTO dt VALUES (1); SELECT count(*) FROM dt"
+        ),
+        "1"
+    );
+}
+
 /// The control: a TABLE in the same position was always visible and must
 /// stay so. It is what made this look like an array defect rather than a
 /// visibility one.
