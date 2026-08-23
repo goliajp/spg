@@ -221,6 +221,15 @@ else
         --fixture scripts/fixtures/mailrs-pg-extensions.sql \
         --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
         --report "scripts/dropin-acceptance-report-v${VERSION}.md"
+    # v7.38.18 — the copy at the repository root is the one a reader
+    # finds first, and it was written by whoever last ran the panel by
+    # hand. It said `goliakk/spg:7.37.15` and `panel cases: 57` while
+    # the panel had been 66 for several releases: a tracked file whose
+    # freshness depends on someone remembering is a file that is stale.
+    # The versioned report under scripts/ is the record; this is the
+    # view, and it is now written from the record every release.
+    cp "scripts/dropin-acceptance-report-v${VERSION}.md" \
+       ./dropin-acceptance-report.md
 fi
 
 banner "v${VERSION} published — remaining human steps"
@@ -240,8 +249,11 @@ cat <<EOF
 EOF
 else
 cat <<EOF
-  [ ] commit scripts/dropin-acceptance-report-v${VERSION}.md on develop
+  [ ] commit BOTH dropin reports on develop — the versioned one and
+      ./dropin-acceptance-report.md, which this run rewrote
       (chore(release): v${VERSION} post-release — check in dropin report)
+      The versioned reports stop at v7.38.8: this step was skipped for
+      several releases running, which is why it now names both files.
   [ ] mailrs ack note — include the manifest digest:
       $(cat "target/release-digest-v${VERSION}.txt" 2>/dev/null || echo '(docker step skipped)')
   [ ] release battery was green before finish: gate.sh all + mailrs
