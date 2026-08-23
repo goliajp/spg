@@ -145,6 +145,31 @@ fn spanish_matches_pg() {
     );
 }
 
+/// v7.38.18 — and the French configuration. PG 18.4's answers.
+///
+/// `les` is NOT dropped: it is not in Snowball's French stopword list,
+/// and it stems to `le`. A reader who expects every article to vanish
+/// would call that a bug; the oracle calls it French.
+#[test]
+fn french_matches_pg() {
+    let mut e = eng();
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT to_tsvector('french', 'les petits chats chantaient rapidement')::text"
+        ),
+        "'chant':4 'chat':3 'le':1 'petit':2 'rapid':5"
+    );
+    assert_eq!(text_of(&mut e, "SELECT to_tsquery('french','chats')::text"), "'chat'");
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT ts_headline('french','le chat noir', to_tsquery('french','chat'))"
+        ),
+        "le <b>chat</b> noir"
+    );
+}
+
 #[test]
 fn to_tsvector_round_trips_through_cast_literal() {
     // INSERT VALUES path only takes literals; round-trip through a
