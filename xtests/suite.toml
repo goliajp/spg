@@ -63,6 +63,23 @@ tier = "precommit"
 name = "slt-smoke"
 impl = "external"
 cmd = "cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+# v7.38.18 — 45, and the number is two things, not one.
+#
+# The corpus itself is 1.5-2.0 s: 413 cases, measured twice on a warm
+# build. The rest is `cargo run` rebuilding the workspace in debug,
+# which is what precommit exists to run right after — so the step is
+# fast when nothing changed and 15-20 s when spg-sql or spg-engine did.
+#
+# At 15 the budget sat exactly across that split, and this step's colour
+# depended on whether some earlier command had warmed the cache. It
+# failed the v7.38.18 release commit -- a CHANGELOG-only commit, whose
+# own affected-crate steps correctly skipped -- because commits before it
+# had touched three crates. A hard gate that a rebuild decides is not
+# measuring the thing it names.
+#
+# Observed: 0.8 / 5.1 / 6.0 / 15.4 / 19.7 s across five runs. The tier's
+# own 150 s cap is the real guard and had 125 s to spare on the run that
+# tripped this one.
 budget_s = 15
 
 [[step]]

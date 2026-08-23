@@ -192,6 +192,58 @@ fn main() {
             } else {
                 std::collections::BTreeSet::new()
             };
+            // v7.38.18 — precommit compiles ONCE, before anything is
+            // timed, and that compile is in neither a step budget nor the
+            // tier total.
+            //
+            // The budgets claim to measure the change. They were measuring
+            // the build cache. `slt-smoke` is `cargo run -q -p
+            // sqllogictest`: the corpus it runs is 1.5-2.0 s for all 413
+            // cases, and the step took 0.8 s or 19.7 s depending on whether
+            // some earlier command had already built the workspace in
+            // debug. At a 15 s budget the split ran straight through the
+            // middle, and a HARD gate whose colour a warm cache decides is
+            // not a gate.
+            //
+            // It failed the v7.38.18 release commit, which touched
+            // CHANGELOG.md and nothing else — its own affected-crate steps
+            // correctly skipped, while the rebuild left by the three
+            // commits before it landed on this one. `band` is computed from
+            // the diff; the cost comes from the cache, and those are
+            // different questions.
+            //
+            // This is v7.38.14's finding one level down. That release
+            // banded the TIER cap after a no-op change could not clear it —
+            // "a cap that a no-op cannot clear is not measuring the change,
+            // it is measuring the workspace" — and left the per-step
+            // budgets flat, measuring exactly that.
+            //
+            // The time is printed rather than dropped: a total that cannot
+            // show what it excluded is a total that overstates.
+            if tier == "precommit" {
+                let t_prep = std::time::Instant::now();
+                let out = std::process::Command::new("cargo")
+                    .args(["build", "-q", "--workspace", "--all-targets"])
+                    .current_dir(root)
+                    .status();
+                let took = t_prep.elapsed();
+                match out {
+                    Ok(st) if st.success() => println!(
+                        "prepare: cargo build --workspace --all-targets in {took:?} \
+                         (outside every budget and the tier total)"
+                    ),
+                    Ok(st) => {
+                        eprintln!(
+                            "prepare: cargo build failed ({st}) — nothing below would mean anything"
+                        );
+                        std::process::exit(1);
+                    }
+                    Err(e) => {
+                        eprintln!("prepare: cargo build could not run: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             let mut failed: Option<String> = None;
             let t_total = std::time::Instant::now();
             let tier_steps = m.tier(tier);
