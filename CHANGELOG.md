@@ -163,6 +163,58 @@ Four gates gained the ability to see something they had claimed to check.
 - **The gate's cross-version open made a one-release hop**, which is the
   hop least likely to break. It now opens the oldest fixture as well.
 
+- **The suite's servers inherited the machine's collation**, and the
+  testbed exports `LANG=en_US.UTF-8`. So the sweep's baseline leg had
+  been running under a locale for as long as the gate has run there,
+  while every comment about it says `C` — which means **the
+  locale-collation panel added earlier in this same version was comparing
+  en_US against en_US** and reporting no losses. The panel added to catch
+  a collation regression could not have caught one.
+
+  Found because the sort panel went red on the testbed with numbers that
+  made no sense beside the local ones: PostgreSQL's times were nearly
+  identical on both machines while SPG's were two to three times worse. A
+  slower machine is slower for both legs.
+
+  The declaration moved to the one place that spawns a server, so the
+  five others with the same exposure — the cross-version open, the wire
+  smoke, the pgbench leg and the dump round-trip pair — were fixed by the
+  same change rather than one at a time. And the leg's collation is now
+  **checked** against a stated expectation, not only printed: printing is
+  where three of this version's defects lived.
+
+- **A collated `ORDER BY` called ICU once per comparison** rather than
+  once per value. A symbolicated profile put 97 % of the non-waiting
+  samples inside ICU; a sort of n rows makes about n·log₂n comparisons
+  where a key needs n computations. `build_order_keys_bound` already took
+  the collations as a parameter and had never read them. Measured as an
+  A/B of two release binaries in one window: 328 ms → 264, against
+  PostgreSQL's 158 — 2.08x behind down to 1.67x.
+
+  Two more paths had the same defect one level down, both per-row: the
+  index-entry builder and the index probe each constructed a whole ICU
+  collator per call.
+
+### Still open, named rather than left out
+
+- **Sorting a collated text column is 1.67x behind PostgreSQL** after the
+  key change, and the remaining cost is ICU building the keys.
+
+- **The image ships `C` while the reference image ships a locale.**
+  `postgres:18` sorts `apple, Bob, Zebra`; `goliakk/spg` sorts `Bob,
+  Zebra, apple`. A customer moving off the standard PostgreSQL image gets
+  a different row order, silently — which is the divergence the
+  v7.38.18 collation work exists to close, still open one level up.
+
+  Not flipped in this version, and the condition is stated rather than
+  the conclusion: setting `LANG` in the image hands every customer the
+  ordering cost above. Close the ordering gap, then flip. Flipping first
+  trades a silent wrong answer for a loud slow one.
+
+  (`postgres:18-alpine` declares `en_US.utf8` and sorts by bytes anyway —
+  musl has no locale data — so a deployment on the alpine image is
+  unaffected either way.)
+
 ---
 
 ## [7.38.18] — 2026-08-23
