@@ -1,5 +1,17 @@
 # Locale collation — RFC
 
+> **STATUS: closed in v7.38.18 (2026-08-23).** Everything below is the
+> reasoning of rounds 671–693 and is kept as the record of how the
+> shape list was derived. **Its opening paragraph is no longer true** —
+> SPG performs 880 of PostgreSQL 18.4's collations, a database records
+> the one it was created with, and an undeclared text column inherits
+> it.
+>
+> §5's recommended sequence is NOT the one taken, and the last step is
+> the reason: it ends with "index rebuild path", and there is no rebuild
+> path because there is nothing to rebuild. See **§7** at the end and
+> `docs/DESIGN-2026-08-23-collation.md`.
+
 SPG orders text by bytes. That is the C collation, it is what
 `pg_database.datcollate` advertises, and it is self-consistent — but a
 customer's PG is very often `en_US.utf8`, and against one of those, nine
@@ -551,3 +563,79 @@ failure modes our own perf work keeps hitting:
 
 An instrument that cannot express the defect, and an empty result read as a
 measurement. Same two, every time.
+
+---
+
+## 7. How it actually closed — v7.38.18
+
+§4j's *What remains* named two things. Both are done, and the first was
+done by removing the problem rather than solving it.
+
+### Index order
+
+§4 and §4j both said a collation "decides a text index's key order, so
+changing one invalidates every text index on disk. Needs a rebuild path
+and a data-compat story." §5's sequence therefore ends with one.
+
+**PostgreSQL does not allow a live database's collation to change.**
+`ALTER DATABASE … LC_COLLATE` is refused there — measured, 18.4. So
+there is no moment at which an index's key order can be invalidated, and
+the rebuild path this RFC kept deferring never needed to exist. That was
+the whole difficulty, and it was self-inflicted: the RFC assumed a
+mutable property because it never asked the oracle whether the property
+was mutable.
+
+What an index needed instead was to carry its collation IN its key: the
+ICU sort key, with the original string after a NUL as the deterministic
+tiebreak PG's collations require. The byte-ordered B-tree then orders by
+the locale with no change to the B-tree and none to the on-disk format.
+Proven before being built on: over three locales and 29 strings
+including accents, punctuation, case and canonically-equivalent forms,
+sort keys compared as bytes agree with `compare` on all 2,523 pairs.
+
+This also closed a live defect the RFC had not noticed: a column that
+DECLARED a locale collation lost rows the moment an index existed on it.
+Five rows, `WHERE x > 'b'`: PG 18.4 answers four with an index and
+without; SPG answered four without one and **one** with.
+
+### The database default
+
+Recorded at creation from `SPG_LC_COLLATE`, `LC_ALL`, `LC_COLLATE`,
+`LANG` — POSIX's precedence, and `initdb`'s — and persisted. **Absent on
+disk means `C`**, which is what every database written before v7.38.18
+was built under, so an upgrade changes no answer and rebuilds nothing.
+Immutable afterwards, which is PG's own refusal and what makes the index
+keys sound.
+
+Inheritance is resolved, not stamped, so
+`information_schema.columns.collation_name` still reads NULL for an
+inheriting column as PG reads it. It reaches ordering and not padding —
+`'a' = 'a  '` stays false — and not the MySQL dialect, whose columns
+carry their own collation model.
+
+### Two more things the shape list could not see
+
+* **`pg_collation` listed three rows** against PG's 880, so a column
+  could be declared `COLLATE "en_US.utf8"`, work, and be told by the
+  catalogue that the collation did not exist. 880 now, filtered to what
+  this build can perform.
+* **A name PostgreSQL does not have was accepted.** ICU falls back to
+  the root collation for any well-formed language tag, so `zz_ZZ` was a
+  collation on a database, on a column and in an `ORDER BY` key. All
+  three answer PG's `collation "zz_ZZ" for encoding "UTF8" does not
+  exist`.
+
+### What is still open
+
+* **`COLLATE` on an arbitrary expression** (`'a' < 'B' COLLATE
+  "en_US.utf8"`). It works on a column declaration and in an `ORDER BY`
+  key; carrying it on an expression needs an `Expr::Collate` node and
+  every walker taught about it. The refusal names the two positions that
+  do work.
+* **A sort is ~1.3× behind PG 18.4 in-process** under a locale
+  collation (228 ms against 163–166 over 200,000 rows). The obvious
+  attack — a precomputed sort key per row — was priced and dropped:
+  building 200,000 keys costs 138 ms against ICU's ~175 ms of
+  comparisons for that sort, an 18% saving that still loses. PG's
+  advantage is the ABBREVIATED key, which needs a truncated build that
+  `icu_collator` does not offer. The release sweep's cell does not lose.

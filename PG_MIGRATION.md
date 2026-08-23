@@ -347,11 +347,25 @@ PG-wire client pool with a per-statement router.
 
 ---
 
-## SQL compatibility matrix (v7.12.10 ship-time)
+## SQL compatibility matrix (re-measured v7.38.18, 2026-08-23)
 
 ✅ = works through the 4-corpus regression. ⚠️ = works in
 common shapes; corner cases differ from PG. ❌ = not
 implemented; further breakdown follows the table.
+
+> **This table was written at v7.12.10 and not re-run for twenty-six
+> versions.** Every `❌` in it was executed against v7.38.18 on
+> 2026-08-23 and **twenty-one of twenty-six now work** — `UUID`,
+> `TRUNCATE`, `RIGHT JOIN`, `FULL OUTER JOIN`, `INTERSECT`, `EXCEPT`,
+> `LATERAL`, `CREATE SCHEMA`, domains, composite types, partitions, RLS,
+> `GRANT` on tables, `pg_class` / `pg_attribute`, `pg_trgm`,
+> `ts_headline`, the four remaining array types, multi-dimensional
+> arrays, `ALTER TABLE … RENAME COLUMN`, and the PL/pgSQL loop /
+> `SELECT INTO` / `GET DIAGNOSTICS` trio.
+>
+> A compatibility matrix that says a database cannot do what it does is
+> not a conservative document; it turns customers away for nothing. The
+> rows below are what v7.38.18 actually answers.
 
 ### Data definition (DDL)
 
@@ -374,14 +388,14 @@ implemented; further breakdown follows the table.
 | `ALTER TABLE t ADD COLUMN col TYPE REFERENCES other(c) [ON DELETE …]` | ✅ v7.13.2 | inline REFERENCES on ADD COLUMN; parser splits into column add + FK install |
 | Multi-subaction `ALTER TABLE t … , … , …` | ✅ v7.13.2 | comma-separated ADD COLUMN / ALTER COLUMN TYPE / DROP CONSTRAINT / ADD CONSTRAINT FK; applied in source order |
 | `ALTER TABLE t DROP [COLUMN] [IF EXISTS] col [CASCADE\|RESTRICT]` | ✅ v7.13.3 | `IF EXISTS` idempotent; CASCADE drops dependent FKs; RESTRICT (default) errors on dependents |
-| `ALTER TABLE t RENAME COLUMN` | ❌ | Re-CREATE with the desired layout + `INSERT INTO new SELECT …` |
+| `ALTER TABLE t RENAME COLUMN` | ✅ | In place; no re-CREATE needed (was ❌ at v7.12.10) |
 | `'<text>'::jsonb` cast in DEFAULT / INSERT / UPDATE | ✅ v7.13.3 | produces JSONB-typed value (matches a JSONB column); same for `'<text>'::json` → JSON |
 | `CREATE TABLE IF NOT EXISTS` reconciliation | ✅ v7.13.3 SPG-ext | when table exists, **adds missing columns + FKs from the new definition** (SPG-specific; PG silently no-ops). Existing columns never modified. See note below. |
 | `ALTER TABLE t ALTER COLUMN c TYPE T [USING expr]` | ✅ v7.13.0 | `USING` expression evaluated per row; falls back to direct cast; `USING NULL` clears (v7.13.2 disambiguation) |
 | `ALTER TABLE t DROP CONSTRAINT [IF EXISTS] name [CASCADE]` | ✅ v7.13.2 | `IF EXISTS` makes drop idempotent; CASCADE/RESTRICT accepted silently |
 | `ALTER INDEX … REBUILD` | ✅ | NSW / BRIN rebuild lands; B-tree no-op |
-| `CREATE SCHEMA foo; foo.bar` | ❌ | Single-namespace catalog; rename-to-prefix as workaround |
-| `CREATE TYPE` / domains / composite types | ❌ | A7 — out of scope |
+| `CREATE SCHEMA foo; foo.bar` | ✅ | Qualified names resolve (was ❌ at v7.12.10) |
+| `CREATE TYPE` / domains / composite types | ✅ | `CREATE DOMAIN … CHECK`, `CREATE TYPE … AS (…)` (was ❌ — A7 no longer applies) |
 | Foreign keys (`REFERENCES … ON DELETE/UPDATE …`) | ✅ v7.6 | All four `ON DELETE / ON UPDATE` actions (NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT) |
 | `CHECK` constraints (column-level + table-level) | ✅ v7.13.0 | Inline `<col> TYPE CHECK (expr)` and `CHECK (expr)` table-level; enforced on INSERT / UPDATE; NULL passes (PG three-valued semantics) |
 | Inline `UNIQUE` column constraint | ✅ v7.13.0 | `<col> TYPE NOT NULL UNIQUE` folds to a single-column UNIQUE; full BTree index + INSERT enforcement |
@@ -394,8 +408,8 @@ implemented; further breakdown follows the table.
 | PG btree opclasses (`text_pattern_ops` etc) | ✅ v7.13.0 | Token accepted; doesn't change BTree comparator (SPG already orders text bytewise) |
 | `CREATE FUNCTION ... LANGUAGE plpgsql` (trigger functions) | ✅ v7.12.4 | DECLARE / IF / RAISE / embedded SQL — full subset used by mailrs's `update_search_vector`; see [§PL/pgSQL triggers](#plpgsql-triggers) below |
 | `CREATE FUNCTION` (scalar UDF, non-trigger) | ⚠️ | DDL parses, body is stored, but invocation surface ships in v7.13+. Use built-in functions for v7.12.x. |
-| Partition tables (`PARTITION BY`) | ❌ | Cold-tier covers time-series natively |
-| Row-Level Security (`RLS`) | ❌ | A5 — process isolation instead |
+| Partition tables (`PARTITION BY`) | ✅ | `PARTITION BY RANGE` + `PARTITION OF … FOR VALUES` (was ❌) |
+| Row-Level Security (`RLS`) | ✅ | `ENABLE ROW LEVEL SECURITY` + `CREATE POLICY`, enforced (was ❌ — A5 no longer applies) |
 
 ### Data types
 
@@ -413,14 +427,14 @@ implemented; further breakdown follows the table.
 | `JSON` | ✅ | Text-backed; PG-wire OID 114 |
 | `JSONB` | ✅ v7.9.0 | Same storage as JSON; PG-wire OID 3802 for sqlx-style clients |
 | `SERIAL` / `BIGSERIAL` | ✅ v7.9.6 | Aliased to `INT/BIGINT NOT NULL AUTO_INCREMENT` |
-| `UUID` | ❌ | Store as `TEXT(36)` |
+| `UUID` | ✅ | Native type, indexable (was ❌ — TEXT(36) no longer needed) |
 | `BYTEA` | ✅ v7.10.4 | Native bytes; PG-wire OID 17, `\xDEADBEEF` hex literal in/out, `length()` / `octet_length()` (v7.10.4), `\|\|` / `substring` / `position` (v7.11.2) |
 | `VECTOR(N)` | ✅ | pgvector-flavoured; HNSW + SQ8/HALF encodings |
 | `tsvector` + `tsquery` types | ✅ v7.12.0 | PG-wire OIDs 3614 / 3615; `pg_dump`-shape `::tsvector` / `::tsquery` cast literals round-trip; see [§Full-text search](#full-text-search) below |
 | `TEXT[]` | ✅ v7.10.9 | PG-wire OID 1009; external form `{a,b,NULL}` round-trips, `ARRAY[…]` literal, subscript, `ANY` / `ALL`, `array_length` / `array_position` / `unnest` / `\|\|` (v7.11.1) |
 | `INT[]` / `BIGINT[]` | ✅ v7.11.2 | PG-wire OIDs 1007 / 1016; full op parity with `TEXT[]` — typed `unnest`, mixed-width `\|\|` widens to `BIGINT[]` |
-| `SMALLINT[]` / `NUMERIC[]` / `BOOLEAN[]` / `FLOAT[]` | ❌ | Store as `INT[]` / `BIGINT[]` / `TEXT[]` until v7.12 |
-| Multi-dimensional arrays | ❌ | Single-dim only; `array_length(_, dim>1)` returns NULL |
+| `SMALLINT[]` / `NUMERIC[]` / `BOOLEAN[]` / `FLOAT[]` | ✅ | All four native (was ❌) |
+| Multi-dimensional arrays | ✅ | `ARRAY[[1,2],[3,4]]`, `array_length(_, 2)` (was ❌) |
 
 ### Data manipulation (DML)
 
@@ -438,8 +452,8 @@ implemented; further breakdown follows the table.
 | `INSERT … ON CONFLICT (col1, col2)` composite target | ✅ v7.9.10 | For CalDAV / CardDAV upsert patterns |
 | `INSERT INTO t [(cols)] SELECT … FROM …` | ✅ v7.13.0 | Inner SELECT runs first; materialised rows feed the regular INSERT pipeline (FK / CHECK / UC / RETURNING / ON CONFLICT all stay) |
 | `UPDATE t SET col = CASE WHEN cond THEN x ELSE y END` | ✅ v7.13.0 | CASE WHEN in any expression position (UPDATE SET, SELECT projection, WHERE, …) |
-| `TRUNCATE TABLE` | ❌ | Use `DELETE FROM t` |
-| Bulk `COPY FROM STDIN` (PG-wire) | ❌ | Use multi-row INSERT instead |
+| `TRUNCATE TABLE` | ✅ | Native (was ❌ — `DELETE FROM` no longer needed) |
+| Bulk `COPY FROM STDIN` (PG-wire) | ❌ | Use multi-row INSERT instead. `COPY … TO STDOUT` DOES work — measured v7.38.18 |
 
 ### Queries (SELECT)
 
@@ -451,18 +465,20 @@ implemented; further breakdown follows the table.
 | `IN (…)` / `NOT IN (…)` | ✅ | |
 | `LIKE` / `ILIKE` / `NOT LIKE` | ✅ | Includes wildcards `%` `_` |
 | `ORDER BY` (single & multi-column) | ✅ | |
+| Locale collation (`en_US.utf8` and 879 more) | ✅ | v7.38.18. Set `LC_COLLATE` / `LANG` before the first start and an undeclared text column sorts as your PostgreSQL does — see the gotcha below |
+| `COLLATE` on a column / in `ORDER BY` | ✅ | v7.38.18. Not on an arbitrary expression |
 | `GROUP BY` / `HAVING` | ✅ | |
 | `LIMIT n` / `OFFSET n` | ✅ | |
 | `DISTINCT` / `DISTINCT ON (cols)` | ✅ | |
 | `INNER JOIN` / `LEFT JOIN` / cross-join | ✅ | |
-| `RIGHT JOIN` / `FULL OUTER JOIN` | ❌ | Rewrite as `LEFT JOIN` |
+| `RIGHT JOIN` / `FULL OUTER JOIN` | ✅ | Both native; no rewrite needed (was ❌) |
 | `UNION` / `UNION ALL` | ✅ | |
-| `INTERSECT` / `EXCEPT` | ❌ | Application-level set ops |
+| `INTERSECT` / `EXCEPT` | ✅ | Native, with `ALL` (was ❌) |
 | CTEs (`WITH name AS (…)`) | ✅ | |
 | Recursive CTEs (`WITH RECURSIVE`) | ✅ | v4.22 ship |
 | Window functions (`OVER (PARTITION BY …)`) | ✅ | Including `ROW_NUMBER`, `RANK`, `LAG`, `LEAD`, `SUM` etc |
 | Correlated subqueries | ✅ | Memoised by Memoize node (v6.2.6) |
-| `LATERAL` joins | ❌ | |
+| `LATERAL` joins | ✅ | Native, including correlated `LATERAL (SELECT …)` (was ❌) |
 | `EXISTS` / `NOT EXISTS` | ✅ | |
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | |
 | `EXPLAIN (SUGGEST) …` | ✅ | SPG-specific advisor |
@@ -509,9 +525,9 @@ maintained search vectors run unmodified.
 | `ts_rank(vec, query)` / `ts_rank_cd(vec, query)` | ✅ v7.12.2 | Weight × occurrence sum normalised by `1 + ln(unique_terms)`; `cd` adds cover-density factor |
 | `CREATE INDEX … USING GIN (tsvector_col)` | ✅ v7.12.3 | Real posting-list inverted index — replaces the v7.9.26b BTree fallback. `@@` query planner picks it automatically; `Term` / `And` / `Or` accelerated, `Not` / `Phrase` fall through to full scan |
 | `CREATE INDEX … USING GIN (non_tsvector_col)` | ✅ v7.9.26b | Loads as BTree fallback on the leading column so `pg_dump` JSONB-GIN scripts still load |
-| `ts_headline` / `ts_lexize` / other display-side FTS funcs | ❌ | Out of scope for v7.12.x; on the v7.13+ queue if customer-flagged |
-| Spanish / French / German / non-English config | ❌ | `simple` and `english` only in v7.12.x — unsupported configs error with a clear message |
-| Trigram (`pg_trgm` extension) | ❌ | `CREATE EXTENSION pg_trgm` parses as no-op (v7.9.15); the operators / functions don't exist yet |
+| `ts_headline` / `ts_lexize` / other display-side FTS funcs | ⚠️ | `ts_headline` works; `ts_lexize` does not — see below |
+| Spanish / French / German / non-English config | ❌ | `simple` and `english` only, still. Measured v7.38.18: `to_tsvector('french', …)` errors |
+| Trigram (`pg_trgm` extension) | ✅ | `similarity()` and the operators work (was ❌ — no longer a parse-only no-op) |
 
 ### PL/pgSQL triggers
 
@@ -527,7 +543,7 @@ clean_text` runs end-to-end.
 | `BEGIN ... END;` body | ✅ v7.12.4 | Required outer block |
 | `NEW.col := <expr>;` (BEFORE only) | ✅ v7.12.4 | AFTER triggers attempting NEW.col := … error with a clear "NEW is read-only post-write" message |
 | `RETURN NEW` / `RETURN OLD` / `RETURN NULL` / bare `RETURN;` | ✅ v7.12.4 | NULL skips the row (BEFORE) / no-ops the notification (AFTER) |
-| `OLD.col := <expr>;` | ❌ | PG forbids; we mirror with a clear error |
+| `OLD.col := <expr>;` | ✅ | Accepted in a trigger function (was ❌) |
 | `DECLARE var TYPE [:= init_expr];` | ✅ v7.12.6 | Block before BEGIN; earlier DECLAREs in scope for later init exprs |
 | `IF cond THEN ... [ELSIF cond THEN ...]* [ELSE ...] END IF;` | ✅ v7.12.6 | Arbitrary nesting; bodies are full statement lists |
 | `RAISE { NOTICE \| WARNING \| INFO \| LOG \| DEBUG } '<fmt>' [, args]*;` | ✅ v7.12.6 | PG-style `%` substitution; logged but doesn't affect outcome |
@@ -535,9 +551,9 @@ clean_text` runs end-to-end.
 | Embedded SQL: `INSERT / UPDATE / DELETE / SELECT` inside trigger body | ✅ v7.12.7 | NEW / OLD / DECLARE-local refs substituted into the statement's Expr tree; recursion bounded at 16 deep |
 | `DROP TRIGGER [IF EXISTS] name ON tbl` | ✅ v7.12.4 | |
 | `DROP FUNCTION [IF EXISTS] fn[()]` | ✅ v7.12.4 | Arg-list disambiguation deferred (no PG-style overloading in v7.12.x) |
-| `LOOP / WHILE / FOR` iteration | ❌ | Carve-out; not on the mailrs critical path |
-| `SELECT … INTO var` binding | ❌ | The SELECT runs (as embedded SQL) but doesn't yet bind the result into a local. Workaround: use a separate UPDATE |
-| `GET DIAGNOSTICS` / `EXIT WHEN` / nested sub-blocks | ❌ | Out of scope for v7.12.x |
+| `LOOP / WHILE / FOR` iteration | ✅ | `LOOP … EXIT WHEN … END LOOP` (was ❌) |
+| `SELECT … INTO var` binding | ✅ | Binds into the local (was ❌) |
+| `GET DIAGNOSTICS` / `EXIT WHEN` / nested sub-blocks | ⚠️ | `GET DIAGNOSTICS` and `EXIT WHEN` work; a nested `DECLARE … BEGIN` block does not |
 | `BEFORE` trigger embedded SQL with PG's strict inline-between-rows semantics | ⚠️ | Embedded SQL collected during the row-write pass + executed after the firing DML's main work completes. Functionally equivalent for audit / sync / cascade patterns; differs only if the embedded SQL needs to read its own pre-INSERT row |
 
 ### Transactions / sessions
@@ -557,7 +573,7 @@ clean_text` runs end-to-end.
 | SCRAM-SHA-256 auth (PG-wire) | ✅ | v4.1 |
 | `CREATE USER`/`DROP USER` | ✅ | |
 | Roles (`admin` / `readwrite` / `readonly`) | ✅ | Three built-in roles, not arbitrary `CREATE ROLE` |
-| `GRANT` / `REVOKE` on tables | ❌ | Role-level grants only |
+| `GRANT` / `REVOKE` on tables | ✅ | Table-level grants work (was ❌ — not role-level only) |
 | `pg_hba.conf` style auth rules | ❌ | Single password / role per session |
 
 ### Replication
@@ -573,7 +589,7 @@ clean_text` runs end-to-end.
 
 | Feature | SPG | Notes |
 |---|---|---|
-| `pg_catalog.pg_class` / `pg_attribute` | ❌ | Use `SHOW TABLES` / `SHOW COLUMNS` |
+| `pg_catalog.pg_class` / `pg_attribute` | ✅ | Both readable, with `pg_settings` / `pg_collation` / `pg_stats` (was ❌) |
 | `information_schema.*` | ⚠️ | A small subset works through the simple-query path |
 | `SHOW TABLES` (non-PG; SPG-specific) | ✅ | |
 | `SHOW COLUMNS FROM t` | ✅ | |
@@ -678,6 +694,30 @@ v8 / v9 plan. If you need any of them, **stay on PG**.
 ---
 
 ## Common migration gotchas (from real ports)
+
+0. **Set `LC_COLLATE` before the first start, or your `ORDER BY` changes
+   answer.** A stock PostgreSQL on Debian collates as `en_US.utf8`. SPG
+   collates as `C` unless told otherwise, and under `C` an uppercase
+   letter sorts before every lowercase one: `Zebra` comes before `apple`
+   rather than after it. It is silent — no error, no warning, just a
+   different row order from every `ORDER BY` over text, every
+   `min`/`max`, and every range comparison on a column that declares no
+   collation of its own.
+
+   ```sh
+   # match the PostgreSQL you are replacing
+   docker run -e LANG=en_US.utf8 …          # or LC_ALL / LC_COLLATE
+   docker run -e SPG_LC_COLLATE=en_US.utf8 … # SPG's own spelling
+   ```
+
+   Read it back with `SELECT datcollate FROM pg_database`.
+
+   **It is set once, at creation, and cannot be changed afterwards** —
+   which is what PostgreSQL does too, and for the same reason: every
+   index key in the database was built under it. A database that already
+   exists keeps what it has, so this is a decision to make before the
+   first start, not after. An existing SPG database from before
+   v7.38.18 keeps `C` and keeps every answer it had.
 
 1. **`SERIAL` columns**. Use SPG's `AUTO_INCREMENT` flag on
    an `INT NOT NULL` column. Sequences themselves don't
