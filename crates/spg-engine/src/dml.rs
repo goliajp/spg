@@ -3186,7 +3186,13 @@ impl Engine {
         // Expand + rewrite the projection into flat (output_name, ty, expr)
         // triples against the synthetic schema.
         let expanded = expand_merge_returning_items(items, target_alias, source_alias, target_cols);
-        let projection = build_projection(&expanded, &syn, "", self.backslash_escapes)?;
+        let projection = build_projection(
+            &expanded,
+            &syn,
+            "",
+            self.backslash_escapes,
+            Some(self.active_catalog()),
+        )?;
         let columns: Vec<ColumnSchema> = projection
             .iter()
             .map(crate::select::ProjectedItem::to_column_schema)

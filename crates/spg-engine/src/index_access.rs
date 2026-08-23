@@ -380,7 +380,11 @@ pub(crate) fn materialise_in_order(
     mysql: bool,
 ) -> Result<QueryResult, EngineError> {
     let ctx = EvalContext::new(schema_cols, Some(table_alias));
-    let projection = build_projection(&stmt.items, schema_cols, table_alias, mysql)?;
+    let projection = // A free function with no engine to ask, so a user function
+    // projected here still falls back to text. Reaching it needs both an
+    // indexed equality predicate and a UDF in the projection; that shape
+    // goes through the ordinary select path.
+    build_projection(&stmt.items, schema_cols, table_alias, mysql, None)?;
     let mut output_rows: Vec<Row<'static>> = Vec::with_capacity(ordered_rows.len());
     for row_cow in ordered_rows {
         let row = row_cow.as_ref();

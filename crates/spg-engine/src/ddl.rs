@@ -5705,12 +5705,20 @@ impl Engine {
         let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
         let cat = self.active_catalog_mut();
         cat.create_table(schema).map_err(EngineError::Storage)?;
+        // v7.38.19 — the materialised row count is the statement's
+        // answer, not a detail. PG tags CTAS and CREATE MATERIALIZED
+        // VIEW `SELECT <n>`, and a driver reads that to learn how many
+        // rows it wrote. Returning 0 here made every CTAS report writing
+        // nothing while writing the right rows -- silent, and the wrong
+        // half is the one a program acts on.
+        let mut materialised = 0usize;
         if s.with_data {
             let table = cat
                 .get_mut(&s.name)
                 .expect("just-created materialized-view backing table must exist");
             for row in rows {
                 table.insert(row).map_err(EngineError::Storage)?;
+                materialised += 1;
             }
         }
         // v7.38 (read01 P6.49) — CTAS / SELECT INTO produce a plain table; only
@@ -5725,7 +5733,7 @@ impl Engine {
             }
         }
         Ok(QueryResult::CommandOk {
-            affected: 0,
+            affected: materialised,
             modified_catalog: self.catalog_change_is_committed(),
         })
     }

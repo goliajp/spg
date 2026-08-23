@@ -357,6 +357,7 @@ impl crate::Engine {
             &cols,
             lz.alias.as_str(),
             self.backslash_escapes,
+            Some(self.active_catalog()),
         )?;
         // Same ceiling the materialising path charges through the
         // executor. Without it a cursor would be the one way to build an
@@ -474,6 +475,7 @@ impl crate::Engine {
                     &scols,
                     alias.as_str(),
                     self.backslash_escapes,
+                    Some(self.active_catalog()),
                 )?;
                 let columns: Vec<ColumnSchema> = projection
                     .into_iter()
