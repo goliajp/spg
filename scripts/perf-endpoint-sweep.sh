@@ -16,11 +16,23 @@
 #     testbed has produced 8-23 differing cells from two runs of the SAME
 #     binary (v7.37 audit, r648-r650), so a 1.05x median threshold
 #     manufactures losses that no change can fix. Verdicts are now
-#     non-overlapping ranges — `BENCH_PROTOCOL.md` rule 4 — and every run
-#     carries a same-binary CONTROL whose differing-cell count IS the
-#     run's resolution. Cells inside that resolution report `unresolved`,
-#     not `tied`: the panel does not get to call something equal when it
-#     cannot tell.
+#     non-overlapping ranges — `BENCH_PROTOCOL.md` rule 4 — and every
+#     CELL carries a same-binary CONTROL leg, timed between the other
+#     two. Where the binary separates from itself, the cell's verdict is
+#     WITHDRAWN and reported `unresolved`: the panel does not get to
+#     call something equal when it cannot tell, and it does not get to
+#     call something a loss either.
+#
+#     v7.38.18 — the two sentences above used to describe the control as
+#     the run's resolution while the code consulted it for nothing. It
+#     ran at one size, after every size had finished, and its count was
+#     printed and dropped. A prerelease run called `two keys` at 1,000
+#     rows a LOSS on a 27 microsecond separation; its control, taken
+#     later in a calmer window, reported a clean floor. The same cell
+#     re-measured on a quiet box at N=25 was 0.524-0.645 against PG's
+#     0.516-0.718 — no gap. A header that promised a check the code did
+#     not perform is the same defect as a compatibility table nobody
+#     re-ran.
 #
 #   * It covered the dogfood corpus only. The whole ORDER BY surface was
 #     outside it, which is how 29 losing cells out of 32 went unreported
@@ -35,7 +47,13 @@
 #                 and 3 has proved too few to separate 10% at this size)
 #   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
 #
-# Exit 0 when no cell LOSES beyond the run's own resolution; 1 otherwise.
+#   N           — see above; a cell's control leg costs a third of the
+#                 run's timings and is not optional.
+#
+# Exit 0 when no cell LOSES beyond its own control's resolution; 1
+# otherwise. The verdict line carries `withdrawn=` — the number of
+# win/LOSS calls the control took back — so a summary cannot report a
+# clean sweep without saying how much of it was unreadable.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -200,7 +218,7 @@ TYPED_SHAPES=(
   'bytea equality|SELECT count(*) FROM @N@ WHERE b = decode(lpad(to_hex(7), 16, $q$0$q$), $q$hex$q$)'
 )
 
-LOSSES=0; CELLS=0; CONTROL_DIFFS=0
+LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0
 
 printf '\n%-8s %-26s %-16s %-16s %s\n' SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' VERDICT
 printf '%-8s %-26s %-16s %-16s %s\n' -------- -------------------------- ---------------- ---------------- -------
@@ -217,62 +235,75 @@ for rows in ${SIZES}; do
 
   for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
     name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"
-    s=(); g=()
+    # Three legs, not two: SPG, PG, and SPG a second time. The third is
+    # this cell's own control, and it is timed HERE, between the other
+    # two, rather than in a block after every size has finished.
+    #
+    # v7.38.18 — that block is why this changed. The header has always
+    # said the control's differing-cell count IS the run's resolution and
+    # that cells inside it report `unresolved`. Neither was true: the
+    # count was printed and never consulted, and it was measured at one
+    # size, minutes after the cells it was supposed to qualify, on a
+    # machine whose load had moved on. A prerelease run called `two keys`
+    # at 1,000 rows a LOSS on a 27 microsecond separation while its
+    # control -- taken later, in a calmer window -- reported a clean
+    # floor. Re-measured on a quiet machine at N=25, the same cell was
+    # 0.524-0.645 against PG's 0.516-0.718: no gap at all.
+    #
+    # A separation the same binary produces against ITSELF, in the same
+    # window, on the same shape, is not a verdict about SPG.
+    s=(); g=(); c=()
     for ((i = 0; i < N; i++)); do
-      # Rule 4: alternate, and flip which side starts each round.
-      if (( i % 2 == 0 )); then
-        s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-        g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
-      else
-        g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
-        s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-      fi
+      # Rule 4: alternate, and rotate which leg starts each round, so no
+      # leg is systematically last while the machine drifts.
+      case $(( i % 3 )) in
+        0)
+          s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+          c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          ;;
+        1)
+          g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+          c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          ;;
+        *)
+          c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+          g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+          ;;
+      esac
     done
     smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
     gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
+    cmin="$(lo "${c[@]}")"; cmax="$(hi "${c[@]}")"
     v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
+    # The same binary against itself. If THAT separates, this cell has no
+    # resolution left to spend on a verdict about PG.
+    cv="$(verdict "${smin}" "${smax}" "${cmin}" "${cmax}")"
+    note=""
+    if [[ "${cv}" != unresolved ]]; then
+      CONTROL_DIFFS=$((CONTROL_DIFFS + 1))
+      if [[ "${v}" != unresolved ]]; then
+        note="  <- withdrawn: same binary against itself separated too (${cmin}-${cmax})"
+        DEMOTED=$((DEMOTED + 1))
+        v="unresolved"
+      fi
+    fi
     [[ "${v}" == LOSS ]] && LOSSES=$((LOSSES + 1))
     CELLS=$((CELLS + 1))
-    printf '%-8s %-26s %-16s %-16s %s\n' "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" "${v}"
+    printf '%-8s %-26s %-16s %-16s %s%s\n' \
+      "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" "${v}" "${note}"
   done
-done
-
-# The control: SPG against ITSELF, same binary, same window. Any cell it
-# calls a difference is the panel's own noise, and that count is the
-# resolution every verdict above has to be read against.
-echo
-echo "control — SPGS against itself, same binary (differing cells here are this run's noise floor):"
-# The control runs on a table this sweep actually built — hardcoding a
-# size meant the control silently queried a missing table whenever SIZES
-# did not contain it, and a control that errors on every cell reports a
-# clean noise floor it never measured.
-CT="sweep_$(set -- ${SIZES}; echo "$1")"
-CNT="sweept_$(set -- ${SIZES}; echo "$1")"
-for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
-  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${CT}}"; sql="${sql//@N@/${CNT}}"
-  a=(); b=()
-  for ((i = 0; i < N; i++)); do
-    if (( i % 2 == 0 )); then
-      a+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-      b+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-    else
-      b+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-      a+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
-    fi
-  done
-  cv="$(verdict "$(lo "${a[@]}")" "$(hi "${a[@]}")" "$(lo "${b[@]}")" "$(hi "${b[@]}")")"
-  if [[ "${cv}" != unresolved ]]; then
-    CONTROL_DIFFS=$((CONTROL_DIFFS + 1))
-    printf '  %-26s %s  <- same binary, called %s\n' "${name}" "${cv}" "${cv}"
-  fi
 done
 
 echo
 echo "load after: $(uptime)"
-echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS}"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED}"
 if (( CONTROL_DIFFS > 0 )); then
-  echo "WARNING: the control found ${CONTROL_DIFFS} difference(s) between a binary and itself."
-  echo "         Every verdict above is only as good as that. Re-run on a quieter machine"
-  echo "         or raise N before acting on any single cell."
+  echo "NOTE: on ${CONTROL_DIFFS} cell(s) the binary separated from ITSELF in the same"
+  echo "      window. ${DEMOTED} verdict(s) were withdrawn on that ground and report"
+  echo "      \`unresolved\`. A machine this busy cannot certify a small difference;"
+  echo "      re-run on a quiet box or raise N before acting on any single cell."
 fi
 (( LOSSES == 0 )) || exit 1
