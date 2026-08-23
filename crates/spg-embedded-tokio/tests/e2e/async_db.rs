@@ -176,7 +176,9 @@ fn tempdir_unique(prefix: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}-{seq}"));
+    let path = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("{prefix}-{pid}-{nanos}-{seq}"));
     std::fs::create_dir_all(&path).expect("mkdir tempdir");
     path
 }

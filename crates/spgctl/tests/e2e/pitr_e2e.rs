@@ -39,7 +39,7 @@ fn unique(name: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let mut p = std::env::temp_dir();
+    let mut p = std::env::temp_dir().join("spg-tests");
     p.push(format!(
         "spg-pitr-e2e-{}-{name}-{nanos}",
         std::process::id()

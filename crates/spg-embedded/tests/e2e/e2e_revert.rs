@@ -8,7 +8,7 @@ struct Scratch {
 }
 impl Scratch {
     fn new(label: &str) -> Self {
-        let mut p = std::env::temp_dir();
+        let mut p = std::env::temp_dir().join("spg-tests");
         let nanos: u64 = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)

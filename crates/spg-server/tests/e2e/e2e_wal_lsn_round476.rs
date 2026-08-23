@@ -93,7 +93,7 @@ fn lsn_bytes(text: &str) -> u64 {
 
 #[test]
 fn round476_wal_lsn_is_the_files_real_byte_position() {
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::common::tmp_base().join(format!(
         "spg-e2e-wal-lsn-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -147,7 +147,7 @@ fn round476_wal_lsn_is_the_files_real_byte_position() {
 fn round476_no_wal_still_answers_zero() {
     // Without a WAL nothing is being written, and 0/0 is the truth rather
     // than a stub — the point of the change is not to invent a number.
-    let dir = std::env::temp_dir().join(format!(
+    let dir = crate::common::tmp_base().join(format!(
         "spg-e2e-wal-lsn-none-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()

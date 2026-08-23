@@ -151,7 +151,9 @@ fn embedded_dml_crash_matrix() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("spg-embed-matrix-{nanos}"));
+    let dir = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-embed-matrix-{nanos}"));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path: PathBuf = dir.join("spg.db");
 

@@ -16,7 +16,7 @@ fn round786_run_round_trips_and_cleans_up() {
     // 230273): other processes churn /tmp while the test runs. Same
     // failure class this session spent two rounds characterising —
     // an observation that is only stable on a quiet machine.
-    let dir = std::env::temp_dir().join(format!("spg-t35-{}", std::process::id()));
+    let dir = crate::common::tmp_base().join(format!("spg-t35-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     // v7.38.19 — the run files live in `<dir>/spg-run/` now, so the
     // server's startup sweep reads only what SPG wrote rather than all of
@@ -89,7 +89,7 @@ fn r840_file_run_access_pattern_cost() {
     const ROWS: usize = 400_000;
     let body = vec![b'y'; 208];
 
-    let dir = std::env::temp_dir().join(format!("spg-r840-{}", std::process::id()));
+    let dir = crate::common::tmp_base().join(format!("spg-r840-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut run = crate::tempstore_shim::create_run_in(&dir).expect("factory");

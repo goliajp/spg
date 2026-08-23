@@ -34,7 +34,9 @@ fn unique_tmpfile(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("spg-embed-persist-{label}-{nanos}.spg"))
+    std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-embed-persist-{label}-{nanos}.spg"))
 }
 
 #[test]

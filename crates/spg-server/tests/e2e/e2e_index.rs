@@ -32,7 +32,7 @@ fn unique_tmpdir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let serial = TMPDIR_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("spg-idx-e2e-{pid}-{nanos}-{serial}"));
+    let dir = crate::common::tmp_base().join(format!("spg-idx-e2e-{pid}-{nanos}-{serial}"));
     fs::create_dir_all(&dir).expect("create tmpdir");
     dir
 }

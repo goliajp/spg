@@ -306,3 +306,84 @@ mod recorded_delta_register {
         );
     }
 }
+
+/// v7.38.19 — a test's scratch directory belongs under one root.
+///
+/// 161 files built a unique path under `std::env::temp_dir()` per run
+/// and none removed it. On the machine this was found on `$TMPDIR` had
+/// reached 61,708 entries and 30 GB — and it was not only disk:
+/// `spg-server` swept that directory at every start, so one `readdir`
+/// took 95 seconds and every server an e2e test spawned waited a minute
+/// and a half before it could listen. The failures read exactly like a
+/// busy machine, and were put down to one.
+///
+/// They now go under `$TMPDIR/spg-tests/`, which makes the mess
+/// removable in one pass. This keeps it that way: a bare
+/// `std::env::temp_dir()` in a test is red.
+#[cfg(test)]
+mod test_scratch_root {
+    use std::path::{Path, PathBuf};
+
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn no_test_writes_to_the_bare_temp_dir() {
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![root().join("crates"), root().join("xtests")];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.filter_map(Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    if p.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                // `src/` is the product; it may use the temp directory
+                // as an operator's temp directory, which is what
+                // `SPG_TEMP_DIR` documents. This is about TESTS.
+                let is_test = p.components().any(|c| c.as_os_str() == "tests")
+                    || p.file_name().is_some_and(|n| n == "config.rs");
+                if !is_test {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                for (i, line) in text.lines().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") || t.starts_with("///") {
+                        continue;
+                    }
+                    let needle = concat!("env::temp", "_dir()");
+                    if let Some(rest) = t.split_once(needle).map(|(_, r)| r)
+                        && !rest.trim_start().starts_with(".join(\"spg-tests\")")
+                        && !t.contains("tmp_base")
+                    {
+                        offenders.push(format!("{}:{}", p.display(), i + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these tests write scratch straight into $TMPDIR instead of \
+             $TMPDIR/spg-tests — 161 files doing that reached 30 GB and made \
+             every server start wait 95 seconds on one readdir:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+}

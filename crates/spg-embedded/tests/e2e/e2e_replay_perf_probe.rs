@@ -30,7 +30,9 @@ fn unique_tmpdir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("spg-replay-probe-{label}-{nanos}"));
+    let p = std::env::temp_dir()
+        .join("spg-tests")
+        .join(format!("spg-replay-probe-{label}-{nanos}"));
     std::fs::create_dir_all(&p).unwrap();
     p
 }
