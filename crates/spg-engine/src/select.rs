@@ -10669,13 +10669,15 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     // matches PG's default C / binary text collation. Every other type
     // keeps the lossless-enough `f64` fast path below.
     if let Value::Text(s) = v {
-        return Ok(OrderKey::Text(s.as_ref().into()));
+        return Ok(OrderKey::Text(crate::orderby::CompactText::new(s.as_ref())));
     }
     // v7.39 (bpchar epic) — bpchar sorts by its blank-stripped form then
     // byte order (PG bpcharcmp under C collation), so mixed-pad values of
     // the same logical string order equal.
     if let Value::BpChar(s) = v {
-        return Ok(OrderKey::Text(s.trim_end_matches(' ').into()));
+        return Ok(OrderKey::Text(crate::orderby::CompactText::new(
+            s.trim_end_matches(' '),
+        )));
     }
     // v7.38 (read01 P6.24) — jsonb sorts by PG's type-aware total order, so
     // carry the parsed value and compare it structurally (see
@@ -10683,7 +10685,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
     if let Value::Json(s) = v {
         return Ok(match crate::json::parse(s) {
             Ok(jv) => OrderKey::Json(jv),
-            Err(_) => OrderKey::Text(s.as_ref().into()),
+            Err(_) => OrderKey::Text(crate::orderby::CompactText::new(s.as_ref())),
         });
     }
     // v7.37 — byte-orderable types PG sorts byte-wise but that have no
@@ -10739,7 +10741,10 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         ),
         Value::TextArray(a) => Some(
             a.iter()
-                .map(|o| o.as_ref().map_or_else(inf, |s| OrderKey::Text(s.clone())))
+                .map(|o| {
+                    o.as_ref()
+                        .map_or_else(inf, |s| OrderKey::Text(crate::orderby::CompactText::new(s)))
+                })
                 .collect(),
         ),
         #[allow(clippy::cast_precision_loss)]
