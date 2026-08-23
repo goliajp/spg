@@ -1054,6 +1054,7 @@ mod e2e_for_update;
 mod e2e_format;
 mod e2e_frame_exclude;
 mod e2e_fts;
+mod e2e_fts_snowball;
 mod e2e_fulltext_gin_seek;
 mod e2e_fulltext_index;
 mod e2e_fulltext_planner;

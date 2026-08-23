@@ -63,6 +63,8 @@ mod expr_analysis;
 mod expr_index;
 pub(crate) mod extsort;
 pub mod fts;
+mod fts_es;
+mod fts_stop;
 mod guc_catalog;
 mod immutable_fn;
 mod index_access;
