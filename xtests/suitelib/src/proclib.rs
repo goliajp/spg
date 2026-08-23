@@ -207,6 +207,24 @@ impl Roster {
             .arg(data_dir.join("audit"))
             .arg(data_dir.join("wal"))
             .env("SPG_PG_ADDR", format!("{pg_bind}:{pg_port}"))
+            // v7.38.19 — declare the collation instead of inheriting the
+            // machine's, and do it HERE so no spawn site can forget.
+            //
+            // The testbed exports `LANG=en_US.UTF-8` and `LC_ALL`, so
+            // every server the suite started inherited a locale
+            // collation while every comment about the suite says `C`.
+            // The sweep's baseline leg was the visible casualty -- the
+            // locale panel added in this same version was comparing
+            // en_US against en_US and reporting no losses -- but five
+            // more servers had the same exposure, including the one that
+            // opens a released data directory and the pair that runs the
+            // dump round-trip.
+            //
+            // `C` is what every fixture and expectation in this suite was
+            // authored under. A caller that wants otherwise passes
+            // `SPG_LC_COLLATE` in `envs`, which is applied after this and
+            // therefore wins.
+            .env("SPG_LC_COLLATE", "C")
             .envs(envs.iter().map(|(k, v)| (*k, *v)))
             .stdout(Stdio::from(
                 logf.try_clone()
