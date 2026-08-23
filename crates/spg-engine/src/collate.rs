@@ -297,9 +297,53 @@ pub(crate) fn is_byte_wise(collation: &str) -> bool {
 /// a wrong answer, only a name PG would not have accepted.
 pub(crate) fn is_known(name: &str) -> bool {
     let n = name.trim();
+    // The ENCODING SUFFIX is spelled differently by different systems
+    // and is not part of the collation's identity. macOS exports
+    // `LANG=en_US.UTF-8`; PostgreSQL's catalogue holds `en_US.utf8` and
+    // `en_US`. Matching the whole string turned the commonest locale on
+    // a developer's laptop into "does not exist", and a server started
+    // there silently kept `C` — found by running the server, which an
+    // in-process test could not have shown.
+    //
+    // The base is what identifies a collation, which is also what
+    // `normalise` hands to ICU. `zz_ZZ` still fails: its base is in the
+    // catalogue no more than the whole name is.
+    fn base(s: &str) -> &str {
+        let t = s.trim();
+        t.split(['.', '@']).next().unwrap_or(t)
+    }
+    let want = base(n);
     if crate::collation_catalog::PG_COLLATIONS
         .iter()
-        .any(|(_, c, ..)| c.eq_ignore_ascii_case(n))
+        .any(|(_, c, ..)| c.eq_ignore_ascii_case(n) || base(c).eq_ignore_ascii_case(want))
+    {
+        return true;
+    }
+    // A POSIX locale name against the ICU half of the catalogue.
+    //
+    // The libc half is whatever locales the HOST that produced the
+    // catalogue had installed — five entries, all English. Checking a
+    // German customer's `de_DE.UTF-8` against those refused a collation
+    // this build performs perfectly well, which is the catalogue being
+    // used for a question it cannot answer. The ICU half does not have
+    // that problem: `de-DE-x-icu`, `ja-JP-x-icu` and 869 more come from
+    // ICU rather than from the host, so they are the same wherever
+    // PostgreSQL is built with ICU.
+    //
+    // `normalise` already turns `de_DE.UTF-8` into the BCP-47 `de-DE`.
+    // `zz_ZZ` still fails: there is no `zz-ZZ-x-icu` and no `zz-x-icu`,
+    // which is exactly the difference between a locale ICU has data for
+    // and one it merely falls back to root for.
+    let tag = normalise(n);
+    let lang: alloc::string::String = tag.split('-').next().unwrap_or(&tag).into();
+    if crate::collation_catalog::PG_COLLATIONS
+        .iter()
+        .filter(|(_, _, provider, ..)| *provider == "i")
+        .any(|(_, c, ..)| {
+            c.strip_suffix("-x-icu").is_some_and(|icu| {
+                icu.eq_ignore_ascii_case(&tag) || icu.eq_ignore_ascii_case(&lang)
+            })
+        })
     {
         return true;
     }
