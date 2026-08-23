@@ -2136,11 +2136,29 @@ impl Engine {
                     "database \"{name}\" does not exist"
                 )))
             }
-            Statement::NoOpPreventedInTransaction { what } => {
+            Statement::NoOpPreventedInTransaction { what, collation } => {
                 self.require_no_transaction_block(&what)?;
+                // v7.38.18 — the NAME is a no-op here; the collation is
+                // not. A bootstrap script that says `LC_COLLATE
+                // 'de_DE.utf8'` and gets the container's `LANG` instead
+                // has a different answer to every ORDER BY it runs, and
+                // nothing told it so.
+                let mut modified_catalog = false;
+                if let Some(c) = collation {
+                    if self.declare_database_collation(&c)? {
+                        modified_catalog = true;
+                    } else {
+                        self.warning(alloc::format!(
+                            "collation {c:?} was not applied: this database \
+                             already has tables, and their index keys were \
+                             built under {:?}",
+                            self.catalog.db_collation()
+                        ));
+                    }
+                }
                 Ok(QueryResult::CommandOk {
                     affected: 0,
-                    modified_catalog: false,
+                    modified_catalog,
                 })
             }
             Statement::AlterSystem { parameter } => {

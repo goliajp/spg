@@ -3000,6 +3000,29 @@ impl Engine {
         Ok(changed)
     }
 
+    /// `CREATE DATABASE … LC_COLLATE 'x'` — the SQL path, as opposed to
+    /// [`Self::set_database_collation`]'s host-environment one.
+    ///
+    /// Returns whether it took effect. A `false` means a table already
+    /// exists, and the caller warns; see
+    /// [`Catalog::declare_db_collation`] for why that is not an error.
+    ///
+    /// # Errors
+    /// When the name is not a collation PostgreSQL has, or is one this
+    /// build cannot perform — the same two refusals as the other path.
+    pub fn declare_database_collation(&mut self, name: &str) -> Result<bool, EngineError> {
+        if !crate::collate::is_known(name) {
+            return Err(crate::collate::unknown_collation_error(name));
+        }
+        if !crate::collate::is_supported(name) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "collation {name:?} is not one this build can perform; \
+                 a database created under it could not be read back"
+            )));
+        }
+        Ok(self.catalog.declare_db_collation(name))
+    }
+
     pub(crate) fn active_catalog(&self) -> &Catalog {
         match self.current_tx {
             Some(t) => self

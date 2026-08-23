@@ -296,3 +296,92 @@ fn the_collation_survives_a_round_trip() {
         "Bob client Zebra"
     );
 }
+
+/// `CREATE DATABASE … LC_COLLATE` — the SQL path.
+///
+/// v7.38.18. The design note, the CHANGELOG and a customer letter all
+/// said a database could be created with a collation, and every test
+/// behind that claim went through `set_database_collation`, the Rust
+/// API. The statement itself was parsed and thrown away whole: SPG is
+/// single-database, so `CREATE DATABASE` had been a no-op since v7.14,
+/// and the `LC_COLLATE` on it went with the rest of the tokens.
+///
+/// It is in every PostgreSQL bootstrap script there is. A database that
+/// sorts by the container's `LANG` instead of the one the script asked
+/// for gives a different answer to every `ORDER BY` it will ever run,
+/// and says nothing.
+mod create_database_lc_collate {
+    use super::{Engine, one};
+
+    #[test]
+    fn the_statement_sets_the_collation() {
+        let mut e = Engine::new();
+        e.execute("CREATE DATABASE app LC_COLLATE 'de_DE.utf8'")
+            .unwrap();
+        assert_eq!(
+            one(&mut e, "SELECT datcollate FROM pg_database"),
+            "de_DE.utf8"
+        );
+        // And it reaches ordering, which is the only reason to want it.
+        e.execute("CREATE TABLE t(x TEXT)").unwrap();
+        e.execute("INSERT INTO t VALUES ('Zebra'),('apfel'),('Bob')")
+            .unwrap();
+        assert_eq!(
+            one(&mut e, "SELECT string_agg(x, ',' ORDER BY x) FROM t"),
+            "apfel,Bob,Zebra"
+        );
+    }
+
+    /// `LOCALE` is the other spelling, and `=` is optional in both.
+    #[test]
+    fn locale_and_an_equals_sign_are_the_same_statement() {
+        for sql in [
+            "CREATE DATABASE app LOCALE 'de_DE.utf8'",
+            "CREATE DATABASE app LC_COLLATE = 'de_DE.utf8'",
+            "CREATE DATABASE app WITH TEMPLATE = template0 LC_COLLATE = 'de_DE.utf8' LC_CTYPE = 'de_DE.utf8'",
+        ] {
+            let mut e = Engine::new();
+            e.execute(sql).unwrap();
+            assert_eq!(
+                one(&mut e, "SELECT datcollate FROM pg_database"),
+                "de_DE.utf8",
+                "{sql}"
+            );
+        }
+    }
+
+    /// The negative control the whole feature rests on: a plain
+    /// `CREATE DATABASE` is still a no-op, and still leaves `C`.
+    #[test]
+    fn a_statement_without_a_collation_changes_nothing() {
+        let mut e = Engine::new();
+        e.execute("CREATE DATABASE app").unwrap();
+        assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database"), "C");
+        assert_eq!(one(&mut e, "SELECT ('B' < 'a')"), "Bool(true)");
+    }
+
+    /// Once a table exists its index keys were built under the old
+    /// collation, so the statement cannot take effect. It must not fail
+    /// either: PostgreSQL would have created a SEPARATE database here
+    /// and returned success, and failing a bootstrap script is a
+    /// customer change.
+    #[test]
+    fn a_database_with_tables_warns_and_succeeds() {
+        let mut e = Engine::new();
+        e.execute("CREATE TABLE t(x TEXT)").unwrap();
+        e.execute("CREATE DATABASE app LC_COLLATE 'de_DE.utf8'")
+            .expect("must not fail a bootstrap script");
+        assert_eq!(one(&mut e, "SELECT datcollate FROM pg_database"), "C");
+    }
+
+    /// A name PostgreSQL does not have is refused here too, rather than
+    /// letting ICU fall back to the root locale.
+    #[test]
+    fn an_unknown_collation_is_refused() {
+        let mut e = Engine::new();
+        assert!(
+            e.execute("CREATE DATABASE app LC_COLLATE 'zz_ZZ.utf8'")
+                .is_err()
+        );
+    }
+}
