@@ -176,6 +176,104 @@ Resolution path: `crates/spg-server/src/main.rs::env_resolve`. Add
 a new alias as one line in the `ALIASES` table; downstream readers
 inherit it automatically.
 
+## How a boolean switch is read (v7.38.18)
+
+`0` / `off` / `false` / `no` are off; `1` / `on` / `true` / `yes` are
+on; case does not matter and a blank value means *nothing was said*, so
+each switch keeps its own default rather than inheriting one.
+
+Before v7.38.18 SPG read a boolean **two ways**. `SPG_AUTOVACUUM` took
+`0`, `false` or `off`; `SPG_WAL_FULLFSYNC`, `SPG_PGWIRE_TIMING`,
+`SPG_PGWIRE_TRACE` and `SPG_FREEZER_DISABLE` took only `0`, so every
+other spelling — the word `false` included — meant ON. An operator
+writing `SPG_FREEZER_DISABLE=false`, meaning *do not disable it*,
+disabled it. One reader now, with PostgreSQL's spellings.
+
+Three switches still read their own way and are marked in the tables
+below: `SPG_DATA_SYNC_RETRY` is on only for the exact word `on`,
+`SPG_SEGMENT_COMPRESSION` is off only for the word `none`, and
+`SPG_WAL_HASH` names a scheme rather than a boolean.
+
+## Missing from this page until v7.38.18
+
+These thirty-one were read by shipped code and documented nowhere. The
+tables below now carry them; this note stays so the gap is on the
+record rather than quietly closed.
+
+### Access and transport
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_HBA_FILE` | unset | A `pg_hba.conf`-format file. First matching line decides; a file that will not parse **refuses the start**. See `PG_MIGRATION.md`. |
+| `SPG_REQUIRE_TLS` | off | Refuse a plaintext pg-wire connection (SQLSTATE `08P01`). |
+| `SPG_TLS_CERT` / `SPG_TLS_KEY` | unset | PEM paths. Both or neither. |
+| `SPG_PG_ADDR` | unset | `host:port` for the PostgreSQL wire. Unset means the wire is not started. |
+
+### Collation and text
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_LC_COLLATE` | unset | The collation a NEW database is created with, ahead of `LC_ALL` / `LC_COLLATE` / `LANG`. Set once, at creation; it cannot be changed afterwards, exactly as in PostgreSQL. Absent leaves `C`. |
+
+### Durability and WAL
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_WAL_FULLFSYNC` | off | macOS: force `F_FULLFSYNC` instead of `F_BARRIERFSYNC`. Measured at r702-SW: 433 ms against 43 ms. |
+| `SPG_WAL_HASH` | `crc32c` | `blake3` selects the stronger WAL frame hash. **Not a boolean** — it names a scheme. |
+| `SPG_WAL_TRACE` | off | Per-frame WAL tracing. |
+| `SPG_DATA_SYNC_RETRY` | off | Retry a failed data fsync instead of failing the write. **Reads only the exact word `on`.** |
+| `SPG_WAL_WRITER_DELAY_MS` | unset (off) | Group-commit delay for the WAL writer; a zero is ignored. |
+| `SPG_COMMIT_TRACE` | off | Per-commit tracing. |
+| `SPG_FAULT_RECOVERY_PAUSE_MS` | `0` | Pause injected in the recovery path; a test aid that ships enabled. |
+
+### Storage and segments
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_TEMP_DIR` | the OS temp dir | Where a spilling sort writes its runs. A blank value falls back to the OS directory rather than the empty path. |
+| `SPG_COMPACTION_TARGET_SEGMENT_BYTES` | `COMPACTION_TARGET_DEFAULT_BYTES` | Target size a compaction aims for. |
+| `SPG_COMPRESSION_MIN_BYTES` | `WAL_COMPRESS_MIN_BYTES` | Below this, a WAL record is stored uncompressed. |
+| `SPG_SEGMENT_COMPRESSION` | on | `none` turns cold-segment compression off. **Reads only the word `none`.** |
+| `SPG_WARM_UP_COLD_BUDGET_MS` | unset (no budget) | Milliseconds spent pre-loading cold segments at open; `0` disables the warm-up. |
+
+### Embedded host
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_EMBEDDED_CHECKPOINT_BYTES` | adaptive | WAL bytes between checkpoints; a zero is ignored. Setting it turns adaptive mode OFF. |
+| `SPG_EMBEDDED_CHECKPOINT_SECONDS` | adaptive | The time half of the same. |
+| `SPG_REPLAY_HEARTBEAT_MS` | `5000` | How often a long replay reports progress. |
+| `SPG_OPEN_PATH_LOG` / `SPG_OPEN_PATH_TIMING` | off | Trace and time `Database::open_path`. |
+| `SPG_SQLX_INLINE_BUDGET_MS` | `1000` | Budget for the `spg-sqlx` inline path before it hands off. |
+
+### PITR
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_PITR_RETENTION_HOURS` | `0` (off) | Delete WAL chunks older than this. |
+| `SPG_PITR_RETENTION_CHECK_SEC` | `60` | How often the retention sweep wakes. |
+| `SPG_PITR_ARCHIVE_CMD` | unset | Command run per chunk before deletion; a non-zero exit records `archive=FAILED` and keeps the chunk. |
+
+### Maintenance and planner
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_AUTOVACUUM` | on | Turning it off leaves dead rows unreclaimed. |
+| `SPG_AUTOVACUUM_NAPTIME_MS` | see `SPG_AUTO_ANALYZE_INTERVAL_MS` | The SPG-spelled twin of the PG name. |
+| `SPG_PARALLEL` | on | Parallel execution. Reads `0`/`false`/`off`. |
+| `SPG_MVCC_INPLACE` | on | In-place MVCC. Reads `0`/`false`/`off`. |
+| `SPG_PLAN_CACHE_MAX` | engine default | Plan-cache entry cap; an unparseable value is ignored. |
+| `SPG_MATVIEW_TRACE` | off | Materialised-view maintenance tracing. |
+| `SPG_PGWIRE_TRACE` / `SPG_PGWIRE_TIMING` | off | Per-message trace and timing on the PG wire. |
+| `SPG_PUBSUB_SUBJECT` / `SPG_PUBSUB_TARGET` | built-in defaults | WAL pub/sub routing. |
+
+### Fault injection (ships enabled — these are not `SPG_TEST_`)
+
+| Env | Default | Effect |
+|---|---|---|
+| `SPG_FAIL_FSYNC_AT` / `SPG_FAIL_AUDIT_AT` | unset | Fail the Nth fsync or audit append. Used by the crash matrix; they are named here because a deployer can set them, which makes them part of the interface. |
+
 ## Discovery
 
 `spgctl tunables` (planned 22.10 / 23.8 follow-up) will print
