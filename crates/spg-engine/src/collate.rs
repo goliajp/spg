@@ -101,14 +101,14 @@ pub(crate) fn sort_key(collation: &str, s: &str) -> Option<alloc::vec::Vec<u8>> 
     {
         return None;
     }
-    let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
-    let prefs = icu_collator::CollatorPreferences::from(&locale);
-    let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
-    let mut key: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    collator.write_sort_key_to(s, &mut key).ok()?;
-    key.push(0);
-    key.extend_from_slice(s.as_bytes());
-    Some(key)
+    // v7.38.19 — resolve through `Collated`, which is where the collator
+    // lives, instead of parsing the locale and building a fresh one on
+    // every call. Both callers are per-ROW: one builds an index entry,
+    // the other an index probe, so this ran once per row of a collated
+    // index. It is the same defect the scan filter had -- `Collated`
+    // exists for exactly this and two more paths were never connected to
+    // it.
+    Collated::resolve(name)?.sort_key_of(s)
 }
 
 /// v7.38.18 — a collation resolved ONCE, for a comparator that will be
@@ -143,6 +143,32 @@ impl Collated {
         Some(Self {
             collator: Some(collator),
         })
+    }
+
+    /// v7.38.19 — the ICU sort key for a value, computed ONCE, so a sort
+    /// compares bytes instead of calling the collator per comparison.
+    ///
+    /// A symbolicated profile of `ORDER BY` over 200,000 collated text
+    /// values put **97 % of the non-waiting samples inside ICU** —
+    /// `CollatorBorrowed::compare` at 936 and `CollationElements` at
+    /// 1,003 against `cmp_multi_key_in`'s 57. A sort of n rows makes
+    /// about n·log₂n comparisons — 3.5 million here — where a key needs
+    /// n computations.
+    ///
+    /// The bytes end with a NUL and then the original string, so two
+    /// values the collation calls equal still order deterministically,
+    /// exactly as [`Collated::compare`] tiebreaks.
+    ///
+    /// `None` when this collation needs no collator: `C` and the `_bin`
+    /// family are byte order already, and building a key for them would
+    /// be a copy that changes nothing.
+    pub(crate) fn sort_key_of(&self, s: &str) -> Option<alloc::vec::Vec<u8>> {
+        let c = self.collator.as_ref()?;
+        let mut key: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        c.write_sort_key_to(s, &mut key).ok()?;
+        key.push(0);
+        key.extend_from_slice(s.as_bytes());
+        Some(key)
     }
 
     /// The same ordering [`compare`] produces, tiebreak included.

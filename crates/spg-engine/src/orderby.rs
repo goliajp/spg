@@ -1862,6 +1862,30 @@ pub(crate) fn build_order_keys_bound(
                 _ => unreachable!("guarded by matches! above"),
             };
             keys.push(OrderKey::Text(CompactText::new(&folded)));
+        } else if let Some(k) = collations
+            .get(i)
+            .and_then(Option::as_ref)
+            .and_then(|c| match v {
+                Value::Text(t) => c.sort_key_of(t.as_ref()),
+                Value::BpChar(t) => c.sort_key_of(t.as_ref()),
+                _ => None,
+            })
+        {
+            // v7.38.19 — the collated sort compares BYTES.
+            //
+            // `collations` has been a parameter of this function since
+            // the database collation landed and has never been read
+            // here: the key was the text, and the comparator called the
+            // collator on every comparison. A symbolicated profile of
+            // `ORDER BY` over 200,000 collated values put 97% of the
+            // non-waiting samples inside ICU.
+            //
+            // A sort of n rows makes about n·log₂n comparisons — 3.5
+            // million here — where a key needs n computations. The bytes
+            // carry ICU's own key, a NUL, and the original string, so
+            // ties still order deterministically; that is the same
+            // tiebreak `Collated::compare` applies.
+            keys.push(OrderKey::Bytes(k));
         } else {
             keys.push(value_to_order_key(v)?);
         }
