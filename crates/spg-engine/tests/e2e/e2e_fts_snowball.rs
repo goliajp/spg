@@ -75,3 +75,8 @@ fn check(config: &str, file: &str) {
 fn spanish_stems_as_pg_does() {
     check("spanish", "spanish.tsv");
 }
+
+#[test]
+fn french_stems_as_pg_does() {
+    check("french", "french.tsv");
+}
