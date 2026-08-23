@@ -106,7 +106,7 @@ TMP="${TMPDIR:-/tmp}"
 # v7.38.19 — the tests' scratch now lands under one directory, so this is
 # a single removal rather than a scan of tens of thousands of entries by
 # prefix. The prefix sweep stays for what earlier versions left behind.
-for base in "$TMP/spg-tests"; do
+for base in "$TMP/spg-tests" "/tmp/spg-tests"; do
     [[ -d "$base" ]] || continue
     n=$(find "$base" -maxdepth 1 -mindepth 1 -mtime +1 2>/dev/null | wc -l | tr -d ' ')
     [[ "${n:-0}" -gt 0 ]] || { say "no test scratch older than a day under $base"; continue; }
