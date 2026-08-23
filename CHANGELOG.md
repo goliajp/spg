@@ -238,7 +238,7 @@ the current build; this file is a release-organized view.
   instead of the name. Over 200,000 rows: **1,715 ms → 216 ms**.
 
 - **An expression index stood in for a column index, and a row went
-  missing.** This one the shipped build already had, on a plain `C`
+  missing.** Present in **v7.38.16 and v7.38.17**, on a plain `C`
   database, with no collation involved:
 
   ```
@@ -252,6 +252,18 @@ the current build; this file is a release-organized view.
   tree holds `lower(s)`, so a probe built from the column's own value
   asked it a question its keys could not answer — and v7.38.16 fixed
   that exact shape for GIN, two lines away in the same function.
+
+  Which releases carry it was established by running the shape against
+  every published image, not by reading the history: 7.38.6 through
+  7.38.15 answer 1, 7.38.16 and 7.38.17 answer 0. v7.38.16 is where an
+  expression index began holding the *expression's* values rather than
+  the anchor column's — before that the tree held the column's own
+  values, so handing it to a column probe still answered correctly. The
+  improvement to the index is what exposed the lookup behind it.
+
+  The first draft of this entry said "the shipped build already had" it,
+  undated, which is a claim about every release ever made. It was
+  written from the code and it was wrong; the images corrected it.
 
   Found by chasing a deviation the differential corpus reported, not by
   a report. The lower-case rows in most fixtures match by coincidence,
