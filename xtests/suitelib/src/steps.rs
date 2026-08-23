@@ -265,11 +265,7 @@ pub fn ironrules_full(root: &Path, runid: &str) -> Result<String, String> {
 
 /// Open one released data directory with the binary being released, and
 /// check every count and checksum the fixture recorded.
-fn open_datadir_fixture(
-    root: &Path,
-    fixture: &Path,
-    runid: &str,
-) -> Result<String, String> {
+fn open_datadir_fixture(root: &Path, fixture: &Path, runid: &str) -> Result<String, String> {
     // The fixture's own name, so a failure sends the reader to the
     // directory that actually failed. These messages said `v7.38.15`
     // literally, which was the same aging lie as the path they came
@@ -1033,7 +1029,11 @@ mod datadir_choice_tests {
             .filter(|e| e.path().join("expected.txt").exists())
             .count();
         if dirs > 1 {
-            assert_eq!(names.len(), 2, "expected the oldest and the newest, got {names:?}");
+            assert_eq!(
+                names.len(),
+                2,
+                "expected the oldest and the newest, got {names:?}"
+            );
             assert!(
                 parts(&names[0]) < parts(&names[1]),
                 "the oldest must come first: {names:?}"
