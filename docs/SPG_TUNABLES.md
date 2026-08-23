@@ -196,9 +196,19 @@ below: `SPG_DATA_SYNC_RETRY` is on only for the exact word `on`,
 
 ## Missing from this page until v7.38.18
 
-These thirty-one were read by shipped code and documented nowhere. The
-tables below now carry them; this note stays so the gap is on the
-record rather than quietly closed.
+These thirty-two were read by shipped code and documented nowhere. The
+tables below now carry them; this note stays so the gap is on the record
+rather than quietly closed.
+
+The count is the set difference between the names this page carried at
+v7.38.17 (63) and the names it carries now (95), not a tally kept while
+writing. It said thirty-one until the difference was actually taken.
+
+Six `SPG_*` names in the tree are still absent, deliberately: every one
+of them is read only by an example or a test harness — `SPG_NO_AV`,
+`SPG_SOAK_TESTS`, `SPG_PERF_1B_ROW_BUDGET`, `SPG_TEST_FIXED_CLOCK_MICROS`,
+`SPG_TEST_SPAWN_DEADLINE_SECS`, and `SPG_SOMETHING`, which is a fixture
+name. No shipped code path reads any of them.
 
 ### Access and transport
 
