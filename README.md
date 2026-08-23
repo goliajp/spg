@@ -15,6 +15,7 @@ written from scratch on top of `std`/`alloc`/`core`.
 | **Storage** | In-memory page-less heap, atomic snapshot via tmpfile+rename, secondary B-tree indices (`alloc::collections::BTreeMap`), append-only catalog binary format with magic+version. |
 | **Persistence** | Two modes: atomic full-snapshot per writeful query *or* append-only WAL with fsync. WAL replay handles partial transactions via auto-rollback. |
 | **Executor** | Volcano-style row pipeline. WHERE filter, projection with column aliases, table aliases, ORDER BY (any expression), LIMIT, single-column-equality index seek, kNN via `<->` + ORDER BY. |
+| **Collation** (v7.38.18) | 880 of PostgreSQL 18.4's collations, performed by ICU and calibrated against it. A database records the one it was created with — from `LC_COLLATE` / `LANG`, the way `initdb` reads them — and a text column that declares none inherits it. `COLLATE` on a column and in an `ORDER BY` key. Index keys carry their collation, so a seek and a scan give the same rows. Absent on disk means `C`, so a database from an earlier version keeps every answer it had. |
 | **Transactions** | `BEGIN`/`COMMIT`/`ROLLBACK` with a clone-on-BEGIN shadow catalog. Single-writer locking; own-write visibility inside the TX. |
 | **Audit log** | Append-only, BLAKE3 hash-chain. Every committed statement appears; the daemon refuses to start if the chain has been tampered. |
 | **Crypto** | Self-built BLAKE3 (full reference impl, KAT-verified against the spec). No third-party crates. |
