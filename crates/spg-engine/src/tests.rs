@@ -2908,3 +2908,58 @@ fn another_slots_transaction_does_not_stop_autoanalyze_counting() {
 
     e.execute_in("COMMIT", holder).unwrap();
 }
+
+// ---------------------------------------------------------------------
+// v7.38.19 — a constant array must not keep its predicate off the
+// compiled path.
+
+/// `fully_compilable` is the gate that decides whether a WHERE
+/// predicate is compiled once or walked by the interpreter for every
+/// row. An all-literal `ARRAY[…]` folds to a single `Step::Lit` at
+/// compile time, but it was missing from this list, so any predicate
+/// carrying one fell to the interpreter — which rebuilt the array, a
+/// `Vec` and a `String` per element, per row.
+///
+/// Measured on 200,000 rows of sentori's `events`:
+///
+/// ```text
+/// traits ?  'plan'                 10.103 ms      (no array)
+/// traits ?| 'plan'                 10.388         (bare TEXT — same)
+/// traits ?| ARRAY['plan']          26.227         (one element)
+/// traits ?| ARRAY['x','plan']      39.626
+/// traits ?| ARRAY['x','y','plan']  45.403
+/// ```
+///
+/// The second line is what said the operator was never the cost: the
+/// same question with the same one key, spelled without an array, was
+/// as cheap as `?`. After: 11.298 / 17.112 / 19.312.
+///
+/// The assertion is on the DECISION, not on elapsed time. This defect
+/// is "the predicate was not compiled", and that is a yes or no.
+#[test]
+fn v73819_a_constant_array_predicate_is_compilable() {
+    fn where_of(sql: &str) -> Expr {
+        match spg_sql::parser::parse_statement(sql).expect("parse") {
+            Statement::Select(s) => s.where_.expect("a WHERE"),
+            other => panic!("expected SELECT, got {other:?}"),
+        }
+    }
+    for sql in [
+        "SELECT 1 FROM t WHERE d ?| ARRAY['a','b']",
+        "SELECT 1 FROM t WHERE d ?& ARRAY['a']",
+        "SELECT 1 FROM t WHERE d ?| ARRAY['a'] AND id = 1",
+    ] {
+        assert!(
+            crate::eval::fully_compilable(&where_of(sql)),
+            "must compile, not fall to the per-row interpreter: {sql}"
+        );
+    }
+    // The narrowness is the point: an array whose elements are not all
+    // constant cannot be folded, so it must NOT claim to be compilable
+    // — the fold would have to happen per row, which is the trap this
+    // list exists to avoid.
+    assert!(
+        !crate::eval::fully_compilable(&where_of("SELECT 1 FROM t WHERE d ?| ARRAY[k, 'b']")),
+        "an array mentioning a column is not constant"
+    );
+}
