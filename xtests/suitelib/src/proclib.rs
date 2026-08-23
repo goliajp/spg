@@ -472,8 +472,25 @@ pub fn crash_cycle(
 /// A temp workspace under `/tmp/spg-suite-<runid>/` — the ONLY prefix
 /// the janitor is allowed to collect (D10).
 #[must_use]
+/// v7.38.19 — under the same root every other test scratch uses.
+///
+/// This hard-coded `/tmp/spg-suite-<runid>`, which is neither `$TMPDIR`
+/// nor the `spg-tests` root this release moved 161 leaking test files
+/// into — so the suite's own run directories were exactly the thing the
+/// scratch-root gate was written to stop, and the gate could not see
+/// them because it scans for `env::temp_dir()` and this does not call
+/// it.
+///
+/// `/tmp` is kept rather than `$TMPDIR` because a suite run spawns
+/// servers whose socket and data paths appear in process listings and
+/// error messages, and `/tmp/spg-tests/spg-suite-<runid>` stays legible
+/// where a `/var/folders/rx/1_v1…/T/` prefix does not. What changes is
+/// that one `rm -rf /tmp/spg-tests` now collects the suite's leavings
+/// along with everything else's.
 pub fn run_tmp_dir(runid: &str) -> PathBuf {
-    PathBuf::from(format!("/tmp/spg-suite-{runid}"))
+    let base = PathBuf::from("/tmp/spg-tests");
+    let _ = std::fs::create_dir_all(&base);
+    base.join(format!("spg-suite-{runid}"))
 }
 
 #[cfg(test)]

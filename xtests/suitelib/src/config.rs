@@ -404,4 +404,77 @@ mod test_scratch_root {
             offenders.join("\n  ")
         );
     }
+
+    /// v7.38.19 — and the other way of writing the same mistake.
+    ///
+    /// The check above scans for `env::temp_dir()`. The suite's own
+    /// `run_tmp_dir` did not call it — it built `/tmp/spg-suite-<runid>`
+    /// by hand — so the suite's run directories were exactly what the
+    /// gate was written to stop and the gate could not see them. Found by
+    /// reading a process listing during a run, not by the check.
+    ///
+    /// A literal `/tmp/spg` outside the shared root is red for the same
+    /// reason: one `rm -rf` should collect everything a run leaves.
+    #[test]
+    fn nothing_builds_a_scratch_path_out_of_a_bare_tmp_literal() {
+        let root = root();
+        let mut offenders: Vec<String> = Vec::new();
+        let mut stack = vec![root.join("crates"), root.join("xtests")];
+        let needle = concat!("\"/tmp", "/spg");
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.filter_map(Result::ok) {
+                let p = e.path();
+                if p.is_dir() {
+                    if p.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(p);
+                    continue;
+                }
+                if p.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
+                for (i, line) in text.lines().enumerate() {
+                    let t = line.trim_start();
+                    if t.starts_with("//") || !t.contains(needle) {
+                        continue;
+                    }
+                    if t.contains("/tmp/spg-tests") {
+                        continue;
+                    }
+                    // A literal that never becomes a path on disk is not
+                    // a leak. `parse_copy_intent("COPY t TO '/tmp/…'")`
+                    // is a parser test asserting on a string, and the
+                    // first version of this check called it a violation —
+                    // the same over-broad reading that made the previous
+                    // check red on four already-correct files.
+                    //
+                    // The signal is USE: a scratch path is built to be
+                    // created, opened or handed to a process.
+                    let creates = t.contains("PathBuf::from")
+                        || t.contains("create_dir")
+                        || t.contains("File::create")
+                        || t.contains("write(")
+                        || t.contains("remove_dir");
+                    if !creates {
+                        continue;
+                    }
+                    offenders.push(format!("{}:{}", p.display(), i + 1));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these build a scratch path from a bare /tmp literal instead of \
+             /tmp/spg-tests, which puts them outside the one directory a \
+             cleanup can collect:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 }
