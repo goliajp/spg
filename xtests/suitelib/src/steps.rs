@@ -202,7 +202,8 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         let r = sh(
             root,
             &format!(
-                "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000                  bash scripts/perf-endpoint-sweep.sh"
+                "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
+                 EXPECT_SPG_COLLATE=en_US.utf8 bash scripts/perf-endpoint-sweep.sh"
             ),
         );
         roster2.reap_all();
