@@ -453,7 +453,7 @@ implemented; further breakdown follows the table.
 | `INSERT INTO t [(cols)] SELECT … FROM …` | ✅ v7.13.0 | Inner SELECT runs first; materialised rows feed the regular INSERT pipeline (FK / CHECK / UC / RETURNING / ON CONFLICT all stay) |
 | `UPDATE t SET col = CASE WHEN cond THEN x ELSE y END` | ✅ v7.13.0 | CASE WHEN in any expression position (UPDATE SET, SELECT projection, WHERE, …) |
 | `TRUNCATE TABLE` | ✅ | Native (was ❌ — `DELETE FROM` no longer needed) |
-| Bulk `COPY FROM STDIN` (PG-wire) | ❌ | Use multi-row INSERT instead. `COPY … TO STDOUT` DOES work — measured v7.38.18 |
+| Bulk `COPY FROM STDIN` (PG-wire) | ✅ | Over the wire, which is where `psql -f` and `pg_dump` use it. Measured v7.38.18: `pg_dump \| psql` round-trips schema and rows. The in-process `Engine::execute("COPY … FROM STDIN")` form is not the same surface and still refuses |
 
 ### Queries (SELECT)
 
@@ -483,7 +483,7 @@ implemented; further breakdown follows the table.
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | |
 | `EXPLAIN (SUGGEST) …` | ✅ | SPG-specific advisor |
 | `SELECT … FROM t AS OF SEGMENT '<id>'` | ✅ | SPG-specific cold-tier time travel |
-| `SELECT … AS OF TIMESTAMP <ts>` | ❌ | Per-segment timestamps not yet recorded |
+| `SELECT … AS OF TIMESTAMP <ts>` | n/a | **PostgreSQL 18.4 does not have this either** — `syntax error at or near "timestamp"`, measured. It is Oracle / SQL Server / CockroachDB syntax, so its absence is not a PG compatibility gap and this row should never have been a ❌ |
 | `CASE WHEN … THEN … ELSE … END` | ✅ | |
 | `COALESCE` / `NULLIF` / `GREATEST` / `LEAST` | ✅ | |
 | Aggregates: `count` / `sum` / `avg` / `min` / `max` / `count(DISTINCT)` | ✅ | |
@@ -582,7 +582,7 @@ clean_text` runs end-to-end.
 |---|---|---|
 | Streaming replication (`pg_basebackup` + standby) | ⚠️ | Different protocol: MAGIC_V2 wire frame |
 | Logical replication (`CREATE PUBLICATION` / `CREATE SUBSCRIPTION`) | ✅ | SPG ships its own logical replication (v6.1.x); not wire-compatible with PG's |
-| `pg_dump` / `pg_restore` | ❌ | SPG uses its own BACKUP/RESTORE format (`spg backup` / `spg restore`) |
+| `pg_dump` / `pg_restore` | ✅ | Measured v7.38.18 against pg_dump 18.6: `pg_dump` exits 0 with the full schema + data, `psql -f` and `pg_restore -Fc` both restore it into SPG. `spg backup` / `spg restore` remain the faster native path |
 | WAL streaming to a remote (`archive_command`) | ✅ | `SPG_WAL_TEE_PATH` writes a side-channel mirror |
 
 ### `pg_catalog` / introspection
