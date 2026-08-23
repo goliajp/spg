@@ -2992,8 +2992,43 @@ fn sql_is_read_only(sql: &str) -> bool {
             lower[k] = b.to_ascii_lowercase();
         }
         let s = &lower[..kw.len()];
-        s == b"select" || s == b"show"
+        (s == b"select" || s == b"show") && !select_writes_into(bytes)
     }
+}
+
+/// v7.38.19 — `SELECT … INTO t` starts with `SELECT` and creates a
+/// table.
+///
+/// `sql_is_read_only` above says an over-broad hit "just takes the read
+/// path and engine returns `WriteRequired` if wrong — caller falls
+/// back". The engine does return it; **the caller does not fall back**,
+/// so the client gets `statement requires a write lock (use execute,
+/// not execute_readonly)` -- an internal message, for a statement
+/// PostgreSQL answers `SELECT 3`.
+///
+/// The comment has described a recovery that is not there for as long as
+/// it has existed, and nothing noticed because until this version SPG
+/// could not parse `SELECT … INTO` at all: the statement failed earlier,
+/// in the parser, and never reached the claim.
+///
+/// Word-boundary matching rather than a substring: `SELECT into_col FROM
+/// t` and `SELECT x FROM points_into` are ordinary reads.
+fn select_writes_into(bytes: &[u8]) -> bool {
+    let n = bytes.len();
+    let mut i = 0;
+    while i + 4 <= n {
+        if bytes[i].eq_ignore_ascii_case(&b'i')
+            && bytes[i + 1].eq_ignore_ascii_case(&b'n')
+            && bytes[i + 2].eq_ignore_ascii_case(&b't')
+            && bytes[i + 3].eq_ignore_ascii_case(&b'o')
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_')
+            && (i + 4 == n || !bytes[i + 4].is_ascii_alphanumeric() && bytes[i + 4] != b'_')
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// v6.1.8 — `effective_wal_level` discriminant. `replica`

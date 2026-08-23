@@ -1241,6 +1241,7 @@ mod e2e_row_is_null;
 mod e2e_rows_from;
 mod e2e_runtime_default;
 mod e2e_schema;
+mod e2e_select_into;
 mod e2e_select_star_agg;
 mod e2e_sentori_cutover;
 mod e2e_sequence;
