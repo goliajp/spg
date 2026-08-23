@@ -84,6 +84,30 @@ instrument being asked to prove it could see what it claimed to check.
 
 - **`pg_advisory_unlock` did not warn**, where PostgreSQL does.
 
+- **A function created earlier in the same query string was invisible to
+  the statements after it.** `CREATE FUNCTION f() … ; SELECT f()` sent as
+  one simple query answered `function f() does not exist` while the
+  CREATE in that same string had just succeeded. A multi-statement simple
+  query is an implicit transaction, so the new function lives in the
+  transaction's shadow catalog and the evaluator threaded the committed
+  one.
+
+  It is the ninth member of the family v7.38.18 recorded for `ANALYZE`,
+  and the first eight were each found by something being wrong, one at a
+  time, over several releases. The rest of the family is now enumerated
+  rather than waited for: two tables and a join — which reads the catalog
+  through the join reorderer, a different path from the scan — a view, an
+  index, an enum type, a sequence and a domain, each measured against
+  PostgreSQL 18.4 and each passing on the day it was written down.
+
+  **Found by re-verifying a customer's ledger rather than believing it.**
+  Their status document lists `RETURNS bigint[]` as fixed in v7.37.25,
+  with its status column reading "on 7.38.1" — eighteen releases behind.
+  Re-running that row produced `function fb() does not exist`, which
+  looked like an array-return regression and was not: on its own the
+  array return is fine. Their probe had been the two-statement form, and
+  what it caught was a different defect neither side knew about.
+
 - **`SELECT 1::xid8` returned `1`** where PostgreSQL answers `cannot cast
   type integer to xid8`. **SPG accepting what PG rejects is the worse
   direction** — code PG would have stopped runs here, and the difference
@@ -162,6 +186,14 @@ Four gates gained the ability to see something they had claimed to check.
 
 - **The gate's cross-version open made a one-release hop**, which is the
   hop least likely to break. It now opens the oldest fixture as well.
+
+- **The declaration of a leg's collation moved to the one place that
+  spawns a server**, so the five servers with the same exposure as the
+  sweep's — the cross-version open, the wire smoke, the pgbench leg and
+  the dump round-trip pair — were fixed by one change rather than one at
+  a time. And the sweep now **checks** its leg's collation against a
+  stated expectation rather than printing it: printing is where three of
+  this version's defects lived.
 
 - **The suite's servers inherited the machine's collation**, and the
   testbed exports `LANG=en_US.UTF-8`. So the sweep's baseline leg had
