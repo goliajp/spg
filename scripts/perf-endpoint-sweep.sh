@@ -186,6 +186,39 @@ verify_typed_predicates() { # $1=uri $2=table
 SPG_WM='SET work_mem = 4096'
 PG_WM="SET work_mem='4MB'"
 
+# v7.38.19 — the SORT panel, verdicted separately from the shapes above.
+#
+# Every ORDER BY shape in `SHAPES` returns its rows, and at 400,000 rows
+# of TEXT the wire transfer dominates the cell. SPG's encoder is fast
+# enough to win them all while the sort inside is 1.2-2x behind
+# PostgreSQL -- measured by wrapping the same work in `count(*)`, which
+# returns one row and leaves only the sort:
+#
+#   ORDER BY a text column   SPG 52.2 ms   PG 42.4   1.23x
+#   ORDER BY an int column   SPG 29.9 ms   PG 14.6   2.05x
+#
+# And no shape above sorts TEXT at all: they order by `k INT`, `n
+# NUMERIC`, `b BYTEA`. The text ordering path -- the one v7.38.19 changed
+# twice -- had no cell.
+#
+# These are held to a CEILING rather than to parity, because SPG loses
+# them today and a gate that cannot be met is a gate that gets skipped.
+# The ceiling is a tripwire against getting worse, and it is written down
+# so that lowering it is a decision somebody makes on purpose.
+# 3.0, from a measurement rather than a preference: the worst cell is the
+# text sort at 2.43x, taken on a box whose load average was 11.3, and a
+# ceiling a hair above the worst reading on a loaded machine is a ceiling
+# that flaps. A flapping gate is worse than none -- it teaches the reader
+# to skip the line, which is how `gates` came to be over budget on every
+# run for months without anyone acting.
+SORT_CEILING="${SORT_CEILING:-3.0}"
+SORT_SHAPES=(
+  'sort only, text|SELECT count(*) FROM (SELECT pad FROM @T@ ORDER BY pad) z'
+  'sort only, int|SELECT count(*) FROM (SELECT k FROM @T@ ORDER BY k) z'
+  'sort only, two keys|SELECT count(*) FROM (SELECT k FROM @T@ ORDER BY k, id) z'
+  'sort only, distinct text|SELECT count(*) FROM (SELECT DISTINCT pad FROM @T@ ORDER BY pad) z'
+)
+
 SHAPES=(
   'wide, non-indexed key|SELECT pad FROM @T@ ORDER BY k'
   'narrow, non-indexed key|SELECT id FROM @T@ ORDER BY k'
@@ -297,9 +330,38 @@ for rows in ${SIZES}; do
   done
 done
 
+# The sort panel, at the largest size only: a cost class shows most
+# clearly there, and these four cells are extra work on top of the
+# sixty-four above.
+echo
+echo "sort panel — the sort alone, ratio against PG18, ceiling ${SORT_CEILING}x:"
+SORT_WORST=0
+SORT_OVER=0
+BIG="sweep_$(set -- ${SIZES}; for x in "$@"; do :; done; echo "$x")"
+for entry in "${SORT_SHAPES[@]}"; do
+  name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${BIG}}"
+  s=(); g=()
+  for ((i = 0; i < N; i++)); do
+    if (( i % 2 == 0 )); then
+      s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+      g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+    else
+      g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+      s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+    fi
+  done
+  smin="$(lo "${s[@]}")"; gmin="$(lo "${g[@]}")"
+  ratio="$(awk -v a="${smin}" -v b="${gmin}" 'BEGIN{ if (b <= 0) print "0"; else printf "%.2f", a/b }')"
+  over="$(awk -v r="${ratio}" -v c="${SORT_CEILING}" 'BEGIN{ print (r > c) ? 1 : 0 }')"
+  (( over )) && SORT_OVER=$((SORT_OVER + 1))
+  SORT_WORST="$(awk -v a="${ratio}" -v b="${SORT_WORST}" 'BEGIN{ print (a > b) ? a : b }')"
+  printf '  %-26s %8s %8s  %sx%s\n' "${name}" "${smin}" "${gmin}" "${ratio}" \
+    "$( (( over )) && echo '  <- OVER CEILING' )"
+done
+
 echo
 echo "load after: $(uptime)"
-echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED}"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
 if (( CONTROL_DIFFS > 0 )); then
   echo "NOTE: on ${CONTROL_DIFFS} cell(s) the binary separated from ITSELF in the same"
   echo "      window. ${DEMOTED} verdict(s) were withdrawn on that ground and report"
@@ -307,3 +369,9 @@ if (( CONTROL_DIFFS > 0 )); then
   echo "      re-run on a quiet box or raise N before acting on any single cell."
 fi
 (( LOSSES == 0 )) || exit 1
+if (( SORT_OVER > 0 )); then
+  echo "SORT PANEL: ${SORT_OVER} cell(s) past the ${SORT_CEILING}x ceiling (worst ${SORT_WORST}x)."
+  echo "            The sort is known to be behind; getting FURTHER behind is not"
+  echo "            allowed to pass quietly. See docs/PERF-FINDING-2026-08-24-sort-and-collation.md"
+  exit 1
+fi
