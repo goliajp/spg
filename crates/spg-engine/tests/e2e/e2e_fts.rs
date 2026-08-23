@@ -160,13 +160,43 @@ fn french_matches_pg() {
         ),
         "'chant':4 'chat':3 'le':1 'petit':2 'rapid':5"
     );
-    assert_eq!(text_of(&mut e, "SELECT to_tsquery('french','chats')::text"), "'chat'");
+    assert_eq!(
+        text_of(&mut e, "SELECT to_tsquery('french','chats')::text"),
+        "'chat'"
+    );
     assert_eq!(
         text_of(
             &mut e,
             "SELECT ts_headline('french','le chat noir', to_tsquery('french','chat'))"
         ),
         "le <b>chat</b> noir"
+    );
+}
+
+/// v7.38.18 — and the German configuration. PG 18.4's answers.
+///
+/// `die` is a stopword and drops out; the position it held still
+/// counts, which is why `klein` is at 2.
+#[test]
+fn german_matches_pg() {
+    let mut e = eng();
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT to_tsvector('german', 'die kleinen katzen sangen schnell')::text"
+        ),
+        "'katz':3 'klein':2 'sang':4 'schnell':5"
+    );
+    assert_eq!(
+        text_of(&mut e, "SELECT to_tsquery('german','katzen')::text"),
+        "'katz'"
+    );
+    assert_eq!(
+        text_of(
+            &mut e,
+            "SELECT ts_headline('german','die schwarze katze', to_tsquery('german','katze'))"
+        ),
+        "die schwarze <b>katze</b>"
     );
 }
 

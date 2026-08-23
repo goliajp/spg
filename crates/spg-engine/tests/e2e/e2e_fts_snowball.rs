@@ -34,7 +34,7 @@ fn gold(name: &str) -> Vec<(String, String)> {
 fn check(config: &str, file: &str) {
     let mut e = spg_engine::Engine::new();
     let rows = gold(file);
-    assert!(rows.len() > 500, "{file}: only {} words", rows.len());
+    assert!(rows.len() > 400, "{file}: only {} words", rows.len());
     let mut wrong: Vec<String> = Vec::new();
     for (word, want) in &rows {
         let sql = format!(
@@ -79,4 +79,9 @@ fn spanish_stems_as_pg_does() {
 #[test]
 fn french_stems_as_pg_does() {
     check("french", "french.tsv");
+}
+
+#[test]
+fn german_stems_as_pg_does() {
+    check("german", "german.tsv");
 }

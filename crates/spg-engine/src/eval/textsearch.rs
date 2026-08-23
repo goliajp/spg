@@ -1147,6 +1147,7 @@ pub(super) fn fts_ts_headline(
             crate::fts::TsConfig::English => crate::fts::porter_stem(&lowered),
             crate::fts::TsConfig::Spanish => crate::fts_es::stem_es(&lowered),
             crate::fts::TsConfig::French => crate::fts_fr::stem_fr(&lowered),
+            crate::fts::TsConfig::German => crate::fts_de::stem_de(&lowered),
         };
         let is_match = terms.iter().any(|t| *t == lex);
         tokens.push(HlToken {

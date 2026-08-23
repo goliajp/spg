@@ -63,6 +63,7 @@ mod expr_analysis;
 mod expr_index;
 pub(crate) mod extsort;
 pub mod fts;
+mod fts_de;
 mod fts_es;
 mod fts_fr;
 mod fts_stop;
