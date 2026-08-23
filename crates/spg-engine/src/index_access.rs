@@ -6,6 +6,7 @@
 
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use core::ops::Bound;
 
@@ -1858,6 +1859,78 @@ pub(crate) fn try_index_seek<'a>(
             snapshot,
             mysql,
         );
+    }
+    // v7.38.19 — `a = 1 OR a = 2` is `a IN (1, 2)` written the other way,
+    // and this engine has seeked the IN form since v7.33 while scanning
+    // the OR one. Measured on 200k rows, the predicate matching nothing,
+    // with an ORDINARY single-column index in place so nothing else was
+    // in the way:
+    //
+    //     project_id IN (98, 99)              0.192 ms
+    //     project_id = 99 OR project_id = 98  6.560 ms
+    //
+    // The union is only sound when EVERY disjunct seeks: a disjunct that
+    // falls through to a scan contributes rows this set would then be
+    // missing, and the caller re-applies the predicate to candidates
+    // rather than finding more. That is the same rule the GIN OR walk
+    // below states, and the reason both use `?` on every arm.
+    //
+    // Disjuncts need not share a column, and need not be equalities —
+    // each side goes back through this function, so `a = 1 OR b > 9`
+    // unions an equality seek with a range walk. What bounds the cost is
+    // that each arm already refuses to return more than a quarter of the
+    // table.
+    if let Expr::Binary {
+        lhs,
+        op: BinOp::Or,
+        rhs,
+    } = where_expr
+    {
+        let left = try_index_seek(
+            lhs,
+            schema_cols,
+            catalog,
+            table,
+            table_alias,
+            snapshot,
+            mysql,
+        )?;
+        let right = try_index_seek(
+            rhs,
+            schema_cols,
+            catalog,
+            table,
+            table_alias,
+            snapshot,
+            mysql,
+        )?;
+        // A union wider than the scan it replaces is not a win. Each arm
+        // is capped on its own, so two of them can still add up past the
+        // table; refuse there rather than materialise it.
+        if left.len() + right.len() > table.rows().len() {
+            return None;
+        }
+        // A row satisfying BOTH disjuncts appears in both arms, and the
+        // caller counts what it is given — so the duplicate has to go
+        // here. Hot rows are borrowed out of `table.rows()`, so identity
+        // is the address and the test is exact.
+        //
+        // A COLD row is decoded into a fresh allocation per arm, so two
+        // copies of one row have two addresses and no cheap test tells
+        // them apart. Rather than dedup something this cannot identify,
+        // decline the union and let the scan answer it — the same
+        // decision the range walk makes about cold locators.
+        let mut seen: BTreeSet<usize> = BTreeSet::new();
+        let mut out: Vec<Cow<'a, Row>> = Vec::with_capacity(left.len() + right.len());
+        for row in left.into_iter().chain(right) {
+            let Cow::Borrowed(hot) = row else {
+                return None;
+            };
+            if seen.insert(core::ptr::from_ref::<Row>(hot) as usize) {
+                out.push(Cow::Borrowed(hot));
+            }
+        }
+        return Some(out);
     }
     // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeks each literal
     // and unions the rows (PG's bitmap index scan) instead of a full scan
