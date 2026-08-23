@@ -40,6 +40,7 @@ thread_local! {
     static PREFETCH_HITS_BOOT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 mod commands;
+mod hba;
 mod mysqlwire;
 mod pgwire;
 mod replication;
@@ -1181,6 +1182,11 @@ mod env_knob_tests {
         assert_eq!(AUTOVACUUM_ENV, "SPG_AUTOVACUUM");
         assert_eq!(WAL_FULLFSYNC_ENV, "SPG_WAL_FULLFSYNC");
         assert_eq!(FREEZER_DISABLE_ENV, "SPG_FREEZER_DISABLE");
+        // v7.38.18 — the file that decides who may connect at all. It
+        // is read at STARTUP rather than at the first connection, so a
+        // malformed security file stops the server instead of failing
+        // later on whoever happens to dial in.
+        assert_eq!(super::HBA_FILE_ENV, "SPG_HBA_FILE");
 
         // Unset keeps each default, which is what every deployment that
         // sets nothing already has.
@@ -2215,6 +2221,14 @@ fn restore_engine(
         None => Engine::new(),
     };
     apply_database_collation(&mut engine);
+    // v7.38.18 — read the hba file NOW, not at the first connection.
+    //
+    // `hba_rules` is a `OnceLock`, so leaving it to the first client
+    // meant a malformed security file started the server happily and
+    // failed hours later, on whoever happened to connect. Measured:
+    // with a `kerberos` method the server came up and printed its
+    // listen address. A file that will not parse has to stop the start.
+    let _ = hba_rules();
     Ok((engine, manifest_wal_baseline))
 }
 
@@ -2249,6 +2263,33 @@ pub(crate) fn env_bool(raw: Option<&str>) -> Option<bool> {
     }
     None
 }
+
+/// v7.38.18 — the parsed `pg_hba.conf`, read once.
+///
+/// `SPG_HBA_FILE` names it. Absent or empty means no rules, which is
+/// what every deployment before this version had; a file that will not
+/// parse is a startup FAILURE rather than a warning, because a
+/// half-read security file is worse than none — a `reject` line that
+/// was skipped reads as permission.
+pub(crate) fn hba_rules() -> &'static hba::Hba {
+    static HBA: std::sync::OnceLock<hba::Hba> = std::sync::OnceLock::new();
+    HBA.get_or_init(|| {
+        let Some(path) = env::var(HBA_FILE_ENV).ok().filter(|p| !p.trim().is_empty()) else {
+            return hba::Hba::default();
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            eprintln!("spg-server: fatal: cannot read {HBA_FILE_ENV}={path}: {e}");
+            std::process::exit(1);
+        });
+        hba::Hba::parse(&text).unwrap_or_else(|e| {
+            eprintln!("spg-server: fatal: {path}: {e}");
+            std::process::exit(1);
+        })
+    })
+}
+
+/// See [`AUTOVACUUM_ENV`].
+pub(crate) const HBA_FILE_ENV: &str = "SPG_HBA_FILE";
 
 /// v7.38.18 (G5) — the switch names these decisions read.
 ///

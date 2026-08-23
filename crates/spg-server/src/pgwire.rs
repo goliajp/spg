@@ -1670,6 +1670,12 @@ fn run_pg_session(
     secure: bool,
     sock: Option<TcpStream>,
 ) -> std::io::Result<()> {
+    // v7.38.18 — the peer address, taken BEFORE `sock` is handed on.
+    // The hba rules need it and the socket does not survive that far.
+    let peer_ip = sock
+        .as_ref()
+        .and_then(|s| s.peer_addr().ok())
+        .map(|a| a.ip());
     // ---- Startup phase ----
     let (user, params) = read_startup(stream)?;
     // v7.39 (TLS) — SPG_REQUIRE_TLS refuses a plaintext connection. Reported
@@ -1824,7 +1830,62 @@ fn run_pg_session(
         .read()
         .is_ok_and(|e| e.users().iter().any(|(_, r)| r.has_credentials()));
 
-    let role = if has_users {
+    // v7.38.18 — `pg_hba.conf`-style rules, when a file names any.
+    //
+    // First match decides and a failure under it is a refusal, which is
+    // PostgreSQL's rule and the one that makes the file a security
+    // control: a `reject` line above a permissive one has to win. A
+    // connection that matches NOTHING is refused too, again as PG does.
+    //
+    // No file means no rules and the credential logic below is
+    // untouched, so nothing changes for a deployment that writes none.
+    let hba = crate::hba_rules();
+    let hba_method = if hba.is_empty() {
+        None
+    } else {
+        let peer = peer_ip.unwrap_or_else(|| std::net::IpAddr::from([127u8, 0, 0, 1]));
+        let db = params
+            .iter()
+            .find(|(k, _)| k == "database")
+            .map_or(user.as_str(), |(_, v)| v.as_str());
+        match hba.method_for(peer, db, &user, secure) {
+            Some(m) => Some(m),
+            None => {
+                send_error(
+                    stream,
+                    "28000",
+                    &format!(
+                        "no pg_hba.conf entry for host \"{peer}\", user \"{user}\", \
+                         database \"{db}\", no encryption"
+                    ),
+                )?;
+                return Ok(());
+            }
+        }
+    };
+    if hba_method == Some(crate::hba::Method::Reject) {
+        send_error(
+            stream,
+            "28000",
+            &format!("pg_hba.conf rejects connection for host, user \"{user}\""),
+        )?;
+        return Ok(());
+    }
+
+    let role = if hba_method == Some(crate::hba::Method::Trust) {
+        // `trust` means no credential is demanded, which is what the
+        // line says even when the user has one on file.
+        state
+            .engine
+            .read()
+            .ok()
+            .and_then(|e| {
+                e.users()
+                    .iter()
+                    .find_map(|(n, r)| (*n == user).then(|| r.role))
+            })
+            .unwrap_or(Role::Admin)
+    } else if has_users || hba_method.is_some() {
         // v4.8: prefer SCRAM-SHA-256 when the user has stored
         // secrets. Fall back to CleartextPassword for legacy users
         // (loaded from a pre-v4.8 snapshot, no SCRAM verifier on
@@ -1841,7 +1902,14 @@ fn run_pg_session(
                     .find_map(|(n, r)| (n == user).then(|| r.scram().is_some()))
             })
             .unwrap_or(false);
-        let outcome = if user_has_scram {
+        // A matching line names the method; without a file the old
+        // rule stands (SCRAM when the user has a verifier).
+        let want_scram = match hba_method {
+            Some(crate::hba::Method::Scram) => true,
+            Some(crate::hba::Method::Password) => false,
+            _ => user_has_scram,
+        };
+        let outcome = if want_scram {
             scram_auth(stream, state, &user, secure)?
         } else {
             cleartext_auth(stream, state, &user)?

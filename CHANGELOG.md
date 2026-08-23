@@ -40,6 +40,34 @@ the current build; this file is a release-organized view.
 
 ### Added
 
+- **`pg_hba.conf`-style host-based authentication.** `SPG_HBA_FILE`
+  names a file in PostgreSQL's own format:
+
+  ```
+  host    all   all   127.0.0.1/32   trust
+  host    all   all   all            scram-sha-256
+  ```
+
+  `local` / `host` / `hostssl` / `hostnossl`, `all` or a named database
+  and user, an address with a prefix length, and `trust` / `reject` /
+  `scram-sha-256` / `password`. **The first matching line decides and a
+  failure under it is a refusal, not a fallthrough** — which is
+  PostgreSQL's rule and the one that makes the file a security control.
+  A connection matching no line is refused with PostgreSQL's own `no
+  pg_hba.conf entry for host …` message.
+
+  A file that will not parse **refuses the start**, naming the line, and
+  it is read at startup rather than at the first connection. No file
+  means no rules and the credential logic is exactly what every
+  deployment has today.
+
+- **The `spanish`, `french` and `german` text-search configurations.**
+  Snowball's stemmer and stopword list for each, implemented from the
+  published algorithms and verified word for word against PostgreSQL
+  18.4 over **6,120 words** — 1,874 Spanish, 2,229 French, 2,017 German.
+  `to_tsvector`, `to_tsquery` and `ts_headline` all follow the
+  configuration.
+
 - **`pg_collation` answers for the collations SPG has** — 880 rows where
   it listed three. It had become what `pg_settings` was earlier in this
   same version: a column declared `COLLATE "en_US.utf8"` worked,
