@@ -279,7 +279,35 @@ instrument being asked to prove it could see what it claimed to check.
 
 ### Instruments
 
-Four gates gained the ability to see something they had claimed to check.
+Five gates gained the ability to see something they had claimed to check.
+
+- **The suite handed out a port another server was already serving**,
+  and the locale-collation panel spent its runs measuring one leg
+  against itself.
+
+  `TcpListener::bind` sets `SO_REUSEADDR`, and on macOS and the BSDs
+  that permits binding `127.0.0.1:P` while something else holds
+  `0.0.0.0:P` — which is how every server here binds. The free-port
+  probe therefore bound successfully and called an occupied port free.
+  The panel's second leg comes from a fresh roster, so the "already
+  ours" check could not help either: both legs landed on 25476 and its
+  `SPG_URI` pointed at the leg it was supposed to be compared against.
+
+  That is the same defect the panel was added to catch, one version
+  earlier, in the other direction — and it surfaced only because this
+  version also made the panel STATE which collation it expects. Without
+  that it would have gone on reporting `losses=0` for a comparison it
+  was not making. A connect settles what a bind could not: if anything
+  answers, someone is serving.
+
+- **A benchmark harness printed a table of dashes and called its
+  control clean.** Run `xbench/dropin-perf` with a `psql` that answers
+  but never prints a `Time:` line and every cell came back `-  -  -
+  unresolved  clean`, with `cells=8 candidate_slower=0
+  control_false_differences=0` under it, and exit 0. An empty timing
+  now ends the run. The first version of that guard was the same bug:
+  every call site is a command substitution, so its `exit` ended the
+  subshell and the run printed the dashes anyway.
 
 - **The perf sweep's control leg was decoration.** Its header has said
   since round 885 that the control's differing-cell count IS the run's
