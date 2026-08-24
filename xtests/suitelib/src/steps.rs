@@ -117,7 +117,30 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     } else {
         ("psql".to_string(), "127.0.0.1", "127.0.0.1")
     };
-    let pg_uri = format!("postgres://bench:bench@{host}:25432/bench");
+    // v7.38.19 — the PostgreSQL leg orders text the way the SPGS leg
+    // does, which it did not.
+    //
+    // The oracle container's `bench` database is `en_US.utf8`; the SPGS
+    // leg is `C`. For a text sort those are different work, and the
+    // sixty-four cells had been reporting WINS on the difference:
+    // `short text distinct` read 0.44x across the collations and 3.01x
+    // within one. `bench_c` is the same server, same box, same data,
+    // ordering bytes — which is also what `postgres:18-alpine` does for
+    // the customers this panel speaks for, musl carrying no locale data.
+    //
+    // Created here rather than assumed: a step that silently falls back
+    // to the mismatched database would put the flattering numbers back.
+    let pg_uri = format!("postgres://bench:bench@{host}:25432/bench_c");
+    let admin_uri = format!("postgres://bench:bench@{host}:25432/postgres");
+    let _ = sh(
+        root,
+        &format!(
+            "{psql} --no-psqlrc -X -q -tA '{admin_uri}' -c \"SELECT 1 FROM pg_database WHERE \
+             datname = 'bench_c'\" | grep -q 1 || {psql} --no-psqlrc -X -q -tA '{admin_uri}' \
+             -c \"CREATE DATABASE bench_c TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C' \
+             ENCODING 'UTF8'\""
+        ),
+    );
     let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sweep"));
     let _ = std::fs::remove_dir_all(&tmp);
     let mut roster = Roster::new();
@@ -203,7 +226,8 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
             root,
             &format!(
                 "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
-                 EXPECT_SPG_COLLATE=en_US.utf8 bash scripts/perf-endpoint-sweep.sh"
+                 EXPECT_SPG_COLLATE=en_US.utf8 ALLOW_COLLATION_MISMATCH=1 \
+                 bash scripts/perf-endpoint-sweep.sh"
             ),
         );
         roster2.reap_all();

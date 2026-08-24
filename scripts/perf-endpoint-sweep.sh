@@ -96,8 +96,17 @@ EXPECT_SPG_COLLATE="${EXPECT_SPG_COLLATE:-C}"
 # whose failure is indistinguishable from a different failure.
 leg_collation() {
   local out rc
+  # v7.38.19 — `WHERE datname = current_database()`, not `LIMIT 1`.
+  #
+  # `LIMIT 1` returns an ARBITRARY row of `pg_database` — whichever the
+  # scan reaches first — so it answered for a database nobody was
+  # connected to. On the SPGS leg, which has one, it was right by
+  # accident. On the PostgreSQL leg, which has several, it reported
+  # `en_US.utf8` for a connection to a `C` database and the collation
+  # check refused a run that was correctly configured.
   out="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" \
-        -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>&1)" && rc=0 || rc=$?
+        -c 'SELECT datcollate FROM pg_database WHERE datname = current_database()' 2>&1)" \
+        && rc=0 || rc=$?
   if [[ "${rc}" -ne 0 ]]; then
     echo "fatal: the leg at $1 would not answer what collation it serves." >&2
     echo "       psql exited ${rc}: ${out}" >&2
@@ -109,6 +118,34 @@ leg_collation() {
 spg_coll="$(leg_collation "${SPG_URI}")"
 pg_coll="$(leg_collation "${PG_URI}")"
 echo "leg SPGS collation: ${spg_coll:-<unknown>}   leg PG18 collation: ${pg_coll:-<unknown>}"
+# v7.38.19 — the two legs must ORDER TEXT THE SAME WAY, or the text
+# cells are not a comparison.
+#
+# The sweep's SPGS leg runs under `C` and its PostgreSQL leg under the
+# oracle container's `en_US.utf8`. For a text sort those are different
+# work: one orders bytes, the other collates. Sixty-four cells reported
+# no losses on that footing, and two of them reported WINS:
+#
+#     cell                        SPG(C) vs PG(locale)   SPG(C) vs PG(C)
+#     short text distinct              0.44x                 3.01x
+#     long text distinct               0.88x                 2.86x
+#
+# "We are twice as fast" and "we are three times slower" about the same
+# query, and the difference is which question the other leg was
+# answering.
+#
+# `ALLOW_COLLATION_MISMATCH=1` is for the ONE panel that compares across
+# collations on purpose — the locale panel, whose whole question is what
+# declaring one costs. Everywhere else a mismatch is a broken yardstick.
+ALLOW_COLLATION_MISMATCH="${ALLOW_COLLATION_MISMATCH:-0}"
+if [[ "${ALLOW_COLLATION_MISMATCH}" != "1" && "${spg_coll}" != "${pg_coll}" ]]; then
+  echo "fatal: the legs collate differently — SPGS ${spg_coll:-<unknown>}, PG18 ${pg_coll:-<unknown>}." >&2
+  echo "       A text sort under one is not the same work as under the other," >&2
+  echo "       so the text cells would not be comparing anything. Point both" >&2
+  echo "       legs at the same collation, or pass ALLOW_COLLATION_MISMATCH=1" >&2
+  echo "       if crossing them IS the question." >&2
+  exit 2
+fi
 if [[ "${spg_coll}" != "${EXPECT_SPG_COLLATE}" ]]; then
   echo "fatal: the SPGS leg serves collation ${spg_coll:-<unknown>}, expected ${EXPECT_SPG_COLLATE}." >&2
   echo "       Every cell's history was measured under ${EXPECT_SPG_COLLATE}; a leg serving" >&2
