@@ -10698,6 +10698,7 @@ fn norm_hash_value<H: core::hash::Hasher>(v: &Value<'static>, h: &mut H) {
             months,
             days,
             micros,
+            kind,
         } => {
             h.write_u8(TAG_INTERVAL);
             h.write_i32(*months);
@@ -11134,6 +11135,7 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
             months,
             days,
             micros,
+            kind,
         } => {
             let total = i128::from(*months) * 30 * 86_400_000_000
                 + i128::from(*days) * 86_400_000_000
@@ -12347,6 +12349,7 @@ fn generate_series_timestamps(
             months,
             days,
             micros,
+            kind,
         } => (*months, *days, *micros),
         _ => unreachable!("caller guards step.is_interval"),
     };
@@ -12385,6 +12388,7 @@ fn generate_series_timestamps(
                 months,
                 days,
                 micros,
+                kind: spg_storage::IntervalKind::Finite,
             },
         )
         .map_err(EngineError::Eval)?;

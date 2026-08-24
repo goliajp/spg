@@ -396,6 +396,7 @@ mod e2e_intersect_except;
 mod e2e_interval_array_round40;
 mod e2e_interval_component_arith;
 mod e2e_interval_expr_round350;
+mod e2e_interval_infinity;
 mod e2e_interval_justify;
 mod e2e_interval_literal_arg_round621;
 mod e2e_interval_qualifier_round102;

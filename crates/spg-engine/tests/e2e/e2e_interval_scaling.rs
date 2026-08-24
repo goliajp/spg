@@ -14,6 +14,7 @@ fn interval(e: &mut Engine, sql: &str) -> (i32, i32, i64) {
         months,
         days,
         micros,
+        kind,
     } = rows[0].values[0]
     else {
         panic!("expected Interval, got {:?}", rows[0].values[0]);

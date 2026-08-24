@@ -2098,13 +2098,24 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Interval { months, days, micros } => {
+                // v7.38.19 — an infinity is already justified, and the
+                // fields it carries are the extremes, so the arithmetic
+                // below would overflow on a value PostgreSQL hands back
+                // unchanged.
+                Value::Interval { kind, .. } if !kind.is_finite() => Ok(Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                    kind: *kind,
+                }),
+                Value::Interval { months, days, micros, kind } => {
                     let extra_months: i32 = days.div_euclid(30);
                     let leftover_days: i32 = days.rem_euclid(30);
                     Ok(Value::Interval {
                         months: months + extra_months,
                         days: leftover_days,
                         micros: *micros,
+                        kind: *kind,
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
@@ -2128,7 +2139,17 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Interval { months, days, micros } => {
+                // v7.38.19 — an infinity is already justified, and the
+                // fields it carries are the extremes, so the arithmetic
+                // below would overflow on a value PostgreSQL hands back
+                // unchanged.
+                Value::Interval { kind, .. } if !kind.is_finite() => Ok(Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                    kind: *kind,
+                }),
+                Value::Interval { months, days, micros, kind } => {
                     const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
                     let extra_days_i64 = micros.div_euclid(DAY_US);
                     let leftover_micros = micros.rem_euclid(DAY_US);
@@ -2138,6 +2159,7 @@ fn apply_function_dispatch(
                         months: *months,
                         days: days + extra_days,
                         micros: leftover_micros,
+                        kind: *kind,
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
@@ -2161,7 +2183,17 @@ fn apply_function_dispatch(
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
-                Value::Interval { months, days, micros } => {
+                // v7.38.19 — an infinity is already justified, and the
+                // fields it carries are the extremes, so the arithmetic
+                // below would overflow on a value PostgreSQL hands back
+                // unchanged.
+                Value::Interval { kind, .. } if !kind.is_finite() => Ok(Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                    kind: *kind,
+                }),
+                Value::Interval { months, days, micros, kind } => {
                     const DAY_US: i64 = 24 * 60 * 60 * 1_000_000;
                     let extra_days_i64 = micros.div_euclid(DAY_US);
                     let leftover_micros = micros.rem_euclid(DAY_US);
@@ -2174,6 +2206,7 @@ fn apply_function_dispatch(
                         months: months + extra_months,
                         days: leftover_days,
                         micros: leftover_micros,
+                        kind: *kind,
                     })
                 }
                 other => Err(EvalError::TypeMismatch {
@@ -7020,7 +7053,7 @@ fn apply_function_dispatch(
             // interval for the stride argument, so accept both a real
             // Interval value and a Text literal.
             let (stride_months, stride_days, stride_micros) = match &args[0] {
-                Value::Interval { months, days, micros } => (*months, *days, *micros),
+                Value::Interval { months, days, micros, kind } => (*months, *days, *micros),
                 Value::Text(s) => match spg_sql::parser::parse_interval_text(s) {
                     Some(parts) => parts,
                     None => {
@@ -7932,7 +7965,10 @@ fn apply_function_dispatch(
                 Value::Timestamp(t) => {
                     Ok(Value::Bool(*t != i64::MAX && *t != i64::MIN))
                 }
-                Value::Interval { .. } => Ok(Value::Bool(true)),
+                // v7.38.19 — and an interval has the same two, which
+                // this arm answered `true` for because until now it had
+                // none.
+                Value::Interval { kind, .. } => Ok(Value::Bool(kind.is_finite())),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "isfinite() needs date/timestamp/interval, got {}",
@@ -8216,6 +8252,7 @@ fn apply_function_dispatch(
                 months: total_months,
                 days: total_days,
                 micros,
+                kind: spg_storage::IntervalKind::Finite,
             })
         }
         // v7.37.17 (17.6 siblings) — PG 16+ `date_add(ts, interval)`
@@ -8256,7 +8293,7 @@ fn apply_function_dispatch(
                 _ => None,
             };
             match (base, &args[1]) {
-                (Some(t), Value::Interval { months, days, micros }) => {
+                (Some(t), Value::Interval { months, days, micros, kind }) => {
                     let out = crate::eval::add_interval_to_micros(
                         t,
                         i64::from(*months),
@@ -8320,6 +8357,7 @@ fn apply_function_dispatch(
                     months,
                     days,
                     micros,
+                    kind,
                 } => (
                     crate::eval::add_interval_to_micros(
                         base,
@@ -8362,7 +8400,7 @@ fn apply_function_dispatch(
                 _ => None,
             };
             match (base, &args[1]) {
-                (Some(t), Value::Interval { months, days, micros }) => {
+                (Some(t), Value::Interval { months, days, micros, kind }) => {
                     let out = crate::eval::add_interval_to_micros(
                         t,
                         -i64::from(*months),
@@ -11066,11 +11104,16 @@ fn apply_function_dispatch(
                 0 => 0,
                 1 => match &args[0] {
                     Value::Null => return Ok(Value::Null),
-                    Value::Interval { months, days, micros } => {
+                    Value::Interval { months, days, micros, kind } => {
                         // Months are calendar-relative; PG's own shift is
                         // applied to a millisecond clock, so approximate the
                         // month and day parts the same way its interval →
                         // µs conversion does.
+                        // v7.38.19 — an infinite interval has no finite
+                        // shift; the caller refuses it before reaching
+                        // here, and `kind` is named to say the field was
+                        // considered rather than skipped.
+                        let _ = kind;
                         micros
                             .saturating_add(i64::from(*days) * 86_400_000_000)
                             .saturating_add(i64::from(*months) * 30 * 86_400_000_000)

@@ -636,6 +636,87 @@ pub enum TsQueryAst {
     },
 }
 
+/// v7.38.19 — whether an `interval` is finite, and if not, which way.
+///
+/// PostgreSQL has no NaN interval — measured, not assumed: `'nan'::interval`
+/// is a syntax error on 18.4 while `'infinity'` and `'-infinity'` parse —
+/// so this carries three states where `NumericKind` carries four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum IntervalKind {
+    #[default]
+    Finite,
+    NegInf,
+    PosInf,
+}
+
+impl IntervalKind {
+    /// PostgreSQL's own representation of the two infinities, measured
+    /// off the wire rather than read out of its source.
+    ///
+    /// ```text
+    /// COPY (SELECT 'infinity'::interval)  TO STDOUT (FORMAT binary)
+    ///   … 7fffffffffffffff 7fffffff 7fffffff
+    /// COPY (SELECT '-infinity'::interval) TO STDOUT (FORMAT binary)
+    ///   … 8000000000000000 80000000 80000000
+    /// COPY (SELECT '1 day'::interval)     TO STDOUT (FORMAT binary)
+    ///   … 0000000000000000 00000001 00000000
+    /// ```
+    ///
+    /// All three fields at their extreme, which is why SPG can carry an
+    /// explicit `kind` in memory -- so the compiler names every site
+    /// that has to decide what infinity means there -- and still write
+    /// sixteen bytes on disk and on the wire. No finite interval reaches
+    /// the triple: PostgreSQL reserves it, so no value PostgreSQL ever
+    /// produced holds it either, and a file written before this version
+    /// cannot contain one.
+    #[must_use]
+    pub const fn from_fields(months: i32, days: i32, micros: i64) -> Self {
+        if micros == i64::MAX && days == i32::MAX && months == i32::MAX {
+            Self::PosInf
+        } else if micros == i64::MIN && days == i32::MIN && months == i32::MIN {
+            Self::NegInf
+        } else {
+            Self::Finite
+        }
+    }
+
+    /// The three fields this kind is written as. `Finite` hands back
+    /// what it was given.
+    #[must_use]
+    pub const fn to_fields(self, months: i32, days: i32, micros: i64) -> (i32, i32, i64) {
+        match self {
+            Self::Finite => (months, days, micros),
+            Self::PosInf => (i32::MAX, i32::MAX, i64::MAX),
+            Self::NegInf => (i32::MIN, i32::MIN, i64::MIN),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_finite(self) -> bool {
+        matches!(self, Self::Finite)
+    }
+
+    /// Where this kind sits in the total order.
+    ///
+    /// v7.38.19 — PostgreSQL 18.4, measured: `'-infinity' < '-100 years'`
+    /// and `'infinity' > '100 years'` are both true, and `'infinity' =
+    /// 'infinity'` is true. So the rank decides first and the numbers
+    /// only speak between two finite values.
+    ///
+    /// Every comparison of two intervals asks THIS -- the ordering
+    /// comparator, the value comparator and the binary operators each
+    /// had their own copy of the span arithmetic, and three copies of a
+    /// question is how they come to disagree.
+    #[must_use]
+    pub const fn rank(self) -> i8 {
+        match self {
+            Self::NegInf => -1,
+            Self::Finite => 0,
+            Self::PosInf => 1,
+        }
+    }
+}
+
 /// A row-cell value, including SQL `NULL`. `Float` uses `f64`; NaN compares
 /// non-equal to itself (PG behaviour) — `PartialEq` is derived so callers
 /// must opt into NaN-aware comparison if they need stronger guarantees.
@@ -720,6 +801,21 @@ pub enum Value<'arena> {
         months: i32,
         days: i32,
         micros: i64,
+        /// v7.38.19 — finite, or one of the two infinities.
+        ///
+        /// PostgreSQL 17 gave `interval` an infinite value and SPG had
+        /// none, so `'infinity'::interval` was refused outright and the
+        /// subtraction error the ledger described was one symptom of
+        /// that, not the defect.
+        ///
+        /// A field beside the numbers rather than a sentinel inside
+        /// them, which is the shape `Value::Numeric` already uses for
+        /// exactly this question — and a field on THIS variant rather
+        /// than a new one, so the compiler names every site that has to
+        /// decide what infinity means there. A new variant would have
+        /// compiled everywhere on the first try and let a `_` arm
+        /// answer for it at one of a hundred and five of them.
+        kind: IntervalKind,
     },
     /// v4.9 `JSON` — raw JSON text. No structural validation
     /// happens at the storage layer; whatever the parser hands us
@@ -1031,6 +1127,8 @@ pub struct IntervalSpan {
     pub months: i32,
     pub days: i32,
     pub micros: i64,
+    /// v7.38.19 — see [`IntervalKind`].
+    pub kind: IntervalKind,
 }
 
 impl<'arena> Value<'arena> {
@@ -1193,10 +1291,12 @@ impl<'arena> Value<'arena> {
                 months,
                 days,
                 micros,
+                kind,
             } => Value::Interval {
                 months,
                 days,
                 micros,
+                kind,
             },
             Value::Json(s) => Value::Json(Cow::Owned(s.into_owned())),
             Value::Bytes(b) => Value::Bytes(Cow::Owned(b.into_owned())),

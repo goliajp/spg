@@ -2205,6 +2205,7 @@ fn acc_cell(a: &mut NumAcc, v: &Value<'_>) -> Result<(), EvalError> {
             months,
             days,
             micros,
+            kind,
         } => {
             a.sum_iv_months += i64::from(*months);
             a.sum_iv_days += i64::from(*days);
@@ -5842,6 +5843,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                     months: st.num.sum_iv_months as i32,
                     days: st.num.sum_iv_days as i32,
                     micros: st.num.sum_iv_micros as i64,
+                    kind: spg_storage::IntervalKind::Finite,
                 }
             } else if st.num.use_money {
                 Value::Money(st.num.sum_money as i64)
@@ -5909,6 +5911,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                     months: month_out as i32,
                     days: (day_out + days_from_month) as i32,
                     micros: micros as i64,
+                    kind: spg_storage::IntervalKind::Finite,
                 }
             } else if st.num.use_money {
                 // PG has no avg(money); we accept it as a sensible superset —
@@ -6555,6 +6558,7 @@ fn finalize_ordered_set(
                             months,
                             days,
                             micros,
+                            kind,
                         } => (f64::from(*months), f64::from(*days), *micros as f64),
                         _ => unreachable!(),
                     }
@@ -6578,6 +6582,7 @@ fn finalize_ordered_set(
                         months: (lm as i64 + m_i) as i32,
                         days: (ld as i64 + d_i) as i32,
                         micros: lu as i64 + libm::round(us) as i64,
+                        kind: spg_storage::IntervalKind::Finite,
                     }
                 };
                 if let Some(fracs) = percentile_fraction_array(fraction) {
@@ -7546,6 +7551,7 @@ fn encode_one_raw(out: &mut String, v: &Value) {
             months,
             days,
             micros,
+            kind,
         } => {
             out.push('i');
             out.push_str(&months.to_string());

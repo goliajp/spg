@@ -2145,9 +2145,14 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
                 months,
                 days,
                 micros,
+                kind,
             },
             DataType::Interval,
         ) => {
+            // v7.38.19 — an infinity writes the same sixteen bytes
+            // PostgreSQL writes for it, so the body stays fixed-width
+            // and no file version moves. See `IntervalKind::to_fields`.
+            let (months, days, micros) = kind.to_fields(*months, *days, *micros);
             out.extend_from_slice(&micros.to_le_bytes());
             out.extend_from_slice(&days.to_le_bytes());
             out.extend_from_slice(&months.to_le_bytes());
@@ -2784,7 +2789,9 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
             months,
             days,
             micros,
+            kind,
         } => {
+            let (months, days, micros) = kind.to_fields(*months, *days, *micros);
             out.push(30);
             out.extend_from_slice(&micros.to_le_bytes());
             out.extend_from_slice(&days.to_le_bytes());
@@ -3862,6 +3869,7 @@ impl<'a> Cursor<'a> {
                     months,
                     days,
                     micros,
+                    kind: crate::IntervalKind::from_fields(months, days, micros),
                 })
             }
             DataType::Json => Ok(Value::Json(Cow::Owned(self.read_str()?))),
@@ -3940,6 +3948,7 @@ impl<'a> Cursor<'a> {
                                 months,
                                 days,
                                 micros,
+                                kind: crate::IntervalKind::from_fields(months, days, micros),
                             }));
                         }
                         1 => items.push(None),
@@ -4750,6 +4759,7 @@ impl<'a> Cursor<'a> {
                     months,
                     days,
                     micros,
+                    kind: crate::IntervalKind::from_fields(months, days, micros),
                 })
             }
             // v7.37.5 β-P4: tag 31 — INTERVAL[] (schema-less). Body
@@ -4767,6 +4777,7 @@ impl<'a> Cursor<'a> {
                                 months,
                                 days,
                                 micros,
+                                kind: crate::IntervalKind::from_fields(months, days, micros),
                             }));
                         }
                         1 => items.push(None),

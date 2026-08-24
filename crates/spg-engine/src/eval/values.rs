@@ -100,17 +100,22 @@ pub(super) fn value_cmp_for_min_max(a: &Value, b: &Value, mysql: bool) -> core::
                 months: am,
                 days: ad,
                 micros: au,
+                kind: akind,
             },
             Value::Interval {
                 months: bm,
                 days: bd,
                 micros: bu,
+                kind: bkind,
             },
         ) => {
             let total = |m: i32, d: i32, u: i64| -> i128 {
                 i128::from(m) * 30 * 86_400_000_000 + i128::from(d) * 86_400_000_000 + i128::from(u)
             };
-            total(*am, *ad, *au).cmp(&total(*bm, *bd, *bu))
+            akind
+                .rank()
+                .cmp(&bkind.rank())
+                .then_with(|| total(*am, *ad, *au).cmp(&total(*bm, *bd, *bu)))
         }
         // v7.39 (round 511) — a tid orders by block then offset. GREATEST /
         // LEAST share this comparator with min/max's, and both used to reach
@@ -388,7 +393,11 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
             months,
             days,
             micros,
-        } => crate::eval::format_interval_styled(*months, *days, *micros, style),
+            kind,
+        } if kind.is_finite() => {
+            crate::eval::format_interval_styled(*months, *days, *micros, style)
+        }
+        Value::Interval { kind, .. } => crate::eval::format_interval_kinded(0, 0, 0, *kind),
         Value::Null => "NULL".into(),
         // v7.10.4 — BYTEA renders as PG hex form.
         // v7.39 (round 524) — unless the session asked for `escape`.
@@ -599,6 +608,7 @@ pub(crate) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
             months: s.months,
             days: s.days,
             micros: s.micros,
+            kind: s.kind,
         }),
         Value::UuidArray(items) => nth!(items, |u| Value::Uuid(*u)),
         Value::BytesArray(items) => nth!(items, |b| Value::Bytes(Cow::Owned(b.clone()))),
@@ -700,10 +710,12 @@ pub(super) fn array_rebuild(model: &Value<'_>, elems: &[Value<'static>]) -> Opti
                 months,
                 days,
                 micros,
+                kind,
             } => Some(spg_storage::IntervalSpan {
                 months: *months,
                 days: *days,
                 micros: *micros,
+                kind: *kind,
             }),
             _ => None,
         }),
@@ -848,10 +860,12 @@ pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'
                         months,
                         days,
                         micros,
+                        kind,
                     } => out.push(Some(spg_storage::IntervalSpan {
                         months: *months,
                         days: *days,
                         micros: *micros,
+                        kind: *kind,
                     })),
                     _ => return None,
                 }

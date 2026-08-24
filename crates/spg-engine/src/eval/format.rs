@@ -265,6 +265,26 @@ fn secs_body(abs_us: i64) -> String {
 /// - postgres_verbose — `@ ` + `years/mons/days/hours/mins/secs`
 ///   fields; when the interval compares below zero every field is
 ///   negated and ` ago` is appended; zero → `@ 0`.
+/// Render an interval that may be infinite.
+///
+/// v7.38.19 — PostgreSQL 18.4 renders the two infinities as the words
+/// `infinity` and `-infinity`, in every interval style, and reads them
+/// back (`'infinity'::text::interval` round-trips). `'inf'` is NOT
+/// accepted, which is the one place interval differs from float here.
+#[must_use]
+pub fn format_interval_kinded(
+    months: i32,
+    days: i32,
+    micros: i64,
+    kind: spg_storage::IntervalKind,
+) -> String {
+    match kind {
+        spg_storage::IntervalKind::PosInf => alloc::string::String::from("infinity"),
+        spg_storage::IntervalKind::NegInf => alloc::string::String::from("-infinity"),
+        spg_storage::IntervalKind::Finite => format_interval(months, days, micros),
+    }
+}
+
 pub fn format_interval_styled(months: i32, days: i32, micros: i64, style: &RenderStyle) -> String {
     match style.interval_style {
         IntervalStyleKind::Postgres => format_interval(months, days, micros),
@@ -433,7 +453,11 @@ pub fn format_interval_array_styled(
     style: &RenderStyle,
 ) -> String {
     array_styled(items, |iv| {
-        format_interval_styled(iv.months, iv.days, iv.micros, style)
+        if iv.kind.is_finite() {
+            format_interval_styled(iv.months, iv.days, iv.micros, style)
+        } else {
+            format_interval_kinded(0, 0, 0, iv.kind)
+        }
     })
 }
 
@@ -1854,9 +1878,16 @@ pub fn format_interval_array(items: &[Option<spg_storage::IntervalSpan>]) -> Str
         match item {
             None => out.push_str("NULL"),
             Some(span) => {
-                out.push('"');
-                out.push_str(&format_interval(span.months, span.days, span.micros));
-                out.push('"');
+                // v7.38.19 — an element can be infinite too, and the
+                // word carries no comma or space, so PostgreSQL prints
+                // it unquoted: `{infinity,"1 day"}`.
+                if span.kind.is_finite() {
+                    out.push('"');
+                    out.push_str(&format_interval(span.months, span.days, span.micros));
+                    out.push('"');
+                } else {
+                    out.push_str(&format_interval_kinded(0, 0, 0, span.kind));
+                }
             }
         }
     }

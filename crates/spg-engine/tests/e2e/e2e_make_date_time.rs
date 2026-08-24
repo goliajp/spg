@@ -53,6 +53,7 @@ fn make_interval_components() {
             months,
             days,
             micros,
+            kind,
         } => {
             assert_eq!(months, 14); // 12 + 2
             assert_eq!(days, 10); // 7 + 3
@@ -66,6 +67,7 @@ fn make_interval_components() {
             months: 0,
             days: 0,
             micros: 0,
+            kind,
         } => {}
         other => panic!("got {other:?}"),
     }

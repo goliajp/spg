@@ -279,7 +279,10 @@ fn value_to_wire(v: &Value) -> WireValue {
             months,
             days,
             micros,
-        } => WireValue::Text(spg_engine::eval::format_interval(*months, *days, *micros)),
+            kind,
+        } => WireValue::Text(spg_engine::eval::format_interval_kinded(
+            *months, *days, *micros, *kind,
+        )),
         // v7.10.4 — BYTEA goes on the wire as PG hex text
         // (`\x` + lowercase hex). RowDescription advertises OID 17
         // (`pg_type_oid` covers that), and PG text-mode clients

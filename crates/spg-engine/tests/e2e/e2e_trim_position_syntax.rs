@@ -66,6 +66,7 @@ fn numeric_operand_interval_scaling() {
             months,
             days,
             micros,
+            kind,
         } => (months, days, micros),
         other => panic!("expected Interval, got {other:?}"),
     };

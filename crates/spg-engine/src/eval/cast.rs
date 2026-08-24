@@ -545,6 +545,7 @@ pub fn cast_value_ref_in(
                 months: 0,
                 days: 0,
                 micros: us,
+                kind: spg_storage::IntervalKind::Finite,
             }),
             other => cast_to_interval(other),
         },
@@ -2062,10 +2063,12 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
             months,
             days,
             micros,
+            kind,
         } => Ok(Value::Interval {
             months,
             days,
             micros,
+            kind,
         }),
         Value::Text(s) => {
             let (months, days, micros) =
@@ -2079,6 +2082,10 @@ fn cast_to_interval(v: Value) -> Result<Value, EvalError> {
                 months,
                 days,
                 micros,
+                // v7.38.19 — the parser answers an infinity as the same
+                // three extreme fields PostgreSQL puts on the wire, so
+                // nothing here has to know the spelling.
+                kind: spg_storage::IntervalKind::from_fields(months, days, micros),
             })
         }
         other => Err(EvalError::TypeMismatch {

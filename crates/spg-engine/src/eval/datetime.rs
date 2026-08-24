@@ -129,6 +129,7 @@ pub(super) fn extract_field(
         months,
         days,
         micros,
+        kind,
     } = *v
     {
         let years = months / 12;
@@ -674,6 +675,7 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
             detail: "age() day count exceeds i32".into(),
         })?,
         micros,
+        kind: spg_storage::IntervalKind::Finite,
     })
 }
 
@@ -1216,6 +1218,7 @@ pub(super) fn date_trunc(
         months,
         days,
         micros,
+        kind,
     } = &args[1]
     {
         let unit_lc = unit.to_ascii_lowercase();
@@ -1266,6 +1269,7 @@ pub(super) fn date_trunc(
             months: mo,
             days: dd,
             micros: us,
+            kind: spg_storage::IntervalKind::Finite,
         });
     }
     // Both DATE and TIMESTAMP sources are accepted. DATE lifts to
@@ -1933,6 +1937,7 @@ pub(super) fn timezone_pg(
         months,
         days,
         micros,
+        kind,
     } = &args[0]
     {
         if *months != 0 || *days != 0 {

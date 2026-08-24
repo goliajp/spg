@@ -191,8 +191,30 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 months,
                 days,
                 micros,
+                kind,
             },
         ) => {
+            // v7.38.19 — negating an infinity gives the other one, and
+            // it must be answered BEFORE the arithmetic: the fields hold
+            // `i64::MIN` for `-infinity`, whose negation overflows, so
+            // the finite path answered "INTERVAL overflows on unary -"
+            // for a value PostgreSQL simply flips.
+            use spg_storage::IntervalKind as K;
+            match kind {
+                K::PosInf | K::NegInf => {
+                    return Ok(Value::Interval {
+                        months: 0,
+                        days: 0,
+                        micros: 0,
+                        kind: if kind == K::PosInf {
+                            K::NegInf
+                        } else {
+                            K::PosInf
+                        },
+                    });
+                }
+                K::Finite => {}
+            }
             let overflow = || EvalError::TypeMismatch {
                 detail: "INTERVAL overflows on unary -".into(),
             };
@@ -200,6 +222,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 months: months.checked_neg().ok_or_else(overflow)?,
                 days: days.checked_neg().ok_or_else(overflow)?,
                 micros: micros.checked_neg().ok_or_else(overflow)?,
+                kind: K::Finite,
             })
         }
         // v7.39 (round 238) — PG's wording: "operator does not exist: - text".
@@ -1745,6 +1768,7 @@ fn apply_binary_calendar(
                 months: 0,
                 days,
                 micros: delta % DAY_US,
+                kind: spg_storage::IntervalKind::Finite,
             }));
         }
         (Value::Time(a), Value::Time(b)) if op == BinOp::Sub => {
@@ -1755,6 +1779,7 @@ fn apply_binary_calendar(
                 months: 0,
                 days: 0,
                 micros: a - b,
+                kind: spg_storage::IntervalKind::Finite,
             }));
         }
         _ => {}
@@ -1860,10 +1885,23 @@ pub(crate) fn apply_binary_interval(
         months: rhs_months,
         days: rhs_days,
         micros: rhs_us,
+        kind,
     } = rhs
     else {
         unreachable!("rhs guaranteed to be Interval by the match above");
     };
+    // v7.38.19 — an infinity on either side decides the whole thing,
+    // and two of them that cancel is a refusal. Measured on 18.4:
+    //
+    //   'infinity'::interval - 'infinity'::interval  ERROR interval out of range
+    //   '2020-01-01'::timestamp + 'infinity'::interval        infinity
+    //   'infinity'::interval + '1 day'::interval              infinity
+    //
+    // The error is the indeterminate form, not an overflow -- PG gives
+    // the same wording for `* 0`.
+    if let Some(out) = infinite_interval_arith(lhs, kind, sign)? {
+        return Ok(Some(out));
+    }
     let signed_months = i64::from(*rhs_months) * sign;
     let signed_days = i64::from(*rhs_days) * sign;
     let signed_micros = rhs_us
@@ -1911,6 +1949,7 @@ pub(crate) fn apply_binary_interval(
             months: lhs_months,
             days: lhs_days,
             micros: lhs_us,
+            kind,
         } => {
             let new_months = i64::from(*lhs_months)
                 .checked_add(signed_months)
@@ -1943,6 +1982,7 @@ pub(crate) fn apply_binary_interval(
                 months: new_months,
                 days: new_days,
                 micros: raw_micros,
+                kind: spg_storage::IntervalKind::Finite,
             }))
         }
         _ => Err(EvalError::TypeMismatch {
@@ -1954,6 +1994,56 @@ pub(crate) fn apply_binary_interval(
     }
 }
 
+/// The answer when an infinity takes part in `±` on an interval, or
+/// `None` when both sides are finite and the ordinary path applies.
+///
+/// v7.38.19 — `sign` is `-1` for subtraction, which is what turns
+/// `inf - inf` into the cancelling pair PostgreSQL refuses.
+fn infinite_interval_arith(
+    lhs: &Value<'static>,
+    rhs_kind: &spg_storage::IntervalKind,
+    sign: i64,
+) -> Result<Option<Value<'static>>, EvalError> {
+    use spg_storage::IntervalKind as K;
+    let effective = match (rhs_kind, sign) {
+        (K::Finite, _) => K::Finite,
+        (K::PosInf, s) if s < 0 => K::NegInf,
+        (K::NegInf, s) if s < 0 => K::PosInf,
+        (k, _) => *k,
+    };
+    let lhs_kind = match lhs {
+        Value::Interval { kind, .. } => *kind,
+        _ => K::Finite,
+    };
+    if effective.is_finite() && lhs_kind.is_finite() {
+        return Ok(None);
+    }
+    // Two infinities that point opposite ways have no answer.
+    if !effective.is_finite() && !lhs_kind.is_finite() && effective != lhs_kind {
+        return Err(EvalError::TypeMismatch {
+            detail: "interval out of range".into(),
+        });
+    }
+    let out = if effective.is_finite() {
+        lhs_kind
+    } else {
+        effective
+    };
+    Ok(Some(match lhs {
+        // A TIMESTAMP shifted by an infinite interval IS the infinite
+        // timestamp, which this build already has: the sentinel is
+        // `i64::MAX` / `i64::MIN` micros, the same two `isfinite` reads.
+        Value::Timestamp(_) => Value::Timestamp(if out == K::PosInf { i64::MAX } else { i64::MIN }),
+        Value::Date(_) => Value::Timestamp(if out == K::PosInf { i64::MAX } else { i64::MIN }),
+        _ => Value::Interval {
+            months: 0,
+            days: 0,
+            micros: 0,
+            kind: out,
+        },
+    }))
+}
+
 /// Scale an interval by a float factor per PG's `interval_mul`
 /// (timestamp.c): months and days truncate toward zero; the
 /// fractional month remainder spills into days at 30 days/month and
@@ -1963,6 +2053,7 @@ fn scale_interval(iv: &Value<'static>, factor: f64) -> Result<Value<'static>, Ev
         months,
         days,
         micros,
+        kind,
     } = iv
     else {
         unreachable!("caller guarantees Interval");
@@ -1970,6 +2061,29 @@ fn scale_interval(iv: &Value<'static>, factor: f64) -> Result<Value<'static>, Ev
     if !factor.is_finite() {
         return Err(EvalError::TypeMismatch {
             detail: "INTERVAL scale factor must be finite".into(),
+        });
+    }
+    // v7.38.19 — scaling an infinity, measured on PostgreSQL 18.4:
+    // `'infinity'::interval * 2` is `infinity`, `* -1` is `-infinity`,
+    // and `* 0` is *interval out of range* -- the same refusal an
+    // indeterminate form gets everywhere else in this type.
+    if !kind.is_finite() {
+        if factor == 0.0 {
+            return Err(EvalError::TypeMismatch {
+                detail: "interval out of range".into(),
+            });
+        }
+        let flip = factor < 0.0;
+        let out = match (kind, flip) {
+            (spg_storage::IntervalKind::PosInf, false)
+            | (spg_storage::IntervalKind::NegInf, true) => spg_storage::IntervalKind::PosInf,
+            _ => spg_storage::IntervalKind::NegInf,
+        };
+        return Ok(Value::Interval {
+            months: 0,
+            days: 0,
+            micros: 0,
+            kind: out,
         });
     }
     let m = f64::from(*months) * factor;
@@ -1990,6 +2104,7 @@ fn scale_interval(iv: &Value<'static>, factor: f64) -> Result<Value<'static>, Ev
         months: new_months as i32,
         days: new_days as i32,
         micros: libm::rint(new_micros) as i64,
+        kind: spg_storage::IntervalKind::Finite,
     })
 }
 
@@ -3392,6 +3507,7 @@ fn mysql_date_plus_interval(op: BinOp, l: &Value<'_>, r: &Value<'_>) -> Option<V
             months,
             days,
             micros,
+            kind,
         } => Some((*months, *days, *micros)),
         _ => None,
     };
@@ -5947,17 +6063,22 @@ pub(super) fn compare(
                 months: am,
                 days: ad,
                 micros: au,
+                kind: akind,
             },
             Value::Interval {
                 months: bm,
                 days: bd,
                 micros: bu,
+                kind: bkind,
             },
         ) => {
             let span = |m: i32, d: i32, u: i64| -> i128 {
                 (i128::from(m) * 30 + i128::from(d)) * 86_400_000_000 + i128::from(u)
             };
-            span(*am, *ad, *au).cmp(&span(*bm, *bd, *bu))
+            akind
+                .rank()
+                .cmp(&bkind.rank())
+                .then_with(|| span(*am, *ad, *au).cmp(&span(*bm, *bd, *bu)))
         }
         // PG-style implicit coercion: comparing a DATE / TIMESTAMP
         // column against a text literal lifts the literal into the
@@ -6624,6 +6745,7 @@ mod tests {
             months: 0,
             days: 7,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         };
         let v = apply_binary_interval(BinOp::Add, &lhs, &rhs)
             .unwrap()
@@ -6641,6 +6763,7 @@ mod tests {
             months: 0,
             days: 0,
             micros: 3_600_000_000,
+            kind: spg_storage::IntervalKind::Finite,
         };
         let v = apply_binary_interval(BinOp::Add, &lhs, &rhs)
             .unwrap()

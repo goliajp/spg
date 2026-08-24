@@ -24,6 +24,7 @@ fn interval_text_cast_via_double_colon() {
         months,
         days,
         micros,
+        kind,
     } = r[0][0]
     else {
         panic!("expected Interval, got {:?}", r[0][0]);
@@ -68,6 +69,7 @@ fn interval_with_compound_units() {
         months,
         days,
         micros,
+        kind,
     } = r[0][0]
     else {
         panic!();
@@ -86,6 +88,7 @@ fn interval_with_months_and_years() {
         months,
         days,
         micros,
+        kind,
     } = r[0][0]
     else {
         panic!();
@@ -103,6 +106,7 @@ fn interval_negative_value() {
         months,
         days,
         micros,
+        kind,
     } = r[0][0]
     else {
         panic!();
