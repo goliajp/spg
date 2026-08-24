@@ -168,6 +168,101 @@ pub(crate) fn numeric_bignum_cmp(a: &Value, b: &Value) -> Option<core::cmp::Orde
 /// paths where a fallback currently answers. If this is converged, the
 /// shape is a shared `Option<Ordering>` core with each caller keeping
 /// its own fallback — not one function with the union of the arms.
+/// Order two strings, deciding on the first differing byte in the loop
+/// rather than in a call to `memcmp`.
+///
+/// v7.38.19 — a 400,000-row sort over 192-byte distinct text spent 43%
+/// of its working samples inside `_platform_memcmp` (609 leaf samples
+/// plus 258 in its stub), which is what `str`'s own `Ord` reaches. It
+/// is not that comparing the bytes is expensive: two unrelated strings
+/// differ in their FIRST byte fifteen times out of sixteen, so the
+/// comparison is over immediately and the call around it is the whole
+/// cost, ~7.4 M times.
+///
+/// The bounded loop answers those in the caller. The tail hands the
+/// rare equal-prefix pair back to `[u8]`'s comparison, which re-reads
+/// the sixteen bytes -- correct, and rare enough not to matter.
+#[inline]
+pub(crate) fn str_cmp_prefix_first(a: &str, b: &str) -> core::cmp::Ordering {
+    let (x, y) = (a.as_bytes(), b.as_bytes());
+    for (p, q) in x.iter().zip(y.iter()).take(16) {
+        if p != q {
+            return p.cmp(q);
+        }
+    }
+    x.cmp(y)
+}
+
+#[cfg(test)]
+mod str_cmp_prefix_first_tests {
+    use super::str_cmp_prefix_first;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    /// The only property that matters: it answers what `str` answers.
+    /// Checked over pairs that exercise every branch -- decided inside
+    /// the bounded loop, decided by the length after an equal prefix,
+    /// and equal.
+    #[test]
+    fn it_agrees_with_str_ord_everywhere() {
+        let mut corpus: Vec<String> = Vec::new();
+        for s in [
+            "",
+            "a",
+            "b",
+            "ab",
+            "aB",
+            "A",
+            "_",
+            "~",
+            "\u{7f}",
+            "é",
+            "日本語",
+            // Equal for longer than the loop looks, then differing --
+            // the case the tail exists for.
+            "0123456789abcdefX",
+            "0123456789abcdefY",
+            "0123456789abcdef",
+            "0123456789abcdefXZ",
+        ] {
+            corpus.push(String::from(s));
+        }
+        // And text shaped like the fixture the change was measured on.
+        for g in 0..40u32 {
+            corpus.push(format!("{g:08}-{}", "q".repeat(180)));
+        }
+        for a in &corpus {
+            for b in &corpus {
+                assert_eq!(
+                    str_cmp_prefix_first(a, b),
+                    a.as_str().cmp(b.as_str()),
+                    "disagreed on {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    /// A byte past the loop's window still decides, and the byte that
+    /// decides is compared as a BYTE -- `'~'` (0x7e) is above `'_'`
+    /// (0x5f), which a char-wise or case-folding comparison would not
+    /// give.
+    #[test]
+    fn the_window_does_not_truncate_the_answer() {
+        let a = "0123456789abcdefg_";
+        let b = "0123456789abcdefg~";
+        assert_eq!(str_cmp_prefix_first(a, b), a.cmp(b));
+        assert!(str_cmp_prefix_first(a, b).is_lt());
+        let long_a = "z".repeat(300);
+        let mut long_b = long_a.clone();
+        long_b.push('a');
+        assert_eq!(
+            str_cmp_prefix_first(&long_a, &long_b),
+            long_a.as_str().cmp(long_b.as_str())
+        );
+    }
+}
+
 pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     // v7.39 (round 485) — a same-variant scalar answers here, ahead of the
