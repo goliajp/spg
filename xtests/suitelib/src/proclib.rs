@@ -56,6 +56,30 @@ pub struct Roster {
     procs: Vec<Proc>,
 }
 
+/// v7.38.19 — free means "nothing is serving it", which a bind test
+/// alone does not establish.
+///
+/// Rust's `TcpListener::bind` sets `SO_REUSEADDR`, and on macOS and the
+/// BSDs that permits binding `127.0.0.1:P` while another process holds
+/// `0.0.0.0:P` — which is how every server here binds. So the probe
+/// bound successfully and called an occupied port free.
+///
+/// It cost the locale-collation panel, whose second server comes from a
+/// FRESH roster, so the "already ours" check above could not help
+/// either: both legs landed on 25476, the panel's `SPG_URI` pointed at
+/// the leg it was meant to be compared AGAINST, and it measured one
+/// server against itself for the whole run. That is the same defect the
+/// panel exists to catch, one version earlier, in the other direction.
+///
+/// A connect settles it. If anything answers, someone is serving.
+fn port_is_free(p: u16) -> bool {
+    if std::net::TcpListener::bind(("127.0.0.1", p)).is_err() {
+        return false;
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_err()
+}
+
 impl Roster {
     #[must_use]
     pub fn new() -> Self {
@@ -78,9 +102,10 @@ impl Roster {
             if self.procs.iter().any(|x| x.port == p) {
                 continue;
             }
-            if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
-                return Ok(p);
+            if !port_is_free(p) {
+                continue;
             }
+            return Ok(p);
         }
         Err(format!(
             "no free port in the suite range {PORT_RANGE:?} — earlier runs leaked; run scripts/janitor.sh"
@@ -519,6 +544,43 @@ mod tests {
         let r = Roster::new();
         let p = r.free_port().expect("a free port");
         assert!(PORT_RANGE.contains(&p), "{p}");
+    }
+
+    /// v7.38.19 — a port ANOTHER process is serving on the wildcard
+    /// address must not be handed out.
+    ///
+    /// Rust's `TcpListener::bind` sets `SO_REUSEADDR`, and on macOS and
+    /// the BSDs that permits binding `127.0.0.1:P` while something else
+    /// holds `0.0.0.0:P`. The probe therefore called an occupied port
+    /// free.
+    ///
+    /// It cost the locale-collation panel, which spawns its second
+    /// server from a FRESH roster — so the "already ours" check could
+    /// not help either. Both legs landed on 25476, the panel's
+    /// `SPG_URI` pointed at the leg it was supposed to be compared
+    /// AGAINST, and it spent the run measuring one server against
+    /// itself. Which is the same defect that panel was added to catch,
+    /// one version earlier, in the other direction.
+    ///
+    /// It surfaced only because this version also made the panel state
+    /// which collation it expects. Without that it would have gone on
+    /// reporting `losses=0` for a comparison it was not making.
+    #[test]
+    fn free_port_skips_a_port_another_process_is_serving() {
+        let _serial = server_test_guard();
+        let r = Roster::new();
+        let victim = r.free_port().expect("a free port");
+        // Hold it the way a spawned server does: the wildcard address.
+        let held = std::net::TcpListener::bind(("0.0.0.0", victim))
+            .expect("the probe just said this port was free");
+        for _ in 0..8 {
+            let p = r.free_port().expect("a free port");
+            assert_ne!(
+                p, victim,
+                "handed out a port that another listener is serving"
+            );
+        }
+        drop(held);
     }
 
     /// 7.38.1 CP1 — a child that dies during startup (the bind-race
