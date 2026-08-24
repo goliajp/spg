@@ -385,6 +385,40 @@ Five gates gained the ability to see something they had claimed to check.
 
 ### Still open, named with what closing them would cost
 
+- **A collated text sort is 4x behind PostgreSQL and its top-N is
+  120x.** 400,000 rows of 192-character text, both engines under
+  `en_US.utf8`:
+
+  | | SPG | PG 18 |
+  |---|---:|---:|
+  | `ORDER BY s_long LIMIT 10` | **1329.5 ms** | 11.0 |
+  | `ORDER BY s_long` (full) | 1687.8 | 418.1 |
+  | `ORDER BY s_short` (9 chars) | **289.0** | 493.9 |
+
+  Read the last row first: on short text we are nearly twice as fast.
+  The cost is proportional to string length and theirs is not.
+
+  It is not the key building — building keys only for the full sort and
+  letting the top-N compare measured 1334.3 → 1320.3, nothing, and was
+  reverted after the branch was proven to be taken. What that
+  establishes is that one ICU comparison costs about what one ICU sort
+  key costs. It is ICU itself, on long strings, under the `Shifted`
+  handling PostgreSQL's ordering requires — correctly chosen, and about
+  ten times what glibc charges.
+
+  Three attacks are named in
+  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md`; the promising
+  one is an ASCII fast path, since `en_US` order and byte order agree on
+  `[0-9a-z]`, which covers hashes and slugs. It is also the kind of
+  shortcut that is silently wrong if the subset is drawn one character
+  too wide, so it needs a generated differential before it is believed.
+
+  **This is why the release gate is red.** The panel is right.
+
+  It also means the main sweep has been unfair in OUR favour for text
+  shapes: its SPG leg runs under `C` and its PostgreSQL leg under
+  `en_US.utf8`, which for a sort is not the same work.
+
 `docs/RECORDED_DELTAS.md` now carries a **condition** for every open row
 rather than a verdict, because a register that says "open" without saying
 what open costs makes every reader repeat the same investigation. The
