@@ -3381,6 +3381,36 @@ fn eval_function_call_arm(
                 })
                 .map(alloc::string::String::from)
         };
+        // v7.38.19 — a cast to a PSEUDO-type reports what PostgreSQL
+        // reports, which is not always the name written.
+        //
+        // Measured on 18.4 rather than reasoned about: `cstring` and
+        // `void` report themselves, while `anyelement`, `anynonarray`
+        // and `unknown` all report `unknown` -- a polymorphic
+        // placeholder resolves against the argument, and a bare literal
+        // gives it nothing to resolve to. The value travels as text
+        // either way, which is why the name has to come from the
+        // expression: `'x'::cstring` renders `x` on both engines and
+        // answered `text` here.
+        //
+        // The list here is SHORTER than `pseudo_type`'s on purpose: it
+        // is the names measured on 18.4 for this call, no more. `record`
+        // is the reason it has to be. `pg_typeof(ROW(1,'x')::r285::record)`
+        // answers `r285` -- the composite's own name, not `record` --
+        // and a first draft that reported every pseudo-type here turned
+        // that into `unknown`, which `e2e_record_type_round285` caught.
+        if let Some(named) = expr_enum_type_name(arg, ctx.columns)
+            && let Some(pseudo) = crate::conversions::pseudo_type(named)
+            && matches!(
+                pseudo,
+                "cstring" | "void" | "anyelement" | "anynonarray" | "unknown"
+            )
+        {
+            return Ok(Value::text(match pseudo {
+                "cstring" | "void" => pseudo,
+                _ => "unknown",
+            }));
+        }
         let is_enum = is_user_type;
         if let Some(en) = is_enum(arg) {
             return Ok(Value::text(en));

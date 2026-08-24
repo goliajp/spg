@@ -3839,6 +3839,16 @@ impl Engine {
                 col.user_composite_type = Some(name.clone());
                 continue;
             }
+            // v7.38.19 — a PSEUDO-type is a different refusal. The name
+            // exists; it just cannot hold a value, which PG reports as an
+            // INVALID TABLE DEFINITION (42P16) naming the column rather
+            // than an undefined type (42704) naming the type.
+            if let Some(pseudo) = crate::conversions::pseudo_type(&name) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "column \"{}\" has pseudo-type {pseudo}",
+                    col.name
+                )));
+            }
             // v7.39 (read01 round 89) — PG's 42704 wording. The old
             // "column X: unknown column type Y (...)" carried SPG's own
             // vocabulary and fell to the generic error class; PG says
