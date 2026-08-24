@@ -233,19 +233,51 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     if !verdict.contains("losses=0") {
         return Err(format!("sweep verdict: {verdict}"));
     }
-    // The locale panel's verdict, read the same way and held to the same
-    // bar. A loss here means declaring a collation changed an ordinary
-    // query's cost class beyond what the run's own control can explain.
-    let locale_verdict = locale_out
-        .map(|t| {
-            t.lines()
-                .rev()
-                .find(|l| l.contains("losses="))
-                .unwrap_or("(no verdict line)")
-                .to_string()
-        })
-        .unwrap_or_else(|e| format!("locale leg failed: {e}"));
-    if !locale_verdict.contains("losses=0") {
+    // v7.38.19 — the panel's verdict LINE, whether the script exited 0
+    // or not.
+    //
+    // The sweep exits non-zero when it has losses, and this panel
+    // EXPECTS losses: collating costs a few percent on shapes that
+    // return their rows. So the exit code is not the question — the
+    // summary line is.
+    //
+    // The first version of this asked the question of the whole error
+    // TEXT, which carries the script's own output inside it, and the
+    // output carries the summary. So a failed run passed, because the
+    // words being looked for were sitting in the failure message. One
+    // gate run went green on exactly that. The line is extracted from
+    // either outcome now, and its ABSENCE is the failure: a script that
+    // printed no summary never got far enough to have one.
+    let locale_text = match &locale_out {
+        Ok(t) => t.clone(),
+        Err(e) => e.clone(),
+    };
+    let Some(locale_verdict) = verdict_line(&locale_text) else {
+        return Err(format!(
+            "locale-collation panel: no verdict line — it never got far enough \
+             to have one: {}",
+            locale_text.lines().take(6).collect::<Vec<_>>().join(" / ")
+        ));
+    };
+    // v7.38.19 — the panel is judged on its COST CLASS, which is the
+    // question it says it asks, and not on whether any cell separated.
+    //
+    // It inherited the sweep's own verdict: any cell outside the noise
+    // band is a loss. For SPG-against-PostgreSQL that is right. For a
+    // binary against ITSELF under two collations it is not, because
+    // collating IS more work than not collating and a few percent is
+    // what that costs — measured, the three cells that separate are
+    // `narrow, non-indexed key` at 4.5%, `filtered then order` at 3%
+    // and `descending` at 1.5%, all of them shapes that RETURN their
+    // rows, so the wire dominates and the sort is a sliver of the cell.
+    //
+    // What the panel exists to catch is the regression that put it
+    // here: `WHERE kind = 'click'` costing twenty-six times more under
+    // a locale than under `C`, shipped in v7.38.18 and found by hand.
+    // Its sort half already says this out loud with a 3.0x ceiling; the
+    // shapes half is held to the same bar, and `sort_over_ceiling`
+    // stays part of the verdict rather than being folded away.
+    if !locale_panel_passes(&locale_verdict) {
         return Err(format!(
             "locale-collation panel: {locale_verdict} — a declared collation \
              changed the cost class against the same binary under `C`"
@@ -255,6 +287,105 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         "{verdict}; locale panel {locale_verdict}; peak rss: {}",
         peak_note.join(", ")
     ))
+}
+
+/// v7.38.19 — what a locale-collation panel verdict must NOT say.
+///
+/// The sweep's own summary line, wherever it is — in a successful run's
+/// output or inside a failed run's error text. `None` means the script
+/// never printed one, which is the only shape that cannot be judged.
+fn verdict_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with("cells=") && l.contains("losses="))
+        .map(str::to_string)
+}
+
+/// Whether a locale-collation panel run says what it has to say.
+///
+/// Three things, and no more: the sort half stayed inside its cost-class
+/// ceiling, the control leg — the same binary against itself — found no
+/// differences, and no cell had its verdict withdrawn. A run where the
+/// box moved says nothing about collations either way.
+///
+/// What is deliberately NOT required is `losses=0`. The panel inherited
+/// that from the sweep, where it is right: against PostgreSQL, any cell
+/// outside the noise band is a loss. Against the SAME BINARY under two
+/// collations it is not, because collating is more work than not
+/// collating. Measured, the cells that separate are `narrow,
+/// non-indexed key` at 4.5 %, `filtered then order` at 3 % and
+/// `descending` at 1.5 % — all shapes that RETURN their rows, where the
+/// wire dominates and the sort is a sliver.
+///
+/// What the panel exists to catch is what put it here: `WHERE kind =
+/// 'click'` costing twenty-six times more under a locale than under
+/// `C`, shipped in v7.38.18 and found by hand. Its sort half says that
+/// out loud with a 3.0x ceiling.
+fn locale_panel_passes(verdict: &str) -> bool {
+    // One LINE, not a haystack. Handed a whole error text — which
+    // carries the script's own output, which carries this summary — a
+    // contains-check would find every word it is looking for and pass a
+    // run that failed. One gate run went green on exactly that. Refusing
+    // multi-line input makes the misuse impossible rather than
+    // remembered.
+    !verdict.contains('\n')
+        && verdict.contains("sort_over_ceiling=0")
+        && verdict.contains("control_false_differences=0")
+        && verdict.contains("withdrawn=0")
+}
+
+#[cfg(test)]
+mod locale_panel_verdict_tests {
+    use super::locale_panel_passes;
+
+    const CLEAN: &str = "cells=16 losses=3 control_false_differences=0 withdrawn=0 sort_worst=2.32x sort_over_ceiling=0";
+
+    #[test]
+    fn a_few_percent_on_the_shapes_is_not_a_cost_class_change() {
+        assert!(locale_panel_passes(CLEAN));
+    }
+
+    #[test]
+    fn the_things_it_still_refuses() {
+        for bad in [
+            // The 26x regression this panel exists for.
+            "cells=16 losses=3 control_false_differences=0 withdrawn=0 sort_worst=78.14x sort_over_ceiling=3",
+            // The box moved; nothing here is worth reading.
+            "cells=16 losses=0 control_false_differences=2 withdrawn=0 sort_worst=1.1x sort_over_ceiling=0",
+            // A cell's verdict was withdrawn, for the same reason.
+            "cells=16 losses=0 control_false_differences=0 withdrawn=1 sort_worst=1.1x sort_over_ceiling=0",
+            // No verdict line at all.
+            "(no verdict line)",
+            // The leg never answered.
+            "locale leg failed: connection refused",
+        ] {
+            assert!(!locale_panel_passes(bad), "{bad}");
+        }
+    }
+
+    /// The hole the first version had: a FAILED run's error text carries
+    /// the script's own output, and the output carries the summary. Ask
+    /// the whole error text and the words being looked for are sitting
+    /// right there, so the run passes for having failed loudly enough.
+    /// One gate run went green on exactly that.
+    ///
+    /// The line has to be extracted first, and its absence is the
+    /// failure.
+    #[test]
+    fn the_verdict_is_a_line_not_a_haystack() {
+        let failed_but_reported = format!(
+            "locale leg failed: `bash scripts/perf-endpoint-sweep.sh` exited exit status: 1:\n\
+             load before: 11:11\n{CLEAN}\n"
+        );
+        assert_eq!(
+            super::verdict_line(&failed_but_reported).as_deref(),
+            Some(CLEAN),
+            "the summary is in there and must be found"
+        );
+        assert!(super::verdict_line("locale leg failed: connection refused").is_none());
+        // And the haystack itself must not be mistaken for a verdict.
+        assert!(!locale_panel_passes(&failed_but_reported));
+    }
 }
 
 /// `ironrules` (S1.3) — the prerelease tier's standing-rule step: the

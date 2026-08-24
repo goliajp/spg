@@ -34,6 +34,45 @@ instrument being asked to prove it could see what it claimed to check.
 
 ### Fixed
 
+- **A collated text sort was 4x behind PostgreSQL and its top-N 120x.**
+  400,000 rows of 192-character text, both engines under `en_US.utf8`:
+
+  | | before | after | PG 18 |
+  |---|---:|---:|---:|
+  | `ORDER BY s_long LIMIT 10` | 1357.5 ms | **43.2** | 11.4 |
+  | `ORDER BY s_long` (full) | 1706.5 | **395.6** | 415.9 |
+  | `ORDER BY s_short LIMIT 10` | 114.0 | **14.7** | 21.9 |
+  | `ORDER BY s_short` (full) | 446.1 | **211.0** | 502.4 |
+
+  Three of those four now beat PostgreSQL. The sort panel's worst ratio
+  went 78.14x to 2.39x and `sort_over_ceiling` 3 to 0.
+
+  Under many collations — not all — `[0-9a-z]` orders by bytes, so ICU
+  need not be asked. Measured against PostgreSQL 18's ICU collations
+  over all 839,160 ordered pairs of two-character strings from that
+  alphabet: `en`, `sv`, `de`, `fr`, `tr` agree exactly; `cs` disagrees
+  198 times (`ch` is a letter after `h`), `et` 7,992 (`z` between `s`
+  and `t`), `lt` 20,609, `da` 925, `hu` 18. So it is an allowlist, and
+  the test beside it re-derives the whole thing in process — put `cs` in
+  and it goes red.
+
+  Adding an underscore, a hyphen, a dot or a space to the alphabet costs
+  fourteen to twenty-three thousand disagreements: those are the
+  characters `AlternateHandling::Shifted` treats as variable, which is
+  the handling PostgreSQL's ordering needs.
+
+  Three measurements, each refuting the reading before it: skipping keys
+  for a top-N moved 1334.3 → 1320.3 (nothing, which established that one
+  ICU comparison costs what one ICU key costs); checking the alphabet in
+  the comparator moved 1701.9 → 1467.5 (7.4 million comparisons scanning
+  2.8 GB); asking once per value and letting the key carry the answer
+  gave 395.6.
+
+  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md` has the whole
+  path, including the invariant that was not one — reading the promise
+  off the key's variant held everywhere except the join path, and
+  `round688` said so.
+
 - **A composite index was invisible to its own leading column.** On
   sentori's `events (project_id, kind)`, 200,000 rows, on an idle box,
   each of these matching NOTHING:
@@ -384,47 +423,6 @@ Five gates gained the ability to see something they had claimed to check.
   collator per call.
 
 ### Still open, named with what closing them would cost
-
-- **A collated text sort is 4x behind PostgreSQL and its top-N is
-  120x.** 400,000 rows of 192-character text, both engines under
-  `en_US.utf8`:
-
-  | | SPG | PG 18 |
-  |---|---:|---:|
-  | `ORDER BY s_long LIMIT 10` | **1329.5 ms** | 11.0 |
-  | `ORDER BY s_long` (full) | 1687.8 | 418.1 |
-  | `ORDER BY s_short` (9 chars) | **289.0** | 493.9 |
-
-  Read the last row first: on short text we are nearly twice as fast.
-  The cost is proportional to string length and theirs is not.
-
-  It is not the key building — building keys only for the full sort and
-  letting the top-N compare measured 1334.3 → 1320.3, nothing, and was
-  reverted after the branch was proven to be taken. What that
-  establishes is that one ICU comparison costs about what one ICU sort
-  key costs. It is ICU itself, on long strings, under the `Shifted`
-  handling PostgreSQL's ordering requires — correctly chosen, and about
-  ten times what glibc charges.
-
-  Three attacks are named in
-  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md`; the promising
-  one is an ASCII fast path, since `en_US` order and byte order agree on
-  `[0-9a-z]`, which covers hashes and slugs. It is also the kind of
-  shortcut that is silently wrong if the subset is drawn one character
-  too wide, so it needs a generated differential before it is believed.
-
-  **This is why the release gate is red.** The panel is right.
-
-  It also means the main sweep has been unfair in OUR favour for text
-  shapes: its SPG leg runs under `C` and its PostgreSQL leg under
-  `en_US.utf8`, which for a sort is not the same work.
-
-`docs/RECORDED_DELTAS.md` now carries a **condition** for every open row
-rather than a verdict, because a register that says "open" without saying
-what open costs makes every reader repeat the same investigation. The
-three were re-measured against PostgreSQL 18.4 on the day this shipped
-and all three still reproduce, which is the property the register exists
-to have — one of its rows was stated backwards when it was created.
 
 - **`pg_typeof(x::cstring)` reads `text`.** `cstring` is a pseudo-type;
   PostgreSQL refuses `CREATE TABLE t(c cstring)` itself, and the value

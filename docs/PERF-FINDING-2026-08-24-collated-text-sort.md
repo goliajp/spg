@@ -1,6 +1,22 @@
 # A collated text sort is 4x behind PostgreSQL, and its top-N is 120x
 
-**Status: open. Measured, decomposed, one attack tried and reverted.**
+**Status: CLOSED for the alphabet that covers the common cases, on
+2026-08-24. Three of the five sort shapes now beat PostgreSQL 18. The
+sort panel's worst ratio went 78.14x to 2.39x and `sort_over_ceiling`
+3 to 0.**
+
+|  | before | after | PostgreSQL 18 |
+|---|---:|---:|---:|
+| `ORDER BY s_long LIMIT 10` | 1357.5 ms | **43.2** | 11.4 |
+| `ORDER BY s_long` (full) | 1706.5 | **395.6** | 415.9 |
+| `ORDER BY s_short LIMIT 10` | 114.0 | **14.7** | 21.9 |
+| `ORDER BY s_short` (full) | 446.1 | **211.0** | 502.4 |
+
+What closed it is attack 1 below, taken with the guard it asked for.
+The rest of this document is the reasoning as it stood before, kept
+because two of its three readings were wrong and the record of that is
+worth more than a tidy page. See "What it turned out to be" at the end.
+
 
 Found on 2026-08-24 by the locale-collation panel added in v7.38.19 —
 which could not have found it a day earlier, because the panel was
@@ -109,3 +125,58 @@ one version earlier, in the other direction. It surfaced only because
 the same version also made the panel STATE which collation it expects.
 
 Two instruments, each blind in the way the other was built to see.
+
+
+## What it turned out to be
+
+Attack 1, with the differential it demanded.
+
+**The claim**: under many collations — not all — `[0-9a-z]` orders by
+bytes. Measured against PostgreSQL 18's ICU collations over all 839,160
+ordered pairs of two-character strings from that alphabet:
+
+```text
+  en  0     cs    198     `ch` is a letter, after `h`
+  sv  0     et  7,992     `z` sorts between `s` and `t`
+  de  0     lt 20,609     `y` sorts after `i`
+  fr  0     da    925     `aa` is `å`, after `z`
+  tr  0     hu     18     `cs`, `gy`, `sz` … are letters
+```
+
+So: an allowlist keyed on the language, and a test that re-derives the
+whole thing in process — every allowed language must agree over the
+alphabet at one, two, three and some four characters, and every language
+in the second column must NOT. Put `cs` in the allowlist and the second
+test goes red; that is how the allowlist was confirmed to be a check
+rather than a claim.
+
+The corpus is checked by SORTING it twice rather than comparing every
+pair: two total orders agree on every pair exactly when they produce the
+same sequence, so one sort answers what 1.2 billion comparisons would,
+in 0.13 seconds.
+
+**Three measurements, each refuting the reading before it:**
+
+1. *Skip the keys for a top-N.* 1334.3 → 1320.3. Nothing. Established
+   that one ICU comparison costs about what one ICU sort key costs.
+2. *Check the alphabet in the comparator.* 1701.9 → 1467.5. The check
+   walks the string and a full sort asked it 7.4 million times — 2.8 GB
+   of scanning, itself the cost.
+3. *Ask once per value; let the KEY carry the answer.* 395.6.
+
+**And an invariant that was not one.** The first version of (3) read the
+promise off the key's VARIANT — a plain `Text` key under such a
+collation had to be alnum, because the builder gave everything else
+ICU's key. That holds only where the builder and the comparator are
+handed the same collations, and the join path is not such a place:
+`round688` came back `Banana,Zebra,_under,apple,cherry,Ápple` where
+PostgreSQL gives `apple,Ápple,Banana,cherry,_under,Zebra`. An invariant
+two call sites have to agree on is not an invariant. The promise is
+carried in the value now.
+
+## Still open
+
+Attack 2 and attack 3 are untried and no longer urgent. What remains
+behind PostgreSQL is the top-N at 2.39x, and a value OUTSIDE the
+alphabet — anything with a space, a capital or an accent — still pays
+full ICU, which is correct and unimproved.

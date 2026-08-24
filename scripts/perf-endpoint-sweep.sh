@@ -82,9 +82,29 @@ echo "load before: $(uptime)"
 # under, and a leg serving something else is a run whose numbers are not
 # comparable to the ones before it.
 EXPECT_SPG_COLLATE="${EXPECT_SPG_COLLATE:-C}"
+# v7.38.19 — the reason a leg would not say, said.
+#
+# This threw the error away (`2>/dev/null`) and ran under `set -e`, so a
+# leg that failed to answer killed the script between "load before" and
+# the line that names the collations — one line of output, no reason in
+# it, and the caller then reported the panel's own summary as though the
+# panel had run and disagreed. A prerelease gate spent a run saying "a
+# declared collation changed the cost class" about a comparison it never
+# made.
+#
+# The pattern is the one this version has been chasing all day: a check
+# whose failure is indistinguishable from a different failure.
 leg_collation() {
-  "${PSQL}" --no-psqlrc -X -q -t -A "$1" \
-    -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>/dev/null | head -1
+  local out rc
+  out="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" \
+        -c 'SELECT datcollate FROM pg_database LIMIT 1' 2>&1)" && rc=0 || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "fatal: the leg at $1 would not answer what collation it serves." >&2
+    echo "       psql exited ${rc}: ${out}" >&2
+    echo "       That is not a collation mismatch — it is a leg that is not there." >&2
+    exit 2
+  fi
+  printf '%s' "${out}" | head -1
 }
 spg_coll="$(leg_collation "${SPG_URI}")"
 pg_coll="$(leg_collation "${PG_URI}")"
