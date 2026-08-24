@@ -6246,6 +6246,14 @@ fn policy_cmd_to_storage(c: spg_sql::ast::PolicyCmd) -> spg_storage::PolicyCmd {
     }
 }
 
+/// v7.38.19 — a DEFAULT that is a call to `nextval`, however it spells
+/// its argument. `nextval('s')` and `nextval('s'::regclass)` are the
+/// same column; `pg_dump` writes the second.
+fn is_nextval_call(e: &Expr) -> bool {
+    matches!(e, Expr::FunctionCall { name, args }
+        if name.eq_ignore_ascii_case("nextval") && args.len() == 1)
+}
+
 fn is_runtime_default_expr(expr: &Expr) -> bool {
     match expr {
         Expr::FunctionCall { .. } => true,
@@ -6327,6 +6335,47 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
                 s.replace('\'', "''"),
                 crate::conversions::pg_type_name_for_error(col_ty)
             )
+        }
+        // v7.38.19 — a call renders its arguments the way PostgreSQL
+        // prints them, which for a typed string literal is
+        // `'zs'::regclass` and not `('zs')::regclass`.
+        //
+        // The generic Display arm below parenthesises a Cast, so
+        // `nextval('zs'::regclass)` — what `pg_dump` writes for a serial
+        // column, and what a schema-diff tool compares — read back as
+        // `nextval(('zs')::regclass)`. It re-parses here and the dump
+        // round-trip is a fixed point, so this never broke anything of
+        // ours; it broke the comparison with theirs, which is the bar.
+        //
+        // r1054 fixed the same spelling for a default that IS a cast.
+        // This is the same fix one level in.
+        // Narrow on purpose: only a call that CARRIES such an argument
+        // is re-rendered. Taking every call broke `CURRENT_DATE`, which
+        // the parser lowers to a zero-argument `current_date` whose
+        // Display prints the keyword — this arm printed the lowering.
+        // The existing default-text test caught it in the same minute.
+        Expr::FunctionCall { name, args }
+            if args.iter().any(|a| {
+                matches!(a, Expr::Cast { expr: inner, .. }
+                    if matches!(inner.as_ref(), Expr::Literal(Literal::String(_))))
+            }) =>
+        {
+            let rendered: Vec<alloc::string::String> = args
+                .iter()
+                .map(|a| match a {
+                    Expr::Cast {
+                        expr: inner,
+                        target,
+                    } if matches!(inner.as_ref(), Expr::Literal(Literal::String(_))) => {
+                        let Expr::Literal(Literal::String(lit)) = inner.as_ref() else {
+                            unreachable!("guarded by matches!")
+                        };
+                        alloc::format!("'{}'::{target}", lit.replace('\'', "''"))
+                    }
+                    other => alloc::format!("{other}"),
+                })
+                .collect();
+            alloc::format!("{name}({})", rendered.join(", "))
         }
         // Boolean literal → PG's lowercase `true` / `false` (SPG's Literal
         // Display emits uppercase `TRUE`).
@@ -6639,7 +6688,31 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
         // INSERT). Function calls (`now()`, `current_timestamp`
         // — see v7.9.20 keyword promotion) take the runtime path.
         // Literals continue to cache. mailrs G4.
-        if is_runtime_default_expr(&default_expr) {
+        // v7.38.19 — a `nextval(…)` DEFAULT is the column being
+        // NUMBERED, not an expression to re-evaluate per row.
+        //
+        // Advancing a sequence needs a mutable catalog, and the context a
+        // runtime DEFAULT is evaluated in does not hold one -- so this
+        // stored the call as text and every INSERT that left the column
+        // to its default answered `nextval() requires a sequence
+        // resolver (read-only context)`. PostgreSQL 18.4 inserts.
+        //
+        // The OTHER spelling of the same column has worked since v7.22:
+        // `ALTER TABLE … SET DEFAULT nextval(…)` lowers to the
+        // auto-increment marker, because that is what `pg_dump` emits
+        // for a serial column and imports were losing their numbering.
+        // Two spellings of one column definition disagreed about whether
+        // the column worked at all. This is the same lowering, reached
+        // from the other side.
+        if is_nextval_call(&default_expr) {
+            if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "auto-increment applies to integer columns only ({:?} is {ty:?})",
+                    c.name
+                )));
+            }
+            schema.auto_increment = true;
+        } else if is_runtime_default_expr(&default_expr) {
             let display = alloc::format!("{default_expr}");
             schema = schema.with_runtime_default(display);
         } else {

@@ -6744,6 +6744,19 @@ fn explicit_auto_value(raw: &Value<'_>) -> Option<i64> {
 /// point for `col`: the table's next value, floored by any sequence restart.
 /// Extracted so the generate path and the explicit-value bump path below can
 /// never seed from different places.
+/// RD-12 — the next value for a `serial` / `DEFAULT nextval(…)` column.
+///
+/// The table's maximum plus one, where PostgreSQL reads a counter that
+/// knows nothing about the table. After a row supplies its own id, the
+/// two part company: three inserts with `50` in the middle give
+/// PostgreSQL `1, 2, 50` and give us `1, 50, 51`.
+///
+/// Neither is simply right. PostgreSQL's counter will eventually reach
+/// 50 and collide; ours never hands out a value the table already
+/// holds. It is also not free: this is a scan, so one INSERT into a
+/// 200,000-row table costs 3.666 ms against PostgreSQL's flat 1.375,
+/// and the gap grows with the table. `docs/RECORDED_DELTAS.md` carries
+/// the measurements and the argument.
 fn auto_cursor_seed(
     table: &spg_storage::Table,
     i: usize,

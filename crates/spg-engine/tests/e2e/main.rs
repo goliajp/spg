@@ -196,6 +196,7 @@ mod e2e_create_index_autoname_round93;
 mod e2e_create_index_concurrently;
 mod e2e_create_statistics_round280;
 mod e2e_create_table_like_round531;
+mod e2e_create_table_nextval_default;
 mod e2e_create_wider_pg_dump_compat;
 mod e2e_crypt;
 mod e2e_ctas;
