@@ -88,6 +88,82 @@ pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> 
     Ok(format!("unit green over {} crates", affected.len()))
 }
 
+/// `pins-current` — the e2e pins THIS commit adds or touches.
+///
+/// v7.38.19 — the step used to be `cargo test --test e2e pin_v738_`,
+/// a filter on a test-NAME prefix that exactly one test in the repo
+/// carries. Meanwhile 33 e2e files with 195 tests had been added since
+/// v7.38.0. A step named for this version's pins was running one test
+/// and could not go red for any reason a pin exists to catch.
+///
+/// The selector is now the diff, which is what the tier's siblings
+/// already use, and it has two ways to go red that the old one did not:
+/// a new pin file that `main.rs` never declares (it would compile,
+/// ship, and never run), and a filter set that matches no tests at all.
+///
+/// # Errors
+/// A failing pin, an unwired pin file, or a filter set that selects
+/// nothing while pin files were touched.
+pub fn pins_current(root: &Path) -> Result<String, String> {
+    // `d` excludes deletions: a removed file cannot be run, and naming
+    // it as a filter would select nothing and read as the failure below.
+    //
+    // Tracked files only, which is staged plus unstaged -- the contents
+    // of the commit. An UNTRACKED pin file is not in this commit, and a
+    // draft that included those made the step red for work the author
+    // had not asked to commit yet. A new pin file is seen the moment it
+    // is staged, which is the moment it becomes part of a commit.
+    let diff = sh(root, "git diff --name-only --diff-filter=d HEAD")?;
+    let mut mods: Vec<String> = Vec::new();
+    for f in diff.lines() {
+        let Some(rest) = f.strip_prefix("crates/spg-engine/tests/e2e/") else {
+            continue;
+        };
+        let Some(m) = rest.strip_suffix(".rs") else {
+            continue;
+        };
+        if m == "main" || m.contains('/') || mods.iter().any(|x| x == m) {
+            continue;
+        }
+        mods.push(m.to_string());
+    }
+    if mods.is_empty() {
+        return Ok("no e2e pins touched — skipped".into());
+    }
+    // A pin file that `main.rs` does not declare is not compiled into
+    // the harness. It reviews as coverage and runs never.
+    let main_rs = std::fs::read_to_string(root.join("crates/spg-engine/tests/e2e/main.rs"))
+        .map_err(|e| format!("reading the e2e main.rs: {e}"))?;
+    let unwired: Vec<&String> = mods
+        .iter()
+        .filter(|m| !main_rs.contains(&format!("mod {m};")))
+        .collect();
+    if !unwired.is_empty() {
+        return Err(format!(
+            "pin file(s) not declared in crates/spg-engine/tests/e2e/main.rs, \
+             so nothing in them runs: {unwired:?}"
+        ));
+    }
+    let filters = mods.join(" ");
+    let out = sh(
+        root,
+        &format!("cargo test -q -p spg-engine --test e2e -- {filters}"),
+    )?;
+    let ran: usize = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("test result: ok. "))
+        .filter_map(|l| l.split(' ').next())
+        .filter_map(|n| n.parse::<usize>().ok())
+        .sum();
+    if ran == 0 {
+        return Err(format!(
+            "{} pin file(s) touched but the filters selected no tests: {mods:?}",
+            mods.len()
+        ));
+    }
+    Ok(format!("{ran} pin(s) over {} touched file(s)", mods.len()))
+}
+
 /// `perf-sweep` (S1.2) — the release-blocking endpoint sweep with its
 /// legs configured HERE, never from operator env: PERF blocked two
 /// release trains for missing URIs before this step existed.

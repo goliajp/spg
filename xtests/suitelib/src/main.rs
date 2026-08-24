@@ -24,6 +24,7 @@ fn main() {
             let out = match name.as_str() {
                 "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
                 "unit-affected" => suitelib::steps::unit_affected(root, &graph),
+                "pins-current" => suitelib::steps::pins_current(root),
                 "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                 "ironrules" => suitelib::steps::ironrules_full(root, &runid),
                 "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
@@ -372,6 +373,7 @@ fn main() {
                     _ => match s.name.as_str() {
                         "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
                         "unit-affected" => suitelib::steps::unit_affected(root, &graph),
+                        "pins-current" => suitelib::steps::pins_current(root),
                         "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                         // S1.3 — smoke plus the previous release's data
                         // directory opened by the current binary.

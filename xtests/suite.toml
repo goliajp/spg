@@ -54,8 +54,7 @@ budget_s = 35
 [[step]]
 tier = "precommit"
 name = "pins-current"
-impl = "external"
-cmd = "cargo test -q -p spg-engine --test e2e pin_v738_"
+impl = "internal"
 budget_s = 10
 
 [[step]]
