@@ -26733,6 +26733,34 @@ fn parse_year_month_literal(text: &str) -> Option<i32> {
 }
 
 pub fn parse_interval_text(s: &str) -> Option<(i32, i32, i64)> {
+    // v7.38.19 — the two infinities, answered as the three extreme
+    // fields PostgreSQL itself puts on the wire for them:
+    //
+    //   COPY (SELECT 'infinity'::interval) TO STDOUT (FORMAT binary)
+    //     … 7fffffffffffffff 7fffffff 7fffffff
+    //
+    // So no caller has to know the spelling — every one of them already
+    // reads the three numbers, and `IntervalKind::from_fields` names
+    // what they mean.
+    //
+    // `inf` is NOT one of them, measured: `'inf'::interval` is *invalid
+    // input syntax* on PostgreSQL 18.4 while `'inf'::float8` is
+    // infinity. Interval takes the full word, in any case.
+    {
+        let word = s.trim();
+        let word = word.strip_prefix('@').map_or(word, str::trim);
+        let (neg, body) = match word.strip_prefix('-') {
+            Some(rest) => (true, rest.trim_start()),
+            None => (false, word.strip_prefix('+').map_or(word, str::trim_start)),
+        };
+        if body.eq_ignore_ascii_case("infinity") {
+            return Some(if neg {
+                (i32::MIN, i32::MIN, i64::MIN)
+            } else {
+                (i32::MAX, i32::MAX, i64::MAX)
+            });
+        }
+    }
     // v7.39 (read01 timestamp.c) — PG's postgres_verbose forms: a leading
     // `@` is decorative; a trailing `ago` negates the whole interval.
     let mut trimmed = s.trim();

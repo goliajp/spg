@@ -236,10 +236,12 @@ impl UniformArrayKind {
                             months,
                             days,
                             micros,
+                            kind,
                         } => Some(spg_storage::IntervalSpan {
                             months,
                             days,
                             micros,
+                            kind,
                         }),
                         _ => unreachable!("uniform Interval"),
                     })
@@ -2931,6 +2933,7 @@ pub(crate) fn literal_to_value(l: Literal) -> Value<'static> {
             months,
             days,
             micros,
+            kind: spg_storage::IntervalKind::Finite,
         },
     }
 }
@@ -3370,10 +3373,12 @@ fn coerce_text_array_to(
                             months,
                             days,
                             micros,
+                            kind,
                         } => Some(spg_storage::IntervalSpan {
                             months,
                             days,
                             micros,
+                            kind,
                         }),
                         _ => None,
                     })
@@ -4907,6 +4912,7 @@ pub(crate) fn coerce_value(
                 months,
                 days,
                 micros,
+                kind: spg_storage::IntervalKind::from_fields(months, days, micros),
             }),
             None => {
                 return Err(EngineError::Eval(EvalError::TypeMismatch {

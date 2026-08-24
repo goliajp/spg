@@ -120,6 +120,7 @@ fn bare_interval_literal_evaluates() {
             months: 0,
             days: 30,
             micros: 0,
+            kind,
         }
     ));
 }

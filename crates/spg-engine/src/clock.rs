@@ -66,6 +66,7 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
             months,
             days,
             micros,
+            kind,
         } => Literal::Interval {
             months,
             days,

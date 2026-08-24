@@ -36,6 +36,7 @@ fn interval_cast_arithmetic_with_now() {
         months,
         days,
         micros,
+        kind,
     } = rows[0].values[0]
     else {
         panic!()

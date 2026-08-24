@@ -19,6 +19,7 @@ fn assert_interval(v: &spg_storage::Value<'_>, exp_months: i32, exp_days: i32, e
             months,
             days,
             micros,
+            kind,
         } => {
             assert_eq!(*months, exp_months, "months mismatch");
             assert_eq!(*days, exp_days, "days mismatch");

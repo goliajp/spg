@@ -1997,6 +1997,7 @@ pub(super) fn to_char_in_zone(
         months,
         days,
         micros,
+        kind,
     } = &args[0]
     {
         return Ok(Value::text(to_char_interval(

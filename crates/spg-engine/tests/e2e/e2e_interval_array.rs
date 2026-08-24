@@ -26,6 +26,7 @@ fn span(months: i32, days: i32, micros: i64) -> IntervalSpan {
         months,
         days,
         micros,
+        kind: spg_storage::IntervalKind::Finite,
     }
 }
 

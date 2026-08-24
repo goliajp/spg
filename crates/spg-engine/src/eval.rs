@@ -56,10 +56,11 @@ use encoding::{decode_text, encode_text};
 pub use format::{
     days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
     format_date, format_date_array, format_float, format_float_array, format_int_array,
-    format_interval, format_interval_array, format_money, format_numeric, format_numeric_array,
-    format_numeric_kind, format_real, format_smallint_array, format_text_array, format_time,
-    format_timestamp, format_timestamp_array, format_timestamptz, format_timestamptz_at,
-    format_timetz, format_uuid_array, parse_date_literal, parse_timestamp_literal,
+    format_interval, format_interval_array, format_interval_kinded, format_money, format_numeric,
+    format_numeric_array, format_numeric_kind, format_real, format_smallint_array,
+    format_text_array, format_time, format_timestamp, format_timestamp_array, format_timestamptz,
+    format_timestamptz_at, format_timetz, format_uuid_array, parse_date_literal,
+    parse_timestamp_literal,
 };
 // v7.39 (GUC knife 3) — session render styles + styled formatters.
 pub use format::{
@@ -2995,7 +2996,12 @@ fn eval_cast_arm(
                 months,
                 days,
                 micros,
+                kind,
             } => {
+                // v7.38.19 — an infinity is the word, in every style.
+                if !kind.is_finite() {
+                    return Ok(Value::text(format::format_interval_kinded(0, 0, 0, *kind)));
+                }
                 return Ok(Value::text(format::format_interval_styled(
                     *months,
                     *days,
@@ -5682,6 +5688,7 @@ pub(crate) fn literal_to_value(l: &Literal) -> Value<'static> {
             months: *months,
             days: *days,
             micros: *micros,
+            kind: spg_storage::IntervalKind::Finite,
         },
     }
 }
@@ -6492,6 +6499,7 @@ mod tests {
                 months: 0,
                 days: 0,
                 micros: 5,
+                kind: spg_storage::IntervalKind::Finite,
             },
         ];
         let ops = [

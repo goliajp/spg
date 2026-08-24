@@ -430,7 +430,8 @@ fn render_cell(v: &Value, ty: char) -> String {
             months,
             days,
             micros,
-        } => spg_engine::eval::format_interval(*months, *days, *micros),
+            kind,
+        } => spg_engine::eval::format_interval_kinded(*months, *days, *micros, *kind),
         Value::Json(s) => s.to_string(),
         // v7.15.0 — TEXT[]/INT[]/BIGINT[] render as their PG-side
         // canonical text form so fixtures can assert on

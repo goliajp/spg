@@ -634,17 +634,22 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
                 months: xm,
                 days: xd,
                 micros: xu,
+                kind: xkind,
             },
             Value::Interval {
                 months: ym,
                 days: yd,
                 micros: yu,
+                kind: ykind,
             },
         ) => {
             let span = |m: i32, d: i32, u: i64| -> i128 {
                 (i128::from(m) * 30 + i128::from(d)) * 86_400_000_000 + i128::from(u)
             };
-            span(*xm, *xd, *xu).cmp(&span(*ym, *yd, *yu))
+            xkind
+                .rank()
+                .cmp(&ykind.rank())
+                .then_with(|| span(*xm, *xd, *xu).cmp(&span(*ym, *yd, *yu)))
         }
         // Cross-type compare: fall back to the debug rendering —
         // same-partition is the goal, exact order is irrelevant.
@@ -853,7 +858,8 @@ pub(crate) fn canonical_value_repr(v: &Value) -> alloc::string::String {
             months,
             days,
             micros,
-        } => eval::format_interval(*months, *days, *micros),
+            kind,
+        } => eval::format_interval_kinded(*months, *days, *micros, *kind),
         Value::Numeric {
             scaled,
             scale,

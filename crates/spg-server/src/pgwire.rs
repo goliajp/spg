@@ -3739,6 +3739,11 @@ fn decode_binary_param(oid: u32, bytes: &[u8]) -> Result<spg_storage::Value<'sta
                 months,
                 days,
                 micros,
+                // v7.38.19 — PostgreSQL sends an infinite interval as
+                // all three fields at their extreme, measured off
+                // `COPY … TO STDOUT (FORMAT binary)`. Reading it back
+                // is the same mapping.
+                kind: spg_storage::IntervalKind::from_fields(months, days, micros),
             })
         }
         2950 => {
@@ -7188,7 +7193,11 @@ fn copy_cell_raw(
             months,
             days,
             micros,
-        } => spg_engine::eval::format_interval_styled(*months, *days, *micros, style),
+            kind,
+        } if kind.is_finite() => {
+            spg_engine::eval::format_interval_styled(*months, *days, *micros, style)
+        }
+        Value::Interval { kind, .. } => spg_engine::eval::format_interval_kinded(0, 0, 0, *kind),
         Value::Vector(v) => {
             let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
             format!("[{}]", parts.join(","))
@@ -8090,7 +8099,9 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
             months,
             days,
             micros,
+            kind,
         } => {
+            let (months, days, micros) = kind.to_fields(*months, *days, *micros);
             let mut buf = Vec::with_capacity(16);
             buf.extend_from_slice(&micros.to_be_bytes());
             buf.extend_from_slice(&days.to_be_bytes());
@@ -8917,9 +8928,13 @@ fn value_to_pg_text<'a>(
             months,
             days,
             micros,
-        } => into_arena(&spg_engine::eval::format_interval_styled(
+            kind,
+        } if kind.is_finite() => into_arena(&spg_engine::eval::format_interval_styled(
             *months, *days, *micros, style,
         )),
+        Value::Interval { kind, .. } => {
+            into_arena(&spg_engine::eval::format_interval_kinded(0, 0, 0, *kind))
+        }
         Value::Numeric {
             scaled,
             scale,
@@ -9618,8 +9633,41 @@ mod tests {
                 months: 1,
                 days: 2,
                 micros: 3,
+                kind: spg_storage::IntervalKind::Finite,
             }
         );
+    }
+
+    /// v7.38.19 — the two infinities as PostgreSQL puts them on the
+    /// wire, measured with
+    /// `COPY (SELECT 'infinity'::interval) TO STDOUT (FORMAT binary)`:
+    /// all three fields at their extreme, not a flag beside them.
+    #[test]
+    fn decode_binary_param_interval_infinity() {
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&i64::MAX.to_be_bytes());
+        bytes[8..12].copy_from_slice(&i32::MAX.to_be_bytes());
+        bytes[12..16].copy_from_slice(&i32::MAX.to_be_bytes());
+        let v = decode_binary_param(1186, &bytes).expect("INTERVAL infinity BIND must succeed");
+        assert!(matches!(
+            v,
+            spg_storage::Value::Interval {
+                kind: spg_storage::IntervalKind::PosInf,
+                ..
+            }
+        ));
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&i64::MIN.to_be_bytes());
+        bytes[8..12].copy_from_slice(&i32::MIN.to_be_bytes());
+        bytes[12..16].copy_from_slice(&i32::MIN.to_be_bytes());
+        let v = decode_binary_param(1186, &bytes).expect("INTERVAL -infinity BIND must succeed");
+        assert!(matches!(
+            v,
+            spg_storage::Value::Interval {
+                kind: spg_storage::IntervalKind::NegInf,
+                ..
+            }
+        ));
     }
 
     /// Negative dimensions thread through unchanged (PG INTERVAL
@@ -9638,6 +9686,7 @@ mod tests {
                 months: -1,
                 days: -1,
                 micros: -86_400_000_000,
+                kind: spg_storage::IntervalKind::Finite,
             }
         );
     }

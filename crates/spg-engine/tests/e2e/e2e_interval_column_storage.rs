@@ -62,6 +62,7 @@ fn insert_select_round_trip_days_dimension() {
             months: 0,
             days: 1,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
     assert_eq!(
@@ -70,6 +71,7 @@ fn insert_select_round_trip_days_dimension() {
             months: 0,
             days: 30,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
     assert_eq!(
@@ -78,6 +80,7 @@ fn insert_select_round_trip_days_dimension() {
             months: 2,
             days: 0,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
 }
@@ -103,6 +106,7 @@ fn pg_byte_equal_day_vs_24h_preserved_through_storage() {
             months: 0,
             days: 1,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
     assert_eq!(
@@ -111,6 +115,7 @@ fn pg_byte_equal_day_vs_24h_preserved_through_storage() {
             months: 0,
             days: 0,
             micros: 86_400_000_000,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
     assert_ne!(r[0][0], r[1][0]);
@@ -133,6 +138,7 @@ fn compound_interval_round_trips_through_storage() {
             months: 14,
             days: 3,
             micros: (4_i64 * 3600 + 5 * 60 + 6) * 1_000_000,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
 }
@@ -152,6 +158,7 @@ fn nullable_interval_column_accepts_null() {
             months: 0,
             days: 1,
             micros: 0,
+            kind: spg_storage::IntervalKind::Finite,
         }
     );
 }
@@ -223,6 +230,7 @@ fn many_intervals_round_trip_unchanged() {
                 months: *m,
                 days: *d,
                 micros: *us,
+                kind: spg_storage::IntervalKind::Finite,
             },
             "round-trip mismatch @ idx {idx}: ({m}, {d}, {us})"
         );

@@ -19,6 +19,7 @@ fn as_interval(v: &spg_storage::Value<'_>) -> (i32, i32, i64) {
             months,
             days,
             micros,
+            kind,
         } => (*months, *days, *micros),
         other => panic!("expected Interval, got {other:?}"),
     }

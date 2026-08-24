@@ -9614,6 +9614,7 @@ pub(crate) fn synth_pg_timezone_names(engine: &Engine) -> (Vec<ColumnSchema>, Ve
                     months: 0,
                     days: 0,
                     micros: off_secs * 1_000_000,
+                    kind: spg_storage::IntervalKind::Finite,
                 },
                 Value::Bool(is_dst),
             ])
@@ -9649,6 +9650,7 @@ pub(crate) fn synth_pg_timezone_abbrevs(engine: &Engine) -> (Vec<ColumnSchema>, 
                     months: 0,
                     days: 0,
                     micros: off_secs * 1_000_000,
+                    kind: spg_storage::IntervalKind::Finite,
                 },
                 Value::Bool(is_dst),
             ])
