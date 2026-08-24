@@ -1040,6 +1040,22 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
 pub(crate) enum CompactText {
     Inline(u8, [u8; 15]),
     Heap(alloc::boxed::Box<str>),
+    /// v7.38.19 — the same text, and a promise about it: every byte is
+    /// in `[0-9a-z]`, which under the collations
+    /// [`crate::collate::Collated::ascii_byte_order`] names is byte
+    /// order. A comparison between two of these is a `memcmp`.
+    ///
+    /// The promise is carried rather than assumed. The first version of
+    /// this read it off the VARIANT — a plain `Text` key under such a
+    /// collation had to be alnum, because the key builder gave
+    /// everything else ICU's key — and that held only where the builder
+    /// and the comparator were handed the same collations. The join path
+    /// is not such a place, and `round688` came back
+    /// `Banana,Zebra,_under,apple,cherry,Ápple` where PostgreSQL gives
+    /// `apple,Ápple,Banana,cherry,_under,Zebra`. An invariant that two
+    /// call sites have to agree on is not an invariant.
+    Alnum(u8, [u8; 15]),
+    AlnumHeap(alloc::boxed::Box<str>),
 }
 
 impl CompactText {
@@ -1057,14 +1073,44 @@ impl CompactText {
         }
     }
 
+    /// v7.38.19 — the same text, marked as being in `[0-9a-z]`.
+    ///
+    /// Asked once, here, where the value is seen once. A sort of n rows
+    /// makes n·log₂n comparisons, and this test walks the string: on
+    /// 400,000 values of 192 characters, asking it per comparison
+    /// scanned 2.8 GB and was itself the cost the shortcut was meant to
+    /// remove.
+    /// The caller has already established that every byte is in
+    /// `[0-9a-z]`. Taking its word rather than asking again is worth
+    /// saying out loud: the test walks the string, and on 400,000 values
+    /// of 192 characters asking it twice cost a second 77 MB of
+    /// scanning — 45.7 ms became 74.4 while nothing else changed.
+    pub(crate) fn new_known_alnum(s: &str) -> Self {
+        let b = s.as_bytes();
+        if b.len() <= 15 {
+            let mut buf = [0u8; 15];
+            buf[..b.len()].copy_from_slice(b);
+            Self::Alnum(b.len() as u8, buf)
+        } else {
+            Self::AlnumHeap(s.into())
+        }
+    }
+
+    /// Whether this text carries the byte-order promise.
+    pub(crate) const fn is_alnum(&self) -> bool {
+        matches!(self, Self::Alnum(_, _) | Self::AlnumHeap(_))
+    }
+
     pub(crate) fn as_str(&self) -> &str {
         match self {
             // Built from a `&str`, so the bytes are valid UTF-8 by
             // construction; the slice is a prefix of one, which UTF-8
             // guarantees is itself valid only when cut at a boundary --
             // and `new` copies whole strings, never cuts.
-            Self::Inline(n, buf) => core::str::from_utf8(&buf[..*n as usize]).unwrap_or(""),
-            Self::Heap(s) => s,
+            Self::Inline(n, buf) | Self::Alnum(n, buf) => {
+                core::str::from_utf8(&buf[..*n as usize]).unwrap_or("")
+            }
+            Self::Heap(s) | Self::AlnumHeap(s) => s,
         }
     }
 }
@@ -1178,6 +1224,22 @@ pub(crate) enum OrderKey {
 /// collation, so equality is unchanged there too (`'a' = 'A'` is false) and
 /// only ORDER differs. A collation this build cannot perform keeps byte
 /// order, which is what round 679's CREATE TABLE warning tells the user.
+/// The original string a collated sort key carries after its NUL.
+///
+/// [`crate::collate::Collated::sort_key_of`] appends it so that two
+/// values the collation calls equal still order deterministically. It is
+/// read here for a second reason: a value that needed no key at all has
+/// only its text, and comparing the two kinds means putting them back on
+/// the same footing.
+///
+/// `None` when the shape is not that — the caller then falls through to
+/// the ordinary key comparison, which is what it did before this
+/// existed.
+fn original_after_key(key: &[u8]) -> Option<&str> {
+    let nul = key.iter().position(|b| *b == 0)?;
+    core::str::from_utf8(key.get(nul + 1..)?).ok()
+}
+
 fn order_key_elem_cmp_in(
     a: &OrderKey,
     b: &OrderKey,
@@ -1186,7 +1248,54 @@ fn order_key_elem_cmp_in(
     // v7.38.18 — resolved once by `order_by_collations`, not per call.
     // Building the collator here cost ten times the comparison.
     if let (OrderKey::Text(x), OrderKey::Text(y), Some(c)) = (a, b, collation) {
+        // v7.38.19 — under a collation that orders `[0-9a-z]` by bytes, a
+        // TEXT key can only have come from a value in that alphabet:
+        // `build_order_keys_bound` gives everything else ICU's key. So
+        // the question has already been asked, once, when the key was
+        // built — asking it again here would be asking it n·log₂n times.
+        //
+        // That is not a saving to be assumed. Three measurements on
+        // 400,000 rows of 192-character text, each one refuting the
+        // reading before it:
+        //
+        //   keys for everything            1701.9 ms
+        //   no keys, check per comparison  1467.5      (the scan moved, not left)
+        //   no keys, check per value          —        (same: `compare` still scanned)
+        //
+        // The scan was 384 bytes a comparison and 7.4 million
+        // comparisons. It had to stop being per-comparison, and the key
+        // VARIANT is what carries the answer.
+        if c.ascii_byte_order() && x.is_alnum() && y.is_alnum() {
+            return x.as_str().as_bytes().cmp(y.as_str().as_bytes());
+        }
         return c.compare(x.as_str(), y.as_str());
+    }
+    // v7.38.19 — one side keyed, one side not.
+    //
+    // Under a collation that orders `[0-9a-z]` by bytes, a value drawn
+    // from that alphabet carries no key: the text IS the key. A value
+    // with a space or a capital in it still needs ICU's. So a mixed
+    // column carries both kinds, and comparing across them cannot use
+    // either representation — a raw string against an ICU key would
+    // order by whichever bytes happened to be larger.
+    //
+    // The key ends with a NUL and then the original string, exactly so
+    // this case can recover it and ask the collator. Rare by
+    // construction: it costs one comparison per boundary between the two
+    // kinds, not one per row.
+    if let Some(c) = collation {
+        let recovered = match (a, b) {
+            (OrderKey::Text(x), OrderKey::Bytes(k)) => {
+                original_after_key(k).map(|y| c.compare(x.as_str(), y))
+            }
+            (OrderKey::Bytes(k), OrderKey::Text(y)) => {
+                original_after_key(k).map(|x| c.compare(x, y.as_str()))
+            }
+            _ => None,
+        };
+        if let Some(ord) = recovered {
+            return ord;
+        }
     }
     order_key_elem_cmp(a, b)
 }
@@ -1794,6 +1903,10 @@ pub(crate) fn build_order_keys_bound(
 ) -> Result<(), EngineError> {
     keys.clear();
     keys.reserve(order_by.len());
+    // v7.38.19 — set by the collated branch when the value carries the
+    // byte-order promise, so the key it pushes says so. Cleared at the
+    // head of that branch, which is where it is also read.
+    let mut alnum_text: Option<CompactText>;
     for (i, o) in order_by.iter().enumerate() {
         let borrowed: Option<&Value<'static>> = bound
             .get(i)
@@ -1862,15 +1975,57 @@ pub(crate) fn build_order_keys_bound(
                 _ => unreachable!("guarded by matches! above"),
             };
             keys.push(OrderKey::Text(CompactText::new(&folded)));
-        } else if let Some(k) = collations
-            .get(i)
-            .and_then(Option::as_ref)
-            .and_then(|c| match v {
-                Value::Text(t) => c.sort_key_of(t.as_ref()),
-                Value::BpChar(t) => c.sort_key_of(t.as_ref()),
-                _ => None,
-            })
-        {
+        } else if let Some(k) = ({
+            alnum_text = None;
+            collations.get(i).and_then(Option::as_ref)
+        })
+        // v7.38.19 — a collation whose `[0-9a-z]` order is byte order
+        // builds NO key, because its comparison is already cheap.
+        //
+        // Keys are bought to replace n·log₂n collator calls with n
+        // transforms. Where the comparison costs single-digit
+        // nanoseconds that trade is a loss, and a large one: the
+        // transform is the same ICU work either way. Measured on
+        // 400,000 rows of hex text, `ORDER BY … LIMIT 10` cost
+        // 1329.5 ms with keys against PostgreSQL 18's 11.0.
+        //
+        // The decision is per COLLATION, never per value: a column
+        // holding both `deadbeef` and `Dead Beef` must not key one
+        // and not the other, or the comparator would be handed two
+        // kinds of key and would order them by kind. `Collated::compare`
+        // handles the mixed column instead, testing both operands.
+        .and_then(|c| {
+            let t = match v {
+                Value::Text(t) | Value::BpChar(t) => t.as_ref(),
+                _ => return None,
+            };
+            // v7.38.19 — a value this collation orders by BYTES needs
+            // no key, and asking here is what makes that affordable.
+            //
+            // The test walks the string, so it is asked once per
+            // value. Asked per COMPARISON instead — n·log₂n of them
+            // — it scanned 2.8 GB on a 400,000-row sort and cost
+            // more than it saved: 1635.5 ms with keys, 1421.2 with
+            // the check in the comparator.
+            //
+            // A column holding both kinds therefore carries both
+            // kinds of key, and `order_key_elem_cmp_in` compares a
+            // Text against a Bytes by recovering the original from
+            // after the key's NUL and asking the collator. That
+            // case is the only one that pays, and it is the one that
+            // has to.
+            if c.ascii_byte_order() && crate::collate::is_ascii_alnum_lower(t) {
+                // Marked, not merely un-keyed: the comparator must
+                // not have to infer the promise from where the key
+                // came from. The join path hands the comparator a
+                // collation the key builder never saw, and inferring
+                // there gave `Banana,Zebra,_under,apple,cherry,Ápple`
+                // for PostgreSQL's `apple,Ápple,Banana,cherry,_under,Zebra`.
+                alnum_text = Some(CompactText::new_known_alnum(t));
+                return None;
+            }
+            c.sort_key_of(t)
+        }) {
             // v7.38.19 — the collated sort compares BYTES.
             //
             // `collations` has been a parameter of this function since
@@ -1886,6 +2041,8 @@ pub(crate) fn build_order_keys_bound(
             // ties still order deterministically; that is the same
             // tiebreak `Collated::compare` applies.
             keys.push(OrderKey::Bytes(k));
+        } else if let Some(t) = alnum_text {
+            keys.push(OrderKey::Text(t));
         } else {
             keys.push(value_to_order_key(v)?);
         }
