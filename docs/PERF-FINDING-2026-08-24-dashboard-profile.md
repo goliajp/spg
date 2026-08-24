@@ -1,7 +1,16 @@
 # The dashboard shape, under a profiler
 
-**Status: profiled. Two attacks tried and REVERTED, one named and not
-started. The remaining gap has a cause and a design.**
+**Status: the named attack is DONE, 2026-08-24. Two of the shapes it
+touches now beat PostgreSQL; the dashboard is 1.42x from 1.87x. The two
+reverted attacks stay recorded below, because two of the three readings
+in this document were wrong and the record of that is worth more than a
+tidy page.**
+
+| shape | before | after | PG 18 |
+|---|---:|---:|---:|
+| `count(*) WHERE project_id = 3` | 0.940 ms | **0.408** | 0.789 |
+| `SELECT id WHERE project_id = 3` | 0.951 | **0.410** | 0.791 |
+| `dashboard: top versions` | 6.473 | **5.436** | 3.828 |
 
 Sentori's `dashboard: top versions`:
 
@@ -99,16 +108,11 @@ the whole `WHERE` to each candidate because the seek's contract says the
 answer is a CANDIDATE set, which is true of the GIN, trigram and jsonb
 seeks and of a collated key, and not true here.
 
-## The attack, not started
+## The attack, done
 
-Let the seek report whether its answer was EXACT for the whole
-predicate, and let the caller skip the re-check when it was.
-
-Not started because it is a contract change across the whole seek
-family, and an arm that claims "exact" when it is over-approximate
-returns silently wrong rows — the failure mode this codebase has been
-bitten by twice this version alone. Each arm has to earn the claim
-separately:
+`Seeked { rows, exact }`. `exact` is FALSE everywhere it is not proven —
+a miss costs a re-check, a false claim silently drops or invents rows.
+Each arm earned the claim separately:
 
   * single-column equality on a non-collated key — exact
   * leading-prefix walk, when the predicate IS that one equality — exact
@@ -117,5 +121,20 @@ separately:
   * GIN / trigram / jsonb containment — NOT exact, by construction
   * anything with a residual conjunct — NOT exact
 
-It wants its own round, with a pin per arm and a negative control that
-puts a row in the candidate set the predicate rejects.
+"Stands for the value" is asked of the KEY rather than the value: a key
+that exists came through `probe_key`, which already refused a collated
+column and one whose comparison folds, so what is left is the type and
+the key's variant is the honest way to ask it. `DATE` and `TIMESTAMP`
+are absent from the allowlist even though both index as integers —
+they index as the SAME integer variant, so a key cannot say which it
+came from.
+
+Nine answer tests, every count taken from PostgreSQL 18.4 rather than
+reasoned about — the first draft of the prefix test asserted 30 where
+the answer is 15 and failed on the code being right. The negative
+control flips every arm to claim exactness; three tests go red. Two do
+NOT bite and say so in their own text: the collated equality is exact in
+FACT (the sort key appends the original bytes, so two strings never
+share a key) and is still not claimed exact, and no jsonb shape could be
+found where the candidate set is wider than the answer — six were
+tried.
