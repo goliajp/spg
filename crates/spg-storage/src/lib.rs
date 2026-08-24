@@ -3471,6 +3471,41 @@ impl Index {
         }
     }
 
+    /// v7.38.19 — the largest integer key this index holds.
+    ///
+    /// For the one question it answers — what number comes next for a
+    /// `serial` column — a tree already knows, and knew all along.
+    /// [`Table::next_auto_value`] read every row instead:
+    ///
+    /// ```text
+    ///   rows in the table    one INSERT      PostgreSQL 18
+    ///      1,000              1.831 ms          1.245
+    ///     10,000              1.814             1.289
+    ///     50,000              2.703             1.386
+    ///    200,000              3.666             1.375
+    /// ```
+    ///
+    /// Theirs is flat because a sequence is a counter. Ours grew with
+    /// the table, so an ingest workload got slower the longer it ran.
+    ///
+    /// A dead row version's key is still in the tree, so this can be
+    /// HIGHER than the maximum over live rows. That is the safe
+    /// direction — it hands out a value no row has ever held — and it
+    /// is the direction PostgreSQL goes too, which never reuses a
+    /// number a deleted row was given.
+    ///
+    /// `None` = no B-tree, or its keys are not integers, and the caller
+    /// falls back to the scan.
+    pub fn max_int_key(&self) -> Option<i64> {
+        let IndexKind::BTree(map) = &self.kind else {
+            return None;
+        };
+        match map.iter_rev().next()? {
+            (IndexKey::Int(n), _) => Some(*n),
+            _ => None,
+        }
+    }
+
     fn new_btree(name: String, column_position: usize) -> Self {
         Self {
             name,
