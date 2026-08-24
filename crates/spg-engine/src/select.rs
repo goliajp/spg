@@ -7492,36 +7492,118 @@ impl Engine {
                     .map(|(c, o)| (*c, o.desc, o.nulls_first))
                     .collect();
                 let mysql = ctx.mysql_dialect;
-                tagged.sort_by(|a, b| {
-                    for (i, (col, desc, nf)) in terms.iter().enumerate() {
-                        let va = a.1.values.get(*col);
-                        let vb = b.1.values.get(*col);
-                        let (Some(va), Some(vb)) = (va, vb) else {
-                            continue;
-                        };
-                        let _ = i;
-                        // v7.38.19 — two non-NULL strings, no MySQL fold, is
-                        // where a text sort spends every one of its ~7 M
-                        // comparisons, and the shared comparator cannot be
-                        // inlined into this loop: it carries NULL placement,
-                        // the fold, the NUMERIC bignum gate and the float
-                        // total order. Answering that one pair here is the
-                        // same answer by the same route — `value_cmp`'s
-                        // leading same-variant arm is `x.cmp(y)`, and the
-                        // raw comparator's last act is this reverse.
-                        let ord = match (va, vb) {
-                            (Value::Text(x), Value::Text(y)) if !mysql => {
-                                let c = x.cmp(y);
-                                if *desc { c.reverse() } else { c }
+                // v7.38.19 — sort a PERMUTATION carrying the first eight
+                // bytes, not the rows.
+                //
+                // The elements above are `(Vec<OrderKey>, Row)`, 48 bytes,
+                // and driftsort moves them ~n log n times: 7.4 M moves at
+                // 400,000 rows. Worse, every comparison chases three
+                // dependent loads PER SIDE to reach the byte it wants --
+                // the row's `Vec`, the `Value`, then the string's own
+                // buffer -- and a profile of this sort put 35% of its
+                // working samples in the sort machinery around that.
+                //
+                // A `(u64, u32)` is 16 bytes and the comparison reads it
+                // straight out of the array. The u64 is the first eight
+                // bytes big-endian, zero-padded, which ORDERS THE SAME as
+                // the string: if two differ inside those bytes they differ
+                // at the same index either way, and a string shorter than
+                // eight pads with zeros exactly where `[u8]`'s own
+                // comparison runs out. Equal prefixes fall through to the
+                // full comparator, so nothing rests on the padding being
+                // clever.
+                //
+                // The tail-break on the index is what keeps the sort
+                // STABLE, which `sort_by` was giving for free and an
+                // unstable sort over a permutation would not.
+                let keyed = sort_keys_of(&tagged, terms[0].0)
+                    .filter(|(keys, exact)| *exact || key_discriminates(keys));
+                if let Some((mut order, exact)) = keyed {
+                    let (first_col, first_desc, _) = terms[0];
+                    let row_cmp = |ia: u32, ib: u32| -> core::cmp::Ordering {
+                        let (a, b) = (&tagged[ia as usize], &tagged[ib as usize]);
+                        for (col, desc, nf) in &terms {
+                            let (Some(va), Some(vb)) = (a.1.values.get(*col), b.1.values.get(*col))
+                            else {
+                                continue;
+                            };
+                            let ord = match (va, vb) {
+                                (Value::Text(x), Value::Text(y)) if !mysql => {
+                                    let c = crate::orderby::str_cmp_prefix_first(x, y);
+                                    if *desc { c.reverse() } else { c }
+                                }
+                                _ => {
+                                    crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql)
+                                }
+                            };
+                            if ord != core::cmp::Ordering::Equal {
+                                return ord;
                             }
-                            _ => crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql),
-                        };
-                        if ord != core::cmp::Ordering::Equal {
-                            return ord;
                         }
-                    }
-                    core::cmp::Ordering::Equal
-                });
+                        core::cmp::Ordering::Equal
+                    };
+                    let _ = first_col;
+                    order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
+                        let c = pa.cmp(&pb);
+                        let c = if first_desc { c.reverse() } else { c };
+                        if c != core::cmp::Ordering::Equal {
+                            return c;
+                        }
+                        // An EXACT key that ties means the values are
+                        // equal, so only the remaining terms can speak.
+                        // A prefix that ties has decided nothing yet and
+                        // the first term must be asked again, which
+                        // `row_cmp` does by walking every term from the
+                        // start.
+                        if exact && terms.len() == 1 {
+                            return ia.cmp(&ib);
+                        }
+                        row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
+                    });
+                    let mut slots: Vec<Option<(Vec<crate::orderby::OrderKey>, Row<'static>)>> =
+                        core::mem::take(&mut tagged).into_iter().map(Some).collect();
+                    tagged = order
+                        .iter()
+                        .map(|&(_, i)| {
+                            slots[i as usize]
+                                .take()
+                                .expect("the permutation names each row once")
+                        })
+                        .collect();
+                } else {
+                    tagged.sort_by(|a, b| {
+                        for (i, (col, desc, nf)) in terms.iter().enumerate() {
+                            let va = a.1.values.get(*col);
+                            let vb = b.1.values.get(*col);
+                            let (Some(va), Some(vb)) = (va, vb) else {
+                                continue;
+                            };
+                            let _ = i;
+                            // v7.38.19 — two non-NULL strings, no MySQL fold, is
+                            // where a text sort spends every one of its ~7 M
+                            // comparisons, and the shared comparator cannot be
+                            // inlined into this loop: it carries NULL placement,
+                            // the fold, the NUMERIC bignum gate and the float
+                            // total order. Answering that one pair here is the
+                            // same answer by the same route — `value_cmp`'s
+                            // leading same-variant arm is `x.cmp(y)`, and the
+                            // raw comparator's last act is this reverse.
+                            let ord = match (va, vb) {
+                                (Value::Text(x), Value::Text(y)) if !mysql => {
+                                    let c = crate::orderby::str_cmp_prefix_first(x, y);
+                                    if *desc { c.reverse() } else { c }
+                                }
+                                _ => {
+                                    crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql)
+                                }
+                            };
+                            if ord != core::cmp::Ordering::Equal {
+                                return ord;
+                            }
+                        }
+                        core::cmp::Ordering::Equal
+                    });
+                }
             } else {
                 crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &order_colls);
             }
@@ -13976,6 +14058,87 @@ fn value_order_is_key_order(col: &ColumnSchema) -> bool {
             col.ty,
             T::SmallInt | T::Int | T::BigInt | T::Text | T::Varchar(_) | T::Bool | T::Uuid
         )
+}
+
+/// An eight-byte key for each row's sort column, paired with the row's
+/// index — or `None` when the column cannot give one on every row.
+///
+/// v7.38.19 — the pair is what the sort array holds instead of the row.
+/// Two kinds of column can supply it:
+///
+///   * an INTEGER, whose whole value fits. Flipping the sign bit maps
+///     the signed order onto the unsigned one, so the key is EXACT and
+///     a comparison never has to look at the row at all.
+///   * TEXT, as the first eight bytes big-endian, zero-padded. That
+///     orders the same as the string — two that differ inside those
+///     bytes differ at the same index either way, and one shorter than
+///     eight pads with zeros exactly where `[u8]`'s own comparison runs
+///     out — but it is a PREFIX, so equal keys must still ask the full
+///     comparator.
+///
+/// The `None` is the safety of it: a NULL or any other type has no
+/// faithful eight-byte key, so such a column takes the ordinary path
+/// rather than being given a made-up one.
+fn sort_keys_of(
+    tagged: &[(Vec<crate::orderby::OrderKey>, Row<'static>)],
+    col: usize,
+) -> Option<(Vec<(u64, u32)>, bool)> {
+    let n = u32::try_from(tagged.len()).ok()?;
+    let mut out: Vec<(u64, u32)> = Vec::with_capacity(tagged.len());
+    let exact = match tagged.first()?.1.values.get(col)? {
+        Value::Text(_) => false,
+        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => true,
+        _ => return None,
+    };
+    for (i, row) in (0..n).zip(tagged.iter()) {
+        let key = match row.1.values.get(col) {
+            Some(Value::Text(t)) if !exact => {
+                let mut k = [0u8; 8];
+                let bytes = t.as_bytes();
+                let take = bytes.len().min(8);
+                k[..take].copy_from_slice(&bytes[..take]);
+                u64::from_be_bytes(k)
+            }
+            Some(Value::SmallInt(v)) if exact => (i64::from(*v) as u64) ^ (1 << 63),
+            Some(Value::Int(v)) if exact => (i64::from(*v) as u64) ^ (1 << 63),
+            Some(Value::BigInt(v)) if exact => (*v as u64) ^ (1 << 63),
+            _ => return None,
+        };
+        out.push((key, i));
+    }
+    Some((out, exact))
+}
+
+/// Whether a PREFIX key is worth sorting a permutation on.
+///
+/// v7.38.19 — it is not always, and the panel says so in one cell. The
+/// `text (26 values)` fixture is two hundred identical characters drawn
+/// from twenty-six letters, so every eight-byte prefix inside a letter
+/// is the same and 15,000 rows tie on it. Each tie then pays the prefix
+/// compare, a two-hundred-byte comparison, AND a random read into a
+/// 400,000-element array — while sorting the rows in place keeps the
+/// partition contiguous. Measured: 160 ms sorting rows, 247 ms sorting
+/// the permutation, on the very fixture built to be degenerate.
+///
+/// So the permutation is taken when the key DECIDES, and a sample says
+/// whether it does. An exact key always decides; a prefix has to earn
+/// it.
+fn key_discriminates(keys: &[(u64, u32)]) -> bool {
+    const SAMPLE: usize = 1024;
+    let step = (keys.len() / SAMPLE).max(1);
+    let mut seen: Vec<u64> = keys
+        .iter()
+        .step_by(step)
+        .take(SAMPLE)
+        .map(|&(k, _)| k)
+        .collect();
+    let taken = seen.len();
+    if taken < 8 {
+        return true;
+    }
+    seen.sort_unstable();
+    seen.dedup();
+    seen.len() * 2 >= taken
 }
 
 fn order_by_output_cols_if_identical(

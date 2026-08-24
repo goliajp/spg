@@ -222,26 +222,53 @@ fn main() {
             // The time is printed rather than dropped: a total that cannot
             // show what it excluded is a total that overstates.
             if tier == "precommit" {
-                let t_prep = std::time::Instant::now();
-                let out = std::process::Command::new("cargo")
-                    .args(["build", "-q", "--workspace", "--all-targets"])
-                    .current_dir(root)
-                    .status();
-                let took = t_prep.elapsed();
-                match out {
-                    Ok(st) if st.success() => println!(
-                        "prepare: cargo build --workspace --all-targets in {took:?} \
-                         (outside every budget and the tier total)"
+                // v7.38.19 — the second line is the one that was missing,
+                // and its absence cost four release commits.
+                //
+                // `--all-targets` does not build a lib's UNIT-test
+                // harness: that is the crate compiled with `--cfg test`,
+                // a different artifact from the lib, the bins, the
+                // integration tests and the benches. So `unit-affected`
+                // was compiling twelve crates before it could run a
+                // single test, inside a hard 480 s budget, and reported
+                // 487 s, 658 s and 723 s on three tries while every step
+                // in it was green. The same command with the harnesses
+                // already built takes 132 s.
+                //
+                // Which is exactly what the note above says prepare is
+                // for: a budget that a compile can blow is measuring the
+                // workspace, not the change.
+                for (args, label) in [
+                    (
+                        ["build", "-q", "--workspace", "--all-targets"].as_slice(),
+                        "cargo build --workspace --all-targets",
                     ),
-                    Ok(st) => {
-                        eprintln!(
-                            "prepare: cargo build failed ({st}) — nothing below would mean anything"
-                        );
-                        std::process::exit(1);
-                    }
-                    Err(e) => {
-                        eprintln!("prepare: cargo build could not run: {e}");
-                        std::process::exit(1);
+                    (
+                        ["test", "-q", "--workspace", "--no-run", "--lib", "--bins"].as_slice(),
+                        "cargo test --workspace --no-run --lib --bins",
+                    ),
+                ] {
+                    let t_prep = std::time::Instant::now();
+                    let out = std::process::Command::new("cargo")
+                        .args(args)
+                        .current_dir(root)
+                        .status();
+                    let took = t_prep.elapsed();
+                    match out {
+                        Ok(st) if st.success() => println!(
+                            "prepare: {label} in {took:?} \
+                             (outside every budget and the tier total)"
+                        ),
+                        Ok(st) => {
+                            eprintln!(
+                                "prepare: {label} failed ({st}) — nothing below would mean anything"
+                            );
+                            std::process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("prepare: {label} could not run: {e}");
+                            std::process::exit(1);
+                        }
                     }
                 }
             }
