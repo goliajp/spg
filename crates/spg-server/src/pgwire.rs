@@ -5209,7 +5209,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42883"
         // v7.39 (read01 round 45, commands/) — DDL object errors.
         // A second PRIMARY KEY is PG's 42P16 INVALID_TABLE_DEFINITION.
-        } else if msg.contains("multiple primary keys for table") {
+        } else if msg.contains("multiple primary keys for table")
+            // v7.38.19 — a column declared with a pseudo-type is the same
+            // class: the table definition is invalid, not the type
+            // undefined.
+            || msg.contains("has pseudo-type")
+        {
             "42P16"
         // A GENERATED ALWAYS identity/column explicit-value insert is PG's
         // 428C9 GENERATED_ALWAYS.

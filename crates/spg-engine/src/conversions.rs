@@ -26,6 +26,49 @@ use crate::numeric::{
 /// `invalid hexadecimal digit: "Z"` (naming the offending character) and
 /// `invalid hexadecimal data: odd number of digits`. They used to be SPG
 /// phrasings wrapped in `cannot parse "…" as BYTEA: `.
+/// PostgreSQL's pseudo-types, canonically spelled.
+///
+/// v7.38.19 — `SELECT typname FROM pg_type WHERE typtype = 'p'` on
+/// PostgreSQL 18.4, minus `any` and `_record`. `any` is a reserved word,
+/// so PG answers a syntax error rather than a type error and matching
+/// its list here would replace one with the other; `_record` is the
+/// array spelling and is not written by hand.
+///
+/// A pseudo-type has no storage. PG refuses a column declared with one,
+/// and it refuses it as an INVALID TABLE DEFINITION (42P16) rather than
+/// an undefined type (42704) -- the name exists, it just cannot hold a
+/// value. SPG answered `type "cstring" does not exist`, which is the
+/// wrong class and the wrong claim.
+pub(crate) fn pseudo_type(name: &str) -> Option<&'static str> {
+    const NAMES: &[&str] = &[
+        "anyarray",
+        "anycompatible",
+        "anycompatiblearray",
+        "anycompatiblemultirange",
+        "anycompatiblenonarray",
+        "anycompatiblerange",
+        "anyelement",
+        "anyenum",
+        "anymultirange",
+        "anynonarray",
+        "anyrange",
+        "cstring",
+        "event_trigger",
+        "fdw_handler",
+        "index_am_handler",
+        "internal",
+        "language_handler",
+        "pg_ddl_command",
+        "record",
+        "table_am_handler",
+        "trigger",
+        "tsm_handler",
+        "unknown",
+        "void",
+    ];
+    NAMES.iter().find(|n| n.eq_ignore_ascii_case(name)).copied()
+}
+
 pub(crate) fn decode_bytea_literal(s: &str) -> Result<alloc::vec::Vec<u8>, alloc::string::String> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
