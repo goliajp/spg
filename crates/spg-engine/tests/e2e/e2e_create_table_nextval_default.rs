@@ -188,3 +188,102 @@ fn the_catalog_text_matches_postgresql() {
         ["nextval('zs')"]
     );
 }
+
+/// The next value for a `serial` column must not depend on how many
+/// rows the table holds.
+///
+/// It did: `next_auto_value` walked every row to find the maximum, so
+/// one INSERT into a 200,000-row table cost 3.666 ms against
+/// PostgreSQL 18's flat 1.375, and the gap grew with the table —
+/// 1.831 at a thousand rows, 2.703 at fifty thousand. An ingest
+/// workload got slower the longer it ran. It is 1.106 now, against
+/// their 1.075.
+///
+/// The assertion is on the DECISION, because nothing else can see it.
+/// The first version of this test watched `seq_scan` and asserted it did
+/// not move — it does not move either way, since that counter is for
+/// query-level scans and this walk is inside the insert path. Removing
+/// the fix left the test green, which is how it was found; a test whose
+/// negative control passes is checking nothing.
+///
+/// The two paths cannot be told apart by their ANSWERS — measured, they
+/// agree, including after a delete (see the case below) — so the
+/// decision is asked directly, from the one place that makes it.
+#[test]
+fn the_next_serial_value_comes_from_the_index_not_the_rows() {
+    use spg_storage::Table;
+
+    fn table_of(e: &Engine, name: &str) -> Table {
+        e.catalog()
+            .get(name)
+            .unwrap_or_else(|| panic!("no table {name}"))
+            .clone()
+    }
+
+    let mut e = Engine::new();
+    e.execute("CREATE SEQUENCE zs").unwrap();
+    e.execute("CREATE TABLE indexed (id bigint PRIMARY KEY DEFAULT nextval('zs'), k text)")
+        .unwrap();
+    e.execute("CREATE TABLE plain (id bigserial, k text)")
+        .unwrap();
+    for i in 0..50 {
+        e.execute(&format!("INSERT INTO indexed (k) VALUES ('r{i}')"))
+            .unwrap();
+        e.execute(&format!("INSERT INTO plain (k) VALUES ('r{i}')"))
+            .unwrap();
+    }
+
+    let indexed = table_of(&e, "indexed");
+    let plain = table_of(&e, "plain");
+    assert_eq!(
+        indexed.auto_value_from_index(0),
+        Some(51),
+        "a PRIMARY KEY is an index, and its largest key is the answer"
+    );
+    assert_eq!(
+        plain.auto_value_from_index(0),
+        None,
+        "no index on the column, so there is nothing to descend"
+    );
+    // Whichever path a table takes, the number is the same.
+    assert_eq!(indexed.next_auto_value(0), Some(51));
+    assert_eq!(plain.next_auto_value(0), Some(51));
+
+    e.execute("INSERT INTO indexed (k) VALUES ('one more')")
+        .unwrap();
+    assert_eq!(rows(&mut e, "SELECT max(id) FROM indexed"), ["BigInt(51)"]);
+    assert_eq!(rows(&mut e, "SELECT count(*) FROM indexed"), ["BigInt(51)"]);
+}
+
+/// Deleting the highest row and inserting again does not reuse its id —
+/// on either path, and on PostgreSQL 18.4, which all three answer
+/// `1,2,3,4,6`. A deleted row leaves a version behind that the tree and
+/// the scan both still see, which is what makes the two paths
+/// interchangeable rather than merely similar.
+#[test]
+fn a_deleted_top_id_is_not_handed_out_again() {
+    for ddl in [
+        "CREATE TABLE dz (id bigserial PRIMARY KEY, k text)",
+        "CREATE TABLE dz (id bigserial, k text)",
+    ] {
+        let mut e = Engine::new();
+        e.execute(ddl).unwrap();
+        for i in 0..5 {
+            e.execute(&format!("INSERT INTO dz (k) VALUES ('r{i}')"))
+                .unwrap();
+        }
+        e.execute("DELETE FROM dz WHERE id = 5").unwrap();
+        e.execute("INSERT INTO dz (k) VALUES ('after')").unwrap();
+        assert_eq!(
+            rows(&mut e, "SELECT id FROM dz ORDER BY id"),
+            [
+                "BigInt(1)",
+                "BigInt(2)",
+                "BigInt(3)",
+                "BigInt(4)",
+                "BigInt(6)"
+            ],
+            "{ddl}"
+        );
+    }
+}

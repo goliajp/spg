@@ -1143,10 +1143,47 @@ impl Table {
     /// when the column currently holds no integer values. NULL / non-
     /// integer cells are skipped. Returns `None` when the column isn't
     /// an integer type.
+    /// v7.38.19 — the next value for `col_pos` taken from its index,
+    /// or `None` when there is no index to take it from.
+    ///
+    /// A B-tree already holds these values in order, so its largest key
+    /// is a descent rather than a walk of every row. [`Self::next_auto_value`]
+    /// walked, and one INSERT with a `bigserial` id cost:
+    ///
+    /// ```text
+    ///   rows        before     after     PostgreSQL 18
+    ///    1,000     1.831 ms      —          1.245
+    ///   50,000     2.703         —          1.386
+    ///  200,000     3.666       1.106        1.075
+    /// ```
+    ///
+    /// Theirs is flat because a sequence is a counter; ours grew with
+    /// the table, so an ingest workload got slower the longer it ran.
+    ///
+    /// Separate from `next_auto_value` and public so a test can ask
+    /// WHICH path a table takes — the two answer identically, measured,
+    /// so nothing else can tell them apart from the outside. Deleting
+    /// the highest row and inserting again gives `1,2,3,4,6` either way
+    /// and on PostgreSQL 18.4, because a deleted row leaves a version
+    /// behind that both the tree and the scan still see.
+    pub fn auto_value_from_index(&self, col_pos: usize) -> Option<i64> {
+        let m = self.index_on(col_pos)?.max_int_key()?;
+        let floor = self
+            .schema
+            .columns
+            .get(col_pos)
+            .and_then(|c| c.auto_restart)
+            .unwrap_or(i64::MIN);
+        Some((m + 1).max(floor))
+    }
+
     pub fn next_auto_value(&self, col_pos: usize) -> Option<i64> {
         let ty = self.schema.columns.get(col_pos)?.ty;
         if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
             return None;
+        }
+        if let Some(v) = self.auto_value_from_index(col_pos) {
+            return Some(v);
         }
         let mut max: Option<i64> = None;
         for row in &self.rows {

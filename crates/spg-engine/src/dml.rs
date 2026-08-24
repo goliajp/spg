@@ -6753,10 +6753,10 @@ fn explicit_auto_value(raw: &Value<'_>) -> Option<i64> {
 ///
 /// Neither is simply right. PostgreSQL's counter will eventually reach
 /// 50 and collide; ours never hands out a value the table already
-/// holds. It is also not free: this is a scan, so one INSERT into a
-/// 200,000-row table costs 3.666 ms against PostgreSQL's flat 1.375,
-/// and the gap grows with the table. `docs/RECORDED_DELTAS.md` carries
-/// the measurements and the argument.
+/// holds. The COST of ours is closed — v7.38.19 reads the column's
+/// B-tree instead of walking every row, 3.666 ms to 1.106 on a
+/// 200,000-row table against PostgreSQL's 1.075 — so what remains is
+/// the decision. `docs/RECORDED_DELTAS.md` carries the measurements.
 fn auto_cursor_seed(
     table: &spg_storage::Table,
     i: usize,

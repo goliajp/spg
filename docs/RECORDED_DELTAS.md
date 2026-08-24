@@ -95,13 +95,17 @@ have not decided which we owe our users. Matching PostgreSQL means
 importing the landmine; keeping ours means a `SELECT nextval()` and an
 INSERT can disagree about what comes next.
 
-It is not free either way: max-plus-one is computed by scanning the
-table's rows, so one INSERT into a 200,000-row table costs 3.666 ms
-against PostgreSQL's flat 1.375, and the gap grows with the table (1.831
-at a thousand rows, 2.703 at fifty thousand). A real counter would close
-that AND the divergence above in one move — which is the argument for
-eventually taking PostgreSQL's side of it, with a floor at the table's
-maximum so the landmine does not come with it.
+The COST of ours is closed. Max-plus-one used to be computed by walking
+every row, so one INSERT into a 200,000-row table cost 3.666 ms against
+PostgreSQL's flat 1.375 and the gap grew with the table — 1.831 at a
+thousand rows, 2.703 at fifty thousand. A B-tree on the column already
+holds those values in order, so v7.38.19 takes its largest key instead:
+**1.106 ms against their 1.075**, and flat.
+
+What is left is only the divergence, which is a decision and not a
+defect. A column with no index on it still walks; that is the shape
+where the two are hardest to tell apart and also the shape nobody
+numbers.
 
 ### RD-2, priced
 
