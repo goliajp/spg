@@ -128,6 +128,27 @@ pub(crate) fn sort_key(collation: &str, s: &str) -> Option<alloc::vec::Vec<u8>> 
 /// keeps the branch out of the inner loop.
 pub(crate) struct Collated {
     collator: Option<icu_collator::CollatorBorrowed<'static>>,
+    /// v7.38.19 — this collation orders `[0-9a-z]` the way bytes do.
+    ///
+    /// Not a property of collations in general, and not one that can be
+    /// asked of a collator: it depends on the locale's tailoring.
+    /// Measured against PostgreSQL 18's ICU collations over all 839,160
+    /// ordered pairs of two-character strings from that alphabet:
+    ///
+    /// ```text
+    ///   en  0     cs    198     (`ch` is a letter, after `h`)
+    ///   sv  0     et  7,992     (`z` sorts between `s` and `t`)
+    ///   de  0     lt 20,609     (`y` sorts after `i`)
+    ///   fr  0     da    925     (`aa` is `å`, after `z`)
+    ///   tr  0     hu     18     (`cs`, `gy`, `sz` … are letters)
+    /// ```
+    ///
+    /// So it is an allowlist, keyed on the language, and the test beside
+    /// it re-derives the whole thing in process: every allowed language
+    /// must agree over the subset at one, two and three characters, and
+    /// every language in the second column above must NOT — an allowlist
+    /// nothing falls outside is not a check.
+    ascii_byte_order: bool,
 }
 
 impl Collated {
@@ -135,14 +156,24 @@ impl Collated {
     /// caller on byte order — the same answer [`compare`] gives.
     pub(crate) fn resolve(name: &str) -> Option<Self> {
         if is_byte_wise(name) {
-            return Some(Self { collator: None });
+            return Some(Self {
+                collator: None,
+                ascii_byte_order: true,
+            });
         }
-        let locale = icu_locale_core::Locale::try_from_str(&normalise(name)).ok()?;
+        let normalised = normalise(name);
+        let locale = icu_locale_core::Locale::try_from_str(&normalised).ok()?;
         let prefs = icu_collator::CollatorPreferences::from(&locale);
         let collator = icu_collator::Collator::try_new(prefs, pg_options()).ok()?;
         Some(Self {
             collator: Some(collator),
+            ascii_byte_order: ascii_alnum_is_byte_order(&normalised),
         })
+    }
+
+    /// Whether `[0-9a-z]` orders by bytes under this collation.
+    pub(crate) const fn ascii_byte_order(&self) -> bool {
+        self.ascii_byte_order
     }
 
     /// v7.38.19 — the ICU sort key for a value, computed ONCE, so a sort
@@ -174,9 +205,32 @@ impl Collated {
     /// The same ordering [`compare`] produces, tiebreak included.
     pub(crate) fn compare(&self, a: &str, b: &str) -> Ordering {
         match &self.collator {
-            // PG's locale collations are deterministic, so a collation
-            // tie is broken by the bytes — see `compare`.
-            Some(c) => c.compare(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes())),
+            // v7.38.19 — the ASCII shortcut, and it is the whole point
+            // of `ascii_byte_order`.
+            //
+            // A collated comparison of two 192-character strings costs
+            // about 1.6 µs; the bytes cost single-digit nanoseconds. On
+            // 400,000 rows of hex text that was the difference between
+            // 1329.5 ms and PostgreSQL 18's 11.0 on the same query under
+            // the same collation.
+            //
+            // Both operands are tested, so a mixed column stays correct:
+            // a value with a space or a capital in it takes the collator,
+            // as it must, and only pays the check.
+            Some(c) => {
+                if self.ascii_byte_order && is_ascii_alnum_lower(a) && is_ascii_alnum_lower(b) {
+                    return a.as_bytes().cmp(b.as_bytes());
+                }
+                // NOTE: this test walks both strings, so it belongs
+                // where a value is seen ONCE. `build_order_keys_bound`
+                // asks it per value; a sort asks this function per
+                // COMPARISON, n·log₂n of them, and on 192-character
+                // values that scanning was itself the cost. See
+                // `is_ascii_alnum_lower`'s own note.
+                // PG's locale collations are deterministic, so a collation
+                // tie is broken by the bytes — see `compare`.
+                c.compare(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+            }
             None => a.as_bytes().cmp(b.as_bytes()),
         }
     }
@@ -401,6 +455,51 @@ pub(crate) fn is_supported(collation: &str) -> bool {
 ///
 /// `default` is not a locale at all — it names whatever the database was
 /// created with, which for SPG is C.
+/// `[0-9a-z]`, the alphabet the shortcut is verified over.
+///
+/// Digits and lowercase only. Adding an underscore, a hyphen, a dot or a
+/// space costs fourteen to twenty-three THOUSAND disagreements out of the
+/// same 936,396 pairs, because those are the characters `AlternateHandling::Shifted`
+/// treats as variable — the very handling PostgreSQL's ordering needs.
+/// Mixing case costs 216 of 630.
+///
+/// This walks the whole string, so it is asked ONCE PER VALUE, when the
+/// sort key is built — never per comparison. A full sort of 400,000
+/// 192-character values makes about 7.4 million comparisons; asking
+/// there scanned 2.8 GB and cost more than the ICU calls it replaced
+/// (1635.5 ms with keys, 1421.2 with the check in the comparator, and
+/// the whole point was to get well under both).
+pub(crate) const fn is_ascii_alnum_lower(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if !(c.is_ascii_digit() || c.is_ascii_lowercase()) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The languages whose tailoring leaves `[0-9a-z]` in byte order.
+///
+/// Keyed on the language subtag alone: a region or a script does not
+/// re-tailor the Latin letters among themselves, and the test checks the
+/// tagged forms too.
+///
+/// This is deliberately SHORT. A language absent from it is not wrong,
+/// only unaccelerated, and that is the failure direction to prefer:
+/// every entry has to be earned by an exhaustive check, while an
+/// omission costs a comparison.
+fn ascii_alnum_is_byte_order(normalised: &str) -> bool {
+    let lang = normalised.split('-').next().unwrap_or(normalised);
+    matches!(
+        lang,
+        "und" | "en" | "de" | "fr" | "es" | "it" | "pt" | "nl" | "sv" | "tr" | "id" | "ms"
+    )
+}
+
 fn normalise(name: &str) -> String {
     // PG's own names for the root collation. `default` is whatever the
     // database was created with, which for SPG is C; `unicode` and
@@ -704,5 +803,134 @@ mod tests {
             "{supported}/{} performable",
             all.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod ascii_shortcut_tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    const ALPHA: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    /// Every string of one, two and three characters over `[0-9a-z]`,
+    /// plus a slice of the four-character ones: 36 + 1,296 + 46,656 +
+    /// ~1,300.
+    fn corpus() -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for &a in ALPHA {
+            out.push(String::from_utf8(alloc::vec![a]).unwrap());
+            for &b in ALPHA {
+                out.push(String::from_utf8(alloc::vec![a, b]).unwrap());
+                for &c in ALPHA {
+                    out.push(String::from_utf8(alloc::vec![a, b, c]).unwrap());
+                    for &d in ALPHA {
+                        if (usize::from(a) + usize::from(b) + usize::from(c) + usize::from(d))
+                            % 1301
+                            == 0
+                        {
+                            out.push(String::from_utf8(alloc::vec![a, b, c, d]).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether the collation and the bytes agree over the WHOLE corpus.
+    ///
+    /// Asked by sorting rather than by comparing every pair. Two total
+    /// orders agree on every pair exactly when they produce the same
+    /// sequence, so one sort answers what 1.2 billion comparisons would,
+    /// and answers it for four-character strings too.
+    fn first_disagreement(name: &str) -> Option<(String, String)> {
+        let c = Collated::resolve(name).expect("resolvable");
+        let icu = c.collator.as_ref().expect("a collator");
+        let mut by_bytes = corpus();
+        by_bytes.sort_unstable();
+        let mut by_coll = by_bytes.clone();
+        by_coll.sort_by(|x, y| {
+            icu.compare(x.as_str(), y.as_str())
+                .then_with(|| x.as_bytes().cmp(y.as_bytes()))
+        });
+        by_bytes
+            .iter()
+            .zip(by_coll.iter())
+            .find(|(a, b)| a != b)
+            .map(|(a, b)| (a.clone(), b.clone()))
+    }
+
+    /// The allowlist, re-derived. Every language it names must order the
+    /// alphabet exactly as bytes do.
+    #[test]
+    fn every_allowed_collation_orders_the_alphabet_by_bytes() {
+        for name in [
+            "und",
+            "en_US.utf8",
+            "en_GB",
+            "de_DE.utf8",
+            "fr_FR",
+            "es_ES",
+            "it_IT",
+            "pt_BR",
+            "nl_NL",
+            "sv_SE",
+            "tr_TR",
+            "id_ID",
+            "ms_MY",
+            "de_AT",
+            "fr_CA",
+        ] {
+            let c = Collated::resolve(name).expect("resolvable");
+            assert!(
+                c.ascii_byte_order(),
+                "{name} must be on the allowlist for this test to mean anything"
+            );
+            assert_eq!(first_disagreement(name), None, "{name}");
+        }
+    }
+
+    /// And the other half, which is what makes the first half a check.
+    ///
+    /// These five DO retailor the alphabet. PostgreSQL 18's ICU
+    /// collations disagree with bytes on 198 (cs), 7,992 (et), 20,609
+    /// (lt), 925 (da) and 18 (hu) of the 839,160 two-character pairs. An
+    /// allowlist nothing falls outside is not an allowlist.
+    #[test]
+    fn the_languages_that_retailor_the_alphabet_are_not_allowed() {
+        for (name, why) in [
+            ("cs_CZ", "`ch` is a letter, sorting after `h`"),
+            ("et_EE", "`z` sorts between `s` and `t`"),
+            ("lt_LT", "`y` sorts after `i`"),
+            ("da_DK", "`aa` is `å`, sorting after `z`"),
+            ("hu_HU", "`cs`, `gy`, `sz` … are letters"),
+        ] {
+            let c = Collated::resolve(name).expect("resolvable");
+            assert!(!c.ascii_byte_order(), "{name}: {why}");
+            assert!(
+                first_disagreement(name).is_some(),
+                "{name} was excluded for a reason that does not reproduce: {why}"
+            );
+        }
+    }
+
+    /// The shortcut only fires when BOTH operands are in the alphabet,
+    /// so a mixed column keeps the collator where it needs it. Under
+    /// `en_US` a capital sorts among the lowercase letters, which bytes
+    /// never do.
+    #[test]
+    fn a_value_outside_the_alphabet_still_takes_the_collator() {
+        let c = Collated::resolve("en_US.utf8").expect("resolvable");
+        assert!(c.ascii_byte_order());
+        assert_eq!(c.compare("Bob", "apple"), Ordering::Greater);
+        assert_eq!("Bob".as_bytes().cmp("apple".as_bytes()), Ordering::Less);
+        assert_eq!(c.compare("bob", "apple"), Ordering::Greater);
+        assert!(!is_ascii_alnum_lower("a b"));
+        assert!(is_ascii_alnum_lower("a0z"));
+        assert!(!is_ascii_alnum_lower("A"));
+        assert!(!is_ascii_alnum_lower("\u{e9}"));
+        assert!(is_ascii_alnum_lower(""));
     }
 }

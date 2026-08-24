@@ -144,6 +144,7 @@ mod e2e_collate_minmax_round690;
 mod e2e_collate_order_group;
 mod e2e_collate_order_round688;
 mod e2e_collate_range_round693;
+mod e2e_collated_mixed_keys;
 mod e2e_collation_round670;
 mod e2e_column_accepts_round643;
 mod e2e_column_acl_round59;
