@@ -217,6 +217,8 @@ setup_table() { # $1=uri $2=table $3=rows $4=work_mem-setting
   got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
   # Rule 2: a timing read off an unverified table is not evidence.
   [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
+  "${PSQL}" --no-psqlrc -X -q "$1" -c "ANALYZE $2" >/dev/null 2>&1 ||
+    { echo "SETUP FAILED: ANALYZE $2 on $1 — see the note above setup_sort_table" >&2; exit 2; }
 }
 
 # r1042 — a SECOND fixture, for the types v7.37.26 gave index keys to.
@@ -291,6 +293,25 @@ PG_WM="SET work_mem='4MB'"
 #
 # A sort attack judged on `pad` alone is a sort attack judged on a
 # degenerate case.
+# v7.38.19 — ANALYZE, on both legs, before anything is timed.
+#
+# Without it the release verdict was a coin flip about autovacuum. A
+# freshly built `sortfix_400000` has no statistics, so PostgreSQL
+# estimated 1,030,370 rows for 400,000 and planned a SERIAL external
+# merge; once analysed it estimates correctly and plans a PARALLEL
+# Gather Merge with two workers. Whether the daemon happened to reach
+# the table before the timed loop therefore decided PG's level for the
+# WHOLE run -- 61 ms in one run and 117-128 in the next, on identical
+# fixtures.
+#
+# The panel's own numbers show why repetition could not absorb it:
+# `time_one` already takes the best of three in one session and the
+# loop takes the best of five of those, and within a single run both
+# legs land inside 0.4%. It was never sampling noise. It was two
+# different query plans, and no number of samples averages those.
+#
+# Measured with the SAME binary on both sides, the sort cell read 2.92x
+# and then 4.95x, and a release was judged on the difference.
 setup_sort_table() { # $1=uri $2=table $3=rows
   "${PSQL}" --no-psqlrc -X -q "$1" \
     -c "DROP TABLE IF EXISTS $2" \
@@ -310,6 +331,8 @@ setup_sort_table() { # $1=uri $2=table $3=rows
   local distinct
   distinct="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(DISTINCT s_long) FROM $2")"
   [[ "${distinct}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${distinct} distinct s_long, wanted $3 — the fixture is not varied" >&2; exit 2; }
+  "${PSQL}" --no-psqlrc -X -q "$1" -c "ANALYZE $2" >/dev/null 2>&1 ||
+    { echo "SETUP FAILED: ANALYZE $2 on $1 — see the note above setup_sort_table" >&2; exit 2; }
 }
 
 # v7.38.19 — the SORT panel, verdicted separately from the shapes above.
@@ -487,11 +510,13 @@ for entry in "${SORT_SHAPES[@]}"; do
     fi
   done
   smin="$(lo "${s[@]}")"; gmin="$(lo "${g[@]}")"
+  smax="$(hi "${s[@]}")"; gmax="$(hi "${g[@]}")"
   ratio="$(awk -v a="${smin}" -v b="${gmin}" 'BEGIN{ if (b <= 0) print "0"; else printf "%.2f", a/b }')"
   over="$(awk -v r="${ratio}" -v c="${SORT_CEILING}" 'BEGIN{ print (r > c) ? 1 : 0 }')"
   (( over )) && SORT_OVER=$((SORT_OVER + 1))
   SORT_WORST="$(awk -v a="${ratio}" -v b="${SORT_WORST}" 'BEGIN{ print (a > b) ? a : b }')"
-  printf '  %-26s %8s %8s  %sx%s\n' "${name}" "${smin}" "${gmin}" "${ratio}" \
+  printf '  %-26s %8s-%-8s %8s-%-8s  %sx%s\n' "${name}" "${smin}" "${smax}" \
+    "${gmin}" "${gmax}" "${ratio}" \
     "$( (( over )) && echo '  <- OVER CEILING' )"
 done
 
