@@ -73,6 +73,31 @@ instrument being asked to prove it could see what it claimed to check.
   off the key's variant held everywhere except the join path, and
   `round688` said so.
 
+- **A seek that answered the whole predicate was asked again, once per
+  row.** Every index seek returned a CANDIDATE set and the caller
+  re-applied the `WHERE`; for the arms where the index had already
+  decided, that re-check was the query's dominant cost.
+
+  | | before | after | PG 18 |
+  |---|---:|---:|---:|
+  | `count(*) WHERE project_id = 3` | 0.940 ms | **0.408** | 0.789 |
+  | `SELECT id WHERE project_id = 3` | 0.951 | **0.410** | 0.791 |
+  | `dashboard: top versions` | 6.473 | **5.436** | 3.828 |
+
+  The first two now beat PostgreSQL. Found by profiling:
+  `try_index_seek` 1,814 leaf samples and `binop::compare` 1,633 — and
+  `compare`'s first arm is `(Int, Int) => a.cmp(b)`, so it was never
+  that a comparison is expensive. The same query with `GROUP BY
+  project_id` bolted on ran in half the time, doing strictly more work.
+
+  Exactness is FALSE everywhere it is not proven. A single equality, an
+  IN list and a range earn it when the key stands for the value; an `OR`
+  union earns it iff both halves do; an `AND` never does (the seek picks
+  one conjunct and drops the rest), and neither do the GIN, trigram,
+  jsonb or expression-index walks. `DATE` and `TIMESTAMP` are absent
+  from the allowlist even though both index as integers — they index as
+  the SAME variant, so a key cannot say which it came from.
+
 - **A composite index was invisible to its own leading column.** On
   sentori's `events (project_id, kind)`, 200,000 rows, on an idle box,
   each of these matching NOTHING:
