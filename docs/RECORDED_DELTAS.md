@@ -30,6 +30,7 @@ cannot be forgotten is a delta someone will eventually close.
 | RD-4 | `transaction.rs` — a concurrent UPDATE's re-check | re-applies to the winner's new version (EvalPlanQual) | the UPDATE matches zero rows | not re-measured; needs two live sessions |
 | RD-5 | `explain.rs` — `EXPLAIN (ANALYZE, BUFFERS)` sort line | reports a peak | SPG does not meter one | not re-measured; a number that was not measured is worse than none |
 | RD-6 | `parser.rs` — `json_populate_record` with a non-NULL record base | takes the base's field values as defaults | the base carries only the type | not re-measured; needs a composite fixture |
+| RD-12 | `dml.rs` — the next value for a `serial` / `DEFAULT nextval(…)` column after a row supplied one explicitly | the sequence is a counter that ignores the table: `1, 2, 50` | the table's maximum plus one: `1, 50, 51` | 2026-08-24 |
 
 ### RD-3, bisected
 
@@ -63,6 +64,44 @@ to raise, it is the representation. Moving the epoch would rewrite every
 stored timestamp and every encoded one on the wire, to buy twenty-nine
 years nobody will reach — which is why this row's condition is simply
 **do not**.
+
+### RD-12, and why it is not simply a bug
+
+Three inserts, the middle one naming its own id:
+
+```sql
+INSERT INTO z1 (k)     VALUES ('a');
+INSERT INTO z1 (id, k) VALUES (50, 'b');
+INSERT INTO z1 (k)     VALUES ('c');
+```
+
+| | ids |
+|---|---|
+| PostgreSQL 18.4 | `1, 2, 50` |
+| SPG | `1, 50, 51` |
+
+PostgreSQL's sequence is a counter that knows nothing about the table,
+so the explicit 50 does not move it and the next row gets 2. Which means
+that sequence will go on counting until it reaches 50, and the insert
+that lands there will fail on the primary key — a landmine planted by a
+perfectly ordinary statement, and a support case every PostgreSQL shop
+eventually sees.
+
+Ours is the table's maximum plus one, so it never hands out a value the
+table already holds, and never goes backwards.
+
+Recorded rather than closed because the two are not both right and we
+have not decided which we owe our users. Matching PostgreSQL means
+importing the landmine; keeping ours means a `SELECT nextval()` and an
+INSERT can disagree about what comes next.
+
+It is not free either way: max-plus-one is computed by scanning the
+table's rows, so one INSERT into a 200,000-row table costs 3.666 ms
+against PostgreSQL's flat 1.375, and the gap grows with the table (1.831
+at a thousand rows, 2.703 at fifty thousand). A real counter would close
+that AND the divergence above in one move — which is the argument for
+eventually taking PostgreSQL's side of it, with a floor at the table's
+maximum so the landmine does not come with it.
 
 ### RD-2, priced
 
