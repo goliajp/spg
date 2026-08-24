@@ -7074,16 +7074,13 @@ impl Engine {
         // boundary key and `WITH TIES` extends past the limit through the
         // keys, both of which need one to exist. DISTINCT keys on them
         // too, and an SRF's keys come from the EXPANDED row.
-        // And to the UNCOLLATED sort: the value-level comparator takes a
-        // collation by NAME and builds the collator behind it, which is
-        // the per-row cost v7.38.18 removed from the scan filter. Paying
-        // it once per COMPARISON would be worse than the copy this
-        // avoids.
+        // A COLLATION does not rule it out, but it has to be one that
+        // orders these values the way bytes do -- decided on the values
+        // themselves, further down, once they exist.
         let sort_by_output: Option<Vec<usize>> = if stmt.distinct
             || stmt.limit_with_ties
             || srf_position.is_some()
             || topk_stream.is_some()
-            || order_colls.iter().any(Option::is_some)
         {
             None
         } else {
@@ -7182,6 +7179,15 @@ impl Engine {
             let order_keys = if order_by.is_empty()
                 || stmt.distinct
                 || srf_position.is_some()
+                // v7.38.19 — the branch below builds whatever key it
+                // needs from the projected values, collation included,
+                // so nothing has to be built here for it.
+                //
+                // A draft that skipped them here but still let the
+                // COLLATED case fall through to the key-based sort put a
+                // mixed column back in INSERT order: every key empty,
+                // every row equal, a stable sort faithfully preserving
+                // nothing. The rule is one decision, not two.
                 || sort_by_output.is_some()
             {
                 Vec::new()
@@ -7516,9 +7522,66 @@ impl Engine {
                 // The tail-break on the index is what keeps the sort
                 // STABLE, which `sort_by` was giving for free and an
                 // unstable sort over a permutation would not.
+                // v7.38.19 — three ways to sort these rows, and which
+                // one is right turns on the values, which is why it is
+                // decided here rather than at plan time.
+                //
+                //   * the collation orders these values the way bytes do
+                //     -- take the eight-byte key below
+                //   * it does not, but there IS a collation -- build its
+                //     sort key once per row and order the permutation on
+                //     those, which is what the key path did, done from
+                //     the projected value instead of during the scan
+                //   * no collation at all -- the eight-byte key again
+                //
+                // The middle case is the one a draft got wrong by
+                // leaving the rows to a key path whose keys it had just
+                // skipped building.
+                let mut keep_sorted = false;
+                let bytes_answer = byte_order_answers_the_collation(&tagged, &terms, &order_colls);
+                if !bytes_answer && let Some(coll) = order_colls.first().and_then(Option::as_ref) {
+                    let (first_col, first_desc, _) = terms[0];
+                    let mut order: Vec<(Vec<u8>, u32)> = Vec::with_capacity(tagged.len());
+                    for (i, row) in tagged.iter().enumerate() {
+                        let k = match row.1.values.get(first_col) {
+                            Some(Value::Text(t)) => coll.sort_key_of(t).unwrap_or_else(|| {
+                                let mut v = Vec::with_capacity(t.len() + 1);
+                                v.push(0);
+                                v.extend_from_slice(t.as_bytes());
+                                v
+                            }),
+                            _ => Vec::new(),
+                        };
+                        order.push((k, u32::try_from(i).unwrap_or(u32::MAX)));
+                    }
+                    order.sort_by(|(ka, ia), (kb, ib)| {
+                        let c = ka.cmp(kb);
+                        let c = if first_desc { c.reverse() } else { c };
+                        if c != core::cmp::Ordering::Equal {
+                            return c;
+                        }
+                        row_cmp_by_index(&tagged, &terms, &order_colls, mysql, *ia, *ib)
+                            .then_with(|| ia.cmp(ib))
+                    });
+                    let mut slots: Vec<Option<(Vec<crate::orderby::OrderKey>, Row<'static>)>> =
+                        core::mem::take(&mut tagged).into_iter().map(Some).collect();
+                    tagged = order
+                        .iter()
+                        .map(|&(_, i)| {
+                            slots[i as usize]
+                                .take()
+                                .expect("the permutation names each row once")
+                        })
+                        .collect();
+                    keep_sorted = true;
+                }
                 let keyed = sort_keys_of(&tagged, terms[0].0)
                     .filter(|(keys, exact)| *exact || key_discriminates(keys));
-                if let Some((mut order, exact)) = keyed {
+                if keep_sorted {
+                    // The collated permutation above already placed every
+                    // row. A draft let the byte-order fallback run after
+                    // it and undo the whole thing.
+                } else if let Some((mut order, exact)) = keyed {
                     let (first_col, first_desc, _) = terms[0];
                     let row_cmp = |ia: u32, ib: u32| -> core::cmp::Ordering {
                         let (a, b) = (&tagged[ia as usize], &tagged[ib as usize]);
@@ -14058,6 +14121,88 @@ fn value_order_is_key_order(col: &ColumnSchema) -> bool {
             col.ty,
             T::SmallInt | T::Int | T::BigInt | T::Text | T::Varchar(_) | T::Bool | T::Uuid
         )
+}
+
+/// The full ORDER BY comparison between two rows, named by index.
+///
+/// v7.38.19 — what a permutation sort falls back to when its key ties.
+fn row_cmp_by_index(
+    tagged: &[(Vec<crate::orderby::OrderKey>, Row<'static>)],
+    terms: &[(usize, bool, Option<bool>)],
+    colls: &[Option<crate::collate::Collated>],
+    mysql: bool,
+    ia: u32,
+    ib: u32,
+) -> core::cmp::Ordering {
+    let (a, b) = (&tagged[ia as usize], &tagged[ib as usize]);
+    for (i, (col, desc, nf)) in terms.iter().enumerate() {
+        let (Some(va), Some(vb)) = (a.1.values.get(*col), b.1.values.get(*col)) else {
+            continue;
+        };
+        let ord = match (va, vb) {
+            (Value::Text(x), Value::Text(y)) => match colls.get(i).and_then(Option::as_ref) {
+                Some(c) => {
+                    let o = c.compare(x, y);
+                    if *desc { o.reverse() } else { o }
+                }
+                None if !mysql => {
+                    let o = crate::orderby::str_cmp_prefix_first(x, y);
+                    if *desc { o.reverse() } else { o }
+                }
+                None => crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql),
+            },
+            _ => crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql),
+        };
+        if ord != core::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    core::cmp::Ordering::Equal
+}
+
+/// Whether ordering these rows by BYTES is what the collation in force
+/// would have answered anyway.
+///
+/// v7.38.19 — a collated sort used to be shut out of the keyed path
+/// entirely, and the cost of that showed up the moment the byte path
+/// got fast: on the same fixture, the same binary took 92 ms under `C`
+/// and 371 ms under `en_US`, so declaring a collation had become a
+/// four-fold tax on a query that sorts md5 hex.
+///
+/// It need not be. For several locales `[0-9a-z]` orders exactly as
+/// bytes do -- `collate::ascii_byte_order` carries that fact, and the
+/// test beside it re-derives the whole allowlist by sorting a corpus
+/// twice rather than asserting it. So when the collation is one of
+/// those AND every value in every sort column is drawn from that
+/// alphabet, the byte answer IS the collated answer.
+///
+/// Both halves are required. A collation outside the list can put `z`
+/// between `s` and `t`; a value outside the alphabet can be `Ápple`,
+/// which no locale in the list orders by its bytes. Either one and this
+/// returns false, and the sort takes the collator's own path.
+fn byte_order_answers_the_collation(
+    tagged: &[(Vec<crate::orderby::OrderKey>, Row<'static>)],
+    terms: &[(usize, bool, Option<bool>)],
+    colls: &[Option<crate::collate::Collated>],
+) -> bool {
+    if colls.iter().all(Option::is_none) {
+        return true;
+    }
+    if !colls
+        .iter()
+        .flatten()
+        .all(crate::collate::Collated::ascii_byte_order)
+    {
+        return false;
+    }
+    tagged.iter().all(|(_, row)| {
+        terms.iter().all(|(col, _, _)| match row.values.get(*col) {
+            // Only TEXT is collation-sensitive; a number or a NULL
+            // orders the same under every collation there is.
+            Some(Value::Text(t)) => crate::collate::is_ascii_alnum_lower(t),
+            _ => true,
+        })
+    })
 }
 
 /// An eight-byte key for each row's sort column, paired with the row's
