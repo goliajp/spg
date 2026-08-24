@@ -34,6 +34,134 @@ instrument being asked to prove it could see what it claimed to check.
 
 ### Fixed
 
+- **A composite index was invisible to its own leading column.** On
+  sentori's `events (project_id, kind)`, 200,000 rows, on an idle box,
+  each of these matching NOTHING:
+
+  | predicate | before | after | PG 18 |
+  |---|---:|---:|---:|
+  | `project_id = 99` | 3.415 ms | **0.195** | 0.207 |
+  | `project_id > 90` | 3.282 | **0.166** | 0.214 |
+  | `project_id BETWEEN 90 AND 99` | 6.395 | **0.191** | 0.204 |
+  | `project_id IN (98, 99)` | 3.069 | **0.198** | 0.212 |
+
+  A predicate matching nothing cost what one matching a quarter of the
+  table costs, because that is what it did: it read every row. Add a
+  single-column index on `project_id` and every form already answered
+  in 0.16–0.20 ms, which is what says the predicate shape was never the
+  obstacle.
+
+  `Table::index_on` answers only with a single-column B-tree, and
+  deliberately: a composite index keys tuples, and a one-component
+  lookup against those answers nothing while looking exactly like "no
+  rows matched". So every bare-predicate path asked it, got nothing,
+  and scanned. The prefix walk they needed already existed and was
+  already right — it lived inside the `AND` branch, reachable only from
+  a predicate with a second conjunct, so a ONE-component prefix was the
+  only prefix this engine could not take.
+
+  Sentori's dashboard shape, eight alternating rounds: 9.77–11.52 ms
+  before, 6.66–9.01 after, against PostgreSQL's 3.75–3.99.
+
+- **The next value for a `serial` column was a walk of every row.** One
+  INSERT letting a `bigserial` fill its id:
+
+  | rows in the table | before | after | PG 18 |
+  |---|---:|---:|---:|
+  | 1,000 | 1.831 ms | — | 1.245 |
+  | 10,000 | 1.814 | — | 1.289 |
+  | 50,000 | 2.703 | — | 1.386 |
+  | 200,000 | 3.666 | **1.106** | 1.075 |
+
+  Theirs is flat because a sequence is a counter. Ours grew with the
+  table, so an ingest workload got slower the longer it ran. A B-tree on
+  the column already holds those values in order, so its largest key is
+  a descent — and on a `serial PRIMARY KEY` there is always such an
+  index.
+
+  The indexes on the table were the obvious suspects and were wrong:
+  dropping the GIN, the BRIN and the composite one at a time changed
+  nothing measurable. What separated it was adding one column kind at a
+  time to a 200,000-row table — `bigserial PRIMARY KEY` jumped from
+  1.374 to 4.326 and nothing else moved.
+
+  Both paths answer identically, measured, including after a delete, so
+  the pin is on the decision. The first version of that pin watched
+  `seq_scan`, which does not move either way; removing the fix left it
+  green, which is how it was found.
+
+- **`CREATE TABLE t (id bigint DEFAULT nextval('s'), …)` could not
+  insert a row** — `ERROR: nextval() requires a sequence resolver
+  (read-only context)`. The same column reached the other way worked:
+
+  | | |
+  |---|---|
+  | `CREATE TABLE … DEFAULT nextval('zs')` | ERROR |
+  | `CREATE TABLE … DEFAULT nextval('zs'::regclass)` | ERROR |
+  | `ALTER … SET DEFAULT nextval('zs')` | `INSERT 0 1` |
+  | `ALTER … SET DEFAULT nextval('zs'::regclass)` | `INSERT 0 1` |
+
+  The ALTER form has been recognised since v7.22 because it is what
+  `pg_dump` writes for a serial column. The CREATE TABLE form stored the
+  call as text to be re-parsed per INSERT, and the context a runtime
+  DEFAULT is evaluated in cannot advance a sequence. Same lowering,
+  reached from the other side; a non-integer column is now refused at
+  definition time rather than at the first INSERT.
+
+  `information_schema.columns` also printed `nextval(('zs')::regclass)`
+  where PostgreSQL prints `nextval('zs'::regclass)`.
+
+  Two things this does not close, both measured, both now **RD-12** in
+  `docs/RECORDED_DELTAS.md`: we number from the table's maximum plus one
+  where PostgreSQL reads a counter that ignores the table (`1, 50, 51`
+  against their `1, 2, 50`), and max-plus-one is a scan, so one INSERT
+  into a 200,000-row table costs 3.666 ms against their flat 1.375 and
+  the gap grows with the table.
+
+- **Two jsonb operators built a whole document to answer a question
+  about its top level.** `?`, `?|` and `?&` parsed the left side —
+  allocating every key and every value — to say whether ONE key was
+  present. `@>` had stopped building a tree for the left side in
+  v7.38.9 but still built one for the RIGHT, a constant in every
+  `WHERE … @> '{…}'`, on every matched row.
+
+  On a 200,000-row `events` table:
+
+  | | before | after | PG 18 |
+  |---|---:|---:|---:|
+  | `traits ? 'plan'` | 46.599 ms | **10.341** | 5.988 |
+  | `traits ?\| ARRAY['x','plan']` | 112.998 | **17.112** | 7.638 |
+  | `traits @> '{"plan":"pro","country":"jp"}'` | 8.421 | **5.068** | 4.236 |
+  | the same `@>` matching nothing | 0.607 | 0.599 | 0.753 |
+
+  Two lines say what this was. `traits->>'plan'` finds the same key AND
+  copies the value out, and cost 14.137 — a third of what merely
+  locating it cost. And with nothing to recheck, `@>` was already
+  faster than PostgreSQL, so the whole containment gap was
+  per-matched-row.
+
+  The byte comparison is narrow, and PostgreSQL drew the line:
+  `'{"a":1.00}'::jsonb @> '{"a":1.0}'` is TRUE while the tokens differ,
+  because jsonb numbers compare numerically and keep their scale.
+  Numbers and escaped strings go to the parser.
+
+- **A constant `ARRAY[…]` kept its whole predicate off the compiled
+  path**, so the array was rebuilt — a `Vec` and a `String` per element
+  — for every row. `traits ?| 'plan'` cost 10.388 ms and `traits ?|
+  ARRAY['plan']` cost 26.227, which is what said the operator was never
+  the cost. The compiler has folded a constant array to a single
+  literal since v7.39; `fully_compilable` simply did not list it. After:
+  11.298, and `?|` lands at 2.32x PostgreSQL from 5.18.
+
+- **`a = 1 OR a = 2` scanned while `a IN (1, 2)` seeked.** The two
+  predicates mean the same thing; with an ordinary single-column index
+  in place, the IN form took 0.194 ms and the OR form 6.426, against
+  PostgreSQL's 0.217. Disjuncts are unioned when — and only when —
+  every one of them seeks, because a disjunct that falls back to a scan
+  contributes rows the union would then be missing. A row matching both
+  arms is dropped by address; a cold-tier row has no such identity, so
+  a union containing one declines rather than guess.
+
 - **A locale database collation cost 26x on the most ordinary
   predicate**, and it shipped in v7.38.18. `WHERE kind = 'click'` over
   200,000 rows: 2.2–3.1 ms under `C`, **58.3–76.2 ms** under
