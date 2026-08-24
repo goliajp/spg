@@ -7,7 +7,13 @@ anywhere; it does not read anything outside itself.
 PROFILE=profiles/sentori ./run.sh goliakk/spg:7.38.18 postgres:18-alpine
 ```
 
-Needs `docker`, `psql` and `awk`. Nothing else, and no checkout of ours.
+Needs `docker`, `psql` and `awk`, plus the POSIX text tools (`grep`,
+`sed`, `sort`, `head`, `tail`, `printf`). No checkout of ours.
+
+The first version of this line said "three commands"; listing what the
+script actually calls found ten. `uptime` was one of them, is not on
+every container's PATH, and printed context rather than a measurement —
+it now degrades to a note instead of failing the run.
 
 ## What it refuses to do
 
