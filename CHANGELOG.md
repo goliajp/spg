@@ -17,6 +17,80 @@ instrument being asked to prove it could see what it claimed to check.
 
 ### Added
 
+- **`interval` has the two infinities PostgreSQL 17 gave it.**
+  `'infinity'::interval` was refused; the ledger called that a
+  subtraction edge case, and it was not — the type had no infinite value
+  at all and the subtraction error was one symptom.
+
+  Forty-six behaviours, each measured against PostgreSQL 18.4 rather
+  than reasoned about, of which three are hard to guess:
+
+  | | |
+  |---|---|
+  | `'inf'::interval` | **invalid input syntax** — though `'inf'` IS accepted for `float8` |
+  | `inf - inf`, `inf * 0` | **interval out of range** — an indeterminate form, not an overflow |
+  | `timestamp + inf` | the infinite TIMESTAMP, a value this build already had |
+
+  The representation is an `IntervalKind` beside the numbers, the way
+  `Value::Numeric` already carries `NumericKind` — and the field is on
+  the EXISTING variant rather than a new one, so the compiler named all
+  105 sites that had to decide what infinity means there. A new variant
+  would have compiled everywhere on the first try and let a `_` arm
+  answer for it at one of them. Three of the sites it named were
+  comparison functions each carrying a private copy of the span
+  arithmetic.
+
+  The numbers written are the ones PostgreSQL puts on the wire, measured
+  with `COPY … (FORMAT binary)`: all three fields at their extreme. So
+  the body stays sixteen bytes and no file version moves — no finite
+  interval reaches the triple, PostgreSQL reserves it, and a file
+  written before this version cannot contain one.
+
+  Two things the extremes broke, both caught by a test rather than by
+  reading: negating `-infinity` overflowed on `i64::MIN.checked_neg()`
+  and answered *INTERVAL overflows on unary -* for a value PG simply
+  flips, and the three `justify_*` functions did arithmetic on
+  `i32::MAX` months.
+
+
+- **A pseudo-type is refused as an invalid table definition, and reported
+  by the name PostgreSQL reports.** `CREATE TABLE t (c cstring)` answered
+  `type "cstring" does not exist`. The name exists — it is one of the
+  twenty-six in `pg_type` with `typtype = 'p'`, which describe function
+  signatures and have no storage — so PostgreSQL refuses the COLUMN:
+
+      ERROR:  42P16: column "c" has pseudo-type cstring
+
+  42P16 is INVALID TABLE DEFINITION; SPG's answer fell to 42704,
+  UNDEFINED OBJECT, telling a driver the wrong thing about why its DDL
+  failed.
+
+  And `pg_typeof('x'::cstring)` read `text`. The value does travel as
+  text — `'x'::cstring` renders `x` on both engines — so the name has to
+  come from the EXPRESSION, which is the discipline enums and domains
+  already needed in that function. What it reports is not always the
+  name written, and this is measured rather than reasoned about:
+
+  | | PostgreSQL 18.4 |
+  |---|---|
+  | `'x'::cstring` | `cstring` |
+  | `'x'::void` | `void` |
+  | `'x'::anyelement` | `unknown` |
+  | `'x'::anynonarray` | `unknown` |
+  | `'x'::unknown` | `unknown` |
+
+  A polymorphic placeholder resolves against its argument and a bare
+  literal gives it nothing to resolve to. So the arm names those five and
+  no more — and `record` is why it has to:
+  `pg_typeof(ROW(1,'x')::r285::record)` answers `r285`, the composite's
+  own name, and a first draft that claimed every pseudo-type turned that
+  into `unknown`.
+
+  Fourteen statements now answer byte-for-byte what PG 18.4 answers.
+  The ledger had this blocked on a `DataType` variant that could be added
+  "without widening the enum"; it needed no variant at all.
+
+
 - **`SELECT … INTO t`** — PostgreSQL's other spelling of `CREATE TABLE …
   AS`. A comment has said since v7.38 that the two lower to the same
   node; only one ever did, and `SELECT i INTO t FROM src` answered
@@ -33,6 +107,99 @@ instrument being asked to prove it could see what it claimed to check.
   PG 18.4 exactly.
 
 ### Fixed
+
+- **An environment variable could silently reorder an entire database.**
+  A database created under `C`, holding `apple, Bob, Zebra`, restarted
+  from the SAME data directory with `SPG_LC_COLLATE=en_US.utf8`:
+
+  | | `datcollate` | `ORDER BY s` |
+  |---|---|---|
+  | before | `C` | `Bob,Zebra,apple` |
+  | after | `en_US.utf8` | `apple,Bob,Zebra` |
+
+  Every text sort in that database changed answer because an
+  environment variable did, with nothing said. PostgreSQL cannot do
+  this: `initdb` writes the collation into the cluster and a later
+  `LANG` does not touch it.
+
+  The guard existed and was already right — `set_db_collation` refuses
+  to change a collation once the database has tables, because every
+  index key was built under the old one. It ran at the wrong moment.
+  `apply_database_collation` ran BEFORE the WAL was replayed, so on a
+  server killed without checkpointing — every crash, every plain `kill`
+  — it saw an empty catalog, let the environment through, and replay
+  then brought the rows back under a collation nobody had chosen.
+
+  Moving the call after replay is the whole change. The server now
+  refuses and says why, and
+  `e2e_collation_survives_restart` holds it from the other side.
+
+
+- **The sort was 6.12x behind PostgreSQL and is now 1.53x, and every
+  cell in the panel improved or held.** 400,000 rows, both engines
+  ordering bytes, the release gate's own instrument:
+
+  | cell | before | after |
+  |---|---:|---:|
+  | `sort only, int` | 53.7 ms / 0.99x | **43.6 / 0.79x** |
+  | `sort only, two keys` | 127.8 / 1.91x | 129.1 / 1.94x |
+  | `sort only, text (26 values)` | 183.0 / 2.46x | 164.2 / 2.17x |
+  | `sort only, short text distinct` | 214.6 / 2.93x | **104.5 / 1.42x** |
+  | `sort only, long text distinct` | 364.1 / **6.12x** | **92.0 / 1.53x** |
+  | `sort only, long text top-N` | 16.9 / 1.84x | 17.3 / 1.91x |
+
+  Three things, each found by profiling the one before it.
+
+  **The sort key was a copy of a column the output already held.** One
+  `OrderKey` per row, holding the column's bytes: 400,000 allocations,
+  400,000 frees and 77 MB moved, and the allocator's free path was 2,025
+  leaf samples in a query that allocates nothing of its own. The copy
+  exists because the source row is gone by the time the sort runs — but
+  when the ORDER BY names a column the projection already carries, it is
+  not gone.
+
+  **The byte comparison was a library call, ~7.4 M times.** With the keys
+  gone, 43% of the working samples were in `memcmp`. Comparing the bytes
+  was never expensive: two distinct 192-byte strings differ in their
+  first byte fifteen times out of sixteen. Reaching the comparison was.
+
+  **The rows were what got sorted.** 48-byte elements moved ~n log n
+  times, and every comparison chased three dependent loads per side to
+  reach the byte it wanted. A `(u64, u32)` is 16 bytes and the comparison
+  reads it out of the array: an integer's whole value fits, with the sign
+  bit flipped; text gives its first eight bytes big-endian, which orders
+  the same but is a prefix, so equal keys still ask the full comparator.
+
+  Two regressions had to be found and closed on the way, and the panel
+  found both — neither was visible in the cell being attacked. `int` had
+  gone 0.99x → 2.17x when the keys stopped being built, because for an
+  integer the key was never the expensive part; the exact integer key
+  gives back more than was lost. And `text (26 values)` went 160 → 247 ms
+  on the first permutation draft, because that fixture is two hundred
+  identical characters drawn from twenty-six letters and fifteen thousand
+  rows tie on any eight-byte prefix; a prefix key now has to EARN the
+  permutation by sampling 1024 keys and finding half of them distinct.
+
+- **Declaring a collation cost up to 4.09x and now costs 1.00x–1.26x.**
+  Making the byte path four times faster made a declared collation four
+  times more expensive: the same binary, same fixture, took 92 ms under
+  `C` and 371 ms under `en_US`.
+
+  For several locales `[0-9a-z]` orders exactly as bytes do — a fact the
+  collation module already carried, with a test beside it that re-derives
+  the allowlist by sorting a corpus twice rather than asserting it — so
+  when the collation is one of those AND every value is drawn from that
+  alphabet, the byte answer IS the collated answer. When they do not both
+  hold, the rows still need a key, and the sort now builds one itself
+  from the projected value.
+
+  Two drafts got this wrong from opposite ends and BOTH returned wrong
+  rows rather than an error: one left a mixed column to a key path whose
+  keys it had just skipped building (every key empty, every row equal, a
+  stable sort faithfully preserving INSERT order), and the other sorted
+  by collation correctly and then let the byte fallback run afterwards
+  and undo it (`ABC, aBc, abc` where PostgreSQL says `abc, aBc, ABC`).
+
 
 - **A collated text sort was 4x behind PostgreSQL and its top-N 120x.**
   400,000 rows of 192-character text, both engines under `en_US.utf8`:
@@ -343,7 +510,71 @@ instrument being asked to prove it could see what it claimed to check.
 
 ### Instruments
 
-Five gates gained the ability to see something they had claimed to check.
+Three of these were found while measuring this version's own perf work,
+and each one had been reporting something untrue for longer than the
+work took. The pattern is the one the version keeps running into: the
+failure of a measuring device looks exactly like data.
+
+- **The sort verdict was a coin flip about autovacuum.** Same binary,
+  seven runs of the sort panel on a quiet box, against a 3.0x ceiling:
+
+      2.81x  2.92x  2.96x  2.99x  3.11x  4.95x  5.76x
+
+  A release was judged on that spread, and the judgement changed with
+  it — the run that read 4.95x was read as this version making the sort
+  worse.
+
+  It was never sampling noise, and the panel's own construction says so:
+  it takes the best of three in one session, the best of five of those,
+  and within any single run both legs land inside 0.4%. Fifteen
+  executions cannot average away what was moving.
+
+  Two query plans were moving. The fixture is rebuilt every run, so it
+  starts with no statistics: PostgreSQL estimated 1,030,370 rows for
+  400,000 and planned a SERIAL external merge at 117–128 ms; once
+  analysed it estimates correctly and plans a parallel Gather Merge at
+  59–68 ms. Whether the daemon happened to reach the table before the
+  timed loop decided PG's level for the whole run.
+
+  Both legs' fixtures are now ANALYZEd as part of building them, and
+  both legs' min–max is printed rather than a bare minimum each — which
+  is what the sixty-four cells above have always printed, and is what
+  would have shown this the first time. After: 6.05x / 6.07x, then
+  4.83x / 4.84x on the other binary. 0.3% apart within each pair.
+
+  **The number it uncovered is worse than the one it replaced**, and
+  that is the point: this cell was 6.12x behind PostgreSQL, not the 2.9x
+  the ledger carried. Every earlier reading was against a PG leg that
+  was, some fraction of the time, running the serial plan its missing
+  statistics chose for it.
+
+- **`pins-current` ran one test and could not go red.** The step is named
+  for this version's pins. Its selector was a test-NAME prefix,
+  `pin_v738_`, which exactly one test in the repository carries — while
+  33 e2e files holding 195 tests have been added since v7.38.0, none of
+  them named that way. Its own log said so on every run and nobody read
+  it: `1 passed; 6578 filtered out`.
+
+  The selector is now the diff, which is what the tier's siblings
+  already use, and it has two ways to go red that the old one did not: a
+  pin file the commit adds that the e2e `main.rs` never declares (it
+  compiles, it reviews as coverage, and it runs never), and a filter set
+  that selects no tests at all while pin files were touched.
+
+- **A precommit budget was measuring the workspace, not the change.**
+  `unit-affected` reported 487 s, 658 s and 723 s across three tries
+  inside a hard 480 s budget, with every step inside it green.
+  `--all-targets` does not build a lib's UNIT-test harness — that is the
+  crate compiled with `--cfg test`, a different artifact from the lib,
+  the bins, the integration tests and the benches — so the step was
+  compiling twelve crates before it could run a single test. The same
+  command with the harnesses already built takes 132 s. Precommit's
+  prepare now builds them, which is exactly what the note above prepare
+  says prepare is for.
+
+
+Five more gates gained the ability to see something they had claimed to
+check.
 
 - **The suite handed out a port another server was already serving**,
   and the locale-collation panel spent its runs measuring one leg
@@ -449,55 +680,15 @@ Five gates gained the ability to see something they had claimed to check.
 
 ### Still open, named with what closing them would cost
 
-- **Our sorts are 1.8x to 3.0x PostgreSQL, and the release gate is red
-  on one of them.** 400,000 rows, both engines ordering BYTES:
-
-  | | SPG | PG 18 | |
-  |---|---:|---:|---|
-  | `sort only, long text distinct` | 231.3 ms | 62.5 | **3.70x — over the 3.0x ceiling** |
-  | `sort only, two keys` | 148.8 | 67.9 | 2.19x |
-  | `sort only, text (26 values)` | 159.3 | 78.7 | 2.02x |
-  | `sort only, long text top-N` | 19.1 | 9.5 | 2.00x |
-  | `sort only, short text distinct` | 150.5 | 103.6 | 1.45x |
-  | `sort only, int` | 53.4 | 55.7 | 0.96x |
-
-  Newly visible: the sweep had been comparing our `C` leg against a
-  collated PostgreSQL one, and two of these cells were reporting WINS
-  on the difference. The integer cell being level while every other is
-  2x says this is the sort machinery and not the text.
-
-  Two attacks tried and both measured NEUTRAL — sorting the permutation
-  by index, and copying the key into a contiguous array the way the
-  integer path does. Both were first judged WORSE by a harness that
-  turned out to have a 2x per-leg bias, found by running the same
-  binary as both legs. It wants its own round, with the sweep's own
-  control leg rather than a hand-rolled one.
-
-
-- **`pg_typeof(x::cstring)` reads `text`.** `cstring` is a pseudo-type;
-  PostgreSQL refuses `CREATE TABLE t(c cstring)` itself, and the value
-  round-trips as text on both engines. Closing it means a `DataType`
-  variant that exists to be reported and never to hold a value — and
-  v7.37.26 measured what a new variant on a hot enum costs: `IndexKey`
-  went 32 bytes to 48 and two queries with no numeric column paid 7–8 %.
-  Condition: close it when the variant can be added without widening the
-  enum.
-
-- **`'infinity'::interval` is refused.** Not the subtraction edge case
-  its marker describes — SPG's `Interval` has no infinite value at all,
-  and the subtraction error is one symptom. A type-level change.
-
 - **Timestamps in the last 29 years PostgreSQL accepts.** Bisected: SPG
   reaches year 294247, PostgreSQL 294276. `i64::MAX` microseconds from
   1970 lands in 294247.02, and PostgreSQL counts from 2000 — **the delta
   is the difference between two epochs**, not a bound anyone chose.
   Moving the epoch would rewrite every stored and encoded timestamp to
-  buy twenty-nine years nobody reaches. Condition: **do not**.
+  buy twenty-nine years nobody reaches. Condition: **do not**. This is a
+  decision, not a queue entry.
 
 ### Still open, named rather than left out
-
-- **Sorting a collated text column is 1.67x behind PostgreSQL** after the
-  key change, and the remaining cost is ICU building the keys.
 
 - **The image ships `C` while the reference image ships a locale.**
   `postgres:18` sorts `apple, Bob, Zebra`; `goliakk/spg` sorts `Bob,
@@ -505,10 +696,27 @@ Five gates gained the ability to see something they had claimed to check.
   a different row order, silently — which is the divergence the
   v7.38.18 collation work exists to close, still open one level up.
 
-  Not flipped in this version, and the condition is stated rather than
-  the conclusion: setting `LANG` in the image hands every customer the
-  ordering cost above. Close the ordering gap, then flip. Flipping first
-  trades a silent wrong answer for a loud slow one.
+  Both conditions this was waiting on are now met, and the second one
+  was not known when the first was written.
+
+  The stated condition was *setting `LANG` in the image hands every
+  customer the ordering cost above; close the ordering gap, then flip.*
+  The ordering gap is closed: declaring a collation now costs
+  1.00x–1.26x against the same binary under `C`, where it cost up to
+  4.09x.
+
+  The unstated one turned up while checking what a flip would do to an
+  existing deployment, and it was a defect rather than a condition — a
+  restart under a different environment silently redeclared the
+  database and reordered every row. That is fixed above. An existing
+  data directory now keeps the collation it was created with, so a flip
+  would reach only NEW databases, which is exactly what `postgres:18`
+  does.
+
+  What is left is the flip itself, and it is deliberately not in this
+  version: the fix it depends on has not shipped yet, so the flip and
+  the guarantee that makes it safe would reach customers in the same
+  image. They should not.
 
   (`postgres:18-alpine` declares `en_US.utf8` and sorts by bytes anyway —
   musl has no locale data — so a deployment on the alpine image is
