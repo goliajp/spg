@@ -92,6 +92,27 @@ impl Roster {
     /// When every port in the range is taken — which means earlier runs
     /// leaked, and the caller should say so rather than hunt elsewhere.
     pub fn free_port(&self) -> Result<u16, String> {
+        self.free_port_excluding(None)
+    }
+
+    /// v7.38.19 — one implementation, because there were two.
+    ///
+    /// The native listener's port was chosen by a SECOND copy of this
+    /// loop, carrying the bare `TcpListener::bind` that the fix above
+    /// replaced. So a server could be told to serve its native protocol
+    /// on a port another server was already answering pgwire on, and a
+    /// client asking that port for a Postgres connection got
+    ///
+    /// ```text
+    /// received invalid response to SSL negotiation: -
+    /// ```
+    ///
+    /// which reached a prerelease gate as "the locale panel failed",
+    /// because the panel's own error was the only one anything printed.
+    ///
+    /// `held` is the port this same spawn has already claimed but not
+    /// yet bound; nothing else knows about it, so it has to be passed.
+    pub fn free_port_excluding(&self, held: Option<u16>) -> Result<u16, String> {
         // Rotate the scan start by pid so concurrent test PROCESSES
         // spread across the range instead of all courting the first
         // port — full runs saw three suites claim 25460 at once.
@@ -99,7 +120,7 @@ impl Roster {
         let off = (std::process::id() as u16) % len;
         for i in 0..len {
             let p = PORT_RANGE.start + (off + i) % len;
-            if self.procs.iter().any(|x| x.port == p) {
+            if Some(p) == held || self.procs.iter().any(|x| x.port == p) {
                 continue;
             }
             if !port_is_free(p) {
@@ -204,24 +225,12 @@ impl Roster {
     ) -> Result<u16, SpawnAttempt> {
         let fatal = SpawnAttempt::fatal;
         let pg_port = self.free_port().map_err(SpawnAttempt::Fatal)?;
-        let native_port = {
-            // Reserve pg_port by pushing a placeholder before the second probe.
-            let held = pg_port;
-            let len = PORT_RANGE.end - PORT_RANGE.start;
-            let off = (std::process::id() as u16) % len;
-            let mut np = None;
-            for i in 0..len {
-                let p = PORT_RANGE.start + (off + i) % len;
-                if p != held
-                    && !self.procs.iter().any(|x| x.port == p)
-                    && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
-                {
-                    np = Some(p);
-                    break;
-                }
-            }
-            np.ok_or_else(|| fatal("no second free port for the native listener".into()))?
-        };
+        // The native listener's port comes from the SAME probe as the
+        // pgwire one, excluding it. It used to come from a second copy
+        // of that loop — see `free_port_excluding`.
+        let native_port = self
+            .free_port_excluding(Some(pg_port))
+            .map_err(SpawnAttempt::Fatal)?;
         std::fs::create_dir_all(data_dir)
             .map_err(|e| fatal(format!("{name}: mkdir data dir: {e}")))?;
         let log = data_dir.join("server.log");
@@ -978,6 +987,47 @@ pub(crate) mod tests_support {
         } else {
             eprintln!("SKIPPED loudly: target/release/spg-server not built");
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod second_port_tests {
+    use super::*;
+
+    /// v7.38.19 — the native listener's port must come from the same
+    /// probe as the pgwire one.
+    ///
+    /// It came from a second copy of the loop, carrying the bare bind
+    /// that `port_is_free` replaced, so a server could be told to serve
+    /// its native protocol on a port another server was already
+    /// answering pgwire on. A client then got `received invalid response
+    /// to SSL negotiation`, and a prerelease gate reported it as the
+    /// locale panel disagreeing about a collation.
+    #[test]
+    fn the_second_port_also_skips_a_port_someone_is_serving() {
+        let r = Roster::new();
+        let first = r.free_port().expect("a free port");
+        let held = std::net::TcpListener::bind(("0.0.0.0", first))
+            .expect("the probe just said this port was free");
+        for _ in 0..8 {
+            let second = r.free_port_excluding(Some(9)).expect("a free port");
+            assert_ne!(second, first, "handed out a port someone is serving");
+        }
+        drop(held);
+    }
+
+    /// And it excludes what the same spawn has already claimed but not
+    /// yet bound — which nothing else can know about.
+    #[test]
+    fn the_second_port_is_never_the_first() {
+        let r = Roster::new();
+        let first = r.free_port().expect("a free port");
+        for _ in 0..8 {
+            assert_ne!(
+                r.free_port_excluding(Some(first)).expect("a free port"),
+                first
+            );
         }
     }
 }
