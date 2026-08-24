@@ -809,6 +809,7 @@ mod e2e_scalar_subquery_null_key_round620;
 mod e2e_scalar_subquery_type_round189;
 mod e2e_scan_memory_round656;
 mod e2e_security_definer_round334;
+mod e2e_seek_exactness;
 mod e2e_seek_skips_dead_round490;
 mod e2e_sequence_functions_round244;
 mod e2e_sequence_last_value;

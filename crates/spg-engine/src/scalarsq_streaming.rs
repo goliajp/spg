@@ -383,6 +383,10 @@ impl Engine {
         // Phase C.3 step 2c — compute the reader's MVCC snapshot once
         // and thread it into every index-seek fast path. No-op today.
         let seek_snapshot = self.current_snapshot();
+        // v7.38.19 — this path re-applies the WHERE to every candidate
+        // unconditionally, so it takes the ROWS and drops the seek's
+        // exactness. Correct as it stands; the saving is available here
+        // too and has not been measured on this shape.
         let indexed_rows: Option<Vec<Cow<'_, Row<'static>>>> = stmt.where_.as_ref().and_then(|w| {
             try_index_seek(
                 w,
@@ -393,6 +397,7 @@ impl Engine {
                 &seek_snapshot,
                 ctx.mysql_dialect,
             )
+            .map(|s| s.rows)
             .or_else(|| try_gin_seek(w, schema_cols, catalog, table, alias, &ctx, &seek_snapshot))
             .or_else(|| try_trgm_seek(w, schema_cols, table, alias, &seek_snapshot))
             .or_else(|| try_gin_jsonb_seek(w, schema_cols, table, alias, &seek_snapshot))

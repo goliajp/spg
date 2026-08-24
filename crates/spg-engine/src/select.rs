@@ -4447,7 +4447,7 @@ impl Engine {
         alias: &str,
         ctx: &crate::eval::EvalContext<'_>,
         seek_snapshot: &crate::Snapshot,
-    ) -> Option<Vec<Cow<'r, Row<'static>>>> {
+    ) -> Option<crate::index_access::Seeked<'r>> {
         stmt.where_.as_ref().and_then(|w| {
             // BTree / col=literal seek first — covers the v7.11.3 multi-
             // column AND case and the leading-column equality lookup.
@@ -4475,6 +4475,7 @@ impl Engine {
                     ctx,
                     seek_snapshot,
                 )
+                .map(crate::index_access::Seeked::over_approximate)
             })
             .or_else(|| {
                 // v7.15.0 — trigram-GIN-accelerated
@@ -4483,6 +4484,7 @@ impl Engine {
                 // Over-approximate candidate set; the WHERE
                 // re-eval verifies the LIKE per row.
                 try_trgm_seek(w, schema_cols, table, alias, seek_snapshot)
+                    .map(crate::index_access::Seeked::over_approximate)
             })
             .or_else(|| {
                 // v7.37.8(sentori Epic 5 P2)— real JSONB-GIN
@@ -4492,6 +4494,7 @@ impl Engine {
                 // approximate candidate set; the WHERE re-eval
                 // verifies the full `@>` predicate per row.
                 try_gin_jsonb_seek(w, schema_cols, table, alias, seek_snapshot)
+                    .map(crate::index_access::Seeked::over_approximate)
             })
         })
     }
@@ -6568,7 +6571,7 @@ impl Engine {
         table: &'a spg_storage::Table,
         schema_cols: &'a [ColumnSchema],
         alias: &str,
-        indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
+        indexed_rows: Option<crate::index_access::Seeked<'a>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         // v7.38 (read01 U15) — per-scan sampler cell for TABLESAMPLE
@@ -6655,13 +6658,35 @@ impl Engine {
                 (None, None) => Ok(true),
             }
         };
-        if let Some(rows) = &indexed_rows {
-            for cow in rows {
-                let row = cow.as_ref();
-                if !row_passes_where(row, &mut eval_stack, &mut memo)? {
-                    continue;
+        if let Some(seeked) = &indexed_rows {
+            // v7.38.19 — an EXACT seek has already applied the whole
+            // predicate, so asking again is asking the index's question
+            // a second time, once per row.
+            //
+            // Profiled on `count(*) FROM events WHERE project_id = 3`
+            // over 200,000 rows: `try_index_seek` 1,814 leaf samples and
+            // `binop::compare` 1,633 — and `compare`'s first arm is
+            // `(Int, Int) => a.cmp(b)`, so it was never that a
+            // comparison is expensive. It was that 25,000 of them were
+            // re-deciding what the walk had decided. The same query with
+            // `GROUP BY project_id` bolted on ran in half the time,
+            // doing strictly more work, because that path reached the
+            // rows differently.
+            //
+            // `exact` is false for every arm that has not proven it —
+            // the GIN, trigram and jsonb walks, an `AND` whose other
+            // conjuncts went unapplied, a collated key, a type whose key
+            // cannot name it. See `index_access::Seeked`.
+            if seeked.exact {
+                filtered.extend(seeked.rows.iter().map(Cow::as_ref));
+            } else {
+                for cow in &seeked.rows {
+                    let row = cow.as_ref();
+                    if !row_passes_where(row, &mut eval_stack, &mut memo)? {
+                        continue;
+                    }
+                    filtered.push(row);
                 }
-                filtered.push(row);
             }
         }
         // v7.36 (cold-tier coverage) — single-table aggregate's
@@ -6860,7 +6885,7 @@ impl Engine {
         table: &'a spg_storage::Table,
         schema_cols: &'a [ColumnSchema],
         alias: &str,
-        indexed_rows: Option<Vec<Cow<'a, Row<'static>>>>,
+        indexed_rows: Option<crate::index_access::Seeked<'a>>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         // v7.38 (read01 U15) — a fresh per-scan sampler cell for
@@ -7098,11 +7123,21 @@ impl Engine {
         let mut boundary_check_on = true;
         // Inline the per-row work in a closure so the indexed and full-
         // scan branches share the body.
-        let mut process_row = |row: &Row<'static>, loop_idx: usize| -> Result<(), EngineError> {
+        // v7.38.19 — `check_where` is per CALL SITE, not per closure: the
+        // full-scan loops below must apply the predicate, and the
+        // indexed loop must not when the seek already did. A captured
+        // flag would have to be right for both.
+        let mut process_row = |row: &Row<'static>,
+                               loop_idx: usize,
+                               check_where: bool|
+         -> Result<(), EngineError> {
             if loop_idx.is_multiple_of(256) {
                 cancel.check()?;
             }
-            if let Some(cw) = &compiled_where {
+            if !check_where {
+                // The seek answered the whole predicate. See
+                // `index_access::Seeked`.
+            } else if let Some(cw) = &compiled_where {
                 let cond = eval::eval_compiled(cw, row, &ctx, &mut eval_stack)
                     .map_err(EngineError::Eval)?;
                 if !crate::eval::predicate_is_true(&cond, "WHERE", ctx.mysql_dialect)? {
@@ -7339,14 +7374,15 @@ impl Engine {
         // all of them (verified by the full e2e suite staying green).
         let scan_snapshot = self.current_snapshot();
         let mut emitted: usize = 0;
-        if let Some(rows) = &indexed_rows {
-            for (loop_idx, cow) in rows.iter().enumerate() {
+        if let Some(seeked) = &indexed_rows {
+            let recheck = !seeked.exact;
+            for (loop_idx, cow) in seeked.rows.iter().enumerate() {
                 if let Some(cap) = early_cap
                     && emitted >= cap
                 {
                     break;
                 }
-                process_row(cow.as_ref(), loop_idx)?;
+                process_row(cow.as_ref(), loop_idx, recheck)?;
                 emitted = emitted.saturating_add(1);
             }
         } else {
@@ -7374,7 +7410,7 @@ impl Engine {
                     continue;
                 }
                 let Some(row) = rows_cur.get(i) else { continue };
-                process_row(row, i)?;
+                process_row(row, i, true)?;
                 emitted = emitted.saturating_add(1);
             }
             // v7.35.1 (mailrs prod #6 follow-up) — fold cold-tier
@@ -7390,7 +7426,7 @@ impl Engine {
                 {
                     break;
                 }
-                process_row(row, table.row_count() + offset)?;
+                process_row(row, table.row_count() + offset, true)?;
                 emitted = emitted.saturating_add(1);
             }
         }
