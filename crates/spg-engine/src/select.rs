@@ -7067,6 +7067,28 @@ impl Engine {
         } else {
             None
         };
+        // v7.38.19 — when the sort column is one the projection already
+        // carries, build no key at all and sort by reading it.
+        //
+        // Restricted to the FULL sort: a top-N compares against a stored
+        // boundary key and `WITH TIES` extends past the limit through the
+        // keys, both of which need one to exist. DISTINCT keys on them
+        // too, and an SRF's keys come from the EXPANDED row.
+        // And to the UNCOLLATED sort: the value-level comparator takes a
+        // collation by NAME and builds the collator behind it, which is
+        // the per-row cost v7.38.18 removed from the scan filter. Paying
+        // it once per COMPARISON would be worse than the copy this
+        // avoids.
+        let sort_by_output: Option<Vec<usize>> = if stmt.distinct
+            || stmt.limit_with_ties
+            || srf_position.is_some()
+            || topk_stream.is_some()
+            || order_colls.iter().any(Option::is_some)
+        {
+            None
+        } else {
+            order_by_output_cols_if_identical(&order_by, &projection, schema_cols)
+        };
         // v7.37.16 — streaming DISTINCT seen-set: norm-hash → indices of
         // kept rows in `tagged`. Probing on the PROJECTED row as soon as
         // it is built means a duplicate costs neither a build_order_keys
@@ -7157,7 +7179,11 @@ impl Engine {
             // ORDER BY against the INPUT row: a key naming the SRF's own
             // output became a scalar call to it, which is where
             // "function unnest(integer[]) does not exist" came from.
-            let order_keys = if order_by.is_empty() || stmt.distinct || srf_position.is_some() {
+            let order_keys = if order_by.is_empty()
+                || stmt.distinct
+                || srf_position.is_some()
+                || sort_by_output.is_some()
+            {
                 Vec::new()
             } else {
                 let mut buf = key_pool.pop().unwrap_or_default();
@@ -7454,7 +7480,51 @@ impl Engine {
                     .map(|l| l as usize + stmt.offset_literal().map_or(0, |o| o as usize))
             };
             let descs: Vec<bool> = order_by.iter().map(|o| o.desc).collect();
-            crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &order_colls);
+            if let Some(cols) = &sort_by_output {
+                // No keys were built; the sort reads the projected row.
+                // The comparator is the value-level one the window
+                // functions and the key path both defer to, so DESC,
+                // NULLS placement, the MySQL fold and the collation are
+                // not restated here.
+                let terms: Vec<(usize, bool, Option<bool>)> = cols
+                    .iter()
+                    .zip(order_by.iter())
+                    .map(|(c, o)| (*c, o.desc, o.nulls_first))
+                    .collect();
+                let mysql = ctx.mysql_dialect;
+                tagged.sort_by(|a, b| {
+                    for (i, (col, desc, nf)) in terms.iter().enumerate() {
+                        let va = a.1.values.get(*col);
+                        let vb = b.1.values.get(*col);
+                        let (Some(va), Some(vb)) = (va, vb) else {
+                            continue;
+                        };
+                        let _ = i;
+                        // v7.38.19 — two non-NULL strings, no MySQL fold, is
+                        // where a text sort spends every one of its ~7 M
+                        // comparisons, and the shared comparator cannot be
+                        // inlined into this loop: it carries NULL placement,
+                        // the fold, the NUMERIC bignum gate and the float
+                        // total order. Answering that one pair here is the
+                        // same answer by the same route — `value_cmp`'s
+                        // leading same-variant arm is `x.cmp(y)`, and the
+                        // raw comparator's last act is this reverse.
+                        let ord = match (va, vb) {
+                            (Value::Text(x), Value::Text(y)) if !mysql => {
+                                let c = x.cmp(y);
+                                if *desc { c.reverse() } else { c }
+                            }
+                            _ => crate::orderby::order_by_value_cmp_in(*desc, *nf, va, vb, mysql),
+                        };
+                        if ord != core::cmp::Ordering::Equal {
+                            return ord;
+                        }
+                    }
+                    core::cmp::Ordering::Equal
+                });
+            } else {
+                crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &order_colls);
+            }
         }
 
         // v7.17.0 Phase 3.P0-49 — `FETCH FIRST … WITH TIES` extends
@@ -13864,6 +13934,94 @@ fn expand_srf_row_with(
 ///
 /// `None` keeps the key on the input row, which is where an ORDER BY naming
 /// a column the query does not project has to be evaluated.
+/// v7.38.19 — the output column an ORDER BY term reads, when reading it
+/// is provably the same as building a key from the input row.
+///
+/// A sort key is a COPY of the sort column, made because the source row
+/// is gone by the time the sort runs — only the projection survives. On
+/// `SELECT s_long FROM t ORDER BY s_long` that copy is of data the
+/// projected row already holds, and on 400,000 rows of 192-character
+/// text it is 400,000 allocations, 400,000 frees and 77 MB of copying.
+/// A profile of that cell put the allocator at 2,025 leaf samples of the
+/// working set, second only to the comparison chain.
+///
+/// The condition is narrow on purpose. `srf_order_output_cols` resolves
+/// an ORDER BY term the way SQL does — a positional ordinal, or a name
+/// matching the select list — and SQL resolves against the select list
+/// BEFORE the input columns. The key path resolves against the INPUT
+/// columns. For `SELECT g AS id … ORDER BY id` on a table that also has
+/// an `id`, those are different columns, and swapping one for the other
+/// would change answers rather than timings.
+///
+/// So this takes only the case where the two cannot disagree: a bare
+/// unqualified column name, matching exactly one output item, whose own
+/// expression is that same column. The projected cell then IS the input
+/// cell, and the key would have been its copy.
+/// True when comparing two of this column's VALUES gives the same order
+/// as comparing the sort KEYS built from them.
+///
+/// It does not hold widely. A user ENUM stores its label as text but
+/// orders by DECLARATION position; an array orders element-wise; a
+/// domain or composite carries its own rules. For those the two paths
+/// answer differently, and a sort that skipped the key would silently
+/// reorder the result. This is the short list where they agree.
+fn value_order_is_key_order(col: &ColumnSchema) -> bool {
+    use spg_storage::DataType as T;
+    col.user_enum_type.is_none()
+        && col.user_domain_type.is_none()
+        && col.user_composite_type.is_none()
+        && col.collation_name.is_none()
+        && col.collation == spg_storage::Collation::Binary
+        && matches!(
+            col.ty,
+            T::SmallInt | T::Int | T::BigInt | T::Text | T::Varchar(_) | T::Bool | T::Uuid
+        )
+}
+
+fn order_by_output_cols_if_identical(
+    order_by: &[spg_sql::ast::OrderBy],
+    projection: &[ProjectedItem],
+    schema_cols: &[ColumnSchema],
+) -> Option<Vec<usize>> {
+    if order_by.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(order_by.len());
+    for ob in order_by {
+        let Expr::Column(c) = &ob.expr else {
+            return None;
+        };
+        if c.qualifier.is_some() {
+            return None;
+        }
+        let mut hit = None;
+        for (i, p) in projection.iter().enumerate() {
+            if !p.output_name.eq_ignore_ascii_case(&c.name) {
+                continue;
+            }
+            if hit.is_some() {
+                return None; // ambiguous — SQL would reject it too
+            }
+            // The item must BE that column, not merely be named for it.
+            let Expr::Column(pc) = &p.expr else {
+                return None;
+            };
+            if !pc.name.eq_ignore_ascii_case(&c.name) {
+                return None;
+            }
+            let sc = schema_cols
+                .iter()
+                .find(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+            if !value_order_is_key_order(sc) {
+                return None;
+            }
+            hit = Some(i);
+        }
+        out.push(hit?);
+    }
+    Some(out)
+}
+
 fn srf_order_output_cols(
     order_by: &[spg_sql::ast::OrderBy],
     projection: &[ProjectedItem],

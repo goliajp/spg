@@ -844,6 +844,7 @@ mod e2e_similar_to_round31;
 mod e2e_similarity_real_round766;
 mod e2e_snapshot_export_probes;
 mod e2e_sort_pruned_decode_round938;
+mod e2e_sort_without_keys;
 mod e2e_soundex;
 mod e2e_spg_catalog_round661;
 mod e2e_spg_version;

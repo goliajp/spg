@@ -449,6 +449,31 @@ Five gates gained the ability to see something they had claimed to check.
 
 ### Still open, named with what closing them would cost
 
+- **Our sorts are 1.8x to 3.0x PostgreSQL, and the release gate is red
+  on one of them.** 400,000 rows, both engines ordering BYTES:
+
+  | | SPG | PG 18 | |
+  |---|---:|---:|---|
+  | `sort only, long text distinct` | 231.3 ms | 62.5 | **3.70x — over the 3.0x ceiling** |
+  | `sort only, two keys` | 148.8 | 67.9 | 2.19x |
+  | `sort only, text (26 values)` | 159.3 | 78.7 | 2.02x |
+  | `sort only, long text top-N` | 19.1 | 9.5 | 2.00x |
+  | `sort only, short text distinct` | 150.5 | 103.6 | 1.45x |
+  | `sort only, int` | 53.4 | 55.7 | 0.96x |
+
+  Newly visible: the sweep had been comparing our `C` leg against a
+  collated PostgreSQL one, and two of these cells were reporting WINS
+  on the difference. The integer cell being level while every other is
+  2x says this is the sort machinery and not the text.
+
+  Two attacks tried and both measured NEUTRAL — sorting the permutation
+  by index, and copying the key into a contiguous array the way the
+  integer path does. Both were first judged WORSE by a harness that
+  turned out to have a 2x per-leg bias, found by running the same
+  binary as both legs. It wants its own round, with the sweep's own
+  control leg rather than a hand-rolled one.
+
+
 - **`pg_typeof(x::cstring)` reads `text`.** `cstring` is a pseudo-type;
   PostgreSQL refuses `CREATE TABLE t(c cstring)` itself, and the value
   round-trips as text on both engines. Closing it means a `DataType`
