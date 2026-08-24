@@ -103,6 +103,7 @@ mod e2e_chaos_logical;
     unused_variables
 )]
 mod e2e_chaos_netsplit;
+mod e2e_collation_survives_restart;
 #[allow(unsafe_code)]
 mod e2e_compression_metrics;
 mod e2e_conn_attrs_round319;

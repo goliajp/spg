@@ -1970,6 +1970,27 @@ fn run(
 
     replay_wal_into_engine(&mut engine, wal_path.as_deref(), manifest_wal_baseline)?;
 
+    // v7.38.19 — AFTER replay, and the ordering is the whole guard.
+    //
+    // `set_db_collation` refuses to change a collation once the
+    // database has tables, because every index key was built under the
+    // old one. That guard is only as good as what the catalog holds
+    // when it runs, and this used to run before the WAL was replayed.
+    //
+    // A server killed without checkpointing -- which is every crash and
+    // every plain `kill` -- starts from an EMPTY catalog and rebuilds
+    // itself from the WAL. Measured: a database created under `C`
+    // holding `apple, Bob, Zebra`, restarted from the same directory
+    // with `SPG_LC_COLLATE=en_US.utf8`, came back declaring
+    // `en_US.utf8` and answering `apple, Bob, Zebra` where it had
+    // answered `Bob, Zebra, apple`. Every text sort in the database
+    // silently changed answer because an environment variable did.
+    //
+    // PostgreSQL cannot do this: `initdb` writes the collation into the
+    // cluster and a later `LANG` does not touch it. Running after
+    // replay is what makes SPG's guard mean the same thing.
+    apply_database_collation(&mut engine);
+
     bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
 
     let (wal, wal_sync_clone) = open_wal_for_append(wal_path.as_deref())?;
@@ -2231,7 +2252,6 @@ fn restore_engine(
         }
         None => Engine::new(),
     };
-    apply_database_collation(&mut engine);
     // v7.38.18 — read the hba file NOW, not at the first connection.
     //
     // `hba_rules` is a `OnceLock`, so leaving it to the first client
