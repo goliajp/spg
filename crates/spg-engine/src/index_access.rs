@@ -1397,7 +1397,7 @@ fn try_range_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
-) -> Option<Vec<Cow<'a, Row<'static>>>> {
+) -> Option<Seeked<'a>> {
     let db_coll = table.db_collation();
     // r1038 — EXACT: see the note in `try_index_seek_positions`. The AND
     // recursion in `try_index_seek` retries each conjunct alone, so a
@@ -1455,7 +1455,35 @@ fn try_range_seek<'a>(
     }
     // v7.39 (pg_stat knife B) — one index scan.
     table.note_index_scan(out.len() as u64);
-    Some(out)
+    // v7.38.19 — `parse_range_bounds_exact` is exact by name and by
+    // contract: it refuses a predicate that is a range PLUS something
+    // else, which is why the AND recursion exists above it. So the walk
+    // answered the whole predicate, and the only remaining question is
+    // whether the key ORDERS the way the value does — a question about
+    // the column's type and collation.
+    //
+    // The bound VALUES decide it, not just the column: `parse_range_bounds_exact`
+    // builds them through `probe_key`, and a bound of a different type
+    // than the column is the shape that would make the key a poor
+    // stand-in.
+    fn bound_key(b: &Bound<IndexKey>) -> Option<&IndexKey> {
+        match b {
+            Bound::Included(k) | Bound::Excluded(k) => Some(k),
+            Bound::Unbounded => None,
+        }
+    }
+    let faithful = schema_cols.get(col_pos).is_some_and(|c| {
+        let (lk, hk) = (bound_key(&lo), bound_key(&hi));
+        // At least one bound, and every bound present stands for its
+        // value. An unbounded side asks nothing of the encoding.
+        (lk.is_some() || hk.is_some())
+            && lk.is_none_or(|k| key_stands_for_the_value(c, k))
+            && hk.is_none_or(|k| key_stands_for_the_value(c, k))
+    });
+    Some(Seeked {
+        rows: out,
+        exact: faithful,
+    })
 }
 
 /// Whether the WHOLE predicate is a single indexed range — the BETWEEN
@@ -1563,6 +1591,79 @@ pub(crate) fn try_range_count(
     Some(count)
 }
 
+/// v7.38.19 — a seek's answer, and whether the predicate is already
+/// fully applied to it.
+///
+/// Every seek here has returned a CANDIDATE set: the caller re-applies
+/// the whole `WHERE` to each row. That is not a formality — the GIN,
+/// trigram and jsonb-containment walks are over-approximate by
+/// construction, an `AND` recursion drops the conjuncts it did not
+/// seek on, and a collated key is an ENCODING of the value rather than
+/// the value.
+///
+/// But some arms answer the predicate exactly, and for those the
+/// re-check is the query's dominant cost. Profiled on sentori's
+/// `count(*) FROM events WHERE project_id = 3` over 200,000 rows:
+/// `try_index_seek` 1,814 leaf samples and `binop::compare` 1,633, and
+/// `compare`'s first arm is `(Int, Int) => a.cmp(b)` — so it was not
+/// that each comparison was expensive, it was that 25,000 of them were
+/// re-deciding what the index had already decided. The same query with
+/// `GROUP BY project_id` bolted on ran in half the time, doing strictly
+/// more work.
+///
+/// `exact` is FALSE everywhere it is not proven. A miss costs a
+/// re-check; a false claim silently drops rows.
+pub(crate) struct Seeked<'a> {
+    pub(crate) rows: Vec<Cow<'a, Row<'static>>>,
+    pub(crate) exact: bool,
+}
+
+impl<'a> Seeked<'a> {
+    /// The safe default: a candidate set the caller must filter.
+    fn candidates(rows: Vec<Cow<'a, Row<'static>>>) -> Self {
+        Self { rows, exact: false }
+    }
+
+    /// The same, said by a caller about a walk that is over-approximate
+    /// by construction — a posting-list intersection or a trigram set.
+    pub(crate) fn over_approximate(rows: Vec<Cow<'a, Row<'static>>>) -> Self {
+        Self::candidates(rows)
+    }
+}
+
+/// v7.38.19 — whether this key STANDS FOR the value it was built from:
+/// two values compare equal exactly when their keys do, and in the same
+/// order.
+///
+/// Asked of the key rather than the value on purpose. A key that exists
+/// at all came through [`probe_key`], which already refused a collated
+/// column and a column whose comparison folds — so what is left to
+/// decide is the type, and the key's own variant is the honest way to
+/// ask it.
+///
+/// Deliberately a short allowlist rather than a list of exclusions.
+/// `DATE` and `TIMESTAMP` are ABSENT even though both index as integers,
+/// and that is the point: they index as the SAME integer variant, so a
+/// key cannot say which it came from, and a stand-in that cannot name
+/// its own type is not one. The encoding has a lossy arm too —
+/// `Value::BpChar` keys by its TRIMMED text, right for `CHAR`'s
+/// blank-insensitive comparison and wrong as a stand-in for anything
+/// else.
+///
+/// A type missing from this list costs a re-check. A type wrongly
+/// present costs rows.
+fn key_stands_for_the_value(col: &ColumnSchema, key: &IndexKey) -> bool {
+    use spg_storage::DataType as T;
+    matches!(
+        (col.ty, key),
+        (T::SmallInt | T::Int | T::BigInt, IndexKey::Int(_))
+            | (T::Bool, IndexKey::Bool(_))
+            | (T::Uuid, IndexKey::Uuid(_))
+            | (T::Bytes, IndexKey::Bytes(_))
+            | (T::Text | T::Varchar(_), IndexKey::Text(_))
+    )
+}
+
 pub(crate) fn try_index_seek<'a>(
     where_expr: &Expr,
     schema_cols: &[ColumnSchema],
@@ -1571,7 +1672,7 @@ pub(crate) fn try_index_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
-) -> Option<Vec<Cow<'a, Row<'static>>>> {
+) -> Option<Seeked<'a>> {
     // v7.38.18 (S2) — the collation an undeclared text column is
     // compared under, and so the one its index keys under.
     let db_coll = table.db_collation();
@@ -1584,9 +1685,10 @@ pub(crate) fn try_index_seek<'a>(
     // purpose rather than a limit of the parser: one-sided ranges became
     // seekable, so without the exactness test here the mixed predicate above
     // would take the range and leave the equality unused.
-    if let Some(rows) = try_range_seek(where_expr, schema_cols, table, table_alias, snapshot, mysql)
+    if let Some(seeked) =
+        try_range_seek(where_expr, schema_cols, table, table_alias, snapshot, mysql)
     {
-        return Some(rows);
+        return Some(seeked);
     }
     // v7.11.3 — recurse through top-level `AND` so a PG-style
     // composite predicate like `WHERE id = 1 AND created_at > $1`
@@ -1799,7 +1901,8 @@ pub(crate) fn try_index_seek<'a>(
             }
             if all_hot {
                 table.note_index_scan(out.len() as u64);
-                return Some(out);
+                // Inside the AND branch: the other conjuncts were not applied.
+                return Some(Seeked::candidates(out));
             }
         }
         if let Some((_, col_pos, lo, hi)) = best_range
@@ -1831,15 +1934,20 @@ pub(crate) fn try_index_seek<'a>(
             }
             if all_hot {
                 table.note_index_scan(out.len() as u64);
-                return Some(out);
+                // Inside the AND branch: the other conjuncts were not applied.
+                return Some(Seeked::candidates(out));
             }
         }
         if let Some((_, c)) = best {
-            return try_index_seek(c, schema_cols, catalog, table, table_alias, snapshot, mysql);
+            // The chosen conjunct is one of several; the others were not
+            // applied, so this is a candidate set however exact the
+            // seek for `c` alone would be.
+            return try_index_seek(c, schema_cols, catalog, table, table_alias, snapshot, mysql)
+                .map(|s| Seeked::candidates(s.rows));
         }
         // No equality conjunct is indexable — keep the old recursion
         // for the range / IN-list shapes hiding inside the AND.
-        if let Some(rows) = try_index_seek(
+        if let Some(seeked) = try_index_seek(
             lhs,
             schema_cols,
             catalog,
@@ -1848,7 +1956,7 @@ pub(crate) fn try_index_seek<'a>(
             snapshot,
             mysql,
         ) {
-            return Some(rows);
+            return Some(Seeked::candidates(seeked.rows));
         }
         return try_index_seek(
             rhs,
@@ -1858,7 +1966,8 @@ pub(crate) fn try_index_seek<'a>(
             table_alias,
             snapshot,
             mysql,
-        );
+        )
+        .map(|s| Seeked::candidates(s.rows));
     }
     // v7.38.19 — `a = 1 OR a = 2` is `a IN (1, 2)` written the other way,
     // and this engine has seeked the IN form since v7.33 while scanning
@@ -1904,6 +2013,11 @@ pub(crate) fn try_index_seek<'a>(
             snapshot,
             mysql,
         )?;
+        // v7.38.19 — a union answers the whole `OR` exactly when both
+        // halves answer their own half exactly. One over-approximate arm
+        // makes the union over-approximate.
+        let exact = left.exact && right.exact;
+        let (left, right) = (left.rows, right.rows);
         // A union wider than the scan it replaces is not a win. Each arm
         // is capped on its own, so two of them can still add up past the
         // table; refuse there rather than materialise it.
@@ -1930,13 +2044,13 @@ pub(crate) fn try_index_seek<'a>(
                 out.push(Cow::Borrowed(hot));
             }
         }
-        return Some(out);
+        return Some(Seeked { rows: out, exact });
     }
     // v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` seeks each literal
     // and unions the rows (PG's bitmap index scan) instead of a full scan
     // + per-row membership test. The single-table path otherwise tested a
     // 60-element list against every row (24k × 60 string compares ~66 ms).
-    if let Some(rows) = try_inlist_seek(
+    if let Some(seeked) = try_inlist_seek(
         where_expr,
         schema_cols,
         catalog,
@@ -1945,7 +2059,7 @@ pub(crate) fn try_index_seek<'a>(
         snapshot,
         mysql,
     ) {
-        return Some(rows);
+        return Some(seeked);
     }
     let Expr::Binary {
         lhs,
@@ -1967,7 +2081,10 @@ pub(crate) fn try_index_seek<'a>(
         for i in positions {
             out.push(Cow::Borrowed(table.rows().get(i)?));
         }
-        return Some(out);
+        // An expression index answers `lower(s) = 'x'` from keys the
+        // engine built; whether that is the WHOLE predicate exactly is a
+        // question this has not earned, so it stays a candidate set.
+        return Some(Seeked::candidates(out));
     }
     let (col_pos, value) = resolve_col_literal_pair(lhs, rhs, schema_cols, table_alias)
         .or_else(|| resolve_col_literal_pair(rhs, lhs, schema_cols, table_alias))?;
@@ -2023,7 +2140,19 @@ pub(crate) fn try_index_seek<'a>(
     }
     // v7.39 (pg_stat knife B) — one index scan.
     table.note_index_scan(out.len() as u64);
-    Some(out)
+    // v7.38.19 — this arm answered `col = <literal>`, which IS the whole
+    // predicate: the function only reaches here when `where_expr` is that
+    // single equality. The rows are every row whose key equals the probe,
+    // so the caller need not ask again — provided the key is a faithful
+    // stand-in for the value, which is a question about the column's type
+    // and collation and is asked as one.
+    //
+    // A cold row is materialised through `resolve_cold_locator`, the same
+    // key lookup, so the same argument covers it.
+    let exact = schema_cols
+        .get(col_pos)
+        .is_some_and(|c| key_stands_for_the_value(c, &key));
+    Some(Seeked { rows: out, exact })
 }
 
 /// v7.33 (mailrs 7.33.0) — `indexed_col IN (lit, …)` candidate seek.
@@ -2042,7 +2171,7 @@ fn try_inlist_seek<'a>(
     table_alias: &str,
     snapshot: &spg_storage::snapshot::Snapshot,
     mysql: bool,
-) -> Option<Vec<Cow<'a, Row<'static>>>> {
+) -> Option<Seeked<'a>> {
     // v7.38.18 (S2) — the collation an undeclared text column is
     // compared under, and so the one its index keys under.
     let db_coll = table.db_collation();
@@ -2133,7 +2262,15 @@ fn try_inlist_seek<'a>(
     }
     // v7.39 (pg_stat knife B) — one index scan.
     table.note_index_scan(out.len() as u64);
-    Some(out)
+    // v7.38.19 — the list IS the whole predicate: this function only
+    // fires on a bare non-negated `IN`, and it refuses the whole seek if
+    // any element is not a literal. So the union of per-literal lookups
+    // is every matching row and no other — as long as each key stands
+    // for its value.
+    let exact = schema_cols
+        .get(col_pos)
+        .is_some_and(|c| keys.iter().all(|k| key_stands_for_the_value(c, k)));
+    Some(Seeked { rows: out, exact })
 }
 
 /// v7.12.3 — GIN-accelerated candidate seek for `WHERE col @@ <ts_query>`.
