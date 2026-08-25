@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 269 | 0 | 0 | 100.0% | postgres × 19 |
+| `15_regressions` | 284 | 0 | 0 | 100.0% | postgres × 21 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 449 | 0 | 0 | 100.0% | mysql × 27 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
@@ -51,6 +51,8 @@ Per-corpus pass / fail / skip:
 | `v73818_two_gin_indexes.test` | 29 | 0 | 0 | postgres |
 | `v73819_interval_infinity.test` | 25 | 0 | 0 | postgres |
 | `v73819_pseudo_types.test` | 11 | 0 | 0 | postgres |
+| `v73821_collated_topn.test` | 6 | 0 | 0 | postgres |
+| `v73822_collated_sort_paths.test` | 9 | 0 | 0 | postgres |
 
 ### `duckdb/`
 

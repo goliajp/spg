@@ -198,7 +198,13 @@ const NO_RUN: usize = usize::MAX;
 
 /// Order two runs by their heads, with everything that cannot supply a
 /// row sorting last: a drained run, then an empty slot.
-fn head_cmp(heads: &[Head], descs: &[bool], a: usize, b: usize) -> core::cmp::Ordering {
+fn head_cmp(
+    heads: &[Head],
+    descs: &[bool],
+    collations: &[Option<crate::collate::Collated>],
+    a: usize,
+    b: usize,
+) -> core::cmp::Ordering {
     use core::cmp::Ordering;
     match (a == NO_RUN, b == NO_RUN) {
         (true, true) => return Ordering::Equal,
@@ -223,7 +229,9 @@ fn head_cmp(heads: &[Head], descs: &[bool], a: usize, b: usize) -> core::cmp::Or
         // exists to prevent between its two callers.
         //
         // Not reversed under DESC: arrival order is not a key.
-        (Some((ka, _)), Some((kb, _))) => cmp_multi_key_in(ka, kb, descs, &[]).then(a.cmp(&b)),
+        (Some((ka, _)), Some((kb, _))) => {
+            cmp_multi_key_in(ka, kb, descs, collations).then(a.cmp(&b))
+        }
     }
 }
 
@@ -252,12 +260,17 @@ struct HeadHeap {
 }
 
 impl HeadHeap {
-    fn build(k: usize, heads: &[Head], descs: &[bool]) -> Self {
+    fn build(
+        k: usize,
+        heads: &[Head],
+        descs: &[bool],
+        collations: &[Option<crate::collate::Collated>],
+    ) -> Self {
         let mut h = Self {
             heap: (0..k).filter(|&i| heads[i].is_some()).collect(),
         };
         for start in (0..h.heap.len() / 2).rev() {
-            h.sift_down(start, heads, descs);
+            h.sift_down(start, heads, descs, collations);
         }
         h
     }
@@ -268,7 +281,12 @@ impl HeadHeap {
 
     /// The run at the top has a new head — or none left, in which case it
     /// leaves the heap.
-    fn settle_root(&mut self, heads: &[Head], descs: &[bool]) {
+    fn settle_root(
+        &mut self,
+        heads: &[Head],
+        descs: &[bool],
+        collations: &[Option<crate::collate::Collated>],
+    ) {
         let Some(&top) = self.heap.first() else {
             return;
         };
@@ -281,23 +299,29 @@ impl HeadHeap {
             }
         }
         if !self.heap.is_empty() {
-            self.sift_down(0, heads, descs);
+            self.sift_down(0, heads, descs, collations);
         }
     }
 
-    fn sift_down(&mut self, mut node: usize, heads: &[Head], descs: &[bool]) {
+    fn sift_down(
+        &mut self,
+        mut node: usize,
+        heads: &[Head],
+        descs: &[bool],
+        collations: &[Option<crate::collate::Collated>],
+    ) {
         let n = self.heap.len();
         loop {
             let (l, r) = (2 * node + 1, 2 * node + 2);
             let mut best = node;
             if l < n
-                && head_cmp(heads, descs, self.heap[l], self.heap[best])
+                && head_cmp(heads, descs, collations, self.heap[l], self.heap[best])
                     == core::cmp::Ordering::Less
             {
                 best = l;
             }
             if r < n
-                && head_cmp(heads, descs, self.heap[r], self.heap[best])
+                && head_cmp(heads, descs, collations, self.heap[r], self.heap[best])
                     == core::cmp::Ordering::Less
             {
                 best = r;
@@ -350,6 +374,18 @@ pub(crate) struct ExternalSorter<'a> {
     /// whose types are already declared.
     record_schema: TableSchema,
     descs: &'a [bool],
+    /// v7.38.22 — the collation for each key position, resolved once by
+    /// the caller.
+    ///
+    /// This sorter compared with `cmp_multi_key_in(.., &[])` at every
+    /// site, so an ORDER BY that named a collation — or a database that
+    /// declared one — was ordered by BYTES here while the materialising
+    /// sort honoured it. Same query, two answers, decided by which path
+    /// the planner took, and the byte one is silently wrong:
+    /// PostgreSQL 18.4 answers `apple, Banana, Cherry, date` for
+    /// `ORDER BY s COLLATE "en_US.utf8"` and every published SPG through
+    /// 7.38.21 answered `Banana, Cherry, apple, date`.
+    collations: &'a [Option<crate::collate::Collated>],
     /// The batch, held the way PG holds one: the rows encoded back to
     /// back in ONE buffer, the keys flattened beside them, and nothing
     /// allocated per row.
@@ -393,12 +429,14 @@ impl<'a> ExternalSorter<'a> {
         budget_bytes: usize,
         record_cols: Vec<spg_storage::ColumnSchema>,
         descs: &'a [bool],
+        collations: &'a [Option<crate::collate::Collated>],
     ) -> Self {
         Self {
             factory,
             budget_bytes,
             record_schema: TableSchema::new("spg_sort_run", record_cols),
             descs,
+            collations,
             arena: Vec::new(),
             ends: Vec::new(),
             keys: Vec::new(),
@@ -536,6 +574,7 @@ impl<'a> ExternalSorter<'a> {
             return order;
         }
         let (keys, stride, descs) = (&self.keys, self.key_stride, self.descs);
+        let collations = self.collations;
         if stride == 1
             && let Some(mut inline) = Self::inline_int_keys(keys)
         {
@@ -586,7 +625,12 @@ impl<'a> ExternalSorter<'a> {
                     // the general path below does with the same rows.
                     inline[lo..hi].sort_by(|&(_, a), &(_, b)| {
                         let (a, b) = (a as usize * stride, b as usize * stride);
-                        cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
+                        cmp_multi_key_in(
+                            &keys[a..a + stride],
+                            &keys[b..b + stride],
+                            descs,
+                            collations,
+                        )
                     });
                 }
                 lo = hi;
@@ -598,7 +642,12 @@ impl<'a> ExternalSorter<'a> {
         }
         order.sort_by(|&a, &b| {
             let (a, b) = (a as usize * stride, b as usize * stride);
-            cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
+            cmp_multi_key_in(
+                &keys[a..a + stride],
+                &keys[b..b + stride],
+                descs,
+                collations,
+            )
         });
         order
     }
@@ -773,7 +822,7 @@ impl<'a> ExternalSorter<'a> {
             )?);
         }
 
-        let mut heap = HeadHeap::build(heads.len(), &heads, self.descs);
+        let mut heap = HeadHeap::build(heads.len(), &heads, self.descs, self.collations);
         while let Some(w) = heap.peek() {
             let Some((keys, record)) = heads[w].take() else {
                 break;
@@ -790,7 +839,7 @@ impl<'a> ExternalSorter<'a> {
                 &mut readbuf,
                 keys,
             )?;
-            heap.settle_root(&heads, self.descs);
+            heap.settle_root(&heads, self.descs, self.collations);
         }
         Ok(emitted)
     }
@@ -1001,10 +1050,10 @@ mod tests {
             ])
         };
 
-        let mut full = ExternalSorter::new(None, usize::MAX, cols.clone(), &descs);
+        let mut full = ExternalSorter::new(None, usize::MAX, cols.clone(), &descs, &[]);
         // `id` is read, `pad` is not.
         let mask = [true, false];
-        let mut lean = ExternalSorter::new(None, usize::MAX, cols, &descs).with_pruned(&mask);
+        let mut lean = ExternalSorter::new(None, usize::MAX, cols, &descs, &[]).with_pruned(&mask);
         for i in 0..1000i32 {
             let r = wide((i * 7919) % 1000);
             let mut k = keys_vec(&r);
@@ -1076,7 +1125,7 @@ mod tests {
 
         let run_one = |needed: &[bool]| -> (u64, u64, Vec<i32>) {
             let stats = crate::tempstore::SpillStats::default();
-            let mut s = ExternalSorter::new(Some(mem_run), 4096, cols.clone(), &descs)
+            let mut s = ExternalSorter::new(Some(mem_run), 4096, cols.clone(), &descs, &[])
                 .with_stats(&stats)
                 .with_pruned(needed);
             for i in 0..2000i32 {
@@ -1136,7 +1185,7 @@ mod tests {
         use core::cell::Cell;
 
         let descs = [false];
-        let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs, &[]);
         for i in 0..5000i32 {
             let r = record((i * 7919) % 5000);
             let mut k = keys_vec(&r);
@@ -1178,8 +1227,8 @@ mod tests {
     fn finish_each_matches_finish_spilled_and_unspilled() {
         let descs = [false];
         for budget in [4096usize, 64 * 1024 * 1024] {
-            let mut a = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
-            let mut b = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
+            let mut a = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs, &[]);
+            let mut b = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs, &[]);
             for i in 0..2000i32 {
                 let r = record((i * 7919) % 2000);
                 a.push(&mut keys_vec(&r), &r).unwrap();
@@ -1245,7 +1294,8 @@ mod tests {
         let descs = [false];
 
         for rows in [50_000usize, 100_000, 200_000, 400_000] {
-            let mut s = ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs);
+            let mut s =
+                ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs, &[]);
             for i in 0..rows {
                 let r = Row::new(alloc::vec![
                     Value::Int(i32::try_from((i * 7919) % rows).unwrap()),
@@ -1501,7 +1551,8 @@ mod tests {
             ("computed", computed_keys, false),
             ("narrow-projection", free_keys, true),
         ] {
-            let mut s = ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs);
+            let mut s =
+                ExternalSorter::new(Some(mem_run), 4 * 1024 * 1024, cols.clone(), &descs, &[]);
             for i in 0..ROWS {
                 let r = Row::new(alloc::vec![
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
@@ -1555,8 +1606,13 @@ mod tests {
         let descs = [false];
 
         for budget_mb in [4usize, 16, 64] {
-            let mut s =
-                ExternalSorter::new(Some(mem_run), budget_mb * 1024 * 1024, cols.clone(), &descs);
+            let mut s = ExternalSorter::new(
+                Some(mem_run),
+                budget_mb * 1024 * 1024,
+                cols.clone(),
+                &descs,
+                &[],
+            );
             for i in 0..ROWS {
                 let r = Row::new(alloc::vec![
                     Value::Int(i32::try_from((i * 7919) % ROWS).unwrap()),
@@ -1671,7 +1727,7 @@ mod tests {
             .collect();
         let build = t0.elapsed();
 
-        let mut s = ExternalSorter::new(Some(mem_run), WORK_MEM, cols, &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), WORK_MEM, cols, &descs, &[]);
         let t1 = Instant::now();
         for r in rows {
             let mut k = keys_vec(&r);
@@ -1697,7 +1753,7 @@ mod tests {
     #[test]
     fn a_key_that_was_never_projected_still_orders_the_merge() {
         let descs = [false];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs, &[]);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
             let mut k = keys_vec(&r);
@@ -1730,7 +1786,7 @@ mod tests {
     #[test]
     fn a_spilled_sort_returns_exactly_what_an_in_memory_sort_would() {
         let descs = [false];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs, &[]);
         for id in [7, 3, 9, 1, 8, 2, 6, 4, 5, 0] {
             let r = record(id);
             let mut k = keys_vec(&r);
@@ -1749,7 +1805,7 @@ mod tests {
     #[test]
     fn descending_order_survives_the_merge() {
         let descs = [true];
-        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs);
+        let mut s = ExternalSorter::new(Some(mem_run), 1, record_cols(), &descs, &[]);
         for id in [3, 1, 2] {
             let r = record(id);
             let mut k = keys_vec(&r);
@@ -1770,7 +1826,7 @@ mod tests {
     #[test]
     fn without_a_factory_the_sort_stays_in_memory_and_still_sorts() {
         let descs = [false];
-        let mut s = ExternalSorter::new(None, 1, record_cols(), &descs);
+        let mut s = ExternalSorter::new(None, 1, record_cols(), &descs, &[]);
         for id in [2, 0, 1] {
             let r = record(id);
             let mut k = keys_vec(&r);
@@ -1802,7 +1858,7 @@ mod tests {
     /// with it, and a hand-written order would just be a second chance
     /// to make the same mistake.
     fn assert_order_matches(name: &str, keyrows: &[Vec<OrderKey>], descs: &[bool]) {
-        let mut s = ExternalSorter::new(None, usize::MAX, record_cols(), descs);
+        let mut s = ExternalSorter::new(None, usize::MAX, record_cols(), descs, &[]);
         for (i, k) in keyrows.iter().enumerate() {
             let r = record(i as i32);
             s.push(&mut k.clone(), &r).unwrap();
@@ -1913,7 +1969,7 @@ mod tests {
             let mut want: Vec<(i128, i128, i32)> = (0..4000i32)
                 .map(|i| (i as i128 % 3, ((i as i128) * 7919) % 13, i))
                 .collect();
-            let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
+            let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs, &[]);
             for &(a, b, id) in &want {
                 let r = record(id);
                 let mut k = alloc::vec![OrderKey::Int(a), OrderKey::Int(b)];
@@ -1950,7 +2006,7 @@ mod tests {
     fn inline_int_key_holds_when_the_sort_spills() {
         let descs = [false];
         for budget in [4096usize, 64 * 1024 * 1024] {
-            let mut s = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs);
+            let mut s = ExternalSorter::new(Some(mem_run), budget, record_cols(), &descs, &[]);
             for i in 0..2000i32 {
                 let r = record((i * 7919) % 2000);
                 s.push(&mut keys_vec(&r), &r).unwrap();

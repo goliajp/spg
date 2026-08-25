@@ -482,6 +482,56 @@ pub(crate) const fn is_ascii_alnum_lower(s: &str) -> bool {
     true
 }
 
+/// v7.38.22 — whether a collation may be attached to this type at all.
+///
+/// PostgreSQL keeps a `typcollation` on every type and refuses a
+/// `COLLATE` on the ones that have none:
+///
+/// ```text
+/// ERROR:  42804: collations are not supported by type integer
+/// ```
+///
+/// SPG accepted it on every type, which is two defects wearing one
+/// clause. The visible one is that `ORDER BY n COLLATE "en_US.utf8"`
+/// answered where PostgreSQL raises. The quiet one is that a DATABASE
+/// collation was attached to every ORDER BY term regardless of type, so
+/// once a database declares one, sorting a NUMERIC or a BYTEA column
+/// carries a collator it can never consult — and misses the fast paths
+/// that check for its absence. The release panel that compares the same
+/// binary under a collation against itself under `C` read 1.02x on
+/// `numeric key` and 1.06x on `bytea key` for exactly that.
+///
+/// The list is measured against PostgreSQL 18.4, not reasoned about.
+/// Accepted: `text`, `varchar`, `char(n)`, `name`, and arrays of those.
+/// Refused: everything else that was asked — `int`, `bigint`, `numeric`,
+/// `boolean`, `date`, `bytea`, `json`, `jsonb`, `uuid`, `xml`,
+/// `tsvector`, `tsquery`, `inet`, `money`, `bit`, `oid`, `int4range`,
+/// and `integer[]`. An array follows its ELEMENT: `text[]` takes a
+/// collation and `integer[]` does not.
+#[must_use]
+pub(crate) const fn is_collatable(t: &spg_storage::DataType) -> bool {
+    use spg_storage::DataType as D;
+    matches!(
+        t,
+        D::Text
+            | D::Varchar(_)
+            | D::Char(_)
+            | D::Name
+            | D::TextArray
+            | D::VarcharArray
+            | D::CharArray
+    )
+}
+
+/// PostgreSQL's own wording for the refusal, so a driver reading the
+/// message gets the same string from both engines.
+#[must_use]
+pub(crate) fn not_collatable_error(type_name: &str) -> crate::EngineError {
+    crate::EngineError::Unsupported(alloc::format!(
+        "collations are not supported by type {type_name}"
+    ))
+}
+
 /// The languages whose tailoring leaves `[0-9a-z]` in byte order.
 ///
 /// Keyed on the language subtag alone: a region or a script does not

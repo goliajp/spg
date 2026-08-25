@@ -58,7 +58,7 @@
 | `SPG_AUTOVACUUM_NAPTIME_MS` | `crates/spg-server/src/autovacuum.rs:45` | yes |
 | `SPG_AUTO_ANALYZE_INTERVAL_MS` | `crates/spg-server/src/main.rs:1146` | yes |
 | `SPG_COMMIT_DELAY_US` | `crates/spg-server/src/wal.rs:660` | yes |
-| `SPG_COMMIT_GROUP_MAX` | `crates/spg-server/src/wal.rs:645` | **no** |
+| `SPG_COMMIT_GROUP_MAX` | `crates/spg-server/src/wal.rs:645` | yes |
 | `SPG_COMMIT_TRACE` | `crates/spg-server/src/main.rs:301` | **no** |
 | `SPG_COMPACTION_TARGET_SEGMENT_BYTES` | `crates/spg-server/src/commands.rs:273` | **no** |
 | `SPG_COMPRESSION_MIN_BYTES` | `crates/spg-server/src/wal.rs:205` | **no** |

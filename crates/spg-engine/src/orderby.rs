@@ -1710,6 +1710,54 @@ pub(crate) fn sort_by_keys_in(
 /// Only a bare column reference has one: `ORDER BY upper(name)` sorts a new
 /// value, and SPG does not track collation through expressions. Resolved
 /// once per sort, beside `descs`, never per row.
+/// v7.38.22 — the ORDER BY term's type, when it is knowable without
+/// evaluating it.
+///
+/// Two shapes answer, and they are the two that reach the collation
+/// question in practice: a bare column (the type the catalog declares)
+/// and a cast (the type written). Anything else returns `None`, which
+/// the caller reads as "no opinion" and treats exactly as it did before
+/// this existed — the conservative direction, since the cost of not
+/// knowing is a collator that never gets consulted, not a wrong answer.
+fn static_term_type(expr: &spg_sql::ast::Expr, ctx: &EvalContext) -> Option<spg_storage::DataType> {
+    use spg_sql::ast::Expr;
+    match expr {
+        Expr::Column(c) => {
+            let pos = eval::find_column_pos(c, ctx)?;
+            Some(ctx.columns.get(pos)?.ty)
+        }
+        Expr::Cast { target, .. } => cast_target_type(target),
+        _ => None,
+    }
+}
+
+/// The stored type a `CastTarget` produces, for the targets whose
+/// collatability differs from the default.
+///
+/// Only the targets that MATTER are listed: a cast to text is
+/// collatable, a cast to any of the named others is not, and everything
+/// else answers `None` rather than guessing — an unlisted target is
+/// simply not accelerated and not refused.
+fn cast_target_type(t: &spg_sql::ast::CastTarget) -> Option<spg_storage::DataType> {
+    use spg_sql::ast::CastTarget as C;
+    use spg_storage::DataType as D;
+    Some(match t {
+        C::Text => D::Text,
+        C::TextArray => D::TextArray,
+        C::Int => D::Int,
+        C::BigInt => D::BigInt,
+        C::Float => D::Float,
+        C::Bool => D::Bool,
+        C::Date => D::Date,
+        C::Timestamp => D::Timestamp,
+        C::Timestamptz => D::Timestamptz,
+        C::Interval => D::Interval,
+        C::Json => D::Json,
+        C::Jsonb => D::Jsonb,
+        _ => return None,
+    })
+}
+
 pub(crate) fn order_by_collations(
     order_by: &[spg_sql::ast::OrderBy],
     ctx: &EvalContext,
@@ -1743,6 +1791,16 @@ pub(crate) fn order_by_collations(
                 if !crate::collate::is_known(name) {
                     return Err(crate::collate::unknown_collation_error(name));
                 }
+                // v7.38.22 — and the TYPE has to be able to carry one.
+                // PostgreSQL 18.4: `ORDER BY n COLLATE "en_US.utf8"` over
+                // an integer raises 42804. SPG answered.
+                if let Some(t) = static_term_type(&o.expr, ctx)
+                    && !crate::collate::is_collatable(&t)
+                {
+                    return Err(crate::collate::not_collatable_error(
+                        crate::eval::pg_typeof_name_for_datatype(t).unwrap_or("unknown"),
+                    ));
+                }
                 return Ok(crate::collate::is_supported(name)
                     .then(|| crate::collate::Collated::resolve(name))
                     .flatten());
@@ -1766,9 +1824,25 @@ pub(crate) fn order_by_collations(
             // column is compared under. `C` resolves to `None` and keeps
             // the byte-order path exactly as it was, which is what makes
             // every database written before this one unaffected.
+            // v7.38.22 — and only for a term whose type can carry one.
+            //
+            // Without this, declaring a database collation attached a
+            // collator to EVERY ORDER BY term — including NUMERIC and
+            // BYTEA columns, which can never consult it. The comparator
+            // then takes the collated path and the fast paths that check
+            // for `None` are all skipped, for nothing. The release panel
+            // that runs the same binary under a collation against itself
+            // under `C` measured that as `numeric key` 1.02x and
+            // `bytea key` 1.06x.
+            //
+            // A term whose type is not statically knowable keeps the old
+            // behaviour: unknown means unaccelerated, never wrong.
+            let term_takes_a_collation =
+                static_term_type(&o.expr, ctx).is_none_or(|t| crate::collate::is_collatable(&t));
             let db = ctx
                 .catalog
                 .map(spg_storage::Catalog::db_collation)
+                .filter(|_| term_takes_a_collation)
                 .filter(|d| !crate::collate::is_byte_wise(d));
             // v7.38.18 — resolved to a built collator here, once per
             // query, because the comparator this feeds runs per

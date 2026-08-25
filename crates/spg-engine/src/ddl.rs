@@ -3728,6 +3728,18 @@ impl Engine {
             let Some(name) = c.collation_name.as_deref() else {
                 continue;
             };
+            // v7.38.22 — the type has to be able to carry one.
+            //
+            // PostgreSQL 18.4 refuses `CREATE TABLE t (c INT COLLATE
+            // "en_US.utf8")` with 42804; SPG took the declaration and
+            // stored it, which is the same "taken and ignored" shape F36
+            // was opened for, one level up — and it then travels into
+            // every comparison the column takes part in.
+            if !crate::collate::is_collatable(&c.ty) {
+                return Err(crate::collate::not_collatable_error(
+                    crate::eval::pg_typeof_name_for_datatype(c.ty).unwrap_or("unknown"),
+                ));
+            }
             if crate::collate::is_supported(name)
                 && (name.eq_ignore_ascii_case("C")
                     || name.eq_ignore_ascii_case("POSIX")
