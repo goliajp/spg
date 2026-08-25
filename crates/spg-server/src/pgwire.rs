@@ -5214,6 +5214,15 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42883"
         // v7.39 (read01 round 45, commands/) — DDL object errors.
         // A second PRIMARY KEY is PG's 42P16 INVALID_TABLE_DEFINITION.
+        // v7.38.22 — a COLLATE on a type that cannot carry one is PG's
+        // 42804 DATATYPE_MISMATCH, not a syntax or feature class:
+        //
+        //     ERROR:  42804: collations are not supported by type integer
+        //
+        // Measured on PostgreSQL 18.4 for `ORDER BY … COLLATE` and for the
+        // column declaration; both raise the same code, so both map here.
+        } else if msg.contains("collations are not supported by type") {
+            "42804"
         } else if msg.contains("multiple primary keys for table")
             // v7.38.19 — a column declared with a pseudo-type is the same
             // class: the table definition is invalid, not the type

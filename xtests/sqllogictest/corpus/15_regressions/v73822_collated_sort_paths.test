@@ -1,0 +1,60 @@
+# v7.38.22 — a collation reaches BOTH sort implementations.
+#
+# Two sorts serve ORDER BY. The materialising one has honoured a
+# declared collation since v7.38.18; the streaming/spilling one compared
+# with an empty collation slice at every site, so the shape that takes it
+# — a plain single-table SELECT — was ordered by bytes.
+#
+# Measured on the published images: 7.38.6, 7.38.16, 7.38.18 and 7.38.21
+# all answer `Banana, Cherry, apple, date` where PostgreSQL 18.4 answers
+# `apple, Banana, Cherry, date`. The expectations below are PG 18.4's,
+# taken from a live server, not reasoned about.
+
+statement ok
+CREATE TABLE coll_paths (s TEXT, n INT)
+
+statement ok
+INSERT INTO coll_paths VALUES ('Banana', 3), ('apple', 1), ('Cherry', 4), ('date', 2)
+
+# The collation decides, on the plain path.
+query T
+SELECT s FROM coll_paths ORDER BY s COLLATE "en_US.utf8"
+----
+apple
+Banana
+Cherry
+date
+
+# And through a subquery, which takes the other implementation. Same
+# query, same answer — that is the point.
+query T
+SELECT s FROM (SELECT s FROM coll_paths ORDER BY s COLLATE "en_US.utf8") z
+----
+apple
+Banana
+Cherry
+date
+
+# No collation named: a `C` database still orders bytes, unchanged.
+query T
+SELECT s FROM coll_paths ORDER BY s
+----
+Banana
+Cherry
+apple
+date
+
+# A collation this build cannot perform is refused rather than ignored.
+statement error
+SELECT s FROM coll_paths ORDER BY s COLLATE "zz_NOT_A_COLLATION"
+
+# And a type that cannot carry one refuses it, with PostgreSQL's wording
+# and its SQLSTATE (42804).
+statement error
+SELECT n FROM coll_paths ORDER BY n COLLATE "en_US.utf8"
+
+statement error
+CREATE TABLE coll_bad (c INT COLLATE "en_US.utf8")
+
+statement ok
+DROP TABLE coll_paths

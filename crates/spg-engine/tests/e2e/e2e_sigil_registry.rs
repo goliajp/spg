@@ -287,11 +287,15 @@ fn the_scanner_can_see_both_kinds_of_evidence() {
         exercised_in_repo(&root, "SPG_SQLX_INLINE_BUDGET_MS"),
         "SPG_SQLX_INLINE_BUDGET_MS is set by an ordinary integration test"
     );
+    // v7.38.22 — was `SPG_COMMIT_GROUP_MAX`, which stopped being an
+    // example of prose-only evidence when the group-commit gate started
+    // SETTING it as its negative control. The registry noticed before
+    // anyone did, which is what it is for; the example moved to a switch
+    // that is still named only in comments.
     assert!(
-        !exercised_in_repo(&root, "SPG_COMMIT_GROUP_MAX"),
-        "SPG_COMMIT_GROUP_MAX appears in three test files and in every \
-         one of them it is a doc comment; counting it would be counting \
-         prose"
+        !exercised_in_repo(&root, "SPG_COMMIT_TRACE"),
+        "SPG_COMMIT_TRACE is named in comments and nowhere else; counting \
+         it would be counting prose"
     );
     assert!(
         !exercised_in_repo(&root, "SPG_NO_SUCH_SWITCH_ANYWHERE"),

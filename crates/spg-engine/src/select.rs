@@ -8004,11 +8004,23 @@ impl Engine {
         // STORES and not just what it decodes (round 995).
         let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
 
+        // v7.38.22 — resolved HERE, because this path did not resolve
+        // them at all.
+        //
+        // Every published SPG through 7.38.21 answered `ORDER BY s COLLATE
+        // "en_US.utf8"` in BYTE order on this path — and swallowed an
+        // unknown collation name rather than raising — because the sorter
+        // below compared with an empty collation slice. The materialising
+        // path honoured both. Which answer a query got depended on which
+        // path the planner took, and this is the path a plain single-table
+        // SELECT takes.
+        let order_colls = crate::orderby::order_by_collations(&order_by, &ctx)?;
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
             cols.clone(),
             &descs,
+            &order_colls,
         )
         .with_stats(&self.spill_stats)
         .with_pruned(&needed);
@@ -8062,7 +8074,7 @@ impl Engine {
             crate::orderby::build_order_keys_bound(
                 &order_by,
                 &order_bound,
-                &[],
+                &order_colls,
                 row,
                 &ctx,
                 &mut keys,
@@ -8962,11 +8974,23 @@ impl Engine {
         // STORES and not just what it decodes (round 995).
         let needed = Self::sort_record_columns_needed(&stmt.items, &order_bound, cols.len(), &ctx);
 
+        // v7.38.22 — resolved HERE, because this path did not resolve
+        // them at all.
+        //
+        // Every published SPG through 7.38.21 answered `ORDER BY s COLLATE
+        // "en_US.utf8"` in BYTE order on this path — and swallowed an
+        // unknown collation name rather than raising — because the sorter
+        // below compared with an empty collation slice. The materialising
+        // path honoured both. Which answer a query got depended on which
+        // path the planner took, and this is the path a plain single-table
+        // SELECT takes.
+        let order_colls = crate::orderby::order_by_collations(&order_by, &ctx)?;
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
             cols.clone(),
             &descs,
+            &order_colls,
         )
         .with_stats(&self.spill_stats)
         .with_pruned(&needed);
@@ -9020,7 +9044,7 @@ impl Engine {
             crate::orderby::build_order_keys_bound(
                 &order_by,
                 &order_bound,
-                &[],
+                &order_colls,
                 row,
                 &ctx,
                 &mut keys,
