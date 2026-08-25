@@ -81,6 +81,19 @@ had been reporting the machine.
   PostgreSQL 18.4's 360.4 ms**. `SPG_LC_COLLATE=C` restores byte order
   for a deployment that wants it.
 
+### Documentation
+
+- **A panel number reaches a customer-facing document with its spread.**
+  `long distinct text 1.44x` went into the README from one release run;
+  the same cell measured 1.42x, 1.44x and 1.55x across three runs of the
+  same binary, `short text distinct` measured 1.02x and 1.33x, and
+  `LIMIT 10` over long text measured 0.99x and 1.37x. Every one of those
+  was measured, and each single one implied a steadiness the cell does
+  not have. `docs/BENCH_PROTOCOL.md` now asks for two independent runs,
+  a range rather than a sample, and the conditions the number depends on
+  — row count, `work_mem`, and what BOTH sides were collating by, which
+  this repository has published several times without naming.
+
 ### Instruments
 
 - **The group-commit gate counts fsyncs instead of timing the machine.**
