@@ -197,3 +197,74 @@ fn a_uniform_run_keeps_its_input_order() {
         other => panic!("expected rows, got {other:?}"),
     }
 }
+
+/// v7.38.20 — a SECOND sort key no longer sends the whole sort to the
+/// general path.
+///
+/// The inline-integer-key sort used to bail on `k.len() != 1`, saying
+/// the tie rate was not knowable. The runs know it: sorting on the
+/// first key leaves runs of equal first keys, and only those need the
+/// later ones. These fixtures are the two shapes that matters between —
+/// a first key that decides everything, and one that decides nothing.
+#[test]
+fn a_second_key_orders_within_the_first() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (a int, b int, pad text)")
+        .unwrap();
+    // `a` repeats in blocks of ten, so every run is ten long and `b`
+    // decides inside it. `b` descends on input so a working second key
+    // has to move rows.
+    for i in 0..400i32 {
+        e.execute(&format!(
+            "INSERT INTO t VALUES ({}, {}, 'p{i}')",
+            i / 10,
+            400 - i
+        ))
+        .unwrap();
+    }
+    // `pad` is what the projection carries, NOT the sort columns —
+    // which is what keeps this on the key-based path in `orderby`
+    // rather than the output-reading one above. A first draft selected
+    // `a, b` and its negative control did not bite, because it was
+    // exercising a different sort entirely.
+    // NEITHER sort column is projected, which is what keeps this on the
+    // key-based path rather than the output-reading one. `pad` carries
+    // the input index so the order is still checkable.
+    let got = col0(&mut e, "SELECT pad FROM t ORDER BY a, b");
+    assert_eq!(got.len(), 400);
+    // Row i has a = i/10 and b = 400-i, so inside each block of ten the
+    // ascending `b` is the DESCENDING input index: the first block must
+    // come back p9, p8, … p0.
+    assert_eq!(
+        &got[..10],
+        &["p9", "p8", "p7", "p6", "p5", "p4", "p3", "p2", "p1", "p0"]
+    );
+    assert_eq!(got[10], "p19");
+}
+
+/// And when the first key decides everything — a permutation, every run
+/// of length one — the second key must not disturb it.
+#[test]
+fn a_first_key_that_decides_needs_no_second_pass() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (a int, b int, pad text)")
+        .unwrap();
+    for i in 0..400i64 {
+        let a = (i * 7919) % 400;
+        e.execute(&format!("INSERT INTO t VALUES ({a}, {}, 'p{i}')", 400 - i))
+            .unwrap();
+    }
+    match e.execute("SELECT a, pad FROM t ORDER BY a, b").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            let got: Vec<i32> = rows
+                .iter()
+                .map(|r| match &r.values[0] {
+                    spg_storage::Value::Int(a) => *a,
+                    other => panic!("expected int, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(got, (0..400).collect::<Vec<i32>>());
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}

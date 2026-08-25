@@ -1585,7 +1585,7 @@ pub(crate) fn partial_sort_tagged_in(
             tagged.truncate(k);
         }
         _ => {
-            if sort_tagged_by_inline_int_key(tagged, descs) {
+            if sort_tagged_by_inline_int_key(tagged, descs, collations) {
                 return;
             }
             tagged.sort_by(cmp);
@@ -1612,13 +1612,30 @@ pub(crate) fn partial_sort_tagged_in(
 ///
 /// The rebuild is what makes it worth doing rather than clever: an
 /// n log n number of 48-byte moves becomes n of them.
-fn sort_tagged_by_inline_int_key(tagged: &mut Vec<(Vec<OrderKey>, Row)>, descs: &[bool]) -> bool {
+fn sort_tagged_by_inline_int_key(
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
+    descs: &[bool],
+    collations: &[Option<crate::collate::Collated>],
+) -> bool {
     if tagged.len() < 2 {
         return true;
     }
-    // Multiple keys keep the general path: the second key only decides
-    // ties, and the tie rate is not knowable here.
-    if tagged.iter().any(|(k, _)| k.len() != 1) {
+    // v7.38.20 — a SECOND key no longer sends this to the general path.
+    //
+    // The rule here used to be one key or nothing, and its stated reason
+    // was that "the tie rate is not knowable". The runs know it. Sorting
+    // on the first key leaves runs of equal first keys, and only those
+    // runs need the later keys — a run of one needs nothing at all.
+    //
+    // `sort only, two keys` is `ORDER BY k, id` where `k` is
+    // `(g*7919) % 400000`, a permutation of the range: every first key is
+    // distinct, every run has length one, and the second key decides
+    // nothing. That cell was paying the full comparator on 48-byte
+    // elements for a sort the first key had already settled — profiled,
+    // 37% of the working samples in the sort machinery, 26% in
+    // `cmp_multi_key_in`, 23% in the allocator.
+    let multi = tagged.iter().any(|(k, _)| k.len() != 1);
+    if tagged.iter().any(|(k, _)| k.is_empty()) {
         return false;
     }
     let mut order: Vec<(i128, u32)> = Vec::with_capacity(tagged.len());
@@ -1632,9 +1649,33 @@ fn sort_tagged_by_inline_int_key(tagged: &mut Vec<(Vec<OrderKey>, Row)>, descs: 
     // which is the order the scan produced and what DISTINCT's
     // first-occurrence rule already relies on.
     if descs.first().copied().unwrap_or(false) {
-        order.sort_by_key(|p| core::cmp::Reverse(p.0));
+        order.sort_by_key(|p| (core::cmp::Reverse(p.0), p.1));
     } else {
-        order.sort_by_key(|p| p.0);
+        order.sort_by_key(|p| (p.0, p.1));
+    }
+    if multi {
+        // Settle each run of equal first keys with the full comparator,
+        // which reads every key including this one. A run of one — the
+        // whole of `two keys` — is already placed.
+        let mut lo = 0;
+        while lo < order.len() {
+            let mut hi = lo + 1;
+            while hi < order.len() && order[hi].0 == order[lo].0 {
+                hi += 1;
+            }
+            if hi - lo > 1 {
+                order[lo..hi].sort_by(|&(_, ia), &(_, ib)| {
+                    cmp_multi_key_in(
+                        &tagged[ia as usize].0,
+                        &tagged[ib as usize].0,
+                        descs,
+                        collations,
+                    )
+                    .then_with(|| ia.cmp(&ib))
+                });
+            }
+            lo = hi;
+        }
     }
     // Move each row once, into its place. `Option` is the safe way to
     // take out of arbitrary positions; it costs no extra memory here
