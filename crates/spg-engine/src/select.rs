@@ -7575,8 +7575,40 @@ impl Engine {
                         .collect();
                     keep_sorted = true;
                 }
-                let keyed = sort_keys_of(&tagged, terms[0].0)
-                    .filter(|(keys, exact)| *exact || key_discriminates(keys));
+                // v7.38.20 — a key that does NOT discriminate is still
+                // worth sorting on, as long as the runs it leaves are
+                // handled once instead of n log n times.
+                //
+                // `text (26 values)` is two hundred identical characters
+                // drawn from twenty-six letters, so every eight-byte
+                // prefix inside a letter is the same and 15,384 rows tie
+                // on it. A comparison sort then asks ~7.4 M questions of
+                // which nearly all are a two-hundred-byte `memcmp`
+                // answering EQUAL: profiled, 30% of the working samples
+                // sat in `memcmp` and 37% in the sort machinery.
+                //
+                // Sorting the integer keys is cheap. What each run needs
+                // afterwards is ONE pass: if every value in it is equal,
+                // input order already IS the stable answer, and proving
+                // that costs n-1 comparisons rather than n log n. Only a
+                // run that is not all-equal gets sorted.
+                //
+                // Single-term only. With a second ORDER BY column an
+                // all-equal first term does not settle the row order --
+                // the later terms still speak -- and the shortcut would
+                // drop them.
+                let all_keys = if keep_sorted {
+                    None
+                } else {
+                    sort_keys_of(&tagged, terms[0].0)
+                };
+                let low_card = !keep_sorted
+                    && terms.len() == 1
+                    && all_keys
+                        .as_ref()
+                        .is_some_and(|(keys, exact)| !*exact && !key_discriminates(keys));
+                let keyed =
+                    all_keys.filter(|(keys, exact)| *exact || key_discriminates(keys) || low_card);
                 if keep_sorted {
                     // The collated permutation above already placed every
                     // row. A draft let the byte-order fallback run after
@@ -7606,23 +7638,53 @@ impl Engine {
                         core::cmp::Ordering::Equal
                     };
                     let _ = first_col;
-                    order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
-                        let c = pa.cmp(&pb);
-                        let c = if first_desc { c.reverse() } else { c };
-                        if c != core::cmp::Ordering::Equal {
-                            return c;
+                    if low_card {
+                        // Integer sort first, then one pass per run.
+                        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
+                            let c = pa.cmp(&pb);
+                            let c = if first_desc { c.reverse() } else { c };
+                            c.then_with(|| ia.cmp(&ib))
+                        });
+                        let mut lo = 0;
+                        while lo < order.len() {
+                            let mut hi = lo + 1;
+                            while hi < order.len() && order[hi].0 == order[lo].0 {
+                                hi += 1;
+                            }
+                            if hi - lo > 1 {
+                                let head = tagged[order[lo].1 as usize].1.values.get(first_col);
+                                let uniform = order[lo + 1..hi].iter().all(|&(_, i)| {
+                                    tagged[i as usize].1.values.get(first_col) == head
+                                });
+                                if !uniform {
+                                    order[lo..hi].sort_by(|&(_, ia), &(_, ib)| {
+                                        row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
+                                    });
+                                }
+                                // A uniform run is already in index
+                                // order, which IS the stable answer.
+                            }
+                            lo = hi;
                         }
-                        // An EXACT key that ties means the values are
-                        // equal, so only the remaining terms can speak.
-                        // A prefix that ties has decided nothing yet and
-                        // the first term must be asked again, which
-                        // `row_cmp` does by walking every term from the
-                        // start.
-                        if exact && terms.len() == 1 {
-                            return ia.cmp(&ib);
-                        }
-                        row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
-                    });
+                    } else {
+                        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
+                            let c = pa.cmp(&pb);
+                            let c = if first_desc { c.reverse() } else { c };
+                            if c != core::cmp::Ordering::Equal {
+                                return c;
+                            }
+                            // An EXACT key that ties means the values are
+                            // equal, so only the remaining terms can speak.
+                            // A prefix that ties has decided nothing yet and
+                            // the first term must be asked again, which
+                            // `row_cmp` does by walking every term from the
+                            // start.
+                            if exact && terms.len() == 1 {
+                                return ia.cmp(&ib);
+                            }
+                            row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
+                        });
+                    }
                     let mut slots: Vec<Option<(Vec<crate::orderby::OrderKey>, Row<'static>)>> =
                         core::mem::take(&mut tagged).into_iter().map(Some).collect();
                     tagged = order
