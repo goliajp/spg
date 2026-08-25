@@ -306,6 +306,43 @@ fn spawn_wal(db: &std::path::Path, wal: &std::path::Path) -> (Child, String) {
 /// v4.42 — like `spawn_wal` but with extra env vars (e.g.
 /// `SPG_COMMIT_DELAY_US` for the multi-client SLO smoke). Returns
 /// `(child, addr)` from the ephemeral-port allocation.
+/// v7.38.22 — one named counter out of the native `Stats` op.
+///
+/// The server keeps these always on and answers them over the wire
+/// precisely so a measuring window can bracket a workload with them; the
+/// alternative channel, `SPG_WAL_TRACE`, is env-gated and writes a line
+/// from inside the fsync path, which both perturbs what it measures and
+/// (its own comment says so) goes quiet exactly when fsync is off.
+///
+/// Panics rather than defaulting when the counter is absent: a name that
+/// no longer exists must not read as zero.
+fn stat_counter(s: &mut TcpStream, key: &str) -> u64 {
+    let mut out = Vec::new();
+    encode(&spg_wire::build_stats_request(), &mut out).unwrap();
+    s.write_all(&out).unwrap();
+    let mut hdr = [0u8; spg_wire::FRAME_HEADER_LEN];
+    s.read_exact(&mut hdr).unwrap();
+    let plen = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
+    let op = Op::from_byte(hdr[4]).unwrap();
+    assert_eq!(op, Op::StatsResponse, "Stats answered with {op:?}");
+    let mut payload = vec![0u8; plen];
+    if plen > 0 {
+        s.read_exact(&mut payload).unwrap();
+    }
+    let body = spg_wire::parse_stats_response(&Frame {
+        op,
+        payload: payload.clone(),
+    })
+    .expect("stats body is utf-8")
+    .to_string();
+    body.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("Stats has no counter named {key}; it reports:\n{body}"))
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("counter {key} is not a number: {e}"))
+}
+
 fn spawn_wal_with_env(
     db: &std::path::Path,
     wal: &std::path::Path,
@@ -402,7 +439,7 @@ const SLO_V4_39_TOTAL_ROWS: usize = 1_000_000;
 ///
 /// History: 50 ms was the original v4.42 ceiling. v6.0.x's
 /// `perf_lock` serialisation forces this test to run back-to-back
-/// with `slo_wal_insert_4client_throughput_above_floor` (10 s of
+/// with `slo_wal_insert_4client_group_commit_coalesces` (10 s of
 /// continuous WAL fsync) instead of in isolation. Even after the
 /// 500 ms cool-down, 1 out of every 5 runs saw a single sample of
 /// the 200 INSERTs (= the p99 sample) spike past 50 ms from
@@ -429,7 +466,22 @@ const SLO_V4_42_MULTI_CLIENT_P99_US: u128 = 200_000;
 /// floor catches a regression where group commit fails to
 /// activate at all (would drop multi-client throughput below
 /// single-client, since the queue overhead would dominate).
-const SLO_V4_42_4C_THROUGHPUT_FLOOR_RPS: f64 = 300.0;
+/// v7.38.22 — commits per commit group, which is what group commit
+/// produces. From measurement, not from a target.
+///
+/// Measured on 2,000 commits from 4 clients, three runs each:
+///
+///     adaptive (the default, and what this gate runs)   2.00
+///     window pinned to 0                                2.77
+///     window pinned to 200 µs                           2.21
+///
+/// The failure this guards is the leader ceasing to drain the queue,
+/// which puts every commit in its own group and drives the number to
+/// 1.00 on any box. 1.5 sits between that and the least favourable
+/// regime measured, with room for the adaptive window to be IMPROVED
+/// without the floor having to move — a floor set at the current
+/// reading is a floor that fights its own fix.
+const SLO_V4_42_4C_COMMITS_PER_FSYNC_FLOOR: f64 = 1.5;
 const SLO_V4_42_4C_THREADS: usize = 4;
 const SLO_V4_42_4C_PER_THREAD: usize = 500;
 
@@ -582,18 +634,36 @@ fn slo_wal_insert_multi_client_p99_under_budget() {
     );
 }
 
-/// v4.42 — 4-client INSERT throughput gate. Four client threads
-/// stream `SLO_V4_42_4C_PER_THREAD` single-row INSERTs in
-/// parallel. The leader pulls multiple INSERTs into each group
-/// (rolling drain up to `SPG_COMMIT_GROUP_MAX = 16`), so wall
-/// time `≈ groups × fsync_us`, not `total × fsync_us`. Target
-/// floor is `80K r/s` (≈ 1.6× the v4.41 single-client throughput
-/// of 77K r/s; the ship-gate in NEXT.md asks for 148K = `1.5×
-/// MySQL 99K` on the bench harness, which is the source of
-/// truth — this SLO smoke catches gross regression on CI
-/// runners with arbitrary disk contention).
+/// v4.42 — 4-client group-commit gate. Four client threads stream
+/// `SLO_V4_42_4C_PER_THREAD` single-row INSERTs in parallel. The leader
+/// pulls multiple INSERTs into each group (rolling drain up to
+/// `SPG_COMMIT_GROUP_MAX = 16`), so wall time `≈ groups × fsync_us`, not
+/// `total × fsync_us`.
+///
+/// v7.38.22 — this **counts fsyncs** instead of timing throughput, and
+/// the reason is that the timed form spent this release cycle reporting
+/// the machine.
+///
+/// It asserted `≥ 300 r/s`. On a host at load 66-126 with 21.76 GB of
+/// 22.5 GB swap in use it read 238 and failed; the same commit on a quiet
+/// box was never in doubt. Nothing about the code was different, and the
+/// message it printed — *group commit fsync coalescing may have
+/// regressed* — was about a mechanism it never measured. (Its own doc
+/// claimed a floor of `80K r/s` while the constant said `300`, which is
+/// how long nobody had read it.)
+///
+/// Commits-per-fsync IS that mechanism, it is a count rather than a
+/// duration, and its machine-sensitivity runs the SAFE way: a slower box
+/// lets MORE commits queue behind the leader's fsync, so load can only
+/// push this number up. A regression that stops the coalescing drives it
+/// to 1.0 on any box.
+///
+/// Calibrated against the mechanism's own off-switch: `SPG_COMMIT_DELAY_US=0`
+/// closes the window and the same workload measures ~1 commit per fsync.
+/// The throughput line is still printed — as an observation, which is all
+/// it ever was.
 #[test]
-fn slo_wal_insert_4client_throughput_above_floor() {
+fn slo_wal_insert_4client_group_commit_coalesces() {
     let _perf = perf_lock();
     let dir = unique_tmpdir();
     let db = dir.join("slo_4c.db");
@@ -601,7 +671,39 @@ fn slo_wal_insert_4client_throughput_above_floor() {
     // Engage the v4.42 group-commit spin window so concurrent
     // writers coalesce — this gate is the throughput unlock the
     // delay is designed to demonstrate.
-    let (raw_child, addr) = spawn_wal_with_env(&db, &wal, &[("SPG_COMMIT_DELAY_US", "200")]);
+    // v7.38.22 — the server runs its DEFAULT commit window here, which
+    // it did not before.
+    //
+    // This test used to pass `SPG_COMMIT_DELAY_US=200`, with a comment
+    // saying that engaged the group-commit window. It does the opposite:
+    // an explicit value PINS the window and turns off the adaptive one
+    // (`effective_commit_delay_us`), so ever since the AIMD window landed
+    // this gate has been measuring a configuration no deployment runs —
+    // and measuring it in the mechanism's OFF position while asserting
+    // about the mechanism.
+    //
+    // Measured, same box, same workload, 2,000 commits:
+    //
+    //     pinned 200 µs   2.21 commits/group   1.17 s
+    //     pinned 0 µs     2.77 commits/group   0.47 s
+    //     adaptive        see the floor below
+    //
+    // `SPG_TEST_COMMIT_DELAY_US` still pins it, for calibrating against
+    // those two regimes; unset — the way the gate runs — the server
+    // adapts, which is what customers get.
+    let pin = std::env::var("SPG_TEST_COMMIT_DELAY_US").ok();
+    let cap = std::env::var("SPG_TEST_COMMIT_GROUP_MAX").ok();
+    let mut env: Vec<(&str, &str)> = Vec::new();
+    if let Some(v) = pin.as_deref() {
+        env.push(("SPG_COMMIT_DELAY_US", v));
+    }
+    // The negative control this floor is calibrated against:
+    // `SPG_TEST_COMMIT_GROUP_MAX=1` lets the leader take one task per
+    // group, which is the regression the assertion names.
+    if let Some(v) = cap.as_deref() {
+        env.push(("SPG_COMMIT_GROUP_MAX", v));
+    }
+    let (raw_child, addr) = spawn_wal_with_env(&db, &wal, &env);
     let _child = ChildGuard(raw_child);
     let mut setup = connect_to(&addr);
     setup.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
@@ -618,6 +720,11 @@ fn slo_wal_insert_4client_throughput_above_floor() {
     for i in 0..50 {
         round_trip(&mut warm, &format!("INSERT INTO slo_4c VALUES (0, {i})"));
     }
+    // v7.38.22 — the counters as the warm-up leaves them, read on the
+    // warm-up's own connection before it is dropped.
+    let before_solo = stat_counter(&mut warm, "commit_groups_solo");
+    let before_coalesced = stat_counter(&mut warm, "commit_groups_coalesced");
+    let before_fsyncs = stat_counter(&mut warm, "wal_fsyncs");
     drop(warm);
 
     let inserted = Arc::new(AtomicUsize::new(0));
@@ -654,18 +761,49 @@ fn slo_wal_insert_4client_throughput_above_floor() {
     let max_ns = elapsed_ns.load(Ordering::Relaxed) as f64;
     assert!(max_ns > 0.0, "no elapsed time recorded");
     let rps = total * 1_000_000_000.0 / max_ns;
+
+    // The instrument answers before the mechanism does. A counter that
+    // did not move and a mechanism that did not run look identical from
+    // here, so the reading is checked for life before it is believed.
+    let mut probe = connect_to(&addr);
+    probe.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let solo = stat_counter(&mut probe, "commit_groups_solo") - before_solo;
+    let coalesced = stat_counter(&mut probe, "commit_groups_coalesced") - before_coalesced;
+    let groups = solo + coalesced;
+    let fsyncs = stat_counter(&mut probe, "wal_fsyncs") - before_fsyncs;
+    drop(probe);
+    assert!(
+        groups > 0 && fsyncs > 0,
+        "the server reports {groups} commit groups and {fsyncs} fsyncs for {total:.0} \
+         committed INSERTs — a counter that stayed still is an instrument failure, not a \
+         passing run"
+    );
+    // Two independently sited counters for one story: every group ends in
+    // an fsync, so the group count cannot exceed the fsync count. If it
+    // does, one of them is counting something other than what its name
+    // says and neither reading can be used.
+    assert!(
+        groups <= fsyncs,
+        "{groups} commit groups against {fsyncs} fsyncs — every group ends in an fsync, so \
+         these two counters disagree about what they are counting"
+    );
+
+    let per_group = total / groups as f64;
     eprintln!(
-        "SLO smoke (WAL-on, 4 clients, single-row INSERTs): {total:.0} writes in {:.3} s → {rps:.0} r/s \
-         (floor ≥ {} r/s)",
+        "SLO smoke (WAL-on, 4 clients, single-row INSERTs): {total:.0} writes in {:.3} s \
+         → {rps:.0} r/s (observation); {groups} groups ({solo} solo, {coalesced} coalesced), \
+         {fsyncs} fsyncs → {per_group:.2} commits per group \
+         (floor ≥ {SLO_V4_42_4C_COMMITS_PER_FSYNC_FLOOR:.2})",
         max_ns / 1_000_000_000.0,
-        SLO_V4_42_4C_THROUGHPUT_FLOOR_RPS as u64,
     );
     assert!(
-        rps >= SLO_V4_42_4C_THROUGHPUT_FLOOR_RPS,
-        "v4.42 4-client INSERT throughput {rps:.0} r/s blew the floor of {:.0} r/s — \
-         group commit fsync coalescing may have regressed; see PERFORMANCE.md sweep \
-         for the source-of-truth number",
-        SLO_V4_42_4C_THROUGHPUT_FLOOR_RPS
+        per_group >= SLO_V4_42_4C_COMMITS_PER_FSYNC_FLOOR,
+        "v4.42 group commit coalesced {per_group:.2} commits per group, under the floor of \
+         {SLO_V4_42_4C_COMMITS_PER_FSYNC_FLOOR:.2} — the leader is no longer draining the \
+         queue into one fsync. ({total:.0} commits, {groups} groups, {fsyncs} fsyncs, \
+         {rps:.0} r/s.) `SPG_TEST_COMMIT_GROUP_MAX=1` reproduces the uncoalesced regime, \
+         which reads 1.00 — and 1,384 r/s, which the throughput floor this replaced \
+         would have called healthy."
     );
 }
 
