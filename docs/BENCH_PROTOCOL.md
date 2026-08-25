@@ -92,6 +92,29 @@ Rule 4 does not cover this. Interleaving handles drift *between* two
 sides measured in one window; it cannot rescue a window where everything
 moved at once.
 
+## Before a number reaches a customer-facing document
+
+A panel number in `README.md`, `CHANGELOG.md` or a letter is read as a
+property of the software. Its run-to-run spread has to travel with it,
+because without one a reader takes a single sample for a constant.
+
+- [ ] **At least two INDEPENDENT runs**, not two cells of one run. A
+      run's own min-max says how steady the box was for those seconds;
+      it says nothing about the next run.
+- [ ] **Quote the range, or a median with its N.** `1.42-1.55x` is a
+      fact; `1.44x` is one sample wearing the clothes of a fact.
+- [ ] **State the conditions the number depends on** — row count,
+      `work_mem`, and what BOTH sides were collating by. A sort ratio
+      measured under `C` on both sides is a different quantity from one
+      measured under a locale, and this repository has published both
+      while naming neither.
+
+v7.38.22 is why this section exists. `long distinct text 1.44x` went
+into the README from the release run; the same cell measured 1.42x,
+1.44x and 1.55x across three runs of the same binary, and
+`short text distinct` measured 1.02x and 1.33x. Neither was wrong. Both
+were narrower than the truth.
+
 ## Before quoting a number in a decision
 
 - [ ] Same client both sides?
