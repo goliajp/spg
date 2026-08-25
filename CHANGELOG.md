@@ -81,6 +81,28 @@ those three.
   19.360-36.225 on the same box. The cell was behind its fast mode and
   is now level with it.
 
+- **A declared collation gets the top-N gate too.** The panel that runs
+  the same binary under a collation against itself under `C` read
+  `sort only, long text top-N` at **4.16x** once `C` got faster — a cost
+  CLASS difference, which is what that panel exists to refuse. Which
+  collations order `[0-9a-z]` by byte is already decided
+  (`Collated::ascii_byte_order`), and the gate now asks that same
+  allowlist, plus the text question per row because a streaming top-N
+  has no batch to ask about.
+
+  Asking it the batch's way — `is_ascii_alnum_lower` over a
+  192-character string, once per row — cost more than the keys it
+  saved: 48.9 ms against 10.4, on both legs. The gate compares eight
+  bytes and rejects only on a strict difference inside them, so eight
+  bytes is the window whose contents can decide anything.
+
+      long text top-N, collated   43.236-43.627  ->  8.939-9.588
+      the same leg under `C`      10.402-11.258  ->  8.855-9.198
+      ratio                                4.16x  ->  1.01x
+
+  So declaring a collation costs this shape nothing, and both legs are
+  faster than either was.
+
 ### Fixed
 
 - **A spilled sort no longer reorders rows its in-memory self would
