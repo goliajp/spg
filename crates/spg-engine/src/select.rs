@@ -7122,6 +7122,12 @@ impl Engine {
         // keeping. Anything that loses to it cannot reach the answer, so
         // it is dropped before its projection is ever built.
         let mut topk_boundary: Option<Vec<crate::orderby::OrderKey>> = None;
+        // v7.38.20 — the boundary's own leading eight bytes, so a losing
+        // row can be turned away before a key is built for it. Kept
+        // beside the boundary and refreshed with it; `None` whenever the
+        // boundary's first key is not one this can read, which sends
+        // every row down the ordinary path.
+        let mut topk_boundary_prefix: Option<u64> = None;
         // v7.39 (round 582) — resolve each ORDER BY column once, not
         // once per row. See `order_by_bound_positions`.
         let order_bound =
@@ -7192,6 +7198,31 @@ impl Engine {
             {
                 Vec::new()
             } else {
+                // v7.38.20 — turn a decisively losing row away before
+                // its key is built. Only the FIRST key is read, and only
+                // its leading eight bytes; a tie there decides nothing
+                // and falls through to the full path below.
+                //
+                // ASC only: under DESC the boundary is the largest kept
+                // key and the comparison flips, which this deliberately
+                // does not try to express — a second direction in a
+                // fast-path predicate is how one of them ends up wrong.
+                if boundary_check_on
+                    && let Some((_, descs)) = &topk_stream
+                    && !descs.first().copied().unwrap_or(false)
+                    && order_by.len() == 1
+                    && order_colls.iter().all(Option::is_none)
+                    && let Some(bp) = topk_boundary_prefix
+                    && let Some(rp) = crate::orderby::first_key_prefix(&order_bound, row)
+                    && rp > bp
+                {
+                    boundary_checks += 1;
+                    boundary_rejects += 1;
+                    if boundary_checks == BOUNDARY_WINDOW {
+                        boundary_check_on = boundary_rejects.saturating_mul(4) >= boundary_checks;
+                    }
+                    return Ok(());
+                }
                 let mut buf = key_pool.pop().unwrap_or_default();
                 crate::orderby::build_order_keys_bound(
                     &order_by,
@@ -7392,6 +7423,11 @@ impl Engine {
                     &mut key_pool,
                     &mut topk_boundary,
                 );
+                // The prefix follows the boundary it summarises.
+                topk_boundary_prefix = topk_boundary
+                    .as_ref()
+                    .and_then(|b| b.first())
+                    .and_then(crate::orderby::order_key_text_prefix);
             }
             Ok(())
         };
