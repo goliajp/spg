@@ -423,7 +423,7 @@ implemented; further breakdown follows the table.
 | `DATE` | ✅ | Days since epoch |
 | `TIMESTAMP` | ✅ | Microseconds since epoch |
 | `TIMESTAMPTZ` | ✅ v7.9.2 → v7.15.0 offset literals | Storage = i64 µs UTC. v7.15.0: accepts `'YYYY-MM-DD HH:MM:SS[.fff]±OO[:MM]'` / `…Z` / `… UTC` (pg_dump-shape) and round-trips with a `+00` suffix so `SELECT` output re-INSERTs verbatim. PG-wire OID 1184 |
-| `INTERVAL` | ⚠️ | Runtime literals only, no column storage |
+| `INTERVAL` | ✅ | Columns, arrays, arithmetic and `extract`, plus the two infinities PostgreSQL 17 gave the type. Re-measured v7.38.20 against PG 18.4: the ⚠️ this row carried said *runtime literals only, no column storage*, and `CREATE TABLE t (iv interval)` had been storing and reading them back for some time |
 | `JSON` | ✅ | Text-backed; PG-wire OID 114 |
 | `JSONB` | ✅ v7.9.0 | Same storage as JSON; PG-wire OID 3802 for sqlx-style clients |
 | `SERIAL` / `BIGSERIAL` | ✅ v7.9.6 | Aliased to `INT/BIGINT NOT NULL AUTO_INCREMENT` |
@@ -465,7 +465,7 @@ implemented; further breakdown follows the table.
 | `IN (…)` / `NOT IN (…)` | ✅ | |
 | `LIKE` / `ILIKE` / `NOT LIKE` | ✅ | Includes wildcards `%` `_` |
 | `ORDER BY` (single & multi-column) | ✅ | |
-| Locale collation (`en_US.utf8` and 879 more) | ✅ | v7.38.18. Set `LC_COLLATE` / `LANG` before the first start and an undeclared text column sorts as your PostgreSQL does — see the gotcha below |
+| Locale collation (`en_US.utf8` and 879 more) | ✅ | v7.38.18. Set `LC_COLLATE` / `LANG` before the first start and an undeclared text column sorts as your PostgreSQL does — see the gotcha below, which v7.38.20 made true of the code as well as of the intent |
 | `COLLATE` on a column / in `ORDER BY` | ✅ | v7.38.18. Not on an arbitrary expression |
 | `GROUP BY` / `HAVING` | ✅ | |
 | `LIMIT n` / `OFFSET n` | ✅ | |
@@ -718,6 +718,17 @@ v8 / v9 plan. If you need any of them, **stay on PG**.
    exists keeps what it has, so this is a decision to make before the
    first start, not after. An existing SPG database from before
    v7.38.18 keeps `C` and keeps every answer it had.
+
+   That sentence became true of the code in **v7.38.20**. The guard
+   existed before it and was already right, but it ran before the WAL
+   was replayed — so a server killed without checkpointing, which is
+   every crash and every plain `kill`, came up with an empty catalog,
+   took whatever the environment said, and replayed its rows in under
+   it. A database created under `C` came back declaring `en_US.utf8`
+   and answering `apple, Bob, Zebra` where it had answered `Bob, Zebra,
+   apple`. On v7.38.20 and later the server refuses and says which
+   collation it is keeping. **On v7.38.18 and v7.38.19, do not change
+   the locale environment of a running deployment.**
 
 1. **`SERIAL` columns**. Use SPG's `AUTO_INCREMENT` flag on
    an `INT NOT NULL` column. Sequences themselves don't
