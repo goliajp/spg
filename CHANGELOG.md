@@ -8,6 +8,112 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+A collation that only reached one of the two sorts, an image default
+held back for two releases because of it, and three release gates that
+had been reporting the machine.
+
+### Fixed
+
+- **A declared collation reaches the SPILLING sort, which it never did.**
+  Two sorts serve ORDER BY. The materialising one has honoured a
+  collation since v7.38.18; the streaming one — the path a plain
+  single-table `SELECT … ORDER BY` takes — compared with an empty
+  collation slice at every site and ordered by BYTES.
+
+  Measured on the published images, not reasoned about. **7.38.6,
+  7.38.16, 7.38.18 and 7.38.21 all answer:**
+
+      SELECT s FROM t ORDER BY s COLLATE "en_US.utf8"
+      SPG   Banana, Cherry, apple, date
+      PG18  apple, Banana, Cherry, date
+
+  and the same holds with no COLLATE in the query at all, on a database
+  that DECLARES one — `datcollate` read `en_US.utf8` while the rows came
+  back in byte order. The catalogue reported a collation the answers did
+  not use, and which answer a query got depended on which path the
+  planner picked. Every row is present; only the order is wrong, which
+  is why nothing caught it.
+
+  An unknown collation name was swallowed on that path too:
+  `ORDER BY s COLLATE "zz_NOT_A_COLLATION"` answered instead of raising.
+
+- **A collation is refused on the types that cannot carry one.**
+  PostgreSQL keeps a `typcollation` and raises 42804 for the types that
+  have none. SPG accepted `COLLATE` on every type, at two entrances: the
+  ORDER BY key and the column declaration. Measured against PG 18.4 —
+  `text`, `varchar`, `char(n)`, `name` and arrays of those accept;
+  `int`, `bigint`, `numeric`, `boolean`, `date`, `bytea`, `json`,
+  `jsonb`, `uuid`, `xml`, `tsvector`, `tsquery`, `inet`, `money`, `bit`,
+  `oid`, `int4range` and `integer[]` refuse. Both entrances now answer
+
+      ERROR:  42804: collations are not supported by type integer
+
+  byte for byte, SQLSTATE included. The same rule stops a DATABASE
+  collation from being attached to a NUMERIC or BYTEA sort, which was
+  carrying a collator those types can never consult and skipping every
+  fast path that checks for its absence.
+
+### Changed
+
+- **The image collates like the image it replaces.** `postgres:18` sets
+  `LANG=en_US.utf8`; this one set nothing and fell through to `C`, so a
+  customer moving over got a different row order and nothing said so.
+  It now sets the same value.
+
+  Held through two releases for two reasons, both closed. A restart
+  under a different environment used to redeclare an EXISTING database's
+  collation — fixed and shipped in v7.38.20. And the collation reached
+  only one sort path, above — fixed here; flipping before that would
+  have handed every customer a database claiming a locale and sorting
+  bytes.
+
+  Verified against running images rather than reasoned about: a data
+  directory created by 7.38.21 **and** one created by 7.38.18 both keep
+  `C` and their existing row order when opened by the flipped image, so
+  the change reaches only NEW databases — which is what `postgres:18`
+  does. Drop-in acceptance is 69/69 against it.
+
+  What it costs, on 400,000 rows: 164.8 ms under `C` against 232.5 ms
+  under `en_US.utf8`. Against the image it replaces — which also carries
+  a locale — the comparison that matters is **234.2 ms here to
+  PostgreSQL 18.4's 360.4 ms**. `SPG_LC_COLLATE=C` restores byte order
+  for a deployment that wants it.
+
+### Instruments
+
+- **The group-commit gate counts fsyncs instead of timing the machine.**
+  It asserted `>= 300 r/s` and spent a release cycle reporting the host:
+  238 on a box at load 66-126 with 21.76 GB of 22.5 GB swap in use, and
+  never in doubt on a quiet one. Four runs of the same commit read
+  1,523-6,318 r/s and **2.00, 2.00, 2.00, 2.00** commits per group. The
+  negative control — one task per group — reads 1.00 and reddens, while
+  its throughput stays far above the floor this replaced, so the old
+  judge would have passed the defect it was written to catch.
+
+  It also runs the DEFAULT commit window now. It passed
+  `SPG_COMMIT_DELAY_US=200` with a comment saying that engaged group
+  commit; an explicit value PINS the window and turns the adaptive one
+  off, so the gate had been measuring the mechanism in its off position.
+
+- **A missed spawn deadline says whether the host or the server caused
+  it**, with a control that is not this server: the time to start
+  `/usr/bin/true`, measured at the moment of the miss. Still a failure —
+  this makes the red legible, it does not make it green.
+
+- **An over-budget verdict prints what it takes to read it.** The same
+  commit has measured 35 s and 1,990 s for `unit-affected` here. Three
+  sensors were tried for deciding automatically whether the step or the
+  machine was slow, and all three were refuted by measurement — the
+  informative one being `fmt`, which does identical work every run and
+  read 2,554 ms in the 1,989,963 ms run. The machine was not generally
+  slow; running a dozen test binaries at once on a swapping host was.
+  So the run prints the same step's recent durations at the same band
+  (now recorded) and leaves the verdict hard.
+
+---
+
 ## [7.38.21] — 2026-08-25
 
 Five attacks on ORDER BY, each one a rule that had been deciding more

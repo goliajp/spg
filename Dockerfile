@@ -121,5 +121,35 @@ USER nonroot:nonroot
 #     image into a service slot that previously ran postgres
 #     without changing client URLs.
 ENV SPG_PG_ADDR=0.0.0.0:5432
+# v7.38.22 — the same default the image this one replaces ships.
+#
+# `postgres:18` sets `LANG=en_US.utf8`, so a database created in it
+# collates by locale: `apple, Bob, Zebra`. This image set nothing, the
+# server's POSIX chain (`SPG_LC_COLLATE` → `LC_ALL` → `LC_COLLATE` →
+# `LANG`) fell through to `C`, and the same data came back
+# `Bob, Zebra, apple`. A customer moving off the standard image got a
+# different row order and nothing said so.
+#
+# Held back through two releases, for two reasons that are now closed:
+#
+#   * a restart under a different environment used to redeclare an
+#     EXISTING database's collation and reorder every text column. Fixed
+#     in v7.38.20 and shipped there, so a data directory created before
+#     this flip keeps the `C` it was created with — the flip reaches new
+#     databases only, which is exactly what `postgres:18` does.
+#   * a declared collation reached only ONE of the two sort paths. On the
+#     other — the one a plain `SELECT … ORDER BY` takes — the answer was
+#     still bytes while `datcollate` reported the locale. Flipping before
+#     that was fixed would have handed every customer a database claiming
+#     a locale and sorting bytes. Fixed earlier in this version.
+#
+# What it costs, measured on 400,000 rows: 164.8 ms under `C` against
+# 232.5 ms under `en_US.utf8`. Against the image this one replaces,
+# which also carries a locale, the comparison that matters is
+# 234.2 ms here to PostgreSQL 18.4's 360.4 ms.
+#
+# `SPG_LC_COLLATE=C` (or `LANG=C`) restores the old default for a
+# deployment that wants byte order.
+ENV LANG=en_US.utf8
 ENTRYPOINT ["/usr/local/bin/spg-server"]
 CMD ["0.0.0.0:5544", "/data/spg.db", "-", "/data/wal.log"]
