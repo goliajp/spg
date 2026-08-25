@@ -8,12 +8,25 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.19] — 2026-08-25
 
-Everything here came out of one customer report and the audit it started.
-Three of the four defects sentori named were the ones they could see; the
-rest of this is what was behind them, and most of it was found by an
-instrument being asked to prove it could see what it claimed to check.
+This version began with one customer report and ended somewhere else.
+Three of the four defects sentori named were the ones they could see;
+the rest of what follows is what was behind them.
+
+Then the release gate went red on a sort, and the attack on it took the
+version over: the cell was 6.12x behind PostgreSQL and is now 1.53x,
+every other cell in the panel improved or held, and declaring a
+collation went from costing 4.09x to costing 1.26x. Two type gaps the
+ledger had been carrying with conditions attached — `'infinity'::interval`
+and the pseudo-types — turned out to be closable, and one of the two
+conditions was simply wrong.
+
+Six instruments were repaired along the way, three of them found while
+measuring this version's own work and each having reported something
+untrue for longer than the work took. One of them had been deciding a
+release verdict by whether autovacuum happened to run. The number it
+uncovered was worse than the one it replaced, which is the point.
 
 ### Added
 
