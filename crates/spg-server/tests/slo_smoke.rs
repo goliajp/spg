@@ -31,11 +31,14 @@
 //! `xbench/competitor/src/bin/latency.rs` /
 //! `throughput.rs` for the real story.
 
+#[path = "common/mod.rs"]
+mod common;
+
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -147,57 +150,13 @@ impl Drop for ChildGuard {
 /// see e2e_wal_binary's `spawn_server_on_ephemeral_port` for the
 /// rationale.
 fn spawn_in_memory() -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_spg-server"))
-        .arg("127.0.0.1:0")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR")
+    // `SPG_DB` / `SPG_WAL` on top of the shared spawner's defaults: this
+    // one wants no store at all, and an inherited path would give it one.
+    let (child, addrs) = common::ServerBuilder::new()
         .env_remove("SPG_DB")
         .env_remove("SPG_WAL")
-        .spawn()
-        .unwrap();
-    let stderr = child.stderr.take().expect("piped stderr");
-    let addr = read_listening_addr(&mut child, stderr);
-    (child, addr)
-}
-
-fn read_listening_addr(child: &mut Child, stderr: std::process::ChildStderr) -> String {
-    use std::io::{BufRead as _, BufReader};
-    let mut reader = BufReader::new(stderr);
-    let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let mut line = String::new();
-    while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                if let Ok(Some(status)) = child.try_wait() {
-                    panic!("server exited before printing listen addr: {status:?}");
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Ok(_) => {
-                if let Some(addr) = extract_listen_addr(&line) {
-                    thread::spawn(move || {
-                        let mut sink = String::new();
-                        let _ = std::io::Read::read_to_string(&mut reader, &mut sink);
-                    });
-                    return addr;
-                }
-            }
-            Err(e) => panic!("read stderr: {e}"),
-        }
-    }
-    let _ = child.kill();
-    panic!("server didn't print listen addr within {STARTUP_TIMEOUT:?}");
-}
-
-fn extract_listen_addr(line: &str) -> Option<String> {
-    let after = line.find("listening on ")?;
-    let tail = &line[after + "listening on ".len()..];
-    let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
-    Some(tail[..end].to_string())
+        .spawn();
+    (child, addrs.native)
 }
 
 fn connect_to(addr: &str) -> TcpStream {
@@ -343,28 +302,27 @@ fn stat_counter(s: &mut TcpStream, key: &str) -> u64 {
         .unwrap_or_else(|e| panic!("counter {key} is not a number: {e}"))
 }
 
+/// v7.38.22 — through the SHARED spawner, which this file used to
+/// duplicate.
+///
+/// The copy here had its own deadline and its own failure message, so a
+/// missed startup said different things depending on which test binary
+/// hit it — and only one of the two learned to name the host as the
+/// cause. One spawner, one rule.
 fn spawn_wal_with_env(
     db: &std::path::Path,
     wal: &std::path::Path,
     extra_env: &[(&str, &str)],
 ) -> (Child, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
-    cmd.arg("127.0.0.1:0")
-        .arg(db)
+    let mut b = common::ServerBuilder::new()
+        .arg_path(db)
         .arg("-")
-        .arg(wal)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .env_remove("SPG_PASSWORD")
-        .env_remove("SPG_ADMIN_PASSWORD")
-        .env_remove("SPG_PG_ADDR");
+        .arg_path(wal);
     for (k, v) in extra_env {
-        cmd.env(k, v);
+        b = b.env(*k, *v);
     }
-    let mut child = cmd.spawn().unwrap();
-    let stderr = child.stderr.take().expect("piped stderr");
-    let addr = read_listening_addr(&mut child, stderr);
-    (child, addr)
+    let (child, addrs) = b.spawn();
+    (child, addrs.native)
 }
 
 /// v4.34: perf gate for the implicit BEGIN..COMMIT wrap. Runs the
@@ -801,9 +759,9 @@ fn slo_wal_insert_4client_group_commit_coalesces() {
         "v4.42 group commit coalesced {per_group:.2} commits per group, under the floor of \
          {SLO_V4_42_4C_COMMITS_PER_FSYNC_FLOOR:.2} — the leader is no longer draining the \
          queue into one fsync. ({total:.0} commits, {groups} groups, {fsyncs} fsyncs, \
-         {rps:.0} r/s.) `SPG_TEST_COMMIT_GROUP_MAX=1` reproduces the uncoalesced regime, \
-         which reads 1.00 — and 1,384 r/s, which the throughput floor this replaced \
-         would have called healthy."
+         {rps:.0} r/s.) `SPG_TEST_COMMIT_GROUP_MAX=1` reproduces the uncoalesced regime: \
+         it reads 1.00 here, while its throughput — 1,384 and 5,208 r/s on two runs — \
+         stays far above the 300 r/s floor this assertion replaced."
     );
 }
 
