@@ -1,0 +1,55 @@
+# v7.38.19 — a pseudo-type is reported by the name PostgreSQL reports,
+# and a column declared with one is refused as an invalid table
+# definition rather than an undefined type.
+#
+# `pg_typeof('x'::cstring)` read `text`; the value travels as text on
+# both engines, so the name has to come from the expression. What it
+# reports is not always the name written — a polymorphic placeholder
+# resolves against its argument, and a bare literal gives it nothing.
+
+query T
+SELECT pg_typeof('x'::cstring)
+----
+cstring
+
+query T
+SELECT pg_typeof('x'::void)
+----
+void
+
+query T
+SELECT pg_typeof('x'::anyelement)
+----
+unknown
+
+query T
+SELECT pg_typeof('x'::anynonarray)
+----
+unknown
+
+query T
+SELECT pg_typeof('x'::unknown)
+----
+unknown
+
+query T
+SELECT 'x'::cstring
+----
+x
+
+query T
+SELECT pg_typeof('x'::cstring::text)
+----
+text
+
+statement error
+CREATE TABLE pt_probe (c cstring)
+
+statement error
+CREATE TABLE pt_probe (c record)
+
+statement error
+CREATE TABLE pt_probe (c internal)
+
+statement error
+CREATE TABLE pt_probe (c nosuchtype)
