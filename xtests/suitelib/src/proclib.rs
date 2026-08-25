@@ -1007,9 +1007,21 @@ mod second_port_tests {
     #[test]
     fn the_second_port_also_skips_a_port_someone_is_serving() {
         let r = Roster::new();
-        let first = r.free_port().expect("a free port");
-        let held = std::net::TcpListener::bind(("0.0.0.0", first))
-            .expect("the probe just said this port was free");
+        // v7.38.20 — take the port, do not merely be told it is free.
+        //
+        // Between the probe and the bind, another test in the same run
+        // can take it, and this failed a release commit that way: the
+        // bind's `expect` fired with "the probe just said this port was
+        // free", which was true when it said it. The test is about the
+        // EXCLUSION, so it retries until it actually holds one.
+        let (first, held) = (0..64)
+            .find_map(|_| {
+                let p = r.free_port().ok()?;
+                std::net::TcpListener::bind(("0.0.0.0", p))
+                    .ok()
+                    .map(|l| (p, l))
+            })
+            .expect("a port this test can hold");
         for _ in 0..8 {
             let second = r.free_port_excluding(Some(9)).expect("a free port");
             assert_ne!(second, first, "handed out a port someone is serving");

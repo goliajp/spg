@@ -8,7 +8,17 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.19] — 2026-08-25
+## [7.38.20] — 2026-08-25
+
+**v7.38.19 is a tag that never became a release.** Nothing was
+published under it — no crates, no image — and it is left in place
+rather than moved, which is this project's rule for a pushed tag. The
+release train refreshes `report.md` / `report.json` as it runs, and
+`TOOLCHAIN` §2.3 says to commit or discard those immediately; mid-train
+the answer is discard, because the train requires the tag to be HEAD.
+They were committed instead, master moved one commit past the tag, and
+the invariant could only be restored by rewriting a pushed branch or
+moving a pushed tag. Cutting the next number costs neither.
 
 This version began with one customer report and ended somewhere else.
 Three of the four defects sentori named were the ones they could see;
