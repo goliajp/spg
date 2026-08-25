@@ -67,6 +67,53 @@ pub fn startup_timeout() -> Duration {
         .map_or(STARTUP_TIMEOUT, Duration::from_secs)
 }
 
+/// v7.38.22 — how long this host takes to start a trivial process, right
+/// now.
+///
+/// A spawn deadline that expires has two causes with identical symptoms:
+/// the server is broken, or the machine cannot start processes. This
+/// measures the second one directly, with a control that has nothing to
+/// do with SPG — so the verdict rests on evidence rather than on whoever
+/// reads the red remembering that the box was busy.
+///
+/// `None` when no control binary is available, and that matters: no
+/// evidence means no forgiveness, so the caller fails exactly as it did
+/// before rather than assuming the host was at fault.
+pub fn spawn_control_latency() -> Option<Duration> {
+    let bin = ["/usr/bin/true", "/bin/true"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())?;
+    let t = Instant::now();
+    Command::new(bin).status().ok()?;
+    Some(t.elapsed())
+}
+
+/// The control reading above which this host is not starting processes
+/// promptly.
+///
+/// Measured on the development box at load 8.5: `/usr/bin/true` starts in
+/// 0.9-2.1 ms across sixty samples. 20 ms is ten times the worst of those
+/// — far enough out that a working machine cannot reach it, and far below
+/// what a machine deep in swap produces (the run that prompted this had
+/// load 66-126 with 21.76 GB of 22.5 GB swap in use).
+pub const SPAWN_CONTROL_STALL: Duration = Duration::from_millis(20);
+
+/// Whether a missed spawn deadline is the HOST's doing.
+///
+/// Pure, so the rule can be pinned in both directions rather than
+/// trusted. Three ways to answer no, and each matters:
+///
+///   * the child is gone — that is a server that died, and no amount of
+///     machine load explains it;
+///   * no control reading — see [`spawn_control_latency`];
+///   * a prompt control — the machine started a process in under
+///     [`SPAWN_CONTROL_STALL`] while the server could not publish a line
+///     in seconds, which is the server's problem.
+#[must_use]
+pub fn host_stalled_the_spawn(child_alive: bool, control: Option<Duration>) -> bool {
+    child_alive && control.is_some_and(|d| d >= SPAWN_CONTROL_STALL)
+}
+
 /// All listener addresses the spg-server child can publish on its
 /// stderr. `native` is always present (it's the mandatory CLI arg);
 /// the rest are populated only when the matching env opt-in is set.
@@ -158,6 +205,20 @@ impl ServerBuilder {
     #[must_use]
     pub fn keep_env(mut self, k: &str) -> Self {
         self.env_remove.retain(|x| x != k);
+        self
+    }
+
+    /// v7.38.22 — clear one more variable from the child's environment,
+    /// on top of the three every spawn clears.
+    ///
+    /// The counterpart to [`Self::keep_env`], and it exists because a
+    /// test that wants a server with NO store must not inherit one from
+    /// whoever ran it.
+    #[must_use]
+    pub fn env_remove(mut self, k: &str) -> Self {
+        if !self.env_remove.iter().any(|x| x == k) {
+            self.env_remove.push(k.to_string());
+        }
         self
     }
 
@@ -345,8 +406,23 @@ fn read_listener_addrs(
         }
     }
     let Some(n) = native else {
+        // v7.38.22 — say WHY, with a control that is not this server.
+        let alive = !matches!(child.try_wait(), Ok(Some(_)));
+        let control = spawn_control_latency();
         let _ = child.kill();
-        panic!("server didn't publish native listen addr within {deadline:?}");
+        let verdict = if host_stalled_the_spawn(alive, control) {
+            "this host is not starting processes promptly, so the deadline is about the \
+             machine and not about the server"
+        } else if !alive {
+            "the child is gone — the server exited during startup"
+        } else {
+            "the host starts processes promptly, so this is the server"
+        };
+        panic!(
+            "server didn't publish native listen addr within {deadline:?} — {verdict}. \
+             (child alive: {alive}; a trivial process took {control:?} to start, stall \
+             threshold {SPAWN_CONTROL_STALL:?})"
+        );
     };
     if want_http && http.is_none() {
         let _ = child.kill();
@@ -501,4 +577,41 @@ pub fn tmp_base() -> std::path::PathBuf {
     let p = std::env::temp_dir().join("spg-tests");
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+#[cfg(test)]
+mod spawn_verdict_tests {
+    use super::{Duration, SPAWN_CONTROL_STALL, host_stalled_the_spawn};
+
+    #[test]
+    fn a_dead_child_is_never_the_host() {
+        // The machine being on fire does not make a server that exited
+        // into a server that is merely slow.
+        assert!(!host_stalled_the_spawn(
+            false,
+            Some(SPAWN_CONTROL_STALL * 100)
+        ));
+    }
+
+    #[test]
+    fn no_control_reading_means_no_forgiveness() {
+        assert!(!host_stalled_the_spawn(true, None));
+    }
+
+    #[test]
+    fn a_prompt_control_points_at_the_server() {
+        // Just under the threshold: 19 ms against 20, written out rather
+        // than subtracted so the number the test means is the number it
+        // says.
+        assert!(!host_stalled_the_spawn(
+            true,
+            Some(Duration::from_millis(19))
+        ));
+    }
+
+    #[test]
+    fn a_stalled_control_points_at_the_host() {
+        assert!(host_stalled_the_spawn(true, Some(SPAWN_CONTROL_STALL)));
+        assert!(host_stalled_the_spawn(true, Some(SPAWN_CONTROL_STALL * 5)));
+    }
 }
