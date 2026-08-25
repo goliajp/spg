@@ -179,6 +179,7 @@ fn main() {
                 })
                 .unwrap_or(1);
             let band = if tier == "precommit" { affected } else { 1u64 };
+            ledger.band = band;
             if band > 1 {
                 println!(
                     "budget band: BASE ({band} crates affected; clippy/unit x{band}x1.2, cap 480 s)"
@@ -521,6 +522,47 @@ fn main() {
             if !over.is_empty() {
                 if tier == "precommit" {
                     eprintln!("suite-run: OVER BUDGET (precommit budgets are hard, D25): {over:?}");
+                    // v7.38.22 — the evidence needed to read that verdict,
+                    // printed at the moment it is made.
+                    //
+                    // The same commit has produced 35 s and 1,990 s for
+                    // `unit-affected` on this host. Whether a run is slow
+                    // because the STEP changed or because the MACHINE was
+                    // busy is not visible in the number alone, and three
+                    // attempts at sensing it automatically were refuted by
+                    // measurement: a process-spawn probe moved 1.2x under
+                    // twelve spinners, a parallel-CPU probe 1.1-1.4x, and
+                    // `fmt` — fixed work every run — read 2,554 ms in the
+                    // run where `unit-affected` read 1,989,963 ms and
+                    // 2,300 ms in the 34,644 ms run of the SAME commit.
+                    //
+                    // None of them tracks the condition, so none of them
+                    // gets to decide. The history does the arguing: same
+                    // step, same band, most recent first.
+                    for name in over
+                        .iter()
+                        .map(|s| s.split_whitespace().next().unwrap_or(s))
+                    {
+                        let past = suitelib::reportlib::recent_step_ms(
+                            &root.join("target"),
+                            tier,
+                            name,
+                            band,
+                            6,
+                        );
+                        if past.is_empty() {
+                            eprintln!("  {name}: no earlier run at band {band} to compare with");
+                        } else {
+                            let secs: Vec<String> = past
+                                .iter()
+                                .map(|ms| format!("{:.1}s", *ms as f64 / 1000.0))
+                                .collect();
+                            eprintln!(
+                                "  {name}: same step at band {band}, most recent first: {}",
+                                secs.join(", ")
+                            );
+                        }
+                    }
                     rc = 1;
                 } else {
                     eprintln!("suite-run: over budget (recorded, not blocking): {over:?}");

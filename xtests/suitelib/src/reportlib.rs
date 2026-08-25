@@ -32,6 +32,13 @@ pub struct StepRecord {
 pub struct Ledger {
     pub tier: String,
     pub runid: String,
+    /// v7.38.22 — the budget band this run was judged under.
+    ///
+    /// Recorded because a step's duration is only comparable to its own
+    /// history at the SAME band: `unit-affected` has honestly taken 11 ms
+    /// and 1,989,963 ms in this repository, and the difference is how many
+    /// crates the commit touched.
+    pub band: u64,
     started: Instant,
     steps: Vec<StepRecord>,
 }
@@ -50,6 +57,7 @@ impl Ledger {
         Self {
             tier: tier.to_string(),
             runid: runid.to_string(),
+            band: 1,
             started: Instant::now(),
             steps: Vec::new(),
         }
@@ -128,6 +136,7 @@ impl Ledger {
         let mut out = String::from("{\n");
         let _ = writeln!(out, "  \"tier\": \"{}\",", self.tier);
         let _ = writeln!(out, "  \"runid\": \"{}\",", self.runid);
+        let _ = writeln!(out, "  \"band\": {},", self.band);
         let _ = writeln!(
             out,
             "  \"total_ms\": {},",
@@ -263,5 +272,147 @@ mod tests {
         let bad = l2.to_json();
         let d = diff_reports(&ok, &bad);
         assert!(d.iter().any(|x| x.contains("pass -> fail")), "{d:?}");
+    }
+}
+
+/// v7.38.22 — what this step has taken on this host lately, at the same
+/// band.
+///
+/// An over-budget verdict says a number was exceeded; it does not say
+/// whether the step got slower or the machine did. Three sensors were
+/// tried for that and all three were refuted by measurement (see the
+/// v7.38.22 plan, item D3), so the run prints the evidence instead of
+/// guessing: the same step, same band, most recent first.
+///
+/// Reports whose band is absent are from before this field existed and
+/// are skipped rather than assumed to match.
+#[must_use]
+pub fn recent_step_ms(
+    target_dir: &std::path::Path,
+    tier: &str,
+    step: &str,
+    band: u64,
+    n: usize,
+) -> Vec<u64> {
+    let dir = target_dir.join("suite");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let prefix = format!("report-{tier}-");
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|f| f.to_str())
+                .is_some_and(|f| f.starts_with(&prefix) && f.ends_with(".json"))
+        })
+        .filter_map(|p| p.metadata().ok()?.modified().ok().map(|m| (m, p)))
+        .collect();
+    files.sort_by_key(|(m, _)| std::cmp::Reverse(*m));
+    let mut out = Vec::new();
+    for (_, p) in files {
+        if out.len() >= n {
+            break;
+        }
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        if field_u64(&text, "\"band\":") != Some(band) {
+            continue;
+        }
+        // The step objects are one per line; find this step's `ms`.
+        if let Some(line) = text
+            .lines()
+            .find(|l| l.contains(&format!("\"name\": \"{step}\"")))
+            && let Some(ms) = field_u64(line, "\"ms\":")
+        {
+            out.push(ms);
+        }
+    }
+    out
+}
+
+/// The first integer after `key` in `text`, if any.
+fn field_u64(text: &str, key: &str) -> Option<u64> {
+    let after = text.split(key).nth(1)?;
+    let digits: String = after
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::{Ledger, StepStatus, recent_step_ms};
+    use std::time::Duration;
+
+    fn write_run(dir: &std::path::Path, runid: &str, band: u64, unit_ms: u64) {
+        let mut l = Ledger::new("precommit", runid);
+        l.band = band;
+        l.record_result(
+            "unit-affected",
+            Some(Duration::from_secs(35)),
+            Duration::from_millis(unit_ms),
+            true,
+        );
+        l.write(dir).expect("write");
+        // Reports are ordered by mtime; make each one strictly newer.
+        std::thread::sleep(Duration::from_millis(12));
+    }
+
+    #[test]
+    fn reads_the_same_step_at_the_same_band_newest_first() {
+        let dir = std::env::temp_dir().join(format!("spg-hist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_run(&dir, "a-1111111", 1, 900);
+        write_run(&dir, "b-2222222", 8, 500_000);
+        write_run(&dir, "c-3333333", 1, 34_644);
+        let got = recent_step_ms(&dir, "precommit", "unit-affected", 1, 6);
+        assert_eq!(
+            got,
+            vec![34_644, 900],
+            "band 8 must not be mixed in, newest first"
+        );
+        let got8 = recent_step_ms(&dir, "precommit", "unit-affected", 8, 6);
+        assert_eq!(got8, vec![500_000]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_step_that_never_ran_reads_empty_rather_than_zero() {
+        let dir = std::env::temp_dir().join(format!("spg-hist-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_run(&dir, "a-1111111", 1, 900);
+        assert!(recent_step_ms(&dir, "precommit", "no-such-step", 1, 6).is_empty());
+        // And a band nobody has run at: empty, not the nearest one.
+        assert!(recent_step_ms(&dir, "precommit", "unit-affected", 5, 6).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_cap_is_honoured() {
+        let dir = std::env::temp_dir().join(format!("spg-hist-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..5 {
+            write_run(&dir, &format!("r{i}-1111111"), 1, 100 + i);
+        }
+        assert_eq!(
+            recent_step_ms(&dir, "precommit", "unit-affected", 1, 2).len(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ledger_records_the_band_it_was_judged_under() {
+        let mut l = Ledger::new("precommit", "z-9999999");
+        l.band = 7;
+        l.record_result("fmt", None, Duration::from_millis(1), true);
+        assert!(l.to_json().contains("\"band\": 7"), "{}", l.to_json());
+        assert!(matches!(l.over_budget().len(), 0), "no budget, no verdict");
+        let _ = StepStatus::Pass;
     }
 }
