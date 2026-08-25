@@ -2023,6 +2023,57 @@ pub(crate) fn build_order_keys_into(
     build_order_keys_bound(order_by, &[], &[], row, ctx, keys)
 }
 
+/// The same eight bytes, read off a KEY rather than a row — the other
+/// half of the pair, used to summarise the top-N boundary.
+///
+/// v7.38.20 — `None` for any key that is not text, which turns the fast
+/// path off rather than guessing at it.
+#[must_use]
+pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<u64> {
+    let OrderKey::Text(t) = key else { return None };
+    let mut k = [0u8; 8];
+    let b = t.as_str().as_bytes();
+    let take = b.len().min(8);
+    k[..take].copy_from_slice(&b[..take]);
+    Some(u64::from_be_bytes(k))
+}
+
+/// The first ORDER BY key's leading eight bytes, read straight off the
+/// row — without building a key.
+///
+/// v7.38.20 — `LIMIT 10` over 400,000 rows built 400,000 sort keys and
+/// kept ten. The boundary check that already stands here rejects a
+/// losing row before it is PROJECTED, which round 581 added, but the
+/// keys were built first because the comparison needs them. Profiled on
+/// `ORDER BY s_long LIMIT 10`: 30% of the working samples in
+/// `build_order_keys_bound` and `value_to_order_key`, and 25% in the
+/// allocator — a `CompactText` per row, each one a copy of a
+/// 192-character string, 77 MB moved to keep ten of them.
+///
+/// A row that loses the boundary decisively does not need a key at all.
+/// Eight bytes decide that for almost every row, and they are already
+/// in the row: `bound` names the column, so there is nothing to
+/// evaluate.
+///
+/// `None` when the shape does not permit it — an expression rather than
+/// a bare column, a type whose order is not its bytes, or a NULL, whose
+/// placement depends on the direction and the NULLS clause. Those take
+/// the ordinary path.
+#[must_use]
+pub(crate) fn first_key_prefix(bound: &[Option<usize>], row: &Row<'static>) -> Option<u64> {
+    let idx = (*bound.first()?)?;
+    match row.values.get(idx)? {
+        Value::Text(t) => {
+            let mut k = [0u8; 8];
+            let b = t.as_bytes();
+            let take = b.len().min(8);
+            k[..take].copy_from_slice(&b[..take]);
+            Some(u64::from_be_bytes(k))
+        }
+        _ => None,
+    }
+}
+
 /// The same, reading a bound key's cell instead of evaluating it.
 /// `bound` may be shorter than `order_by`; a missing or `None` entry
 /// falls back to the interpretive path, so the keys are the ones

@@ -268,3 +268,53 @@ fn a_first_key_that_decides_needs_no_second_pass() {
         other => panic!("expected rows, got {other:?}"),
     }
 }
+
+/// v7.38.20 — a top-N row that loses the boundary on its first eight
+/// bytes is turned away before a sort key is built for it.
+///
+/// The danger is a row turned away that should have been kept, and it
+/// is silent: the answer is simply missing a row. These fixtures put
+/// the winners at the END of the scan, after the boundary has settled
+/// on much larger values, so a gate that rejects too eagerly loses
+/// them.
+#[test]
+fn the_top_n_boundary_never_turns_away_a_winner() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text)").unwrap();
+    // 2,000 rows of `zz…`, then ten of `aa…` at the very end.
+    for i in 0..2000i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'zz{i:06}')"))
+            .unwrap();
+    }
+    for i in 0..10i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({}, 'aa{i:06}')", 9000 + i))
+            .unwrap();
+    }
+    let got = col0(&mut e, "SELECT s FROM t ORDER BY s LIMIT 10");
+    assert_eq!(
+        got,
+        (0..10)
+            .map(|i| format!("aa{i:06}"))
+            .collect::<Vec<String>>(),
+        "the ten smallest arrived last and must still be the answer"
+    );
+}
+
+/// A tie on the first eight bytes decides nothing, so those rows must
+/// take the ordinary path rather than being rejected.
+#[test]
+fn a_tie_on_the_prefix_is_not_a_rejection() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text)").unwrap();
+    // Every value shares eight leading bytes; only the tail orders them,
+    // and the smallest tails arrive last.
+    for i in 0..2000i32 {
+        e.execute(&format!(
+            "INSERT INTO t VALUES ({i}, 'SHAREDPX{:06}')",
+            9999 - i
+        ))
+        .unwrap();
+    }
+    let got = col0(&mut e, "SELECT s FROM t ORDER BY s LIMIT 3");
+    assert_eq!(got, ["SHAREDPX008000", "SHAREDPX008001", "SHAREDPX008002"]);
+}
