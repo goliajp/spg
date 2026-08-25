@@ -210,7 +210,20 @@ fn head_cmp(heads: &[Head], descs: &[bool], a: usize, b: usize) -> core::cmp::Or
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
-        (Some((ka, _)), Some((kb, _))) => cmp_multi_key_in(ka, kb, descs, &[]),
+        // v7.38.21 — `.then(a.cmp(&b))`, and the batch sort's promise is
+        // why.
+        //
+        // It says equal keys keep the order they arrived in, and inside a
+        // batch they do. A run holds rows that were all pushed before
+        // every row of the next run, so preferring the LOWER run index on
+        // a tie is that same order continued across the merge. Without
+        // it, a binary heap hands back whichever equal head happened to
+        // sit higher, and the same ORDER BY answers differently depending
+        // on whether the sort spilled -- the exact split `inline_int_key`
+        // exists to prevent between its two callers.
+        //
+        // Not reversed under DESC: arrival order is not a key.
+        (Some((ka, _)), Some((kb, _))) => cmp_multi_key_in(ka, kb, descs, &[]).then(a.cmp(&b)),
     }
 }
 
@@ -538,11 +551,71 @@ impl<'a> ExternalSorter<'a> {
             }
             return order;
         }
+        // v7.38.21 — the same rule the materialising sort dropped in this
+        // version, at the OTHER entrance to it.
+        //
+        // `stride == 1` above is where a single integer key skips the
+        // general comparator. A second ORDER BY term fell past it to a
+        // comparison sort over 48-byte keys, and the second term only
+        // decides ties in the first. Sorting on the first key leaves runs
+        // of equal first keys, and only a run longer than one needs the
+        // later keys at all -- on a first key that is a permutation, no
+        // run is.
+        //
+        // Found by profiling `SELECT pad FROM t ORDER BY k, id` at 50,000
+        // rows, which spills: the batch sorts and their comparators were
+        // 12% of the working samples, and the in-memory fix shipped
+        // earlier in this version could not reach them.
+        if stride >= 2
+            && let Some(mut inline) = Self::inline_first_keys(keys, stride)
+        {
+            if descs.first().copied().unwrap_or(false) {
+                inline.sort_by_key(|p| core::cmp::Reverse(p.0));
+            } else {
+                inline.sort_by_key(|p| p.0);
+            }
+            let mut lo = 0;
+            while lo < inline.len() {
+                let mut hi = lo + 1;
+                while hi < inline.len() && inline[hi].0 == inline[lo].0 {
+                    hi += 1;
+                }
+                if hi - lo > 1 {
+                    // Stable, so a run the full comparator calls equal
+                    // keeps the order it was pushed in -- which is what
+                    // the general path below does with the same rows.
+                    inline[lo..hi].sort_by(|&(_, a), &(_, b)| {
+                        let (a, b) = (a as usize * stride, b as usize * stride);
+                        cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
+                    });
+                }
+                lo = hi;
+            }
+            for (slot, (_, i)) in order.iter_mut().zip(inline) {
+                *slot = i;
+            }
+            return order;
+        }
         order.sort_by(|&a, &b| {
             let (a, b) = (a as usize * stride, b as usize * stride);
             cmp_multi_key_in(&keys[a..a + stride], &keys[b..b + stride], descs, &[])
         });
         order
+    }
+
+    /// `(first key, row index)` when EVERY row's first key travels as an
+    /// integer, or `None` when one does not.
+    ///
+    /// Only the first: the later keys stay `OrderKey`s and are compared
+    /// by the general comparator inside a run, so a text or numeric
+    /// second key costs this path nothing.
+    fn inline_first_keys(keys: &[OrderKey], stride: usize) -> Option<Vec<(i128, u32)>> {
+        let rows = keys.len() / stride;
+        let mut out: Vec<(i128, u32)> = Vec::with_capacity(rows);
+        for i in 0..rows {
+            out.push((crate::orderby::inline_int_key(&keys[i * stride])?, i as u32));
+        }
+        Some(out)
     }
 
     /// `(key, row index)` for one integer key per row, or `None` when
@@ -854,6 +927,20 @@ mod tests {
         match &src.values[0] {
             Value::Int(n) => {
                 out.push(OrderKey::Int(i128::from(*n)));
+                Ok(())
+            }
+            other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
+        }
+    }
+
+    /// v7.38.21 — two keys, re-derived from the row the same way the
+    /// pusher derived them, which is the contract `finish` states.
+    fn keys_of_two(src: &Row<'static>, out: &mut Vec<OrderKey>) -> Result<(), EngineError> {
+        match &src.values[0] {
+            Value::Int(n) => {
+                let id = i128::from(*n);
+                out.push(OrderKey::Int(id % 3));
+                out.push(OrderKey::Int((id * 7919) % 13));
                 Ok(())
             }
             other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
@@ -1758,11 +1845,38 @@ mod tests {
             alloc::vec![OrderKey::Text("apple".into())],
             alloc::vec![OrderKey::Num(1.5)],
         ];
-        // Declined: more than one key per row.
+        // v7.38.21 — taken now, by the first key, with the later keys
+        // deciding inside a run. Every one of these has ties in the first
+        // key: without them the run branch never executes and the case
+        // proves nothing about it.
         let two_keys: Vec<Vec<OrderKey>> = alloc::vec![
             alloc::vec![OrderKey::Int(1), OrderKey::Int(9)],
             alloc::vec![OrderKey::Int(1), OrderKey::Int(2)],
             alloc::vec![OrderKey::Int(0), OrderKey::Int(5)],
+            alloc::vec![OrderKey::Int(1), OrderKey::Int(2)],
+            alloc::vec![OrderKey::Int(0), OrderKey::Int(5)],
+        ];
+        // A run whose first key is a NULL sentinel is still a run.
+        let null_runs: Vec<Vec<OrderKey>> = alloc::vec![
+            alloc::vec![OrderKey::NullBig, OrderKey::Int(3)],
+            alloc::vec![OrderKey::Int(4), OrderKey::Int(1)],
+            alloc::vec![OrderKey::NullBig, OrderKey::Int(1)],
+            alloc::vec![OrderKey::NullSmall, OrderKey::Int(2)],
+            alloc::vec![OrderKey::NullSmall, OrderKey::Int(0)],
+        ];
+        // The later key need not be an integer: inside a run it is the
+        // general comparator that answers, exactly as before.
+        let text_second: Vec<Vec<OrderKey>> = alloc::vec![
+            alloc::vec![OrderKey::Int(2), OrderKey::Text("pear".into())],
+            alloc::vec![OrderKey::Int(2), OrderKey::Text("apple".into())],
+            alloc::vec![OrderKey::Int(1), OrderKey::Num(1.5)],
+            alloc::vec![OrderKey::Int(2), OrderKey::Text("apple".into())],
+        ];
+        // Declined, and it must be: the FIRST key is what this path reads.
+        let text_first: Vec<Vec<OrderKey>> = alloc::vec![
+            alloc::vec![OrderKey::Text("b".into()), OrderKey::Int(1)],
+            alloc::vec![OrderKey::Text("a".into()), OrderKey::Int(2)],
+            alloc::vec![OrderKey::Text("b".into()), OrderKey::Int(0)],
         ];
 
         for (name, rows) in [
@@ -1774,8 +1888,58 @@ mod tests {
             assert_order_matches(name, rows, &[false]);
             assert_order_matches(name, rows, &[true]);
         }
-        assert_order_matches("two keys", &two_keys, &[false, false]);
-        assert_order_matches("two keys, second descending", &two_keys, &[false, true]);
+        for (name, rows) in [
+            ("two keys", &two_keys),
+            ("two keys, null runs", &null_runs),
+            ("two keys, text second", &text_second),
+            ("two keys, text first", &text_first),
+        ] {
+            for descs in [[false, false], [false, true], [true, false], [true, true]] {
+                assert_order_matches(name, rows, &descs);
+            }
+        }
+    }
+
+    /// v7.38.21 — the two-key batch sort at a size that spills, against
+    /// the order the general comparator gives the same rows.
+    ///
+    /// The three-row cases above all fit in one batch. A run that
+    /// straddles a spill boundary is a different question, and this is
+    /// the shape the endpoint sweep's `two keys` cell has: a first key
+    /// with ties, 4,000 rows, a budget that cannot hold them.
+    #[test]
+    fn the_two_key_batch_sort_agrees_when_it_spills() {
+        for descs in [[false, false], [true, false], [false, true]] {
+            let mut want: Vec<(i128, i128, i32)> = (0..4000i32)
+                .map(|i| (i as i128 % 3, ((i as i128) * 7919) % 13, i))
+                .collect();
+            let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs);
+            for &(a, b, id) in &want {
+                let r = record(id);
+                let mut k = alloc::vec![OrderKey::Int(a), OrderKey::Int(b)];
+                s.push(&mut k, &r).unwrap();
+            }
+            assert!(s.spilled(), "{descs:?}: the point is the spilled path");
+            want.sort_by(|x, y| {
+                let first = if descs[0] {
+                    y.0.cmp(&x.0)
+                } else {
+                    x.0.cmp(&y.0)
+                };
+                let second = if descs[1] {
+                    y.1.cmp(&x.1)
+                } else {
+                    x.1.cmp(&y.1)
+                };
+                first.then(second).then(x.2.cmp(&y.2))
+            });
+            let out = s.finish(keys_of_two, project_identity).unwrap();
+            assert_eq!(
+                ids_of(&out, 0),
+                want.iter().map(|w| w.2).collect::<Vec<i32>>(),
+                "{descs:?}"
+            );
+        }
     }
 
     /// And the rows themselves come back in that order, spilled or not —
