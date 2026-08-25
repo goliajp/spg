@@ -1,0 +1,38 @@
+# v7.38.21 — a top-N under a declared collation answers by the
+# collation, not by the bytes.
+#
+# The boundary gate turns a losing row away on its first eight bytes
+# before a sort key is built for it. It reads bytes, so it may only run
+# where bytes answer the collation in force. `'ápple' < 'zz000000'` is
+# true under `en_US.utf8` and false under `C` — measured on PostgreSQL
+# 18.4 — so a boundary of `zz…` with `ápple…` rows arriving last is
+# exactly the shape byte order gets wrong, and getting it wrong is
+# silent: the answer is simply short those rows.
+
+statement ok
+CREATE TABLE topn_coll (id INT, s TEXT COLLATE "en_US.utf8")
+
+statement ok
+INSERT INTO topn_coll SELECT g, 'zz' || lpad(g::text, 6, '0') FROM generate_series(1, 2000) g
+
+statement ok
+INSERT INTO topn_coll SELECT 9000 + g, 'ápple' || lpad(g::text, 6, '0') FROM generate_series(1, 10) g
+
+query T
+SELECT s FROM topn_coll ORDER BY s LIMIT 3
+----
+ápple000001
+ápple000002
+ápple000003
+
+# And the same table under C, where the bytes DO answer: the á rows
+# sort after every z.
+query T
+SELECT s FROM topn_coll ORDER BY s COLLATE "C" LIMIT 3
+----
+zz000001
+zz000002
+zz000003
+
+statement ok
+DROP TABLE topn_coll
