@@ -8,17 +8,37 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.21] — 2026-08-25
 
-Three attacks on ORDER BY, each one a rule that had been deciding more
+Five attacks on ORDER BY, each one a rule that had been deciding more
 than it knew.
 
 The panel that gates a release measures seven sorting shapes against
 PostgreSQL 18.4 on the same box, both engines ordering bytes. At the
 start of v7.38.20 its worst cell was 6.12x behind; that release brought
 it to 2.01x by giving the sort a way to skip building keys at all. What
-was left were the shapes that path could not take, and this version is
-those three.
+was left were the shapes that path could not take.
+
+Three of the five are the in-memory sort. The fourth is the one that
+matters most about how the other three were found: after all of them,
+the endpoint sweep still had exactly one LOSS, and it had not moved at
+all. It was not a bad measurement and it was not a small win lost in
+noise — that cell SPILLS, and none of the three run there. The fifth
+came from the panel that runs the same binary under a collation against
+itself under `C`: making `C` four times faster on a shape the collated
+leg was excluded from is a cost-CLASS difference, which is the one
+thing that panel exists to refuse.
+
+Measured on the gate's own run, 400,000 rows:
+
+    sort only, int                  0.71x
+    sort only, two keys             0.89x
+    sort only, text (26 values)     1.24x
+    sort only, short text distinct  1.33x
+    sort only, long text distinct   1.44x
+    sort only, long text top-N      1.34x
+
+    64 cells, 0 losses
 
 ### Changed
 
