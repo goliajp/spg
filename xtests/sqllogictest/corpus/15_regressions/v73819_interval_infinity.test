@@ -1,0 +1,131 @@
+# v7.38.19 — `interval` has the two infinities PostgreSQL 17 gave it.
+#
+# `'infinity'::interval` was refused outright; the type had no infinite
+# value at all. Every answer below was read from PostgreSQL 18.4 rather
+# than reasoned about, including the three that are hard to guess:
+# `'inf'` is refused for interval though accepted for float8, the
+# cancelling forms are *interval out of range* rather than an overflow,
+# and a timestamp shifted by an infinite interval is the infinite
+# timestamp.
+
+query T
+SELECT ('infinity'::interval)::text
+----
+infinity
+
+query T
+SELECT ('-infinity'::interval)::text
+----
+-infinity
+
+query T
+SELECT ('Infinity'::interval)::text
+----
+infinity
+
+query T
+SELECT ('@ infinity'::interval)::text
+----
+infinity
+
+query T
+SELECT ('infinity'::text::interval)::text
+----
+infinity
+
+query B
+SELECT 'infinity'::interval > '100 years'::interval
+----
+1
+
+query B
+SELECT '-infinity'::interval < '-100 years'::interval
+----
+1
+
+query B
+SELECT isfinite('infinity'::interval)
+----
+0
+
+query B
+SELECT isfinite('1 day'::interval)
+----
+1
+
+query T
+SELECT (-('infinity'::interval))::text
+----
+-infinity
+
+query T
+SELECT ('infinity'::interval * 2)::text
+----
+infinity
+
+query T
+SELECT ('infinity'::interval * -1)::text
+----
+-infinity
+
+query T
+SELECT ('1 day'::interval - 'infinity'::interval)::text
+----
+-infinity
+
+query T
+SELECT (justify_days('infinity'::interval))::text
+----
+infinity
+
+query T
+SELECT (justify_interval('-infinity'::interval))::text
+----
+-infinity
+
+query T
+SELECT ('2020-01-01'::timestamp + 'infinity'::interval)::text
+----
+infinity
+
+query T
+SELECT ('2020-01-01'::timestamp - 'infinity'::interval)::text
+----
+-infinity
+
+statement ok
+CREATE TABLE iv_inf (id int, iv interval, arr interval[])
+
+statement ok
+INSERT INTO iv_inf VALUES (1,'infinity','{infinity,1 day}'),(2,'-infinity','{-infinity}'),(3,'1 day','{1 day}')
+
+query T
+SELECT iv::text FROM iv_inf WHERE id = 1
+----
+infinity
+
+query T
+SELECT arr::text FROM iv_inf WHERE id = 1
+----
+{infinity,"1 day"}
+
+query I
+SELECT id FROM iv_inf ORDER BY iv
+----
+2
+3
+1
+
+query TT
+SELECT min(iv)::text, max(iv)::text FROM iv_inf
+----
+-infinity
+infinity
+
+query I
+SELECT count(*) FROM iv_inf WHERE isfinite(iv)
+----
+1
+
+statement ok
+DROP TABLE iv_inf
