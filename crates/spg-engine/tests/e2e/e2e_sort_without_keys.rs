@@ -139,3 +139,61 @@ fn an_output_item_that_only_shares_a_name_is_refused() {
         ["Int(1)", "Int(2)", "Int(3)"]
     );
 }
+
+/// v7.38.20 — a key that leaves long runs of ties is sorted run by run,
+/// and a run that is NOT all-equal still gets sorted.
+///
+/// The shortcut is that a run whose values are all equal is already in
+/// its stable order, which costs n-1 comparisons to prove instead of
+/// n log n to re-establish. It is only sound when the run really is
+/// uniform, so the interesting case is the one that is not: eight
+/// leading bytes shared, and the ninth deciding.
+#[test]
+fn a_tied_run_that_is_not_uniform_is_still_ordered() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text)").unwrap();
+    // Every value shares the first eight bytes, so the prefix key ties
+    // across all of them and the run covers the whole table.
+    // Big enough that the sampler runs at all: `key_discriminates`
+    // answers `true` for anything under eight sampled keys, so a
+    // four-row fixture never reaches the path this test is for. The
+    // first draft WAS four rows, and its negative control did not bite.
+    for i in 0..400i32 {
+        let tail = ["d", "b", "a", "c"][(i % 4) as usize];
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'SHAREDPX{tail}')"))
+            .unwrap();
+    }
+    let got = col0(&mut e, "SELECT s FROM t ORDER BY s");
+    assert_eq!(got.len(), 400);
+    assert_eq!(got[0], "SHAREDPXa");
+    assert_eq!(got[399], "SHAREDPXd");
+    assert!(got.windows(2).all(|w| w[0] <= w[1]), "not ordered");
+    let desc = col0(&mut e, "SELECT s FROM t ORDER BY s DESC");
+    assert_eq!(desc[0], "SHAREDPXd");
+    assert_eq!(desc[399], "SHAREDPXa");
+    assert!(desc.windows(2).all(|w| w[0] >= w[1]), "not ordered");
+}
+
+/// And a run that IS uniform keeps its input order, which is what
+/// stability means. The `id` column rides along to make the order
+/// visible.
+#[test]
+fn a_uniform_run_keeps_its_input_order() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text)").unwrap();
+    for i in 0..400i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'SAMEVALUE')"))
+            .unwrap();
+    }
+    // Every row ties; a stable sort must return them as they went in.
+    match e.execute("SELECT s, id FROM t ORDER BY s").unwrap() {
+        QueryResult::Rows { rows, .. } => {
+            let ids: Vec<String> = rows.iter().map(|r| format!("{:?}", r.values[1])).collect();
+            assert_eq!(
+                ids,
+                (0..400).map(|i| format!("Int({i})")).collect::<Vec<_>>()
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
