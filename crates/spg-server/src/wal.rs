@@ -660,6 +660,31 @@ pub(crate) fn commit_group_max() -> usize {
 /// set this to ~200 µs because on macOS APFS a single fsync is
 /// ~milliseconds — a 200 µs spin is well under that cost and
 /// pays for itself by letting 4-16 writers share one fsync.
+///
+/// v7.38.22 — that advice is measurably wrong on this box, and two
+/// instruments followed it.
+///
+/// `concurrent_sweep`, three runs each, median aggregate r/s:
+///
+/// ```text
+///   clients   adaptive (default)   pinned 0   pinned 200 us
+///         1                 4776       4809            1256
+///         4                 7894       7890            2839
+///         8                14850      14697            5663
+/// ```
+///
+/// The spin does not pay for itself; it costs 2.6-3.8x. The reason is
+/// that these writers are a CLOSED loop — each sends its next statement
+/// only after the last one returns — so nobody arrives DURING the wait.
+/// What fills the queue is the leader's own fsync: the other writers
+/// pile up behind it while it runs. The fsync IS the window, and adding
+/// another one in front of it only delays the group.
+///
+/// The adaptive window lands within 1% of zero at every client count,
+/// which is the same thing said in numbers. Nothing here argues for
+/// changing the controller; it argues against pinning it, which is what
+/// the group-commit SLO gate and `concurrent_sweep` both did while
+/// claiming to measure group commit.
 pub(crate) fn commit_delay_us() -> u64 {
     parse_env_u64("SPG_COMMIT_DELAY_US").unwrap_or(0)
 }

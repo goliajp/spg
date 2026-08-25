@@ -136,9 +136,24 @@ fn spawn_spg_server() -> Result<Child, Box<dyn std::error::Error>> {
         .env_remove("SPG_PASSWORD")
         .env_remove("SPG_ADMIN_PASSWORD")
         .env_remove("SPG_PG_ADDR")
-        // v4.42 group commit — set the leader spin window so
-        // concurrent writers actually coalesce.
-        .env("SPG_COMMIT_DELAY_US", "200")
+        // v7.38.22 — the window is NOT pinned here any more.
+        //
+        // This set `SPG_COMMIT_DELAY_US=200` with a comment saying it
+        // made concurrent writers coalesce. An explicit value PINS the
+        // leader's window and turns OFF the adaptive one that ships as
+        // the default (`effective_commit_delay_us`), so this harness —
+        // built to measure group commit — was measuring the mechanism in
+        // its off position, and so was the SLO gate until earlier in this
+        // version.
+        //
+        // Unset, the server adapts, which is what a deployment does. Set
+        // it in the harness's OWN environment to pin it and compare:
+        // `SPG_COMMIT_DELAY_US=0 cargo run … --bin concurrent_sweep`.
+        .envs(
+            std::env::var("SPG_COMMIT_DELAY_US")
+                .ok()
+                .map(|v| ("SPG_COMMIT_DELAY_US".to_string(), v)),
+        )
         .spawn()?;
     let stderr = child.stderr.take().expect("stderr piped");
     let mut reader = BufReader::new(stderr);
