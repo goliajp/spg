@@ -7127,7 +7127,9 @@ impl Engine {
         // beside the boundary and refreshed with it; `None` whenever the
         // boundary's first key is not one this can read, which sends
         // every row down the ordinary path.
-        let mut topk_boundary_prefix: Option<u64> = None;
+        // v7.38.21 — and whether those bytes may be trusted under the
+        // collation in force, which is the boundary's own text to answer.
+        let mut topk_boundary_prefix: Option<(u64, bool)> = None;
         // v7.39 (round 582) — resolve each ORDER BY column once, not
         // once per row. See `order_by_bound_positions`.
         let order_bound =
@@ -7142,6 +7144,21 @@ impl Engine {
         // three. After a window of rows it looks at what it has
         // actually rejected and switches itself off if the shape is not
         // paying. The answers do not depend on it either way.
+        // v7.38.21 — resolved once per query, not per row.
+        //
+        // No collation at all is the case v7.38.20 shipped. A DECLARED
+        // one may still be answered by bytes, and which collations those
+        // are is `Collated::ascii_byte_order`'s to say — the same
+        // allowlist `byte_order_answers_the_collation` consults, so the
+        // two cannot come to disagree about a collation. What that
+        // allowlist requires of the TEXT is checked per row and on the
+        // boundary, because a streaming top-N has no batch to check.
+        let boundary_no_collation = order_colls.iter().all(Option::is_none);
+        let boundary_collations_permit = boundary_no_collation
+            || order_colls
+                .iter()
+                .flatten()
+                .all(crate::collate::Collated::ascii_byte_order);
         const BOUNDARY_WINDOW: u32 = 8192;
         let mut boundary_checks: u32 = 0;
         let mut boundary_rejects: u32 = 0;
@@ -7211,9 +7228,11 @@ impl Engine {
                     && let Some((_, descs)) = &topk_stream
                     && !descs.first().copied().unwrap_or(false)
                     && order_by.len() == 1
-                    && order_colls.iter().all(Option::is_none)
-                    && let Some(bp) = topk_boundary_prefix
-                    && let Some(rp) = crate::orderby::first_key_prefix(&order_bound, row)
+                    && boundary_collations_permit
+                    && let Some((bp, boundary_is_ascii)) = topk_boundary_prefix
+                    && let Some((rp, row_is_ascii)) =
+                        crate::orderby::first_key_prefix(&order_bound, row)
+                    && (boundary_no_collation || (boundary_is_ascii && row_is_ascii))
                     && rp > bp
                 {
                     boundary_checks += 1;

@@ -2029,13 +2029,9 @@ pub(crate) fn build_order_keys_into(
 /// v7.38.20 — `None` for any key that is not text, which turns the fast
 /// path off rather than guessing at it.
 #[must_use]
-pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<u64> {
+pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<(u64, bool)> {
     let OrderKey::Text(t) = key else { return None };
-    let mut k = [0u8; 8];
-    let b = t.as_str().as_bytes();
-    let take = b.len().min(8);
-    k[..take].copy_from_slice(&b[..take]);
-    Some(u64::from_be_bytes(k))
+    Some(text_prefix(t.as_str().as_bytes()))
 }
 
 /// The first ORDER BY key's leading eight bytes, read straight off the
@@ -2059,19 +2055,58 @@ pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<u64> {
 /// a bare column, a type whose order is not its bytes, or a NULL, whose
 /// placement depends on the direction and the NULLS clause. Those take
 /// the ordinary path.
+/// v7.38.21 — the second half of the pair says whether those bytes may
+/// be trusted under a DECLARED collation.
+///
+/// Byte order is not collation order in general, so v7.38.20 turned this
+/// gate off whenever a collation was in play. That was the safe answer
+/// and it cost the collated leg the whole win: the release panel that
+/// compares the same binary under a collation against itself under `C`
+/// read 4.16x on this shape once `C` got faster, which is a cost CLASS
+/// difference — the thing that panel exists to refuse.
+///
+/// The judgement is [`crate::collate::is_ascii_alnum_lower`]'s, the same
+/// one [`crate::select::byte_order_answers_the_collation`] asks of a
+/// whole batch. It is asked here per row rather than per batch because a
+/// streaming top-N has no batch to ask about.
 #[must_use]
-pub(crate) fn first_key_prefix(bound: &[Option<usize>], row: &Row<'static>) -> Option<u64> {
+pub(crate) fn first_key_prefix(bound: &[Option<usize>], row: &Row<'static>) -> Option<(u64, bool)> {
     let idx = (*bound.first()?)?;
     match row.values.get(idx)? {
-        Value::Text(t) => {
-            let mut k = [0u8; 8];
-            let b = t.as_bytes();
-            let take = b.len().min(8);
-            k[..take].copy_from_slice(&b[..take]);
-            Some(u64::from_be_bytes(k))
-        }
+        Value::Text(t) => Some(text_prefix(t.as_bytes())),
         _ => None,
     }
+}
+
+/// The leading eight bytes big-endian, zero-padded, and whether those
+/// bytes are `[0-9a-z]` — one place, so the row's prefix and the
+/// boundary's cannot come to be built differently.
+///
+/// v7.38.21 — the flag asks about THOSE EIGHT BYTES, not the whole
+/// string, and the difference is the point.
+/// [`crate::select::byte_order_answers_the_collation`] asks about whole
+/// strings because the batch sort compares whole strings; this gate
+/// compares eight bytes and rejects only on a STRICT difference inside
+/// them, so eight is the window whose contents can decide anything.
+///
+/// Asking the wider question here was measured and it is not free: an
+/// `is_ascii_alnum_lower` over a 192-character string, once per row, put
+/// this shape at 48.9 ms where the eight-byte question leaves it at
+/// 10.4 — the whole win, spent on re-reading text the comparison never
+/// looks at.
+///
+/// A byte outside `[0-9a-z]` turns the flag off, which also disposes of
+/// the alignment worry: a multi-byte character inside the window makes
+/// the flag false rather than letting byte positions and character
+/// positions drift apart.
+fn text_prefix(b: &[u8]) -> (u64, bool) {
+    let mut k = [0u8; 8];
+    let take = b.len().min(8);
+    k[..take].copy_from_slice(&b[..take]);
+    let ordered = k[..take]
+        .iter()
+        .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase());
+    (u64::from_be_bytes(k), ordered)
 }
 
 /// The same, reading a bound key's cell instead of evaluating it.

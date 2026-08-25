@@ -318,3 +318,76 @@ fn a_tie_on_the_prefix_is_not_a_rejection() {
     let got = col0(&mut e, "SELECT s FROM t ORDER BY s LIMIT 3");
     assert_eq!(got, ["SHAREDPX008000", "SHAREDPX008001", "SHAREDPX008002"]);
 }
+
+/// v7.38.21 — the same gate under a DECLARED collation.
+///
+/// v7.38.20 turned it off whenever a collation was in play, which was
+/// the safe answer and cost the collated leg the entire win: once `C`
+/// got faster, the release panel that runs the same binary under a
+/// collation against itself under `C` read this shape at 4.16x, and a
+/// cost-class difference is what that panel exists to refuse.
+///
+/// Every value here is `[0-9a-z]`, which is the class `en_US` orders by
+/// byte — so the gate may read the bytes, and the answer must be the
+/// one the collation gives.
+#[test]
+fn a_declared_collation_still_gets_the_boundary_gate() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text COLLATE \"en_US.utf8\")")
+        .unwrap();
+    for i in 0..2000i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'zz{i:06}')"))
+            .unwrap();
+    }
+    for i in 0..10i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({}, 'aa{i:06}')", 9000 + i))
+            .unwrap();
+    }
+    let got = col0(&mut e, "SELECT s FROM t ORDER BY s LIMIT 10");
+    assert_eq!(
+        got,
+        (0..10)
+            .map(|i| format!("aa{i:06}"))
+            .collect::<Vec<String>>(),
+        "the ten smallest arrived last and must still be the answer"
+    );
+}
+
+/// And it is OFF for a row whose own bytes do not answer the collation,
+/// even when the boundary's do.
+///
+/// This is the hazard the row-side check exists for. The boundary
+/// settles on `zz…`, which is `[0-9a-z]` and orders by byte; the rows
+/// that must win are `ápple…`, which does not. PostgreSQL 18.4 answers
+/// `'ápple' < 'zz000000'` true under `en_US.utf8` and false under `C`,
+/// so byte order would reject exactly the ten rows that belong in the
+/// answer, and the answer would simply be short of them.
+///
+/// Two thousand rows and `LIMIT 10` because that is the shape this gate
+/// is on. Written first at six hundred rows with `LIMIT 1`, it passed
+/// with the gate sabotaged two independent ways — which is what a test
+/// that never reaches the code looks like.
+#[test]
+fn the_gate_declines_a_row_whose_bytes_do_not_answer_the_collation() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE t (id int, s text COLLATE \"en_US.utf8\")")
+        .unwrap();
+    for i in 0..2000i32 {
+        e.execute(&format!("INSERT INTO t VALUES ({i}, 'zz{i:06}')"))
+            .unwrap();
+    }
+    for i in 0..10i32 {
+        e.execute(&format!(
+            "INSERT INTO t VALUES ({}, 'ápple{i:06}')",
+            9000 + i
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        col0(&mut e, "SELECT s FROM t ORDER BY s LIMIT 10"),
+        (0..10)
+            .map(|i| format!("ápple{i:06}"))
+            .collect::<Vec<String>>(),
+        "en_US puts á next to a; its bytes put it after z"
+    );
+}
