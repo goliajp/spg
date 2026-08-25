@@ -527,7 +527,7 @@ fn main() {
                 }
             }
             if tier == "precommit" && total > hard_cap {
-                eprintln!("suite-run: precommit total {total:?} exceeds the 150 s hard cap");
+                eprintln!("suite-run: precommit total {total:?} exceeds the {hard_cap:?} hard cap");
                 rc = 1;
             }
             std::process::exit(rc);
