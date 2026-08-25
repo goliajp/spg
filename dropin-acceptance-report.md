@@ -1,6 +1,6 @@
 # SPG drop-in acceptance report
 
-- image: `goliakk/spg:7.38.18`
+- image: `goliakk/spg:7.38.20`
 - panel cases: 71  (pass 71  / fail 0)
 
 **Verdict: PASS — every probed PG dialect feature lands on this SPG image.**
@@ -84,5 +84,5 @@
 ## Reproducer
 
 ```bash
-scripts/dropin-acceptance.sh --image goliakk/spg:7.38.18 --port 25433
+scripts/dropin-acceptance.sh --image goliakk/spg:7.38.20 --port 25433
 ```
