@@ -8,6 +8,98 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+Three attacks on ORDER BY, each one a rule that had been deciding more
+than it knew.
+
+The panel that gates a release measures seven sorting shapes against
+PostgreSQL 18.4 on the same box, both engines ordering bytes. At the
+start of v7.38.20 its worst cell was 6.12x behind; that release brought
+it to 2.01x by giving the sort a way to skip building keys at all. What
+was left were the shapes that path could not take, and this version is
+those three.
+
+### Changed
+
+- **A key that ties in long runs is answered once per run.**
+  `sort only, text (26 values)` is two hundred identical characters
+  drawn from twenty-six letters, so every eight-byte prefix inside a
+  letter is the same and 15,384 rows tie on it. The comparison sort
+  asked ~7.4 M questions of which nearly all were a two-hundred-byte
+  `memcmp` answering EQUAL — 30% of the working samples in `memcmp`
+  alone.
+
+  Sorting the integer keys is cheap; what each run of equal keys needs
+  afterwards is ONE pass. If every value in the run is equal, input
+  order already IS the stable answer, and proving that costs n-1
+  comparisons rather than n log n to re-establish. Only a run that is
+  not all-equal is sorted.
+
+      before   174.786-178.033   2.41x
+      after     89.998- 91.366   1.22x
+
+- **A second ORDER BY key no longer sends the whole sort to the slow
+  path.** The rule that did it read: *multiple keys keep the general
+  path — the second key only decides ties, and the tie rate is not
+  knowable here.* The runs know the tie rate. `ORDER BY k, id` where `k`
+  is a permutation of the range has every run of length one, so the
+  second key decides nothing, and the sort was paying the general
+  comparator on 48-byte elements for an order the first key had already
+  settled.
+
+      before   143.360-147.755   2.03x
+      after     65.022- 76.178   0.82x
+
+- **A top-N row that loses on eight bytes needs no sort key.**
+  `ORDER BY s_long LIMIT 10` over 400,000 rows built 400,000 sort keys
+  to keep ten — each key a copy of a 192-character string, 77 MB moved.
+  A boundary check already rejected a losing row before it was
+  PROJECTED; the keys survived it because they are what the comparison
+  needs. They are needed only when the comparison is close: eight bytes
+  decide it for nearly every row, and those bytes are already in the row.
+
+      before   17.548-18.303   1.85x
+      after    10.138-10.832   1.14x
+
+  Narrow on purpose — ASC, one term, no collation, and a STRICT loss on
+  the prefix. A tie decides nothing and takes the ordinary path.
+
+- **The spilled sort has the same rule, at the other entrance.** The
+  three changes above are the in-memory sort, and the release gate's one
+  remaining LOSS did not move for any of them: `SELECT pad FROM t ORDER
+  BY k, id` at 50,000 rows is 10 MB against a 4 MB `work_mem`, so it
+  SPILLS, and none of them run there. `ExternalSorter::sorted_order`
+  carried the same `stride == 1` rule the materialising sort had just
+  dropped, so a second key fell to a comparison sort over 48-byte keys —
+  12% of the working samples.
+
+      before   22.854-23.464
+      after    19.840-20.874
+
+  PostgreSQL spills too, external merge, 10.8 MB of temp, and answers in
+  19.360-36.225 on the same box. The cell was behind its fast mode and
+  is now level with it.
+
+### Fixed
+
+- **A spilled sort no longer reorders rows its in-memory self would
+  not.** A run holds rows that were all pushed before every row of the
+  next run, but the merge ordered two equal heads by nothing, and a
+  binary heap is not stable — so equal keys came back in whichever order
+  the heap happened to hold, while the same query answered in arrival
+  order when it fit in memory. The batch sort's own comment promises
+  arrival order for equal keys; it was true inside a batch and stopped
+  being true at the spill boundary. Found by a test written for the
+  change above, which failed with that change disabled too.
+
+- **The suite's own budget message named a cap it was not applying.**
+  Over the tier total it printed *exceeds the 150 s hard cap* whichever
+  band was in force, including the 600 s one. The number a gate reports
+  is the number someone will compare against.
+
+---
+
 ## [7.38.20] — 2026-08-25
 
 **v7.38.19 is a tag that never became a release.** Nothing was
