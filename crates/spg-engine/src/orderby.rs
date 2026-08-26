@@ -1577,7 +1577,7 @@ pub(crate) fn partial_sort_tagged(
 /// 308.9 ms to 107.6 ms. PostgreSQL sorts it on an abbreviated key: the
 /// first bytes packed into a machine word, compared inline, with the
 /// full string consulted only on a tie. This is that.
-fn inline_sort_key(k: &OrderKey) -> Option<(i128, bool, bool)> {
+pub(crate) fn inline_sort_key(k: &OrderKey) -> Option<(i128, bool, bool)> {
     match k {
         OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some((*n, true, true)),
         OrderKey::NullSmall => Some((i128::MIN, true, true)),
