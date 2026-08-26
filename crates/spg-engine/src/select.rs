@@ -8068,9 +8068,10 @@ impl Engine {
                 }
             }
             keys.clear();
-            // `&[]`: this sorter compares with `cmp_multi_key_in(.., &[])`
-            // (extsort.rs:213/543/1221), so the key must stay folded or the
-            // two would disagree. See `build_order_keys_bound`.
+            // The same collations the sorter compares with, and the
+            // re-derivation below is handed the same ones. `finish`'s
+            // contract is that a key comes back the way it was pushed;
+            // a collation is part of the way it was pushed.
             crate::orderby::build_order_keys_bound(
                 &order_by,
                 &order_bound,
@@ -8085,10 +8086,10 @@ impl Engine {
         let key_ctx = &ctx;
         let rows = sorter.finish(
             |src, buf| {
-                crate::orderby::build_order_keys_bound(
+                crate::orderby::build_order_keys_rederived(
                     &order_by,
                     &order_bound,
-                    &[],
+                    &order_colls,
                     src,
                     key_ctx,
                     buf,
@@ -9038,9 +9039,10 @@ impl Engine {
                 }
             }
             keys.clear();
-            // `&[]`: this sorter compares with `cmp_multi_key_in(.., &[])`
-            // (extsort.rs:213/543/1221), so the key must stay folded or the
-            // two would disagree. See `build_order_keys_bound`.
+            // The same collations the sorter compares with, and the
+            // re-derivation below is handed the same ones. `finish`'s
+            // contract is that a key comes back the way it was pushed;
+            // a collation is part of the way it was pushed.
             crate::orderby::build_order_keys_bound(
                 &order_by,
                 &order_bound,
@@ -9059,10 +9061,10 @@ impl Engine {
         let mut emitted_since_check = 0usize;
         let n = sorter.finish_each(
             |src, buf| {
-                crate::orderby::build_order_keys_bound(
+                crate::orderby::build_order_keys_rederived(
                     &order_by,
                     &order_bound,
-                    &[],
+                    &order_colls,
                     src,
                     key_ctx,
                     buf,
