@@ -121,6 +121,20 @@ the current build; this file is a release-organized view.
   like a clean measurement. Repaired, it immediately said something true:
   `SHOW lc_collate` is not a parameter SPG recognises.
 
+- **"Absent leaves `C`" stopped being true when the image got a `LANG`.**
+
+  `SPG_LC_COLLATE`'s row in `docs/SPG_TUNABLES.md` said that. It was
+  right until v7.38.22 put `LANG=en_US.utf8` in the image — the same
+  value `postgres:18` carries — and the sentence a customer reads to
+  answer "what do I get if I set nothing" has been wrong since.
+
+  Measured on the published image rather than reasoned about: with no
+  environment at all `datcollate` answers `en_US.utf8`; with
+  `SPG_LC_COLLATE=C` it answers `C`. The precedence the row now states —
+  `SPG_LC_COLLATE`, `LC_ALL`, `LC_COLLATE`, `LANG` — is the one
+  `main.rs` walks, read rather than copied from the row's own earlier
+  sentence.
+
 - **And then the collation costs nothing at all.**
 
   What was left after the fix above is `is_ascii_alnum_lower` — the test
