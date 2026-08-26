@@ -575,65 +575,56 @@ impl<'a> ExternalSorter<'a> {
         }
         let (keys, stride, descs) = (&self.keys, self.key_stride, self.descs);
         let collations = self.collations;
-        if stride == 1
-            && let Some(mut inline) = Self::inline_int_keys(keys)
-        {
-            // Stable, as the general sort is, so equal keys keep the
-            // order they arrived in.
+        // v7.38.22 — ONE inline path, and it takes text as well as
+        // integers.
+        //
+        // There were two: `stride == 1` with an exact integer key, and
+        // `stride >= 2` with an integer FIRST key and the later keys
+        // settling its runs. Neither took text, so a spilled
+        // `ORDER BY <text>` compared full strings on every comparison —
+        // and under a declared collation, that is a full ICU comparison
+        // every time.
+        //
+        // The panel could not see it until v7.38.22 added a cell for a
+        // text sort that RETURNS its rows, which is the shape that takes
+        // this sorter. It read 561.8 ms against 216.1 ms for the same
+        // query under `C` — **2.60x for declaring a collation** — while
+        // the materialising sort, which got the abbreviated key earlier
+        // in this version, read 1.30x for the same thing.
+        //
+        // Third time this release that a capability existed on one path
+        // and not its twin. The rule is `orderby::inline_sort_key`'s,
+        // shared, so the two cannot drift.
+        if let Some((mut inline, exact)) = Self::inline_first_keys(keys, stride, collations) {
             if descs.first().copied().unwrap_or(false) {
                 inline.sort_by_key(|p| core::cmp::Reverse(p.0));
             } else {
                 inline.sort_by_key(|p| p.0);
             }
-            for (slot, (_, i)) in order.iter_mut().zip(inline) {
-                *slot = i;
-            }
-            return order;
-        }
-        // v7.38.21 — the same rule the materialising sort dropped in this
-        // version, at the OTHER entrance to it.
-        //
-        // `stride == 1` above is where a single integer key skips the
-        // general comparator. A second ORDER BY term fell past it to a
-        // comparison sort over 48-byte keys, and the second term only
-        // decides ties in the first. Sorting on the first key leaves runs
-        // of equal first keys, and only a run longer than one needs the
-        // later keys at all -- on a first key that is a permutation, no
-        // run is.
-        //
-        // Found by profiling `SELECT pad FROM t ORDER BY k, id` at 50,000
-        // rows, which spills: the batch sorts and their comparators were
-        // 12% of the working samples, and the in-memory fix shipped
-        // earlier in this version could not reach them.
-        if stride >= 2
-            && let Some(mut inline) = Self::inline_first_keys(keys, stride)
-        {
-            if descs.first().copied().unwrap_or(false) {
-                inline.sort_by_key(|p| core::cmp::Reverse(p.0));
-            } else {
-                inline.sort_by_key(|p| p.0);
-            }
-            let mut lo = 0;
-            while lo < inline.len() {
-                let mut hi = lo + 1;
-                while hi < inline.len() && inline[hi].0 == inline[lo].0 {
-                    hi += 1;
+            // A prefix key decides only where it differs, so every run of
+            // equal keys still goes to the full comparator — the same
+            // pass a second ORDER BY key already needed. An exact key
+            // with one term needs neither.
+            if stride > 1 || !exact {
+                let mut lo = 0;
+                while lo < inline.len() {
+                    let mut hi = lo + 1;
+                    while hi < inline.len() && inline[hi].0 == inline[lo].0 {
+                        hi += 1;
+                    }
+                    if hi - lo > 1 {
+                        inline[lo..hi].sort_by(|&(_, a), &(_, b)| {
+                            let (a, b) = (a as usize * stride, b as usize * stride);
+                            cmp_multi_key_in(
+                                &keys[a..a + stride],
+                                &keys[b..b + stride],
+                                descs,
+                                collations,
+                            )
+                        });
+                    }
+                    lo = hi;
                 }
-                if hi - lo > 1 {
-                    // Stable, so a run the full comparator calls equal
-                    // keeps the order it was pushed in -- which is what
-                    // the general path below does with the same rows.
-                    inline[lo..hi].sort_by(|&(_, a), &(_, b)| {
-                        let (a, b) = (a as usize * stride, b as usize * stride);
-                        cmp_multi_key_in(
-                            &keys[a..a + stride],
-                            &keys[b..b + stride],
-                            descs,
-                            collations,
-                        )
-                    });
-                }
-                lo = hi;
             }
             for (slot, (_, i)) in order.iter_mut().zip(inline) {
                 *slot = i;
@@ -658,13 +649,42 @@ impl<'a> ExternalSorter<'a> {
     /// Only the first: the later keys stay `OrderKey`s and are compared
     /// by the general comparator inside a run, so a text or numeric
     /// second key costs this path nothing.
-    fn inline_first_keys(keys: &[OrderKey], stride: usize) -> Option<Vec<(i128, u32)>> {
+    fn inline_first_keys(
+        keys: &[OrderKey],
+        stride: usize,
+        collations: &[Option<crate::collate::Collated>],
+    ) -> Option<(Vec<(i128, u32)>, bool)> {
+        let collated = collations.iter().any(Option::is_some);
+        if collated
+            && !collations
+                .iter()
+                .flatten()
+                .all(crate::collate::Collated::ascii_byte_order)
+        {
+            return None;
+        }
         let rows = keys.len() / stride;
         let mut out: Vec<(i128, u32)> = Vec::with_capacity(rows);
+        let mut exact = true;
+        let (mut saw_int, mut saw_text) = (false, false);
         for i in 0..rows {
-            out.push((crate::orderby::inline_int_key(&keys[i * stride])?, i as u32));
+            let k = &keys[i * stride];
+            let (v, is_exact, byte_ordered) = crate::orderby::inline_sort_key(k)?;
+            if collated && !byte_ordered {
+                return None;
+            }
+            match k {
+                OrderKey::Text(_) => saw_text = true,
+                OrderKey::Int(_) => saw_int = true,
+                _ => {}
+            }
+            exact &= is_exact;
+            out.push((v, i as u32));
         }
-        Some(out)
+        if saw_int && saw_text {
+            return None;
+        }
+        Some((out, exact))
     }
 
     /// `(key, row index)` for one integer key per row, or `None` when
@@ -976,6 +996,23 @@ mod tests {
         match &src.values[0] {
             Value::Int(n) => {
                 out.push(OrderKey::Int(i128::from(*n)));
+                Ok(())
+            }
+            other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
+        }
+    }
+
+    /// v7.38.22 — the text key, re-derived from the row the way the
+    /// pusher derived it.
+    fn keys_of_text(src: &Row<'static>, out: &mut Vec<OrderKey>) -> Result<(), EngineError> {
+        match &src.values[0] {
+            Value::Int(n) => {
+                let i = *n;
+                out.push(OrderKey::Text(
+                    alloc::format!("PFX{}xxxx-{:04}", i % 5, (i * 7919) % 200)
+                        .as_str()
+                        .into(),
+                ));
                 Ok(())
             }
             other => Err(EngineError::Internal(alloc::format!("bad key: {other:?}"))),
@@ -1953,6 +1990,45 @@ mod tests {
             for descs in [[false, false], [false, true], [true, false], [true, true]] {
                 assert_order_matches(name, rows, &descs);
             }
+        }
+    }
+
+    /// v7.38.22 — a TEXT first key through the spilled sort, against the
+    /// order the general comparator gives the same rows.
+    ///
+    /// Eight bytes decide most pairs and decide nothing for the rest, so
+    /// the fixture is built to leave work for both: two hundred distinct
+    /// strings whose first eight bytes are one of five prefixes, and a
+    /// tail that orders them. A prefix that ordered a run wrongly, or a
+    /// run left unsettled, both show up as a disagreement.
+    #[test]
+    fn a_text_first_key_survives_the_spill() {
+        for descs in [[false], [true]] {
+            let mut want: Vec<(alloc::string::String, i32)> = (0..200i32)
+                .map(|i| {
+                    (
+                        alloc::format!("PFX{}xxxx-{:04}", i % 5, (i * 7919) % 200),
+                        i,
+                    )
+                })
+                .collect();
+            let mut s = ExternalSorter::new(Some(mem_run), 4096, record_cols(), &descs, &[]);
+            for (k, id) in &want {
+                let r = record(*id);
+                let mut keys = alloc::vec![OrderKey::Text(k.as_str().into())];
+                s.push(&mut keys, &r).unwrap();
+            }
+            assert!(s.spilled(), "{descs:?}: the point is the spilled path");
+            want.sort_by(|a, b| {
+                let c = a.0.cmp(&b.0);
+                if descs[0] { c.reverse() } else { c }.then(a.1.cmp(&b.1))
+            });
+            let out = s.finish(keys_of_text, project_identity).unwrap();
+            assert_eq!(
+                ids_of(&out, 0),
+                want.iter().map(|w| w.1).collect::<Vec<i32>>(),
+                "{descs:?}"
+            );
         }
     }
 

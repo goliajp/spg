@@ -356,9 +356,36 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
                  bash scripts/perf-endpoint-sweep.sh"
             ),
         );
+        // v7.38.22 — and a THIRD comparison, against PostgreSQL under the
+        // SAME locale.
+        //
+        // The sixty-four cells above compare `C` against `C`, which was
+        // the configuration this image shipped. It is not any more: the
+        // image now sets `LANG=en_US.utf8`, the same default
+        // `postgres:18` carries, so a new database on either side
+        // collates by locale. A panel that only compares byte order no
+        // longer measures what a customer runs.
+        //
+        // The same SPG leg, already up under `en_US.utf8`, against
+        // PostgreSQL's `bench` — which is `en_US.utf8`. No
+        // `ALLOW_COLLATION_MISMATCH` here: the two legs are supposed to
+        // agree, and the script's own check should say so if they stop.
+        let shipped_uri = format!("postgres://bench:bench@{host}:25432/bench");
+        let shipped = sh(
+            root,
+            &format!(
+                "PSQL='{psql}' PG_URI='{shipped_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
+                 EXPECT_SPG_COLLATE=en_US.utf8 bash scripts/perf-endpoint-sweep.sh"
+            ),
+        );
         roster2.reap_all();
         let _ = std::fs::remove_dir_all(&tmp2);
-        r
+        // Both verdicts travel; the caller grades them separately.
+        match (r, shipped) {
+            (Ok(a), Ok(b)) => Ok(format!("{a}\n===SHIPPED-DEFAULT===\n{b}")),
+            (Err(e), _) => Err(e),
+            (Ok(a), Err(e)) => Ok(format!("{a}\n===SHIPPED-DEFAULT===\nFAILED: {e}")),
+        }
     })();
     // D20 — the sweep leg's peak RSS goes into the account, and the
     // manifest ceiling has teeth at reap.
@@ -398,9 +425,19 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     // gate run went green on exactly that. The line is extracted from
     // either outcome now, and its ABSENCE is the failure: a script that
     // printed no summary never got far enough to have one.
-    let locale_text = match &locale_out {
+    let both = match &locale_out {
         Ok(t) => t.clone(),
         Err(e) => e.clone(),
+    };
+    // v7.38.22 — two panels arrive in one string, so grade them apart.
+    //
+    // `verdict_line` reads BACKWARDS for the last `cells=` line. With the
+    // shipped-default panel appended, that line belongs to the wrong
+    // panel, and the locale panel would be graded on someone else's
+    // numbers.
+    let (locale_text, shipped_text) = match both.split_once("===SHIPPED-DEFAULT===") {
+        Some((a, b)) => (a.to_string(), Some(b.to_string())),
+        None => (both.clone(), None),
     };
     let Some(locale_verdict) = verdict_line(&locale_text) else {
         return Err(format!(
@@ -433,8 +470,24 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
              changed the cost class against the same binary under `C`"
         ));
     }
+    // v7.38.22 — the shipped default REPORTS, it does not judge. Yet.
+    //
+    // The sixty-four cells compare `C` against `C`; the image now ships
+    // `LANG=en_US.utf8`, so that is no longer the configuration a
+    // customer runs. This panel is the one that is: SPG under the
+    // locale, against PostgreSQL under the same locale.
+    //
+    // No bar on it in the release that introduces it. The locale panel
+    // was introduced the same way, and the reason is the same — a bar
+    // set before the distribution is known is a bar that flaps, and a
+    // flapping gate teaches the reader to skip the line.
+    let shipped_note = shipped_text
+        .as_deref()
+        .and_then(verdict_line)
+        .unwrap_or_else(|| "(no verdict line — see the step's output)".to_string());
     Ok(format!(
-        "{verdict}; locale panel {locale_verdict}; peak rss: {}",
+        "{verdict}; locale panel {locale_verdict}; shipped-default panel \
+         (SPG en_US vs PG18 en_US, reported not judged) {shipped_note}; peak rss: {}",
         peak_note.join(", ")
     ))
 }
