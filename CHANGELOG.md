@@ -96,6 +96,39 @@ the current build; this file is a release-organized view.
   v7.38.18 regression that cost twenty-six times. A bar set for 26x does
   not stop 2.70x.
 
+- **The locale panel's sort ceiling is 2.0x, and both sides of it were
+  measured.**
+
+  It was 3.0x, chosen to catch a v7.38.18 regression that cost
+  twenty-six times. This release's defect measured 3.07x and 3.09x on
+  the panel's own instrument and 2.89x-2.91x with spreads to 3.15 on a
+  second one: the old bar ran through the MIDDLE of the defect's spread,
+  so catching it was a coin toss rather than a gate.
+
+      shipped (7896408a)   SWEEP_EXIT=1  sort_worst=3.09x  over_ceiling=2
+      fixed   (fd2e3501)   SWEEP_EXIT=0  sort_worst=1.44x  over_ceiling=0
+
+  Four further runs of the fixed build whose own control did not fire
+  read 1.27x, 1.30x, 1.35x, 1.44x. Worst trustworthy green 1.44, bar 2.0,
+  defect 3.07. Only the locale panel moves; the PostgreSQL panel keeps
+  3.0x, because a text sort may legitimately cost a multiple against
+  another engine while a binary against ITSELF under a collation that
+  orders the data exactly as bytes do should cost almost nothing.
+
+- **Seven of the sort panel's nine cells never spill.**
+
+  Measured with `temp_files` as the witness, one cell at a time: every
+  `sort only, …` cell — all seven of them, each a `count(*)` over a
+  sorted subquery — moves the counter by zero. Only the two
+  row-returning cells spill, by 230 files each.
+
+  A `count(*)` wrapper takes a different plan, and the plan it takes is
+  the materialising sort. So the panel that exists to isolate sort cost
+  measures the OTHER sort in seven of nine cells, and this release's
+  defect lived entirely in the spilling one. The loose ceiling is only
+  half of why it passed; the other half is that the panel's sampling
+  barely reaches the path at all.
+
 - **Which releases this costs, taken from the images rather than from
   the source.**
 

@@ -353,6 +353,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
             &format!(
                 "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
                  EXPECT_SPG_COLLATE=en_US.utf8 ALLOW_COLLATION_MISMATCH=1 \
+                 SORT_CEILING=2.0 \
                  bash scripts/perf-endpoint-sweep.sh"
             ),
         );
@@ -446,6 +447,32 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
             locale_text.lines().take(6).collect::<Vec<_>>().join(" / ")
         ));
     };
+    // v7.38.23 — 2.0x for the sort half here, where the PG18 panel keeps
+    // 3.0x. The two panels ask different questions and the bar follows
+    // the question: against PostgreSQL a text sort may legitimately cost
+    // a multiple, but a binary against ITSELF under a collation that
+    // orders the data exactly as bytes do should cost almost nothing.
+    //
+    // 3.0x was chosen to catch the v7.38.18 regression that cost
+    // twenty-six times, and a bar set for 26x does not stop 2.7x: this
+    // release's defect measured 2.89x and 2.91x on the two row-returning
+    // cells and passed. Worse, their spreads reached 3.08 and 3.15, so
+    // the old bar would have flapped on it rather than caught it.
+    //
+    // Both sides of 2.0 are measured, one instrument, twelve pairs a
+    // cell, each build named by md5:
+    //
+    //   shipped (f9530767)   2.89x (2.67-3.08)   2.91x (2.84-3.15)   RED
+    //   fixed   (fd2e3501)   1.13x               1.25x               green
+    //
+    // and the fixed build's `sort_worst` across four runs whose own
+    // control did not fire reads 1.27x, 1.30x, 1.35x, 1.44x. A run where
+    // `control_false_differences` is non-zero is the same binary
+    // separating from ITSELF, which this step already refuses to grade;
+    // one such run read 1.96x and is not a verdict.
+    //
+    // Worst trustworthy green 1.44x, bar 2.0x, defect 3.07x. Margin on
+    // both sides, which is the whole point of choosing it from data.
     // v7.38.19 — the panel is judged on its COST CLASS, which is the
     // question it says it asks, and not on whether any cell separated.
     //
