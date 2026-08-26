@@ -510,6 +510,12 @@ else
 fi
 
 FIXTURE_REPORT=""
+if [ "${#FIXTURES[@]}" -eq 0 ]; then
+  # Say so. The panel is optional, and an optional panel that is silent
+  # when absent is how a 71 turns into a 69 with nothing to point at.
+  echo ""
+  echo "=== Fixture panel === none requested (no --fixture); the count below excludes it"
+fi
 if [ "${#FIXTURES[@]}" -gt 0 ]; then
   echo ""
   echo "=== Fixture panel ==="
@@ -567,7 +573,18 @@ TOTAL=$((PASS_COUNT + FAIL_COUNT))
   echo "## Reproducer"
   echo ""
   echo "\`\`\`bash"
-  echo "scripts/dropin-acceptance.sh --image $IMAGE --port $PORT"
+  # The fixtures too, or this line does not reproduce the run it heads.
+  #
+  # v7.38.23 — it printed only --image and --port, and the fixture panel
+  # exists only when --fixture is passed. Following the line as printed
+  # scored 69 where the run it describes scored 71, and the two missing
+  # cases were the two mailrs fixtures. A reproducer that quietly drops
+  # two cases reads as a discrepancy in the PRODUCT.
+  printf 'scripts/dropin-acceptance.sh --image %s --port %s' "$IMAGE" "$PORT"
+  for f in "${FIXTURES[@]:-}"; do
+    [ -n "$f" ] && printf ' \\\n  --fixture %s' "$f"
+  done
+  echo ""
   echo "\`\`\`"
 } > "$REPORT"
 

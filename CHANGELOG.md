@@ -134,6 +134,25 @@ the current build; this file is a release-organized view.
   another engine while a binary against ITSELF under a collation that
   orders the data exactly as bytes do should cost almost nothing.
 
+- **The drop-in report's reproducer did not reproduce the run it heads.**
+
+  It printed `--image` and `--port` and nothing else, while the fixture
+  panel exists only when `--fixture` is passed. Following the line as
+  printed scored 69 where the run it describes scored 71, and the two
+  missing cases were the two mailrs fixtures — dropped silently, because
+  a fixture panel with nothing in it prints nothing at all.
+
+  That is how a harness discrepancy reads as a PRODUCT discrepancy: the
+  first thing it looked like was two acceptance cases that stopped
+  passing when the image started collating by locale. It was neither the
+  image nor the code; it was the reproducer.
+
+  The reproducer now carries every `--fixture` it ran with, and a run
+  with none says so above the count. Verified both ways against
+  `goliakk/spg:7.38.22`: 69 with the line as it used to print, 71 with
+  the line as it prints now. The 71/71 in the pending customer notes is
+  the correct number for that image.
+
 - **Seven of the sort panel's nine cells never spill.**
 
   Measured with `temp_files` as the witness, one cell at a time: every
