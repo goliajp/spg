@@ -10,6 +10,34 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Findings
+
+- **The streaming sorted-spill path costs more than the path it
+  replaces, on a text key — and buys nothing at all under a collation.**
+
+  A panel cell added for a text sort that RETURNS its rows read 2.5x for
+  declaring a collation, where the same sort under a `count(*)` wrapper
+  reads 1.25x. Ruled out one at a time: not spill volume (both legs
+  write exactly 23 files and 79,600,000 bytes), not the send (equal
+  without an ORDER BY), not an integer key (equal), and not ICU — read
+  by INCLUSIVE call-tree time rather than leaves, the merge is 5.9%
+  against 4.9% and every symbol containing `collate` is **0.0%**.
+
+  An ablation answered it. With `try_spill_sorted_stream` disabled, both
+  legs fall back to the materialising path:
+
+      sort text + send      streaming ON      streaming OFF
+      C                        247.7 ms          186.3 ms
+      en_US.utf8               598.0 ms          224.2 ms
+
+  It exists to bound peak memory, and that half is measured too: on `C`
+  it spends 61 ms to save 73 MB of peak RSS. Under a declared collation
+  it spends 374 ms to save **nothing** — 49 MB against 48.
+
+  Recorded, not acted on: the question this raises is not the one the
+  earlier hypothesis in this file asked, and the fix has to answer why
+  the path is slower on a text key before deciding whether to take it.
+
 ### Instruments
 
 - **The ten full-tier steps were run, once each.** The tier says it on
