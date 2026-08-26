@@ -34,43 +34,6 @@ the current build; this file is a release-organized view.
   prefixes, so both halves of the key have work to do; removing the
   run-settling pass reddens it.
 
-- **A third panel, and it is the one a customer runs.**
-
-  The sixty-four endpoint cells compare `C` against `C`. That was the
-  configuration the image shipped until v7.38.22 put `LANG=en_US.utf8`
-  in it, and a panel that only compares byte order stopped measuring
-  what a new database does. The `perf-sweep` step now runs a third
-  comparison after the other two: the same SPG leg already up under
-  `en_US.utf8`, against PostgreSQL 18.4's `bench`, which is `en_US.utf8`
-  as well. No `ALLOW_COLLATION_MISMATCH` on this one — the two legs are
-  supposed to agree, and the script's own check says so if they stop.
-
-  It **reports, it does not judge**, in the release that introduces it,
-  for the reason the locale panel was introduced the same way: a bar set
-  before the distribution is known is a bar that flaps. On this
-  release's tier run it reads `cells=16 losses=0
-  control_false_differences=0 sort_worst=1.54x`.
-
-  Grading them apart took care the first version did not have:
-  `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
-  second panel appended the locale panel would have been graded on
-  someone else's numbers.
-
-- **The panel can see a text sort that returns its rows.**
-
-  Both panels reported no losses on a shape that loses. Every cell in
-  the endpoint panel sorted by an INT; every cell in the sort panel
-  wrapped its sort in `count(*)`, which takes the materialising plan. No
-  cell anywhere sorted TEXT on the path a plain `SELECT … ORDER BY`
-  takes — the streaming one, which is the one a customer's query uses.
-
-      text key, rows returned        213.5-218.1 ms  vs PG 166.4-202.0   1.28x
-      text key desc, rows returned   220.7-227.4 ms  vs PG 161.8-206.6   1.36x
-
-  Those two cells are what caught everything else in this release. See
-  also the finding below: seven of the sort panel's nine cells still
-  never spill, because a `count(*)` wrapper is still what they are.
-
 - **The spilling sort re-derived its keys, and the half that re-derived
   them was passed no collation at all.**
 
@@ -480,6 +443,43 @@ the current build; this file is a release-organized view.
   sort. Nothing was skipped.
 
 ### Instruments
+
+- **A third panel, and it is the one a customer runs.**
+
+  The sixty-four endpoint cells compare `C` against `C`. That was the
+  configuration the image shipped until v7.38.22 put `LANG=en_US.utf8`
+  in it, and a panel that only compares byte order stopped measuring
+  what a new database does. The `perf-sweep` step now runs a third
+  comparison after the other two: the same SPG leg already up under
+  `en_US.utf8`, against PostgreSQL 18.4's `bench`, which is `en_US.utf8`
+  as well. No `ALLOW_COLLATION_MISMATCH` on this one — the two legs are
+  supposed to agree, and the script's own check says so if they stop.
+
+  It **reports, it does not judge**, in the release that introduces it,
+  for the reason the locale panel was introduced the same way: a bar set
+  before the distribution is known is a bar that flaps. On this
+  release's tier run it reads `cells=16 losses=0
+  control_false_differences=0 sort_worst=1.54x`.
+
+  Grading them apart took care the first version did not have:
+  `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
+  second panel appended the locale panel would have been graded on
+  someone else's numbers.
+
+- **The panel can see a text sort that returns its rows.**
+
+  Both panels reported no losses on a shape that loses. Every cell in
+  the endpoint panel sorted by an INT; every cell in the sort panel
+  wrapped its sort in `count(*)`, which takes the materialising plan. No
+  cell anywhere sorted TEXT on the path a plain `SELECT … ORDER BY`
+  takes — the streaming one, which is the one a customer's query uses.
+
+      text key, rows returned        213.5-218.1 ms  vs PG 166.4-202.0   1.28x
+      text key desc, rows returned   220.7-227.4 ms  vs PG 161.8-206.6   1.36x
+
+  Those two cells are what caught everything else in this release. See
+  also the finding below: seven of the sort panel's nine cells still
+  never spill, because a `count(*)` wrapper is still what they are.
 
 - **The ten full-tier steps were run, once each.** The tier says it on
   every run — *NOT RUN (10 full-tier step(s), no schedule runs these)* —
