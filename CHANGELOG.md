@@ -75,6 +75,10 @@ the current build; this file is a release-organized view.
   overlaps neither: the second half is not a refinement of the first, it
   is the condition on shipping it.
 
+  **This table stops one row short of what ships.** A fourth change —
+  the entry below — takes the lowercase column to **0.99x**, and the
+  release notes for this fix are only complete read together with it.
+
   Three numbers appear in this release for the same defect — 2.70x above,
   2.91x here, 3.07x where the ceiling is discussed — and they are three
   instruments, not a disagreement. 2.70x is two servers timed in
