@@ -66,6 +66,32 @@ sort cells. 7.38.22 measures 3.09x on it and fails; this release
 measures 1.08x and 1.32x across two runs whose own control did not
 fire.
 
+## Against PostgreSQL, on the configuration you now run
+
+Our panel compares us against PostgreSQL 18.4 with **both sides under
+`en_US.utf8`** — which is what our image ships since 7.38.22 and what
+`postgres:18` has always shipped. On 400,000 rows:
+
+    text key, rows returned        us 170.8-174.4 ms   PG18 301.6-321.1   0.57x
+    text key desc, rows returned   us 172.2-175.4      PG18 293.8-406.8   0.59x
+
+**About twice as fast**, on the shape this release was about. The worst
+cell in that panel reads 1.15x, against 1.54x before the last of the
+three changes.
+
+One of those three is worth naming on its own, because it is not the
+collation at all: our spilling sorter's short-cut key was integer-only,
+so a spilled sort on a TEXT column compared whole strings on every
+comparison while the sort next door compared eight bytes. Measured with
+two binaries built from either side of that change, alternating, both
+spilling identically:
+
+    before   242.1 ms   (234.3-255.2)
+    after    202.5      (193.1-203.7)     0.806x
+
+19% on that shape, and it applies whether or not a collation is
+declared.
+
 ## What we are not claiming
 
 The timings are ours, on our testbed, 400,000 rows, `work_mem = 4MB`.
