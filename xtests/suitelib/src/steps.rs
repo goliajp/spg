@@ -515,9 +515,18 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     // shapes half is held to the same bar, and `sort_over_ceiling`
     // stays part of the verdict rather than being folded away.
     if !locale_panel_passes(&locale_verdict) {
+        // v7.38.23 — carry the other panel into the failure.
+        //
+        // The shipped-default sweep has already RUN by this point — ten
+        // minutes of the machine — and returning here threw its numbers
+        // away. A step that fails is exactly when a reader wants every
+        // number the run produced, and the second panel is the one that
+        // measures the configuration a customer runs.
         return Err(format!(
             "locale-collation panel: {locale_verdict} — a declared collation \
-             changed the cost class against the same binary under `C`"
+             changed the cost class against the same binary under `C`; \
+             shipped-default panel said: {}",
+            verdict_or_first_line(shipped_text.as_deref())
         ));
     }
     // v7.38.22 — the shipped default REPORTS, it does not judge. Yet.
