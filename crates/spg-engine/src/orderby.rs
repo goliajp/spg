@@ -1553,6 +1553,40 @@ pub(crate) fn partial_sort_tagged(
 /// keys may travel as a bare integer" is how they would come to disagree,
 /// and disagreeing would mean the same ORDER BY answering differently
 /// depending on which path a query took.
+/// v7.38.22 — the same idea as [`inline_int_key`], widened to TEXT.
+///
+/// Returns the `i128` a key travels as, and whether that value is the
+/// whole key or only its first eight bytes.
+///
+/// An integer's value is exact and settles the order by itself. Text
+/// gives its leading eight bytes big-endian, which orders the same way
+/// the string does but only DECIDES when the two differ inside them —
+/// so an inexact key leaves runs of equal keys that the full comparator
+/// has to settle, exactly as a second ORDER BY key does.
+///
+/// The NULL sentinels bracket both: `i128::MIN` and `i128::MAX` sit
+/// outside `[0, 2^64)`, where every text prefix lands, and outside the
+/// 64-bit-and-narrower range every integer key lands in.
+///
+/// Why it is worth having: `ORDER BY s_long` over 400,000 distinct
+/// 192-character strings, projecting a different column so the key
+/// cannot be read off the output, profiles at 41% of its working
+/// samples in comparison — `cmp_multi_key_in` 17%, `CompactText::cmp`
+/// 14%, `order_key_elem_cmp` 4%, `memcmp` 6% — plus 22% in the sort
+/// machinery around them. Against PostgreSQL 18.4 that shape measured
+/// 308.9 ms to 107.6 ms. PostgreSQL sorts it on an abbreviated key: the
+/// first bytes packed into a machine word, compared inline, with the
+/// full string consulted only on a tie. This is that.
+fn inline_sort_key(k: &OrderKey) -> Option<(i128, bool)> {
+    match k {
+        OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some((*n, true)),
+        OrderKey::NullSmall => Some((i128::MIN, true)),
+        OrderKey::NullBig => Some((i128::MAX, true)),
+        OrderKey::Text(t) => Some((i128::from(text_prefix(t.as_str().as_bytes()).0), false)),
+        _ => None,
+    }
+}
+
 pub(crate) fn inline_int_key(k: &OrderKey) -> Option<i128> {
     match k {
         OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some(*n),
@@ -1638,12 +1672,38 @@ fn sort_tagged_by_inline_int_key(
     if tagged.iter().any(|(k, _)| k.is_empty()) {
         return false;
     }
+    // v7.38.22 — a collation makes the byte prefix the wrong question,
+    // and this path has no way to ask the right one. The general
+    // comparator does; leave it to it.
+    if collations.iter().any(Option::is_some) {
+        return false;
+    }
     let mut order: Vec<(i128, u32)> = Vec::with_capacity(tagged.len());
+    // v7.38.22 — a TEXT first key travels as its leading eight bytes, so
+    // the sorted order is only a starting point: every run of equal keys
+    // still has to be settled by the full comparator. `exact` says which
+    // it is. Mixing the two — an integer key on one row and text on
+    // another — would compare a value against a prefix, so a batch that
+    // does that takes the general path.
+    let mut exact = true;
+    let mut saw_int = false;
+    let mut saw_text = false;
     for (i, (keys, _)) in tagged.iter().enumerate() {
-        match inline_int_key(&keys[0]) {
-            Some(v) => order.push((v, i as u32)),
+        match inline_sort_key(&keys[0]) {
+            Some((v, is_exact)) => {
+                match &keys[0] {
+                    OrderKey::Text(_) => saw_text = true,
+                    OrderKey::Int(_) => saw_int = true,
+                    _ => {}
+                }
+                exact &= is_exact;
+                order.push((v, i as u32));
+            }
             None => return false,
         }
+    }
+    if saw_int && saw_text {
+        return false;
     }
     // Stable, as `sort_by` is: equal keys keep the order they arrived in,
     // which is the order the scan produced and what DISTINCT's
@@ -1653,10 +1713,14 @@ fn sort_tagged_by_inline_int_key(
     } else {
         order.sort_by_key(|p| (p.0, p.1));
     }
-    if multi {
+    if multi || !exact {
         // Settle each run of equal first keys with the full comparator,
         // which reads every key including this one. A run of one — the
         // whole of `two keys` — is already placed.
+        //
+        // v7.38.22 — `!exact` brings the text prefix here: eight equal
+        // bytes are not an equal string, so those runs are exactly the
+        // comparisons the prefix could not decide, and no others.
         let mut lo = 0;
         while lo < order.len() {
             let mut hi = lo + 1;
@@ -2656,6 +2720,178 @@ mod inline_int_key_sort_tests {
         let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
         let want: Vec<i32> = general.iter().map(|(_, r)| tag_of(r)).collect();
         assert_eq!(got, want, "{name} (desc={descs:?})");
+    }
+
+    /// v7.38.22 — the same agreement, for the TEXT prefix key.
+    ///
+    /// The prefix decides only when two keys differ inside their first
+    /// eight bytes; everything else is a run the full comparator has to
+    /// settle. These cases are chosen so that each of those two halves
+    /// is exercised by something, and the reference is the general
+    /// comparator, as above.
+    #[test]
+    fn the_text_prefix_path_agrees_with_the_general_comparator() {
+        let t = |x: &str| vec![OrderKey::Text(x.into())];
+
+        // Decided inside the first eight bytes.
+        let early: Vec<Vec<OrderKey>> = vec![t("delta"), t("alpha"), t("charlie"), t("bravo")];
+
+        // NOT decided there: nine identical leading bytes, and the ninth
+        // character onward is the only thing that orders them. Without
+        // the run-settling this comes back in input order.
+        let late: Vec<Vec<OrderKey>> = vec![
+            t("SHAREDPX_zulu"),
+            t("SHAREDPX_alpha"),
+            t("SHAREDPX_mike"),
+            t("SHAREDPX_alpha"),
+        ];
+
+        // Shorter than the prefix, including the empty string: the key
+        // zero-pads, and `""` must still sort first.
+        let short: Vec<Vec<OrderKey>> = vec![t("zz"), t(""), t("a"), t("ab"), t("")];
+
+        // Text beside the NULL sentinels, which bracket every prefix.
+        let with_nulls: Vec<Vec<OrderKey>> = vec![
+            t("m"),
+            vec![OrderKey::NullBig],
+            t("a"),
+            vec![OrderKey::NullSmall],
+            t("m"),
+        ];
+
+        // A second key, which only the ties in the first can need.
+        let two: Vec<Vec<OrderKey>> = vec![
+            vec![OrderKey::Text("SHAREDPX_a".into()), OrderKey::Int(9)],
+            vec![OrderKey::Text("SHAREDPX_a".into()), OrderKey::Int(2)],
+            vec![OrderKey::Text("b".into()), OrderKey::Int(5)],
+            vec![OrderKey::Text("SHAREDPX_a".into()), OrderKey::Int(2)],
+        ];
+
+        // Declined: an integer key on one row and text on another would
+        // compare a value against a prefix.
+        let mixed: Vec<Vec<OrderKey>> = vec![t("b"), vec![OrderKey::Int(3)], t("a")];
+
+        // Declined: not a key this path reads at all.
+        let nums: Vec<Vec<OrderKey>> = vec![vec![OrderKey::Num(2.5)], vec![OrderKey::Num(1.5)]];
+
+        for (name, rows) in [
+            ("decided in the prefix", &early),
+            ("decided after the prefix", &late),
+            ("shorter than the prefix", &short),
+            ("text among the null sentinels", &with_nulls),
+            ("a second key under a tied prefix", &two),
+            ("int and text in one batch", &mixed),
+            ("numeric keys", &nums),
+        ] {
+            let n = rows[0].len();
+            assert_agrees(name, rows, &vec![false; n]);
+            assert_agrees(name, rows, &vec![true; n]);
+        }
+        assert_agrees("two keys, second descending", &two, &[false, true]);
+    }
+
+    /// v7.38.22 — the same agreement, now that a TEXT first key travels
+    /// as its leading eight bytes.
+    ///
+    /// A prefix DECIDES only when it differs, so every case here is
+    /// chosen for what it leaves undecided: strings that share those
+    /// eight bytes, strings shorter than eight, and a second key that
+    /// has to settle what the first could not. The reference is the
+    /// general comparator, so a prefix that ordered anything wrongly
+    /// shows up as a disagreement rather than as a plausible order.
+    #[test]
+    fn a_text_prefix_key_agrees_with_the_general_comparator() {
+        let t = |s: &str| vec![OrderKey::Text(s.into())];
+
+        // Decided inside the first eight bytes.
+        let distinct: Vec<Vec<OrderKey>> =
+            vec![t("pear"), t("apple"), t("zebra"), t("banana"), t("apple")];
+        // Eight bytes identical, and only the tail orders them. Without
+        // the run-settling pass these come back in input order.
+        let shared: Vec<Vec<OrderKey>> = vec![
+            t("SHAREDPX-zzz"),
+            t("SHAREDPX-aaa"),
+            t("SHAREDPX-mmm"),
+            t("SHAREDPX-aaa"),
+        ];
+        // Shorter than the prefix: the zero padding has to order a short
+        // string before a longer one that starts with it.
+        let short: Vec<Vec<OrderKey>> = vec![t("ab"), t("abc"), t(""), t("a"), t("ab")];
+        // NULLs bracket text the way they bracket integers.
+        let with_nulls: Vec<Vec<OrderKey>> = vec![
+            t("m"),
+            vec![OrderKey::NullBig],
+            t("a"),
+            vec![OrderKey::NullSmall],
+            t("m"),
+        ];
+        // Mixed integer and text first keys: a value against a prefix is
+        // not a comparison, so this must decline and still agree.
+        // The values are chosen to DISAGREE if the two kinds were ever
+        // compared as numbers: a finite integer sorts before text
+        // whatever its value, while `Int(i64::MAX)` is 9.22e18 and the
+        // prefix of `"a"` is 6.99e18. Written with `Int(5)` first, this
+        // case passed with the guard removed and pinned nothing.
+        let mixed: Vec<Vec<OrderKey>> = vec![
+            vec![OrderKey::Int(i128::from(i64::MAX))],
+            t("a"),
+            vec![OrderKey::Int(5)],
+            t("apple"),
+            vec![OrderKey::Int(1)],
+        ];
+        // A second key, which only matters where the first ties.
+        let two: Vec<Vec<OrderKey>> = vec![
+            vec![OrderKey::Text("SHAREDPX".into()), OrderKey::Int(9)],
+            vec![OrderKey::Text("SHAREDPX".into()), OrderKey::Int(2)],
+            vec![OrderKey::Text("aaa".into()), OrderKey::Int(5)],
+            vec![OrderKey::Text("SHAREDPX".into()), OrderKey::Int(2)],
+        ];
+
+        for (name, rows) in [
+            ("distinct inside the prefix", &distinct),
+            ("eight bytes shared", &shared),
+            ("shorter than the prefix", &short),
+            ("null sentinels", &with_nulls),
+            ("mixed int and text", &mixed),
+        ] {
+            assert_agrees(name, rows, &[false]);
+            assert_agrees(name, rows, &[true]);
+        }
+        assert_agrees("text then int", &two, &[false, false]);
+        assert_agrees("text then int, second desc", &two, &[false, true]);
+        assert_agrees("text desc then int", &two, &[true, false]);
+    }
+
+    /// A collation makes the byte prefix the wrong question, so the fast
+    /// path must decline rather than answer it with bytes.
+    ///
+    /// `'apple' < 'Banana'` is true under `en_US.utf8` and false under
+    /// `C` — measured on PostgreSQL 18.4 — so this is a case where the
+    /// two answers genuinely differ.
+    #[test]
+    fn a_collation_sends_the_sort_to_the_general_comparator() {
+        let Some(collated) = crate::collate::Collated::resolve("en_US.utf8") else {
+            // A build without that collation cannot ask the question.
+            return;
+        };
+        let colls = vec![Some(collated)];
+        let keys: Vec<Vec<OrderKey>> = vec![
+            vec![OrderKey::Text("Banana".into())],
+            vec![OrderKey::Text("apple".into())],
+            vec![OrderKey::Text("Cherry".into())],
+        ];
+        let build = || -> Vec<(Vec<OrderKey>, Row<'static>)> {
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), row(i as i32)))
+                .collect()
+        };
+        let mut fast = build();
+        partial_sort_tagged_in(&mut fast, None, &[false], &colls);
+        let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
+        // 1 = apple, 0 = Banana, 2 = Cherry under en_US; byte order would
+        // put the two capitals first.
+        assert_eq!(got, vec![1, 0, 2], "the collation has to decide this");
     }
 
     #[test]
