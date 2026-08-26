@@ -1577,12 +1577,15 @@ pub(crate) fn partial_sort_tagged(
 /// 308.9 ms to 107.6 ms. PostgreSQL sorts it on an abbreviated key: the
 /// first bytes packed into a machine word, compared inline, with the
 /// full string consulted only on a tie. This is that.
-fn inline_sort_key(k: &OrderKey) -> Option<(i128, bool)> {
+fn inline_sort_key(k: &OrderKey) -> Option<(i128, bool, bool)> {
     match k {
-        OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some((*n, true)),
-        OrderKey::NullSmall => Some((i128::MIN, true)),
-        OrderKey::NullBig => Some((i128::MAX, true)),
-        OrderKey::Text(t) => Some((i128::from(text_prefix(t.as_str().as_bytes()).0), false)),
+        OrderKey::Int(n) if *n != i128::MIN && *n != i128::MAX => Some((*n, true, true)),
+        OrderKey::NullSmall => Some((i128::MIN, true, true)),
+        OrderKey::NullBig => Some((i128::MAX, true, true)),
+        OrderKey::Text(t) => {
+            let (prefix, byte_ordered) = text_prefix(t.as_str().as_bytes());
+            Some((i128::from(prefix), false, byte_ordered))
+        }
         _ => None,
     }
 }
@@ -1672,10 +1675,30 @@ fn sort_tagged_by_inline_int_key(
     if tagged.iter().any(|(k, _)| k.is_empty()) {
         return false;
     }
-    // v7.38.22 — a collation makes the byte prefix the wrong question,
-    // and this path has no way to ask the right one. The general
-    // comparator does; leave it to it.
-    if collations.iter().any(Option::is_some) {
+    // v7.38.22 — a collation makes the byte prefix the wrong question
+    // unless it is one of the collations that ORDER by bytes.
+    //
+    // Which those are is `Collated::ascii_byte_order`'s to say, the same
+    // allowlist the top-N boundary gate and the batch sort consult, and
+    // what it requires of the text is checked per key below. Two equal
+    // prefixes still go to the full comparator, and that one is
+    // collation-aware, so this decides only the pairs that differ inside
+    // eight bytes of `[0-9a-z]` — where the collation and the bytes
+    // agree by construction.
+    //
+    // Turning it off wholesale was the first version, and the release
+    // panel priced it: making `C` fast while the collated leg kept the
+    // old path put `sort only, long text, key not projected` at 3.14x
+    // against the same binary under `C`, over the panel's 3.0x ceiling.
+    // A cost class that appears only when a collation is declared is
+    // what that panel exists to refuse.
+    let collated = collations.iter().any(Option::is_some);
+    if collated
+        && !collations
+            .iter()
+            .flatten()
+            .all(crate::collate::Collated::ascii_byte_order)
+    {
         return false;
     }
     let mut order: Vec<(i128, u32)> = Vec::with_capacity(tagged.len());
@@ -1690,7 +1713,10 @@ fn sort_tagged_by_inline_int_key(
     let mut saw_text = false;
     for (i, (keys, _)) in tagged.iter().enumerate() {
         match inline_sort_key(&keys[0]) {
-            Some((v, is_exact)) => {
+            Some((v, is_exact, byte_ordered)) => {
+                if collated && !byte_ordered {
+                    return false;
+                }
                 match &keys[0] {
                     OrderKey::Text(_) => saw_text = true,
                     OrderKey::Int(_) => saw_int = true,
@@ -2860,6 +2886,46 @@ mod inline_int_key_sort_tests {
         assert_agrees("text then int", &two, &[false, false]);
         assert_agrees("text then int, second desc", &two, &[false, true]);
         assert_agrees("text desc then int", &two, &[true, false]);
+    }
+
+    /// And where the collation DOES order by bytes, it takes the fast
+    /// path and still answers what the collation says.
+    ///
+    /// `en_US.utf8` orders `[0-9a-z]` by byte — that is what
+    /// `ascii_byte_order` asserts, exhaustively — so lowercase
+    /// alphanumeric text is a case where the prefix and the collation
+    /// cannot disagree. Declining here anyway is what put
+    /// `sort only, long text, key not projected` at 3.14x against the
+    /// same binary under `C`, past the release panel's ceiling.
+    #[test]
+    fn a_byte_ordering_collation_still_gets_the_prefix_key() {
+        let Some(collated) = crate::collate::Collated::resolve("en_US.utf8") else {
+            return;
+        };
+        let colls = vec![Some(collated)];
+        let t = |s: &str| vec![OrderKey::Text(s.into())];
+        // All `[0-9a-z]`, and two of them share their first eight bytes
+        // so the run-settling pass has to run under the collation too.
+        let keys: Vec<Vec<OrderKey>> = vec![
+            t("sharedpx9"),
+            t("apple"),
+            t("sharedpx1"),
+            t("zebra"),
+            t("apple"),
+        ];
+        let build = || -> Vec<(Vec<OrderKey>, Row<'static>)> {
+            keys.iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), row(i as i32)))
+                .collect()
+        };
+        let mut fast = build();
+        partial_sort_tagged_in(&mut fast, None, &[false], &colls);
+        let mut general = build();
+        general.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, &[false], &colls));
+        let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
+        let want: Vec<i32> = general.iter().map(|(_, r)| tag_of(r)).collect();
+        assert_eq!(got, want, "the collated order, reached through the prefix");
     }
 
     /// A collation makes the byte prefix the wrong question, so the fast
