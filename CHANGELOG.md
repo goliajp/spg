@@ -8,7 +8,24 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.38.23] — 2026-08-27
+## [7.38.24] — 2026-08-27
+
+**v7.38.23 was tagged and never released.** Its train stopped at
+`gate.sh lint`, and the triage ended in a fix — to a gate — which
+belongs in a version rather than being waved past with `SKIP_FULL`. The
+tag stays where it is; pushed tags are not rewritten here. Everything
+below was written for 7.38.23 and ships as 7.38.24, plus the entry
+directly beneath this line.
+
+- **precommit's clippy did not lint test code; the release gate does.**
+  `clippy-affected` ran `cargo clippy -q -p … -- -D warnings` and
+  `gate.sh lint` runs `--workspace --all-targets --locked`. Without
+  `--all-targets` the first covers lib and bins only, so every test
+  written here passed the gate that runs on each commit and could fail
+  only at the release — the one place a failure costs a version. It
+  did, over a `repeat().take()` in a test added the same day.
+  `clippy-affected` takes `--all-targets` now.
+
 
 The bill v7.38.22's own fix sent, and paying it. Declaring a collation
 cost 2.36x on the image's own default, with nothing declared on the
