@@ -508,10 +508,33 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     // was introduced the same way, and the reason is the same — a bar
     // set before the distribution is known is a bar that flaps, and a
     // flapping gate teaches the reader to skip the line.
+    // v7.38.23 — when there is no verdict line, say what there WAS.
+    //
+    // This panel reported "(no verdict line — see the step's output)" on
+    // a run whose output is not kept: the report JSON stores name,
+    // status and timing, and nothing else. The text that reached here
+    // did carry the reason — `sh` puts `FAILED: {e}` in it — and the
+    // fallback threw it away, leaving a message that names a place the
+    // reader cannot go. Run standalone the same panel is green
+    // (`cells=16 losses=0 sort_worst=1.15x`), so the reason mattered and
+    // is now lost.
     let shipped_note = shipped_text
         .as_deref()
         .and_then(verdict_line)
-        .unwrap_or_else(|| "(no verdict line — see the step's output)".to_string());
+        .unwrap_or_else(|| match shipped_text.as_deref() {
+            Some(t) => {
+                let first = t
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("(empty)");
+                format!(
+                    "no verdict line; it said: {}",
+                    &first[..first.len().min(160)]
+                )
+            }
+            None => "no verdict line and no text at all".to_string(),
+        });
     Ok(format!(
         "{verdict}; locale panel {locale_verdict}; shipped-default panel \
          (SPG en_US vs PG18 en_US, reported not judged) {shipped_note}; peak rss: {}",
