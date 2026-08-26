@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.23] — 2026-08-27
 
 The bill v7.38.22's own fix sent, and paying it. Declaring a collation
 cost 2.36x on the image's own default, with nothing declared on the
