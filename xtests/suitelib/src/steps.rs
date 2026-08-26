@@ -58,7 +58,19 @@ pub fn clippy_affected(root: &Path, graph: &CrateGraph) -> Result<String, String
     }
     let affected = graph.affected(&changed);
     let flags: String = affected.iter().map(|c| format!(" -p {c}")).collect();
-    sh(root, &format!("cargo clippy -q{flags} -- -D warnings"))?;
+    // v7.38.23 — `--all-targets`, because without it this step does not
+    // lint TEST code and `gate.sh lint` does.
+    //
+    // The release gate runs `cargo clippy --workspace --all-targets
+    // --locked -- -D warnings`; this one ran the default targets, so a
+    // lint in a test passed precommit every time and could only fail at
+    // the release. It did: v7.38.23's train stopped at `gate.sh lint`
+    // over a `repeat().take()` in a test added the same day, after
+    // precommit had reported "clippy clean over 13 crates".
+    sh(
+        root,
+        &format!("cargo clippy -q --all-targets{flags} -- -D warnings"),
+    )?;
     Ok(format!("clippy clean over {} crates", affected.len()))
 }
 
@@ -649,7 +661,7 @@ mod locale_panel_verdict_tests {
     fn the_no_verdict_fallback_does_not_panic_on_multibyte() {
         // An em-dash every third character, so a byte cut at 160 lands
         // inside one whatever the exact offset.
-        let line: String = core::iter::repeat("a—b").take(200).collect();
+        let line: String = "a—b".repeat(200);
         let got = super::verdict_or_first_line(Some(&line));
         assert!(got.starts_with("no verdict line; it said: "));
         // 160 CHARACTERS kept, not bytes.
