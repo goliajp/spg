@@ -202,7 +202,11 @@ not fixed here.
   `collate::pads_space` already carries the rule, and it was measured
   rather than inferred: over the 838 collation names the two oracles
   list, `NO PAD` holds exactly when the name is `binary` or contains
-  `_0900_` or `nopad`, with zero counter-examples. Every caller feeds it
+  `_0900_` or `nopad`, with zero counter-examples. That is v7.38.18's
+  claim, and half of it was re-checked here rather than repeated —
+  asked of MySQL 9.7.1's catalogue, 286 collations and **0**
+  counter-examples, the same count its comment records. The MariaDB half
+  (552) was not re-run. Every caller feeds it
   a COLUMN's declared name. A comparison of two literals has no column,
   so it takes the session default — and NO PAD is right there, because
   SPG advertises MySQL 8.0, whose default `utf8mb4_0900_ai_ci` is NO
