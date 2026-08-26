@@ -126,6 +126,40 @@ the current build; this file is a release-organized view.
 
 ### Findings
 
+- **`gate.sh dogfood --full` is red, and no release battery runs it.**
+
+  The prerelease tier's `dogfood` step runs `--fast`, which skips the
+  four 234 MB mailrs snapshots and says so on every run. They run only in
+  the full tier's `deep-tier`. Every release note in this series says
+  "nine-step prerelease green", so no shipped release has replayed the
+  four largest customer snapshots.
+
+  Run here: `pass=5 fail=2`, both latency budgets.
+  `content-worker` failed cold at 15.28 ms against 15 and passed on the
+  next run at 10.95 — the machine. `track-a` failed both times, cold
+  ~107 ms against 100 and p50 ~87 against 85.
+
+  That one was not taken as "the machine". Twelve alternating pairs of
+  two md5-stamped binaries, before and after this release's changes:
+
+      cold   old 99.19 (93.84-121.05)   new 104.18 (92.45-131.57)   1.038x
+      p50    old 87.17 (74.70-106.12)   new  88.25 (76.42-103.85)   1.017x
+
+  and 8 of 12 pairs slower on cold, 7 of 12 on p50, where no difference
+  gives 6. Chance. **The pre-change build fails the same budgets on this
+  machine** — its own p50 median is 87.17 against a bar of 85.
+
+  So the budgets are calibrated for an exclusive machine and cannot be
+  judged on a shared one. They are not being raised: a bar moved because
+  the machine was busy is a bar that follows the machine.
+
+  Worth the check on its own terms: `track-a` sorts by booleans,
+  timestamps and a numeric, so it never reaches the collation code this
+  release changed — but `build_order_keys_in` gained a parameter and it
+  sits on the path of every sort. New code taxing the workload it does
+  not serve is a thing that has happened here before. It did not happen
+  here.
+
 - **The panel that exists to catch this measured it, printed it, judged
   it, and passed it — by 0.3x.**
 
