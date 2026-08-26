@@ -19,8 +19,12 @@ the current build; this file is a release-organized view.
   permutation for several. Neither took text, so a spilled
   `ORDER BY <text>` compared whole strings on every comparison while the
   materialising sort next door compared eight bytes. The rule is one
-  place now — `orderby::inline_sort_key`, collation guards included —
-  and worth about 10% on the shape.
+  place now — `orderby::inline_sort_key`, collation guards included,
+  called by both sorters (`extsort.rs` and `orderby.rs`).
+
+  Its own commit puts the gain at "about 10%" and carries no measurement
+  of it; the numbers in that message belong to the half it did NOT fix.
+  Unverified here, and named as such rather than repeated as a figure.
 
   Third time in this series that a capability lived on one path and not
   its twin, and the entry below is the fourth: what this one did NOT fix
