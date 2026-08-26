@@ -10,7 +10,79 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The spilling sort re-derived its keys, and the half that re-derived
+  them was passed no collation at all.**
+
+  v7.38.22 shipped for a declared collation reaching only one of the two
+  sort paths. It gave the spilling sorter its collations; it did not give
+  them to `finish`, which is where that sorter gets its keys back. The
+  sorter does not write keys to disk — it re-derives them from the row as
+  it merges — and that re-derivation was called with `&[]`. So one sort
+  built its keys two ways: the pusher marked a `[0-9a-z]` value as
+  byte-ordered, the merge did not, and every merge comparison fell back
+  on `Collated::compare`, which walks both strings.
+
+  Measured on 400,000 rows of 192-character lowercase hex, one binary,
+  twelve runs a cell, `SELECT s FROM t ORDER BY s`:
+
+                                spilling (4 MB)   in memory (4 GB)
+      no collation declared          259.3 ms          408.8 ms
+      en_US.utf8 declared            700.2            414.1
+
+  In memory a collation that orders this data exactly as bytes do costs
+  **1.3%**. Spilling, the same collation costs **2.70x** — and turns a
+  path that is 1.58x FASTER than sorting in memory into one 1.69x slower.
+
+  It is not ICU. Prefixing every value with `'A'` makes the shortcut
+  impossible and forces a real collated key: that costs 1.72 s over the
+  uncollated leg, 4.3 us a row, i.e. ONE key per row. Per comparison it
+  would be 7.4 million of them at 1.6 us — about twelve seconds. Six
+  times the wrong regime. The negative control holds: with no collation
+  declared, the `'A'` column does not move (294.6 against 259.3).
+
+  It was never a wrong answer. Both paths return
+  `apple, Ápple, Banana, cherry, _under, Zebra`, byte-identical to
+  PostgreSQL 18.4 — the comparator recovers the original text from after
+  an ICU key's NUL and asks the collator, and that holds across the
+  mismatch. This was one differential away from being written up as
+  silent corruption.
+
+  Handing `finish` the collations closes it — 700.2 to 317.4, and the gap
+  to no-collation-at-all from 2.70x to 1.22x — but ICU's key must not come
+  with them. That key turns n log n comparisons into memcmps, which pays
+  when it is built once and sorted on; here it is built once per row
+  DURING the merge and thrown away. Building it moved the `'A'` column
+  from 2013.7 ms to 3526.7. So: marked or plain, never keyed.
+  `build_order_keys_rederived` is that rule.
+
 ### Findings
+
+- **The panel that exists to catch this measured it, printed it, judged
+  it, and passed it — by 0.3x.**
+
+  The locale panel compares SPG under `en_US.utf8` against the same
+  binary under `C`, and its stated question is what declaring a collation
+  costs. Its sort half is held to a 3.0x ceiling, chosen to catch the
+  v7.38.18 regression that cost twenty-six times. A bar set for 26x does
+  not stop 2.70x.
+
+- **The pin written for v7.38.22's headline holds four rows and never
+  sets `work_mem`.**
+
+  The defect was "a collation reaches only one of the two sort paths" and
+  the corpus pin for it fits in either path, so it exercised the
+  materialising sort twice. `e2e_collated_spill_agrees_v73823` is the
+  same question at 20,000 rows under `work_mem = 64`, with the spill
+  witnessed by `temp_files` before the answers are compared at all.
+
+  Both of its halves were made to fail before it was trusted. Ablating
+  the comparator's collations gives two different answers, first
+  divergence at row 5163; ablating every collation gives two answers that
+  agree perfectly, in byte order, and only the check that `apple` sorts
+  before `Banana` can see it.
+
 
 - **The streaming sorted-spill path costs more than the path it
   replaces, on a text key — and buys nothing at all under a collation.**
