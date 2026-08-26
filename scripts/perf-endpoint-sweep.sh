@@ -371,6 +371,15 @@ SORT_SHAPES=(
   # The varied fixture, both key regimes.
   'sort only, short text distinct|SELECT count(*) FROM (SELECT s_short FROM @S@ ORDER BY s_short) z'
   'sort only, long text distinct|SELECT count(*) FROM (SELECT s_long FROM @S@ ORDER BY s_long) z'
+  # v7.38.22 — the sort column NOT projected, which nothing above covers.
+  #
+  # Every cell above projects what it orders by, so all of them can take
+  # the path that reads the key off the OUTPUT. This one cannot, and the
+  # difference was not small: 308.9 ms against PostgreSQL 18.4's 107.6 ms
+  # — 2.87x, on a panel whose worst reading was 1.5x. Projecting LESS
+  # cost 3.7x more than projecting the sorted column, which is backwards,
+  # and no cell could say so.
+  'sort only, long text, key not projected|SELECT count(*) FROM (SELECT id FROM @S@ ORDER BY s_long) z'
   'sort only, long text top-N|SELECT count(*) FROM (SELECT s_long FROM @S@ ORDER BY s_long LIMIT 10) z'
 )
 
