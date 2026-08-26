@@ -573,9 +573,11 @@ not fixed here.
   not the same as "twice" and is not being rounded to it. The same panel read
   `sort_worst=1.54x` before the last of this release's three changes.
 
-  One run of it inside the tier reported no verdict line at all, and the
-  reason was thrown away by the code that summarises it; that is fixed
-  in the same release. Reproduced standalone, the panel is green.
+  Two of this release's three tier runs reported nothing from it at all,
+  which turned out to be two separate ways of throwing it away — see
+  "The shipped-default panel was being thrown away, two different ways"
+  under Findings. Reproduced standalone, the panel is green; the numbers
+  above are that run.
 
   Grading them apart took care the first version did not have:
   `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
