@@ -1021,7 +1021,10 @@ mod ascii_shortcut_tests {
 
             // One byte outside it, at every position in turn.
             for bad_at in 0..len {
-                for bad in ['A', ' ', '_', '{', '/'] {
+                // The last two are multi-byte, which also pushes every
+                // chunk boundary off the character positions — the
+                // alignment case an ASCII-only list cannot reach.
+                for bad in ['A', ' ', '_', '{', '/', '\u{e9}', '\u{4e2d}'] {
                     let mut v: alloc::vec::Vec<char> = all_good.chars().collect();
                     v[bad_at] = bad;
                     let t: alloc::string::String = v.into_iter().collect();
