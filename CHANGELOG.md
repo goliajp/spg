@@ -47,8 +47,12 @@ the current build; this file is a release-organized view.
   25 for legs whose queries take 234 ms and 630 ms — the count was
   measuring psql, not the server.
 
-  A second error compounded it: `prof_on` / `prof_off` were taken from a
-  binary that already carried this release's extsort change, and
+  Two further errors compounded it. The build every profile came from —
+  `target/release-dbg/spg-server` — was the ABLATED one, left from the
+  ablation and never rebuilt; its readings sit exactly in the ablated
+  column, and rebuilt it reads 2.52x, matching the shipping build. And
+  `prof_on` / `prof_off` were taken from a binary that already carried
+  this release's extsort change, and
   `profE` / `profF` from one that did not. Different inlining, different
   symbol sets — and the missing symbols read as the analyser
   contradicting itself. Profiles taken across a code change are not
