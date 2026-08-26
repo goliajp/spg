@@ -23,20 +23,34 @@ the current build; this file is a release-organized view.
   by INCLUSIVE call-tree time rather than leaves, the merge is 5.9%
   against 4.9% and every symbol containing `collate` is **0.0%**.
 
-  An ablation answered it. With `try_spill_sorted_stream` disabled, both
-  legs fall back to the materialising path:
+  An ablation answered it. Two binaries, md5 stamped, alternating, three
+  rounds each — the first pair was taken at different times and did not
+  deserve to be quoted:
 
-      sort text + send      streaming ON      streaming OFF
-      C                        247.7 ms          186.3 ms
-      en_US.utf8               598.0 ms          224.2 ms
+      sort text + send      streaming ON              streaming OFF
+      C                     252.1 / 232.0 / 234.7     181.1 / 148.4 / 152.9
+      en_US.utf8            628.7 / 635.5 / 629.7     214.2 / 221.5 / 215.4
+
+  1.5x under `C`, **2.9x** under the collation, with a 1% spread inside
+  each configuration.
 
   It exists to bound peak memory, and that half is measured too: on `C`
   it spends 61 ms to save 73 MB of peak RSS. Under a declared collation
   it spends 374 ms to save **nothing** — 49 MB against 48.
 
-  Recorded, not acted on: the question this raises is not the one the
-  earlier hypothesis in this file asked, and the fix has to answer why
-  the path is slower on a text key before deciding whether to take it.
+  What the cost is NOT: server CPU. The two configurations sample almost
+  the same working set in the same window (8,850 against 9,261), spill
+  identically, and show no read or write syscall near the top. The time
+  is spent waiting. It also scales with the per-row comparison cost
+  rather than being a flat per-row overhead — the absolute penalty is
+  +82 ms under `C` and +413 ms under the collation.
+
+  What it IS remains unnamed, and the analyser that would name it gave
+  self-contradictory inclusive numbers on these two profiles, so it is
+  not trusted and nothing was concluded from it. Recorded, not acted on:
+  a fix that skips the path where it does not pay, without first
+  answering why it saves no memory under a collation, would be treating
+  the symptom.
 
 ### Instruments
 
