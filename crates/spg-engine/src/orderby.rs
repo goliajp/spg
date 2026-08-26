@@ -2293,6 +2293,50 @@ pub(crate) fn build_order_keys_bound(
     ctx: &EvalContext,
     keys: &mut Vec<OrderKey>,
 ) -> Result<(), EngineError> {
+    build_order_keys_in(order_by, bound, collations, row, ctx, keys, false)
+}
+
+/// v7.38.23 — the same keys, for a value whose key is built and thrown
+/// away once per row.
+///
+/// The spilling sorter does not write keys to disk; it re-derives them
+/// from the row as it merges. That re-derivation was passed no
+/// collations at all, and the two halves of one sort therefore built
+/// different keys: the pusher marked a `[0-9a-z]` value as byte-ordered,
+/// the merge did not, and every merge comparison fell back on
+/// `Collated::compare`, which walks both strings. On 400,000 rows of
+/// 192-character hex under `en_US.utf8` that was 700.2 ms against the
+/// same sort's 259.3 with no collation declared — a collation that
+/// orders this data exactly as bytes do, costing 2.70x to say so.
+///
+/// Handing it the collations closes that, but ICU's key must not come
+/// with it. That key exists to turn n·log n comparisons into memcmps,
+/// which pays when it is built once and sorted on; here it is built once
+/// per row DURING the merge, and its comparisons are already happening.
+/// Building it moved `'A'`-prefixed text from 2013.7 ms to 3526.7 —
+/// 3.8 us a row, one whole ICU key. Marked or plain, never keyed:
+/// `Collated::compare` orders the plain ones correctly, which is what
+/// every published version has been doing on this path.
+pub(crate) fn build_order_keys_rederived(
+    order_by: &[OrderBy],
+    bound: &[Option<usize>],
+    collations: &[Option<crate::collate::Collated>],
+    row: &Row<'static>,
+    ctx: &EvalContext,
+    keys: &mut Vec<OrderKey>,
+) -> Result<(), EngineError> {
+    build_order_keys_in(order_by, bound, collations, row, ctx, keys, true)
+}
+
+fn build_order_keys_in(
+    order_by: &[OrderBy],
+    bound: &[Option<usize>],
+    collations: &[Option<crate::collate::Collated>],
+    row: &Row<'static>,
+    ctx: &EvalContext,
+    keys: &mut Vec<OrderKey>,
+    mark_only: bool,
+) -> Result<(), EngineError> {
     keys.clear();
     keys.reserve(order_by.len());
     // v7.38.19 — set by the collated branch when the value carries the
@@ -2416,7 +2460,7 @@ pub(crate) fn build_order_keys_bound(
                 alnum_text = Some(CompactText::new_known_alnum(t));
                 return None;
             }
-            c.sort_key_of(t)
+            if mark_only { None } else { c.sort_key_of(t) }
         }) {
             // v7.38.19 — the collated sort compares BYTES.
             //
