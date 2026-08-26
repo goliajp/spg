@@ -213,11 +213,15 @@ not fixed here.
   MySQL and MariaDB answer 1.
 
   Alongside it, one line: `@@collation_connection` and
-  `@@collation_server` are hardcoded to `utf8mb4_general_ci`, a PAD
-  SPACE name, while the handshake advertises collation id 255 —
-  `utf8mb4_0900_ai_ci` — and the session behaves NO PAD. The wire and
-  the behaviour agree with each other; only the variable disagrees with
-  both.
+  `@@collation_server` are hardcoded to `utf8mb4_general_ci`
+  (`eval/functions.rs:15623`), a PAD SPACE name, while the session
+  behaves NO PAD and the handshake pushes collation id **255**
+  (`mysqlwire.rs:2626` and `:2651`, from `CHARSET_UTF8MB4 = 0xff`) —
+  which the constant's own comment calls "what MySQL 8.0+ servers
+  advertise by default", i.e. `utf8mb4_0900_ai_ci`. The byte is read
+  from the source; that it names that collation is the comment's claim
+  and this release did not re-measure it. Either way the variable is the
+  odd one out: it disagrees with the behaviour, which is measured.
 
   Neither is fixed here. The variable is a one-line change with a
   visible consequence for anything that reads it; the explicit-`COLLATE`
