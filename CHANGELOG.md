@@ -234,8 +234,23 @@ the current build; this file is a release-organized view.
   before `Banana` can see it.
 
 
-- **The streaming sorted-spill path costs more than the path it
-  replaces, on a text key — and buys nothing at all under a collation.**
+- **SUPERSEDED — "the streaming sorted-spill path costs more, and buys
+  nothing at all under a collation."**
+
+  Kept for the instrument lessons at the end of it, which stand. Of its
+  conclusions:
+
+    * the cost asymmetry — 1.5x under `C`, 2.9x under the collation —
+      SURVIVES, and the Fixed entry at the top of this release says
+      where it lives: the two halves of one sort built their keys
+      differently. It is 1.32x now.
+    * "buys nothing at all under a collation" is WITHDRAWN. See the entry
+      above: peak RSS over the sort is +26 MB spilling against +252 MB in
+      memory with no collation, and +20 against +251 with one. The path
+      saves about 230 MB either way, on this build and on the shipped
+      one.
+    * "where the cost lives is NOT established" and "recorded, not acted
+      on" are both overtaken by the fix.
 
   A panel cell added for a text sort that RETURNS its rows read 2.5x for
   declaring a collation, where the same sort under a `count(*)` wrapper
@@ -283,11 +298,12 @@ the current build; this file is a release-organized view.
   The ablation above is unaffected: it times the query inside an open
   session and alternates two stamped binaries.
 
-  Recorded, not acted on. A fix that skips the path where it does not
-  pay, without first answering why it saves no memory under a collation,
-  would be treating the symptom — and this release has spent enough of
-  its own evidence learning that an instrument has to be trusted before
-  its numbers are.
+  It closed with "recorded, not acted on", on the reasoning that
+  skipping the path before knowing why it saved no memory would be
+  treating the symptom. The reasoning was right and the premise was not:
+  it saves memory perfectly well, the cost was never the path, and the
+  answer was a key built two different ways by two halves of the same
+  sort. Nothing was skipped.
 
 ### Instruments
 
