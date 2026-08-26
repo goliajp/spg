@@ -106,6 +106,14 @@ had been reporting the machine.
   have read 2.87x, which is why it is being added rather than the gap
   quietly closed.
 
+  The prefix key reaches the collations that ORDER by bytes, too. Left
+  declining whenever a collation was in force, it put that same cell at
+  **3.14x** against the same binary under `C` — past the locale panel's
+  3.0x ceiling — because making `C` fast is how a collated leg falls
+  behind. Same allowlist as the top-N gate, which had read 4.16x for the
+  same reason earlier in this version; the collated leg goes 354.4 ms to
+  138.8 ms, and the panel's worst locale reading is 1.27x.
+
 ### Documentation
 
 - **A panel number reaches a customer-facing document with its spread.**
@@ -139,6 +147,16 @@ had been reporting the machine.
   it**, with a control that is not this server: the time to start
   `/usr/bin/true`, measured at the moment of the miss. Still a failure —
   this makes the red legible, it does not make it green.
+
+- **Prepare warms the crate selection the step will run**, and the step
+  says when the time was not its own. `unit-affected` recorded 2289.9 s,
+  167.8 s, 1585.8 s, 8.9 s and 505.2 s at the same band against a hard
+  480 s budget. Timed directly: 1017 s wall for 20.4 s user, then 725 s
+  for 11.8 s — ninety-seven per cent of it waiting for another cargo's
+  build-directory lock. Cargo says so on stderr; the step now reads it
+  back rather than reporting another process's queue as its own cost.
+  On a quiet testbed the same step is 295.2 s, so the budget was never
+  the problem.
 
 - **An over-budget verdict prints what it takes to read it.** The same
   commit has measured 35 s and 1,990 s for `unit-affected` here. Three
