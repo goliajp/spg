@@ -180,3 +180,49 @@ Attack 2 and attack 3 are untried and no longer urgent. What remains
 behind PostgreSQL is the top-N at 2.39x, and a value OUTSIDE the
 alphabet — anything with a space, a capital or an accent — still pays
 full ICU, which is correct and unimproved.
+
+---
+
+## Addendum, 2026-08-27 — the other half of this path
+
+This finding measured the sort that MATERIALISES. The same query spills
+once it outgrows `work_mem`, and the spilling sorter is a separate
+implementation. v7.38.22 gave it the collations; it did not give them to
+`finish`, which is where that sorter gets its keys back — it does not
+write keys to disk, it re-derives them from the row as it merges.
+
+So one sort built its keys two ways. The pusher marked a `[0-9a-z]`
+value as byte-ordered, exactly as this document describes; the merge,
+handed an empty collation slice, did not. Every merge comparison then
+fell back on `Collated::compare`, which walks both strings — the cost
+this document's own §"What it turned out to be" was written to remove.
+
+Measured on 400,000 rows of 192-character hex, `SELECT s FROM t ORDER BY s`:
+
+    spilling (work_mem 4 MB)     259.3 ms under C     700.2 under en_US.utf8
+    in memory (work_mem 4 GB)    408.8                414.1
+
+In memory a collation that orders this data exactly as bytes do costs
+**1.3%**; spilling, **2.70x**. It was never a wrong answer — the
+comparator recovers the original text from after an ICU key's NUL — so
+nothing but the clock could see it.
+
+Handing `finish` the collations closes it, but ICU's key must not come
+with them: that key pays when it is built once and sorted on, and here
+it is built once per row DURING the merge and thrown away. Building it
+moved `'A'`-prefixed text from 2013.7 ms to 3526.7. Marked or plain,
+never keyed.
+
+Two things about this document's own reach, found while closing it:
+
+  * **Seven of the sort panel's nine cells never spill.** Every
+    `sort only, …` cell is a `count(*)` over a sorted subquery, which
+    takes the materialising plan; `temp_files` moves by zero on all
+    seven. The two row-returning cells are the only ones that reach the
+    other implementation.
+  * **Both pins written for v7.38.22 hold four rows**, and four rows fit
+    in the sorter's in-memory batch, so `finish` never re-derives a key
+    from a run. No pin could have seen this.
+
+The `Still open` items above are untouched: the top-N is still 2.39x
+behind, and a value outside the alphabet still pays full ICU.
