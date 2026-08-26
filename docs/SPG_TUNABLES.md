@@ -223,7 +223,7 @@ name. No shipped code path reads any of them.
 
 | Env | Default | Effect |
 |---|---|---|
-| `SPG_LC_COLLATE` | unset | The collation a NEW database is created with, ahead of `LC_ALL` / `LC_COLLATE` / `LANG`. Set once, at creation; it cannot be changed afterwards, exactly as in PostgreSQL. Absent leaves `C`. |
+| `SPG_LC_COLLATE` | unset | The collation a NEW database is created with, ahead of `LC_ALL` / `LC_COLLATE` / `LANG`. Set once, at creation; it cannot be changed afterwards, exactly as in PostgreSQL. Absent, the first of `LC_ALL` / `LC_COLLATE` / `LANG` that is set decides, and only with none of them set does a new database get `C`. Since v7.38.22 the published image ships `LANG=en_US.utf8`, the same value `postgres:18` carries, so on that image a new database collates by locale unless you say otherwise — measured on the image itself: with no environment `datcollate` answers `en_US.utf8`, and `SPG_LC_COLLATE=C` answers `C`. An existing data directory keeps whatever it was created with. |
 
 ### Durability and WAL
 
