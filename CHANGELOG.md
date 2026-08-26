@@ -458,8 +458,9 @@ the current build; this file is a release-organized view.
   It **reports, it does not judge**, in the release that introduces it,
   for the reason the locale panel was introduced the same way: a bar set
   before the distribution is known is a bar that flaps. On this
-  release's tier run it reads `cells=16 losses=0
-  control_false_differences=0 sort_worst=1.54x`.
+  release's tier run it reads
+
+      cells=16 losses=0 control_false_differences=0 sort_worst=1.54x
 
   Grading them apart took care the first version did not have:
   `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
