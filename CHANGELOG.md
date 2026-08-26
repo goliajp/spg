@@ -471,10 +471,22 @@ the current build; this file is a release-organized view.
 
   It **reports, it does not judge**, in the release that introduces it,
   for the reason the locale panel was introduced the same way: a bar set
-  before the distribution is known is a bar that flaps. On this
-  release's tier run it reads
+  before the distribution is known is a bar that flaps.
 
-      cells=16 losses=0 control_false_differences=0 sort_worst=1.54x
+  What it reports is the headline of this release. Both legs
+  `datcollate = en_US.utf8`, which is what the image now ships:
+
+      text key, rows returned        SPG 170.8-174.4 ms   PG18 301.6-321.1   0.57x
+      text key desc, rows returned   SPG 172.2-175.4      PG18 293.8-406.8   0.59x
+      cells=16 losses=0 control_false_differences=0 sort_worst=1.15x
+
+  **On the configuration a customer runs, a text sort that returns its
+  rows is now about twice as fast as PostgreSQL 18.** The same panel read
+  `sort_worst=1.54x` before the last of this release's three changes.
+
+  One run of it inside the tier reported no verdict line at all, and the
+  reason was thrown away by the code that summarises it; that is fixed
+  in the same release. Reproduced standalone, the panel is green.
 
   Grading them apart took care the first version did not have:
   `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
