@@ -34,6 +34,28 @@ the current build; this file is a release-organized view.
   prefixes, so both halves of the key have work to do; removing the
   run-settling pass reddens it.
 
+- **A third panel, and it is the one a customer runs.**
+
+  The sixty-four endpoint cells compare `C` against `C`. That was the
+  configuration the image shipped until v7.38.22 put `LANG=en_US.utf8`
+  in it, and a panel that only compares byte order stopped measuring
+  what a new database does. The `perf-sweep` step now runs a third
+  comparison after the other two: the same SPG leg already up under
+  `en_US.utf8`, against PostgreSQL 18.4's `bench`, which is `en_US.utf8`
+  as well. No `ALLOW_COLLATION_MISMATCH` on this one — the two legs are
+  supposed to agree, and the script's own check says so if they stop.
+
+  It **reports, it does not judge**, in the release that introduces it,
+  for the reason the locale panel was introduced the same way: a bar set
+  before the distribution is known is a bar that flaps. On this
+  release's tier run it reads `cells=16 losses=0
+  control_false_differences=0 sort_worst=1.54x`.
+
+  Grading them apart took care the first version did not have:
+  `verdict_line` reads BACKWARDS for the last `cells=` line, so with a
+  second panel appended the locale panel would have been graded on
+  someone else's numbers.
+
 - **The panel can see a text sort that returns its rows.**
 
   Both panels reported no losses on a shape that loses. Every cell in
