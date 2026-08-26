@@ -81,6 +81,31 @@ had been reporting the machine.
   PostgreSQL 18.4's 360.4 ms**. `SPG_LC_COLLATE=C` restores byte order
   for a deployment that wants it.
 
+### Performance
+
+- **An abbreviated key for text, and the panel cell that could not see
+  why it was needed.** The sort panel's worst reading was 1.4x. Sorting
+  by a long text column that is NOT projected measured **308.9 ms
+  against PostgreSQL 18.4's 107.6 ms — 2.87x** — and no cell said so,
+  because every cell in that panel projects what it orders by and can
+  take the path that reads the key off the output. Projecting LESS cost
+  3.7x more than projecting the sorted column.
+
+  Profiled, that shape spends 41% of its working samples on comparison
+  and 22% in the sort machinery around it. A text key now travels as its
+  leading eight bytes big-endian, in the same integer a numeric key
+  travels in, and carries whether it is EXACT: an integer settles the
+  order by itself, a prefix only decides where it differs, so an inexact
+  key sends each run of equal keys to the full comparator — the pass a
+  second ORDER BY key already needed.
+
+      sort by long text, key not projected   308.9 ms -> 109.8 ms
+      against PostgreSQL 18.4                   2.87x -> 1.18x
+
+  The panel gains that cell. It reads 1.18x now; a release ago it would
+  have read 2.87x, which is why it is being added rather than the gap
+  quietly closed.
+
 ### Documentation
 
 - **A panel number reaches a customer-facing document with its spread.**
