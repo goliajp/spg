@@ -135,10 +135,14 @@ fn a_collated_sort_that_spills_answers_what_one_that_fits_answers() {
     assert_eq!(in_memory.len(), ROWS);
     assert_eq!(files2, files1, "this one was supposed to fit");
 
-    assert_eq!(
-        spilled, in_memory,
-        "one query, two paths, two answers — which is v7.38.22's defect"
-    );
+    // The first place they part, and nothing else. Printing 20,000
+    // values buries the one fact the reader needs under 2.5 MB.
+    if let Some(i) = (0..ROWS).find(|&i| spilled[i] != in_memory[i]) {
+        panic!(
+            "one query, two paths, two answers — v7.38.22's defect.\n               first divergence at row {i}\n               spilled:   {}\n  in memory: {}",
+            spilled[i], in_memory[i]
+        );
+    }
 
     // And the half that keeps two wrong answers from agreeing: bytes put
     // `Banana` first, the collation puts `apple` first.
