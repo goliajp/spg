@@ -66,26 +66,76 @@ pub fn clippy_affected(root: &Path, graph: &CrateGraph) -> Result<String, String
 ///
 /// # Errors
 /// Test failures (the output is the reason).
-pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> {
+/// v7.38.22 — the crate selection `unit-affected` will run, and the
+/// `-p` flags that name it.
+///
+/// Shared with the tier's PREPARE phase, and that is the whole point.
+/// Prepare warmed the build with `--workspace`, the step then ran
+/// `-p A -p B …`, and Cargo resolves features over the SELECTED members:
+/// a subset gets a different feature set for the shared dependencies,
+/// so nothing prepare built could be reused and the step rebuilt from
+/// scratch inside a hard budget.
+///
+/// What that looked like, same step, same band, five runs recorded in
+/// the reports: 2289.9 s, 167.8 s, 1585.8 s, 8.9 s, 505.2 s. A 257x
+/// spread on a step whose budget is 480 s — a coin flip, not a gate.
+/// The short readings are the ones where the subset happened to be warm
+/// from a previous run.
+///
+/// `Ok(None)` when nothing changed, which is the step's own skip.
+///
+/// # Errors
+/// Whatever `changed_crates` reports.
+pub fn affected_selection(
+    root: &Path,
+    graph: &CrateGraph,
+) -> Result<Option<(Vec<String>, String)>, String> {
     let changed = changed_crates(root, graph)?;
     if changed.is_empty() {
-        return Ok("no crate changes — skipped".into());
+        return Ok(None);
     }
     let affected = graph.affected(&changed);
     let flags: String = affected.iter().map(|c| format!(" -p {c}")).collect();
+    Ok(Some((affected, flags)))
+}
+
+pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> {
+    let Some((affected, flags)) = affected_selection(root, graph)? else {
+        return Ok("no crate changes — skipped".into());
+    };
     // v7.38.2 — cargo errors on `--lib` when a SINGLE selected package
     // has no lib target (bins-only spg-server / spgctl), but silently
     // tolerates the same flags across MULTIPLE packages — so this step
     // only ever failed when exactly one bins-only crate changed. Retry
     // without `--lib` on that precise error.
-    match sh(root, &format!("cargo test -q{flags} --lib --bins")) {
-        Ok(_) => {}
+    //
+    // v7.38.22 — `2>&1`, so the step can see whether it SPENT its budget
+    // or waited for it.
+    //
+    // This step has recorded 2289.9 s, 167.8 s, 1585.8 s, 8.9 s and
+    // 505.2 s at the same band against a hard 480 s budget. Timed
+    // directly, twice: 1017 s wall for 20.4 s user and 10.9 s sys, then
+    // 725 s wall for 11.8 s and 1.3 s. Ninety-seven per cent of the
+    // budget went on waiting, and what it waited for was another cargo
+    // holding the build-directory lock — a full workspace clippy, in the
+    // run that produced the 2289 s.
+    //
+    // Cargo says so on stderr, in as many words. Reading it turns a
+    // number nobody could account for into a named cause.
+    let blocked = "Blocking waiting for file lock";
+    let waited = match sh(root, &format!("cargo test -q{flags} --lib --bins 2>&1")) {
+        Ok(out) => out.contains(blocked),
         Err(e) if e.contains("no library targets") => {
-            sh(root, &format!("cargo test -q{flags} --bins"))?;
+            sh(root, &format!("cargo test -q{flags} --bins 2>&1"))?.contains(blocked)
         }
         Err(e) => return Err(e),
-    }
-    Ok(format!("unit green over {} crates", affected.len()))
+    };
+    let note = if waited {
+        " — and WAITED on the build-directory lock, so this duration is another cargo's"
+    } else {
+        ""
+    };
+    Ok(format!("unit green over {} crates{note}", affected.len()))
 }
 
 /// `pins-current` — the e2e pins THIS commit adds or touches.

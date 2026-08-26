@@ -239,7 +239,35 @@ fn main() {
                 // Which is exactly what the note above says prepare is
                 // for: a budget that a compile can blow is measuring the
                 // workspace, not the change.
-                for (args, label) in [
+                // v7.38.22 — and a THIRD, over the same crate selection
+                // the step will use.
+                //
+                // The two above warm the workspace. `unit-affected` then
+                // runs `cargo test -p A -p B …`, and Cargo resolves
+                // features over the SELECTED members — a subset gets a
+                // different feature set for the shared dependencies, so
+                // none of what was just built could be reused and the
+                // step rebuilt from scratch inside a hard 480 s budget.
+                //
+                // Same step, same band, five runs from the reports:
+                // 2289.9 s, 167.8 s, 1585.8 s, 8.9 s, 505.2 s. That is a
+                // 257x spread, and the short readings are the ones where
+                // a previous run happened to leave the subset warm.
+                let subset = suitelib::steps::affected_selection(root, &graph)
+                    .ok()
+                    .flatten()
+                    .map(|(_, flags)| flags);
+                let subset_args: Vec<String> = subset
+                    .as_deref()
+                    .map(|f| {
+                        let mut v = vec!["test".to_string(), "-q".to_string()];
+                        v.extend(f.split_whitespace().map(str::to_string));
+                        v.extend(["--no-run", "--lib", "--bins"].map(str::to_string));
+                        v
+                    })
+                    .unwrap_or_default();
+                let subset_ref: Vec<&str> = subset_args.iter().map(String::as_str).collect();
+                let mut prep: Vec<(&[&str], &str)> = vec![
                     (
                         ["build", "-q", "--workspace", "--all-targets"].as_slice(),
                         "cargo build --workspace --all-targets",
@@ -248,7 +276,14 @@ fn main() {
                         ["test", "-q", "--workspace", "--no-run", "--lib", "--bins"].as_slice(),
                         "cargo test --workspace --no-run --lib --bins",
                     ),
-                ] {
+                ];
+                if !subset_ref.is_empty() {
+                    prep.push((
+                        subset_ref.as_slice(),
+                        "cargo test <affected> --no-run --lib --bins",
+                    ));
+                }
+                for (args, label) in prep {
                     let t_prep = std::time::Instant::now();
                     let out = std::process::Command::new("cargo")
                         .args(args)
