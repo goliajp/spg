@@ -331,6 +331,46 @@ not fixed here.
   another engine while a binary against ITSELF under a collation that
   orders the data exactly as bytes do should cost almost nothing.
 
+- **The shipped-default panel was being thrown away, two different
+  ways, and the message said neither.**
+
+  It reported `(no verdict line — see the step's output)`, and the
+  report JSON keeps name, status, ms and budget_ms — so the message
+  named a place the reader cannot go. Changing it to print what it
+  actually saw is what made both causes visible.
+
+  **One.** The sweep exits 1 on any loss (`(( LOSSES == 0 )) || exit 1`),
+  and the locale panel is ALLOWED losses — `locale_panel_passes` grades
+  a cost class and its own CLEAN example carries `losses=3`. So the
+  ordinary state of that panel made `sh` return Err, and
+  `(Err(e), _) => Err(e)` discarded the second panel with it. Across this
+  release's three tier runs: `losses=0` once, and the panel reported
+  `sort_worst=1.54x`; `losses=3` and `losses=1` the other two, and it
+  reported nothing.
+
+  **Two.** When the locale panel fails its GRADE, the step returned
+  before computing the shipped note. Found by running the step alone and
+  reading its whole output — five lines, one `cells=` among them, and it
+  was the locale panel's, while the shipped-default sweep had already
+  run: ten minutes of the machine, both legs started, timed and reaped.
+
+  The exit status was never the thing to grade: `sh` puts the command's
+  own output into the error, and grading has always meant EXTRACTING the
+  verdict line, whose absence is the failure. The text travels either
+  way now, the second panel is always appended, and a failure carries
+  it too.
+
+  The run that surfaced the second one failed for the right reason and
+  the bar is not being argued with — `control_false_differences=1`, the
+  binary separating from itself inside one window. What was wrong was
+  discarding the rest of the evidence on the way out.
+
+  Alongside: `verdict_or_first_line` is a function with a pin now,
+  because truncating with `&s[..160]` panics when byte 160 lands inside
+  a multi-byte character — in the branch that only runs once something
+  has already gone wrong, over output this repository fills with
+  em-dashes.
+
 - **The drop-in report's reproducer did not reproduce the run it heads.**
 
   It printed `--image` and `--port` and nothing else, while the fixture
