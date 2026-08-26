@@ -2,8 +2,16 @@
 
 **Image:** `goliakk/spg:7.38.23` (draft — not built yet)
 **Manifest digest:** (filled in by the release train)
-**Battery:** nine-step prerelease green on the exclusive testbed; drop-in
-acceptance 71/71 against the built image.
+**Battery:** nine-step prerelease green; drop-in acceptance 71/71
+against the built image.
+
+Unlike previous notes, we are not calling the box exclusive, because it
+was not: other work of ours ran on it throughout. That is why every
+figure below is a RATIO taken with both legs alternating inside one
+window, rather than two sets of milliseconds taken at different times —
+a busy machine moves both legs together and cancels out of a ratio. The
+two places where absolute milliseconds appear, they are quoted with
+their full spread and the comparison is stated beside them.
 
 Nothing you reported is involved and there is nothing for you to change.
 This note exists because the last one announced a fix and did not
