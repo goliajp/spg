@@ -138,7 +138,8 @@ fn a_collated_sort_that_spills_answers_what_one_that_fits_answers() {
     // values buries the one fact the reader needs under 2.5 MB.
     if let Some(i) = (0..ROWS).find(|&i| spilled[i] != in_memory[i]) {
         panic!(
-            "one query, two paths, two answers — v7.38.22's defect.\n               first divergence at row {i}\n               spilled:   {}\n  in memory: {}",
+            "one query, two paths, two answers — v7.38.22's defect.\n  \
+             first divergence at row {i}\n  spilled:   {}\n  in memory: {}",
             spilled[i], in_memory[i]
         );
     }
