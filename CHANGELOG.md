@@ -333,16 +333,19 @@ not fixed here.
   the line as it prints now. The 71/71 in the pending customer notes is
   the correct number for that image.
 
-- **Seven of the sort panel's nine cells never spill.**
+- **Only two of the sort panel's nine cells reach the spilling sort.**
 
-  Measured with `temp_files` as the witness, one cell at a time: every
-  `sort only, …` cell — all seven of them, each a `count(*)` over a
-  sorted subquery — moves the counter by zero. Only the two
-  row-returning cells spill, by 230 files each.
+  Measured with `temp_files` as the witness, one cell at a time: **six**
+  of the seven `sort only, …` cells — each a `count(*)` over a sorted
+  subquery — move the counter by zero, and the two row-returning cells
+  move it by 230 files each. The seventh, `sort only, two keys`, was not
+  measured; it is the same `count(*)` shape as the six, so it is very
+  probably the same, and this sentence says which part is measured and
+  which is inferred.
 
   A `count(*)` wrapper takes a different plan, and the plan it takes is
   the materialising sort. So the panel that exists to isolate sort cost
-  measures the OTHER sort in seven of nine cells, and this release's
+  measures the OTHER sort in most of its cells, and this release's
   defect lived entirely in the spilling one. The loose ceiling is only
   half of why it passed; the other half is that the panel's sampling
   barely reaches the path at all.
