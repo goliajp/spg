@@ -49,13 +49,41 @@ the current build; this file is a release-organized view.
   mismatch. This was one differential away from being written up as
   silent corruption.
 
-  Handing `finish` the collations closes it — 700.2 to 317.4, and the gap
-  to no-collation-at-all from 2.70x to 1.22x — but ICU's key must not come
+  Handing `finish` the collations closes it, but ICU's key must not come
   with them. That key turns n log n comparisons into memcmps, which pays
   when it is built once and sorted on; here it is built once per row
   DURING the merge and thrown away. Building it moved the `'A'` column
   from 2013.7 ms to 3526.7. So: marked or plain, never keyed.
   `build_order_keys_rederived` is that rule.
+
+  The verdict was taken without an exclusive machine, because the machine
+  could not be had — the load on it belongs to someone else. Instead of
+  waiting, the legs moved into one window: an explicit
+  `ORDER BY s COLLATE "en_US.utf8"` against a bare `ORDER BY s` on a `C`
+  database is two queries in one session on one server, alternating, and
+  the ratio between adjacent pairs does not care what else the machine is
+  doing. Three states, one harness, each run naming its binary by md5,
+  its database by `datcollate`, and asserting exactly one server answers:
+
+                              s_long (all lowercase)   s_up (forces ICU)
+      as shipped                 2.91x (2.51-3.08)     8.52x (7.75-9.15)
+      collations to `finish`     1.23x (1.11-1.35)    14.59x (13.52-15.65)
+      + marked, never keyed      1.32x (1.12-1.36)     8.73x (7.40-9.32)
+
+  The third row's ICU column overlaps the first's, so nothing regressed;
+  its lowercase column does not, so something moved. The middle row
+  overlaps neither: the second half is not a refinement of the first, it
+  is the condition on shipping it.
+
+  Two instrument errors, both caught by a witness rather than by
+  suspicion. A leg with no `COLLATE` clause is not an uncollated leg —
+  the database has one — and the first harness compared two collated legs
+  and reported a ratio of 1.00x; the tell was that the "control" read
+  1940 ms where the same column on a `C` database reads 294.6. And the
+  witness that would have said so printed nothing at first, because its
+  quoting sent `psql` to a local socket. A silent instrument looks exactly
+  like a clean measurement. Repaired, it immediately said something true:
+  `SHOW lc_collate` is not a parameter SPG recognises.
 
 ### Findings
 
