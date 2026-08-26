@@ -93,6 +93,25 @@ ssh "$HOST" "mkdir -p '$RDIR'"
 # assumed to carry.
 rsync -az --delete --filter='P /target/' --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
+
+# Stage what just arrived, because the selectors here are diffs.
+#
+# `affected_selection` and `pins_current` both ask
+# `git diff --name-only HEAD`, which lists tracked files — staged or not.
+# The remote checkout sits at whatever commit it was last synced from and
+# receives everything else over rsync, so a file that is NEW locally
+# arrives here UNTRACKED and no diff mentions it.
+#
+# v7.38.23 found what that costs: a new e2e pin was added, the tier ran,
+# and `pins-current` reported "no e2e pins touched — skipped". The step
+# whose entire purpose is to run this commit's pins — and to go red when
+# a pin file is not wired into `main.rs` — saw nothing, because the pin
+# was the one untracked file in the tree. Staged, the same run reports
+# "1 pin(s) over 1 touched file(s)".
+#
+# `git diff ... HEAD` counts staged changes, so this only ever ADDS to
+# what the selectors see. Nothing here is committed or pushed.
+ssh "$HOST" "cd '$RDIR' && git add -A" 2>/dev/null || true
 if [[ -n "$DETACH" ]]; then
     # One runner at a time: a second would fight the first for the cargo
     # build lock and both would look hung.

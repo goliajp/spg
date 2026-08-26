@@ -96,6 +96,23 @@ the current build; this file is a release-organized view.
   v7.38.18 regression that cost twenty-six times. A bar set for 26x does
   not stop 2.70x.
 
+- **A new pin file arrives on the testbed untracked, and every selector
+  in the tier is a diff.**
+
+  `affected_selection` and `pins_current` both ask
+  `git diff --name-only HEAD`, which lists tracked files. The testbed
+  checkout sits at whatever commit it last synced from and takes
+  everything else over rsync, so a file that is new locally is untracked
+  there and no diff names it.
+
+  The tier ran green with `pins-current` reporting
+  `no e2e pins touched — skipped` in the same run that added an e2e pin.
+  That step exists to run this commit's pins and to go red when a pin
+  file is never declared in `main.rs`; it saw nothing, because the pin
+  was the one untracked file in the tree. Staged first, the same run
+  reports `1 pin(s) over 1 touched file(s)`. `scripts/test-on-mini.sh`
+  now stages after it syncs.
+
 - **Both pins written for v7.38.22 hold four rows, and four rows enter
   the spilling sorter without ever leaving it as a run.**
 
