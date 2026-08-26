@@ -38,19 +38,23 @@ the current build; this file is a release-organized view.
   it spends 61 ms to save 73 MB of peak RSS. Under a declared collation
   it spends 374 ms to save **nothing** — 49 MB against 48.
 
-  What the cost is NOT: server CPU. The two configurations sample almost
-  the same working set in the same window (8,850 against 9,261), spill
-  identically, and show no read or write syscall near the top. The time
-  is spent waiting. It also scales with the per-row comparison cost
-  rather than being a flat per-row overhead — the absolute penalty is
-  +82 ms under `C` and +413 ms under the collation.
+  Where the cost lives is NOT established, and the attempts to establish
+  it are withdrawn. Three readings of the same profiles contradicted each
+  other in turn, and all three failed for one reason: the load generator
+  started a fresh `psql` per iteration, so ~500 ms of process startup
+  filled the sampling window and the samples could not be normalised per
+  query. Counting completed queries inside the window showed 27 against
+  25 for legs whose queries take 234 ms and 630 ms — the count was
+  measuring psql, not the server.
 
-  What it IS remains unnamed, and the analyser that would name it gave
-  self-contradictory inclusive numbers on these two profiles, so it is
-  not trusted and nothing was concluded from it. Recorded, not acted on:
-  a fix that skips the path where it does not pay, without first
-  answering why it saves no memory under a collation, would be treating
-  the symptom.
+  The ablation above is unaffected: it times the query inside an open
+  session and alternates two stamped binaries.
+
+  Recorded, not acted on. A fix that skips the path where it does not
+  pay, without first answering why it saves no memory under a collation,
+  would be treating the symptom — and this release has spent enough of
+  its own evidence learning that an instrument has to be trusted before
+  its numbers are.
 
 ### Instruments
 
