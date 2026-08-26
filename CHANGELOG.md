@@ -97,6 +97,14 @@ not fixed here.
   from 2013.7 ms to 3526.7. So: marked or plain, never keyed.
   `build_order_keys_rederived` is that rule.
 
+  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md` measured the sort
+  that MATERIALISES and closed it; this is the other half of the same
+  query, and that document now carries an addendum saying so — including
+  the two things about its own reach it did not know: that seven of the
+  nine sort-panel cells never spill, and that both pins written for
+  v7.38.22 hold four rows, which fit in the sorter's in-memory batch and
+  so never reach a merge at all.
+
   The verdict was taken without an exclusive machine, because the machine
   could not be had — the load on it belongs to someone else. Instead of
   waiting, the legs moved into one window: an explicit
