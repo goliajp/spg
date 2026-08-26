@@ -95,6 +95,35 @@ the current build; this file is a release-organized view.
   like a clean measurement. Repaired, it immediately said something true:
   `SHOW lc_collate` is not a parameter SPG recognises.
 
+- **And then the collation costs nothing at all.**
+
+  What was left after the fix above is `is_ascii_alnum_lower` — the test
+  that decides whether a value is in the alphabet a byte-ordering
+  collation orders by bytes. It is asked once per value, which is where
+  the code says it belongs. What it was not was fast.
+
+  Priced by ablation before it was touched: with the whole function
+  replaced by `true` — the same answer for a fixture of lowercase hex —
+  every cell of the locale panel collapses to 0.91-1.03x and its worst
+  reading goes 1.31x to 1.03x. So the walk was the entire remaining cost,
+  and 1.03x bounded what any rewrite could win.
+
+  The byte-at-a-time loop returned early, and the early return is what
+  stopped it vectorising. On the shape that pays — 192 characters, every
+  one in the alphabet — there is nothing to return early FROM. Sixteen
+  bytes at a time, branchless inside the sixteen:
+
+      declaring en_US.utf8 on 400,000 rows of lowercase hex
+        as shipped (7.38.22)          2.91x
+        collations reach `finish`     1.23x   (14.59x on ICU text)
+        + marked, never keyed         1.32x   (8.73x)
+        + sixteen at a time           0.99x   (9.22x)
+
+  0.99x, spread 0.96-1.08, on the shipping binary named by md5. **On data
+  a byte-ordering collation orders the way bytes do, declaring it is now
+  free.** The ICU column overlaps the shipped reading throughout: nothing
+  was moved onto the values that genuinely need a collator.
+
 ### Findings
 
 - **The panel that exists to catch this measured it, printed it, judged
