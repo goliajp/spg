@@ -989,6 +989,61 @@ mod ascii_shortcut_tests {
         }
     }
 
+    /// v7.38.23 — the sixteen-byte path, which the five assertions
+    /// below it never reach.
+    ///
+    /// `is_ascii_alnum_lower` now walks sixteen bytes at a time with a
+    /// remainder, and every existing case for it is shorter than one
+    /// chunk: `"a b"`, `"a0z"`, `"A"`, `"é"`, `""`. They exercise the
+    /// remainder and nothing else, so a chunk loop that answered
+    /// anything at all would have passed them. This walks a bad byte
+    /// across a chunk boundary and back.
+    ///
+    /// The reference is the definition itself rather than a hand-written
+    /// expectation: `[0-9a-z]` on every byte, asked one byte at a time.
+    /// The chunking's only job is to agree with it.
+    #[test]
+    fn the_chunked_walk_agrees_with_the_definition_at_every_length() {
+        let plain = |s: &str| {
+            s.as_bytes()
+                .iter()
+                .all(|&c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        };
+        // Lengths either side of one chunk, two chunks, and three.
+        for len in [0usize, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 192] {
+            let all_good: alloc::string::String = (0..len).map(|i| ALPHABET[i % 36]).collect();
+            assert_eq!(
+                is_ascii_alnum_lower(&all_good),
+                plain(&all_good),
+                "len {len}, every byte in the alphabet"
+            );
+            assert!(is_ascii_alnum_lower(&all_good), "len {len} is all alphabet");
+
+            // One byte outside it, at every position in turn.
+            for bad_at in 0..len {
+                for bad in ['A', ' ', '_', '{', '/'] {
+                    let mut v: alloc::vec::Vec<char> = all_good.chars().collect();
+                    v[bad_at] = bad;
+                    let t: alloc::string::String = v.into_iter().collect();
+                    assert_eq!(
+                        is_ascii_alnum_lower(&t),
+                        plain(&t),
+                        "len {len}, `{bad}` at {bad_at}"
+                    );
+                    assert!(
+                        !is_ascii_alnum_lower(&t),
+                        "len {len}: `{bad}` at {bad_at} is not in the alphabet"
+                    );
+                }
+            }
+        }
+    }
+
+    const ALPHABET: [char; 36] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+        'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    ];
+
     /// The shortcut only fires when BOTH operands are in the alphabet,
     /// so a mixed column keeps the collator where it needs it. Under
     /// `en_US` a capital sorts among the lowercase letters, which bytes
