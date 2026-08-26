@@ -1,7 +1,13 @@
 # SPG drop-in acceptance report
 
-- image: `goliakk/spg:7.38.22`
+- image: `goliakk/spg:7.38.24`
 - panel cases: 71  (pass 71  / fail 0)
+
+This report describes the image named above and nothing else. The
+root copy is rewritten by each release train AFTER the tag is cut,
+so a checkout of tag `vX.Y.Z` carries the previous release's copy;
+the record for a given release is
+`scripts/dropin-acceptance-report-vX.Y.Z.md`.
 
 **Verdict: PASS — every probed PG dialect feature lands on this SPG image.**
 
@@ -84,5 +90,7 @@
 ## Reproducer
 
 ```bash
-scripts/dropin-acceptance.sh --image goliakk/spg:7.38.22 --port 25433
+scripts/dropin-acceptance.sh --image goliakk/spg:7.38.24 --port 25433 \
+  --fixture scripts/fixtures/mailrs-pg-extensions.sql \
+  --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql
 ```
