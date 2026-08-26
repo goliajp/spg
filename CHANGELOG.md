@@ -96,14 +96,21 @@ the current build; this file is a release-organized view.
   v7.38.18 regression that cost twenty-six times. A bar set for 26x does
   not stop 2.70x.
 
-- **The pin written for v7.38.22's headline holds four rows and never
-  sets `work_mem`.**
+- **Both pins written for v7.38.22 hold four rows, and four rows enter
+  the spilling sorter without ever leaving it as a run.**
 
-  The defect was "a collation reaches only one of the two sort paths" and
-  the corpus pin for it fits in either path, so it exercised the
-  materialising sort twice. `e2e_collated_spill_agrees_v73823` is the
-  same question at 20,000 rows under `work_mem = 64`, with the spill
-  witnessed by `temp_files` before the answers are compared at all.
+  There are two — a corpus file and `e2e_collated_spill_sort`, which does
+  reach the streaming sorter and asserts `apple` before `Banana` on it.
+  What neither reaches is the MERGE. Four rows fit in the sorter's
+  in-memory batch, so `sorted_order` runs and `finish` never re-derives a
+  key from a run — and re-derivation is the whole of this release's
+  defect. That is also why the v7.38.22 headline WAS caught: a comparator
+  without collations spoils the batch sort too. This one does not touch
+  the batch.
+
+  `e2e_collated_spill_agrees_v73823` is the same question at 20,000 rows
+  under `work_mem = 64`, with the spill witnessed by `temp_files` before
+  the answers are compared at all.
 
   Both of its halves were made to fail before it was trusted. Ablating
   the comparator's collations gives two different answers, first
