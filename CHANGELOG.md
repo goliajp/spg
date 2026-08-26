@@ -237,8 +237,15 @@ not fixed here.
   visible consequence for anything that reads it; the explicit-`COLLATE`
   path is a real gap and not a follow-up's size. Recorded for a decision.
 
-  Also found alongside: the MySQL wire rejects the introducer form
-  `_utf8mb4'a'` that MySQL accepts.
+  Also found alongside: the MySQL wire rejects character-set
+  introducers, and the first write-up said `_utf8mb4'a'` because that is
+  the only one that had been tried. All four tested now fail with
+  `ERROR 1064 syntax error` where MySQL 9.7.1 answers `a`:
+
+      _utf8mb4'a'    _binary'a'    N'a'    _utf8'a'
+
+  `N'…'` is the SQL-standard national-string literal, not a MySQL
+  extension, so the gap is wider than "an introducer form".
 
 - **`gate.sh dogfood --full` is red, and no release battery runs it.**
 
@@ -345,13 +352,12 @@ not fixed here.
 
 - **Only two of the sort panel's nine cells reach the spilling sort.**
 
-  Measured with `temp_files` as the witness, one cell at a time: **six**
-  of the seven `sort only, …` cells — each a `count(*)` over a sorted
-  subquery — move the counter by zero, and the two row-returning cells
-  move it by 230 files each. The seventh, `sort only, two keys`, was not
-  measured; it is the same `count(*)` shape as the six, so it is very
-  probably the same, and this sentence says which part is measured and
-  which is inferred.
+  Measured with `temp_files` as the witness, one cell at a time: all
+  seven `sort only, …` cells — each a `count(*)` over a sorted subquery —
+  move the counter by zero, and the two row-returning cells move it by
+  230 files each. (Six were measured first and the seventh,
+  `sort only, two keys`, was written up as inferred from the shape;
+  it was measured afterwards and reads +0 like the rest.)
 
   A `count(*)` wrapper takes a different plan, and the plan it takes is
   the materialising sort. So the panel that exists to isolate sort cost
