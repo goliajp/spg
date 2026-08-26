@@ -212,16 +212,22 @@ not fixed here.
   itself. `('a' COLLATE utf8mb4_general_ci) = 'a '` answers 0 where both
   MySQL and MariaDB answer 1.
 
-  Alongside it, one line: `@@collation_connection` and
-  `@@collation_server` are hardcoded to `utf8mb4_general_ci`
-  (`eval/functions.rs:15623`), a PAD SPACE name, while the session
-  behaves NO PAD and the handshake pushes collation id **255**
-  (`mysqlwire.rs:2626` and `:2651`, from `CHARSET_UTF8MB4 = 0xff`) —
-  which the constant's own comment calls "what MySQL 8.0+ servers
-  advertise by default", i.e. `utf8mb4_0900_ai_ci`. The byte is read
-  from the source; that it names that collation is the comment's claim
-  and this release did not re-measure it. Either way the variable is the
-  odd one out: it disagrees with the behaviour, which is measured.
+  Alongside it, one line, and the three sources disagree in a way that
+  is worth stating exactly. Asked of MySQL 9.7.1's own catalogue:
+
+      SELECT id, collation_name, pad_attribute FROM information_schema.collations
+        45   utf8mb4_general_ci    PAD SPACE
+       255   utf8mb4_0900_ai_ci    NO PAD
+
+  SPG's handshake pushes **255** (`mysqlwire.rs:2626` and `:2651`, from
+  `CHARSET_UTF8MB4 = 0xff`). Its session behaves **NO PAD**, measured
+  above. And `@@collation_connection` / `@@collation_server` answer
+  `utf8mb4_general_ci` — the name of **45** — because that string is
+  hardcoded at `eval/functions.rs:15623`.
+
+  So the wire says one collation, the behaviour agrees with it, and the
+  variable answers with the name of a different one whose pad attribute
+  is the opposite.
 
   Neither is fixed here. The variable is a one-line change with a
   visible consequence for anything that reads it; the explicit-`COLLATE`
