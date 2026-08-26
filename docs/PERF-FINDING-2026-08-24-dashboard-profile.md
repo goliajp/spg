@@ -14,7 +14,7 @@ tidy page.**
 
 Sentori's `dashboard: top versions`:
 
-```sql
+```sql no-run
 SELECT traits->>'version' AS v, count(*) FROM events
 WHERE project_id = 3 GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 10
 ```

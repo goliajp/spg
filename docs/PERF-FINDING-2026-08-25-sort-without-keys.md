@@ -6,7 +6,7 @@
 
 The release sweep's `sort only, long text distinct` cell:
 
-```sql
+```sql no-run
 SELECT count(*) FROM (SELECT s_long FROM s ORDER BY s_long) z
 ```
 

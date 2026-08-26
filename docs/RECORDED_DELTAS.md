@@ -69,7 +69,7 @@ years nobody will reach — which is why this row's condition is simply
 
 Three inserts, the middle one naming its own id:
 
-```sql
+```sql no-run
 INSERT INTO z1 (k)     VALUES ('a');
 INSERT INTO z1 (id, k) VALUES (50, 'b');
 INSERT INTO z1 (k)     VALUES ('c');
