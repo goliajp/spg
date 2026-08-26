@@ -22,9 +22,19 @@ the current build; this file is a release-organized view.
   place now — `orderby::inline_sort_key`, collation guards included,
   called by both sorters (`extsort.rs` and `orderby.rs`).
 
-  Its own commit puts the gain at "about 10%" and carries no measurement
-  of it; the numbers in that message belong to the half it did NOT fix.
-  Unverified here, and named as such rather than repeated as a figure.
+  Its own commit put the gain at "about 10%" and carried no measurement
+  of it — the numbers in that message belong to the half it did NOT fix.
+  Measured since, two binaries built from clean checkouts of the commit
+  and its parent, alternating, four pairs, both legs spilling identically
+  (`temp_files +115` each), `SELECT s FROM t ORDER BY s` on 400,000 rows
+  of 192-character hex under `C`:
+
+      parent (f50e07bc)   242.1 ms   (234.3-255.2)
+      with it            202.5      (193.1-203.7)
+      paired             0.806x     (0.798-0.864)
+
+  **19%, not 10%**, ranges not overlapping and all four pairs the same
+  way. The estimate in the commit was low.
 
   Third time in this series that a capability lived on one path and not
   its twin, and the entry below is the fourth: what this one did NOT fix
