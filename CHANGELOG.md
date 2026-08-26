@@ -75,6 +75,16 @@ the current build; this file is a release-organized view.
   overlaps neither: the second half is not a refinement of the first, it
   is the condition on shipping it.
 
+  Three numbers appear in this release for the same defect — 2.70x above,
+  2.91x here, 3.07x where the ceiling is discussed — and they are three
+  instruments, not a disagreement. 2.70x is two servers timed in
+  milliseconds on a quiet machine; 2.91x is one server, two alternating
+  queries, paired ratios, on a machine with someone else's work on it;
+  3.07x is the sweep's own panel with its own repetition count. Each says
+  where it came from where it is quoted. The one that decided anything is
+  the ratio, because it is the only one whose control shared the window
+  with the cell it judged.
+
   Two instrument errors, both caught by a witness rather than by
   suspicion. A leg with no `COLLATE` clause is not an uncollated leg —
   the database has one — and the first harness compared two collated legs
