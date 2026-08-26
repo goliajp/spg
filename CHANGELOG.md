@@ -8,6 +8,57 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Instruments
+
+- **The ten full-tier steps were run, once each.** The tier says it on
+  every run — *NOT RUN (10 full-tier step(s), no schedule runs these)* —
+  and against v7.38.22 three of them had something to say.
+
+  `doc-corpus` had six failures, all *relation does not exist*: SQL
+  fragments in findings and letters, executed as if they were runnable
+  examples. The runner has the marker for that and uses it elsewhere;
+  those six blocks never carried it, and nothing ran the step that would
+  have said so.
+
+  `deep-tier` went red in `perm-runner`'s `server_extended` permutation,
+  five failures of one kind. The engine was not involved: both SPG and
+  PostgreSQL 18.4 render a boolean as `t` in text on BOTH protocols,
+  measured on each. The harness disagreed with itself — the embedded
+  renderer turned `Value::Bool` into 1/0 whatever the declared type
+  letter said, while the wire renderer normalised only for a column
+  declared `B`. Two fixtures declared a boolean `T`. They now say `B`.
+
+  And `isolation`, `generative` and `doc-corpus` could not be run by
+  `suite-run step <name>` at all, though that subcommand exists for
+  *negative controls that must red a single step in isolation*. Three of
+  ten could not. They can now.
+
+  On a quiet box the tier then passed **end to end for the first time**:
+  19 steps, `SUITE EXIT=0`. `perf-sweep` 64 cells, no losses, worst
+  1.51x. `perm-matrix` 6155/0. `isolation` 7 specs. `generative` 10,000
+  statements, no divergence. `pgbench` 1689.5 tps against PostgreSQL
+  18's 1099.9.
+
+- **Two findings from the first run were re-measured and one of them was
+  wrong.** `sysbench` read SPG at 371.37/s against MySQL's 500.34/s
+  mid-tier, which was recorded as a loss. Run standalone six times: SPG
+  median **581.6**, MySQL **583.7** — 0.4% apart, inside spreads of 6-12%
+  — and the clean full-tier run reads 597.6 against 619.4. The 371 was a
+  contended window, which its own number gave away: SPG measures 563-596
+  when nothing else runs, with a 0.35% spread.
+
+  `parallel_freezer`'s speedup judge read 1.16-1.33x mid-tier against a
+  1.4x floor. Standalone across seven runs: 1.53-2.32x. The whole
+  `perf_gate` binary with the tier's own arguments on a quiet box: 56
+  passed, that test at 2.27x. And the clean tier run passes it. No
+  reproducible failure — recorded rather than acted on.
+
+  A number taken while a tier is running is a number about the queue.
+
+---
+
 ## [7.38.22] — 2026-08-26
 
 A collation that only reached one of the two sorts, an image default
