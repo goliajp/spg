@@ -43,12 +43,12 @@ SELECT arf_vk('4.10.0')
 ----
 {4,10,0,0}
 
-query T
+query B
 SELECT arf_vk('4.10.0') >= arf_vk('4.2')
 ----
 1
 
-query T
+query B
 SELECT arf_vk('4.2') >= arf_vk('4.10.0')
 ----
 0
