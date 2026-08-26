@@ -96,6 +96,25 @@ the current build; this file is a release-organized view.
   v7.38.18 regression that cost twenty-six times. A bar set for 26x does
   not stop 2.70x.
 
+- **WITHDRAWN: "the spilling path buys no memory under a collation".**
+
+  It does, and it buys the same amount either way. Peak RSS over the
+  sort, sampled against the server process, with `temp_files` naming
+  which runs actually spilled:
+
+                              spilling (4 MB)   in memory (4 GB)
+      no collation                 +26 MB           +252 MB
+      en_US.utf8                   +20 MB           +251 MB
+
+  and on the shipped binary, which is where the claim came from,
+  +25 MB and +20 MB — the same two numbers. The path saves about 230 MB
+  and the collation costs nothing in memory on either build.
+
+  The original reading came from the streaming-on/streaming-off ablation
+  whose profiling binary turned out to be a stale ablated build. This is
+  the last of that session's conclusions to be checked, and like the
+  others it does not survive.
+
 - **The locale panel's sort ceiling is 2.0x, and both sides of it were
   measured.**
 
