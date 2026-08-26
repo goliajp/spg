@@ -10,6 +10,15 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+The bill v7.38.22's own fix sent, and paying it. Declaring a collation
+cost 2.36x on the image's own default, with nothing declared on the
+customer's side; it costs nothing now, and on that same default a text
+sort that returns its rows runs about twice as fast as PostgreSQL 18.
+Four gates that could not see the thing they are named for, one of them
+in the same release that added it. And a collation name on the MySQL
+wire that still promises what its comparison does not do — found here,
+not fixed here.
+
 ### Fixed
 
 - **The spilled sorter's inline key takes text, which it never did.**
