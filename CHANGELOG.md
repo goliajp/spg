@@ -96,6 +96,33 @@ the current build; this file is a release-organized view.
   v7.38.18 regression that cost twenty-six times. A bar set for 26x does
   not stop 2.70x.
 
+- **Which releases this costs, taken from the images rather than from
+  the source.**
+
+  Default `datcollate`, each published image started with no environment
+  of its own: 7.37.27, 7.38.1, 7.38.7, 7.38.17 and 7.38.21 all answer
+  `C`. 7.38.22 answers `en_US.utf8` — the release that put `LANG` in the
+  image so a new database collates the way `postgres:18` does.
+
+  What that costs, measured inside each image with an explicit
+  `COLLATE` as the second leg so both legs share one window:
+
+      7.38.21   first value of a spilling collated sort   Banana000001   (bytes: WRONG)
+                collated / uncollated                     0.96x          (free, unapplied)
+      7.38.22   first value                               apple000004    (correct)
+                collated / uncollated                     2.38x  (2.33-2.54)
+
+  And on 7.38.22's own default configuration, where the customer has
+  declared nothing at all, a bare `SELECT s FROM t ORDER BY s` against
+  the same sort under `COLLATE "C"`:
+
+      2.36x  (2.02-2.44)
+
+  So the shape of it: through 7.38.21 a declared collation was ignored by
+  this path and therefore free; 7.38.22 made it correct and made it the
+  default in the same release, and the bill arrives without anyone asking
+  for it. This release keeps the answer and takes the bill to 1.32x.
+
 - **A new pin file arrives on the testbed untracked, and every selector
   in the tier is a diff.**
 
