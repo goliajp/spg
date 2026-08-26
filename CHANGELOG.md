@@ -12,6 +12,39 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **The spilled sorter's inline key takes text, which it never did.**
+
+  `ExternalSorter::sorted_order` had two inline paths and both were
+  integer-only: one exact key for a single ORDER BY term, one first-key
+  permutation for several. Neither took text, so a spilled
+  `ORDER BY <text>` compared whole strings on every comparison while the
+  materialising sort next door compared eight bytes. The rule is one
+  place now — `orderby::inline_sort_key`, collation guards included —
+  and worth about 10% on the shape.
+
+  Third time in this series that a capability lived on one path and not
+  its twin, and the entry below is the fourth: what this one did NOT fix
+  was the key the merge re-derives.
+
+  Its pin drives 200 strings through a spill with five shared eight-byte
+  prefixes, so both halves of the key have work to do; removing the
+  run-settling pass reddens it.
+
+- **The panel can see a text sort that returns its rows.**
+
+  Both panels reported no losses on a shape that loses. Every cell in
+  the endpoint panel sorted by an INT; every cell in the sort panel
+  wrapped its sort in `count(*)`, which takes the materialising plan. No
+  cell anywhere sorted TEXT on the path a plain `SELECT … ORDER BY`
+  takes — the streaming one, which is the one a customer's query uses.
+
+      text key, rows returned        213.5-218.1 ms  vs PG 166.4-202.0   1.28x
+      text key desc, rows returned   220.7-227.4 ms  vs PG 161.8-206.6   1.36x
+
+  Those two cells are what caught everything else in this release. See
+  also the finding below: seven of the sort panel's nine cells still
+  never spill, because a `count(*)` wrapper is still what they are.
+
 - **The spilling sort re-derived its keys, and the half that re-derived
   them was passed no collation at all.**
 
