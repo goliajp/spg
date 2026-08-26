@@ -185,40 +185,46 @@ not fixed here.
 
 ### Findings
 
-- **FOUND, NOT FIXED — on the MySQL wire a collation's name says PAD
-  SPACE and the comparison is NO PAD.**
+- **FOUND, NOT FIXED — an explicit `COLLATE` on an expression does not
+  reach the padding rule, and one variable reports a name that
+  contradicts the wire.**
 
-  Found by taking this release's own question — one declaration, two
-  subsystems, only one honouring it — to the other dialect. Every leg
-  states its collation explicitly, because the pad attribute lives in the
-  collation's NAME:
+  Written up first as "SPG treats every MySQL collation as NO PAD",
+  which reading the code and measuring properly cut down to something
+  much narrower. Recorded at its real size:
 
-      ('a' COLLATE utf8mb4_general_ci) = 'a '
-        MySQL 9.7.1        1        (PAD SPACE)
-        MariaDB 11.8.8     1
-        SPG 7.38.22        0
+      count of rows matching s = 'a' over {'a', 'a '}
+        column COLLATE utf8mb4_general_ci    SPG 2   MySQL 9.7.1 2   PAD, agreed
+        column COLLATE utf8mb4_0900_ai_ci    SPG 1                   NO PAD, agreed
+        bare literal 'a' = 'a '              SPG 0                   session default
+        ('a' COLLATE utf8mb4_general_ci)='a '  SPG 0   MySQL 1       <- the gap
 
-  Across MySQL's three: `general_ci` 1, `0900_ai_ci` 0, `bin` 1 — only
-  the `_0900_` family is NO PAD. SPG answers 0 to all three.
+  `collate::pads_space` already carries the rule, and it was measured
+  rather than inferred: over the 838 collation names the two oracles
+  list, `NO PAD` holds exactly when the name is `binary` or contains
+  `_0900_` or `nopad`, with zero counter-examples. Every caller feeds it
+  a COLUMN's declared name. A comparison of two literals has no column,
+  so it takes the session default — and NO PAD is right there, because
+  SPG advertises MySQL 8.0, whose default `utf8mb4_0900_ai_ci` is NO
+  PAD. That part is deliberate and correct.
 
-  Bisected on the published images: 7.38.7 answers **1**; 7.38.17,
-  7.38.21 and 7.38.22 answer **0**. v7.38.17 introduced it, and its
-  reasoning was RIGHT — SPG advertises `8.0.35-spg`, MySQL 8.0's default
-  `utf8mb4_0900_ai_ci` is NO PAD, and the rule had been calibrated
-  against MariaDB. What did not move with the behaviour is the NAME:
-  `@@collation_connection` still answers `utf8mb4_general_ci`, which is
-  a PAD SPACE collation, and an explicit `COLLATE` of one is not honoured
-  either.
+  What has no path to `pads_space` is a name written in the query
+  itself. `('a' COLLATE utf8mb4_general_ci) = 'a '` answers 0 where both
+  MySQL and MariaDB answer 1.
 
-  Two separable repairs, neither made here: report
-  `utf8mb4_0900_ai_ci`, which costs nothing and makes the name, the
-  behaviour and the advertised version agree; or honour the pad attribute
-  of a named collation, which does not. This would be the second release
-  to move MySQL comparison semantics, and it is not part of finishing
-  v7.38.22 — recorded for a decision rather than taken.
+  Alongside it, one line: `@@collation_connection` and
+  `@@collation_server` are hardcoded to `utf8mb4_general_ci`, a PAD
+  SPACE name, while the handshake advertises collation id 255 —
+  `utf8mb4_0900_ai_ci` — and the session behaves NO PAD. The wire and
+  the behaviour agree with each other; only the variable disagrees with
+  both.
 
-  Also unfixed and found alongside it: the MySQL wire rejects the
-  introducer form `_utf8mb4'a'` that MySQL accepts.
+  Neither is fixed here. The variable is a one-line change with a
+  visible consequence for anything that reads it; the explicit-`COLLATE`
+  path is a real gap and not a follow-up's size. Recorded for a decision.
+
+  Also found alongside: the MySQL wire rejects the introducer form
+  `_utf8mb4'a'` that MySQL accepts.
 
 - **`gate.sh dogfood --full` is red, and no release battery runs it.**
 
