@@ -382,11 +382,34 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         roster2.reap_all();
         let _ = std::fs::remove_dir_all(&tmp2);
         // Both verdicts travel; the caller grades them separately.
-        match (r, shipped) {
-            (Ok(a), Ok(b)) => Ok(format!("{a}\n===SHIPPED-DEFAULT===\n{b}")),
-            (Err(e), _) => Err(e),
-            (Ok(a), Err(e)) => Ok(format!("{a}\n===SHIPPED-DEFAULT===\nFAILED: {e}")),
-        }
+        //
+        // v7.38.23 — a failing LOCALE run must not throw the shipped one
+        // away, which `(Err(e), _) => Err(e)` did.
+        //
+        // The sweep exits 1 on any loss (`(( LOSSES == 0 )) || exit 1`),
+        // and the locale panel is ALLOWED losses — `locale_panel_passes`
+        // grades the cost class, and its own CLEAN example carries
+        // `losses=3`. So the ordinary state of that panel makes `sh`
+        // return Err, and the shipped-default panel was discarded with
+        // it. Across this release's three tier runs: `losses=0` once and
+        // the panel reported `sort_worst=1.54x`; `losses=3` and
+        // `losses=1` the other two, and it reported nothing at all.
+        //
+        // The text is what matters, not the exit status: `sh` puts the
+        // command's own output into the error, and grading has always
+        // been done by EXTRACTING the verdict line, whose absence is the
+        // failure. So keep the text either way and always append the
+        // second panel.
+        let locale_text = match r {
+            Ok(a) | Err(a) => a,
+        };
+        let shipped_text = match shipped {
+            Ok(b) => b,
+            Err(e) => format!("FAILED: {e}"),
+        };
+        Ok(format!(
+            "{locale_text}\n===SHIPPED-DEFAULT===\n{shipped_text}"
+        ))
     })();
     // D20 — the sweep leg's peak RSS goes into the account, and the
     // manifest ceiling has teeth at reap.
@@ -518,28 +541,40 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     // reader cannot go. Run standalone the same panel is green
     // (`cells=16 losses=0 sort_worst=1.15x`), so the reason mattered and
     // is now lost.
-    let shipped_note = shipped_text
-        .as_deref()
-        .and_then(verdict_line)
-        .unwrap_or_else(|| match shipped_text.as_deref() {
-            Some(t) => {
-                let first = t
-                    .lines()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .unwrap_or("(empty)");
-                format!(
-                    "no verdict line; it said: {}",
-                    &first[..first.len().min(160)]
-                )
-            }
-            None => "no verdict line and no text at all".to_string(),
-        });
+    let shipped_note = verdict_or_first_line(shipped_text.as_deref());
     Ok(format!(
         "{verdict}; locale panel {locale_verdict}; shipped-default panel \
          (SPG en_US vs PG18 en_US, reported not judged) {shipped_note}; peak rss: {}",
         peak_note.join(", ")
     ))
+}
+
+/// The panel's verdict line, or — when there is none — the first thing
+/// the panel actually said.
+///
+/// v7.38.23 — the fallback used to be a fixed string pointing at "the
+/// step's output", which the report JSON does not keep: name, status,
+/// ms, budget_ms and nothing else. The text that arrives here carries
+/// the reason (`sh` puts `FAILED: {e}` in it) and throwing it away is
+/// how one run's reason was lost for good.
+fn verdict_or_first_line(text: Option<&str>) -> String {
+    let Some(t) = text else {
+        return "no verdict line and no text at all".to_string();
+    };
+    if let Some(v) = verdict_line(t) {
+        return v;
+    }
+    let first = t
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("(empty)");
+    // `chars`, not a byte slice: `&s[..160]` panics when byte 160 lands
+    // inside a multi-byte character, and what this prints is script
+    // output full of em-dashes. A fallback added to make a failure
+    // legible must not be the thing that crashes on it.
+    let head: String = first.chars().take(160).collect();
+    format!("no verdict line; it said: {head}")
 }
 
 /// v7.38.19 — what a locale-collation panel verdict must NOT say.
@@ -592,6 +627,40 @@ mod locale_panel_verdict_tests {
     use super::locale_panel_passes;
 
     const CLEAN: &str = "cells=16 losses=3 control_false_differences=0 withdrawn=0 sort_worst=2.32x sort_over_ceiling=0";
+
+    /// v7.38.23 — the fallback must survive the text it is there to
+    /// print.
+    ///
+    /// It took the first 160 BYTES of a line that is script output, and
+    /// this repository's script output is full of em-dashes: a cut
+    /// landing inside one panics, in the branch that only runs when
+    /// something has already gone wrong. Never seen, because it needs a
+    /// line over 160 bytes AND a character straddling the cut.
+    #[test]
+    fn the_no_verdict_fallback_does_not_panic_on_multibyte() {
+        // An em-dash every third character, so a byte cut at 160 lands
+        // inside one whatever the exact offset.
+        let line: String = core::iter::repeat("a—b").take(200).collect();
+        let got = super::verdict_or_first_line(Some(&line));
+        assert!(got.starts_with("no verdict line; it said: "));
+        // 160 CHARACTERS kept, not bytes.
+        let head = got.trim_start_matches("no verdict line; it said: ");
+        assert_eq!(head.chars().count(), 160);
+
+        // And the ordinary shapes still answer the way they did.
+        assert_eq!(
+            super::verdict_or_first_line(None),
+            "no verdict line and no text at all"
+        );
+        assert_eq!(
+            super::verdict_or_first_line(Some("FAILED: leg refused\nmore")),
+            "no verdict line; it said: FAILED: leg refused"
+        );
+        assert_eq!(
+            super::verdict_or_first_line(Some("noise\ncells=16 losses=0 x\ntail")),
+            "cells=16 losses=0 x"
+        );
+    }
 
     #[test]
     fn a_few_percent_on_the_shapes_is_not_a_cost_class_change() {
