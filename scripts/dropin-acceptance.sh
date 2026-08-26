@@ -549,6 +549,20 @@ TOTAL=$((PASS_COUNT + FAIL_COUNT))
   echo "- image: \`$IMAGE\`"
   echo "- panel cases: $TOTAL  (pass $PASS_COUNT  / fail $FAIL_COUNT)"
   echo ""
+  # v7.38.23 — say which image this describes, loudly, because the copy
+  # of this file at the repository root lags a release.
+  #
+  # The train pushes the image, then runs this panel, then a human checks
+  # the report in on develop — all after the tag. So a checkout of tag
+  # vX.Y.Z carries the report for X.Y.(Z-1), and reads as a mistake. It is
+  # not; the record is the versioned file, and the header above names the
+  # image either way.
+  echo "This report describes the image named above and nothing else. The"
+  echo "root copy is rewritten by each release train AFTER the tag is cut,"
+  echo "so a checkout of tag \`vX.Y.Z\` carries the previous release's copy;"
+  echo "the record for a given release is"
+  echo "\`scripts/dropin-acceptance-report-vX.Y.Z.md\`."
+  echo ""
   if [ "$FAIL_COUNT" -eq 0 ]; then
     echo "**Verdict: PASS — every probed PG dialect feature lands on this SPG image.**"
   else
