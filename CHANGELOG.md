@@ -13,7 +13,7 @@ the current build; this file is a release-organized view.
 The bill v7.38.22's own fix sent, and paying it. Declaring a collation
 cost 2.36x on the image's own default, with nothing declared on the
 customer's side; it costs nothing now, and on that same default a text
-sort that returns its rows runs about twice as fast as PostgreSQL 18.
+sort that returns its rows runs in 0.57x of PostgreSQL 18's time.
 Four gates that could not see the thing they are named for, one of them
 in the same release that added it. And a collation name on the MySQL
 wire that still promises what its comparison does not do — found here,
@@ -519,7 +519,8 @@ not fixed here.
       cells=16 losses=0 control_false_differences=0 sort_worst=1.15x
 
   **On the configuration a customer runs, a text sort that returns its
-  rows is now about twice as fast as PostgreSQL 18.** The same panel read
+  rows now takes 0.57x of PostgreSQL 18's time** — 1.75x faster, which is
+  not the same as "twice" and is not being rounded to it. The same panel read
   `sort_worst=1.54x` before the last of this release's three changes.
 
   One run of it inside the tier reported no verdict line at all, and the
