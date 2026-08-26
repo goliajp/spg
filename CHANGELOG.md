@@ -241,7 +241,10 @@ the current build; this file is a release-organized view.
 
   Four further runs of the fixed build whose own control did not fire
   read 1.27x, 1.30x, 1.35x, 1.44x. Worst trustworthy green 1.44, bar 2.0,
-  defect 3.07. Only the locale panel moves; the PostgreSQL panel keeps
+  defect 3.07. Those are the readings the bar was chosen from; the
+  sixteen-byte walk below lands after it, and the same panel then reads
+  1.08x and 1.32x, so the margin the bar ships with is wider than the one
+  it was set against. Only the locale panel moves; the PostgreSQL panel keeps
   3.0x, because a text sort may legitimately cost a multiple against
   another engine while a binary against ITSELF under a collation that
   orders the data exactly as bytes do should cost almost nothing.
