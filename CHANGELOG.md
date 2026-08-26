@@ -499,6 +499,14 @@ the current build; this file is a release-organized view.
   letter said, while the wire renderer normalised only for a column
   declared `B`. Two fixtures declared a boolean `T`. They now say `B`.
 
+  The deeper repair — making `render_cell` honour the type letter — was
+  tried and reverted, and that is worth writing down because it is the
+  one a reader would reach for. It reddens `mysql/02_int_types`,
+  `mysql/10_tinyint1_int_coerce` and `duckdb/19_having_and_show`, where
+  `1`/`0` is the DIALECT-correct rendering and `t` would be wrong.
+  Getting it right means teaching the renderer which dialect it serves.
+  Still open, and larger than a released version's follow-up should be.
+
   And `isolation`, `generative` and `doc-corpus` could not be run by
   `suite-run step <name>` at all, though that subcommand exists for
   *negative controls that must red a single step in isolation*. Three of
