@@ -47,6 +47,13 @@ the current build; this file is a release-organized view.
   25 for legs whose queries take 234 ms and 630 ms — the count was
   measuring psql, not the server.
 
+  A second error compounded it: `prof_on` / `prof_off` were taken from a
+  binary that already carried this release's extsort change, and
+  `profE` / `profF` from one that did not. Different inlining, different
+  symbol sets — and the missing symbols read as the analyser
+  contradicting itself. Profiles taken across a code change are not
+  comparable by symbol; the analyser was fine.
+
   The ablation above is unaffected: it times the query inside an open
   session and alternates two stamped binaries.
 
