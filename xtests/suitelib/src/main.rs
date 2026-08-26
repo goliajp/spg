@@ -34,6 +34,33 @@ fn main() {
                 "sql2016" => suitelib::steps::sql2016(root),
                 "pgbench" => suitelib::steps::pgbench(root, &runid),
                 "sysbench" => suitelib::steps::sysbench(root, &runid),
+                // v7.38.22 — these three were reachable only from inside a
+                // tier run, which is the one place `step` exists to avoid.
+                //
+                // Its own comment says it is "for debugging and for
+                // negative controls that must red a single step in
+                // isolation", and three of the ten full-tier steps could
+                // not be run that way. It cost a full-tier run to find
+                // out: `deep-tier` failed, everything after it skipped,
+                // and `isolation` and `generative` could not be reached
+                // any other way.
+                "isolation" => {
+                    suitelib::isolib::run_all(root, std::path::Path::new("xtests/isolation"), false)
+                }
+                "generative" => suitelib::steps::generative(root, &runid),
+                "doc-corpus" => std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg("cargo run -q --release -p sqllogictest -- --docs")
+                    .current_dir(root)
+                    .status()
+                    .map_err(|e| format!("spawn docs corpus: {e}"))
+                    .and_then(|st| {
+                        if st.success() {
+                            Ok("docs corpus green".to_string())
+                        } else {
+                            Err(format!("docs corpus exited {st}"))
+                        }
+                    }),
                 other => Err(format!("unknown internal step {other}")),
             };
             match out {
