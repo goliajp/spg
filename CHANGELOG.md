@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.38.22] — 2026-08-26
 
 A collation that only reached one of the two sorts, an image default
 held back for two releases because of it, and three release gates that
