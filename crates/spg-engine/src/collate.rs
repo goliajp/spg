@@ -469,17 +469,40 @@ pub(crate) fn is_supported(collation: &str) -> bool {
 /// there scanned 2.8 GB and cost more than the ICU calls it replaced
 /// (1635.5 ms with keys, 1421.2 with the check in the comparator, and
 /// the whole point was to get well under both).
-pub(crate) const fn is_ascii_alnum_lower(s: &str) -> bool {
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if !(c.is_ascii_digit() || c.is_ascii_lowercase()) {
+pub(crate) fn is_ascii_alnum_lower(s: &str) -> bool {
+    // v7.38.23 — sixteen bytes at a time, and branchless inside the
+    // sixteen.
+    //
+    // This walk IS the collation's remaining cost on text that the
+    // collation orders exactly as bytes do. Priced by ablation: with the
+    // whole function replaced by `true`, every cell of the locale panel
+    // collapses to 0.91-1.03x and its worst reading goes 1.31x -> 1.03x.
+    // Nothing else measurable is left in it, which also bounds what this
+    // can win.
+    //
+    // The byte-at-a-time loop it replaces returned early, and an early
+    // return is what stopped it vectorising. On the shape that pays —
+    // 192 characters, every one of them in the alphabet — there is
+    // nothing to return early FROM: the answer is only known at the last
+    // byte. Chunking keeps a bounded early exit for the values that do
+    // fail (at most fifteen bytes past the first bad one) and lets the
+    // inner sixteen fold without a branch.
+    //
+    // `wrapping_sub` rather than two comparisons: a byte below `'0'`
+    // wraps to something large and fails the `< 10` on its own, so each
+    // range costs one subtract and one compare.
+    let in_alphabet = |x: u8| (x.wrapping_sub(b'0') < 10) | (x.wrapping_sub(b'a') < 26);
+    let (chunks, rest) = s.as_bytes().as_chunks::<16>();
+    for c in chunks {
+        let mut ok = true;
+        for &x in c {
+            ok &= in_alphabet(x);
+        }
+        if !ok {
             return false;
         }
-        i += 1;
     }
-    true
+    rest.iter().all(|&x| in_alphabet(x))
 }
 
 /// v7.38.22 — whether a collation may be attached to this type at all.
