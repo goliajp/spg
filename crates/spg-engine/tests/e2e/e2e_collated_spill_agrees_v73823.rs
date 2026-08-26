@@ -59,7 +59,10 @@ fn ok(e: &mut Engine, sql: &str) {
 
 fn counter(e: &mut Engine, which: &str) -> u64 {
     let sql = format!("SELECT {which} FROM pg_stat_database");
-    match e.execute(&sql).unwrap_or_else(|err| panic!("{sql}: {err:?}")) {
+    match e
+        .execute(&sql)
+        .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
+    {
         spg_engine::QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
             Value::BigInt(n) => u64::try_from(*n).unwrap(),
             other => panic!("{sql}: unexpected {other:?}"),
@@ -103,11 +106,7 @@ fn loaded() -> Engine {
             if i > 0 {
                 sql.push(',');
             }
-            sql.push_str(&format!(
-                "({n},'{}{n:06}{}')",
-                words[n % 4],
-                "y".repeat(50)
-            ));
+            sql.push_str(&format!("({n},'{}{n:06}{}')", words[n % 4], "y".repeat(50)));
         }
         ok(&mut e, &sql);
     }
