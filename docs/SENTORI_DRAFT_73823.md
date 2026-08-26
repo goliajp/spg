@@ -83,7 +83,8 @@ Our panel compares us against PostgreSQL 18.4 with **both sides under
     text key, rows returned        us 170.8-174.4 ms   PG18 301.6-321.1   0.57x
     text key desc, rows returned   us 172.2-175.4      PG18 293.8-406.8   0.59x
 
-**About twice as fast**, on the shape this release was about. The worst
+**0.57x and 0.59x of PostgreSQL 18's time** — 1.75x and 1.69x faster.
+On the shape this release was about. The worst
 cell in that panel reads 1.15x, against 1.54x before the last of the
 three changes.
 
