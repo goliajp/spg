@@ -381,6 +381,24 @@ SORT_SHAPES=(
   # and no cell could say so.
   'sort only, long text, key not projected|SELECT count(*) FROM (SELECT id FROM @S@ ORDER BY s_long) z'
   'sort only, long text top-N|SELECT count(*) FROM (SELECT s_long FROM @S@ ORDER BY s_long LIMIT 10) z'
+  # v7.38.22 — the same sort, on the OTHER implementation.
+  #
+  # Every cell above wraps the sort in `count(*)`, which takes the
+  # materialising sort. A plain `SELECT … ORDER BY` that returns its rows
+  # takes the streaming one — a different implementation, and the one a
+  # customer's query uses. Nothing in either panel covered it: the
+  # endpoint panel's eight cells all sort by `k`, an INT, so no cell
+  # anywhere sorted TEXT on the path that returns rows.
+  #
+  # What that hid, measured before this cell existed: 211.9 ms against
+  # PostgreSQL 18.4's 162.6 ms — 1.30x, with both panels reporting no
+  # losses. It is also the path where v7.38.22 found a declared collation
+  # being ignored outright, which no cell could have caught either.
+  #
+  # These two carry the send as well as the sort. That is the point: it
+  # is what the query costs.
+  'text key, rows returned|SELECT s_long FROM @S@ ORDER BY s_long'
+  'text key desc, rows returned|SELECT s_long FROM @S@ ORDER BY s_long DESC'
 )
 
 SHAPES=(
