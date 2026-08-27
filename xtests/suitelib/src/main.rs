@@ -312,19 +312,43 @@ fn main() {
                 }
                 for (args, label) in prep {
                     let t_prep = std::time::Instant::now();
-                    let out = std::process::Command::new("cargo")
-                        .args(args)
-                        .current_dir(root)
-                        .status();
+                    // v7.38.25 — `--lib` is an error, not a no-op, when no
+                    // selected package has a lib target, and the affected
+                    // closure is often one bins-only crate.
+                    // `steps::unit_affected` has retried without it since
+                    // v7.38.2; this prepare, which runs first and exits the
+                    // tier on any failure, did not -- so a commit touching
+                    // only `spg-dogfood-replay` could not reach the step
+                    // that knows how to cope. Same defect, same repository,
+                    // fixed in one of the two places that has it.
+                    let run = |a: &[&str]| {
+                        std::process::Command::new("cargo")
+                            .args(a)
+                            .current_dir(root)
+                            .output()
+                    };
+                    let mut out = run(args);
+                    let no_lib = |o: &std::process::Output| {
+                        String::from_utf8_lossy(&o.stderr).contains("no library targets")
+                    };
+                    let mut retried = "";
+                    if matches!(&out, Ok(o) if !o.status.success() && no_lib(o)) {
+                        let without: Vec<&str> =
+                            args.iter().copied().filter(|a| *a != "--lib").collect();
+                        out = run(&without);
+                        retried = " (retried without --lib)";
+                    }
                     let took = t_prep.elapsed();
                     match out {
-                        Ok(st) if st.success() => println!(
-                            "prepare: {label} in {took:?} \
+                        Ok(o) if o.status.success() => println!(
+                            "prepare: {label}{retried} in {took:?} \
                              (outside every budget and the tier total)"
                         ),
-                        Ok(st) => {
+                        Ok(o) => {
+                            eprint!("{}", String::from_utf8_lossy(&o.stderr));
                             eprintln!(
-                                "prepare: {label} failed ({st}) — nothing below would mean anything"
+                                "prepare: {label} failed ({}) — nothing below would mean anything",
+                                o.status
                             );
                             std::process::exit(1);
                         }
