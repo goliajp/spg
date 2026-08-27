@@ -267,7 +267,7 @@ impl Engine {
         let mut rows: Vec<Row<'static>> = Vec::new();
         let canonical: &[(&str, &str)] = &[
             ("version", crate::MYSQL_SERVER_VERSION),
-            ("version_comment", "SPG dual-stack engine"),
+            ("version_comment", crate::MYSQL_VERSION_COMMENT),
             ("character_set_server", "utf8mb4"),
             (
                 "collation_server",
@@ -280,7 +280,24 @@ impl Engine {
             // the default regardless.
             ("sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
             ("time_zone", "SYSTEM"),
-            ("transaction_isolation", "REPEATABLE-READ"),
+            // v7.39 — the LIVE level, via the one function all three
+            // surfaces now ask. This held the literal `REPEATABLE-READ`
+            // (MySQL's default) while the engine ran read committed and
+            // `@@transaction_isolation` held a second literal saying so;
+            // `current_setting()` held a third on the PG side. One
+            // question, three hard-coded answers, two of them wrong —
+            // and the one a client is most likely to trust is the one
+            // that promises a snapshot it does not have.
+            //
+            // Whether the MySQL dialect should DEFAULT to REPEATABLE
+            // READ (MySQL 9.7.2 does; SPG implements RR — `transaction.rs`
+            // caches the BEGIN snapshot for RR/SERIALIZABLE) is a
+            // behavioural change with its own verification, tracked
+            // separately. Reporting truthfully does not wait on it.
+            (
+                "transaction_isolation",
+                self.current_isolation_level.as_mysql_str(),
+            ),
         ];
         for &(k, v) in canonical {
             rows.push(Row::new(alloc::vec![

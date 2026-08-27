@@ -1074,6 +1074,26 @@ impl IsolationLevel {
     /// LEVEL READ UNCOMMITTED; SHOW transaction_isolation` answers
     /// `read uncommitted`) and only BEHAVES as read committed; the old
     /// fold renamed the label too.
+    /// v7.39 — the MySQL display name, which is NOT the PG one: MySQL
+    /// hyphenates and upper-cases. Measured on MySQL 9.7.2 by setting
+    /// each level and reading `@@transaction_isolation` back:
+    /// `READ-UNCOMMITTED` / `READ-COMMITTED` / `REPEATABLE-READ` /
+    /// `SERIALIZABLE` (the last has no hyphen because it is one word).
+    ///
+    /// This exists so the two MySQL surfaces cannot drift: both
+    /// `SHOW VARIABLES` and `@@transaction_isolation` used to carry
+    /// their own hard-coded literal, and the literals disagreed —
+    /// one said `REPEATABLE-READ` while the engine ran read committed.
+    #[must_use]
+    pub fn as_mysql_str(self) -> &'static str {
+        match self {
+            Self::ReadUncommitted => "READ-UNCOMMITTED",
+            Self::ReadCommitted => "READ-COMMITTED",
+            Self::RepeatableRead => "REPEATABLE-READ",
+            Self::Serializable => "SERIALIZABLE",
+        }
+    }
+
     pub fn as_pg_str(self) -> &'static str {
         match self {
             Self::ReadUncommitted => "read uncommitted",
