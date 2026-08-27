@@ -20,10 +20,10 @@
       }
     ],
     "expected": {
-      "_comment": "Class C is the dashboard unread-CTE; PG18 baseline <100 ms cold per mailrs report. Initial budgets loose pending Phase A decomp + Phase B attack. Tighten to PG18 parity after fix lands.",
-      "cold_ms_max": 300,
-      "warm_ms_max": 200,
-      "p95_ms_max": 250
+      "_comment": "v7.38.25 -- measured at last, same as its Class B sibling. Three runs on an idle testbed, five re-extracted cold samples each: cold medians 3.44 / 3.44 / 3.45 ms (individual samples 3.23-4.98), p50 1.18 / 1.18 / 1.18, p95 1.21 / 1.23 / 1.21. The old cold 300 / warm 200 / p95 250 were 87x-207x that. p50 reading 1.18 three times running is what a hundred samples buys; cold gets more headroom than the ratio suggests because five samples of a millisecond-scale quantity do not.",
+      "cold_ms_max": 10,
+      "warm_ms_max": 3,
+      "p95_ms_max": 4
     }
   }
 }

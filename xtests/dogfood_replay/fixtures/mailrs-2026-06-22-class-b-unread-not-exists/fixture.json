@@ -20,10 +20,10 @@
       }
     ],
     "expected": {
-      "_comment": "Class B is the simplest of the three classes in the 4th recurrence (mailrs 2026-06-22). PG18 baseline: <100 ms cold per mailrs report. Initial baseline budget is loose pending real measurement; tighten after Phase A decomposition + Phase B attack lands.",
-      "cold_ms_max": 200,
-      "warm_ms_max": 100,
-      "p95_ms_max": 150
+      "_comment": "v7.38.25 -- measured at last. This fixture opened with loose budgets (cold 200 / warm 100 / p95 150) and a README that said they were 'pending real measurement'; the measurement is three runs on an idle testbed, five re-extracted cold samples each: cold medians 0.88 / 1.11 / 0.87 ms (individual samples 0.82-1.54), p50 0.50 / 0.48 / 0.48, p95 0.60 / 0.55 / 0.58. The old numbers were 200x-250x the measurement, which is the 'set five times too high catches nothing' failure c81f818b named, at forty times that. These are 3-5x instead: the x1.5 rule the suite budgets use does not carry down to sub-millisecond quantities, because scheduling jitter is absolute rather than relative -- 1.5x of 0.88 ms is 1.3 ms and the samples already reach 1.54. For scale, the mailrs report's PG18 baseline for this shape is ~100 ms cold, so 5 ms still leaves twenty times of it.",
+      "cold_ms_max": 5,
+      "warm_ms_max": 2,
+      "p95_ms_max": 3
     }
   }
 }

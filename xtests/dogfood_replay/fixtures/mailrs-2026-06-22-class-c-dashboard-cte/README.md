@@ -29,15 +29,17 @@ Shared with Track A — symlinked. SHA-256
 
 ## Budget posture
 
-Still the **loose** opening budgets, pending measurement. After decomp +
-attack, tighten to PG18 parity.
+Measured, at last. Three runs on an idle testbed with five re-extracted
+cold samples each: cold medians 3.44 / 3.44 / 3.45 ms, p50 1.18 three times
+running, p95 1.21 / 1.23 / 1.21. The opening budgets — cold 300, warm 200,
+p95 250 — were 87–207× that.
 
 <!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
 | Window | Budget |
 | --- | --- |
-| Cold (first iter) | ≤ 300 ms |
-| Warm median (p50) | ≤ 200 ms |
-| p95 | ≤ 250 ms |
+| Cold (first iter) | ≤ 10 ms |
+| Warm median (p50) | ≤ 3 ms |
+| p95 | ≤ 4 ms |
 <!-- /BUDGETS -->
 
 ## Workflow gates
