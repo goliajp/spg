@@ -259,11 +259,7 @@ impl Engine {
         };
         validate_known_guc(&pname, &pval)?;
         if is_local {
-            if self.in_transaction() {
-                let prior = self.session_param(&pname).map(String::from);
-                self.local_guc_saves.push((pname.clone(), prior));
-                self.set_session_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
-            }
+            self.set_local_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
         } else {
             self.set_session_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
         }
@@ -2693,14 +2689,10 @@ impl Engine {
                         let canon = self.canonicalize_timezone(s)?;
                         let local = local;
                         if local {
-                            if self.in_transaction() {
-                                let prior = self.session_param("timezone").map(String::from);
-                                self.local_guc_saves.push(("timezone".into(), prior));
-                                self.set_session_param(
-                                    "timezone".into(),
-                                    spg_sql::ast::SetValue::String(canon),
-                                );
-                            }
+                            self.set_local_param(
+                                "timezone".into(),
+                                spg_sql::ast::SetValue::String(canon),
+                            );
                         } else {
                             self.set_session_param(
                                 "timezone".into(),
@@ -2720,11 +2712,7 @@ impl Engine {
                 // (PG scopes it to the implicit single-statement txn), so
                 // it is dropped rather than persisted to the session.
                 if local {
-                    if self.in_transaction() {
-                        let prior = self.session_param(&name).map(String::from);
-                        self.local_guc_saves.push((name.clone(), prior));
-                        self.set_session_param(name, value);
-                    }
+                    self.set_local_param(name, value);
                 } else {
                     self.set_session_param(name, value);
                 }

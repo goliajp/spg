@@ -8,6 +8,69 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A MySQL session refused an oversized value in PostgreSQL's words.**
+  Named in 7.39.0's Known gaps and closed here. A driver branches on the
+  error code, not the prose, so `1264` and `22003` are the part that has
+  to be right. Six shapes now answer byte-identically to MySQL 9.7.2 —
+  code, SQLSTATE, wording and `at row N`:
+
+      TINYINT / INT / INT UNSIGNED / DECIMAL   1264 (22003) Out of range value
+      VARCHAR(3) / CHAR(3)                     1406 (22001) Data too long
+
+  Two vocabularies had one classifier between them. `mysql_fit_warning`
+  already knew which values do not fit — it is what a NON-strict session
+  consults before bending them — and the strict path did not consult it,
+  falling through to the generic engine error. The refusal is derived
+  from that same classifier now, so strict and non-strict can no longer
+  disagree about what "fits" means.
+
+  Four answers went against what the code suggested, and each is why a
+  line reads the way it does: strict does not reuse the warning's code
+  (the value that warns `1265` refuses as `1264`); `'12xy'` classifies
+  by the column's type rather than by the literal; the noun in the
+  message is not the type name and MySQL's own casing of it is
+  inconsistent, so the pins record it as found rather than as tidied;
+  and DECIMAL overflow is `1264`, not the `1265` its neighbours suggest.
+
+  Found alongside: SPG raised where MySQL clamps. A non-strict session
+  given `9999` into `DECIMAL(3,1)` now stores `99.9` as MySQL does,
+  which needed the bend to model `Numeric` at all — it previously did
+  not. The PostgreSQL dialect still answers in PostgreSQL's words.
+
+### Instruments
+
+- **`pins-current` saw one of seven e2e harnesses.** The step exists to
+  run the pins a commit touches. The commit adding the three MySQL
+  error-code pins above reported *no e2e pins touched — skipped* with
+  their file in its own staged diff.
+
+  The selector stripped one hard-coded prefix,
+  `crates/spg-engine/tests/e2e/`; every other merged harness fell
+  through. There are seven, and **879 pins** live in the six it could
+  not select — 560 of them the wire pins, which are what a customer's
+  driver actually reads back, plus the embedded (154), sqlx (77), sql
+  (50), embedded-tokio (25) and spgctl (13) harnesses.
+
+  This is the failure the function's own v7.38.19 note describes — *a
+  step named for this version's pins ... could not go red for any reason
+  a pin exists to catch* — repaired then for one harness and only one.
+  So the table is held to the tree by a pin rather than by care:
+  `every_e2e_harness_is_listed` walks the crates for `tests/e2e/main.rs`
+  and reddens both on a harness the table omits and on an entry with no
+  harness behind it. It found five of the six itself; I had gone looking
+  for the second.
+
+  Witnessed in both directions before it was believed: touching the wire
+  pin file now runs 39 pins where it ran none, breaking one of them
+  reddens the step, touching a `spg-sql` pin file runs 4, and each of
+  the two table ablations reddens and names what it is missing.
+
+---
+
 ## [7.39.0] — 2026-08-27
 
 Every defect in this release is one shape: **SPG told a session it held

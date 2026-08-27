@@ -833,6 +833,7 @@ mod e2e_set_config_unified;
 mod e2e_set_constraints_named_round308;
 mod e2e_set_constraints_pg_dump_compat;
 mod e2e_set_local;
+mod e2e_set_local_per_connection_v739;
 mod e2e_set_role_pg_dump_compat;
 mod e2e_set_session_characteristics_pg_dump_compat;
 mod e2e_setof_round65;
