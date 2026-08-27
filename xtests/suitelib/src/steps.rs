@@ -166,7 +166,37 @@ pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> 
 /// # Errors
 /// A failing pin, an unwired pin file, or a filter set that selects
 /// nothing while pin files were touched.
+/// Every merged e2e harness in the workspace, as (diff prefix, package).
+///
+/// A crate carrying `tests/e2e/main.rs` and missing from this table is
+/// a harness `pins-current` cannot see. There are seven, and the step
+/// saw one: 879 pins — the wire, the embedded and the driver ones —
+/// could not be selected by a step named for the pins a commit touches.
+/// `every_e2e_harness_is_listed` holds the table to the tree, so an
+/// eighth reddens instead of going quietly unrun.
+const HARNESSES: [(&str, &str); 7] = [
+    ("crates/spg-embedded-tokio/tests/e2e/", "spg-embedded-tokio"),
+    ("crates/spg-embedded/tests/e2e/", "spg-embedded"),
+    ("crates/spg-engine/tests/e2e/", "spg-engine"),
+    ("crates/spg-server/tests/e2e/", "spg-server"),
+    ("crates/spg-sql/tests/e2e/", "spg-sql"),
+    ("crates/spg-sqlx/tests/e2e/", "spg-sqlx"),
+    ("crates/spgctl/tests/e2e/", "spgctl"),
+];
+
 pub fn pins_current(root: &Path) -> Result<String, String> {
+    // v7.39 — SEVEN harnesses, not one. The selector used to strip a
+    // single hard-coded prefix, `crates/spg-engine/tests/e2e/`, so the
+    // 879 pins under the other six were invisible to a step named for
+    // "the pins this commit touches" — among them every wire pin, which
+    // is what a customer's driver actually reads back. The commit that
+    // added three MySQL error-code pins reported "no e2e pins touched
+    // — skipped" while their file sat in its own staged diff, which is
+    // how this was found; the table pin then found the other five.
+    //
+    // Same failure as the v7.38.19 note above — a step that could not
+    // go red for the reason it exists — repaired then for one harness
+    // and only one.
     // `d` excludes deletions: a removed file cannot be run, and naming
     // it as a filter would select nothing and read as the failure below.
     //
@@ -176,54 +206,78 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
     // had not asked to commit yet. A new pin file is seen the moment it
     // is staged, which is the moment it becomes part of a commit.
     let diff = sh(root, "git diff --name-only --diff-filter=d HEAD")?;
-    let mut mods: Vec<String> = Vec::new();
-    for f in diff.lines() {
-        let Some(rest) = f.strip_prefix("crates/spg-engine/tests/e2e/") else {
-            continue;
-        };
-        let Some(m) = rest.strip_suffix(".rs") else {
-            continue;
-        };
-        if m == "main" || m.contains('/') || mods.iter().any(|x| x == m) {
+
+    let mut touched = 0usize;
+    let mut ran_total = 0usize;
+    let mut notes: Vec<String> = Vec::new();
+
+    for (prefix, pkg) in HARNESSES {
+        let mut mods: Vec<String> = Vec::new();
+        for f in diff.lines() {
+            let Some(rest) = f.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some(m) = rest.strip_suffix(".rs") else {
+                continue;
+            };
+            if m == "main" || m.contains('/') || mods.iter().any(|x| x == m) {
+                continue;
+            }
+            mods.push(m.to_string());
+        }
+        if mods.is_empty() {
             continue;
         }
-        mods.push(m.to_string());
+        touched += mods.len();
+
+        // A pin file that `main.rs` does not declare is not compiled into
+        // the harness. It reviews as coverage and runs never.
+        let main_path = root.join(prefix).join("main.rs");
+        let main_rs = std::fs::read_to_string(&main_path)
+            .map_err(|e| format!("reading {}: {e}", main_path.display()))?;
+        let unwired: Vec<&String> = mods
+            .iter()
+            .filter(|m| !main_rs.contains(&format!("mod {m};")))
+            .collect();
+        if !unwired.is_empty() {
+            return Err(format!(
+                "pin file(s) not declared in {}main.rs, \
+                 so nothing in them runs: {unwired:?}",
+                prefix
+            ));
+        }
+
+        let filters = mods.join(" ");
+        let out = sh(
+            root,
+            &format!("cargo test -q -p {pkg} --test e2e -- {filters}"),
+        )?;
+        let ran: usize = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("test result: ok. "))
+            .filter_map(|l| l.split(' ').next())
+            .filter_map(|n| n.parse::<usize>().ok())
+            .sum();
+        // Per harness, not summed: a green engine run must not stand in
+        // for a server filter set that selected nothing.
+        if ran == 0 {
+            return Err(format!(
+                "{} pin file(s) touched under {prefix} but the filters \
+                 selected no tests: {mods:?}",
+                mods.len()
+            ));
+        }
+        ran_total += ran;
+        notes.push(format!("{pkg} {ran}"));
     }
-    if mods.is_empty() {
+
+    if touched == 0 {
         return Ok("no e2e pins touched — skipped".into());
     }
-    // A pin file that `main.rs` does not declare is not compiled into
-    // the harness. It reviews as coverage and runs never.
-    let main_rs = std::fs::read_to_string(root.join("crates/spg-engine/tests/e2e/main.rs"))
-        .map_err(|e| format!("reading the e2e main.rs: {e}"))?;
-    let unwired: Vec<&String> = mods
-        .iter()
-        .filter(|m| !main_rs.contains(&format!("mod {m};")))
-        .collect();
-    if !unwired.is_empty() {
-        return Err(format!(
-            "pin file(s) not declared in crates/spg-engine/tests/e2e/main.rs, \
-             so nothing in them runs: {unwired:?}"
-        ));
-    }
-    let filters = mods.join(" ");
-    let out = sh(
-        root,
-        &format!("cargo test -q -p spg-engine --test e2e -- {filters}"),
-    )?;
-    let ran: usize = out
-        .lines()
-        .filter_map(|l| l.strip_prefix("test result: ok. "))
-        .filter_map(|l| l.split(' ').next())
-        .filter_map(|n| n.parse::<usize>().ok())
-        .sum();
-    if ran == 0 {
-        return Err(format!(
-            "{} pin file(s) touched but the filters selected no tests: {mods:?}",
-            mods.len()
-        ));
-    }
-    Ok(format!("{ran} pin(s) over {} touched file(s)", mods.len()))
+    Ok(format!(
+        "{ran_total} pin(s) over {touched} touched file(s) ({})",
+        notes.join(", ")
+    ))
 }
 
 /// `perf-sweep` (S1.2) — the release-blocking endpoint sweep with its
@@ -1620,6 +1674,56 @@ mod datadir_choice_tests {
             );
         } else {
             assert_eq!(names.len(), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod harness_table_tests {
+    use std::path::Path;
+
+    /// v7.39 — the table must name every merged e2e harness there is.
+    ///
+    /// `pins-current` stripped ONE hard-coded prefix, so the 560 pins
+    /// under `crates/spg-server/tests/e2e/` were invisible to a step
+    /// named for the pins a commit touches: the commit adding three
+    /// MySQL error-code pins reported "no e2e pins touched — skipped"
+    /// with their file in its own staged diff.
+    ///
+    /// The rule, not a literal — a third harness added later reddens
+    /// this instead of quietly going unrun.
+    #[test]
+    fn every_e2e_harness_is_listed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let mut found: Vec<String> = std::fs::read_dir(root.join("crates"))
+            .expect("crates/")
+            .filter_map(Result::ok)
+            .filter(|e| e.path().join("tests/e2e/main.rs").exists())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        found.sort();
+        assert!(
+            !found.is_empty(),
+            "found no e2e harness at all — the walk is broken, not the table"
+        );
+        for pkg in &found {
+            assert!(
+                super::HARNESSES.iter().any(|(_, p)| p == pkg),
+                "{pkg} carries tests/e2e/main.rs but pins-current cannot see it; \
+                 add it to HARNESSES: {found:?}"
+            );
+        }
+        // And nothing listed that is not there, which would run as an
+        // empty filter set and read as a pass.
+        for (prefix, pkg) in super::HARNESSES {
+            assert!(
+                root.join(prefix).join("main.rs").exists(),
+                "HARNESSES names {pkg} at {prefix} and there is no main.rs there"
+            );
         }
     }
 }
