@@ -337,9 +337,27 @@ pub(crate) fn synth_information_schema_columns(
     // recover a column's length and unsigned-ness. It is appended only in
     // the MySQL dialect, so the view's shape stays PG's on a PG session
     // (a PG query naming `column_type` still errors, as it does in PG).
+    // v7.39 — and the charset a MySQL reflection reads to learn how a
+    // column compares. `SELECT CHARACTER_SET_NAME FROM
+    // information_schema.COLUMNS` errored with "column does not exist",
+    // so an ORM could not tell a case-insensitive column from a binary
+    // one. Measured on MySQL 9.7.2: character types report `utf8mb4`,
+    // and int, decimal, date, blob and varbinary report NULL.
+    //
+    // Its partner `collation_name` is NOT appended here: PG's own view
+    // already has that column, and a second one of the same name is
+    // simply not the one a query resolves to. The first attempt did
+    // exactly that, and the tell was a half-right answer — the charset
+    // filled in and the collation still NULL. The existing column
+    // answers in MySQL's terms on a MySQL session instead.
     let mut schema = schema;
     if mysql {
         schema.push(ColumnSchema::new("column_type", DataType::Text, false));
+        schema.push(ColumnSchema::new(
+            "character_set_name",
+            DataType::Text,
+            true,
+        ));
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
@@ -359,6 +377,7 @@ pub(crate) fn synth_information_schema_columns(
             if mysql {
                 row.values
                     .push(Value::text(crate::show::render_mysql_type(col)));
+                row.values.push(mysql_column_charset(col));
             }
             rows.push(row);
         }
@@ -387,6 +406,7 @@ pub(crate) fn synth_information_schema_columns(
             if mysql {
                 row.values
                     .push(Value::text(crate::show::render_mysql_type(col)));
+                row.values.push(mysql_column_charset(col));
             }
             rows.push(row);
         }
@@ -398,6 +418,51 @@ pub(crate) fn synth_information_schema_columns(
 /// views both come through here so the two can never describe the same
 /// column shape differently; `view_updatable` is None for a table and
 /// Some(writable) for a view column.
+/// What MySQL's `information_schema.COLUMNS` reports for a column's
+/// charset and collation.
+///
+/// v7.39 — character types carry the pair, everything else carries
+/// NULL for both (measured on MySQL 9.7.2 across int, decimal, date,
+/// blob and varbinary). A `COLLATE` clause is honoured when it names a
+/// collation MySQL knows; a PostgreSQL spelling falls back to the
+/// default rather than being echoed as a MySQL collation it is not.
+fn mysql_is_character_type(col: &ColumnSchema) -> bool {
+    matches!(
+        col.ty,
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_)
+    )
+}
+
+fn mysql_column_charset(col: &ColumnSchema) -> Value<'static> {
+    if !mysql_is_character_type(col) {
+        return Value::Null;
+    }
+    let declared = col
+        .collation_name
+        .as_deref()
+        .and_then(crate::collate::mysql_charset_of_collation);
+    Value::text(alloc::string::String::from(declared.unwrap_or("utf8mb4")))
+}
+
+/// What MySQL reports in `COLLATION_NAME`: the EFFECTIVE collation, not
+/// only a declared one. A `VARCHAR` with no `COLLATE` clause answers
+/// `utf8mb4_0900_ai_ci` there, where PG answers NULL for a column at its
+/// type's default. The two dialects disagree about the same column name
+/// on purpose, so each gets its own answer rather than a second column.
+fn mysql_column_collation(col: &ColumnSchema) -> Value<'static> {
+    if !mysql_is_character_type(col) {
+        return Value::Null;
+    }
+    match col.collation_name.as_deref() {
+        Some(n) if crate::collate::mysql_charset_of_collation(n).is_some() => {
+            Value::text(alloc::string::String::from(n))
+        }
+        _ => Value::text(alloc::string::String::from(
+            crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
+        )),
+    }
+}
+
 fn info_column_row(
     rel: &str,
     ordinal: i32,
@@ -564,9 +629,13 @@ fn info_column_row(
         // DDL needs the name it wrote. What must not overclaim is the
         // BEHAVIOUR, and round 679 makes that explicit instead — a
         // WARNING at CREATE TABLE saying the column is ordered by bytes.
-        match col.collation_name.as_deref() {
-            Some(n) => Value::text::<&str>(n),
-            None => Value::Null,
+        if mysql {
+            mysql_column_collation(col)
+        } else {
+            match col.collation_name.as_deref() {
+                Some(n) => Value::text::<&str>(n),
+                None => Value::Null,
+            }
         },
         Value::text::<&str>(udt),
         // v7.39 (round 248) — a SERIAL column is NOT identity in PG
@@ -721,8 +790,19 @@ pub(crate) fn synth_information_schema_tables(
 /// target connection.
 pub(crate) fn synth_information_schema_schemata(
     _cat: &Catalog,
+    mysql: bool,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+    // v7.39 — the columns a MySQL reflection reads off a schema.
+    // PostgreSQL 18.6 has `default_character_set_name` and leaves it
+    // NULL (measured), and has no `default_collation_name` at all;
+    // MySQL 9.7.2 answers `utf8mb4` and `utf8mb4_0900_ai_ci`. SPG
+    // presented PG's shape to both, so a MySQL client asking either got
+    // NULL or `column does not exist`.
+    //
+    // Appended in the MySQL dialect only, which is how `column_type`
+    // joins `information_schema.columns`: the view's shape stays PG's on
+    // a PG session.
+    let mut schema = alloc::vec![
         ColumnSchema::new("catalog_name", DataType::Text, false),
         ColumnSchema::new("schema_name", DataType::Text, false),
         ColumnSchema::new("schema_owner", DataType::Text, false),
@@ -731,39 +811,53 @@ pub(crate) fn synth_information_schema_schemata(
         ColumnSchema::new("default_character_set_name", DataType::Text, true),
         ColumnSchema::new("sql_path", DataType::Text, true),
     ];
-    let rows: Vec<Row<'static>> = alloc::vec![
-        // v7.39 (round 543) — this row carried TEN values against a
-        // seven-column schema. Round 543's width check at
-        // materialise_meta_view is what found it; nothing had, because
-        // a row is an untyped value list.
-        Row::new(alloc::vec![
-            Value::text("spg"),
-            Value::text("public"),
-            Value::text("admin"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]),
-        Row::new(alloc::vec![
-            Value::text("spg"),
-            Value::text("pg_catalog"),
-            Value::text("admin"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]),
-        Row::new(alloc::vec![
-            Value::text("spg"),
-            Value::text("information_schema"),
-            Value::text("admin"),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]),
-    ];
+    if mysql {
+        schema.push(ColumnSchema::new(
+            "default_collation_name",
+            DataType::Text,
+            true,
+        ));
+    }
+    // The charset name goes in the column PG already has, so a MySQL
+    // client reading `DEFAULT_CHARACTER_SET_NAME` finds it where MySQL
+    // puts it.
+    let charset = |mysql: bool| -> Value<'static> {
+        if mysql {
+            Value::text("utf8mb4")
+        } else {
+            Value::Null
+        }
+    };
+    let coll = |mysql: bool| -> Vec<Value<'static>> {
+        if mysql {
+            alloc::vec![Value::text(
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
+            )]
+        } else {
+            Vec::new()
+        }
+    };
+    // v7.39 (round 543) — a row here once carried TEN values against a
+    // seven-column schema. Round 543's width check at
+    // materialise_meta_view is what found it; nothing had, because a row
+    // is an untyped value list. Building the three rows from one shape
+    // is why the width can no longer drift per row.
+    let rows: Vec<Row<'static>> = ["public", "pg_catalog", "information_schema"]
+        .into_iter()
+        .map(|name| {
+            let mut vals = alloc::vec![
+                Value::text("spg"),
+                Value::text(name),
+                Value::text("admin"),
+                Value::Null,
+                Value::Null,
+                charset(mysql),
+                Value::Null,
+            ];
+            vals.extend(coll(mysql));
+            Row::new(vals)
+        })
+        .collect();
     (schema, rows)
 }
 

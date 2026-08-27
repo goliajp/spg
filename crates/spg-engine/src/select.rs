@@ -1433,6 +1433,7 @@ impl Engine {
                 "__spg_info_schemata" => {
                     let (schema, rows) = crate::system_catalog::synth_information_schema_schemata(
                         self.active_catalog(),
+                        self.backslash_escapes,
                     );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }

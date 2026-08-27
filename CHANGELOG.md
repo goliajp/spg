@@ -64,6 +64,36 @@ the current build; this file is a release-organized view.
   now, and the three writers that each asked the witness separately go
   through one place.
 
+- **A MySQL reflection could not read a column's charset or
+  collation.** `SELECT CHARACTER_SET_NAME FROM
+  information_schema.COLUMNS` errored with *column does not exist*, and
+  `COLLATION_NAME` answered NULL for every column that had no explicit
+  `COLLATE` — so an ORM reading those back could not tell a
+  case-insensitive column from a binary one.
+
+  Measured on MySQL 9.7.2, character types report `utf8mb4` and the
+  column's EFFECTIVE collation; int, decimal, date, blob and varbinary
+  report NULL for both. `information_schema.SCHEMATA` likewise reports
+  `utf8mb4` / `utf8mb4_0900_ai_ci` where SPG presented PostgreSQL's
+  shape with the field left NULL.
+
+  Both views gain their MySQL columns in the MySQL dialect only, which
+  is how `column_type` already joins `information_schema.columns`: a
+  PostgreSQL session's view keeps PG's shape and PG's answers, and the
+  pins check that direction too. `COLLATION_NAME` is the one place the
+  dialects disagree about a column they BOTH have — PG reports what the
+  DDL declared and NULL where it declared nothing, MySQL reports the
+  effective collation — so that column answers per dialect. The first
+  attempt appended a second column of the same name instead, and the
+  tell was a half-right answer: the charset filled in and the collation
+  still NULL, because a query resolves to the first of two.
+
+  A `COLLATE` clause naming a collation MySQL knows is reported as
+  declared. SPG also accepts PostgreSQL's spellings, and `C` is not a
+  collation MySQL has ever had, so those report the session default —
+  a true statement about how the column compares — rather than being
+  echoed as a MySQL collation they are not.
+
 - **A MySQL session read `"…"` as an identifier.** `SELECT "abc"`
   answered `ERROR 1054 column "abc" does not exist` where MySQL 9.7.2
   answers `abc`. SPG behaved as though `ANSI_QUOTES` were always in
@@ -120,10 +150,6 @@ Measured, not closed here, and written down rather than left implicit:
   `character_set_client`, `_connection`, `_results`, `_database`,
   `_server` — and all three `collation_*` now match MySQL 9.7.2 exactly
   under an identical handshake.
-- `information_schema.SCHEMATA` has no `DEFAULT_CHARACTER_SET_NAME` /
-  `DEFAULT_COLLATION_NAME`, and `information_schema.COLUMNS` no
-  `CHARACTER_SET_NAME` / `COLLATION_NAME`. Schema-reflection tools read
-  these.
 - A MySQL session's unknown-column error says `column "x" does not
   exist` where MySQL says `Unknown column 'x' in 'field list'`. The code
   (1054) and SQLSTATE (42S22) match; the wording does not, and it is the
