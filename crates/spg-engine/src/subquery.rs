@@ -391,7 +391,7 @@ impl Engine {
         mut memo: Option<&mut memoize::MemoizeCache>,
     ) -> Result<(), EngineError> {
         match e {
-            Expr::NamedArg { expr, .. } | Expr::Variadic(expr) => {
+            Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } | Expr::Variadic(expr) => {
                 self.resolve_correlated_in_expr(expr, row, ctx, cancel, memo.as_deref_mut())?;
             }
             Expr::AggregateOrdered { call, order_by, .. } => {
@@ -5186,7 +5186,7 @@ fn substitute_in_expr(
         }
     }
     match e {
-        Expr::NamedArg { expr, .. } => {
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
             substitute_in_expr(expr, row, ctx, outer_alias, cat, visible)
         }
         Expr::Variadic(expr) => substitute_in_expr(expr, row, ctx, outer_alias, cat, visible),
@@ -5334,7 +5334,7 @@ pub fn expr_tree_has_subquery(stmt: &SelectStatement) -> bool {
 
 pub(crate) fn expr_has_subquery(e: &Expr) -> bool {
     match e {
-        Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
         Expr::Variadic(expr) => expr_has_subquery(expr),
         Expr::ScalarSubquery(_)
         | Expr::Exists { .. }

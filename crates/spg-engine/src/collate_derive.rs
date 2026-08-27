@@ -128,6 +128,11 @@ where
             .iter()
             .fold(Derived::None, |acc, a| acc.combine(derive(a, column))),
 
+        // v7.39.2 — the clause this module's `Explicit` was written for,
+        // and until now had no way to be handed: the parser refused or
+        // absorbed it instead of building a node.
+        Expr::Collate { collation, .. } => Derived::Explicit(collation.clone()),
+
         Expr::Binary { lhs, rhs, .. } => derive(lhs, column).combine(derive(rhs, column)),
         Expr::Unary { expr, .. } | Expr::Variadic(expr) | Expr::NamedArg { expr, .. } => {
             derive(expr, column)

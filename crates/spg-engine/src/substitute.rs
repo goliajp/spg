@@ -507,7 +507,9 @@ pub(crate) fn rewrite_column_in_source(
 /// qualifier present is either redundant or wrong.
 fn rewrite_column_in_expr(e: &mut Expr, old: &str, new: &str) {
     match e {
-        Expr::NamedArg { expr, .. } => rewrite_column_in_expr(expr, old, new),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
+            rewrite_column_in_expr(expr, old, new)
+        }
         Expr::Variadic(expr) => rewrite_column_in_expr(expr, old, new),
         Expr::AggregateOrdered { call, order_by, .. } => {
             rewrite_column_in_expr(call, old, new);
@@ -1021,7 +1023,7 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
         return Ok(());
     }
     match e {
-        Expr::NamedArg { expr, .. } => substitute_expr(expr, params)?,
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => substitute_expr(expr, params)?,
         Expr::Variadic(expr) => substitute_expr(expr, params)?,
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_expr(call, params)?;

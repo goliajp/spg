@@ -31,6 +31,9 @@ const CASES: &[(&str, &str)] = &[
     ("Binary", "SELECT 1 + 1"),
     ("Unary", "SELECT -id FROM cov"),
     ("Cast", "SELECT 7::bigint"),
+    // v7.39.2 — the clause became a node; before that it was refused
+    // or absorbed and there was nothing to describe.
+    ("Collate", "SELECT 'a' COLLATE \"C\""),
     ("FieldAccess", "SELECT (rec).f FROM cov_rec"),
     ("IsNull", "SELECT k IS NULL FROM cov"),
     ("BoolTest", "SELECT (id = 1) IS TRUE FROM cov"),

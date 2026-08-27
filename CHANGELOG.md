@@ -242,30 +242,46 @@ the current build; this file is a release-organized view.
 
 ### Known gaps in this section
 
-- **`COLLATE` on an expression is not refused — it is absorbed, and the
-  answer is wrong.** The parser's message says SPG "carries a collation
-  on a column declaration and on an ORDER BY key, not on an arbitrary
-  expression", and refuses the locale names. It does NOT refuse the
-  byte-order spellings (`C`, `POSIX`, `ucs_basic`, …): those are dropped
-  silently, and on an image whose database collates by locale — which is
-  the shipped default since v7.38.22 — the comparison then runs under
-  the locale the query asked it not to use. Measured against
-  PostgreSQL 18.6:
+- **`COLLATE` on an expression is carried now, and it was not refused
+  before — it was absorbed, and the answer was wrong.** The parser said
+  SPG "carries a collation on a column declaration and on an ORDER BY
+  key, not on an arbitrary expression", and refused the locale names. It
+  did NOT refuse the byte-order spellings: those were dropped silently,
+  and on an image whose database collates by locale — the shipped
+  default since v7.38.22 — the comparison then ran under the locale the
+  query asked it not to use. Measured against PostgreSQL 18.6, before
+  and after:
 
-      SELECT 'a' COLLATE "C" < 'B'                 PG f     SPG t
-      SELECT 1 WHERE 'a' COLLATE "C" < 'B'         PG none  SPG 1
-      GROUP BY x COLLATE "C" over ('a'),('A')      PG 2 groups  SPG 1
+      SELECT 'a' COLLATE "C" < 'B'                 PG f    was t
+      SELECT 1 WHERE 'a' COLLATE "C" < 'B'         PG none was 1
+      GROUP BY x COLLATE "C" over ('a'),('A')      PG 2    was 1
+      SELECT 'a' COLLATE "en_US.utf8" < 'B'        PG t    was an error
 
-  So the one family the parser lets through is the one where dropping it
-  changes the answer. An unknown collation name is also reported as "not
-  supported in this position" rather than PostgreSQL's `collation
-  "nosuch" for encoding "UTF8" does not exist`.
+  All four are PG's answer now, and so are the projection, the function
+  argument, the unknown-collation message, and a schema-qualified name.
 
-  Whether absorbing is safe depends on the DATABASE's own collation —
-  under `SPG_LC_COLLATE=C` dropping `COLLATE "C"` is exactly right — and
-  the parser cannot know that. Which is the argument for `Expr::Collate`
-  rather than a parser-side rule: carry the collation and let the engine
-  decide. The same node closes the introducers above.
+  `collate_derive` already modelled `Explicit(name)` — "written in the
+  query with COLLATE" — and had no way to be handed one, because the
+  clause never became a node. It is `Expr::Collate` now, and the module
+  reads it. Whether absorbing is safe depends on the DATABASE's own
+  collation, which the parser cannot see; the engine can.
+
+  Three things the change had to put back or keep, each found by a test
+  rather than by reading: an index key's collation rides a side channel
+  that holds the byte-order spellings only, and suppressing the node
+  there without keeping the check made `CREATE INDEX … (name COLLATE
+  "en_US")` succeed; a MySQL spelling on the PostgreSQL wire has to stay
+  an error, which the old parser did through its allow-list and the
+  engine does now by asking the dialect; and a schema qualifier is
+  dropped — SPG is single-schema — but read first, because PG answers
+  `schema "nosuch" does not exist` and dropping it unread accepted a
+  name that names nothing.
+
+  Still absorbed, and the same defect one position over: the ORDER BY
+  INSIDE an aggregate. `string_agg(x, ',' ORDER BY x COLLATE "C")`
+  answers the database's order where PG answers byte order — the three
+  ORDER BY parse sites share one `order_key_collation` slot, so an
+  aggregate's inner key writes into the statement's. Measured, and next.
 
 - **MySQL's introducers, and why a syntax-only version would be worse
   than the error.** `SELECT _utf8mb4'x'`, `N'y'`, `_binary'z'` and

@@ -95,10 +95,27 @@ fn round539_schema_qualified_collation() {
         ),
         "true"
     );
-    // A locale collation is still refused, qualified or not.
+    // v7.39.2 — this asserted that a locale collation is refused,
+    // qualified or not. `Expr::Collate` carries it now and the answers
+    // are PostgreSQL 18.6's, measured: `pg_catalog."en_US"` is `t` and
+    // `pg_catalog."C"` on a comparison is `f`.
+    assert_eq!(
+        text(&mut e, r#"SELECT 'a' = 'a' COLLATE pg_catalog."en_US""#),
+        "true"
+    );
+    assert_eq!(
+        text(&mut e, r#"SELECT 'a' < 'B' COLLATE pg_catalog."C""#),
+        "false",
+        "byte order through a qualified name is still byte order"
+    );
+    // The QUALIFIER is dropped — SPG is single-schema — but it is read
+    // first. PG answers `schema "nosuch_schema" does not exist`, and
+    // dropping it unread meant a name that names nothing was accepted.
     assert!(
-        e.execute(r#"SELECT 'a' = 'a' COLLATE pg_catalog."en_US""#)
-            .is_err()
+        e.execute(r#"SELECT 'a' = 'a' COLLATE nosuch_schema."C""#)
+            .unwrap_err()
+            .to_string()
+            .contains(r#"schema "nosuch_schema" does not exist"#)
     );
 }
 

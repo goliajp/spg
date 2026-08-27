@@ -305,7 +305,7 @@ pub(crate) fn collect_column_qualifiers<'e>(
 
 pub(crate) fn expr_refers_to(e: &Expr, target: &str) -> bool {
     match e {
-        Expr::NamedArg { expr, .. } => expr_refers_to(expr, target),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => expr_refers_to(expr, target),
         Expr::Variadic(expr) => expr_refers_to(expr, target),
         Expr::AggregateOrdered { call, order_by, .. } => {
             expr_refers_to(call, target) || order_by.iter().any(|o| expr_refers_to(&o.expr, target))
@@ -401,7 +401,8 @@ pub(crate) fn rewrite_nodes_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr) -> b
         | Expr::InSubquery { .. }
         | Expr::RowInSubquery { .. }
         | Expr::RowCmpSubquery { .. } => {}
-        Expr::NamedArg { expr, .. }
+        Expr::Collate { expr, .. }
+        | Expr::NamedArg { expr, .. }
         | Expr::Variadic(expr)
         | Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }

@@ -63,7 +63,7 @@ pub(crate) fn expr_has_window_pub(e: &Expr) -> bool {
 
 fn expr_has_window(e: &Expr) -> bool {
     match e {
-        Expr::NamedArg { expr, .. } => expr_has_window(expr),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => expr_has_window(expr),
         Expr::Variadic(expr) => expr_has_window(expr),
         Expr::WindowFunction { .. } => true,
         Expr::AggregateOrdered { call, order_by, .. } => {

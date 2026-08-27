@@ -149,7 +149,7 @@ pub fn contains_aggregate(e: &Expr) -> bool {
         Expr::FunctionCall { name, args } => {
             is_aggregate_name(name) || args.iter().any(contains_aggregate)
         }
-        Expr::NamedArg { expr, .. } => contains_aggregate(expr),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => contains_aggregate(expr),
         Expr::Variadic(expr) => contains_aggregate(expr),
         Expr::AggregateOrdered { .. } => true,
         Expr::Binary { lhs, rhs, .. } => contains_aggregate(lhs) || contains_aggregate(rhs),
@@ -5148,7 +5148,7 @@ fn spend_stddev_i128(st: &mut AggState) {
 
 fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
     match e {
-        Expr::NamedArg { expr, .. } => collect_aggregates(expr, out),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => collect_aggregates(expr, out),
         Expr::Variadic(expr) => collect_aggregates(expr, out),
         // v7.24 (round-16 A) — ordered aggregate: register the inner
         // call's spec with the ordering attached.
@@ -7206,6 +7206,14 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     }
     // Recurse into children.
     match e {
+        // v7.39.2 — this arm REBUILDS the node, so the collation has to
+        // be carried across rather than joined to the one beside it: the
+        // compiler caught the join turning a `COLLATE` into a named
+        // argument.
+        Expr::Collate { expr, collation } => Expr::Collate {
+            expr: alloc::boxed::Box::new(rewrite_expr(expr, group_exprs, aggs)),
+            collation: collation.clone(),
+        },
         Expr::NamedArg { name, expr } => Expr::NamedArg {
             name: name.clone(),
             expr: alloc::boxed::Box::new(rewrite_expr(expr, group_exprs, aggs)),
