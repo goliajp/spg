@@ -93,7 +93,7 @@ SHOW wsd_spam_setting_that_does_not_exist
 query T
 SHOW server_version
 ----
-18.4 (spg)
+18.6 (spg)
 
 # 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
 statement ok
