@@ -24,7 +24,7 @@ Per-corpus pass / fail / skip:
 | `spg_baseline/13_recovery` | 31 | 0 | 0 | 100.0% | postgres × 4 |
 | `spg_baseline/14_dialect_compat` | 0 | 0 | 0 | 0.0% |  |
 | `spg_baseline/15_regressions` | 556 | 0 | 0 | 100.0% | postgres × 33 |
-| `spg_baseline/16_isolation` | 18 | 0 | 0 | 100.0% | postgres × 1 |
+| `spg_baseline/16_isolation` | 113 | 0 | 0 | 100.0% | postgres × 2 |
 
 ## Per-file detail
 
@@ -432,4 +432,5 @@ Per-corpus pass / fail / skip:
 
 | file | pass | fail | skip | ran in |
 |---|---|---|---|---|
-| `set_transaction_isolation_level.test` | 18 | 0 | 0 | postgres |
+| `read_only_transaction.test` | 78 | 0 | 0 | postgres |
+| `set_transaction_isolation_level.test` | 35 | 0 | 0 | postgres |

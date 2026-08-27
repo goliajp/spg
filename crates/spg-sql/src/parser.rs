@@ -14487,6 +14487,7 @@ impl Parser {
             return Ok(Statement::CreateTable(CreateTableStatement {
                 temporary: false,
                 name,
+                engine: None,
                 columns: Vec::new(),
                 like_specs: Vec::new(),
                 inherits: Vec::new(),
@@ -14688,7 +14689,7 @@ impl Parser {
         // AUTO_INCREMENT=42 ROW_FORMAT=DYNAMIC COMMENT='blog posts'`.
         // SPG accepts all forms as no-ops (each option is
         // `<ident> [=] <ident-or-string>` separated by whitespace).
-        self.consume_mysql_table_options();
+        let engine = self.consume_mysql_table_options();
         // v7.38 (read01 P6.55) — PG storage parameters `WITH (opt=val, …)`.
         // SPG has no per-table reloptions, so accept and ignore them so a
         // pg_dump `CREATE TABLE … WITH (fillfactor=70, …)` restores cleanly.
@@ -14714,6 +14715,7 @@ impl Parser {
         Ok(Statement::CreateTable(CreateTableStatement {
             temporary: false,
             name,
+            engine,
             columns,
             like_specs,
             inherits,
@@ -15244,7 +15246,13 @@ impl Parser {
         }
     }
 
-    fn consume_mysql_table_options(&mut self) {
+    /// v7.39 — returns the `ENGINE=` name, which used to be consumed and
+    /// dropped with everything else here. The rest of the MySQL table
+    /// options genuinely have no meaning for SPG's storage; the engine
+    /// name does, because MySQL REFUSES one it does not know and a dump
+    /// with a typo in it should not quietly become a table.
+    fn consume_mysql_table_options(&mut self) -> Option<alloc::string::String> {
+        let mut engine: Option<alloc::string::String> = None;
         loop {
             // Heuristic: a table option is an ident (or `DEFAULT`
             // reserved keyword) followed by `=` and an
@@ -15293,13 +15301,20 @@ impl Parser {
             if matches!(self.peek(), Token::Eq) {
                 self.advance();
             }
-            match self.peek() {
-                Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_) | Token::Integer(_) => {
+            match self.peek().clone() {
+                Token::Ident(v) | Token::QuotedIdent(v) | Token::String(v) => {
+                    if name_lc == "engine" {
+                        engine = Some(v);
+                    }
+                    self.advance();
+                }
+                Token::Integer(_) => {
                     self.advance();
                 }
                 _ => {}
             }
         }
+        engine
     }
 
     /// v7.9.18 — true when the next tokens are `PRIMARY KEY (…)`.

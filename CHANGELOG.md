@@ -8,6 +8,144 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.39.0] — 2026-08-27
+
+Every defect in this release is one shape: **SPG told a session it held
+a guarantee that nothing was keeping.**
+
+A client asks what isolation level it is running under, whether its
+transaction is read-only, whether the session is strict — and it asks
+for exactly one reason: to decide what it may assume. An answer that is
+wrong in the safe direction costs a little caution. An answer that is
+wrong in the other direction is worse than silence, because the client
+acts on it.
+
+Two of these lose data. One of them loses it without an error.
+
+### Fixed
+
+- **A fresh MySQL connection was not strict, and silently truncated.**
+  `VARCHAR(3) <- 'abcdef'` stored `'abc'`; `TINYINT <- 999` stored
+  `127`. No error, no warning, success reported — while `@@sql_mode`
+  told that same connection `STRICT_TRANS_TABLES`. MySQL 9.7.2 answers
+  `ERROR 1406` and `ERROR 1264`.
+
+  `SessionBag` derived `Default` and a connection's bag is created on
+  first sight with `unwrap_or_default()`, so `mysql_strict` began
+  `false` on every new connection. The field's own documentation has
+  said "this starts true" since it was added: true of the Engine's
+  constructors, never of the bag. `Default` is written out by hand now,
+  and every field was checked — it was the only one whose correct fresh
+  value is not its zero value.
+
+  The engine-level suite, 6,621 tests, could not see this: those build
+  an Engine directly, where the flag was already true. The defect lived
+  in the connection-switching path that only a running server takes.
+
+- **Read-only transactions were not enforced at all.** `BEGIN READ ONLY;
+  INSERT …` answered `INSERT 0 1` and committed. `SET
+  default_transaction_read_only = on` changed nothing either, while
+  reading back whatever it was given. Nothing in the tree enforced it —
+  no SQLSTATE 25006, no classifier for whether a statement writes.
+
+  Applications open read-only transactions as a safety measure: a
+  reporting connection, a read-only leg in a pool, a "this path must not
+  write" discipline. Every statement PostgreSQL 18.6 refuses is refused
+  now, with PG's message and code, including the ones that are not
+  obvious — `CREATE TEMP TABLE` is refused, `UPDATE … WHERE false` is
+  refused though it changes nothing, and `nextval()` is refused inside
+  an otherwise ordinary SELECT.
+
+- **`SET default_transaction_isolation` did nothing.** SPG accepted it
+  and read it back correctly, so a connection pool or ORM that sets it
+  at connect time — an ordinary thing to do — was told it had the level
+  it asked for while every transaction ran read committed. The engine
+  has repeatable read; the setting never reached it.
+
+- **`transaction_isolation` was answered by four surfaces and two of
+  them contradicted the engine.** `SHOW VARIABLES` said
+  `REPEATABLE-READ` while the engine ran read committed;
+  `current_setting()` returned a constant on the PostgreSQL side, so it
+  disagreed with `SHOW` the moment a transaction asked for anything
+  else. All four ask one function now.
+
+- **A bare `SET TRANSACTION ISOLATION LEVEL` changed the session.** PG
+  warns and does nothing outside a transaction block; SPG applied it, so
+  one such statement quietly changed every later transaction. The corpus
+  file covering this had been asserting SPG's behaviour rather than
+  PostgreSQL's, so it defended the difference instead of catching it.
+
+- **`SHOW VARIABLES` ignored every `SET`.** It reported the compiled-in
+  default for every canonical name — `sql_mode`, and `SET NAMES` too,
+  which is wiring added earlier in this same release and verified only
+  on the `@@` side.
+
+- **`SET NAMES … COLLATE` was parsed and discarded**, and a session
+  collation never reached a bare literal comparison, so a MySQL session
+  compared strings by a collation it did not report.
+
+### Changed
+
+- The MySQL dialect defaults to `REPEATABLE READ`, as MySQL 9.7.2 does.
+- `sql_mode` reports one list, and lists only what SPG enforces.
+  `NO_ZERO_DATE` and `NO_ZERO_IN_DATE` are added — enforced all along
+  and never claimed.
+- **An `ENGINE=` name MySQL does not know is refused**, with MySQL's own
+  message and `ERROR 1286 (42000)`. It was consumed and discarded, so a
+  typo in a dump quietly became a table while `sql_mode` claimed
+  `NO_ENGINE_SUBSTITUTION`. The names a real dump carries — `InnoDB`,
+  `MyISAM`, `MEMORY`, `ARCHIVE`, and any of them in any case — still
+  build; refusing those would be the worse defect and the quieter one.
+  `FEDERATED` is refused, as MySQL 9.7.2 refuses it: the row exists in
+  its `ENGINES` table but its `support` is `NO`, so a list copied from
+  that table without reading the column would accept it.
+
+  SPG has one storage engine and stores every table its own way, so it
+  substitutes for all of these and cannot honour the flag in MySQL's
+  full sense. What it honours is the half a client can act on, and
+  `sql_mode` claims it again on that basis.
+- Identity is one constant per fact: `9.7.2-spg` on the MySQL wire,
+  `18.6` on the PostgreSQL one. `version_compile_os` is derived from the
+  build target rather than hard-coded to Linux, and `have_ssl` — removed
+  from MySQL in 8.0.26 — is gone, as is `tx_isolation`, removed in
+  8.0.3.
+- `max_allowed_packet` is 64 MB, which is what MySQL 9.7.2 answers.
+
+### Known gaps
+
+Named because a gap that is written down is not the same defect as a
+gap that is claimed closed:
+
+- `ONLY_FULL_GROUP_BY` is not enforced. It was never claimed either, and
+  is now pinned absent from `sql_mode`.
+- An unknown `ENGINE=` name written WITHOUT quotes is echoed in the
+  error lower-cased — `'nonsuch'` where MySQL says `'NONSUCH'`. The code
+  (1286), the SQLSTATE and the refusal all match, and the quoted forms
+  match exactly; the bare form folds because the lexer folds unquoted
+  identifiers, which is PostgreSQL's rule and correct here. Echoing the
+  original spelling means carrying the source text into the parser, and
+  that is a wide change to a core structure for the case of an
+  already-invalid name.
+- Over-length and out-of-range values are refused, but the wording is
+  PostgreSQL's and the overflow code is `1064/42000` where MySQL uses
+  `1264/22003`. A client that branches on the code will branch wrong.
+
+### Testing
+
+Expectations here come from running the same statements against
+PostgreSQL 18.6 and MySQL 9.7.2, one statement per transaction so no
+error could be attributed to a neighbouring line — five answers were not
+what the documentation would suggest. The isolation corpus was generated
+by pointing the runner at PostgreSQL rather than blessed from SPG's own
+output; the same run re-blessed the seven existing specs and they came
+back byte-identical.
+
+Every fix was ablated with the server binary rebuilt and its checksum
+printed, after two ablations in this cycle scored perfect neutral
+results off a stale build.
+
+---
+
 ## [7.38.24] — 2026-08-27
 
 **v7.38.23 was tagged and never released.** Its train stopped at

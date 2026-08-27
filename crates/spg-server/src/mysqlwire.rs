@@ -977,6 +977,14 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         // the engine's errors into PG SQLSTATEs and is tested on it, so the
         // MySQL errno is derived from that one answer. The two protocols
         // disagree on spelling, never on which failure it was.
+        // v7.39 — the one place the rule above cannot apply. A storage
+        // engine is a MySQL-only concept and PostgreSQL has no SQLSTATE to
+        // sort it into, so there is no single answer to derive this from.
+        // Measured on MySQL 9.7.2: `ERROR 1286 (42000) Unknown storage
+        // engine 'NONSUCH'`.
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Unknown storage engine") => {
+            (1286, "42000", m.clone())
+        }
         _ => {
             let (pg_state, msg) = crate::pgwire::engine_error_to_wire(e);
             let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
