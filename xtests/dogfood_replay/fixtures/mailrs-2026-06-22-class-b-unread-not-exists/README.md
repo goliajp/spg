@@ -34,17 +34,21 @@ sees through the symlink and validates the same payload.
 
 ## Budget posture
 
-Still the **loose** budgets this fixture opened with, pending real
-measurement. After Phase A decomposition + Phase B attack lands, tighten to
-PG18 parity (cold ≤ 100 ms per the mailrs report's PG baseline, warm and p95
-commensurately).
+Measured, at last. Three runs on an idle testbed with five re-extracted
+cold samples each: cold medians 0.88 / 1.11 / 0.87 ms, p50 0.50 / 0.48 /
+0.48, p95 0.60 / 0.55 / 0.58. The budgets this fixture opened with — cold
+200, warm 100, p95 150 — were 200–250× that, and the mailrs report's PG18
+baseline for this shape is ~100 ms cold, so SPG answers it about a hundred
+times faster than the engine it replaced. The numbers below are 3–5× the
+measurement rather than the suite's usual 1.5×, because scheduling jitter
+on a sub-millisecond quantity is absolute rather than relative.
 
 <!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
 | Window | Budget |
 | --- | --- |
-| Cold (first iter) | ≤ 200 ms |
-| Warm median (p50) | ≤ 100 ms |
-| p95 | ≤ 150 ms |
+| Cold (first iter) | ≤ 5 ms |
+| Warm median (p50) | ≤ 2 ms |
+| p95 | ≤ 3 ms |
 <!-- /BUDGETS -->
 
 ## Workflow gates
