@@ -316,11 +316,19 @@ fn run_query_fixture(
             // here, which is what makes the next open a cold one.
             if i + 1 == iters {
                 // The extraction has to outlive the database: its
-                // TempDir deletes the catalog when it drops.
-                held = Some((db, extracted));
+                // TempDir deletes the catalog when it drops, and the
+                // database writes a checkpoint on ITS drop. Held as
+                // (extraction, database) rather than the other way
+                // round because a `let` destructuring drops its
+                // bindings in reverse order -- with the database
+                // second it goes first, and the directory is still
+                // there when it does. Written the other way, every
+                // fixture printed `final checkpoint on Drop failed:
+                // io: No such file or directory`.
+                held = Some((extracted, db));
             }
         }
-        let (mut db, _kept) = held.expect("cold_iters is at least 1, so one database is held");
+        let (_kept, mut db) = held.expect("cold_iters is at least 1, so one database is held");
         let open_med = bench::median(&opens);
         for (j, sql) in stmts.iter().enumerate() {
             let w = bench::warm_stats(&mut db, sql, qs.warmup_iters, qs.measure_iters)?;
