@@ -1,10 +1,21 @@
-# MariaDB 11 oracle config — fast test mode + bin collation.
+# MariaDB oracle config — fast test mode + bin collation.
 # Mirrors mysql/my.cnf so both engines diverge only where their
 # behaviour really diverges, not on incidental config.
 
+# v7.38.25 — sql_mode carries the full set here rather than half here and
+# half in an initdb script. `mysql/initdb/01_sqlmode.sql` used to add
+# NO_ZERO_IN_DATE / NO_ZERO_DATE / ERROR_FOR_DIVISION_BY_ZERO on top of
+# this file; the MariaDB script that did the same was deleted and this
+# file was not updated, so the two legs ran with different sql_mode
+# while the header below claimed they mirrored each other. Measured:
+# MariaDB 12.3.3 accepts every one of these flags and reports them back
+# verbatim, so the asymmetry was an accident, not a limitation.
+#
+# A server default also beats `SET GLOBAL` at initdb time: it applies to
+# the first connection and survives a restart.
 [mariadb]
 innodb_flush_log_at_trx_commit = 0
 innodb_flush_method            = nosync
-sql_mode                       = STRICT_ALL_TABLES,NO_ENGINE_SUBSTITUTION
+sql_mode                       = STRICT_ALL_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
 character_set_server           = utf8mb4
 collation_server               = utf8mb4_bin

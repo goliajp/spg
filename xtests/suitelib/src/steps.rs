@@ -993,7 +993,14 @@ pub fn oracle_three(root: &Path) -> Result<String, String> {
     sh(root, "cargo build -q --release -p spg-oracle-runner")?;
     sh(
         root,
-        "docker compose -f xtests/oracle/docker-compose.yml up -d --wait",
+        // v7.38.25 — `--build`, for the same reason `xtests/oracle/src/docker.rs`
+        // now carries it: without it, `up` reuses whatever `spg-oracle-*:v7.38`
+        // is on the machine, so raising a base version in one of the oracle
+        // Dockerfiles changes the file and not the container that answers the
+        // differential. This is the call site the release gate actually uses --
+        // the one in `docker.rs` is a second implementation of the same step,
+        // and fixing only that one would have left the gate on the old images.
+        "docker compose -f xtests/oracle/docker-compose.yml up -d --wait --build",
     )?;
     let legs = sh(root, "cargo run -q --release -p spg-oracle-runner -- all");
     let down = sh(
@@ -1303,7 +1310,13 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
     let control = (|| -> Result<String, String> {
         sh(
             root,
-            &format!("{docker} compose -f xtests/oracle/docker-compose.yml up -d --wait mysql"),
+            // `--build` here too. Three call sites bring these containers up --
+            // this one, the `oracle-three` step above, and `docker.rs::up` --
+            // and a base-version bump has to reach all three or the sysbench
+            // control leg measures a MySQL the Dockerfile no longer names.
+            &format!(
+                "{docker} compose -f xtests/oracle/docker-compose.yml up -d --wait --build mysql"
+            ),
         )?;
         let curi = "--mysql-host=127.0.0.1 --mysql-port=15433 --mysql-user=root --mysql-password=testpass --mysql-db=testdb";
         sh(
