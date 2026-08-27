@@ -5003,6 +5003,8 @@ pub struct Catalog {
     /// at each of the ~170 engine call sites because `by_name` is private —
     /// this is the ONE place a table name becomes an index.
     temp_prefix: Option<String>,
+    /// v7.39.2 — see [`Catalog::set_case_insensitive_names`].
+    case_insensitive_names: bool,
     /// v7.39 (round 496) — the names of tables this catalog handle has had
     /// changed since the set was last cleared.
     ///
@@ -5821,6 +5823,7 @@ impl Catalog {
             tables: Vec::new(),
             by_name: BTreeMap::new(),
             temp_prefix: None,
+            case_insensitive_names: false,
             dirty_tables: alloc::collections::BTreeSet::new(),
             dirty_nontable: alloc::collections::BTreeSet::new(),
             next_rel_id: 0,
@@ -6986,8 +6989,63 @@ impl Catalog {
             if let Some(idx) = self.by_name.get(&mangled) {
                 return Some(*idx);
             }
+            if self.case_insensitive_names
+                && let Some(idx) = self.index_ignoring_case(&mangled)
+            {
+                return Some(idx);
+            }
         }
-        self.by_name.get(name).copied()
+        if let Some(idx) = self.by_name.get(name) {
+            return Some(*idx);
+        }
+        // v7.39.2 — a MySQL session finds the relation under any
+        // spelling of its name.
+        //
+        // The lexer folds an unquoted identifier and leaves a backticked
+        // one alone, so `CREATE TABLE MyTable` stored `mytable` while
+        // ``SELECT 1 FROM `MyTable` `` looked for `MyTable` and found
+        // nothing: the two spellings of one name were two tables.
+        // `mysqldump` backticks every identifier, so a dump restored
+        // here and an application that writes the name unquoted were
+        // looking at different relations.
+        //
+        // This is MySQL's `lower_case_table_names = 1` — names compare
+        // without case — which is what SPG has always half-done, and
+        // what it now reports. Exact match first, so a catalog that
+        // already holds two names differing only in case keeps
+        // answering the way it did.
+        //
+        // PostgreSQL sessions never set this: `"MyTable"` and `mytable`
+        // are two relations there, and the flag is off.
+        if self.case_insensitive_names {
+            return self.index_ignoring_case(name);
+        }
+        None
+    }
+
+    /// The single relation whose name matches `name` without regard to
+    /// case, or `None` when there is none — or more than one, which the
+    /// exact lookup above has already failed to settle.
+    fn index_ignoring_case(&self, name: &str) -> Option<usize> {
+        let mut found = None;
+        for (k, idx) in &self.by_name {
+            if k.len() == name.len() && k.eq_ignore_ascii_case(name) {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(*idx);
+            }
+        }
+        found
+    }
+
+    /// v7.39.2 — does this session compare relation names without case?
+    ///
+    /// Per SESSION, and the catalog is shared, so the engine installs it
+    /// the way it installs `temp_prefix`: on every session switch, into
+    /// the main catalog and into every open transaction's shadow.
+    pub fn set_case_insensitive_names(&mut self, on: bool) {
+        self.case_insensitive_names = on;
     }
 
     /// v7.39 (round 436) — install the calling session's temp namespace.

@@ -15656,7 +15656,19 @@ fn apply_function_dispatch(
                 "collation_connection" | "collation_server" | "collation_database" => {
                     crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
                 }
-                "lower_case_table_names" => "0",
+                // v7.39.2 — live, and truthful. It said `0`, which claims
+                // names are compared with case and stored as written;
+                // SPG folds an unquoted one, so `0` was never right for
+                // a MySQL session. `1` is MySQL's own name for what SPG
+                // does — compare without case — and the resolution now
+                // matches the report.
+                "lower_case_table_names" => {
+                    if ctx.engine.is_some_and(crate::Engine::folds_relation_names) {
+                        "1"
+                    } else {
+                        "0"
+                    }
+                }
                 // v7.39 — `have_ssl` was REMOVED in MySQL 8.0.26 and
                 // MySQL 9.7.2 answers nothing for it on either surface
                 // (measured). SPG answered `YES` for a variable the

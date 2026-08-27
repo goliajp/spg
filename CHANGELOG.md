@@ -12,6 +12,37 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **In a MySQL session, two spellings of one relation name were two
+  relations.** The lexer folds an unquoted identifier and leaves a
+  backticked one alone, so `CREATE TABLE MyTable` stored `mytable`
+  while ``SELECT 1 FROM `MyTable` `` looked for `MyTable` and found
+  nothing. `mysqldump` backticks every identifier, so a dump restored
+  here and an application that writes the name unquoted were looking at
+  different tables.
+
+  A MySQL session compares relation names without case now — which is
+  MySQL's `lower_case_table_names = 1`, and `@@lower_case_table_names`
+  reports `1` rather than the `0` it used to claim. That `0` asserted a
+  case-sensitivity SPG has never performed: an unquoted name was folded
+  either way. `SHOW VARIABLES` lists the variable too; it carried no
+  entry for it at all while the `@@` surface answered.
+
+  Storage is untouched, so a table created with its case kept still
+  holds that name — and is now reachable under any spelling rather than
+  only the exact one.
+
+  PostgreSQL sessions are unchanged and the pins check it in both
+  directions: `"MyTbl"` and `mytbl` are two relations there, both can
+  exist at once, and each is found only by its own spelling — measured
+  against 18.6.
+
+  The comparison is per session while the catalog is shared by all of
+  them, which is the shape that has gone wrong three times in this
+  release. It is installed the way `temp_prefix` is — on every session
+  switch — and into the current transaction's shadow catalog, which is a
+  second copy of it. That last part had no pin until an ablation removed
+  it and nothing went red.
+
 - **A column named twice was accepted.** `CREATE TABLE t (a int, a int)`
   built the table; `information_schema.columns` then carried two rows
   named `a`, every later reference to that name was ambiguous, and a

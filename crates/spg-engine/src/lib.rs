@@ -2647,6 +2647,7 @@ impl Engine {
         self.mysql_strict = incoming.mysql_strict;
         self.mysql_ansi_quotes = incoming.mysql_ansi_quotes;
         self.speaks_mysql = incoming.speaks_mysql;
+        self.refresh_name_folding();
         self.mysql_warnings = incoming.mysql_warnings;
         self.prepared_statements = incoming.prepared_statements;
         self.lo_descriptors = incoming.lo_descriptors;
@@ -2698,6 +2699,51 @@ impl Engine {
     /// session that never made one pays a single `Option` check per lookup).
     /// Both the committed catalog and any open transaction's shadow are set:
     /// a temp table created inside a transaction must resolve there too.
+    /// v7.39.2 — install this session's relation-name comparison into
+    /// the catalog, which is shared while the dialect is not.
+    ///
+    /// Same shape as [`Engine::refresh_temp_prefix`] and for the same
+    /// reason: one catalog serves every connection, so the per-session
+    /// answer has to be re-installed on each switch — into the main
+    /// catalog AND into every open transaction's shadow.
+    ///
+    /// MySQL compares relation names without case (this is its
+    /// `lower_case_table_names = 1`, which is what SPG reports now).
+    /// PostgreSQL does not: `"MyTable"` and `mytable` are two relations
+    /// there, so a PG session leaves it off.
+    /// Does this session compare relation names without case?
+    ///
+    /// v7.39.2 — what `@@lower_case_table_names` reports, live rather
+    /// than as a constant. It answered `0` — "names are case-sensitive
+    /// and preserved" — while an unquoted name was being folded, which
+    /// is a claim SPG did not keep either way.
+    #[must_use]
+    pub fn folds_relation_names(&self) -> bool {
+        self.speaks_mysql
+    }
+
+    pub(crate) fn refresh_name_folding(&mut self) {
+        let on = self.speaks_mysql;
+        self.catalog.set_case_insensitive_names(on);
+        // THIS session's open transaction, not every session's.
+        //
+        // v7.39.2 — the first version looped over `tx_catalogs` the way
+        // `refresh_temp_prefix` does, which sets the CURRENT session's
+        // answer into every other connection's shadow: a PostgreSQL
+        // session mid-transaction would start folding the moment a
+        // MySQL client connected. Global where the state is per-slot,
+        // for the third time in this release.
+        //
+        // A shadow is cloned from the main catalog at BEGIN, so it
+        // starts with its own session's value and only needs writing
+        // when that session's dialect changes while it is open.
+        if let Some(tx) = self.current_tx
+            && let Some(shadow) = self.tx_catalogs.get_mut(&tx)
+        {
+            shadow.catalog.set_case_insensitive_names(on);
+        }
+    }
+
     pub(crate) fn refresh_temp_prefix(&mut self) {
         let prefix = if self.temp_tables.is_empty()
             && self.temp_sequences.is_empty()
@@ -2776,6 +2822,7 @@ impl Engine {
             self.mysql_strict = true;
             self.mysql_ansi_quotes = false;
             self.speaks_mysql = false;
+            self.refresh_name_folding();
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;
             self.cursors.clear();
@@ -2824,6 +2871,7 @@ impl Engine {
         if !self.speaks_mysql {
             self.speaks_mysql = true;
             self.plan_cache.clear();
+            self.refresh_name_folding();
         }
     }
 
