@@ -24,24 +24,99 @@ fn current_setting_server_version() {
     let mut e = Engine::new();
     assert_eq!(
         text(&first(&mut e, "SELECT current_setting('server_version')")),
-        "18.4 (SPG-compat)"
+        "18.6 (spg)"
     );
     assert_eq!(
         text(&first(
             &mut e,
             "SELECT current_setting('server_version_num')"
         )),
-        "180004"
+        "180006"
     );
     // SHOW and pg_settings agree with the function (drivers gate feature
-    // use on server_version_num; live PG18.4 = 180004).
-    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180004");
+    // use on server_version_num; live PG18.6 = 180006).
+    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180006");
     assert_eq!(
         text(&first(
             &mut e,
             "SELECT setting FROM pg_settings WHERE name = 'server_version_num'"
         )),
-        "180004"
+        "180006"
+    );
+}
+
+/// The same agreement, for `server_version` itself.
+///
+/// This is the half the test above was missing, and the half that broke.
+/// It checked that `SHOW`, `pg_settings` and `current_setting` agreed on
+/// `server_version_num` and never asked the same of `server_version` --
+/// so for a long time SPG answered `18.4 (spg)` on the wire and in
+/// `pg_settings` while answering `18.4 (SPG-compat)` to `SHOW` and to
+/// `current_setting`. In PostgreSQL those are one GUC and cannot differ:
+/// live 18.6 gives `18.6 (Debian 18.6-1.pgdg13+2)` to every one of them.
+///
+/// The values now come from `spg_engine::PG_SERVER_VERSION`; this asks
+/// each surface separately, because each reaches it by its own path.
+#[test]
+fn every_server_version_surface_agrees() {
+    let mut e = Engine::new();
+    let surfaces = [
+        ("SHOW server_version", "SHOW"),
+        (
+            "SELECT current_setting('server_version')",
+            "current_setting()",
+        ),
+        (
+            "SELECT setting FROM pg_settings WHERE name = 'server_version'",
+            "pg_settings.setting",
+        ),
+        (
+            "SELECT boot_val FROM pg_settings WHERE name = 'server_version'",
+            "pg_settings.boot_val",
+        ),
+        (
+            "SELECT reset_val FROM pg_settings WHERE name = 'server_version'",
+            "pg_settings.reset_val",
+        ),
+    ];
+    for (sql, name) in surfaces {
+        assert_eq!(
+            text(&first(&mut e, sql)),
+            spg_engine::PG_SERVER_VERSION,
+            "{name} disagrees with PG_SERVER_VERSION"
+        );
+    }
+
+    // `version()` carries the same version, with PostgreSQL's own
+    // prefix. PG appends the platform and the compiler; SPG stops at the
+    // version rather than claim a build it does not have.
+    let v = text(&first(&mut e, "SELECT version()"));
+    assert!(
+        v.contains(spg_engine::PG_SERVER_VERSION),
+        "version() {v:?} does not carry {}",
+        spg_engine::PG_SERVER_VERSION
+    );
+    assert!(v.starts_with("PostgreSQL "), "version() is {v:?}");
+
+    // And the number matches the string: 18.6 is 180006. A driver that
+    // gates a feature on the number and one that parses the string must
+    // reach the same conclusion.
+    let num = text(&first(&mut e, "SHOW server_version_num"));
+    assert_eq!(num, spg_engine::PG_SERVER_VERSION_NUM);
+    let (major, rest) = spg_engine::PG_SERVER_VERSION
+        .split_once('.')
+        .expect("the version string is major.minor");
+    let minor: u32 = rest
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|d| d.parse().ok())
+        .expect("a minor number follows the dot");
+    let major: u32 = major.parse().expect("a major number");
+    assert_eq!(
+        num.parse::<u32>().expect("the num is an integer"),
+        major * 10_000 + minor,
+        "server_version_num does not encode {}",
+        spg_engine::PG_SERVER_VERSION
     );
 }
 
@@ -294,10 +369,10 @@ fn show_covers_more_params_and_unifies_with_pg_settings() {
     // pg_settings, so extra_float_digits / bytea_output resolve, SHOW ALL
     // lists the full set, and SET → SHOW → pg_settings agree.
     let mut e = Engine::new();
-    // Previously "parameter not recognised". Values verified vs live PG 18.4.
+    // Previously "parameter not recognised". Values verified vs live PG 18.6.
     assert_eq!(text(&first(&mut e, "SHOW extra_float_digits")), "1");
     assert_eq!(text(&first(&mut e, "SHOW bytea_output")), "hex");
-    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180004");
+    assert_eq!(text(&first(&mut e, "SHOW server_version_num")), "180006");
     // SHOW ALL now lists the full canonical set (was a curated 13).
     let show_all = match e.execute("SHOW ALL").unwrap() {
         QueryResult::Rows { rows, .. } => rows.len(),

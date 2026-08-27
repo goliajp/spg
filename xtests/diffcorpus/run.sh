@@ -217,6 +217,20 @@ if [ ! -f "$BASE" ]; then
   echo "no baseline.tsv; run with --rebaseline to record one" >&2
   exit 2
 fi
+# v7.38.25 — say WHICH PostgreSQL the verdict is against.
+#
+# The oracle image is the rolling `postgres:18` tag, so `docker pull`
+# moves it: it went 18.4 -> 18.6 under a running project without a
+# single line of output anywhere changing. "matches baseline" is a claim
+# about a comparison, and a comparison has two sides; naming only one of
+# them lets the other move unwitnessed. A baseline recorded against one
+# minor and checked against another is still a fair check -- this run
+# found the 23 lines unchanged across that move -- but the reader has to
+# be told, not left to assume.
+ORACLE_VERSION="$(printf 'SELECT version();' | PGG 2>/dev/null | head -1)"
+[ -n "$ORACLE_VERSION" ] || ORACLE_VERSION="(the oracle did not answer SELECT version())"
+echo "oracle: $ORACLE_VERSION"
+
 if diff -u "$BASE" <(sort "$OUT/actual.tsv") > "$OUT/baseline.diff" 2>&1; then
   echo "CORPUS OK — matches baseline ($(awk -F'\t' '{s+=$2} END{print s}' "$BASE") lines)"
   exit 0
