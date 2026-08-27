@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.39.1] — 2026-08-28
 
 ### Fixed
 
@@ -160,6 +160,20 @@ Measured, not closed here, and written down rather than left implicit:
   quoting change and applies to `'…'` equally.
 - `in_mysql_dialect()` is still the backslash-escapes flag. Only the
   quoting rule was given its own answer here.
+- **A MySQL session folds an unquoted identifier to lower case, and a
+  backticked one it does not.** `CREATE TABLE MyTable (MyCol int)` is
+  stored as `mytable` / `mycol` and reported that way by `SHOW TABLES`
+  and `information_schema`, where MySQL 9.7.2 keeps `MyTable` / `MyCol`
+  — while `@@lower_case_table_names` answers `0` on both, which is SPG
+  claiming a preservation it does not perform. Worse than the reporting:
+  the two spellings name DIFFERENT tables here. Measured, in one
+  session — `CREATE TABLE MyTable` then ``SELECT 1 FROM `MyTable` ``
+  answers *relation "MyTable" does not exist*, because the unquoted form
+  folded and the quoted one did not. `mysqldump` backticks every
+  identifier, so a dump restored here and an application that writes the
+  name unquoted are looking at two tables. This is identifier handling
+  at the parser, not a surface, and it gets its own measure-and-ablate
+  pass rather than a corner of a release commit.
 
 ### Instruments
 
