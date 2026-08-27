@@ -986,6 +986,12 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Unsupported(m) if m.starts_with("Unknown storage engine") => {
             (1286, "42000", m.clone())
         }
+        // v7.39.2 — a column named twice. The engine words it as MySQL
+        // 9.7.2 does when the session is MySQL; this carries the errno
+        // and SQLSTATE that go with those words.
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Duplicate column name ") => {
+            (1060, "42S21", m.clone())
+        }
         // v7.39 — the strict-mode value-fitting refusals. The engine
         // words these exactly as MySQL 9.7.2 does, and each wording
         // belongs to one errno; measured, with `sql_mode` set both ways:
