@@ -279,6 +279,38 @@ Measured, not closed here, and written down rather than left implicit:
 
 ### Instruments
 
+- **The three-engine differential threw half a dialect switch.** Its
+  own harness put SPG into "MySQL" with `set_backslash_escapes(true)`
+  alone. That was the whole dialect until v7.39.1 split "does this
+  session speak MySQL" from "do backslashes escape", after which the
+  MySQL and MariaDB legs ran with escapes on and everything else off —
+  and nothing noticed, because no fixture asked. The first one that did
+  failed on the SPG side while the harness believed it had switched.
+  `set_mysql_wire_session()` sets both axes now and both callers use
+  just it; two calls meaning one thing is what let this drift.
+
+- **Its SQL splitter was blind to escapes, and to `""` inside `"…"`.**
+  The single-quote branch handled `''` doubling; the double-quote branch
+  handled neither that nor `\"`. So `SELECT "a\"b" AS x; SELECT …`
+  closed at the escaped quote, reopened at `b"`, ran to a quote in the
+  NEXT statement, and handed the engine two statements as one. It
+  surfaced as a parse error naming the following `SELECT` — which reads
+  exactly like an engine defect and was the instrument.
+
+  A new fixture, `orig.mysql_family_literals`, covers what SPG changed
+  in v7.39.1: `"…"` opens a string in the MySQL family, the quote
+  doubles and escapes inside it, and the other quote is data. MySQL
+  9.7.2 and MariaDB 12.3.3 agree byte for byte; SPG matches both, and
+  reverting the v7.39.1 rule turns the fixture red.
+
+  Not in it, and recorded rather than quietly omitted: MySQL's
+  introducers. `SELECT _utf8mb4'x'`, `N'y'` and `_binary'z'` are
+  `ERROR 1064 syntax error` on SPG where both oracles answer the string
+  — an execution abort, which a `.spg.out` lock cannot hold, so the rest
+  of a fixture containing them never runs. `ONLY_FULL_GROUP_BY` is out
+  for a different reason: all three engines refuse with `1055 (42000)`
+  and word it three ways, and this corpus does not normalise error text.
+
 - **The content-worker "first-touch premium" was one sample.** A
   ~6 ms premium on the first query after opening the 246 MB production
   catalog has sat in the ledger as measured-but-unexplained, waiting for

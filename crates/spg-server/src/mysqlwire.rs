@@ -645,7 +645,7 @@ fn command_loop(
     let conn_tx_id = match state.engine.write() {
         Ok(mut engine) => {
             engine.set_current_session(session_id);
-            engine.set_backslash_escapes(true);
+            // Sets both axes; see `Engine::set_mysql_wire_session`.
             engine.set_mysql_wire_session();
             engine.alloc_tx_id()
         }

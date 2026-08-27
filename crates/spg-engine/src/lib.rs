@@ -2899,9 +2899,17 @@ impl Engine {
         }
     }
 
-    /// Mark this session as speaking MySQL. The mysql-wire calls it
-    /// once on connect; see [`SessionBag::speaks_mysql`].
+    /// Put this session into the MySQL dialect — every axis of it.
+    ///
+    /// v7.39.2 — this used to set only `speaks_mysql`, so a caller had
+    /// to remember `set_backslash_escapes(true)` as well. The mysql-wire
+    /// did; the three-engine differential's own harness did not, and the
+    /// first fixture that depended on the OTHER axis — `"…"` opening a
+    /// string — failed against both oracles while the harness believed
+    /// it had switched dialects. Two calls meaning one thing is the
+    /// hazard; this is the one call.
     pub fn set_mysql_wire_session(&mut self) {
+        self.set_backslash_escapes(true);
         if !self.speaks_mysql {
             self.speaks_mysql = true;
             self.plan_cache.clear();
