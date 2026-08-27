@@ -290,14 +290,16 @@ the current build; this file is a release-organized view.
 
 Measured, not closed here, and written down rather than left implicit:
 
-- `SHOW VARIABLES` still omits `character_set_filesystem`,
-  `character_set_system` and `character_sets_dir`. The first two SPG
-  could answer truthfully; `character_sets_dir` names a directory SPG
-  does not have, and inventing a path would be a fabricated fact rather
-  than a compatibility gain. The five names a driver reads —
-  `character_set_client`, `_connection`, `_results`, `_database`,
-  `_server` — and all three `collation_*` now match MySQL 9.7.2 exactly
-  under an identical handshake.
+- `SHOW VARIABLES` omits `character_sets_dir`, and only that one: it
+  names a directory of charset definitions SPG does not have, and a path
+  invented to fill the row would be a fabricated fact rather than a
+  compatibility gain. The other seven now answer on both surfaces.
+  `character_set_system` answers `utf8mb4` where MySQL 9.7.2 says
+  `utf8mb3`, deliberately: that variable is what the server stores
+  IDENTIFIERS in, MySQL's answer is `utf8mb3` because it cannot hold a
+  four-byte one — measured, it stores `` `z4b😀` `` as `z4b?` — and SPG
+  keeps `z4b😀`. Matching MySQL's value would be a claim about SPG that
+  its own catalog contradicts.
 - A MySQL session's unknown-column error says `column "x" does not
   exist` where MySQL says `Unknown column 'x' in 'field list'`. The code
   (1054) and SQLSTATE (42S22) match; the wording does not, and it is the

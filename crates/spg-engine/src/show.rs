@@ -296,6 +296,13 @@ impl Engine {
             ("character_set_results", "utf8mb4"),
             ("character_set_database", "utf8mb4"),
             ("character_set_server", "utf8mb4"),
+            // See the `@@` surface for why these two and not the third:
+            // identifiers here really are utf8mb4 (MySQL's own answer is
+            // utf8mb3 because it truncates a four-byte one), names are
+            // used as bytes, and `character_sets_dir` names a directory
+            // SPG does not have.
+            ("character_set_system", "utf8mb4"),
+            ("character_set_filesystem", "binary"),
             (
                 "collation_connection",
                 crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,

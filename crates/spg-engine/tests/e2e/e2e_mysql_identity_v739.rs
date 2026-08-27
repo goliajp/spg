@@ -301,6 +301,41 @@ fn no_corpus_file_asserts_a_version_we_no_longer_report() {
     );
 }
 
+/// v7.39.2 — the two remaining `character_set_*` names SPG can answer
+/// truthfully, and the one it cannot.
+///
+/// `character_set_system` is what the server stores IDENTIFIERS in.
+/// MySQL 9.7.2 answers `utf8mb3` because it cannot hold a four-byte
+/// one — measured, it stores `` `z4b😀` `` as `z4b?` while SPG keeps
+/// `z4b😀`. So the true answer differs from MySQL's, and matching
+/// MySQL's would be a claim about SPG that its own catalog contradicts.
+///
+/// `character_sets_dir` names a directory of charset definitions that
+/// SPG does not have. It stays absent: a path invented to fill the row
+/// would be a fabricated fact, not a compatibility gain.
+#[test]
+fn the_charset_names_spg_can_answer_and_the_one_it_cannot() {
+    let mut e = mysql();
+    for (var, want) in [
+        ("character_set_system", "utf8mb4"),
+        ("character_set_filesystem", "binary"),
+    ] {
+        // Both surfaces, because one answering and the other not is the
+        // shape this file exists to catch — and this pair answered
+        // neither before.
+        let at = row_text(&mut e, &format!("SELECT @@{var}"));
+        assert_eq!(at, want, "@@{var}");
+        let show = row_text(&mut e, &format!("SHOW VARIABLES LIKE '{var}'"));
+        let shown = show.trim_start_matches(var).trim();
+        assert_eq!(shown, want, "SHOW VARIABLES LIKE '{var}'");
+    }
+    // And the one that has no truthful answer is not invented.
+    assert!(
+        e.execute("SELECT @@character_sets_dir").is_err(),
+        "character_sets_dir names a directory SPG does not have"
+    );
+}
+
 /// v7.39 — `SHOW VARIABLES` must report what the session SET, not the
 /// compiled-in default.
 ///
