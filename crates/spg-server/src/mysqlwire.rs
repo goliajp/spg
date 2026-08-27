@@ -985,6 +985,35 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Unsupported(m) if m.starts_with("Unknown storage engine") => {
             (1286, "42000", m.clone())
         }
+        // v7.39 — the strict-mode value-fitting refusals. The engine
+        // words these exactly as MySQL 9.7.2 does, and each wording
+        // belongs to one errno; measured, with `sql_mode` set both ways:
+        //
+        //   Out of range value for column 'n' at row 1   1264 (22003)
+        //   Data too long for column 'c' at row 1        1406 (22001)
+        //   Incorrect integer value: 'abc' for column…   1366 (HY000)
+        //   Data truncated for column 'i' at row 1       1265 (01000)
+        //   Field 'i' doesn't have a default value       1364 (HY000)
+        //
+        // Derived from the message rather than from a PG SQLSTATE
+        // because PostgreSQL draws the lines elsewhere: it has one
+        // `22003` where MySQL distinguishes a column that will not hold
+        // the value (1264) from an arithmetic result that overflowed
+        // (1690), and it says nothing at all about which COLUMN failed.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("Out of range value for column") =>
+        {
+            (1264, "22003", m.clone())
+        }
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Data too long for column") => {
+            (1406, "22001", m.clone())
+        }
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Incorrect integer value:") => {
+            (1366, "HY000", m.clone())
+        }
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Data truncated for column") => {
+            (1265, "01000", m.clone())
+        }
         _ => {
             let (pg_state, msg) = crate::pgwire::engine_error_to_wire(e);
             let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
