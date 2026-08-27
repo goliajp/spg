@@ -144,6 +144,18 @@ Every fix was ablated with the server binary rebuilt and its checksum
 printed, after two ablations in this cycle scored perfect neutral
 results off a stale build.
 
+Two defects in the measuring equipment were fixed first, because this
+release's conclusions rest on it. The MariaDB oracle image could not be
+rebuilt at all — its Dockerfile copied a directory a previous commit had
+emptied — and kept answering only because a stale image existed; the
+file the harness calls its single source of truth had been unable to
+produce that image for as long as nobody rebuilt it. The same deletion
+left the two MySQL-family legs running under DIFFERENT `sql_mode`, so
+any corpus row touching a zero date or a division by zero would have
+differed between them for a configuration reason rather than a
+behavioural one — which is precisely the ground this release's
+`sql_mode` work stands on.
+
 ---
 
 ## [7.38.24] — 2026-08-27
