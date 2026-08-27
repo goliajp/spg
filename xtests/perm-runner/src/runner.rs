@@ -415,9 +415,55 @@ fn render_wire_cells(rows: &[Vec<String>], type_string: &str) -> Vec<String> {
 
 fn short(s: &str) -> String {
     let one = s.replace('\n', " | ");
-    if one.len() > 160 {
-        format!("{}…", &one[..160])
+    if one.chars().count() > 160 {
+        // Count characters, not bytes. `&one[..160]` panics the moment
+        // byte 160 lands inside a multi-byte character, and this string is
+        // only ever built to report a failure -- the panic would replace
+        // the failure being reported with one of its own. The same defect
+        // was found the same day in `xtests/suitelib/src/steps.rs` and
+        // `xtests/dogfood_replay/src/bench.rs`.
+        format!("{}…", one.chars().take(160).collect::<String>())
     } else {
         one
+    }
+}
+
+#[cfg(test)]
+mod short_tests {
+    use super::short;
+
+    /// Same defect as `xtests/sqllogictest/src/main.rs` and
+    /// `xtests/dogfood_replay/src/bench.rs`: truncating a failure
+    /// reason by byte offset panics on a multi-byte boundary, which
+    /// replaces the failure being reported with one of its own.
+    #[test]
+    fn short_does_not_panic_on_a_multibyte_boundary() {
+        // 158 ASCII characters then a 3-byte one. The string is 161
+        // bytes, so the old `len() > 160` test truncated it, and byte 160
+        // lands INSIDE that last character -- which is exactly where
+        // `&s[..160]` panicked. Counting characters, 159 is short enough
+        // to keep whole.
+        let s = format!("{}\u{4e2d}", "x".repeat(158));
+        assert_eq!(s.len(), 161, "158 bytes plus a 3-byte character");
+        assert_eq!(s.chars().count(), 159);
+        assert_eq!(short(&s), s, "159 characters comes back whole");
+
+        // One that really is too long, built so the cut itself lands
+        // INSIDE a character: 158 ASCII bytes then multi-byte ones, so
+        // byte 160 is the last third of the first of them. A byte slice
+        // at [..160] panics here even when the length test counts
+        // characters -- both halves of the fix are needed, and an
+        // earlier version of this test proved only the first.
+        let long = format!("{}{}", "x".repeat(158), "\u{4e2d}".repeat(10));
+        assert!(
+            !long.is_char_boundary(160),
+            "the cut must land inside a character"
+        );
+        let cut = short(&long);
+        assert!(
+            cut.ends_with('\u{2026}'),
+            "expected an ellipsis, got {cut:?}"
+        );
+        assert_eq!(cut.chars().count(), 161, "160 characters plus the ellipsis");
     }
 }

@@ -558,8 +558,14 @@ fn run_group(name: &str, dir: &Path, diff_sink: &mut Vec<String>) -> GroupReport
 
 fn short(reason: &str) -> String {
     let one_line = reason.replace('\n', " | ");
-    if one_line.len() > 160 {
-        format!("{}…", &one_line[..160])
+    if one_line.chars().count() > 160 {
+        // Count characters, not bytes. `&one_line[..160]` panics the moment
+        // byte 160 lands inside a multi-byte character, and this string is
+        // only ever built to report a failure -- the panic would replace
+        // the failure being reported with one of its own. The same defect
+        // was found the same day in `xtests/suitelib/src/steps.rs` and
+        // `xtests/dogfood_replay/src/bench.rs`.
+        format!("{}…", one_line.chars().take(160).collect::<String>())
     } else {
         one_line
     }
@@ -753,5 +759,46 @@ fn write_diffs(workspace_root: &Path, diffs: &[String]) {
     let _ = fs::create_dir_all(&dir);
     if fs::write(&path, diffs.join("\n")).is_ok() {
         println!("diffs -> {}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod short_tests {
+    use super::short;
+
+    /// `short` truncated by byte offset, so a failure reason carrying a
+    /// multi-byte character across byte 160 panicked the runner instead
+    /// of printing the failure it was called to describe. The corpus
+    /// does contain multi-byte SQL -- the collation files are full of
+    /// it -- so this was reachable, not theoretical.
+    #[test]
+    fn short_does_not_panic_on_a_multibyte_boundary() {
+        // 158 ASCII characters then a 3-byte one. The string is 161
+        // bytes, so the old `len() > 160` test truncated it, and byte 160
+        // lands INSIDE that last character -- which is exactly where
+        // `&s[..160]` panicked. Counting characters, 159 is short enough
+        // to keep whole.
+        let s = format!("{}\u{4e2d}", "x".repeat(158));
+        assert_eq!(s.len(), 161, "158 bytes plus a 3-byte character");
+        assert_eq!(s.chars().count(), 159);
+        assert_eq!(short(&s), s, "159 characters comes back whole");
+
+        // One that really is too long, built so the cut itself lands
+        // INSIDE a character: 158 ASCII bytes then multi-byte ones, so
+        // byte 160 is the last third of the first of them. A byte slice
+        // at [..160] panics here even when the length test counts
+        // characters -- both halves of the fix are needed, and an
+        // earlier version of this test proved only the first.
+        let long = format!("{}{}", "x".repeat(158), "\u{4e2d}".repeat(10));
+        assert!(
+            !long.is_char_boundary(160),
+            "the cut must land inside a character"
+        );
+        let cut = short(&long);
+        assert!(
+            cut.ends_with('\u{2026}'),
+            "expected an ellipsis, got {cut:?}"
+        );
+        assert_eq!(cut.chars().count(), 161, "160 characters plus the ellipsis");
     }
 }
