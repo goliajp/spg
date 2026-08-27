@@ -6984,6 +6984,62 @@ fn localize_assignment_to_tstz(
     z.wall_to_utc(*wall).map_or(v, Value::Timestamp)
 }
 
+/// v7.39 — a STRICT MySQL session refuses a value that would not fit,
+/// in MySQL's own words.
+///
+/// The bend path has spoken MySQL since round 470 — `Out of range value
+/// for column 'n' at row 1`, errno 1264 — while the refusal path spoke
+/// PostgreSQL's: `integer out of range`, `value too long for type
+/// character varying(3)`, and a numeric overflow that leaked its
+/// `DETAIL:` clause into the message. The same failure, described two
+/// ways, and the client had asked for one of them by connecting to a
+/// MySQL port.
+///
+/// One function because `parse_insert_rows` asks this twice — once on
+/// the named-column path and once on the positional one. Guarding only
+/// the first left `INSERT INTO t VALUES (…)` answering in PostgreSQL's
+/// words, which is how the first cut of this fix passed a build and
+/// changed nothing a probe could see.
+#[derive(Clone, Copy)]
+pub(crate) struct FitMode {
+    /// The session speaks MySQL. A PG session keeps PG's vocabulary.
+    pub mysql: bool,
+    /// `sql_mode` carries no STRICT_ flag, so a value that would not fit
+    /// is bent rather than refused.
+    pub non_strict: bool,
+    /// `INSERT IGNORE` — the per-statement form of the same bend.
+    pub ignore: bool,
+}
+
+fn mysql_strict_refuse(
+    mode: FitMode,
+    raw: &Value<'static>,
+    col: &ColumnSchema,
+    row_no: usize,
+    omitted: bool,
+) -> Result<(), EngineError> {
+    // v7.39 — the three flags travel together in a named struct because
+    // clippy is right that four bare bools in a row is a hazard: swapping
+    // `non_strict` and `ignore` at a call site compiles and quietly
+    // changes which values a session accepts. That is the shape of defect
+    // this release exists to remove, so silencing the lint would have
+    // been the wrong reading of it.
+    if !mode.mysql || mode.non_strict || mode.ignore || raw.is_null() {
+        return Ok(());
+    }
+    let bent = crate::conversions::mysql_ignore_fit(raw.clone(), col);
+    if let Some((_, _, msg)) = crate::conversions::mysql_fit_error(raw, &bent, col, row_no, omitted)
+    {
+        // The MESSAGE carries the classification: each wording belongs to
+        // exactly one MySQL errno and `mysqlwire` maps it there. No
+        // internal marker travels in the text — this repository has twice
+        // shipped a layer prefix to a client because a path forgot to
+        // strip it.
+        return Err(EngineError::Unsupported(msg));
+    }
+    Ok(())
+}
+
 fn parse_insert_rows(
     table: &spg_storage::Table,
     // v7.39 (read01 round 55) — the catalog, so a user-named cast in an
@@ -7264,6 +7320,33 @@ fn parse_insert_rows(
                 // would not fit, and fills an OMITTED column; it does not
                 // bend an explicit NULL, which MariaDB still rejects with
                 // 1048 whatever the mode.
+                // v7.39 — a STRICT MySQL session refuses in MySQL's words.
+                //
+                // The bend path below has spoken MySQL since round 470 —
+                // `Out of range value for column 'n' at row 1`, errno 1264
+                // — and the refusal path spoke PostgreSQL's: `integer out
+                // of range`, `value too long for type character
+                // varying(3)`, and a numeric overflow that leaked its
+                // `DETAIL:` clause into the message. Same failure, two
+                // vocabularies, and only one of them was the one the
+                // client asked for by connecting to a MySQL port.
+                //
+                // Classification happens ONCE, in `mysql_fit_error`, which
+                // derives from the warning classifier. The strict codes
+                // are not simply the warning's: a too-long string warns
+                // 1265 `Data truncated` and refuses 1406 `Data too long`,
+                // both code and wording (measured on 9.7.2).
+                mysql_strict_refuse(
+                    FitMode {
+                        mysql,
+                        non_strict,
+                        ignore,
+                    },
+                    &raw,
+                    col,
+                    row_no,
+                    omitted,
+                )?;
                 let raw = if ignore || (non_strict && (omitted || !raw.is_null())) {
                     // v7.38.18 (C12) — bend it, and say what was bent.
                     let before = raw.clone();
@@ -7359,6 +7442,23 @@ fn parse_insert_rows(
                 // v7.39 (round 470) — the positional path names every column,
                 // so nothing here is omitted and an explicit NULL stays an
                 // explicit NULL.
+                // The positional path asks the SAME question the named
+                // path does. The first cut of this fix only guarded the
+                // named one, so `INSERT INTO t VALUES (999)` — the shape
+                // every probe here uses — still answered in PostgreSQL's
+                // words. One decision, two call sites, one of them missed:
+                // the exact shape this release is about.
+                mysql_strict_refuse(
+                    FitMode {
+                        mysql,
+                        non_strict,
+                        ignore,
+                    },
+                    &raw,
+                    col,
+                    row_no,
+                    false,
+                )?;
                 let raw = if ignore || non_strict {
                     // v7.38.18 (C12) — bend it, and say what was bent.
                     let before = raw.clone();

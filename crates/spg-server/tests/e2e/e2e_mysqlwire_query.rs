@@ -1350,3 +1350,162 @@ fn every_flag_sql_mode_claims_refuses_something() {
     // Nothing above landed.
     assert_eq!(query_scalar(&mut s, "SELECT count(*) FROM modes"), "0");
 }
+
+/// v7.39 — a value that will not fit is refused in MySQL's words, with
+/// MySQL's errno and SQLSTATE.
+///
+/// The bend path had spoken MySQL since round 470 — `Out of range value
+/// for column 'n' at row 1`, errno 1264 — and the REFUSAL path still
+/// spoke PostgreSQL's: `integer out of range` with errno 1690, `value
+/// too long for type character varying(3)`, and a numeric overflow that
+/// carried its `DETAIL:` clause inline. The same failure, described two
+/// ways, and the client had asked for one of them by connecting here.
+///
+/// Every pair below was read back from MySQL 9.7.2 rather than reasoned
+/// about, and four of them are not what reasoning would have given:
+///
+///   * strict does NOT simply reuse the warning's code. A too-long
+///     string warns 1265 `Data truncated` and refuses 1406 `Data too
+///     long` — both the code and the wording change. Numerics keep 1264
+///     for both.
+///   * `'12xy'` into an INT is 1265 (it takes the leading digits);
+///     into a DECIMAL it is 1366. Same input shape, different class.
+///   * the noun follows the column type and MySQL is not consistent
+///     about its case: `integer`, `decimal`, `FLOAT`, `DOUBLE`.
+///   * a DECIMAL that overflows is 1264, not the 1265 a non-integer
+///     column would otherwise get.
+///
+/// On the wire because the SQLSTATE only exists here: the engine returns
+/// a message and this layer derives the pair, so an engine-level test
+/// cannot see whether a client is told 1264 or a generic 1064.
+#[test]
+fn a_value_that_will_not_fit_is_refused_the_way_mysql_refuses_it() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+
+    for (i, (ddl, value, errno, sqlstate, msg)) in [
+        (
+            "n TINYINT",
+            "999",
+            1264,
+            "22003",
+            "Out of range value for column 'n' at row 1",
+        ),
+        (
+            "n INT",
+            "99999999999",
+            1264,
+            "22003",
+            "Out of range value for column 'n' at row 1",
+        ),
+        (
+            "n INT UNSIGNED",
+            "-5",
+            1264,
+            "22003",
+            "Out of range value for column 'n' at row 1",
+        ),
+        (
+            "c VARCHAR(3)",
+            "'abcdef'",
+            1406,
+            "22001",
+            "Data too long for column 'c' at row 1",
+        ),
+        (
+            "c CHAR(3)",
+            "'abcdef'",
+            1406,
+            "22001",
+            "Data too long for column 'c' at row 1",
+        ),
+        (
+            "d DECIMAL(3,1)",
+            "9999",
+            1264,
+            "22003",
+            "Out of range value for column 'd' at row 1",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        exec_ok(&mut s, &format!("CREATE TABLE fit_{i} ({ddl})"));
+        let (got_errno, got_state, got_msg) =
+            err_of(&mut s, &format!("INSERT INTO fit_{i} VALUES ({value})"));
+        assert_eq!(
+            (got_errno, got_state.as_str()),
+            (*errno, *sqlstate),
+            "`{ddl} <- {value}`"
+        );
+        assert_eq!(got_msg, *msg, "`{ddl} <- {value}`");
+    }
+}
+
+/// The other direction, and the one that caught a defect this change
+/// introduced: a value that FITS must still be stored.
+///
+/// The DECIMAL clamp's first cut restated every value at the column's
+/// scale and handed that back, so the classifier — which decides "did
+/// not fit" by comparing before with after — read ordinary rounding as
+/// an overflow. A strict session then REFUSED `DECIMAL(3,1) <- 1.26`,
+/// which MySQL stores as `1.3`. All six refusal probes were green while
+/// that was true.
+#[test]
+fn a_value_that_fits_is_still_stored() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+
+    for (i, (ddl, value, stored)) in [
+        ("n TINYINT", "127", "127"),
+        ("c VARCHAR(3)", "'abc'", "abc"),
+        ("d DECIMAL(3,1)", "99.9", "99.9"),
+        // Rounding to the declared scale is not an overflow. It happens
+        // in strict mode too, on both engines.
+        ("d DECIMAL(3,1)", "1.26", "1.3"),
+        ("d DECIMAL(3,1)", "-1.26", "-1.3"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        exec_ok(&mut s, &format!("CREATE TABLE fits_{i} ({ddl})"));
+        exec_ok(&mut s, &format!("INSERT INTO fits_{i} VALUES ({value})"));
+        let col = ddl.split(' ').next().unwrap();
+        assert_eq!(
+            query_scalar(&mut s, &format!("SELECT {col} FROM fits_{i}")),
+            *stored,
+            "`{ddl} <- {value}` must be stored, not refused"
+        );
+    }
+}
+
+/// And a NON-strict session still bends rather than refusing — the fix
+/// corrects what strict SAYS, it does not make the engine strict always.
+/// The DECIMAL rows are new capability: SPG used to raise here, where
+/// MySQL stores the bound, so a bulk load into a non-strict session
+/// stopped on a row MySQL would have taken.
+#[test]
+fn a_non_strict_session_still_bends_the_value() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "SET sql_mode = ''");
+
+    for (i, (ddl, value, bent)) in [
+        ("n TINYINT", "999", "127"),
+        ("c VARCHAR(3)", "'abcdef'", "abc"),
+        ("d DECIMAL(3,1)", "9999", "99.9"),
+        ("d DECIMAL(3,1)", "-9999", "-99.9"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        exec_ok(&mut s, &format!("CREATE TABLE bend_{i} ({ddl})"));
+        exec_ok(&mut s, &format!("INSERT INTO bend_{i} VALUES ({value})"));
+        let col = ddl.split(' ').next().unwrap();
+        assert_eq!(
+            query_scalar(&mut s, &format!("SELECT {col} FROM bend_{i}")),
+            *bent,
+            "`{ddl} <- {value}` must bend in a non-strict session"
+        );
+    }
+}

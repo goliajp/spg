@@ -3057,6 +3057,65 @@ fn column_int_bounds(schema: &ColumnSchema) -> Option<(i128, i128)> {
 /// INSERT INTO w VALUES (99999999999,..)  1264 Out of range value for column 'i' at row 1
 /// INSERT INTO w (s) VALUES ('ok')        1364 Field 'i' doesn't have a default value
 /// ```
+/// v7.39 — what MySQL calls a value that does not fit, in the STRICT
+/// case where it refuses rather than bends.
+///
+/// Same classification as `mysql_fit_warning` and derived from it, so
+/// the two can never describe the same failure differently — which they
+/// did: the warning path had learned MySQL's vocabulary and the error
+/// path still spoke PostgreSQL's, so a MySQL client that let a value
+/// through got `Out of range value for column 'n' at row 1` and one
+/// that was refused got `integer out of range` with errno 1690.
+///
+/// The codes are NOT simply the warning's. Measured on MySQL 9.7.2,
+/// `sql_mode='STRICT_TRANS_TABLES'` versus `sql_mode=''`:
+///
+/// ```text
+///                     non-strict (warning)          strict (error)
+///   TINYINT <- 999    1264 Out of range value…      1264 (22003) same wording
+///   VARCHAR(3) <- …   1265 Data truncated…          1406 (22001) Data too long…
+///   INT <- 'abc'      1366 Incorrect integer value  1366 (HY000) same wording
+///   INT <- '12xy'     1265 Data truncated…          1265 (01000) same wording
+///   omitted NOT NULL  1364 Field … no default       1364 (HY000) same wording
+/// ```
+///
+/// The string case is the one that breaks the pattern: both the code and
+/// the wording change. Assuming otherwise would have been wrong on
+/// exactly the column type this version's worst defect lived in.
+///
+/// Returns the errno, the SQLSTATE MySQL pairs with it, and the message.
+/// `None` when the value fits and there is nothing to refuse.
+pub(crate) fn mysql_fit_error(
+    before: &Value<'_>,
+    after: &Value<'_>,
+    schema: &ColumnSchema,
+    row: usize,
+    omitted: bool,
+) -> Option<(u16, &'static str, alloc::string::String)> {
+    let w = mysql_fit_warning(before, after, schema, row, omitted)?;
+    let col = &schema.name;
+    Some(match w.code {
+        // A string that had to be cut is refused as "too long", not as
+        // "truncated" — different errno AND different wording.
+        1265 if matches!(
+            schema.ty,
+            DataType::Varchar(_) | DataType::Char(_) | DataType::Text
+        ) =>
+        {
+            (
+                1406,
+                "22001",
+                alloc::format!("Data too long for column '{col}' at row {row}"),
+            )
+        }
+        1265 => (1265, "01000", w.message),
+        1264 => (1264, "22003", w.message),
+        1366 => (1366, "HY000", w.message),
+        1364 => (1364, "HY000", w.message),
+        other => (other, "HY000", w.message),
+    })
+}
+
 pub(crate) fn mysql_fit_warning(
     before: &Value<'_>,
     after: &Value<'_>,
@@ -3077,11 +3136,36 @@ pub(crate) fn mysql_fit_warning(
             message: alloc::format!("Field '{col}' doesn't have a default value"),
         });
     }
+    // v7.39 — `Numeric` belongs here. Without it a DECIMAL that would not
+    // fit fell to the 1265 default and was reported as a truncation, where
+    // MySQL calls it 1264 `Out of range value`.
     let numeric_col = matches!(
         schema.ty,
-        DataType::SmallInt | DataType::Int | DataType::BigInt | DataType::Float | DataType::Real
+        DataType::SmallInt
+            | DataType::Int
+            | DataType::BigInt
+            | DataType::Float
+            | DataType::Real
+            | DataType::Numeric { .. }
     );
     if numeric_col {
+        // v7.39 — the NOUN is the column's type, and MySQL is not
+        // consistent about its case. Measured on 9.7.2, one string into
+        // each:
+        //
+        //     BIGINT   Incorrect integer value: 'abc' …
+        //     DECIMAL  Incorrect decimal value: 'abc' …
+        //     FLOAT    Incorrect FLOAT value: 'abc' …
+        //     DOUBLE   Incorrect DOUBLE value: 'abc' …
+        //
+        // Two lower-case, two upper-case. A drop-in copies that rather
+        // than tidying it.
+        let noun = match schema.ty {
+            DataType::Numeric { .. } => "decimal",
+            DataType::Real => "FLOAT",
+            DataType::Float => "DOUBLE",
+            _ => "integer",
+        };
         // A string given to a numeric column is 1366; a number that did
         // not fit its range is 1264.
         return Some(if matches!(before, Value::Text(_) | Value::BpChar(_)) {
@@ -3089,7 +3173,7 @@ pub(crate) fn mysql_fit_warning(
                 level: "Warning",
                 code: 1366,
                 message: alloc::format!(
-                    "Incorrect integer value: '{}' for column '{col}' at row {row}",
+                    "Incorrect {noun} value: '{}' for column '{col}' at row {row}",
                     crate::eval::value_to_text(before)
                 ),
             }
@@ -3106,6 +3190,35 @@ pub(crate) fn mysql_fit_warning(
         code: 1265,
         message: alloc::format!("Data truncated for column '{col}' at row {row}"),
     })
+}
+
+/// v7.39 — carry a value that this clamp does not model through
+/// unchanged, so a shape nobody measured is not silently rewritten.
+fn numeric_untouched(v: Value<'static>, _schema: &ColumnSchema) -> Value<'static> {
+    v
+}
+
+/// v7.39 — restate a scaled integer at a different scale, rounding half
+/// away from zero, which is what MySQL does going to a narrower scale
+/// (measured: `DECIMAL(3,1) <- 1.26` stores `1.3`, not `1.2`).
+fn restate_scaled(scaled: i128, from: u16, to: u16) -> i128 {
+    if from == to {
+        return scaled;
+    }
+    if to > from {
+        let f = 10i128.checked_pow(u32::from(to - from)).unwrap_or(1);
+        return scaled.saturating_mul(f);
+    }
+    let f = 10i128.checked_pow(u32::from(from - to)).unwrap_or(1);
+    if f == 0 {
+        return scaled;
+    }
+    let half = f / 2;
+    if scaled >= 0 {
+        (scaled + half) / f
+    } else {
+        (scaled - half) / f
+    }
 }
 
 pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Value<'static> {
@@ -3131,6 +3244,61 @@ pub(crate) fn mysql_ignore_fit(v: Value<'static>, schema: &ColumnSchema) -> Valu
         && s.trim().parse::<i64>().is_err()
     {
         return Value::BigInt(leading_numeric_prefix(s));
+    }
+    // v7.39 — a DECIMAL that will not fit clamps to the column's bound.
+    //
+    // Not a message fix: SPG REFUSED this even in a non-strict session,
+    // where MySQL stores the bound and warns. Measured on 9.7.2 with
+    // `sql_mode=''` and `DECIMAL(3,1)`:
+    //
+    //     9999  ->  99.9      -9999  ->  -99.9      1.26  ->  1.3
+    //
+    // The last is ordinary rounding to the declared scale and happens in
+    // strict mode too; only the first two are the overflow. A bulk load
+    // into a non-strict session stopped here on a row MySQL would have
+    // taken.
+    //
+    // With the value bent, the STRICT path gets its answer from the same
+    // classifier as every other type — `Out of range value for column 'd'
+    // at row 1`, errno 1264 — instead of PostgreSQL's `numeric field
+    // overflow`, which also carried its `DETAIL:` clause inline.
+    if let DataType::Numeric { precision, scale } = schema.ty
+        && precision != 0
+        && scale >= 0
+    {
+        let col_scale = u16::try_from(scale).unwrap_or(0);
+        let (scaled, val_scale) = match v {
+            Value::Numeric {
+                scaled,
+                scale: vs,
+                kind: spg_storage::NumericKind::Finite,
+            } => (scaled, vs),
+            Value::SmallInt(n) => (i128::from(n), 0),
+            Value::Int(n) => (i128::from(n), 0),
+            Value::BigInt(n) => (i128::from(n), 0),
+            _ => return numeric_untouched(v, schema),
+        };
+        // Restate at the column's scale, rounding half away from zero as
+        // MySQL does, then clamp to +/-(10^precision - 1) in those units.
+        // Only a CLAMP is a value that would not fit. Rounding to the
+        // declared scale is ordinary coercion and happens in strict mode
+        // too: `DECIMAL(3,1) <- 1.26` stores `1.3` on both engines and in
+        // both modes.
+        //
+        // The first cut returned the restated value unconditionally, and
+        // the classifier — which decides "did not fit" by comparing before
+        // with after — read that rounding as an overflow. Strict sessions
+        // then REFUSED 1.26 with `Out of range value`, a value MySQL
+        // takes. The six refusal probes were all green while that was
+        // true; only checking the ACCEPTING side found it.
+        let restated = restate_scaled(scaled, val_scale, col_scale);
+        let limit = 10i128
+            .checked_pow(u32::from(precision))
+            .map_or(i128::MAX, |p| p - 1);
+        if restated < -limit || restated > limit {
+            return Value::numeric(restated.clamp(-limit, limit), col_scale);
+        }
+        return numeric_untouched(v, schema);
     }
     // An out-of-range integer clamps to the column's bound.
     let as_int = match v {
