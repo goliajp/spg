@@ -1,0 +1,9 @@
+== permutation setup seed s1_begin s1_read1 s2_insert s1_read2 s1_commit s1_read3
+setup: ok CREATE TABLE
+seed: ok INSERT 0 1
+s1_begin: ok BEGIN
+s1_read1: rows 1
+s2_insert: ok INSERT 0 1
+s1_read2: rows 2
+s1_commit: ok COMMIT
+s1_read3: rows 2

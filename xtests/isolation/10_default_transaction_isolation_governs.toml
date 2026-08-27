@@ -1,0 +1,62 @@
+# v7.39 — `SET default_transaction_isolation` must reach the SNAPSHOT, not
+# just the report. Until this version SPG accepted the setting and read it
+# back correctly while every transaction still ran read committed, so a
+# connection pool or ORM that sets it at connect time was told it had a
+# guarantee it did not hold.
+#
+# The transaction here names no level. If the setting governs, session 1's
+# second read cannot see session 2's commit. Its control is
+# 09_read_committed_sees_concurrent_commit: same shape, weaker level,
+# the commit visible. Reporting alone cannot pass this — a build that
+# fixed only the report would still show read2 = 2.
+[iso]
+name = "default_transaction_isolation_governs"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE dti (x INT)"
+
+[[step]]
+id = "seed"
+session = 1
+sql = "INSERT INTO dti VALUES (1)"
+
+[[step]]
+id = "s1_set"
+session = 1
+sql = "SET default_transaction_isolation = 'repeatable read'"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN"
+
+[[step]]
+id = "s1_read1"
+session = 1
+sql = "SELECT count(*) FROM dti"
+
+[[step]]
+id = "s2_insert"
+session = 2
+sql = "INSERT INTO dti VALUES (2)"
+
+[[step]]
+id = "s1_read2"
+session = 1
+sql = "SELECT count(*) FROM dti"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s1_read3"
+session = 1
+sql = "SELECT count(*) FROM dti"
+
+[[permutation]]
+order = "setup seed s1_set s1_begin s1_read1 s2_insert s1_read2 s1_commit s1_read3"

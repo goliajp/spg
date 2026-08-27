@@ -296,7 +296,7 @@ impl Engine {
             // separately. Reporting truthfully does not wait on it.
             (
                 "transaction_isolation",
-                self.current_isolation_level.as_mysql_str(),
+                self.current_isolation_level().as_mysql_str(),
             ),
         ];
         for &(k, v) in canonical {

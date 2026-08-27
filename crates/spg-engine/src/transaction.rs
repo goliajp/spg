@@ -538,9 +538,9 @@ impl Engine {
         // the default at COMMIT/ROLLBACK). Set it before the RR/SER snapshot is
         // cached below so a fresh `BEGIN ISOLATION LEVEL REPEATABLE READ` freezes
         // its view without a preceding `SET TRANSACTION`.
-        if let Some(level) = isolation {
-            self.current_isolation_level = level;
-        }
+        // v7.39 — and when it does NOT name one, take the session default
+        // rather than leaving whatever the previous transaction set.
+        self.current_isolation_level = isolation.unwrap_or_else(|| self.default_isolation_level());
         // v7.37.15 Phase C — allocate the tx's writer version FIRST
         // (before caching any snapshot). Concurrent readers that build
         // snapshots between now and COMMIT see this version in
@@ -629,7 +629,7 @@ impl Engine {
             }
             self.restore_all_local_gucs();
             // v7.39 (read01 round 118, B3) — a failed COMMIT ends the tx too.
-            self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
+            self.current_isolation_level = self.default_isolation_level();
             // v7.39 (pg_stat knife A) — a failed COMMIT rolls back.
             self.xact_rollback
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1011,7 +1011,7 @@ impl Engine {
         self.restore_all_local_gucs();
         // v7.39 (read01 round 118, B3) — a transaction's isolation level is
         // scoped to the block; PG reverts to the default at COMMIT/ROLLBACK.
-        self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
+        self.current_isolation_level = self.default_isolation_level();
         // v7.39 (round 552) — bump the commit sequence and stamp every
         // table this tx wrote, so a concurrent SERIALIZABLE reader can
         // tell that what it read has changed since. Commit order is what
@@ -1062,7 +1062,7 @@ impl Engine {
         self.restore_all_local_gucs();
         // v7.39 (read01 round 118, B3) — isolation reverts to the default at
         // transaction end (see exec_commit).
-        self.current_isolation_level = spg_sql::ast::IsolationLevel::ReadCommitted;
+        self.current_isolation_level = self.default_isolation_level();
         // v7.39 (pg_stat knife A) — one rolled-back transaction (a
         // COMMIT inside an aborted tx dispatches here too, like PG).
         self.xact_rollback

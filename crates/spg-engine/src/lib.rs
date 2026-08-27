@@ -3222,7 +3222,59 @@ impl Engine {
     /// `SET TRANSACTION ISOLATION LEVEL …`. Read by
     /// `SHOW transaction_isolation` and any future MVCC/SSI gate.
     pub fn current_isolation_level(&self) -> spg_sql::ast::IsolationLevel {
-        self.current_isolation_level
+        // v7.39 — `current_tx` is the session's SLOT, which a connected
+        // session always has; it is not the witness for "a transaction
+        // block is open". `tx_catalogs` is. Using the slot made this
+        // report the block's level forever, so the first version of this
+        // fix answered `read committed` for a MySQL session that should
+        // default to REPEATABLE READ — the pin caught it.
+        if self
+            .current_tx
+            .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+        {
+            self.current_isolation_level
+        } else {
+            // v7.39 — outside a transaction PG reports the DEFAULT, and
+            // the default is a setting, not a constant. Measured on PG
+            // 18.6: after `SET default_transaction_isolation =
+            // 'repeatable read'`, both `SHOW transaction_isolation` and
+            // the next transaction report `repeatable read`.
+            self.default_isolation_level()
+        }
+    }
+
+    /// v7.39 — the level a transaction gets when it does not name one,
+    /// and the level the session returns to when one ends. This used to
+    /// be the constant `ReadCommitted`, written out at four separate
+    /// sites, and two things were wrong with that.
+    ///
+    /// First, `SET default_transaction_isolation = 'repeatable read'`
+    /// did nothing. SPG accepted it and read it back — so a connection
+    /// pool or ORM that sets it at connect time was told it had the
+    /// level it asked for — while every transaction still ran read
+    /// committed. The engine HAS repeatable read (measured against PG
+    /// 18.6: a concurrent commit is invisible to an open RR transaction
+    /// and visible to a READ COMMITTED one); the setting simply never
+    /// reached it. Reporting a guarantee the session does not hold is
+    /// the worst shape this defect can take, because the client's whole
+    /// reason for asking is to decide what it may assume.
+    ///
+    /// Second, the MySQL dialect inherited PG's default. MySQL 9.7.2
+    /// defaults to REPEATABLE READ (measured: a fresh connection
+    /// answers `REPEATABLE-READ`), so a MySQL application that relies
+    /// on its own engine's default was silently given a weaker one.
+    #[must_use]
+    pub fn default_isolation_level(&self) -> spg_sql::ast::IsolationLevel {
+        if let Some(v) = self.session_params.get("default_transaction_isolation")
+            && let Some(level) = spg_sql::ast::IsolationLevel::from_pg_name(v)
+        {
+            return level;
+        }
+        if self.in_mysql_dialect() {
+            spg_sql::ast::IsolationLevel::RepeatableRead
+        } else {
+            spg_sql::ast::IsolationLevel::ReadCommitted
+        }
     }
 
     /// v7.34 — take the redo captured by the most recent successful

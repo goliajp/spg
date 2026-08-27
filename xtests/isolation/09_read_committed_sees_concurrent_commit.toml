@@ -1,0 +1,50 @@
+# v7.39 — the NEGATIVE CONTROL for 08. Same shape, READ COMMITTED
+# instead: session 1's second read MUST see session 2's commit. If this
+# one reported "unchanged" too, the harness could not observe the
+# difference between the levels and 08's pass would be meaningless.
+[iso]
+name = "read_committed_sees_concurrent_commit"
+sessions = 2
+
+[[step]]
+id = "setup"
+session = 1
+sql = "CREATE TABLE rc (x INT)"
+
+[[step]]
+id = "seed"
+session = 1
+sql = "INSERT INTO rc VALUES (1)"
+
+[[step]]
+id = "s1_begin"
+session = 1
+sql = "BEGIN ISOLATION LEVEL READ COMMITTED"
+
+[[step]]
+id = "s1_read1"
+session = 1
+sql = "SELECT count(*) FROM rc"
+
+[[step]]
+id = "s2_insert"
+session = 2
+sql = "INSERT INTO rc VALUES (2)"
+
+[[step]]
+id = "s1_read2"
+session = 1
+sql = "SELECT count(*) FROM rc"
+
+[[step]]
+id = "s1_commit"
+session = 1
+sql = "COMMIT"
+
+[[step]]
+id = "s1_read3"
+session = 1
+sql = "SELECT count(*) FROM rc"
+
+[[permutation]]
+order = "setup seed s1_begin s1_read1 s2_insert s1_read2 s1_commit s1_read3"
