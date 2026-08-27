@@ -227,7 +227,7 @@ fn run_query_fixture(
     fast: bool,
 ) -> Result<Outcome> {
     let state = verify_snapshot(dir, &q.snapshot.path, &q.snapshot.sha256)?;
-    let extracted = match state {
+    let snapshot_path = match state {
         SnapshotState::Missing => {
             println!(
                 "  SKIP  {} — snapshot missing (fetch from {} to enable)",
@@ -255,7 +255,7 @@ fn run_query_fixture(
                 );
                 return Ok(Outcome::Skip);
             }
-            extract_snapshot(&path).with_context(|| format!("extract snapshot for {}", fx.name))?
+            path
         }
     };
 
@@ -288,7 +288,22 @@ fn run_query_fixture(
         let mut opens: Vec<f64> = Vec::with_capacity(iters);
         let mut colds: Vec<Vec<f64>> = vec![Vec::new(); stmts.len()];
         let mut held = None;
+        // Each sample gets its own extraction. Reopening the same
+        // directory is not the same measurement: the first open reads a
+        // catalog `tar` has just written, and every reopen after it
+        // finds the same bytes already in the page cache. Measured on
+        // `track-a`, three runs: the first open took 3300 / 3368 / 3377
+        // ms and the reopens' median 2336 / 2329 / 2391, and the first
+        // COLD sample read 100.73 / 144.08 / 112.40 ms against medians
+        // of 98.71 / 85.83 / 91.47 -- so a median over reopens would
+        // have passed a budget every one of those first samples breaks.
+        // That is not removing a coin flip, it is swapping the quantity
+        // being judged for a cheaper one. Re-extracting costs a tar per
+        // sample and buys samples that are actually comparable, to each
+        // other and to the number the budget was set from.
         for i in 0..iters {
+            let extracted = extract_snapshot(&snapshot_path)
+                .with_context(|| format!("extract snapshot for {}", fx.name))?;
             let open_start = Instant::now();
             let mut db = Database::open_path(&extracted.catalog_path)
                 .map_err(ee)
@@ -300,16 +315,28 @@ fn run_query_fixture(
             // The last one stays open for the warm loop; the rest close
             // here, which is what makes the next open a cold one.
             if i + 1 == iters {
-                held = Some(db);
+                // The extraction has to outlive the database: its
+                // TempDir deletes the catalog when it drops.
+                held = Some((db, extracted));
             }
         }
-        let mut db = held.expect("cold_iters is at least 1, so one database is held");
+        let (mut db, _kept) = held.expect("cold_iters is at least 1, so one database is held");
         let open_med = bench::median(&opens);
         for (j, sql) in stmts.iter().enumerate() {
             let w = bench::warm_stats(&mut db, sql, qs.warmup_iters, qs.measure_iters)?;
             let cold_med = bench::median(&colds[j]);
             let cold_lo = colds[j].iter().copied().fold(f64::INFINITY, f64::min);
             let cold_hi = colds[j].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            // The FIRST sample is the only one taken against a catalog the
+            // OS page cache has not seen since `tar` wrote it; the reopens
+            // after it are cheaper for that reason alone. Reporting only
+            // the median would quietly swap the quantity being judged for
+            // an easier one -- `content-worker` reads ~20 ms on the first
+            // and ~10 ms on the reopens, so a median of five sits under a
+            // budget the first sample breaks. Both are printed, and the
+            // first is named, so nobody has to guess which is which.
+            let cold_first = colds[j].first().copied().unwrap_or(0.0);
+            let open_first = opens.first().copied().unwrap_or(0.0);
             let cold_ok = q.expected.cold_ms_max == 0.0 || cold_med <= q.expected.cold_ms_max;
             let warm_ok = q.expected.warm_ms_max == 0.0 || w.p50_ms <= q.expected.warm_ms_max;
             let p95_ok = q.expected.p95_ms_max == 0.0 || w.p95_ms <= q.expected.p95_ms_max;
@@ -322,14 +349,17 @@ fn run_query_fixture(
             // median is exactly what hides a bimodal sample, and one of
             // these fixtures has one.
             println!(
-                "  {} open={:.0}ms cold={:.2}ms [{:.2}-{:.2}, n={}] p50={:.2}ms p95={:.2}ms \
-                 p99={:.2}ms max={:.2}ms (n={}) — budget cold≤{} p50≤{} p95≤{}",
+                "  {} open={:.0}ms(1st {:.0}) cold={:.2}ms [{:.2}-{:.2}, n={}, 1st {:.2}] \
+                 p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms (n={}) \
+                 — budget cold≤{} p50≤{} p95≤{}",
                 tag.tag(),
                 open_med,
+                open_first,
                 cold_med,
                 cold_lo,
                 cold_hi,
                 colds[j].len(),
+                cold_first,
                 w.p50_ms,
                 w.p95_ms,
                 w.p99_ms,
