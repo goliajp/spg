@@ -9368,14 +9368,14 @@ pub(crate) fn canonical_gucs() -> &'static [(
         ),
         (
             "server_version",
-            "18.4 (spg)",
+            crate::PG_SERVER_VERSION,
             "Preset Options",
             "string",
             "internal",
         ),
         (
             "server_version_num",
-            "180004",
+            crate::PG_SERVER_VERSION_NUM,
             "Preset Options",
             "integer",
             "internal",

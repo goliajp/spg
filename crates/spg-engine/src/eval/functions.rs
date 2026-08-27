@@ -15720,8 +15720,8 @@ fn apply_function_dispatch(
                 return Ok(Value::BigInt(n as i64));
             }
             let val = match lname.as_str() {
-                "server_version" => "18.4 (SPG-compat)",
-                "server_version_num" => "180004",
+                "server_version" => crate::PG_SERVER_VERSION,
+                "server_version_num" => crate::PG_SERVER_VERSION_NUM,
                 "server_encoding" => "UTF8",
                 "client_encoding" => "UTF8",
                 "lc_collate" => "C.UTF-8",
@@ -18728,7 +18728,7 @@ fn apply_function_dispatch(
         }
         // version() — the PG-compatible banner (canned wire layer was
         // dismantled; the engine is the single source).
-        "version" => Ok(Value::text("PostgreSQL 18.4 (SPG-compat)")),
+        "version" => Ok(Value::text(crate::PG_VERSION_STRING)),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
         // (`WHERE schemaname = current_schema()`, `SELECT *,

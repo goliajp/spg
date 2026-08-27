@@ -1952,7 +1952,7 @@ fn run_pg_session(
     send_msg(stream, b'R', &0u32.to_be_bytes())?;
     // ParameterStatus pairs — keep the set minimal but include the
     // ones psql / driver libraries check first.
-    send_parameter_status(stream, "server_version", "18.4 (spg)")?;
+    send_parameter_status(stream, "server_version", spg_engine::PG_SERVER_VERSION)?;
     send_parameter_status(stream, "client_encoding", "UTF8")?;
     send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
     send_parameter_status(stream, "integer_datetimes", "on")?;
@@ -4703,8 +4703,8 @@ fn known_defaults() -> &'static [(&'static str, &'static str)] {
         ("intervalstyle", "postgres"),
         ("search_path", "\"$user\", public"),
         ("server_encoding", "UTF8"),
-        ("server_version", "18.4 (spg)"),
-        ("server_version_num", "180004"),
+        ("server_version", spg_engine::PG_SERVER_VERSION),
+        ("server_version_num", spg_engine::PG_SERVER_VERSION_NUM),
         ("standard_conforming_strings", "on"),
         ("statement_timeout", "0"),
         ("timezone", "UTC"),

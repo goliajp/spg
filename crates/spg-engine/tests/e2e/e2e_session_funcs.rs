@@ -8,7 +8,7 @@
 //! canned-response shortcuts which only fire on bare `SELECT fn()`):
 //!   * `current_database()` (PG) / `database()` (MySQL) → 'spg'
 //!   * `current_schema()` → 'public'
-//!   * `version()` → 'PostgreSQL 18.4 (SPG-compat)' (already shipped
+//!   * `version()` → 'PostgreSQL 18.6 (spg)' (already shipped
 //!     — corpus-locked here so regression notices)
 //!   * `current_user()` / `user()` → 'admin' (paren form)
 //!
@@ -93,21 +93,35 @@ fn database_in_select_list_alongside_table_column() {
 /// U21 (read01 A-group): SPG positions as a PG 18 drop-in, so the
 /// reported server version must be 18.x — clients gate feature
 /// availability on server_version / server_version_num. It used to
-/// report 16. Anchored to the live PG 18.4 the dropin panel targets.
+/// report 16.
+///
+/// The minor used to be written here as a literal (`18.4`), which meant
+/// the one place that has to move when the oracle moves was a string in
+/// a test rather than the constant the server reads. It is anchored to
+/// `spg_engine::PG_SERVER_VERSION` now; what this test still asserts on
+/// its own is the part that is a promise rather than a number — the
+/// major is 18, and `version()` carries the same version the settings
+/// surfaces do.
 #[test]
 fn reported_server_version_is_pg18() {
     let mut e = Engine::new();
     let v = one_text(&mut e, "SELECT version()");
     assert!(
-        v.contains("18.4"),
-        "version() should report 18.4, got {v:?}"
+        spg_engine::PG_SERVER_VERSION.starts_with("18."),
+        "SPG positions as a PG 18 drop-in; PG_SERVER_VERSION is {:?}",
+        spg_engine::PG_SERVER_VERSION
+    );
+    assert!(
+        v.contains(spg_engine::PG_SERVER_VERSION),
+        "version() {v:?} does not carry {}",
+        spg_engine::PG_SERVER_VERSION
     );
     assert_eq!(
         one_text(&mut e, "SELECT current_setting('server_version')"),
-        "18.4 (SPG-compat)"
+        "18.6 (spg)"
     );
     assert_eq!(
         one_text(&mut e, "SELECT current_setting('server_version_num')"),
-        "180004"
+        "180006"
     );
 }

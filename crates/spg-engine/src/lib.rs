@@ -115,6 +115,40 @@ pub mod triggers;
 pub mod users;
 mod window;
 
+/// The PostgreSQL version SPG reports, in one place.
+///
+/// It used to be in four, and they disagreed. Measured on a live server
+/// with a PostgreSQL 18.6 client, SPG answered the same question two
+/// ways at once:
+///
+/// ```text
+/// startup ParameterStatus   -> 18.4 (spg)
+/// pg_settings.setting       -> 18.4 (spg)
+/// SHOW server_version       -> 18.4 (SPG-compat)
+/// current_setting(...)      -> 18.4 (SPG-compat)
+/// ```
+///
+/// In PostgreSQL those are the same GUC and cannot differ: real 18.6
+/// gives `18.6 (Debian 18.6-1.pgdg13+2)` on every one of them. A driver
+/// that reads the startup packet and application code that runs `SHOW`
+/// were being told different things by the same server.
+///
+/// A fourth spelling, `18.4 (Debian 18.4-1.pgdg13+1)`, sat in
+/// `guc_catalog`'s mirror of PG's parameter table and never surfaced,
+/// because `canonical_gucs` wins where the two overlap. It would have
+/// surfaced the moment that stopped being true, and it would have
+/// claimed SPG was a Debian build of PostgreSQL.
+pub const PG_SERVER_VERSION: &str = "18.6 (spg)";
+
+/// `server_version_num` for [`PG_SERVER_VERSION`]. Keep the two in step:
+/// `18.6` is `180006`.
+pub const PG_SERVER_VERSION_NUM: &str = "180006";
+
+/// What `version()` answers. PostgreSQL adds the platform and the
+/// compiler; SPG is neither built the way that string describes nor
+/// willing to claim it is, so it stops after the version.
+pub const PG_VERSION_STRING: &str = "PostgreSQL 18.6 (spg)";
+
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
 pub use execute::{RowCells, StreamItem};
