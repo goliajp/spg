@@ -848,8 +848,14 @@ impl Engine {
         }
 
         let value: alloc::string::String = match name.to_ascii_lowercase().as_str() {
+            // v7.39 — the FOURTH surface, and the one my own count of
+            // this defect missed: `SHOW transaction_isolation` read the
+            // raw field, which outside a transaction is whatever the
+            // last one left rather than the session default. The pin
+            // found it, which is the argument for pinning agreement
+            // between surfaces instead of any one value.
             "transaction_isolation" => {
-                alloc::string::String::from(self.current_isolation_level.as_pg_str())
+                alloc::string::String::from(self.current_isolation_level().as_pg_str())
             }
             "is_superuser" => alloc::string::String::from("on"),
             _ => {
@@ -2691,11 +2697,38 @@ impl Engine {
             // v7.38 轴 4 — `SET TRANSACTION ISOLATION LEVEL …`. The
             // surface is recorded on `Engine::current_isolation_level`
             // and visible via `SHOW transaction_isolation`. Behavioural
-            // implementation (REPEATABLE READ snapshot / SERIALIZABLE
-            // SSI) lands separately; today every level reads as
-            // effective READ COMMITTED (same as PG's silent upgrade
-            // of READ UNCOMMITTED).
+            // v7.39 — this comment used to end "today every level reads
+            // as effective READ COMMITTED". That stopped being true in
+            // v7.37.15, which caches the BEGIN snapshot for RR/SER;
+            // measured against PG 18.6, an open REPEATABLE READ
+            // transaction does not see a concurrent commit and a READ
+            // COMMITTED one does. The comment outlived the code by
+            // three versions.
             Statement::SetTransaction { isolation } => {
+                // v7.39 — outside a transaction block PG WARNS and does
+                // nothing. Measured on PG 18.6:
+                //
+                //     SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+                //     WARNING:  SET TRANSACTION can only be used in transaction blocks
+                //     SHOW transaction_isolation;  ->  read committed
+                //
+                // SPG applied it to the session instead, so a bare
+                // `SET TRANSACTION` silently changed every later
+                // transaction — the opposite of PG, where it changes
+                // nothing. `Session::warning`'s own doc comment names
+                // `SET CONSTRAINTS` outside a transaction block as the
+                // case it exists for; this is its sibling, and only one
+                // of them had been wired.
+                if !self
+                    .current_tx
+                    .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+                {
+                    self.warning("SET TRANSACTION can only be used in transaction blocks".into());
+                    return Ok(QueryResult::CommandOk {
+                        affected: 0,
+                        modified_catalog: false,
+                    });
+                }
                 // v7.37.17 (Phase E3) — PG rejects an isolation switch
                 // after the transaction's first query (SQLSTATE 25001);
                 // silently applying it to the remaining statements would

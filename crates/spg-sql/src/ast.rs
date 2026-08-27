@@ -1084,6 +1084,21 @@ impl IsolationLevel {
     /// `SHOW VARIABLES` and `@@transaction_isolation` used to carry
     /// their own hard-coded literal, and the literals disagreed —
     /// one said `REPEATABLE-READ` while the engine ran read committed.
+    /// v7.39 — parse what `default_transaction_isolation` holds. PG
+    /// accepts the SQL spellings and stores them lower-cased with a
+    /// space; anything else is not a level this understands and the
+    /// caller keeps its own default rather than guessing.
+    #[must_use]
+    pub fn from_pg_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "read uncommitted" => Some(Self::ReadUncommitted),
+            "read committed" => Some(Self::ReadCommitted),
+            "repeatable read" => Some(Self::RepeatableRead),
+            "serializable" => Some(Self::Serializable),
+            _ => None,
+        }
+    }
+
     #[must_use]
     pub fn as_mysql_str(self) -> &'static str {
         match self {

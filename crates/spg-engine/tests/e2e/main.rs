@@ -409,6 +409,7 @@ mod e2e_is_json;
 mod e2e_is_normalized;
 mod e2e_is_precedence;
 mod e2e_isfinite;
+mod e2e_isolation_default_v739;
 mod e2e_join_bucket_round576;
 mod e2e_join_expr_key_round719;
 mod e2e_join_group_by_key_round621;
