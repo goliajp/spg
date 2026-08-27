@@ -96,6 +96,55 @@ fn tsvector_source_column(e: &spg_sql::ast::Expr) -> Option<String> {
     }
 }
 
+/// The first name that appears twice, or `None`.
+///
+/// v7.39.2 — whether case matters is the DIALECT's answer, and the
+/// first version of this got it wrong in a way no refusal pin could
+/// see. Measured:
+///
+/// * PostgreSQL 18.6 accepts `CREATE TABLE t ("a" int, "A" int)` —
+///   quoting preserves case there, so those are two columns. Unquoted
+///   `(a int, A int)` is still one name twice, because the LEXER folded
+///   it long before this sees it. So the comparison here is exact, and
+///   folding it a second time refuses a table PostgreSQL creates.
+/// * MySQL 9.7.2 refuses ``(`a` int, `A` int)`` with
+///   `Duplicate column name 'A'`: its column names never distinguish
+///   case, quoted or not.
+///
+/// The over-rejection was found by an ablation that did NOT bite —
+/// making the comparison case-sensitive left every pin green, which
+/// said the pin named for case was passing for another reason.
+fn first_duplicate<'a>(
+    names: impl Iterator<Item = &'a str>,
+    fold_case: bool,
+) -> Option<alloc::string::String> {
+    let mut seen: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    for n in names {
+        let key = if fold_case {
+            n.to_ascii_lowercase()
+        } else {
+            alloc::string::String::from(n)
+        };
+        if !seen.insert(key) {
+            // The spelling as WRITTEN, which is what both engines quote
+            // back — MySQL 9.7.2 says `Duplicate column name 'A'` for
+            // the second one.
+            return Some(alloc::string::String::from(n));
+        }
+    }
+    None
+}
+
+/// Each engine's own words for it.
+fn duplicate_column_message(name: &str, mysql: bool) -> alloc::string::String {
+    if mysql {
+        alloc::format!("Duplicate column name '{name}'")
+    } else {
+        alloc::format!("column \"{name}\" specified more than once")
+    }
+}
+
 impl Engine {
     /// v6.7.2 — `ALTER TABLE t SET hot_tier_bytes = X`. Dispatch
     /// arm. Currently the only setting is `hot_tier_bytes`; later
@@ -3053,6 +3102,55 @@ impl Engine {
                 "Unknown storage engine '{engine}'"
             )));
         }
+        // v7.39.2 — a column named twice is refused, which it was not.
+        //
+        // `CREATE TABLE t (a int, a int)` built the table. Measured:
+        // `information_schema.columns` then carried TWO rows named `a`,
+        // every later reference to that name was ambiguous, and a dump
+        // of it restores into neither engine. PostgreSQL 18.6 answers
+        // `column "a" specified more than once`; MySQL 9.7.2 answers
+        // `ERROR 1060 (42S21) Duplicate column name 'a'`. Six places
+        // could produce this table and exactly one — ALTER TABLE ADD
+        // COLUMN — refused it.
+        //
+        // Compared case-INSENSITIVELY, which is both engines' answer:
+        // PG folds an unquoted name, and MySQL's column names never
+        // distinguish case. Measured on both, `(a int, A int)` is the
+        // same refusal.
+        //
+        // Before anything is created, like the ENGINE check above.
+        if let Some(dup) = first_duplicate(
+            stmt.columns.iter().map(|c| c.name.as_str()),
+            self.backslash_escapes,
+        ) {
+            return Err(EngineError::Unsupported(duplicate_column_message(
+                &dup,
+                self.backslash_escapes,
+            )));
+        }
+        // The same name twice inside one PRIMARY KEY or UNIQUE list.
+        // PostgreSQL has its own sentence for this one — measured,
+        // `column "a" appears twice in primary key constraint` — and
+        // MySQL reuses 1060.
+        for tc in &stmt.table_constraints {
+            let (cols, kind) = match tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
+                    (columns, "primary key")
+                }
+                spg_sql::ast::TableConstraint::Unique { columns, .. } => (columns, "unique"),
+                _ => continue,
+            };
+            if let Some(dup) = first_duplicate(
+                cols.iter().map(alloc::string::String::as_str),
+                self.backslash_escapes,
+            ) {
+                return Err(EngineError::Unsupported(if self.backslash_escapes {
+                    alloc::format!("Duplicate column name '{dup}'")
+                } else {
+                    alloc::format!("column \"{dup}\" appears twice in {kind} constraint")
+                }));
+            }
+        }
         // v7.39 (round 436) — a TEMPORARY table is created under the calling
         // session's namespace prefix and remembered there, so it shadows a
         // permanent table of the same name, stays invisible to other
@@ -5021,6 +5119,18 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39.2 — a name twice in the view's own column list. Both
+        // engines refuse it; SPG built the view and every reference to
+        // the name after that was ambiguous.
+        if let Some(dup) = first_duplicate(
+            s.columns.iter().map(alloc::string::String::as_str),
+            self.backslash_escapes,
+        ) {
+            return Err(EngineError::Unsupported(duplicate_column_message(
+                &dup,
+                self.backslash_escapes,
+            )));
+        }
         // v7.39 (round 469) — same as the temporary sequence above: the
         // keyword parsed and was dropped, so the view was permanent and
         // every other connection could select from it.
@@ -5745,6 +5855,21 @@ impl Engine {
         // Promote any synthetic-Text projections to their actual
         // observed types so the backing table accepts the rows.
         cols = infer_column_types(&cols, &rows);
+        // v7.39.2 — `CREATE TABLE t AS SELECT 1 AS a, 2 AS a` built a
+        // table with two columns named `a`, where both engines refuse.
+        // Checked on the RESOLVED names rather than the AST, because
+        // `SELECT *` does not carry them until the body has run — which
+        // is also where PostgreSQL checks it (its target list, after
+        // resolution). Before `create_table`, so a refusal leaves
+        // nothing behind.
+        if let Some(dup) =
+            first_duplicate(cols.iter().map(|c| c.name.as_str()), self.backslash_escapes)
+        {
+            return Err(EngineError::Unsupported(duplicate_column_message(
+                &dup,
+                self.backslash_escapes,
+            )));
+        }
         let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
         let cat = self.active_catalog_mut();
         cat.create_table(schema).map_err(EngineError::Storage)?;

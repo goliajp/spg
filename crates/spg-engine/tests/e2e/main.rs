@@ -266,6 +266,7 @@ mod e2e_drop_column_drops_checks_v7382;
 mod e2e_drop_expression_if_exists_round187;
 mod e2e_drop_wider_pg_dump_compat;
 mod e2e_dump_roundtrip_r1054;
+mod e2e_duplicate_column_v7392;
 mod e2e_empty_target_list_round341;
 mod e2e_encoding_matrix;
 mod e2e_enum_and_reg_to_text;

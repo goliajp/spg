@@ -8,6 +8,44 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A column named twice was accepted.** `CREATE TABLE t (a int, a int)`
+  built the table; `information_schema.columns` then carried two rows
+  named `a`, every later reference to that name was ambiguous, and a
+  dump of it restores into neither engine. PostgreSQL 18.6 answers
+  `column "a" specified more than once`; MySQL 9.7.2 answers
+  `ERROR 1060 (42S21) Duplicate column name 'a'`.
+
+  Six places could produce such a relation and exactly one — `ALTER
+  TABLE ADD COLUMN` — refused it. The other five do now: the column
+  list, a `PRIMARY KEY` or `UNIQUE` list (PostgreSQL has its own
+  sentence for those — `column "a" appears twice in primary key
+  constraint`), a view's own column list, and `CREATE TABLE AS`. The
+  last is checked on the RESOLVED names, because `SELECT *` does not
+  carry them until the body has run, which is where PostgreSQL checks it
+  too. All five refuse before anything is created, so the name stays
+  free.
+
+  Whether case matters is the dialect's answer, and the first version of
+  this got it wrong. PostgreSQL ACCEPTS `("a" int, "A" int)` — quoting
+  preserves case there, so those are two columns — while an unquoted
+  `(a int, A int)` is one name twice because the lexer folded it long
+  before this check sees it. Folding again refused a table PostgreSQL
+  creates. MySQL is the opposite: its column names never distinguish
+  case, so ``(`a` int, `A` int)`` is a duplicate there.
+
+  Found by an ablation that did NOT bite: making the comparison
+  case-sensitive left every pin green, which said the pin named for case
+  was passing for an unrelated reason. No refusal pin can see an
+  over-rejection; only the negative controls and that silence could.
+  PostgreSQL also allows a duplicate column in a plain index, and a
+  control holds that open.
+
+---
+
 ## [7.39.1] — 2026-08-28
 
 ### Fixed
