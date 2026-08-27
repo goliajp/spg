@@ -279,6 +279,21 @@ Measured, not closed here, and written down rather than left implicit:
 
 ### Instruments
 
+- **The content-worker "first-touch premium" was one sample.** A
+  ~6 ms premium on the first query after opening the 246 MB production
+  catalog has sat in the ledger as measured-but-unexplained, waiting for
+  a quiet machine. Run on one: across four runs of five cold samples
+  each, the first sample is the maximum three times and the **minimum**
+  once (9.43 ms in a 9.43–15.15 spread). There is no first-touch effect;
+  there was one outlier at 22.07 ms in a single run.
+
+  The cold MEDIAN, which is what the gate judges, sits at 11.95–12.69 ms
+  across those four runs — a 0.74 ms spread against per-sample variance
+  of 9.00–22.07. `bench.rs` says why in its own words: a struct carrying
+  one `cold_ms` next to a hundred warm samples "is what let a one-sample
+  number be judged against a hard budget for a year". The ledger entry
+  was reading exactly such a number.
+
 - **`pins-current` saw one of seven e2e harnesses.** The step exists to
   run the pins a commit touches. The commit adding the three MySQL
   error-code pins above reported *no e2e pins touched — skipped* with
