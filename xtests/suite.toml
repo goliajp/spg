@@ -110,7 +110,13 @@ tier = "prerelease"
 name = "e2e"
 impl = "external"
 cmd = "scripts/gate.sh e2e"
-# observed 297 / 320 / 494 (n=6)
+# observed 94 / 205 / 360 (min/med/max) over the last ten prerelease
+# runs recorded in target/suite. The line here used to read
+# "297 / 320 / 494 (n=6)" beside a budget of 480 -- 320 x 1.5, the rule
+# c81f818b states applied to the SECOND largest observation, with the
+# 494 above it silently skipped. It was the only budget in this file
+# sitting below a number the file itself recorded. The measurements have
+# moved on since; 480 is 1.33x the largest of the last ten.
 budget_s = 480
 
 [[step]]
@@ -150,10 +156,14 @@ impl = "internal"
 # measured against the C leg, at the largest row count only -- because
 # all sixty-four cells of the first panel run under `C` and could not
 # see a factor-of-twenty-six regression that shipped in v7.38.18.
-# Re-calibrate from a run once the two-panel figure has been recorded a
-# few times; 600 is the observed maximum plus room for the new panel,
-# not a measurement of it.
-budget_s = 600
+# v7.38.24 -- that re-calibration, from measurement at last. The three
+# panels have now been recorded ten times: 350 / 376 / 397 / 359 / 367 /
+# 427 / 360 / 663 / 585 / 634 seconds, in that order (the third of those
+# is a run the step failed, timed anyway). The step really did get
+# longer where the third panel landed: the last three mean 627s against
+# 377s for the seven before them, and 600 sat under two of the three.
+# 663 x 1.5.
+budget_s = 1000
 
 [[step]]
 tier = "prerelease"
@@ -169,14 +179,27 @@ tier = "full"
 name = "prerelease-all"
 impl = "external"
 cmd = "scripts/suite.sh prerelease"
-budget_s = 1500
+# v7.38.24 -- calibrated from measurement. c81f818b calibrated the
+# prerelease steps and left the full tier's alone, so this one kept its
+# guess. The last ten prerelease runs recorded in target/suite totalled
+# 844 / 943 / 964 / 1545 / 1905 / 2181 / 2215 / 2270 / 2402 / 2558
+# seconds -- all ten ran all nine steps, so none is a short abort -- and
+# 1500 sat under seven of them. That is the same "over on every run,
+# reported, ignored" failure c81f818b was written to fix, one tier up.
+# 2558 x 1.5.
+budget_s = 3800
 
 [[step]]
 tier = "full"
 name = "deep-tier"
 impl = "external"
 cmd = "scripts/gate.sh all --full"
-budget_s = 7200
+# observed 552 / 624 / 952 (min/med/max) over the ten full-tier runs
+# recorded in target/suite. c81f818b calibrated the prerelease steps and
+# left this tier alone, so 7200 was still a guess -- 7.6x the largest
+# run, which is past the "set five times too high catches nothing" line
+# that commit drew. 952 x 1.5.
+budget_s = 1430
 
 [[step]]
 tier = "full"
@@ -191,7 +214,9 @@ budget_s = 600
 tier = "full"
 name = "perm-matrix"
 impl = "internal"
-budget_s = 3600
+# observed 16 / 63 / 94 (min/med/max) over the ten full-tier runs
+# recorded in target/suite. 3600 was 38x the largest of them. 94 x 1.5.
+budget_s = 140
 
 # v7.38.17 — promoted from `full`, which nothing runs automatically, to
 # the tier that gates a release. Measured end to end: 101 s for all
