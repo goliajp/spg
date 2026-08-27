@@ -20,7 +20,7 @@
       }
     ],
     "expected": {
-      "_comment": "v7.37.6 — attack #1 (defer combined_vals materialise in try_streamed_inner_join_walk_topn) cut warm from 86ms to 7.9ms. Budgets tightened to warm <= 12ms / p95 <= 14ms with a small variance margin. Previous v7.37.5 budgets (warm 100 / cold 110) kept for cold to give a wider margin for the first-fire JIT / plan-cache cost.",
+      "_comment": "v7.37.6 — attack #1 (defer combined_vals materialise in try_streamed_inner_join_walk_topn) cut warm from 86ms to 7.9ms. Budgets tightened to warm <= 12ms / p95 <= 14ms with a small variance margin. f8669eca measured cold 9.84 / p50 7.22 / p95 8.91 ms over 100 iters on the prod snapshot and set each budget above what it measured; the previous v7.37.5 budgets (cold 110 / warm 100 / p95 110) would have let a 10x regression through. Note that cold is a single execution, so its budget is judged on n=1 while p50 and p95 come from 100 samples.",
       "cold_ms_max": 15,
       "warm_ms_max": 12,
       "p95_ms_max": 14

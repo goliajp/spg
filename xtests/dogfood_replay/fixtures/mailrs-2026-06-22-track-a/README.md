@@ -9,11 +9,22 @@ single statement in the mailrs hot path. The query stitches
 `conversations × messages × labels` with a windowed ranking and a
 `NOT EXISTS` filter against the spam label.
 
-## Expected post-fix
+## Budgets
 
-| Window   | Warm median | p95     | Cold first iter |
-| -------- | ----------- | ------- | --------------- |
-| Post-fix | ≤ 5 ms      | ≤ 10 ms | ≤ 100 ms        |
+`13135db9` replaced this fixture's query. The original was a hand-written
+CTE against tables the prod snapshot does not have (`conversations`,
+`c.user_id`, `c.deleted_at`), so it had never run; the real
+`/api/conversations` SQL took its place and the budgets were re-locked
+around it. This table is generated from `fixture.json` and kept honest by
+`every_query_fixture_readme_carries_the_budget_the_gate_reads`.
+
+<!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
+| Window | Budget |
+| --- | --- |
+| Cold (first iter) | ≤ 100 ms |
+| Warm median (p50) | ≤ 85 ms |
+| p95 | ≤ 90 ms |
+<!-- /BUDGETS -->
 
 ## Snapshot
 

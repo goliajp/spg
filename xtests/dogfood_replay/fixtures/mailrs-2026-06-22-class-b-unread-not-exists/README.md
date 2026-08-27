@@ -34,10 +34,18 @@ sees through the symlink and validates the same payload.
 
 ## Budget posture
 
-Initial budgets are **loose** (cold ≤ 200 ms, warm ≤ 100 ms, p95 ≤ 150 ms)
-pending real measurement. After Phase A decomposition + Phase B attack lands,
-tighten to PG18 parity (cold ≤ 100 ms per the mailrs report's PG baseline,
-warm and p95 commensurately).
+Still the **loose** budgets this fixture opened with, pending real
+measurement. After Phase A decomposition + Phase B attack lands, tighten to
+PG18 parity (cold ≤ 100 ms per the mailrs report's PG baseline, warm and p95
+commensurately).
+
+<!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
+| Window | Budget |
+| --- | --- |
+| Cold (first iter) | ≤ 200 ms |
+| Warm median (p50) | ≤ 100 ms |
+| p95 | ≤ 150 ms |
+<!-- /BUDGETS -->
 
 ## Workflow gates
 

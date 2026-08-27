@@ -29,6 +29,7 @@ use fixture::{Fixture, FixtureKind};
 use snapshot::{SnapshotState, extract_snapshot, verify_snapshot};
 use spg_embedded::Database;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(
@@ -258,36 +259,87 @@ fn run_query_fixture(
         }
     };
 
-    let mut db = Database::open_path(&extracted.catalog_path)
-        .map_err(ee)
-        .with_context(|| format!("open_path {}", extracted.catalog_path.display()))?;
-
+    // v7.38.25 — reopen the catalog for every cold sample, and judge
+    // the median of them.
+    //
+    // Two things were wrong with timing this once. The first is that
+    // `cold` is a single execution, so the budget beside it was decided
+    // by one sample while `p50` and `p95` came from a hundred; on
+    // `content-worker` that single sample is bimodal -- roughly 10 ms or
+    // roughly 20 ms, six times on an idle machine -- and the budget of
+    // 15 sat in the gap, so the verdict was a coin flip.
+    //
+    // The second is that the boundary this fixture measures across has
+    // moved. At 13135db9, where the `track-a` cold budget of 100 ms was
+    // locked, opening this snapshot took 219.5 s and the first query
+    // then took 88.0 ms with a spread of 0.1 ms. Today the open takes
+    // 3.2 s and the first query takes ~104 ms with a spread of 15 ms:
+    // work moved out of the open and into the first execute. Timing
+    // only the query called that a regression while time-to-first-answer
+    // had gone from 219.6 s to 3.3 s. So the open is timed too, and
+    // reported beside the cold it hands off to.
     let mut worst = Outcome::Pass;
     for qs in &q.queries {
         let sql_path = dir.join(&qs.file);
-        let results = bench::bench_sql_file(&mut db, &sql_path, qs.warmup_iters, qs.measure_iters)?;
-        for r in results {
-            let cold_ok = q.expected.cold_ms_max == 0.0 || r.cold_ms <= q.expected.cold_ms_max;
-            let warm_ok = q.expected.warm_ms_max == 0.0 || r.warm_p50_ms <= q.expected.warm_ms_max;
-            let p95_ok = q.expected.p95_ms_max == 0.0 || r.warm_p95_ms <= q.expected.p95_ms_max;
+        let body = std::fs::read_to_string(&sql_path)
+            .with_context(|| format!("read sql file {}", sql_path.display()))?;
+        let stmts = bench::split_sql(&body);
+        let iters = qs.cold_iters.max(1);
+        let mut opens: Vec<f64> = Vec::with_capacity(iters);
+        let mut colds: Vec<Vec<f64>> = vec![Vec::new(); stmts.len()];
+        let mut held = None;
+        for i in 0..iters {
+            let open_start = Instant::now();
+            let mut db = Database::open_path(&extracted.catalog_path)
+                .map_err(ee)
+                .with_context(|| format!("open_path {}", extracted.catalog_path.display()))?;
+            opens.push(open_start.elapsed().as_secs_f64() * 1000.0);
+            for (j, sql) in stmts.iter().enumerate() {
+                colds[j].push(bench::time_one(&mut db, sql)?);
+            }
+            // The last one stays open for the warm loop; the rest close
+            // here, which is what makes the next open a cold one.
+            if i + 1 == iters {
+                held = Some(db);
+            }
+        }
+        let mut db = held.expect("cold_iters is at least 1, so one database is held");
+        let open_med = bench::median(&opens);
+        for (j, sql) in stmts.iter().enumerate() {
+            let w = bench::warm_stats(&mut db, sql, qs.warmup_iters, qs.measure_iters)?;
+            let cold_med = bench::median(&colds[j]);
+            let cold_lo = colds[j].iter().copied().fold(f64::INFINITY, f64::min);
+            let cold_hi = colds[j].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let cold_ok = q.expected.cold_ms_max == 0.0 || cold_med <= q.expected.cold_ms_max;
+            let warm_ok = q.expected.warm_ms_max == 0.0 || w.p50_ms <= q.expected.warm_ms_max;
+            let p95_ok = q.expected.p95_ms_max == 0.0 || w.p95_ms <= q.expected.p95_ms_max;
             let ok = cold_ok && warm_ok && p95_ok;
             let tag = if ok { Outcome::Pass } else { Outcome::Fail };
             if tag == Outcome::Fail {
                 worst = Outcome::Fail;
             }
+            // The cold range is printed beside its median because a
+            // median is exactly what hides a bimodal sample, and one of
+            // these fixtures has one.
             println!(
-                "  {} cold={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms max={:.2}ms (n={}) — budget cold≤{} p50≤{} p95≤{}",
+                "  {} open={:.0}ms cold={:.2}ms [{:.2}-{:.2}, n={}] p50={:.2}ms p95={:.2}ms \
+                 p99={:.2}ms max={:.2}ms (n={}) — budget cold≤{} p50≤{} p95≤{}",
                 tag.tag(),
-                r.cold_ms,
-                r.warm_p50_ms,
-                r.warm_p95_ms,
-                r.warm_p99_ms,
-                r.warm_max_ms,
-                r.iters,
+                open_med,
+                cold_med,
+                cold_lo,
+                cold_hi,
+                colds[j].len(),
+                w.p50_ms,
+                w.p95_ms,
+                w.p99_ms,
+                w.max_ms,
+                w.iters,
                 q.expected.cold_ms_max,
                 q.expected.warm_ms_max,
                 q.expected.p95_ms_max,
             );
+            let _ = sql;
         }
     }
     Ok(worst)
@@ -371,4 +423,89 @@ fn run_wal_replay_fixture(fx: &Fixture, w: &fixture::WalReplayFixture) -> Result
         }
     );
     Ok(tag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every query fixture states its budget twice: once in
+    /// `fixture.json`, which the gate reads, and once in the README,
+    /// which is what a person reads when the gate goes red. Both
+    /// fixtures that restated it drifted. `track-a`'s README still
+    /// quoted <= 5 ms warm / <= 10 ms p95 two months after 13135db9
+    /// replaced its query -- those were the budgets of a hand-written
+    /// CTE that referenced tables the snapshot does not have, so they
+    /// described something that had never run. `content-worker`'s
+    /// README said "These are the numbers pinned in
+    /// `fixture.json.expected`" directly above three numbers, none of
+    /// which were. Anyone reading either one while the gate was red
+    /// would have concluded the product was an order of magnitude off
+    /// its target when it was a few percent off.
+    ///
+    /// So the table is generated from the JSON and checked here. The
+    /// README may still say whatever it likes around it.
+    fn budget_block(q: &fixture::QueryFixture) -> String {
+        let cell = |v: f64| {
+            if v == 0.0 {
+                "unbounded".to_string()
+            } else {
+                format!("\u{2264} {v} ms")
+            }
+        };
+        format!(
+            "<!-- BUDGETS: generated from fixture.json \u{2014} the gate reads the JSON, not this table -->\n\
+             | Window | Budget |\n\
+             | --- | --- |\n\
+             | Cold (first iter) | {} |\n\
+             | Warm median (p50) | {} |\n\
+             | p95 | {} |\n\
+             <!-- /BUDGETS -->",
+            cell(q.expected.cold_ms_max),
+            cell(q.expected.warm_ms_max),
+            cell(q.expected.p95_ms_max),
+        )
+    }
+
+    #[test]
+    fn every_query_fixture_readme_carries_the_budget_the_gate_reads() {
+        let root = locate_fixtures_root().expect("locate fixtures root");
+        let all = fixture::discover_all(&root).expect("discover fixtures");
+
+        // A walk that finds nothing looks exactly like a walk that found
+        // nothing wrong, so name what has to be there.
+        let names: Vec<&str> = all.iter().map(|(n, _, _)| n.as_str()).collect();
+        for want in [
+            "mailrs-2026-06-22-track-a",
+            "mailrs-2026-06-22-content-worker",
+        ] {
+            assert!(
+                names.contains(&want),
+                "{want} is not among the fixtures discovered under {}: {names:?}",
+                root.display()
+            );
+        }
+
+        let mut checked = 0;
+        for (name, dir, fx) in &all {
+            let FixtureKind::Query(q) = &fx.kind else {
+                continue;
+            };
+            let readme_path = dir.join("README.md");
+            let readme = std::fs::read_to_string(&readme_path)
+                .unwrap_or_else(|e| panic!("{name}: read {}: {e}", readme_path.display()));
+            let want = budget_block(q);
+            assert!(
+                readme.contains(&want),
+                "{name}: README.md does not carry the budgets the gate reads.\n\
+                 Paste this block into it verbatim:\n\n{want}\n"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 4,
+            "only {checked} query fixtures were checked -- the walk found the \
+             directory but not the fixtures in it"
+        );
+    }
 }

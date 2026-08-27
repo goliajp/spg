@@ -16,13 +16,19 @@ from the expected sub-10 ms range to 3–5 s warm with a ~19 s tail.
 | ------- | ----------- | ------- | ------- |
 | Pre-fix | 3–5 s       | 5.3 s   | ~19 s   |
 
-## Expected post-fix
+## Budgets
 
-| Window   | Warm median | p95   | Cold first iter |
-| -------- | ----------- | ----- | --------------- |
-| Post-fix | ≤ 10 ms     | ≤ 15 ms | ≤ 100 ms        |
+`f8669eca` tightened these after attack #1 cut warm from 86 ms to 7.9 ms.
+Generated from `fixture.json` and kept honest by
+`every_query_fixture_readme_carries_the_budget_the_gate_reads`.
 
-These are the numbers pinned in `fixture.json.expected`.
+<!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
+| Window | Budget |
+| --- | --- |
+| Cold (first iter) | ≤ 15 ms |
+| Warm median (p50) | ≤ 12 ms |
+| p95 | ≤ 14 ms |
+<!-- /BUDGETS -->
 
 ## Snapshot
 
