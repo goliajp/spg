@@ -29,8 +29,16 @@ Shared with Track A — symlinked. SHA-256
 
 ## Budget posture
 
-Initial loose budgets (cold ≤ 300 ms, warm ≤ 200 ms, p95 ≤ 250 ms) pending
-measurement. After decomp + attack, tighten to PG18 parity.
+Still the **loose** opening budgets, pending measurement. After decomp +
+attack, tighten to PG18 parity.
+
+<!-- BUDGETS: generated from fixture.json — the gate reads the JSON, not this table -->
+| Window | Budget |
+| --- | --- |
+| Cold (first iter) | ≤ 300 ms |
+| Warm median (p50) | ≤ 200 ms |
+| p95 | ≤ 250 ms |
+<!-- /BUDGETS -->
 
 ## Workflow gates
 

@@ -159,6 +159,22 @@ pub struct QuerySet {
     /// Timed measurements that produce the percentile budget.
     #[serde(default = "default_measure")]
     pub measure_iters: usize,
+    /// v7.38.25 — how many times to reopen the catalog and time the
+    /// first execute against it.
+    ///
+    /// `cold` is one execution by definition, so a run of this fixture
+    /// used to produce exactly one sample of it and compare that single
+    /// sample against a hard budget. Both snapshot fixtures showed why
+    /// that cannot decide anything: on `content-worker` the first
+    /// execute is bimodal -- roughly 10 ms or roughly 20 ms, measured
+    /// six times on an idle machine -- and the budget of 15 sat in the
+    /// gap between the two modes, so the verdict was a coin flip. The
+    /// median of several opens decides; one open cannot.
+    ///
+    /// This was not affordable when opening the 246 MB snapshot took
+    /// 219 s. It takes 3.2 s now.
+    #[serde(default = "default_cold_iters")]
+    pub cold_iters: usize,
 }
 
 fn default_warmup() -> usize {
@@ -167,6 +183,10 @@ fn default_warmup() -> usize {
 
 fn default_measure() -> usize {
     100
+}
+
+fn default_cold_iters() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
