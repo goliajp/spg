@@ -413,6 +413,26 @@ pub(crate) const MYSQL_CHARSET_DEFAULT_COLLATION: &[(&str, &str)] = &[
 /// this build does not know. An unknown name is not silently mapped to
 /// a default: that is how a session ends up padding differently from
 /// what it was told.
+/// The charset a MySQL collation name belongs to, or `None` when the
+/// name is not one MySQL would recognise.
+///
+/// v7.39 — `information_schema.COLUMNS` reports the pair, and SPG also
+/// accepts PostgreSQL's spellings in a `COLLATE` clause. A column
+/// declared `COLLATE "C"` has no MySQL charset to report: answering `C`
+/// there would be a collation name MySQL has never had, so the caller
+/// reports the session default instead, which is a true statement about
+/// how that column actually compares.
+pub(crate) fn mysql_charset_of_collation(name: &str) -> Option<&'static str> {
+    let lower = name.trim().to_ascii_lowercase();
+    if lower == "binary" {
+        return Some("binary");
+    }
+    MYSQL_CHARSET_DEFAULT_COLLATION
+        .iter()
+        .map(|(c, _)| *c)
+        .find(|c| lower.starts_with(*c) && lower.as_bytes().get(c.len()) == Some(&b'_'))
+}
+
 pub(crate) fn charset_default_collation(charset: &str) -> Option<&'static str> {
     let lower = charset.trim().to_ascii_lowercase();
     MYSQL_CHARSET_DEFAULT_COLLATION
