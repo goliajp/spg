@@ -277,11 +277,14 @@ the current build; this file is a release-organized view.
   `schema "nosuch" does not exist` and dropping it unread accepted a
   name that names nothing.
 
-  Still absorbed, and the same defect one position over: the ORDER BY
+  And the same defect one position over, fixed with it: the ORDER BY
   INSIDE an aggregate. `string_agg(x, ',' ORDER BY x COLLATE "C")`
-  answers the database's order where PG answers byte order — the three
-  ORDER BY parse sites share one `order_key_collation` slot, so an
-  aggregate's inner key writes into the statement's. Measured, and next.
+  answered the database's order where PostgreSQL answers byte order.
+  The cause was not the shared slot it looked like — the parser has been
+  putting the key's own collation on `OrderBy::collation` all along, per
+  key, saved and restored correctly. The aggregate's sort resolved a
+  collation from the COLUMN and never read the field. Both spellings now
+  agree with PG 18.6 over the same four rows.
 
 - **MySQL's introducers, and why a syntax-only version would be worse
   than the error.** `SELECT _utf8mb4'x'`, `N'y'`, `_binary'z'` and

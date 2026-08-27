@@ -1044,6 +1044,19 @@ pub(crate) fn run(
             .order_by
             .iter()
             .map(|o| {
+                // v7.39.2 — the key's OWN `COLLATE`, which the parser has
+                // been putting on `OrderBy::collation` all along and this
+                // never read. Measured: `string_agg(x, ',' ORDER BY x
+                // COLLATE \"C\")` answered the database's order where
+                // PostgreSQL 18.6 answers byte order — the clause was
+                // captured one layer down and dropped here.
+                //
+                // It comes first because it is EXPLICIT, and PG's
+                // derivation has an explicit collation beat the column's.
+                if let Some(written) = o.collation.as_deref() {
+                    return crate::collate::is_supported(written)
+                        .then(|| alloc::string::String::from(written));
+                }
                 // A bare column key carries its collation; an expression
                 // produces a new value and has none, the same limit
                 // `min`/`max` has over an expression argument.
