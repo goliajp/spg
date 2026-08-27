@@ -789,6 +789,7 @@ mod e2e_regproc_value_round342;
 mod e2e_regtype_arrays_round621;
 mod e2e_regtype_oid_round648;
 mod e2e_reindex_pg_dump_compat;
+mod e2e_relation_name_case_v7392;
 mod e2e_relation_oids_round338;
 mod e2e_relation_size;
 mod e2e_relation_sizes_round519;

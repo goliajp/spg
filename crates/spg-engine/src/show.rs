@@ -280,6 +280,17 @@ impl Engine {
             // follow `SET NAMES` exactly as the `@@` path does — except
             // the two database-scoped names, which MySQL does not scope
             // to the session.
+            // v7.39.2 — the inventory carried no entry for it at all,
+            // while the `@@` surface answered. Same one-question-two-
+            // surfaces shape as the collation names above.
+            (
+                "lower_case_table_names",
+                if self.folds_relation_names() {
+                    "1"
+                } else {
+                    "0"
+                },
+            ),
             ("character_set_client", "utf8mb4"),
             ("character_set_connection", "utf8mb4"),
             ("character_set_results", "utf8mb4"),
