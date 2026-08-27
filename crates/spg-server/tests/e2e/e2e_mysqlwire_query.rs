@@ -1197,3 +1197,125 @@ fn an_index_does_not_change_the_answer_over_the_mysql_wire() {
     exec_ok(&mut s, "DROP TABLE IF EXISTS ja");
     exec_ok(&mut s, "DROP TABLE IF EXISTS jb");
 }
+
+/// v7.39 — a fresh MySQL connection is STRICT, and this has to be tested
+/// on the wire because that is the only place it was ever wrong.
+///
+/// `SessionBag` derived `Default`, and `set_current_session` creates a
+/// bag on first sight with `unwrap_or_default()`, so `mysql_strict`
+/// started `false` on every new connection — while `@@sql_mode` answered
+/// `STRICT_TRANS_TABLES`. Measured over the wire before the fix:
+/// `VARCHAR(3) <- 'abcdef'` stored `'abc'` and `TINYINT <- 999` stored
+/// `127`, silently, both reported as success. Data lost, with a receipt
+/// saying the session was strict.
+///
+/// The whole engine-level suite — 6621 tests — could not see it. Those
+/// build an `Engine` directly, where the field was already `true`; the
+/// defect lived in the connection-switching path that only a real server
+/// takes. A pin anywhere but here would have been green throughout.
+///
+/// The negative control is in the same test: `SET sql_mode = ''` must
+/// still bend the value, because the fix is meant to correct the DEFAULT
+/// and not to weld the switch shut. MariaDB 11 with an empty sql_mode
+/// stores `'too'` for `VARCHAR(3) <- 'toolong'`, and so must this.
+#[test]
+fn a_fresh_connection_is_strict_and_can_still_be_told_not_to_be() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+
+    exec_ok(
+        &mut s,
+        "CREATE TABLE strict_default (c VARCHAR(3), n TINYINT)",
+    );
+
+    // No SET of any kind on this connection first — that is the point.
+    let (errno, sqlstate, _) = err_of(&mut s, "INSERT INTO strict_default (c) VALUES ('abcdef')");
+    assert_eq!(
+        (errno, sqlstate.as_str()),
+        (1406, "22001"),
+        "an over-long value must be refused on a connection that set nothing"
+    );
+
+    let (errno, _, _) = err_of(&mut s, "INSERT INTO strict_default (n) VALUES (999)");
+    assert_ne!(errno, 0, "an out-of-range value must be refused too");
+
+    // Nothing landed: the refusals are not cosmetic.
+    assert_eq!(
+        query_scalar(&mut s, "SELECT count(*) FROM strict_default"),
+        "0"
+    );
+
+    // And the switch still switches.
+    exec_ok(&mut s, "SET sql_mode = ''");
+    exec_ok(&mut s, "INSERT INTO strict_default (c) VALUES ('abcdef')");
+    assert_eq!(
+        query_scalar(&mut s, "SELECT c FROM strict_default"),
+        "abc",
+        "with an empty sql_mode the value is bent to fit, as MariaDB does"
+    );
+}
+
+/// v7.39 — every flag `@@sql_mode` claims must actually refuse something.
+///
+/// This pins the REPORT against the BEHAVIOUR, which is the failure this
+/// version keeps meeting: `SHOW VARIABLES` named two flags, `@@sql_mode`
+/// named three, and both named `NO_ENGINE_SUBSTITUTION` while
+/// `ENGINE=NONSUCH` was accepted silently. A test that only compared the
+/// two reports would have called that agreement.
+///
+/// Each statement below is refused by exactly one of the flags, so the
+/// list cannot grow a member SPG does not honour without this going red.
+/// Verified against MySQL 9.7.2, which refuses all four.
+#[test]
+fn every_flag_sql_mode_claims_refuses_something() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+
+    let claimed = query_scalar(&mut s, "SELECT @@sql_mode");
+    exec_ok(&mut s, "CREATE TABLE modes (c VARCHAR(3), d DATE, n INT)");
+
+    for (flag, sql) in [
+        (
+            "STRICT_TRANS_TABLES",
+            "INSERT INTO modes (c) VALUES ('abcdef')",
+        ),
+        (
+            "NO_ZERO_DATE",
+            "INSERT INTO modes (d) VALUES ('0000-00-00')",
+        ),
+        (
+            "NO_ZERO_IN_DATE",
+            "INSERT INTO modes (d) VALUES ('2020-00-05')",
+        ),
+        (
+            "ERROR_FOR_DIVISION_BY_ZERO",
+            "INSERT INTO modes (n) VALUES (1/0)",
+        ),
+    ] {
+        assert!(
+            claimed.contains(flag),
+            "{flag} is enforced but not claimed — @@sql_mode says {claimed:?}"
+        );
+        let (errno, _, _) = err_of(&mut s, sql);
+        assert_ne!(
+            errno, 0,
+            "`{sql}` must be refused, since @@sql_mode claims {flag}"
+        );
+    }
+
+    // The other direction: a flag SPG does not honour must not be claimed.
+    // `ENGINE=NONSUCH` is accepted here and MySQL 9.7.2 answers
+    // `ERROR 1286 Unknown storage engine 'NONSUCH'`, so until the engine
+    // name is validated the flag stays off the list.
+    assert!(
+        !claimed.contains("NO_ENGINE_SUBSTITUTION"),
+        "NO_ENGINE_SUBSTITUTION is claimed but ENGINE=NONSUCH is still accepted"
+    );
+    assert!(
+        !claimed.contains("ONLY_FULL_GROUP_BY"),
+        "ONLY_FULL_GROUP_BY is claimed but a bare non-aggregated column is still allowed"
+    );
+
+    // Nothing above landed.
+    assert_eq!(query_scalar(&mut s, "SELECT count(*) FROM modes"), "0");
+}

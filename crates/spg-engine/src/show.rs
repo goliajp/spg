@@ -278,7 +278,7 @@ impl Engine {
             // v7.39 (round 470) — the session's own value when it set one;
             // a client that reads sql_mode back after setting it was told
             // the default regardless.
-            ("sql_mode", "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION"),
+            ("sql_mode", crate::MYSQL_DEFAULT_SQL_MODE),
             ("time_zone", "SYSTEM"),
             // v7.39 — the LIVE level, via the one function all three
             // surfaces now ask. This held the literal `REPEATABLE-READ`
@@ -300,9 +300,30 @@ impl Engine {
             ),
         ];
         for &(k, v) in canonical {
+            // v7.39 — a canonical name used to report its DEFAULT here
+            // forever, because this pushed the constant and the
+            // session-parameter loop below skips any name already in this
+            // table. So `SET sql_mode = 'NO_ZERO_DATE'` was honoured by
+            // `@@sql_mode` and ignored by `SHOW VARIABLES`, which went on
+            // naming the default — and the same held for every other
+            // canonical name, `SET NAMES` included.
+            //
+            // Measured on MySQL 9.7.2: after `SET sql_mode='NO_ZERO_DATE'`
+            // both surfaces answer `NO_ZERO_DATE`.
+            //
+            // `transaction_isolation` and `transaction_read_only` are
+            // excluded because their value here is computed live from the
+            // engine, not stored: a stale copy in the parameter map would
+            // shadow the truth rather than reveal it.
+            let live = matches!(k, "transaction_isolation" | "transaction_read_only");
+            let value = if live {
+                v
+            } else {
+                self.session_params.get(k).map_or(v, String::as_str)
+            };
             rows.push(Row::new(alloc::vec![
                 Value::text::<String>(k.into()),
-                Value::text::<String>(v.into()),
+                Value::text::<String>(value.into()),
             ]));
         }
         // Session-set parameters surface here too.
