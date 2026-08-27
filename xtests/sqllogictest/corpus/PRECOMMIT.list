@@ -1,5 +1,7 @@
 # PRECOMMIT.list — the slt-smoke subset (design D6).
-# One relative path per line. Every NEW 15_regressions corpus file's
+# One path per line, from the REPOSITORY ROOT — not relative to this
+# file or to the corpus directory. A path of the other shape is reported
+# as `listed file missing`, which reads like a deleted corpus file. Every NEW 15_regressions corpus file's
 # commit must also touch this list (the tier warns on strays).
 #
 # All of 15_regressions — regressions are precommit's reason to exist:
@@ -35,3 +37,6 @@ xtests/sqllogictest/corpus/spg_baseline/10_constraints/check_constraint.test
 xtests/sqllogictest/corpus/spg_baseline/11_dialect/pg_array_ops.test
 xtests/sqllogictest/corpus/spg_baseline/12_explain/explain_analyze.test
 xtests/sqllogictest/corpus/spg_baseline/16_isolation/set_transaction_isolation_level.test
+# v7.39 — read-only transactions were not enforced at all, and a
+# safety mechanism that does nothing belongs in the tier that runs first.
+xtests/sqllogictest/corpus/spg_baseline/16_isolation/read_only_transaction.test

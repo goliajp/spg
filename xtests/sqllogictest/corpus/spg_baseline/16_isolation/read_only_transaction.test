@@ -1,0 +1,288 @@
+# READ ONLY transactions — measured against PostgreSQL 18.6.
+#
+# v7.39: SPG did not enforce them at all. `BEGIN READ ONLY; INSERT …`
+# answered `INSERT 0 1` and committed; `default_transaction_read_only`
+# behaved the same way while reading back whatever it was given. Both
+# GUCs were in the inventory with no enforcement anywhere in the tree.
+# Applications open read-only transactions as a SAFETY measure, so
+# accepting the writes is the worst available answer.
+#
+# ONE refusal per transaction, on purpose. An error inside a block aborts
+# it — in PG exactly as here, measured:
+#
+#     BEGIN READ ONLY; INSERT …; SELECT 1;
+#     ERROR:  cannot execute INSERT in a read-only transaction
+#     ERROR:  current transaction is aborted, commands ignored until …
+#
+# so chaining the refusals would test the abort rule and stop testing the
+# read-only rule after the first line. The first draft of this file did
+# chain them, and the corpus caught it.
+#
+# Every expectation was read back from PG 18.6 the same way, one
+# statement per transaction, so no error could be attributed to a
+# neighbouring line.
+
+statement ok
+CREATE TABLE ro (x INT)
+
+statement ok
+INSERT INTO ro VALUES (1)
+
+statement ok
+CREATE SEQUENCE roseq
+
+query T nosort
+SHOW transaction_read_only
+----
+off
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+INSERT INTO ro VALUES (2)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+UPDATE ro SET x = 9
+
+statement ok
+ROLLBACK
+
+# Matches no rows; refused anyway — the verb decides, not the row count.
+statement ok
+BEGIN READ ONLY
+
+statement error
+UPDATE ro SET x = x WHERE false
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+DELETE FROM ro
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+TRUNCATE ro
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+CREATE TABLE t2 (a INT)
+
+statement ok
+ROLLBACK
+
+# PG refuses this too, despite the general belief that temporary tables are exempt.
+statement ok
+BEGIN READ ONLY
+
+statement error
+CREATE TEMP TABLE tt (a INT)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+DROP TABLE ro
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+CREATE INDEX ix ON ro (x)
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+CREATE VIEW vv AS SELECT 1
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+CREATE SEQUENCE roseq2
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+COMMENT ON TABLE ro IS 'x'
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+SELECT x FROM ro FOR UPDATE
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+SELECT x FROM ro FOR SHARE
+
+statement ok
+ROLLBACK
+
+# Inside a plain SELECT, so only the sequence path can catch it.
+statement ok
+BEGIN READ ONLY
+
+statement error
+SELECT nextval('roseq')
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN READ ONLY
+
+statement error
+SELECT setval('roseq', 5)
+
+statement ok
+ROLLBACK
+
+# A read-only transaction is still a transaction: refusing these would be
+# its own defect, and a harder one to notice — the client only sees that
+# it is mysteriously not allowed to read.
+statement ok
+BEGIN READ ONLY
+
+query T nosort
+SHOW transaction_read_only
+----
+on
+
+statement ok
+SELECT 1
+
+statement ok
+ANALYZE ro
+
+statement ok
+SAVEPOINT sp
+
+statement ok
+NOTIFY chan
+
+statement ok
+DECLARE c CURSOR FOR SELECT 1
+
+query I nosort
+SELECT count(*) FROM ro
+----
+1
+
+statement ok
+ROLLBACK
+
+# The mode ends with the block.
+query T nosort
+SHOW transaction_read_only
+----
+off
+
+# The refusals were not cosmetic: nothing landed.
+query I nosort
+SELECT count(*) FROM ro
+----
+1
+
+# The session default governs a transaction that names no mode.
+statement ok
+SET default_transaction_read_only = on
+
+query T nosort
+SHOW transaction_read_only
+----
+on
+
+statement ok
+BEGIN
+
+statement error
+INSERT INTO ro VALUES (2)
+
+statement ok
+ROLLBACK
+
+statement ok
+SET default_transaction_read_only = off
+
+# `SET SESSION CHARACTERISTICS AS TRANSACTION` sets the same default —
+# pg_dump prepends it to fix the mode for a restore session, and it used
+# to be accepted and discarded.
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY
+
+query T nosort
+SHOW transaction_read_only
+----
+on
+
+statement ok
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE
+
+query T nosort
+SHOW transaction_read_only
+----
+off
+
+# An explicit mode outranks the session default.
+statement ok
+BEGIN READ ONLY
+
+query T nosort
+SHOW transaction_read_only
+----
+on
+
+statement ok
+ROLLBACK
+
+statement ok
+DROP SEQUENCE roseq
+
+statement ok
+DROP TABLE ro

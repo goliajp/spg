@@ -361,3 +361,70 @@ fn drop_database_is_refused_inside_a_transaction() {
     );
     q(&mut s, "ROLLBACK");
 }
+
+/// v7.39 — the family's other half. 25001 is "not inside a transaction
+/// block"; 25006 is "not inside a READ-ONLY one", and SPG enforced
+/// nothing at all: `BEGIN READ ONLY; INSERT …` answered `INSERT 0 1` and
+/// committed. `default_transaction_read_only` behaved the same way,
+/// while reading back whatever it was given.
+///
+/// The code and every message were read back from PostgreSQL 18.6 —
+/// the SQLSTATE with `\set VERBOSITY verbose`, the wording by running
+/// each statement inside `BEGIN READ ONLY`, one per transaction so no
+/// error could be attributed to a neighbouring line.
+///
+/// This lives on the wire because that is where the SQLSTATE exists: the
+/// engine returns a message and pgwire derives the code, so an
+/// engine-level test cannot see whether a client is told 25006 or
+/// something generic.
+#[test]
+fn a_write_in_a_read_only_transaction_is_refused_with_25006() {
+    let (_child, addrs) = spawn();
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+    q(&mut s, "CREATE TABLE ro739 (x INT)");
+    q(&mut s, "INSERT INTO ro739 VALUES (1)");
+    q(&mut s, "CREATE SEQUENCE sq739");
+
+    for (sql, named) in [
+        ("INSERT INTO ro739 VALUES (2)", "INSERT"),
+        ("UPDATE ro739 SET x = 9", "UPDATE"),
+        ("DELETE FROM ro739", "DELETE"),
+        ("TRUNCATE ro739", "TRUNCATE TABLE"),
+        ("CREATE TABLE t739 (a INT)", "CREATE TABLE"),
+        ("DROP TABLE ro739", "DROP TABLE"),
+        ("GRANT SELECT ON ro739 TO admin", "GRANT"),
+        ("SELECT x FROM ro739 FOR UPDATE", "SELECT FOR UPDATE"),
+        // Inside a plain SELECT, so only the sequence path can catch it.
+        // PG names the function rather than the statement.
+        ("SELECT nextval('sq739')", "nextval()"),
+    ] {
+        q(&mut s, "BEGIN READ ONLY");
+        let msgs = q(&mut s, sql);
+        assert_eq!(
+            sqlstate(&msgs).as_deref(),
+            Some("25006"),
+            "`{sql}` in a read-only transaction must be PG's 25006"
+        );
+        let m = message(&msgs);
+        assert!(
+            m == format!("cannot execute {named} in a read-only transaction"),
+            "`{sql}` should name itself as PG does, got: {m}"
+        );
+        q(&mut s, "ROLLBACK");
+    }
+
+    // And the write really did not happen — the refusal is not cosmetic.
+    q(&mut s, "BEGIN READ ONLY");
+    q(&mut s, "INSERT INTO ro739 VALUES (2)");
+    q(&mut s, "ROLLBACK");
+    let msgs = q(&mut s, "SELECT count(*) FROM ro739");
+    let count = msgs
+        .iter()
+        .find(|m| m.ty == b'D')
+        .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+        .unwrap_or_default();
+    assert!(
+        count.contains('1') && !count.contains('2'),
+        "the refused INSERT must not have landed; the row reads {count:?}"
+    );
+}

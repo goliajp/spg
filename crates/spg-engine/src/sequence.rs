@@ -636,6 +636,26 @@ impl Engine {
                 )));
             }
         };
+        // v7.39 — a read-only transaction refuses the sequence functions
+        // that MOVE the counter, and PG names the FUNCTION rather than the
+        // statement. Measured on PG 18.6 inside `BEGIN READ ONLY`:
+        //
+        //   SELECT nextval('sq')  ->  cannot execute nextval() in a read-only transaction
+        //   SELECT setval('sq',5) ->  cannot execute setval() in a read-only transaction
+        //
+        // The statement-level check cannot see these: they arrive inside a
+        // plain SELECT, which writes nothing by itself. `currval` and
+        // `lastval` only read the session's last value and are allowed.
+        if matches!(op, "nextval" | "setval")
+            && self.current_tx_read_only
+            && self
+                .current_tx
+                .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "cannot execute {op}() in a read-only transaction"
+            )));
+        }
         self.ensure_implicit_sequence(&seq_name);
         // v7.39 (read01 round 60) — sequence privileges. PG: nextval needs USAGE
         // or UPDATE, currval needs USAGE or SELECT, setval needs UPDATE alone.

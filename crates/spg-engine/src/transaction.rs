@@ -525,8 +525,9 @@ impl Engine {
 
     pub(crate) fn exec_begin(
         &mut self,
-        isolation: Option<spg_sql::ast::IsolationLevel>,
+        modes: spg_sql::ast::TransactionModes,
     ) -> Result<QueryResult, EngineError> {
+        let isolation = modes.isolation;
         let tx_id = self
             .current_tx
             .ok_or_else(|| EngineError::NoActiveTransaction)?;
@@ -541,6 +542,9 @@ impl Engine {
         // v7.39 — and when it does NOT name one, take the session default
         // rather than leaving whatever the previous transaction set.
         self.current_isolation_level = isolation.unwrap_or_else(|| self.default_isolation_level());
+        // v7.39 — same rule for the read/write mode: what the statement
+        // named, else the session default.
+        self.current_tx_read_only = modes.read_only.unwrap_or_else(|| self.default_read_only());
         // v7.37.15 Phase C — allocate the tx's writer version FIRST
         // (before caching any snapshot). Concurrent readers that build
         // snapshots between now and COMMIT see this version in
@@ -630,6 +634,7 @@ impl Engine {
             self.restore_all_local_gucs();
             // v7.39 (read01 round 118, B3) — a failed COMMIT ends the tx too.
             self.current_isolation_level = self.default_isolation_level();
+            self.current_tx_read_only = self.default_read_only();
             // v7.39 (pg_stat knife A) — a failed COMMIT rolls back.
             self.xact_rollback
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1012,6 +1017,7 @@ impl Engine {
         // v7.39 (read01 round 118, B3) — a transaction's isolation level is
         // scoped to the block; PG reverts to the default at COMMIT/ROLLBACK.
         self.current_isolation_level = self.default_isolation_level();
+        self.current_tx_read_only = self.default_read_only();
         // v7.39 (round 552) — bump the commit sequence and stamp every
         // table this tx wrote, so a concurrent SERIALIZABLE reader can
         // tell that what it read has changed since. Commit order is what
@@ -1063,6 +1069,7 @@ impl Engine {
         // v7.39 (read01 round 118, B3) — isolation reverts to the default at
         // transaction end (see exec_commit).
         self.current_isolation_level = self.default_isolation_level();
+        self.current_tx_read_only = self.default_read_only();
         // v7.39 (pg_stat knife A) — one rolled-back transaction (a
         // COMMIT inside an aborted tx dispatches here too, like PG).
         self.xact_rollback

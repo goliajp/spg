@@ -5093,6 +5093,13 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // code from the 42P01 an unknown table gets, and clients that
             // branch on it are asking about the database specifically.
             "3D000"
+        } else if msg.contains("in a read-only transaction") {
+            // v7.39 — PG's 25006 READ_ONLY_SQL_TRANSACTION, taken from
+            // `\set VERBOSITY verbose` on PG 18.6. Covers the statement
+            // form (`cannot execute INSERT in a read-only transaction`)
+            // and the sequence-function form (`cannot execute nextval()
+            // in a read-only transaction`), which PG spells the same way.
+            "25006"
         } else if msg.contains("must be called before any query")
             // PG's PreventInTransactionBlock family — VACUUM, ALTER
             // SYSTEM, CREATE DATABASE, the CONCURRENTLY index forms,

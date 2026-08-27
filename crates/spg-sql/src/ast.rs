@@ -503,7 +503,7 @@ pub enum Statement {
     /// `BEGIN` / `START TRANSACTION` — with an optional explicit
     /// `ISOLATION LEVEL …` mode (`None` = use the session default). PG
     /// applies the level for the duration of this transaction only.
-    Begin(Option<IsolationLevel>),
+    Begin(TransactionModes),
     Commit,
     Rollback,
     /// `SAVEPOINT <name>` — push a named savepoint onto the active TX's
@@ -762,7 +762,7 @@ pub enum Statement {
     /// READ UNCOMMITTED to READ COMMITTED; SPG mirrors that —
     /// effectively every level reads as READ COMMITTED in v7.37.8.
     SetTransaction {
-        isolation: IsolationLevel,
+        modes: TransactionModes,
     },
     /// v7.38 轴 4 — `SHOW <param>` returns a 1-column 1-row result
     /// with the parameter's current value as TEXT. Today the only
@@ -3498,6 +3498,197 @@ pub enum OnConflictAction {
 ///
 /// `spg-sql` cannot depend on `spg-engine`, so the strengths and
 /// policies are spelled again here and mapped at the engine boundary.
+/// v7.39 — the modes `BEGIN` / `START TRANSACTION` / `SET TRANSACTION`
+/// / `SET SESSION CHARACTERISTICS` accept. `read_only` used to be parsed
+/// and dropped on the floor, so `BEGIN READ ONLY` opened an ordinary
+/// read-write transaction and every write in it was accepted.
+///
+/// `None` on either field means the statement did not name that mode, so
+/// the session default applies — which is not the same as naming the
+/// default explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransactionModes {
+    pub isolation: Option<IsolationLevel>,
+    /// `Some(true)` = READ ONLY, `Some(false)` = READ WRITE.
+    pub read_only: Option<bool>,
+}
+
+/// v7.39 — what a read-only transaction refuses, and what PG calls it.
+///
+/// SPG did not enforce read-only transactions at all: `BEGIN READ ONLY;
+/// INSERT …` answered `INSERT 0 1` and committed, and
+/// `default_transaction_read_only = on` changed nothing. Both GUCs were
+/// in the inventory, so a session could set one, read it back, and be
+/// told it held a guarantee nothing was enforcing. Applications open
+/// read-only transactions as a SAFETY measure — a reporting connection,
+/// a read-only leg in a pool, a "this path must not write" discipline —
+/// so accepting the writes is the worst possible answer.
+///
+/// `Some(tag)` means refuse with PG's message, `cannot execute {tag} in
+/// a read-only transaction` (SQLSTATE 25006). Every tag below was read
+/// back from PostgreSQL 18.6 by running the statement inside
+/// `BEGIN READ ONLY`, one statement per transaction so no error could be
+/// attributed to the wrong line.
+///
+/// Several answers were not what one would guess, which is why they were
+/// measured rather than reasoned:
+///
+///   * `CREATE TEMP TABLE` is REFUSED, tagged `CREATE TABLE`.
+///   * `NOTIFY`, `LISTEN` and `REINDEX` are ALLOWED.
+///   * `PREPARE` of an INSERT is ALLOWED — only the EXECUTE writes.
+///   * `UPDATE … WHERE false`, which changes nothing, is still REFUSED:
+///     the verb decides, not the row count.
+///   * `GRANT`, `COMMENT ON` and `SELECT … FOR SHARE` are all REFUSED.
+///
+/// The match is exhaustive on purpose. A new statement cannot be added
+/// without deciding here whether it writes, which is the failure this
+/// repository keeps meeting: one member of a family gets handled and its
+/// siblings quietly do not.
+impl Statement {
+    #[must_use]
+    pub fn read_only_violation_tag(&self) -> Option<&'static str> {
+        match self {
+            // ---- writes rows -------------------------------------------
+            Self::Insert { .. } => Some("INSERT"),
+            Self::Update { .. } => Some("UPDATE"),
+            Self::Delete { .. } => Some("DELETE"),
+            Self::Merge { .. } => Some("MERGE"),
+            Self::Truncate { .. } => Some("TRUNCATE TABLE"),
+            Self::CopyFromFile { .. } => Some("COPY FROM"),
+
+            // A SELECT that takes row locks writes lock state, and PG
+            // names the strength it was asked for.
+            Self::Select(sel) => sel.locking.as_ref().map(|l| match l.strength {
+                LockStrength::Update => "SELECT FOR UPDATE",
+                LockStrength::NoKeyUpdate => "SELECT FOR NO KEY UPDATE",
+                LockStrength::Share => "SELECT FOR SHARE",
+                LockStrength::KeyShare => "SELECT FOR KEY SHARE",
+            }),
+
+            // ---- changes the catalog -----------------------------------
+            Self::CreateTable { .. } => Some("CREATE TABLE"),
+            Self::DropTable { .. } => Some("DROP TABLE"),
+            Self::AlterTable { .. } => Some("ALTER TABLE"),
+            Self::CreateIndex { .. } => Some("CREATE INDEX"),
+            Self::DropIndex { .. } => Some("DROP INDEX"),
+            Self::AlterIndex { .. } => Some("ALTER INDEX"),
+            Self::CreateView { .. } => Some("CREATE VIEW"),
+            Self::DropView { .. } => Some("DROP VIEW"),
+            Self::CreateMaterializedView { .. } => Some("CREATE MATERIALIZED VIEW"),
+            Self::RefreshMaterializedView { .. } => Some("REFRESH MATERIALIZED VIEW"),
+            Self::DropMaterializedView { .. } => Some("DROP MATERIALIZED VIEW"),
+            Self::CreateSequence { .. } => Some("CREATE SEQUENCE"),
+            Self::AlterSequence { .. } => Some("ALTER SEQUENCE"),
+            Self::DropSequence { .. } => Some("DROP SEQUENCE"),
+            Self::CreateType { .. } => Some("CREATE TYPE"),
+            Self::DropType { .. } => Some("DROP TYPE"),
+            Self::AlterTypeAddValue { .. } | Self::AlterTypeRenameValue { .. } => {
+                Some("ALTER TYPE")
+            }
+            Self::CreateDomain { .. } => Some("CREATE DOMAIN"),
+            Self::AlterDomain { .. } => Some("ALTER DOMAIN"),
+            Self::DropDomain { .. } => Some("DROP DOMAIN"),
+            Self::CreateSchema { .. } => Some("CREATE SCHEMA"),
+            Self::DropSchema { .. } => Some("DROP SCHEMA"),
+            Self::CreateFunction { .. } => Some("CREATE FUNCTION"),
+            Self::DropFunction { .. } => Some("DROP FUNCTION"),
+            Self::CreateTrigger { .. } => Some("CREATE TRIGGER"),
+            Self::DropTrigger { .. } => Some("DROP TRIGGER"),
+            Self::CreateRule { .. } => Some("CREATE RULE"),
+            Self::DropRule { .. } => Some("DROP RULE"),
+            Self::CreateExtension { .. } => Some("CREATE EXTENSION"),
+            Self::CreateStatistics { .. } => Some("CREATE STATISTICS"),
+            Self::DropStatistics { .. } => Some("DROP STATISTICS"),
+            Self::DropAggregate { .. } => Some("DROP AGGREGATE"),
+            Self::CommentOn { .. } => Some("COMMENT"),
+            Self::DropDatabase { .. } => Some("DROP DATABASE"),
+            Self::CreatePublication { .. } => Some("CREATE PUBLICATION"),
+            Self::DropPublication { .. } => Some("DROP PUBLICATION"),
+            Self::CreateSubscription { .. } => Some("CREATE SUBSCRIPTION"),
+            Self::DropSubscription { .. } => Some("DROP SUBSCRIPTION"),
+
+            // ---- changes roles / permissions ---------------------------
+            Self::CreateUser { .. } => Some("CREATE ROLE"),
+            Self::DropUser { .. } => Some("DROP ROLE"),
+            Self::AlterRolePassword { .. } | Self::SetDbRoleSetting { .. } => Some("ALTER ROLE"),
+            Self::Grant { .. } => Some("GRANT"),
+            Self::Revoke { .. } => Some("REVOKE"),
+            Self::CreatePolicy { .. } => Some("CREATE POLICY"),
+            Self::AlterPolicy { .. } => Some("ALTER POLICY"),
+            Self::DropPolicy { .. } => Some("DROP POLICY"),
+            Self::AlterSystem { .. } => Some("ALTER SYSTEM"),
+
+            // ---- SPG's own writers -------------------------------------
+            // Rewrites cold-tier segments on disk. PG has no equivalent to
+            // ask, so the test is what it does, not what it is called.
+            Self::CompactColdSegments => Some("COMPACT COLD SEGMENTS"),
+
+            // ---- allowed -----------------------------------------------
+            // Reads, transaction control, session state, cursors, and the
+            // maintenance statements PG itself permits. `REINDEX` really is
+            // allowed in a read-only transaction (measured), which is why
+            // `Maintain` is here.
+            //
+            // `Prepare`, `Execute`, `Call` and `DoBlock` are allowed at
+            // this level for the reason PG allows them: the write inside
+            // is refused when it runs, by this same check. Measured:
+            // `PREPARE p AS INSERT …` succeeds; `DO $$ … INSERT … $$`
+            // fails with `cannot execute INSERT`.
+            Self::Explain { .. }
+            | Self::CopyTo { .. }
+            | Self::CopyToFile { .. }
+            | Self::Analyze { .. }
+            | Self::Maintain { .. }
+            | Self::Vacuum { .. }
+            | Self::Begin { .. }
+            | Self::Commit
+            | Self::Rollback
+            | Self::Savepoint { .. }
+            | Self::RollbackToSavepoint { .. }
+            | Self::ReleaseSavepoint { .. }
+            | Self::PrepareTransaction { .. }
+            | Self::SetTransaction { .. }
+            | Self::SetConstraints { .. }
+            | Self::SetParameter { .. }
+            | Self::SetParameterList { .. }
+            | Self::SetUserVars { .. }
+            | Self::SetRole { .. }
+            | Self::ResetParameter { .. }
+            | Self::ShowParameter { .. }
+            | Self::Discard { .. }
+            | Self::Prepare { .. }
+            | Self::Execute { .. }
+            | Self::Deallocate { .. }
+            | Self::Call { .. }
+            | Self::DoBlock { .. }
+            | Self::DeclareCursor { .. }
+            | Self::FetchCursor { .. }
+            | Self::MoveCursor { .. }
+            | Self::CloseCursor { .. }
+            | Self::Listen { .. }
+            | Self::Notify { .. }
+            | Self::Unlisten { .. }
+            | Self::Kill { .. }
+            | Self::WaitForWalPosition { .. }
+            | Self::ValidateOnly { .. }
+            | Self::NoOpPreventedInTransaction { .. }
+            | Self::Empty
+            | Self::ShowTables
+            | Self::ShowDatabases
+            | Self::ShowCreateTable { .. }
+            | Self::ShowIndexes { .. }
+            | Self::ShowStatus
+            | Self::ShowVariables
+            | Self::ShowVariablesLike { .. }
+            | Self::ShowProcesslist
+            | Self::ShowColumns { .. }
+            | Self::ShowUsers
+            | Self::ShowPublications
+            | Self::ShowSubscriptions => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockingClause {
     pub strength: LockStrength,
@@ -5732,8 +5923,18 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::Begin(None) => f.write_str("BEGIN"),
-            Self::Begin(Some(level)) => write!(f, "BEGIN ISOLATION LEVEL {level}"),
+            Self::Begin(modes) => {
+                f.write_str("BEGIN")?;
+                if let Some(level) = modes.isolation {
+                    write!(f, " ISOLATION LEVEL {level}")?;
+                }
+                match modes.read_only {
+                    Some(true) => f.write_str(" READ ONLY")?,
+                    Some(false) => f.write_str(" READ WRITE")?,
+                    None => {}
+                }
+                Ok(())
+            }
             Self::Commit => f.write_str("COMMIT"),
             Self::Rollback => f.write_str("ROLLBACK"),
             Self::Savepoint(n) => write!(f, "SAVEPOINT {}", quote_ident(n)),
@@ -5951,15 +6152,23 @@ impl fmt::Display for Statement {
                     SetValue::Default => f.write_str("DEFAULT"),
                 }
             }
-            Self::SetTransaction { isolation } => {
-                write!(f, "SET TRANSACTION ISOLATION LEVEL ")?;
-                let name = match isolation {
-                    IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
-                    IsolationLevel::ReadCommitted => "READ COMMITTED",
-                    IsolationLevel::RepeatableRead => "REPEATABLE READ",
-                    IsolationLevel::Serializable => "SERIALIZABLE",
-                };
-                f.write_str(name)
+            Self::SetTransaction { modes } => {
+                f.write_str("SET TRANSACTION")?;
+                if let Some(isolation) = modes.isolation {
+                    let name = match isolation {
+                        IsolationLevel::ReadUncommitted => "READ UNCOMMITTED",
+                        IsolationLevel::ReadCommitted => "READ COMMITTED",
+                        IsolationLevel::RepeatableRead => "REPEATABLE READ",
+                        IsolationLevel::Serializable => "SERIALIZABLE",
+                    };
+                    write!(f, " ISOLATION LEVEL {name}")?;
+                }
+                match modes.read_only {
+                    Some(true) => f.write_str(" READ ONLY")?,
+                    Some(false) => f.write_str(" READ WRITE")?,
+                    None => {}
+                }
+                Ok(())
             }
             Self::ShowParameter(name) => write!(f, "SHOW {name}"),
             Self::SetUserVars(assigns, _) => {
