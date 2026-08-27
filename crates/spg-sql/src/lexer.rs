@@ -426,7 +426,7 @@ fn gap_continues_a_literal(gap: &str) -> bool {
 /// with PG string semantics (backslash is a literal byte inside
 /// `'…'`; `''` is the only escape).
 pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
-    tokenize_with(input, false)
+    tokenize_with(input, Dialect::PG)
 }
 
 /// v7.22 (round-13 T3) — dialect-aware tokenizer entry. With
@@ -436,8 +436,43 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, LexError> {
 /// sections, and pg_dump ALWAYS announces PG semantics via
 /// `SET standard_conforming_strings = on` — the engine flips this
 /// flag off/on from those deterministic session signals.
-pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>, LexError> {
-    tokenize_with_offsets(input, backslash_escapes).map(|(tokens, _)| tokens)
+/// How a statement's text is to be read.
+///
+/// v7.39 — this was a lone `bool`. The second axis is `ANSI_QUOTES`,
+/// which SPG behaved as though were always on: measured on MySQL 9.7.2,
+/// `SELECT "abc"` answers `abc`, while a MySQL session on SPG answered
+/// `ERROR 1054 column "abc" does not exist`. Ordinary MySQL SQL that
+/// quotes a string with `"` — which a great deal of it does — failed
+/// with an error naming a column the author never wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dialect {
+    /// `\` escapes inside a string and `#` starts a comment: MySQL and
+    /// MariaDB, unless the session's `sql_mode` says
+    /// `NO_BACKSLASH_ESCAPES`.
+    pub backslash_escapes: bool,
+    /// `"…"` quotes an IDENTIFIER rather than a string literal.
+    ///
+    /// PostgreSQL, always. MySQL only when `ANSI_QUOTES` is in
+    /// `sql_mode`, which its default list does not carry.
+    pub double_quoted_identifiers: bool,
+}
+
+impl Dialect {
+    /// PostgreSQL: no backslash escapes, `"…"` is an identifier.
+    pub const PG: Self = Self {
+        backslash_escapes: false,
+        double_quoted_identifiers: true,
+    };
+}
+
+impl Default for Dialect {
+    fn default() -> Self {
+        Self::PG
+    }
+}
+
+pub fn tokenize_with(input: &str, dialect: Dialect) -> Result<Vec<Token>, LexError> {
+    tokenize_with_offsets(input, dialect).map(|(tokens, _)| tokens)
 }
 
 /// v7.39 (read01 round 95) — like [`tokenize_with`] but also returns, for each
@@ -448,8 +483,9 @@ pub fn tokenize_with(input: &str, backslash_escapes: bool) -> Result<Vec<Token>,
 #[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
 pub fn tokenize_with_offsets(
     input: &str,
-    backslash_escapes: bool,
+    dialect: Dialect,
 ) -> Result<(Vec<Token>, Vec<usize>), LexError> {
+    let backslash_escapes = dialect.backslash_escapes;
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -589,13 +625,21 @@ pub fn tokenize_with_offsets(
             b'*' if peek_eq(bytes, i + 1, b'/') => {
                 i += 2;
             }
-            b'\'' => {
+            // v7.39 — `"` joins this arm in a MySQL session without
+            // ANSI_QUOTES, where it opens a STRING. Measured on MySQL
+            // 9.7.2: `"a""b"` is `a"b` (doubling), `"a\"b"` is `a"b`
+            // (escape), `"a'b"` is `a'b` (the other quote is ordinary
+            // inside), and `LENGTH("\n")` is 1 unless the session says
+            // NO_BACKSLASH_ESCAPES. Every one of those falls out of
+            // passing the quote byte down rather than a second copy of
+            // the machinery.
+            q @ (b'\'' | b'"') if q == b'\'' || !dialect.double_quoted_identifiers => {
                 let (tok, consumed) = if backslash_escapes {
                     // MySQL-dialect session: plain strings decode
                     // backslash escapes — same machinery as E'…'.
-                    lex_escape_string(input, i, true)?
+                    lex_escape_string(input, i, true, q)?
                 } else {
-                    lex_quoted(input, i, b'\'', false)?
+                    lex_quoted(input, i, q, false)?
                 };
                 // r1038 — SQL's implicit concatenation: two string
                 // literals separated by whitespace CONTAINING A NEWLINE
@@ -629,7 +673,7 @@ pub fn tokenize_with_offsets(
             // downstream parser / cast paths treat it identically
             // to a regular string literal.
             b'E' | b'e' if peek_eq(bytes, i + 1, b'\'') => {
-                let (tok, consumed) = lex_escape_string(input, i + 1, false)?;
+                let (tok, consumed) = lex_escape_string(input, i + 1, false, b'\'')?;
                 out.push(tok);
                 i += 1 + consumed;
                 // r1038 — an `E'…'` may LEAD a continued literal (PG18.4:
@@ -1558,9 +1602,14 @@ fn lex_quoted(
 /// Sharing one table meant a MySQL client's `'\Z'` arrived as the letter
 /// `Z`, and `'a\%b'` lost the escape LIKE needed — silently wrong bytes,
 /// not an error.
-fn lex_escape_string(input: &str, start: usize, mysql: bool) -> Result<(Token, usize), LexError> {
+fn lex_escape_string(
+    input: &str,
+    start: usize,
+    mysql: bool,
+    quote: u8,
+) -> Result<(Token, usize), LexError> {
     let bytes = input.as_bytes();
-    debug_assert_eq!(bytes[start], b'\'');
+    debug_assert_eq!(bytes[start], quote);
     let mut i = start + 1;
     // v7.39 (round 773, F31 J3) — PG decodes byte escapes into a BYTE
     // buffer and validates the whole literal as UTF-8 at the end
@@ -1581,9 +1630,9 @@ fn lex_escape_string(input: &str, start: usize, mysql: bool) -> Result<(Token, u
             });
         }
         let b = bytes[i];
-        if b == b'\'' {
-            if peek_eq(bytes, i + 1, b'\'') {
-                push_char(&mut buf, '\'');
+        if b == quote {
+            if peek_eq(bytes, i + 1, quote) {
+                push_char(&mut buf, char::from(quote));
                 i += 2;
                 continue;
             }

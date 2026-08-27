@@ -899,6 +899,32 @@ pub(crate) struct SessionBag {
     /// it off and a value that would otherwise raise is bent to fit
     /// instead — the same conversion `INSERT IGNORE` uses.
     pub(crate) mysql_strict: bool,
+    /// v7.39 — is `ANSI_QUOTES` in this session's `sql_mode`?
+    ///
+    /// It decides whether `"…"` opens an identifier or a string. SPG
+    /// behaved as though it were always set, which is PostgreSQL's rule
+    /// applied to a MySQL session: `SELECT "abc"` answered
+    /// `column "abc" does not exist` where MySQL 9.7.2 answers `abc`.
+    /// MySQL's default `sql_mode` does not carry it, so this starts
+    /// false — and unlike [`SessionBag::mysql_strict`], false IS the
+    /// zero value.
+    pub(crate) mysql_ansi_quotes: bool,
+    /// v7.39 — does this session speak MySQL at all?
+    ///
+    /// `backslash_escapes` was carrying this too, and the two come
+    /// apart: `SET sql_mode='NO_BACKSLASH_ESCAPES'` turns the escapes
+    /// off, which by that test stopped the session being MySQL. Harmless
+    /// until something else asked — and `"…"` asks, so a MySQL session
+    /// that had turned escapes off got PostgreSQL's identifier rule
+    /// back. Set once by the mysql-wire on connect, and by any
+    /// `SET sql_mode`, which only a MySQL client or a mysqldump preamble
+    /// sends.
+    ///
+    /// The wider conflation (`in_mysql_dialect()` IS
+    /// `backslash_escapes`) is left alone here rather than rewired
+    /// underneath everything that reads it; this flag answers the one
+    /// question this change asks.
+    pub(crate) speaks_mysql: bool,
     /// v7.38.18 (C12) — the MySQL diagnostics area: what the last
     /// warning-generating statement bent, ready for `SHOW WARNINGS`
     /// and `@@warning_count`.
@@ -1023,6 +1049,8 @@ impl Default for SessionBag {
     fn default() -> Self {
         Self {
             mysql_strict: true,
+            mysql_ansi_quotes: false,
+            speaks_mysql: false,
             session_params: BTreeMap::new(),
             backslash_escapes: false,
             mysql_warnings: Vec::new(),
@@ -1285,6 +1313,10 @@ pub struct Engine {
     backslash_escapes: bool,
     /// v7.39 (round 470) — see [`SessionBag::mysql_strict`].
     mysql_strict: bool,
+    /// v7.39 — see [`SessionBag::mysql_ansi_quotes`].
+    mysql_ansi_quotes: bool,
+    /// v7.39 — see [`SessionBag::speaks_mysql`].
+    speaks_mysql: bool,
     /// v7.38.18 (C12) — see [`SessionBag::mysql_warnings`]. Lives on
     /// the Engine like every other live-session field and swaps with
     /// the bag, because the server runs ONE Engine for every
@@ -1786,6 +1818,8 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
+            mysql_ansi_quotes: false,
+            speaks_mysql: false,
             mysql_warnings: Vec::new(),
             mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
@@ -2313,6 +2347,8 @@ impl Engine {
             current_tx: None,
             backslash_escapes: false,
             mysql_strict: true,
+            mysql_ansi_quotes: false,
+            speaks_mysql: false,
             mysql_warnings: Vec::new(),
             mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
@@ -2455,6 +2491,8 @@ impl Engine {
                     current_tx: None,
                     backslash_escapes: false,
                     mysql_strict: true,
+                    mysql_ansi_quotes: false,
+                    speaks_mysql: false,
                     mysql_warnings: Vec::new(),
                     mysql_stmt_warnings: Vec::new(),
                     lo_descriptors: BTreeMap::new(),
@@ -2583,6 +2621,8 @@ impl Engine {
             session_params: core::mem::take(&mut self.session_params),
             backslash_escapes: self.backslash_escapes,
             mysql_strict: self.mysql_strict,
+            mysql_ansi_quotes: self.mysql_ansi_quotes,
+            speaks_mysql: self.speaks_mysql,
             mysql_warnings: core::mem::take(&mut self.mysql_warnings),
             prepared_statements: core::mem::take(&mut self.prepared_statements),
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
@@ -2605,6 +2645,8 @@ impl Engine {
         self.session_params = incoming.session_params;
         self.backslash_escapes = incoming.backslash_escapes;
         self.mysql_strict = incoming.mysql_strict;
+        self.mysql_ansi_quotes = incoming.mysql_ansi_quotes;
+        self.speaks_mysql = incoming.speaks_mysql;
         self.mysql_warnings = incoming.mysql_warnings;
         self.prepared_statements = incoming.prepared_statements;
         self.lo_descriptors = incoming.lo_descriptors;
@@ -2732,6 +2774,8 @@ impl Engine {
             self.prepared_statements.clear();
             self.backslash_escapes = false;
             self.mysql_strict = true;
+            self.mysql_ansi_quotes = false;
+            self.speaks_mysql = false;
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;
             self.cursors.clear();
@@ -2757,6 +2801,32 @@ impl Engine {
     /// entering MySQL through a door no directive named, and a harness
     /// that read the directive reported them as PostgreSQL. Ask the
     /// session, do not parse the script.
+    /// How this session's SQL text is to be read.
+    ///
+    /// v7.39 — the parser used to be handed `backslash_escapes` alone,
+    /// so `"…"` was an identifier in every session. One place decides
+    /// both axes now, and both come from the same `sql_mode`.
+    #[must_use]
+    pub fn sql_dialect(&self) -> spg_sql::lexer::Dialect {
+        spg_sql::lexer::Dialect {
+            backslash_escapes: self.backslash_escapes,
+            // A PG session is never in ANSI_QUOTES' scope: `"…"` is an
+            // identifier there. Keyed on `speaks_mysql`, not on the
+            // escapes flag — `NO_BACKSLASH_ESCAPES` turns the latter off
+            // without making the session any less MySQL.
+            double_quoted_identifiers: !self.speaks_mysql || self.mysql_ansi_quotes,
+        }
+    }
+
+    /// Mark this session as speaking MySQL. The mysql-wire calls it
+    /// once on connect; see [`SessionBag::speaks_mysql`].
+    pub fn set_mysql_wire_session(&mut self) {
+        if !self.speaks_mysql {
+            self.speaks_mysql = true;
+            self.plan_cache.clear();
+        }
+    }
+
     pub fn in_mysql_dialect(&self) -> bool {
         self.backslash_escapes
     }

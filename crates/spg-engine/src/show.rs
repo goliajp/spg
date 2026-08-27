@@ -268,7 +268,31 @@ impl Engine {
         let canonical: &[(&str, &str)] = &[
             ("version", crate::MYSQL_SERVER_VERSION),
             ("version_comment", crate::MYSQL_VERSION_COMMENT),
+            // v7.39 — `SHOW VARIABLES LIKE 'collation%'` listed ONE of
+            // MySQL's three and `LIKE 'character_set%'` one of its
+            // eight, while `@@collation_connection` answered on the
+            // other surface. Same disagreement between two surfaces this
+            // release keeps finding, in the inventory rather than in a
+            // value: a client that enumerates gets a different world
+            // from one that asks by name.
+            //
+            // The loop below prefers the session's own value, so these
+            // follow `SET NAMES` exactly as the `@@` path does — except
+            // the two database-scoped names, which MySQL does not scope
+            // to the session.
+            ("character_set_client", "utf8mb4"),
+            ("character_set_connection", "utf8mb4"),
+            ("character_set_results", "utf8mb4"),
+            ("character_set_database", "utf8mb4"),
             ("character_set_server", "utf8mb4"),
+            (
+                "collation_connection",
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
+            ),
+            (
+                "collation_database",
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
+            ),
             (
                 "collation_server",
                 crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,

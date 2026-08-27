@@ -202,7 +202,7 @@ impl Engine {
         &self,
         sql: &str,
     ) -> Result<spg_sql::ast::SelectStatement, EngineError> {
-        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the shared pre-pass. This was the third copy of the
         // list; see `Engine::preprocess`.
         self.preprocess(&mut stmt);
@@ -367,7 +367,7 @@ impl Engine {
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
         cancel.check()?;
-        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the shared pre-pass. THIS is the route every autocommit
         // SELECT takes over the wire, and it was the copy that mattered:
         // `WHERE b = decode(lpad(to_hex(7),16,'0'),'hex')` came through
@@ -413,7 +413,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
-        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the SAME pre-pass `prepare` runs. This path had its own
         // copy of the list, one pass short of it, and every autocommit
         // SELECT over the wire comes through here: a plan `EXPLAIN`

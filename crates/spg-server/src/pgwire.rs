@@ -4925,7 +4925,9 @@ fn window_sqlstate(msg: &str) -> Option<&'static str> {
 
 fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
     match e {
-        EngineError::Parse(pe) => spg_sql::parser::syntax_error_position(sql, false, pe.token_pos),
+        EngineError::Parse(pe) => {
+            spg_sql::parser::syntax_error_position(sql, spg_sql::lexer::Dialect::PG, pe.token_pos)
+        }
         _ => None,
     }
 }

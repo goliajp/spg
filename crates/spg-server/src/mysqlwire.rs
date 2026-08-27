@@ -646,6 +646,7 @@ fn command_loop(
         Ok(mut engine) => {
             engine.set_current_session(session_id);
             engine.set_backslash_escapes(true);
+            engine.set_mysql_wire_session();
             engine.alloc_tx_id()
         }
         Err(_) => spg_engine::IMPLICIT_TX,

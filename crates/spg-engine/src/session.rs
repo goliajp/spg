@@ -386,6 +386,20 @@ impl Engine {
             let upper = normalised.to_ascii_uppercase();
             self.mysql_strict =
                 upper.contains("STRICT_TRANS_TABLES") || upper.contains("STRICT_ALL_TABLES");
+            // v7.39 — and the third thing sql_mode carries: whether
+            // `"…"` is an identifier. Measured on MySQL 9.7.2,
+            // `SET sql_mode='ANSI_QUOTES'; SELECT "abc"` gives
+            // `Unknown column 'abc'` where the default list gives
+            // `abc`. The same text lexes differently either way, so a
+            // flip invalidates the plan cache exactly as
+            // `backslash_escapes` does.
+            // Only a MySQL client or a mysqldump preamble sends this.
+            self.speaks_mysql = true;
+            let ansi = upper.contains("ANSI_QUOTES");
+            if ansi != self.mysql_ansi_quotes {
+                self.mysql_ansi_quotes = ansi;
+                self.plan_cache.clear();
+            }
         }
         // v7.39 (GUC) — PG stores ms-unit time GUCs as an integer and
         // renders SHOW/current_setting in the largest whole unit

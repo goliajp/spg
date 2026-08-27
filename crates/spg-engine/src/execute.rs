@@ -443,7 +443,7 @@ impl Engine {
     ///
     /// Pgwire's `Parse` (P) message lands here.
     pub fn prepare(&self, sql: &str) -> Result<Statement, ParseError> {
-        let mut stmt = parser::parse_statement_with(sql, self.backslash_escapes)?;
+        let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         self.preprocess(&mut stmt);
         Ok(stmt)
     }
