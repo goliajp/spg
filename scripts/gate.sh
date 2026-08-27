@@ -227,6 +227,30 @@ run_perf() {
         return 0
     fi
     if [[ -z "${PG_URI:-}" || -z "${SPG_URI:-}" ]]; then
+        # v7.39.2 — before deciding this is unconfigured, ask the step
+        # that configures ITSELF.
+        #
+        # `suite-run step perf-sweep` builds both legs rather than taking
+        # them from whoever is typing, and it carries three corrections
+        # that hand-configuration got wrong: the PostgreSQL leg has to be
+        # the C-collation `bench_c` database (an `en_US` leg made the
+        # sixty-four cells report wins on the collation difference), the
+        # two legs have to be reached over the same route (a
+        # container-to-host hop on one side alone turned 2 losing cells
+        # into 20), and the SPGS leg has to DECLARE `SPG_LC_COLLATE=C`
+        # rather than inherit the machine's.
+        #
+        # Asking the operator for `PG_URI` and `SPG_URI` blocked the
+        # v7.39.1 train twice, and the second time the hand-written
+        # configuration had to reproduce all three of those corrections
+        # from the maintained step's source. A gate should not require
+        # that of the person running it.
+        if [[ -x "$HOME/spgbench/bin/psql" ]]; then
+            echo "perf: PG_URI / SPG_URI unset; using the maintained sweep, which"
+            echo "      configures both legs itself (testbed detected)."
+            cargo run --quiet -p suitelib -- step perf-sweep
+            return $?
+        fi
         # A routine gate on a checkout has no PG18 to compare against, and
         # breaking the everyday loop is not what "perf blocks the release"
         # asks for. It blocks the RELEASE: `release.sh` sets
