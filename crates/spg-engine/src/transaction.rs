@@ -7,7 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{Engine, EngineError, QueryResult, TxState};
+use crate::{Engine, EngineError, QueryResult, TxId, TxState};
 
 /// v7.37.17 (Phase E2 — RC rebase) — how a statement interacts with an
 /// open transaction's shadow catalog, decided BEFORE dispatch (the
@@ -184,9 +184,48 @@ impl Engine {
     /// (`ROLLBACK TO`). Restores go through `set_session_param` so its
     /// side effects (foreign_key_checks, escape-mode plan-cache flush) are
     /// replayed too.
-    pub(crate) fn restore_local_gucs_to(&mut self, floor: usize) {
-        while self.local_guc_saves.len() > floor {
-            let (name, prior) = self.local_guc_saves.pop().expect("len checked");
+    /// The transaction slot THIS statement runs in, open or not.
+    ///
+    /// v7.39 — the three `SET LOCAL` writers asked `in_transaction()`,
+    /// which is true when ANY connection has a transaction open. On a
+    /// server sharing one Engine that made a connection's `SET LOCAL`
+    /// depend on what an unrelated connection was doing: measured, the
+    /// same two statements on the same connection answered `<NULL>`
+    /// alone and `B` while another connection held a transaction, and
+    /// the "local" value then outlived the statement that set it. In
+    /// the RLS shape — `set_config('app.tenant_id', …, true)` per
+    /// request — that is one request's tenant id surviving into the
+    /// next. Eighth occurrence of this witness confusion; the check
+    /// lives in one place now so a fourth writer cannot repeat it.
+    pub(crate) fn own_open_tx(&self) -> Option<TxId> {
+        self.current_tx.filter(|t| self.is_tx_open(*t))
+    }
+
+    /// Apply a `SET LOCAL`: record the prior value in THIS transaction's
+    /// undo log, then write the new one.
+    ///
+    /// Outside a transaction block PG scopes the change to the implicit
+    /// single-statement transaction, so it leaves nothing behind — which
+    /// is what returning early does.
+    pub(crate) fn set_local_param(&mut self, name: String, value: spg_sql::ast::SetValue) {
+        let Some(tx) = self.own_open_tx() else {
+            return;
+        };
+        let prior = self.session_param(&name).map(String::from);
+        self.local_guc_saves
+            .entry(tx)
+            .or_default()
+            .push((name.clone(), prior));
+        self.set_session_param(name, value);
+    }
+
+    pub(crate) fn restore_local_gucs_to(&mut self, tx_id: TxId, floor: usize) {
+        let Some(log) = self.local_guc_saves.get_mut(&tx_id) else {
+            return;
+        };
+        let cut = floor.min(log.len());
+        let mut undo = log.split_off(cut);
+        while let Some((name, prior)) = undo.pop() {
             match prior {
                 Some(v) => self.set_session_param(name, spg_sql::ast::SetValue::String(v)),
                 None => {
@@ -199,9 +238,10 @@ impl Engine {
 
     /// Revert every `SET LOCAL` of the current transaction and clear the
     /// savepoint marks — used at COMMIT and ROLLBACK.
-    pub(crate) fn restore_all_local_gucs(&mut self) {
-        self.restore_local_gucs_to(0);
-        self.savepoint_guc_marks.clear();
+    pub(crate) fn restore_all_local_gucs(&mut self, tx_id: TxId) {
+        self.restore_local_gucs_to(tx_id, 0);
+        self.local_guc_saves.remove(&tx_id);
+        self.savepoint_guc_marks.remove(&tx_id);
     }
 
     /// v7.37.17 (Phase E2) — READ COMMITTED per-statement rebase: move
@@ -631,7 +671,7 @@ impl Engine {
                 self.abort_writer_version(v);
                 self.release_tx_locks(v);
             }
-            self.restore_all_local_gucs();
+            self.restore_all_local_gucs(tx_id);
             // v7.39 (read01 round 118, B3) — a failed COMMIT ends the tx too.
             self.current_isolation_level = self.default_isolation_level();
             self.current_tx_read_only = self.default_read_only();
@@ -797,7 +837,7 @@ impl Engine {
                         self.abort_writer_version(v);
                         self.release_tx_locks(v);
                     }
-                    self.restore_all_local_gucs();
+                    self.restore_all_local_gucs(tx_id);
                     return Err(EngineError::SerializationFailure(detail));
                 }
                 None => {
@@ -874,7 +914,7 @@ impl Engine {
                     self.abort_writer_version(v);
                     self.release_tx_locks(v);
                 }
-                self.restore_all_local_gucs();
+                self.restore_all_local_gucs(tx_id);
                 return Err(EngineError::SerializationFailure(detail));
             }
         }
@@ -1013,7 +1053,7 @@ impl Engine {
         // `state`).
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at the
         // transaction boundary, reverting to the pre-transaction values.
-        self.restore_all_local_gucs();
+        self.restore_all_local_gucs(tx_id);
         // v7.39 (read01 round 118, B3) — a transaction's isolation level is
         // scoped to the block; PG reverts to the default at COMMIT/ROLLBACK.
         self.current_isolation_level = self.default_isolation_level();
@@ -1065,7 +1105,7 @@ impl Engine {
         }
         // savepoints discarded with the TxState
         // v7.38 (read01 P3.19) — SET LOCAL settings expire at ROLLBACK too.
-        self.restore_all_local_gucs();
+        self.restore_all_local_gucs(tx_id);
         // v7.39 (read01 round 118, B3) — isolation reverts to the default at
         // transaction end (see exec_commit).
         self.current_isolation_level = self.default_isolation_level();
@@ -1091,7 +1131,7 @@ impl Engine {
             .ok_or_else(|| EngineError::NoActiveTransaction)?;
         // v7.38 (read01 P3.19) — remember the SET LOCAL undo-log depth at
         // this savepoint so `ROLLBACK TO` can unwind only the later ones.
-        let guc_depth = self.local_guc_saves.len();
+        let guc_depth = self.local_guc_saves.get(&tx_id).map_or(0, Vec::len);
         let state = self
             .tx_catalogs
             .get_mut(&tx_id)
@@ -1107,8 +1147,9 @@ impl Engine {
         state
             .savepoints
             .push((name.clone(), snapshot, users_snapshot));
-        self.savepoint_guc_marks.retain(|(n, _)| n != &name);
-        self.savepoint_guc_marks.push((name, guc_depth));
+        let marks = self.savepoint_guc_marks.entry(tx_id).or_default();
+        marks.retain(|(n, _)| n != &name);
+        marks.push((name, guc_depth));
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: false,
@@ -1152,14 +1193,12 @@ impl Engine {
         // v7.38 (read01 P3.19) — undo any SET LOCAL made after this
         // savepoint (they roll back with the subtransaction), and drop the
         // marks nested under it.
-        if let Some(mpos) = self
-            .savepoint_guc_marks
-            .iter()
-            .rposition(|(n, _)| n == name)
+        if let Some(marks) = self.savepoint_guc_marks.get_mut(&tx_id)
+            && let Some(mpos) = marks.iter().rposition(|(n, _)| n == name)
         {
-            let floor = self.savepoint_guc_marks[mpos].1;
-            self.savepoint_guc_marks.truncate(mpos + 1);
-            self.restore_local_gucs_to(floor);
+            let floor = marks[mpos].1;
+            marks.truncate(mpos + 1);
+            self.restore_local_gucs_to(tx_id, floor);
         }
         Ok(QueryResult::CommandOk {
             affected: 0,
@@ -1190,12 +1229,10 @@ impl Engine {
         state.savepoints.truncate(pos);
         // v7.38 (read01 P3.19) — RELEASE keeps the SET LOCAL changes (they
         // survive to the outer transaction), only the bookmarks go.
-        if let Some(mpos) = self
-            .savepoint_guc_marks
-            .iter()
-            .rposition(|(n, _)| n == name)
+        if let Some(marks) = self.savepoint_guc_marks.get_mut(&tx_id)
+            && let Some(mpos) = marks.iter().rposition(|(n, _)| n == name)
         {
-            self.savepoint_guc_marks.truncate(mpos);
+            marks.truncate(mpos);
         }
         Ok(QueryResult::CommandOk {
             affected: 0,

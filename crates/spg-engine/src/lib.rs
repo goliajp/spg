@@ -1515,19 +1515,29 @@ pub struct Engine {
     /// Over-approximation is deliberate: read-only statements bump it
     /// too, which only costs an extra (correct) rebase.
     pub(crate) commit_epoch: u64,
-    /// v7.38 (read01 P3.19) — `SET LOCAL` undo log for the current
-    /// transaction. Each entry is `(param_name, prior_value)` captured
-    /// just before a `SET LOCAL` overwrote it (`None` = the param had no
+    /// v7.38 (read01 P3.19) — `SET LOCAL` undo log, PER TRANSACTION
+    /// SLOT. Each entry is `(param_name, prior_value)` captured just
+    /// before a `SET LOCAL` overwrote it (`None` = the param had no
     /// session value, so restoring means removing it). Replayed in
-    /// reverse at COMMIT / ROLLBACK to revert transaction-local settings;
-    /// `savepoint_guc_marks` records the stack depth at each open
-    /// savepoint so `ROLLBACK TO` can unwind just the later ones.
-    pub(crate) local_guc_saves: Vec<(String, Option<String>)>,
+    /// reverse at COMMIT / ROLLBACK to revert transaction-local
+    /// settings; `savepoint_guc_marks` records the stack depth at each
+    /// open savepoint so `ROLLBACK TO` can unwind just the later ones.
+    ///
+    /// v7.39 — this was one `Vec` for the whole Engine while the values
+    /// it restores live in the per-connection `SessionBag`, so a server
+    /// with two connections replayed one connection's undo log into
+    /// another's session: measured, connection A committed a
+    /// transaction of its own and came out holding `app.k = 'Bvalue'`,
+    /// a value only connection B had ever written. Keyed by `TxId` now,
+    /// like `tx_writer_versions` — per-slot state that must outlive the
+    /// removal of the slot's `TxState`, which every COMMIT path does
+    /// before it reverts these.
+    pub(crate) local_guc_saves: BTreeMap<TxId, Vec<(String, Option<String>)>>,
     /// v7.39 (GUC knife 3) — parsed DateStyle / IntervalStyle /
     /// extra_float_digits, kept in lockstep with `session_params` so
     /// renderers don't re-parse GUC text per cell.
     pub(crate) render_style: crate::eval::RenderStyle,
-    pub(crate) savepoint_guc_marks: Vec<(String, usize)>,
+    pub(crate) savepoint_guc_marks: BTreeMap<TxId, Vec<(String, usize)>>,
     /// v7.12.7 — depth counter for trigger-emitted embedded SQL.
     /// Each time the engine executes a `DeferredEmbeddedStmt` it
     /// increments this; the recursive `execute_stmt_with_cancel`
@@ -1841,9 +1851,9 @@ impl Engine {
             commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
-            local_guc_saves: Vec::new(),
+            local_guc_saves: BTreeMap::new(),
             render_style: crate::eval::RenderStyle::default(),
-            savepoint_guc_marks: Vec::new(),
+            savepoint_guc_marks: BTreeMap::new(),
             trigger_recursion_depth: 0,
             rule_rewrite_active: false,
             foreign_key_checks: true,
@@ -2367,9 +2377,9 @@ impl Engine {
             commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
-            local_guc_saves: Vec::new(),
+            local_guc_saves: BTreeMap::new(),
             render_style: crate::eval::RenderStyle::default(),
-            savepoint_guc_marks: Vec::new(),
+            savepoint_guc_marks: BTreeMap::new(),
             trigger_recursion_depth: 0,
             rule_rewrite_active: false,
             foreign_key_checks: true,
@@ -2509,9 +2519,9 @@ impl Engine {
                     commit_epoch: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,
-                    local_guc_saves: Vec::new(),
+                    local_guc_saves: BTreeMap::new(),
                     render_style: crate::eval::RenderStyle::default(),
-                    savepoint_guc_marks: Vec::new(),
+                    savepoint_guc_marks: BTreeMap::new(),
                     trigger_recursion_depth: 0,
                     rule_rewrite_active: false,
                     foreign_key_checks: true,
