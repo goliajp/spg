@@ -231,3 +231,68 @@ fn a_variable_mysql_removed_is_not_answered_here() {
         "tx_isolation was removed in MySQL 8.0.3 and must not answer here"
     );
 }
+
+/// v7.39 — no corpus file may assert a version string that the engine no
+/// longer reports.
+///
+/// The PG oracle moved 18.4 -> 18.6 under a running project, and the
+/// constants moved with it. Precommit stayed green: its list is 37 of
+/// the 301 corpus files and neither of the two that spell the version
+/// out is in it, so the bump landed with the full tier red and nothing
+/// said so until an unrelated run happened to execute everything.
+///
+/// Adding those two files to the fast list would fix this instance.
+/// This pins the class instead: whatever the constants say, no corpus
+/// file may contradict them. It is a text scan, so it costs nothing and
+/// runs in the tier that runs first.
+#[test]
+fn no_corpus_file_asserts_a_version_we_no_longer_report() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root")
+        .join("xtests/sqllogictest/corpus");
+    assert!(root.is_dir(), "corpus not found at {}", root.display());
+
+    // Anything shaped like SPG's own PG version line. A file may DESCRIBE
+    // an older PG in prose ("the expectations below are PG 18.4's") —
+    // that is provenance, and true. What it may not do is assert that
+    // SPG reports it.
+    let current = spg_engine::PG_SERVER_VERSION;
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "test") {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(&path).expect("read corpus file");
+            for (n, line) in text.lines().enumerate() {
+                let line = line.trim();
+                // A bare result row, not a comment: `NN.N (spg)`.
+                if line.starts_with('#') || !line.ends_with("(spg)") {
+                    continue;
+                }
+                if line != current {
+                    offenders.push(format!("{}:{}: {line}", path.display(), n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        scanned > 200,
+        "only scanned {scanned} corpus files — did the path move?"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these assert a version the engine does not report (it reports {current:?}):\n{}",
+        offenders.join("\n")
+    );
+}

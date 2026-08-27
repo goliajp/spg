@@ -18,7 +18,7 @@
 query T nosort
 SHOW server_version
 ----
-18.4 (spg)
+18.6 (spg)
 
 query T nosort
 SHOW server_encoding
