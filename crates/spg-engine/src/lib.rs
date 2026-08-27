@@ -175,6 +175,34 @@ pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 /// `eval/functions.rs` said "SPG (MySQL-compatible)": the same question,
 /// two answers, in the same pair of files that disagreed about
 /// `collation_server` and `version`.
+/// v7.39 — the `sql_mode` a fresh MySQL session reports, and it lists
+/// only what SPG actually does.
+///
+/// Two surfaces had two different hard-coded lists (`SHOW VARIABLES`
+/// named two flags, `@@sql_mode` three), and both named
+/// `NO_ENGINE_SUBSTITUTION`, which SPG does not honour: `ENGINE=NONSUCH`
+/// was accepted silently where MySQL 9.7.2 answers
+/// `ERROR 1286 Unknown storage engine`. It is left off until the engine
+/// name is actually validated — claiming it is the defect this version
+/// is about.
+///
+/// Each flag below was verified by running the statement only that flag
+/// refuses, against MySQL 9.7.2 and against SPG on the MySQL wire:
+///
+///   STRICT_TRANS_TABLES          VARCHAR(3) <- 'abcdef'   -> refused
+///   NO_ZERO_DATE                 DATE <- '0000-00-00'     -> refused
+///   NO_ZERO_IN_DATE              DATE <- '2020-00-05'     -> refused
+///   ERROR_FOR_DIVISION_BY_ZERO   INT <- 1/0               -> refused
+///
+/// `ONLY_FULL_GROUP_BY` is MySQL's sixth default and SPG does not
+/// enforce it — it also never claimed to, which is why it is absent
+/// here rather than listed. The order is MySQL's own.
+///
+/// This is the DEFAULT only. `SET sql_mode = …` is honoured and read
+/// back faithfully, measured on both engines.
+pub const MYSQL_DEFAULT_SQL_MODE: &str =
+    "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO";
+
 pub const MYSQL_VERSION_COMMENT: &str = "SPG dual-stack engine (MySQL-compatible)";
 
 /// What `@@version_compile_os` answers.
@@ -835,7 +863,7 @@ pub struct MysqlWarning {
     pub message: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct SessionBag {
     pub(crate) session_params: BTreeMap<String, String>,
     pub(crate) backslash_escapes: bool,
@@ -944,6 +972,50 @@ pub(crate) struct SessionBag {
     /// to name the catalog map it lives in.
     pub(crate) temp_sequences: alloc::collections::BTreeSet<String>,
     pub(crate) temp_views: alloc::collections::BTreeSet<String>,
+}
+
+impl Default for SessionBag {
+    /// v7.39 — hand-written because ONE field's correct fresh value is not
+    /// its zero value, and `#[derive(Default)]` handed every new
+    /// connection the wrong one.
+    ///
+    /// `set_current_session` creates a bag on first sight with
+    /// `unwrap_or_default()`, so a fresh MySQL connection began with
+    /// `mysql_strict = false` — non-strict — while `@@sql_mode` told it
+    /// `STRICT_TRANS_TABLES`. Measured over the MySQL wire before the
+    /// fix: `VARCHAR(3) <- 'abcdef'` stored `'abc'` and `TINYINT <- 999`
+    /// stored `127`, both silently, both reported as success. Data lost,
+    /// with a receipt saying the session was strict.
+    ///
+    /// The field's own doc has said "this starts true" since round 470.
+    /// That was true of the Engine's constructors and never of the bag.
+    ///
+    /// Every other field was checked one by one: empty collections,
+    /// `false` for `backslash_escapes` (the PG dialect IS the default),
+    /// zero counters and `IsolationLevel::ReadCommitted` are all correct
+    /// as zero values. Writing this out by hand is what makes the next
+    /// field with a non-zero default land here instead of at a call site.
+    fn default() -> Self {
+        Self {
+            mysql_strict: true,
+            session_params: BTreeMap::new(),
+            backslash_escapes: false,
+            mysql_warnings: Vec::new(),
+            prepared_statements: BTreeMap::new(),
+            seq_currvals: BTreeMap::new(),
+            last_sequence_used: None,
+            isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
+            lo_descriptors: BTreeMap::new(),
+            lo_next_fd: 0,
+            cursors: BTreeMap::new(),
+            last_insert_id: 0,
+            row_count: 0,
+            user_vars: BTreeMap::new(),
+            temp_tables: alloc::collections::BTreeSet::new(),
+            temp_sequences: alloc::collections::BTreeSet::new(),
+            temp_views: alloc::collections::BTreeSet::new(),
+        }
+    }
 }
 
 /// v7.39 (round 306) — one open large-object descriptor.

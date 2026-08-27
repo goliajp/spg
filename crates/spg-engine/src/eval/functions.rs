@@ -15633,9 +15633,7 @@ fn apply_function_dispatch(
                 "autocommit" => "1",
                 "version" => crate::MYSQL_SERVER_VERSION,
                 "version_comment" => crate::MYSQL_VERSION_COMMENT,
-                "sql_mode" => {
-                    "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
-                }
+                "sql_mode" => crate::MYSQL_DEFAULT_SQL_MODE,
                 // Measured on MySQL 9.7.2: 67108864 on both surfaces.
                 // `show.rs` already said so; this said 16777216.
                 "max_allowed_packet" => "67108864",

@@ -165,6 +165,10 @@ fn the_two_variable_surfaces_agree() {
         "character_set_server",
         "max_allowed_packet",
         "transaction_isolation",
+        // v7.39 — this one had TWO hard-coded lists that named a
+        // different number of flags, and both named one SPG does not
+        // honour.
+        "sql_mode",
     ] {
         let show = row_text(&mut e, &format!("SHOW VARIABLES LIKE '{v}'"));
         let at = row_text(&mut e, &format!("SELECT @@{v}"));
@@ -295,4 +299,52 @@ fn no_corpus_file_asserts_a_version_we_no_longer_report() {
         "these assert a version the engine does not report (it reports {current:?}):\n{}",
         offenders.join("\n")
     );
+}
+
+/// v7.39 — `SHOW VARIABLES` must report what the session SET, not the
+/// compiled-in default.
+///
+/// It pushed the canonical table's constant unconditionally, and the
+/// session-parameter loop below it skips any name already in that table,
+/// so every canonical name reported its default forever. `@@x` read the
+/// session and `SHOW VARIABLES LIKE 'x'` did not, which is how the
+/// agreement pin found it — no test named a value.
+///
+/// The blast radius was the whole table, not `sql_mode`: `SET NAMES
+/// latin1` followed by `SHOW VARIABLES LIKE 'character_set_client'`
+/// answered `utf8mb4`, and `SET NAMES` is wiring this same version had
+/// just added. Measured on MySQL 9.7.2: after
+/// `SET sql_mode='NO_ZERO_DATE'` both surfaces answer `NO_ZERO_DATE`.
+#[test]
+fn show_variables_reports_what_the_session_set() {
+    let mut e = mysql();
+    for (var, set_to) in [
+        ("sql_mode", "NO_ZERO_DATE"),
+        ("collation_connection", "utf8mb4_bin"),
+        ("time_zone", "+09:00"),
+    ] {
+        e.execute(&format!("SET {var} = '{set_to}'"))
+            .unwrap_or_else(|err| panic!("SET {var}: {err}"));
+        let show = row_text(&mut e, &format!("SHOW VARIABLES LIKE '{var}'"));
+        let shown = show.trim_start_matches(var).trim();
+        let at = row_text(&mut e, &format!("SELECT @@{var}"));
+        assert_eq!(shown, set_to, "SHOW VARIABLES ignored `SET {var}`");
+        assert_eq!(at, set_to, "@@{var} ignored `SET {var}`");
+    }
+
+    // `SET NAMES` sets three of them at once, and they are canonical
+    // names too — the path that made this worth checking.
+    e.execute("SET NAMES latin1").unwrap();
+    for var in [
+        "character_set_client",
+        "character_set_connection",
+        "character_set_results",
+    ] {
+        let show = row_text(&mut e, &format!("SHOW VARIABLES LIKE '{var}'"));
+        let shown = show.trim_start_matches(var).trim();
+        assert_eq!(
+            shown, "latin1",
+            "SHOW VARIABLES ignored `SET NAMES` for {var}"
+        );
+    }
 }
