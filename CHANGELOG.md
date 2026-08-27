@@ -242,6 +242,27 @@ the current build; this file is a release-organized view.
 
 ### Known gaps in this section
 
+- **MySQL's introducers, and why a syntax-only version would be worse
+  than the error.** `SELECT _utf8mb4'x'`, `N'y'`, `_binary'z'` and
+  `_latin1'w'` are `ERROR 1064 syntax error` here; all four answer the
+  literal on MySQL 9.7.2. Accepting the syntax and dropping the charset
+  would fix three of them and break the fourth in the worse direction:
+  measured, `_binary'A' = 'a'` is **0** on MySQL because `_binary` makes
+  the comparison byte-wise, and SPG — comparing under the session
+  collation — would answer **1**. A hard error is an honest answer; a
+  silently wrong comparison is not.
+
+  Carrying that requires a collation on an arbitrary expression, and the
+  parser says in its own words that there is no `Expr::Collate` to carry
+  one. That node is the prerequisite, not the introducer syntax.
+
+  Two details a naive version would also miss: MySQL allows a space
+  (`_utf8mb4 'x'`), and an UNKNOWN charset is not an introducer at all —
+  `_nosuch'x'` answers `Unknown column '_nosuch' in 'field list'`,
+  because it parses as a column reference followed by a string.
+
+
+
 Measured, not closed here, and written down rather than left implicit:
 
 - `SHOW VARIABLES` still omits `character_set_filesystem`,
