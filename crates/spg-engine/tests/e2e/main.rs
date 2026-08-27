@@ -534,6 +534,7 @@ mod e2e_mysql_fsp_render_round425;
 mod e2e_mysql_generated_short_round379;
 mod e2e_mysql_greatest_null_round400;
 mod e2e_mysql_having_alias_round404;
+mod e2e_mysql_identity_v739;
 mod e2e_mysql_implicit_commit_round435;
 mod e2e_mysql_inet;
 mod e2e_mysql_insert_ignore_round406;

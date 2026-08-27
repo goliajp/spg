@@ -133,9 +133,20 @@ fn select_version_reports_pg_compatible_string() {
     let value = std::str::from_utf8(&dr.body[6..6 + len as usize]).unwrap();
     // v7.39 — served by the engine's version() (the canned "spg 4.6"
     // response is gone); drop-in clients sniff the PostgreSQL prefix.
+    //
+    // v7.38.25 — anchored to the constant rather than to a literal. This
+    // asserted `contains("SPG")` against a string that read
+    // `PostgreSQL 18.4 (SPG-compat)`, and when `version()` was
+    // consolidated onto one constant the marker became lowercase
+    // `(spg)` -- the spelling the wire's own `server_version` had been
+    // sending all along. The literal was the thing that had to move, and
+    // it was in a test rather than beside the value. What this test is
+    // actually for is the two invariants below.
+    assert_eq!(value, spg_engine::PG_VERSION_STRING, "got {value:?}");
+    assert!(value.starts_with("PostgreSQL "), "got {value:?}");
     assert!(
-        value.starts_with("PostgreSQL") && value.contains("SPG"),
-        "got {value:?}"
+        value.to_ascii_lowercase().contains("spg"),
+        "a client must be able to tell this is SPG: {value:?}"
     );
     let _ = read_message(&mut s); // C
     read_until_ready(&mut s);

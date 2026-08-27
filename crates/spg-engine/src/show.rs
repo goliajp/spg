@@ -266,10 +266,13 @@ impl Engine {
         ];
         let mut rows: Vec<Row<'static>> = Vec::new();
         let canonical: &[(&str, &str)] = &[
-            ("version", "8.0.35-spg"),
+            ("version", crate::MYSQL_SERVER_VERSION),
             ("version_comment", "SPG dual-stack engine"),
             ("character_set_server", "utf8mb4"),
-            ("collation_server", "utf8mb4_0900_ai_ci"),
+            (
+                "collation_server",
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
+            ),
             ("max_allowed_packet", "67108864"),
             ("autocommit", "ON"),
             // v7.39 (round 470) — the session's own value when it set one;

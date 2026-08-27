@@ -15612,7 +15612,7 @@ fn apply_function_dispatch(
                 // is 1 until the session says otherwise; the wire keeps
                 // the same answer in its status flags.
                 "autocommit" => "1",
-                "version" => "8.0.35-spg",
+                "version" => crate::MYSQL_SERVER_VERSION,
                 "version_comment" => "SPG (MySQL-compatible)",
                 "sql_mode" => {
                     "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
@@ -15620,7 +15620,9 @@ fn apply_function_dispatch(
                 "max_allowed_packet" => "16777216",
                 "character_set_client" | "character_set_connection"
                 | "character_set_results" | "character_set_server" => "utf8mb4",
-                "collation_connection" | "collation_server" => "utf8mb4_general_ci",
+                "collation_connection" | "collation_server" => {
+                    crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
+                }
                 "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
                 "lower_case_table_names" => "0",
                 "have_ssl" => "YES",
@@ -18728,7 +18730,14 @@ fn apply_function_dispatch(
         }
         // version() — the PG-compatible banner (canned wire layer was
         // dismantled; the engine is the single source).
-        "version" => Ok(Value::text(crate::PG_VERSION_STRING)),
+        // v7.39 — dialect-aware. A MySQL client asking `version()` used to
+        // be told `PostgreSQL …`, which every driver that branches on it
+        // reads as the wrong product.
+        "version" => Ok(Value::text(if ctx.mysql_dialect {
+            crate::MYSQL_SERVER_VERSION
+        } else {
+            crate::PG_VERSION_STRING
+        })),
         // v7.17.0 Phase 3.P0-30 — session / introspection functions.
         // Engine-level dispatch so these compose inside expressions
         // (`WHERE schemaname = current_schema()`, `SELECT *,

@@ -2533,10 +2533,15 @@ impl<'a> Cursor<'a> {
 // ---- scramble / version helpers -----------------------------
 
 fn server_version_string() -> String {
-    // Advertise an 8.0 lineage so caching_sha2 capable clients
-    // don't downgrade to mysql_native_password preemptively.
-    // The trailing tag identifies us to dump tooling.
-    format!("8.0.0-spg-v{}", env!("CARGO_PKG_VERSION"))
+    // v7.39 — one constant, shared with `@@version`, `SHOW VARIABLES`
+    // and `version()`. This used to advertise `8.0.0-spg-v…` while
+    // `@@version` said `8.0.35-spg` and `version()` said
+    // `PostgreSQL 18.6 (spg)`: three answers on one wire. The 8.0 note
+    // that used to sit here said the lineage was chosen so caching_sha2
+    // clients would not downgrade -- 9.7.2 is a later 8.0+ lineage and
+    // keeps that property while naming the release SPG is actually
+    // measured against.
+    String::from(spg_engine::MYSQL_SERVER_VERSION)
 }
 
 /// Generate a deterministic 20-byte scramble from a seed. xorshift64*

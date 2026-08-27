@@ -76,9 +76,28 @@ fn handshake_v10_greeting_carries_every_required_field() {
         .position(|b| *b == 0)
         .expect("server_version NUL");
     let server_version = std::str::from_utf8(&payload[1..1 + nul]).expect("server_version utf8");
+    // v7.39 — anchored to the constant. This pinned the literal
+    // `8.0.0-spg`, which is exactly where a version that has to move
+    // should NOT live: SPG advertised an 8.0 lineage it does not track,
+    // while `@@version` said 8.0.35 and `version()` said PostgreSQL.
+    // What the handshake actually has to satisfy is below: the same
+    // string every other surface reports, and a leading `X.Y` a client
+    // can negotiate on.
+    assert_eq!(
+        server_version,
+        spg_engine::MYSQL_SERVER_VERSION,
+        "the handshake must advertise the same version every other surface reports"
+    );
+    let (major, rest) = server_version
+        .split_once('.')
+        .expect("server_version is major.minor…");
     assert!(
-        server_version.starts_with("8.0.0-spg"),
-        "expected 8.0-lineage advertisement, got {server_version}"
+        major.parse::<u32>().is_ok_and(|m| m >= 8),
+        "caching_sha2-capable clients need an 8.0+ lineage, got {server_version}"
+    );
+    assert!(
+        rest.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "a minor number must follow the dot: {server_version}"
     );
     let pos = 1 + nul + 1;
     // connection_id u32 LE
