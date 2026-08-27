@@ -21,11 +21,15 @@
 --     utf8mb4_bin                  3                 2
 --     utf8mb4_general_ci           2                 2
 --
--- SPG answers the first row correctly as of v7.38.17 and the other two
--- wrongly (4/1 and 3/1): it reads a collation name for whether to FOLD
--- and never for whether to PAD. That gap is locked in `.spg.out` rather
--- than left out of the corpus, so it is visible every run and deleting
--- the lock is what closing it looks like.
+-- SPG answered the first row correctly as of v7.38.17 and the other two
+-- wrongly (4/1 and 3/1): it read a collation name for whether to FOLD
+-- and never for whether to PAD. That gap was locked in `.spg.out` so it
+-- was visible every run, and deleting the lock is what closing it looks
+-- like — which is what happened. There is no `.spg.out` here now and
+-- this fixture passes on both MySQL-family legs, so the paragraph above
+-- is history rather than a statement about today. (v7.39.2, checked
+-- rather than assumed: the file is absent and `oracle-three` reports
+-- `failed=0`.)
 
 CREATE TABLE pad_0900 (s VARCHAR(32) COLLATE utf8mb4_0900_ai_ci);
 CREATE TABLE pad_bin (s VARCHAR(32) COLLATE utf8mb4_bin);

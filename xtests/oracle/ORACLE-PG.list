@@ -4,3 +4,6 @@
 port.select_implicit.sql
 port.subquery_correlated_agg.sql
 orig.spg_jsonb_at_op.sql
+# orig.mysql_family_literals excluded: `"abc"` is an IDENTIFIER on this
+# leg, which is PostgreSQL's rule and the very difference the fixture
+# measures. Running it here would assert that PG is MySQL.

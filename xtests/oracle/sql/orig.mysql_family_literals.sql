@@ -1,0 +1,60 @@
+-- orig.mysql_family_literals — what a `"` opens, and what an
+-- introducer does, in the MySQL family.
+--
+-- v7.39.2. SPG read `"…"` as an identifier in a MySQL session — which
+-- is PostgreSQL's rule applied to a MySQL client — so `SELECT "abc"`
+-- answered `ERROR 1054 column "abc" does not exist` where both engines
+-- answer `abc`. A great deal of ordinary MySQL SQL quotes strings that
+-- way, and nothing in this corpus could see it: every fixture here was
+-- SQL all three engines share, and `"` is exactly where they part.
+--
+-- Measured on MySQL 9.7.2 and MariaDB 12.3.3, which agree on every row
+-- below:
+--
+--     SELECT "abc"          -> abc          (a string, not a column)
+--     SELECT "a""b"         -> a"b          (the quote doubles)
+--     SELECT "a\"b"         -> a"b          (and it escapes)
+--
+-- The alias on that row is `backslashed` and not `escaped` because
+-- ESCAPED is a MySQL reserved word (`LOAD DATA … FIELDS ESCAPED BY`).
+-- The first draft used it, both oracles answered `ERROR 1064 … near
+-- 'escaped'`, and reading that as "the engines refuse the backslash
+-- form" would have put a false statement in this file — `SELECT "a\"b"`
+-- and `SELECT "a\"b" AS e1` both answer `a"b`, measured.
+--     SELECT "a'b"          -> a'b          (the other quote is data)
+--
+-- Introducers were in the first draft and are NOT here, because SPG
+-- cannot run them at all: `SELECT _utf8mb4'x'`, `SELECT N'y'` and
+-- `SELECT _binary'z'` each answer `ERROR 1064 syntax error at or near
+-- "'x'"`, while both oracles answer `x`, `y`, `z`. That is an execution
+-- ABORT on the SPG leg, and a `.spg.out` lock can hold a wrong ANSWER
+-- but not a statement the parser refuses — the rest of the fixture
+-- never runs. It is recorded as the open gap it is (milestone G3)
+-- rather than as three lines that make this file unrunnable.
+--
+-- ANSI_QUOTES is NOT exercised here: it makes `"` an identifier again,
+-- and an identifier that does not exist is an error whose text the three
+-- engines word differently, which this corpus does not normalise. It is
+-- pinned engine-side instead (e2e_double_quote_dialect_v7392).
+--
+-- ONLY_FULL_GROUP_BY is absent for the same reason and it is worth
+-- recording why, because it looks like it belongs: both oracles refuse
+-- a bare non-aggregated column with the SAME code and SQLSTATE,
+-- `1055 (42000)`, and word it completely differently —
+--
+--   MySQL 9.7.2  Expression #2 of SELECT list is not in GROUP BY clause
+--                and contains nonaggregated column 'db.t.v' which is not
+--                functionally dependent on columns in GROUP BY clause;
+--                this is incompatible with sql_mode=only_full_group_by
+--   MariaDB      'db.t.v' isn't in GROUP BY
+--
+-- so no single expected file can hold all three legs, and a `.spg.out`
+-- lock is for a BUG rather than for a legal wording difference.
+--
+-- Not on the PG leg: `"abc"` is an identifier there, by PostgreSQL's own
+-- rule, which is the whole point of the fixture.
+
+SELECT "abc" AS plain;
+SELECT "a""b" AS doubled;
+SELECT "a\"b" AS backslashed;
+SELECT "a'b" AS other_quote;

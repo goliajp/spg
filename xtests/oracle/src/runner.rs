@@ -281,7 +281,14 @@ fn run_on_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
     //
     // It is the same failure as `corpus/mysql/` running in PostgreSQL
     // dialect, in the tool built to catch what that corpus missed.
-    engine.set_backslash_escapes(matches!(oracle, Oracle::Mysql | Oracle::Mariadb));
+    // v7.39.2 — the MySQL dialect has more than one axis, and this set
+    // ONE of them. `"…"` opens a string in a MySQL session and an
+    // identifier in a PostgreSQL one, and until the fixture that asks
+    // landed, nothing here noticed that the switch was half thrown.
+    let mysql_family = matches!(oracle, Oracle::Mysql | Oracle::Mariadb);
+    if mysql_family {
+        engine.set_mysql_wire_session();
+    }
     // v7.37.16 — two-way `SPG_MVCC_INPLACE` override (default is now
     // ON; `=0` runs the differential on the legacy path).
     match std::env::var("SPG_MVCC_INPLACE").ok().as_deref() {
@@ -297,7 +304,7 @@ fn run_on_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
         let depd_path = corpus_dir.join(format!("{depd}.sql"));
         let depd_body = std::fs::read_to_string(&depd_path)
             .with_context(|| format!("read depd {}", depd_path.display()))?;
-        for stmt in split_sql_statements(&depd_body) {
+        for stmt in split_sql_statements(&depd_body, mysql_family) {
             engine
                 .execute(&stmt)
                 .map_err(|e| anyhow!("depd {depd}: {e:?} (sql: {stmt})"))?;
@@ -308,7 +315,7 @@ fn run_on_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
     // table block; CommandOk results contribute nothing to the diff
     // (they're DDL/DML side-effects with no oracle visible output).
     let mut out_blocks: Vec<String> = Vec::new();
-    for stmt in split_sql_statements(&body) {
+    for stmt in split_sql_statements(&body, mysql_family) {
         let stmt_trim = stmt.trim();
         if stmt_trim.is_empty() {
             continue;
@@ -345,7 +352,7 @@ fn scan_depd_directives(body: &str) -> Vec<String> {
 /// comment state so semicolons inside strings or comments don't break
 /// statements. The split is intentionally simple — the corpus is
 /// hand-authored and avoids dollar-quoted bodies for now.
-fn split_sql_statements(body: &str) -> Vec<String> {
+fn split_sql_statements(body: &str, backslash_escapes: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     let mut chars = body.chars().peekable();
@@ -371,7 +378,14 @@ fn split_sql_statements(body: &str) -> Vec<String> {
         }
         if in_single {
             cur.push(c);
-            if c == '\'' {
+            // Same rule, same reason — a MySQL-family leg escapes with
+            // `\` here too, and `'a\'b'` would have mis-split exactly
+            // as the double-quoted form did.
+            if c == '\\' && backslash_escapes {
+                if let Some(escaped) = chars.next() {
+                    cur.push(escaped);
+                }
+            } else if c == '\'' {
                 if chars.peek() == Some(&'\'') {
                     // '' escape — consume both, stay inside the string
                     cur.push(chars.next().unwrap());
@@ -383,8 +397,27 @@ fn split_sql_statements(body: &str) -> Vec<String> {
         }
         if in_double {
             cur.push(c);
-            if c == '"' {
-                in_double = false;
+            // v7.39.2 — a `"` section ends at a quote that is neither
+            // doubled nor escaped.
+            //
+            // This branch handled neither, while the `'` branch above
+            // handled doubling. `SELECT "a\"b" AS x; SELECT …` therefore
+            // closed at the escaped quote, reopened at `b"`, and ran to
+            // a quote in the NEXT statement — swallowing the `;` and
+            // handing the engine two statements as one. The fixture that
+            // found it reported a parse error naming the following
+            // SELECT, which reads like an engine defect and was the
+            // splitter.
+            if c == '\\' && backslash_escapes {
+                if let Some(escaped) = chars.next() {
+                    cur.push(escaped);
+                }
+            } else if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    cur.push(chars.next().unwrap());
+                } else {
+                    in_double = false;
+                }
             }
             continue;
         }
