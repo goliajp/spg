@@ -41,6 +41,47 @@ the current build; this file is a release-organized view.
   which needed the bend to model `Numeric` at all — it previously did
   not. The PostgreSQL dialect still answers in PostgreSQL's words.
 
+- **`SET LOCAL` belonged to the Engine, not to the connection.** The
+  server runs one shared Engine: each connection has its own
+  `SessionBag` and its own `tx_id`. The `SET LOCAL` undo log was
+  neither — one `Vec` for the whole Engine, guarded by a witness that is
+  true when ANY connection has a transaction open. Two leaks followed,
+  both measured with two live sessions and a parameter only connection B
+  ever wrote:
+
+      A start                  <unset>
+      A after its own COMMIT   Bvalue    <- a value only B had written
+      B after                  Blocal    <- B is autocommit; its LOCAL stayed
+
+  Applications write this as `set_config('app.tenant_id', …, true)` once
+  per request and read it back with `current_setting` — the RLS and
+  multi-tenant pattern. So the first leak is one request's tenant id
+  surviving into the next, and the second is one connection reading a
+  tenant id set by another. Neither is visible without concurrency,
+  which production has and a bench does not.
+
+  The undo log and the savepoint depth marks are keyed by transaction
+  now, and the three writers that each asked the witness separately go
+  through one place.
+
+- **Four surfaces, four answers, one question.** Asked whether
+  `nosuch_guc` is a parameter, PostgreSQL 18.6 gives one answer four
+  times. SPG gave: PG's error from `SET`, its own sentence from `SHOW`,
+  an empty string from `current_setting` and the value itself back from
+  `set_config`. The last two report a parameter as read or applied when
+  neither happened, which is how a mistyped name goes unnoticed.
+
+  The inventory to answer correctly was already there — `pg_settings`
+  carries the same 399 names PG 18.6 does — and exactly one of the four
+  consulted it. All four now do.
+
+  Along the same edge: a custom parameter this session has set once
+  stays defined and reads back an empty string after `RESET` or after
+  the transaction of a `SET LOCAL` ends, which is PG's behaviour. SPG
+  removed the name, so those read NULL and `SHOW` refused it —
+  an application branching on `IS NULL` versus `= ''` branched the other
+  way. A name never set still reads NULL, which PG agrees with.
+
 ### Instruments
 
 - **`pins-current` saw one of seven e2e harnesses.** The step exists to

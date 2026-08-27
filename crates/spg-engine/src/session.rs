@@ -50,6 +50,66 @@ pub(crate) const LOGIN_ROLE: &str = "admin";
 /// superuser, like the login role.
 pub(crate) const BOOTSTRAP_ROLE: &str = "postgres";
 
+/// The parameter names a session may name at all, beyond PG18's own
+/// inventory.
+///
+/// v7.39 — one list, asked by every surface. They used to decide
+/// separately and gave FOUR answers to one question: measured on the
+/// same name, `SET nosuch_guc` refused it in PG's words,
+/// `SHOW nosuch_guc` refused it in SPG's own words,
+/// `current_setting('nosuch_guc')` returned an empty string and
+/// `set_config('nosuch_guc', 'x', false)` returned `x`. Only the first
+/// was PG's answer.
+///
+/// Three families are accepted past PG's list because refusing them
+/// would break callers that are not wrong:
+///
+/// * anything containing a dot — PG treats `myapp.thing` as a
+///   customised option and accepts it, and extensions rely on that;
+/// * the MySQL-dialect names SPG honours (`sql_mode`,
+///   `foreign_key_checks`, …), which PG has no concept of and which
+///   `mysqldump` preambles emit;
+/// * SPG's own internal keys.
+pub(crate) fn guc_name_accepted_beyond_pg(key: &str) -> bool {
+    key.contains('.')
+        || key.starts_with("__spg")
+        || matches!(
+            key,
+            "sql_mode"
+                | "foreign_key_checks"
+                | "unique_checks"
+                | "autocommit"
+                | "names"
+                | "character_set_client"
+                | "character_set_connection"
+                | "character_set_results"
+                | "collation_connection"
+                | "sql_quote_show_create"
+                | "sql_notes"
+                | "time_zone"
+                | "sql_safe_updates"
+                | "innodb_strict_mode"
+                | "net_write_timeout"
+                | "net_read_timeout"
+                | "wait_timeout"
+                | "interactive_timeout"
+                | "max_allowed_packet"
+                | "group_concat_max_len"
+                | "old_alter_table"
+                | "sql_log_bin"
+                | "session_replication_role"
+        )
+}
+
+/// Is this a name PG18 knows, or one of the three families above?
+///
+/// The read path (`current_setting`, `SHOW`) asks this; the write path
+/// asks [`Engine::reject_unsettable_guc`], which adds PG's per-context
+/// refusals on top of the same list.
+pub(crate) fn guc_name_known(key: &str) -> bool {
+    guc_name_accepted_beyond_pg(key) || crate::guc_catalog::guc_context(key).is_some()
+}
+
 impl Engine {
     /// v7.39 (read01 round 51) — the login identity: the startup packet's
     /// `user`, else the Admin default. Drives `session_user`.
@@ -170,36 +230,7 @@ impl Engine {
     /// Returns the PG error text, or `None` when the SET may proceed.
     pub(crate) fn reject_unsettable_guc(&self, name: &str) -> Option<alloc::string::String> {
         let key = name.to_ascii_lowercase();
-        if key.contains('.')
-            || key.starts_with("__spg")
-            || matches!(
-                key.as_str(),
-                // MySQL dialect — `mysqldump` preambles and MySQL clients.
-                "sql_mode"
-                    | "foreign_key_checks"
-                    | "unique_checks"
-                    | "autocommit"
-                    | "names"
-                    | "character_set_client"
-                    | "character_set_connection"
-                    | "character_set_results"
-                    | "collation_connection"
-                    | "sql_quote_show_create"
-                    | "sql_notes"
-                    | "time_zone"
-                    | "sql_safe_updates"
-                    | "innodb_strict_mode"
-                    | "net_write_timeout"
-                    | "net_read_timeout"
-                    | "wait_timeout"
-                    | "interactive_timeout"
-                    | "max_allowed_packet"
-                    | "group_concat_max_len"
-                    | "old_alter_table"
-                    | "sql_log_bin"
-                    | "session_replication_role"
-            )
-        {
+        if guc_name_accepted_beyond_pg(&key) {
             return None;
         }
         match crate::guc_catalog::guc_context(&key) {
@@ -217,6 +248,28 @@ impl Engine {
         }
     }
 
+    /// Clear a session parameter, PG's way.
+    ///
+    /// v7.39 — a CUSTOM (dotted) parameter that this session has set
+    /// once stays defined for the rest of the session and reads back an
+    /// EMPTY STRING, not nothing: measured on PG 18.6, `SET app.z='1';
+    /// RESET app.z; current_setting('app.z', true)` answers `''`, and so
+    /// does the same read after a `SET LOCAL app.y` transaction commits.
+    /// SPG removed the key, so both answered NULL and `SHOW app.z`
+    /// errored — an application that branches on `IS NULL` versus `= ''`
+    /// branches the other way. A name this session never set still
+    /// answers NULL, which PG agrees with.
+    pub(crate) fn clear_session_param(&mut self, name: &str) {
+        let key = name.to_ascii_lowercase();
+        if key.contains('.') {
+            self.session_params
+                .insert(key, alloc::string::String::new());
+        } else {
+            self.session_params.remove(&key);
+        }
+        self.refresh_render_style();
+    }
+
     pub(crate) fn set_session_param(&mut self, name: String, value: spg_sql::ast::SetValue) {
         let normalised = match value {
             spg_sql::ast::SetValue::String(s) => s,
@@ -227,8 +280,7 @@ impl Engine {
             // override (storing "" would make SHOW render an empty
             // string instead of the default).
             spg_sql::ast::SetValue::Default => {
-                self.session_params.remove(&name.to_ascii_lowercase());
-                self.refresh_render_style();
+                self.clear_session_param(&name);
                 return;
             }
         };
