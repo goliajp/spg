@@ -4373,7 +4373,14 @@ fn eval_in_list_arm(
         && !list.iter().any(|i| resolve::is_binary_coerced(i));
     // v7.38.18 — the membership test has ONE collation, the needle's,
     // and its NAME decides whether trailing spaces count.
-    let in_pads = crate::collate::pads_space(resolve::column_collation_name(expr, ctx).as_deref());
+    // v7.39 — same as `text_compare`: a literal needle has no column, so
+    // this used to fall to `None` = NO PAD. `'a ' IN ('a')` answered 1 on
+    // MySQL 9.7.2 and 0 here under a matched `utf8mb4_general_ci`.
+    let in_pads = crate::collate::pads_space(
+        resolve::column_collation_name(expr, ctx)
+            .or_else(|| resolve::session_collation_name(ctx))
+            .as_deref(),
+    );
     let needle = mysql_collation_key(eval_expr(expr, row, ctx)?, in_fold, in_pads);
     let needle_null = matches!(needle, Value::Null);
     let mut saw_null = needle_null && !list.is_empty();

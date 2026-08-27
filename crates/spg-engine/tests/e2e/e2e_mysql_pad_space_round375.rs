@@ -123,3 +123,86 @@ fn postgres_session_keeps_trailing_spaces() {
     let mut p = Engine::new();
     assert_eq!(scalar(&mut p, "SELECT 'a' = 'a '"), Value::Bool(false));
 }
+
+/// v7.39 — the session's collation decides, and it reaches a bare
+/// literal.
+///
+/// The tests above pin the DEFAULT (`utf8mb4_0900_ai_ci`, NO PAD), and
+/// they passed both before and after the fix this pins, because the
+/// default is NO PAD either way: `pads_space(None)` and
+/// `pads_space("utf8mb4_0900_ai_ci")` both answer false. A suite that
+/// cannot go red for the change it is meant to cover is not covering it.
+///
+/// What was wrong: every `pads_space` call site took its collation from
+/// a COLUMN, so `'a' = 'a '` — two literals, no column — asked nothing
+/// and fell to `None`. Measured against MySQL 9.7.2 with both ends on
+/// `utf8mb4_general_ci` (PAD SPACE, and SPG's own rule agrees): MySQL
+/// answered 1, SPG answered 0, while the same comparison against a
+/// column of that collation answered 1 on both.
+#[test]
+fn a_pad_space_session_collation_reaches_bare_literals() {
+    let mut e = mysql();
+
+    // Default: NO PAD, matching a bare `SET NAMES utf8mb4` on MySQL 9.7.2.
+    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a '"), Value::Bool(false));
+    assert_eq!(scalar(&mut e, "SELECT 'a ' IN ('a')"), Value::Bool(false));
+
+    // Ask for a PAD SPACE collation and both must flip.
+    e.execute("SET collation_connection = 'utf8mb4_general_ci'")
+        .unwrap();
+    assert_eq!(
+        scalar(&mut e, "SELECT 'a' = 'a '"),
+        Value::Bool(true),
+        "a PAD SPACE session collation must reach a bare literal"
+    );
+    assert_eq!(
+        scalar(&mut e, "SELECT 'a ' IN ('a')"),
+        Value::Bool(true),
+        "…and the membership test too"
+    );
+
+    // And back: an explicitly NO PAD name flips them again, which is what
+    // says the session value is being READ rather than a constant.
+    e.execute("SET collation_connection = 'utf8mb4_0900_ai_ci'")
+        .unwrap();
+    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a '"), Value::Bool(false));
+}
+
+/// The PostgreSQL dialect must not pad, whatever the MySQL session says.
+///
+/// `pads_space` reads a MySQL collation NAME, and a PostgreSQL database
+/// collating as `en_US.utf8` does not pad — feeding an inherited name to
+/// it there would make `'a' = 'a  '` true for every text column in such
+/// a database. That sentence is from v7.38.18 and it names the input
+/// this test needs: a **column**, not a literal.
+///
+/// Two earlier versions of this test used literals and could not fail.
+/// Ablated three ways — gate removed, and then
+/// `session_collation_name` rewritten to return a PAD SPACE name
+/// unconditionally — a literal comparison on the PG dialect never
+/// changed its answer, because it does not reach `text_compare`'s
+/// `pads` at all. `text_compare` is where a COLUMN comparison lands,
+/// and a PG column with no collation of its own is exactly what would
+/// inherit the session name if the gate were gone.
+#[test]
+fn a_pad_space_the_pg_dialect_never_pads() {
+    let mut e = Engine::new(); // no MySQL sql_mode: PG dialect
+    assert_eq!(scalar(&mut e, "SELECT 'a' = 'a  '"), Value::Bool(false));
+
+    // The discriminating input: a plain PG text column, compared against
+    // a padded literal, with a PAD SPACE collation named on the session.
+    e.execute("CREATE TABLE pg_pad (s TEXT)").unwrap();
+    e.execute("INSERT INTO pg_pad VALUES ('a')").unwrap();
+    e.execute("SET collation_connection = 'utf8mb4_general_ci'")
+        .unwrap();
+    assert_eq!(
+        count(&mut e, "SELECT count(*) FROM pg_pad WHERE s = 'a  '"),
+        0,
+        "a MySQL collation name must not reach a PostgreSQL column comparison"
+    );
+    assert_eq!(
+        count(&mut e, "SELECT count(*) FROM pg_pad WHERE s IN ('a  ')"),
+        0,
+        "…nor its membership test"
+    );
+}

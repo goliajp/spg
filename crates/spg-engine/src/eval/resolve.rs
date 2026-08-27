@@ -139,7 +139,23 @@ pub(crate) fn text_compare_of(
         column_collation(rhs, ctx),
         Some(spg_storage::Collation::CaseInsensitive)
     );
-    let name = column_collation_name(lhs, ctx).or_else(|| column_collation_name(rhs, ctx));
+    // v7.39 — a bare string literal has no column to inherit from, and
+    // until now that meant `None`, which `pads_space` reads as NO PAD.
+    // Measured against MySQL 9.7.2 with both ends on the same
+    // `utf8mb4_general_ci` (a PAD SPACE collation, and SPG's own rule
+    // agrees it is): `'a' = 'a '` answered 1 there and 0 here, while the
+    // same comparison against a COLUMN of that collation answered 1 on
+    // both. The rule was right and the session value was right; the
+    // literal path asked neither.
+    //
+    // MySQL hands a bare literal `collation_connection`. This falls back
+    // to it, and ONLY on the MySQL dialect -- the note below is why: a
+    // PostgreSQL database collating as `en_US.utf8` does not pad, and
+    // feeding an inherited name to `pads_space` there would make
+    // `'a' = 'a  '` true for every text column in it.
+    let name = column_collation_name(lhs, ctx)
+        .or_else(|| column_collation_name(rhs, ctx))
+        .or_else(|| session_collation_name(ctx));
     // v7.38.18 (S2) — the ordering collation is asked SEPARATELY, and
     // the separation is the point: `pads` is a MySQL property of a MySQL
     // collation NAME, and a PostgreSQL database collating as
@@ -801,4 +817,21 @@ fn json_cell_to_value(jv: &crate::json::JsonValue, ty: spg_storage::DataType) ->
         other => Value::Json(alloc::borrow::Cow::Owned(other.to_json_text())),
     };
     crate::conversions::coerce_value(raw.clone(), ty, "", 0).unwrap_or(raw)
+}
+
+/// v7.39 — the collation a bare string literal carries on a MySQL
+/// session, or `None` off that dialect.
+///
+/// Read from the live session so `SET collation_connection = …` reaches
+/// the comparison, and defaulted to the same constant
+/// `@@collation_connection` reports.
+pub(crate) fn session_collation_name(ctx: &EvalContext<'_>) -> Option<alloc::string::String> {
+    if !ctx.mysql_dialect {
+        return None;
+    }
+    Some(alloc::string::String::from(
+        ctx.engine
+            .and_then(|e| e.session_param("collation_connection"))
+            .unwrap_or(crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION),
+    ))
 }

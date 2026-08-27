@@ -251,6 +251,32 @@ impl Engine {
             normalised.to_ascii_lowercase().as_str(),
             "1" | "on" | "true"
         );
+        // v7.39 — `SET NAMES <charset>` sets the three character_set_*
+        // session variables and, unless a `COLLATE` clause follows,
+        // the charset's DEFAULT collation. The parser emits the charset
+        // under `names` and the expansion lives here, beside the rest of
+        // the MySQL session semantics.
+        //
+        // An unknown charset sets the character_set_* trio and leaves
+        // `collation_connection` alone rather than guessing: a session
+        // that pads differently from what it was told is worse than one
+        // that did not change.
+        if key == "names" {
+            for k in [
+                "character_set_client",
+                "character_set_connection",
+                "character_set_results",
+            ] {
+                self.session_params
+                    .insert(String::from(k), normalised.clone());
+            }
+            if let Some(coll) = crate::collate::charset_default_collation(&normalised) {
+                self.session_params
+                    .insert(String::from("collation_connection"), String::from(coll));
+            }
+            self.refresh_render_style();
+            return;
+        }
         if key == "foreign_key_checks"
             || key == "session_replication_role" && normalised.eq_ignore_ascii_case("replica")
         {

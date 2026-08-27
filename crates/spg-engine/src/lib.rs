@@ -149,6 +149,23 @@ pub const PG_SERVER_VERSION_NUM: &str = "180006";
 /// willing to claim it is, so it stops after the version.
 pub const PG_VERSION_STRING: &str = "PostgreSQL 18.6 (spg)";
 
+/// The MySQL version SPG reports, in one place.
+///
+/// v7.39 — SPG used to advertise an 8.0 lineage, and the reason given
+/// was capability negotiation: "so caching_sha2 capable clients don't
+/// downgrade preemptively". That fixed SPG to a release line it does not
+/// track, and it showed: the handshake said `8.0.0-spg-v…`, `@@version`
+/// said `8.0.35-spg`, and `version()` answered `PostgreSQL 18.6 (spg)`
+/// -- three answers to one question on one wire, one of them naming the
+/// wrong product entirely.
+///
+/// The rule now is the same one the PG side follows: track the current
+/// stable release of the engine SPG claims to be, and keep the
+/// differential oracle pinned to the same one
+/// (`xtests/oracle/mysql/Dockerfile`, `mysql:9.7.2`). A client that
+/// splits on `-` reads `9.7.2`; the suffix says which server answered.
+pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
+
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
 pub use execute::{RowCells, StreamItem};

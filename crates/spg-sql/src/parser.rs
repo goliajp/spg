@@ -3994,14 +3994,34 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("names"))
                 {
                     self.advance();
-                    // Charset ident-or-string.
+                    // v7.39 — this used to parse the clause and throw it
+                    // away ("SPG stores UTF-8 always and orders
+                    // bytewise; accept as a no-op"). That sentence
+                    // stopped being true when collations arrived, and
+                    // once `collation_connection` began driving literal
+                    // comparison, dropping the COLLATE clause became a
+                    // silently wrong answer: `SET NAMES utf8mb4 COLLATE
+                    // utf8mb4_general_ci` reported back
+                    // `utf8mb4_0900_ai_ci` and compared as NO PAD.
+                    //
+                    // The charset name is emitted as `names` and the
+                    // ENGINE expands it, because which collation a
+                    // charset defaults to is MySQL semantics and belongs
+                    // beside the rest of them, not in the parser.
+                    let mut pairs = alloc::vec::Vec::new();
                     if matches!(
                         self.peek(),
                         Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
                     ) {
-                        self.advance();
+                        let charset = match self.advance() {
+                            Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
+                            _ => unreachable!("peeked an ident-or-string"),
+                        };
+                        pairs.push((String::from("names"), crate::ast::SetValue::Ident(charset)));
                     }
-                    // Optional `COLLATE <name>`.
+                    // Optional `COLLATE <name>` — emitted AFTER `names`
+                    // so it overrides the charset's default, which is
+                    // what MySQL does.
                     if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("collate"))
                     {
                         self.advance();
@@ -4009,10 +4029,20 @@ impl Parser {
                             self.peek(),
                             Token::Ident(_) | Token::QuotedIdent(_) | Token::String(_)
                         ) {
-                            self.advance();
+                            let coll = match self.advance() {
+                                Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
+                                _ => unreachable!("peeked an ident-or-string"),
+                            };
+                            pairs.push((
+                                String::from("collation_connection"),
+                                crate::ast::SetValue::Ident(coll),
+                            ));
                         }
                     }
-                    return Ok(Statement::Empty);
+                    if pairs.is_empty() {
+                        return Ok(Statement::Empty);
+                    }
+                    return Ok(Statement::SetParameterList(pairs));
                 }
                 // v7.37.17 (17.6 sibling) — PG `SET ROLE
                 // { NONE | DEFAULT | <role_name> }`. pg_dump preamble
