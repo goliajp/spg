@@ -15603,6 +15603,25 @@ fn apply_function_dispatch(
             // MySQL clears the diagnostics area at the start of the next
             // warning-generating statement; reading it here does not, so
             // a client may ask twice.
+            // v7.39 — LIVE, and it returns before the constant table for the
+            // same reason `warning_count` does. Three surfaces answered this
+            // one question with three separate literals and two of them
+            // disagreed with the engine: this said `READ-COMMITTED` while
+            // `SHOW VARIABLES` said `REPEATABLE-READ` and the engine ran
+            // read committed. A client that trusts the wrong one assumes a
+            // snapshot it does not have. All three now ask `IsolationLevel`.
+            //
+            // `tx_isolation` is gone from the table on purpose: MySQL 8.0.3
+            // REMOVED that spelling, and 9.7.2 answers `Unknown system
+            // variable 'tx_isolation'` on `@@` and zero rows on SHOW
+            // (measured) — the same defect class as `have_ssl`.
+            if lname == "transaction_isolation"
+                && let Some(e) = ctx.engine
+            {
+                return Ok(Value::text(alloc::string::String::from(
+                    e.current_isolation_level().as_mysql_str(),
+                )));
+            }
             if lname == "warning_count" {
                 let n = ctx.engine.map_or(0, crate::Engine::mysql_warning_count);
                 return Ok(Value::BigInt(n as i64));
@@ -15613,19 +15632,27 @@ fn apply_function_dispatch(
                 // the same answer in its status flags.
                 "autocommit" => "1",
                 "version" => crate::MYSQL_SERVER_VERSION,
-                "version_comment" => "SPG (MySQL-compatible)",
+                "version_comment" => crate::MYSQL_VERSION_COMMENT,
                 "sql_mode" => {
                     "STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION"
                 }
-                "max_allowed_packet" => "16777216",
+                // Measured on MySQL 9.7.2: 67108864 on both surfaces.
+                // `show.rs` already said so; this said 16777216.
+                "max_allowed_packet" => "67108864",
                 "character_set_client" | "character_set_connection"
                 | "character_set_results" | "character_set_server" => "utf8mb4",
                 "collation_connection" | "collation_server" => {
                     crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
                 }
-                "transaction_isolation" | "tx_isolation" => "READ-COMMITTED",
                 "lower_case_table_names" => "0",
-                "have_ssl" => "YES",
+                // v7.39 — `have_ssl` was REMOVED in MySQL 8.0.26 and
+                // MySQL 9.7.2 answers nothing for it on either surface
+                // (measured). SPG answered `YES` for a variable the
+                // engine it claims to be does not have; a client that
+                // asks now gets the same "unknown system variable" it
+                // would get from MySQL. `performance_schema` and
+                // `SHOW STATUS` are where TLS state lives in 8.0+.
+                "version_compile_os" => crate::MYSQL_COMPILE_OS,
                 // v7.39 (round 554) — the rest of what a mysqldump
                 // preamble reads back before it changes anything.
                 //
@@ -15721,6 +15748,22 @@ fn apply_function_dispatch(
                 let n = ctx.engine.map_or(0, crate::Engine::mysql_warning_count);
                 return Ok(Value::BigInt(n as i64));
             }
+            // v7.39 — PG guarantees `current_setting('x')` and `SHOW x`
+            // give the same answer, and for this name the answer is the
+            // LIVE level. Measured on PG 18.6: inside
+            // `BEGIN ISOLATION LEVEL SERIALIZABLE` both report
+            // `serializable`. SPG's `SHOW` handler already read the live
+            // level; this one returned the literal `read committed`, so
+            // the two disagreed the moment a transaction asked for
+            // anything else — a silent wrong answer to a question about
+            // what guarantees the client is running under.
+            if lname == "transaction_isolation"
+                && let Some(e) = ctx.engine
+            {
+                return Ok(Value::text(alloc::string::String::from(
+                    e.current_isolation_level().as_pg_str(),
+                )));
+            }
             let val = match lname.as_str() {
                 "server_version" => crate::PG_SERVER_VERSION,
                 "server_version_num" => crate::PG_SERVER_VERSION_NUM,
@@ -15737,7 +15780,6 @@ fn apply_function_dispatch(
                 "intervalstyle" | "interval_style" => "postgres",
                 "search_path" => "\"$user\", public",
                 "default_transaction_isolation" => "read committed",
-                "transaction_isolation" => "read committed",
                 "standard_conforming_strings" => "on",
                 "check_function_bodies" => "on",
                 "row_security" => "on",

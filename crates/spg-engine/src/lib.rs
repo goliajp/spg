@@ -166,6 +166,41 @@ pub const PG_VERSION_STRING: &str = "PostgreSQL 18.6 (spg)";
 /// splits on `-` reads `9.7.2`; the suffix says which server answered.
 pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 
+/// What `@@version_comment` / `SHOW VARIABLES LIKE 'version_comment'`
+/// answer. MySQL puts its edition here ("MySQL Community Server - GPL");
+/// SPG says what it is, which is the one place on this surface where
+/// differing from MySQL is the point rather than a defect.
+///
+/// v7.39 — one constant. `show.rs` said "SPG dual-stack engine" and
+/// `eval/functions.rs` said "SPG (MySQL-compatible)": the same question,
+/// two answers, in the same pair of files that disagreed about
+/// `collation_server` and `version`.
+pub const MYSQL_VERSION_COMMENT: &str = "SPG dual-stack engine (MySQL-compatible)";
+
+/// What `@@version_compile_os` answers.
+///
+/// v7.39 — SPG did not have this variable at all, and answered `YES` to
+/// `have_ssl`, which MySQL REMOVED in 8.0.26 and 9.7.2 does not answer
+/// on either surface (measured). The two go together: one invented a
+/// variable the engine does not have, the other was missing one it does.
+///
+/// The value is derived from the build target rather than hard-coded,
+/// because a constant `"Linux"` would be a lie on the macOS testbed this
+/// is developed on — and a variable whose whole purpose is to say where
+/// the server was built is a poor place to start lying. `no_std` here,
+/// so this is `cfg!` rather than `std::env::consts::OS`.
+pub const MYSQL_COMPILE_OS: &str = if cfg!(target_os = "linux") {
+    "Linux"
+} else if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(target_os = "windows") {
+    "Win64"
+} else if cfg!(target_os = "freebsd") {
+    "FreeBSD"
+} else {
+    "unknown"
+};
+
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
 pub use execute::{RowCells, StreamItem};
