@@ -15653,6 +15653,27 @@ fn apply_function_dispatch(
                 "character_set_client" | "character_set_connection"
                 | "character_set_results" | "character_set_server"
                 | "character_set_database" => "utf8mb4",
+                // v7.39.2 — the two of MySQL's remaining three that SPG
+                // can answer truthfully.
+                //
+                // `character_set_system` is what the server stores
+                // IDENTIFIERS in, and MySQL 9.7.2 says `utf8mb3` because
+                // it cannot hold a four-byte one: measured, it stores
+                // `` `z4b😀` `` as `z4b?`. SPG keeps `z4b😀`. So the true
+                // answer here is `utf8mb4` and it differs from MySQL's —
+                // reporting `utf8mb3` to match would be a claim about
+                // SPG that its own catalog contradicts.
+                //
+                // `character_set_filesystem` is `binary` on MySQL, which
+                // means names are used as bytes rather than transcoded.
+                // That is true here too.
+                //
+                // `character_sets_dir` is NOT answered: it names a
+                // directory of charset definitions that SPG does not
+                // have, and a path invented to fill the row would be a
+                // fabricated fact rather than a compatibility gain.
+                "character_set_system" => "utf8mb4",
+                "character_set_filesystem" => "binary",
                 "collation_connection" | "collation_server" | "collation_database" => {
                     crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
                 }
