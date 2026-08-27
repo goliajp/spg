@@ -251,12 +251,19 @@ impl Engine {
         let pval = match value_v {
             Value::Text(s) => s.into_owned(),
             Value::Null => {
-                self.session_params.remove(&pname.to_ascii_lowercase());
-                self.refresh_render_style();
+                self.clear_session_param(&pname);
                 return Ok(Some(single(Value::Null)));
             }
             _ => return Ok(None),
         };
+        // v7.39 — `set_config` IS `SET` in function form, so it refuses
+        // what `SET` refuses. It used to hand back the value it was
+        // given for any name at all, so `set_config('nosuch_guc', 'x',
+        // false)` answered `x` where PG errors — a typo'd parameter
+        // reported as applied.
+        if let Some(msg) = self.reject_unsettable_guc(&pname) {
+            return Err(EngineError::Unsupported(msg));
+        }
         validate_known_guc(&pname, &pval)?;
         if is_local {
             self.set_local_param(pname, spg_sql::ast::SetValue::String(pval.clone()));
@@ -885,10 +892,14 @@ impl Engine {
                     // it.
                     alloc::string::String::from(boot)
                 } else {
+                    // v7.39 — PG's wording. SPG's own sentence was more
+                    // helpful and matched nothing: a client that
+                    // recognises `unrecognized configuration parameter`
+                    // saw a stranger, and SHOW disagreed with SET about
+                    // the same name.
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "SHOW {name:?}: parameter not recognised; \
-                             see `SELECT name, setting FROM pg_settings` for \
-                             the full inventory"
+                        "unrecognized configuration parameter \"{}\"",
+                        name.to_ascii_lowercase()
                     )));
                 }
             }
@@ -2930,7 +2941,7 @@ impl Engine {
                     // the admin default mid-session.
                     None => self.reset_all_gucs(),
                     Some(name) => {
-                        self.session_params.remove(&name.to_ascii_lowercase());
+                        self.clear_session_param(&name);
                     }
                 }
                 self.refresh_render_style();

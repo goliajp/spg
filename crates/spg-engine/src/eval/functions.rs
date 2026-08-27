@@ -15819,16 +15819,20 @@ fn apply_function_dispatch(
                     }
                     // v7.38 (read01, T26) — a namespaced custom GUC (`myapp.x`)
                     // that was never SET does not exist; PG errors rather than
-                    // returning empty. (A non-dotted name we don't model falls
-                    // back to empty so unlisted built-in GUCs don't hard-fail.)
-                    if name.contains('.') {
-                        return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "unrecognized configuration parameter \"{name}\""
-                            ),
-                        });
-                    }
-                    ""
+                    // returning empty.
+                    //
+                    // v7.39 — and so does a non-dotted name PG has never
+                    // heard of. The empty string here was the safe answer
+                    // while SPG's inventory was partial; it no longer is
+                    // (`pg_settings` carries the same 399 names PG 18.6
+                    // does), and it meant a mistyped parameter read back
+                    // as "set to nothing" instead of erroring. Same list
+                    // `SET` consults, so the two cannot disagree.
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "unrecognized configuration parameter \"{name}\""
+                        ),
+                    });
                 }
             };
             Ok(Value::text::<String>(val.into()))

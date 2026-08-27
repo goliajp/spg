@@ -342,6 +342,7 @@ mod e2e_grouping_elements_round242;
 mod e2e_grouping_in_order_by_round135;
 mod e2e_grouping_sets_round124;
 mod e2e_guc_canonicalize_round204;
+mod e2e_guc_name_one_answer_v739;
 mod e2e_guc_read_path_round534;
 mod e2e_hash_funcs;
 mod e2e_hstore_wire_round780;
