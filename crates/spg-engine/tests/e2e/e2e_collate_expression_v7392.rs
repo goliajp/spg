@@ -149,3 +149,37 @@ fn the_index_key_still_refuses_what_it_cannot_carry() {
     e.execute(r#"CREATE INDEX ok ON ix (name COLLATE "C")"#)
         .expect("the byte-order spelling is what the key can carry");
 }
+
+#[test]
+fn the_order_by_inside_an_aggregate_honours_the_clause_too() {
+    // The same defect one position over, and the field was already
+    // there: the parser has been putting the key's own `COLLATE` on
+    // `OrderBy::collation`, and the aggregate's sort resolved a
+    // collation from the COLUMN and never read it.
+    //
+    // Measured against PostgreSQL 18.6 over
+    // ('apple'),('Banana'),('cherry'),('Zebra'): both engines answer
+    // `apple,Banana,cherry,Zebra` under the locale and
+    // `Banana,Zebra,apple,cherry` under byte order. SPG answered the
+    // locale's order for both.
+    let mut e = locale_db();
+    e.execute("CREATE TABLE ag (x text)").unwrap();
+    e.execute("INSERT INTO ag VALUES ('apple'), ('Banana'), ('cherry'), ('Zebra')")
+        .unwrap();
+    assert_eq!(
+        one(
+            &mut e,
+            r#"SELECT string_agg(x, ',' ORDER BY x COLLATE "en_US.utf8") FROM ag"#
+        ),
+        "apple,Banana,cherry,Zebra"
+    );
+    assert_eq!(
+        one(
+            &mut e,
+            r#"SELECT string_agg(x, ',' ORDER BY x COLLATE "C") FROM ag"#
+        ),
+        "Banana,Zebra,apple,cherry",
+        "byte order puts the capitals first, which the database's own \
+         collation does not"
+    );
+}
