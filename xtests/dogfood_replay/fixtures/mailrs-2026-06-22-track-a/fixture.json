@@ -20,7 +20,7 @@
       }
     ],
     "expected": {
-      "_comment": "v7.37.5 shipped baseline (compile WHERE + compile Expr::Case attacks reduced 171ms→79ms warm = real win; was prod 2500ms = 30x improvement). v7.37.6 target: warm < 10ms after AggState borrow refactor.",
+      "_comment": "v7.37.5 shipped baseline (compile WHERE + compile Expr::Case attacks reduced 171ms\u219279ms warm = real win; was prod 2500ms = 30x improvement). v7.37.6 target: warm < 10ms after AggState borrow refactor. v7.38.25 -- two things this line no longer says correctly. The 'warm < 10ms' target was never reached and is not reachable for this shape: the v7.37.21 attack summary measures the real /api/conversations SQL at 55.9 ms against PG18's 66.7 at one scale and 184.5 against 180 at another, i.e. at parity, and the <10 ms figure belongs to a reduced 'minimal' shape, not this query. Measured today on an idle testbed: p50 72-77 ms, p95 73-78. And the cold budget of 100 was locked when opening this snapshot took 219.5 s -- 99% of it replaying 1040 SQL records -- so the first query then ran against a fully exercised engine. The open is 3.2 s now and cold measures the genuine first execution: 90.4-96.1 ms over nine idle-machine observations against 88.0 ms measured at 13135db9, some 7% higher and inside budget. Do not compute a regression by subtracting the two: they are not the same quantity.",
       "cold_ms_max": 100,
       "warm_ms_max": 85,
       "p95_ms_max": 90
