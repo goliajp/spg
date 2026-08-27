@@ -180,11 +180,10 @@ pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 ///
 /// Two surfaces had two different hard-coded lists (`SHOW VARIABLES`
 /// named two flags, `@@sql_mode` three), and both named
-/// `NO_ENGINE_SUBSTITUTION`, which SPG does not honour: `ENGINE=NONSUCH`
-/// was accepted silently where MySQL 9.7.2 answers
-/// `ERROR 1286 Unknown storage engine`. It is left off until the engine
-/// name is actually validated — claiming it is the defect this version
-/// is about.
+/// `NO_ENGINE_SUBSTITUTION` while `ENGINE=NONSUCH` was accepted silently,
+/// where MySQL 9.7.2 answers `ERROR 1286 Unknown storage engine`. It was
+/// removed from this list, and is back now that the name is checked —
+/// see `MYSQL_KNOWN_ENGINES` for what SPG can and cannot honour there.
 ///
 /// Each flag below was verified by running the statement only that flag
 /// refuses, against MySQL 9.7.2 and against SPG on the MySQL wire:
@@ -200,8 +199,34 @@ pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 ///
 /// This is the DEFAULT only. `SET sql_mode = …` is honoured and read
 /// back faithfully, measured on both engines.
-pub const MYSQL_DEFAULT_SQL_MODE: &str =
-    "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO";
+/// v7.39 — the engine names a MySQL client may name, read out of
+/// MySQL 9.7.2's own `information_schema.ENGINES`:
+///
+///   ARCHIVE BLACKHOLE CSV FEDERATED InnoDB MEMORY MRG_MYISAM MyISAM
+///   ndbcluster ndbinfo PERFORMANCE_SCHEMA
+///
+/// Only the ones whose `support` is not `NO` are accepted — measured,
+/// `ENGINE=FEDERATED` is `ERROR 1286 Unknown storage engine 'FEDERATED'`
+/// on 9.7.2 even though the row exists, because that build cannot
+/// provide it. Matching is case-insensitive there (`ENGINE=innodb`
+/// works) and here.
+///
+/// SPG has ONE storage engine and stores every table its own way, so it
+/// substitutes for all of these. What it can honour is the half that
+/// matters to a client: a name MySQL would reject is rejected here too,
+/// rather than a typo in a dump silently becoming SPG's storage.
+pub const MYSQL_KNOWN_ENGINES: &[&str] = &[
+    "ARCHIVE",
+    "BLACKHOLE",
+    "CSV",
+    "InnoDB",
+    "MEMORY",
+    "MRG_MYISAM",
+    "MyISAM",
+    "PERFORMANCE_SCHEMA",
+];
+
+pub const MYSQL_DEFAULT_SQL_MODE: &str = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 
 pub const MYSQL_VERSION_COMMENT: &str = "SPG dual-stack engine (MySQL-compatible)";
 

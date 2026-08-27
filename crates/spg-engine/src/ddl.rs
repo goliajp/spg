@@ -3032,6 +3032,27 @@ impl Engine {
         &mut self,
         mut stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
+        // v7.39 — an ENGINE MySQL does not know is refused, as MySQL does.
+        // The clause was consumed and dropped, so `ENGINE=NONSUCH` built a
+        // table while `sql_mode` claimed `NO_ENGINE_SUBSTITUTION` — a typo
+        // in a dump quietly became SPG's storage.
+        //
+        // SPG has one storage engine and substitutes for every name in the
+        // list, so it cannot honour that flag in MySQL's full sense. What
+        // it can honour is the half a client can act on: a name MySQL
+        // rejects is rejected here, with MySQL's own message and errno 1286
+        // (measured on 9.7.2, `ERROR 1286 (42000) Unknown storage engine`).
+        // Checked before anything is created, so a refused statement leaves
+        // nothing behind.
+        if let Some(engine) = &stmt.engine
+            && !crate::MYSQL_KNOWN_ENGINES
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(engine))
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "Unknown storage engine '{engine}'"
+            )));
+        }
         // v7.39 (round 436) — a TEMPORARY table is created under the calling
         // session's namespace prefix and remembered there, so it shadows a
         // permanent table of the same name, stays invisible to other

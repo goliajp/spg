@@ -2400,6 +2400,11 @@ pub struct CreateTableStatement {
     /// session ends. A `bool` here lands in the struct's existing padding.
     pub temporary: bool,
     pub name: String,
+    /// v7.39 — the `ENGINE=` a MySQL dump names. Consumed and discarded
+    /// before, so `ENGINE=NONSUCH` built a table where MySQL 9.7.2
+    /// answers `ERROR 1286`, and `sql_mode` claimed
+    /// `NO_ENGINE_SUBSTITUTION` while doing it.
+    pub engine: Option<String>,
     pub columns: Vec<ColumnDef>,
     /// v7.39 (round 531) — the `LIKE` clauses in the column list, in
     /// the order written. Empty for a table that has none.

@@ -661,9 +661,11 @@
         { "file": "wire_streaming_declines.test", "pass": 23, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] }
       ] },
-    { "name": "spg_baseline/16_isolation", "pass": 18, "fail": 0, "skip": 0,
+    { "name": "spg_baseline/16_isolation", "pass": 113, "fail": 0, "skip": 0,
       "files": [
-        { "file": "set_transaction_isolation_level.test", "pass": 18, "fail": 0, "skip": 0, "dialect": "postgres",
+        { "file": "read_only_transaction.test", "pass": 78, "fail": 0, "skip": 0, "dialect": "postgres",
+          "fail_reasons": [] },
+        { "file": "set_transaction_isolation_level.test", "pass": 35, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] }
       ] }
   ]

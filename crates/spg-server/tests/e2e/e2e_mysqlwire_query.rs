@@ -1303,13 +1303,44 @@ fn every_flag_sql_mode_claims_refuses_something() {
         );
     }
 
-    // The other direction: a flag SPG does not honour must not be claimed.
-    // `ENGINE=NONSUCH` is accepted here and MySQL 9.7.2 answers
-    // `ERROR 1286 Unknown storage engine 'NONSUCH'`, so until the engine
-    // name is validated the flag stays off the list.
+    // v7.39 — this assertion used to run the other way: the flag was off
+    // the list, and the pin said so, so that implementing the check would
+    // turn it red and act as the reminder to add the flag back. It did.
     assert!(
-        !claimed.contains("NO_ENGINE_SUBSTITUTION"),
-        "NO_ENGINE_SUBSTITUTION is claimed but ENGINE=NONSUCH is still accepted"
+        claimed.contains("NO_ENGINE_SUBSTITUTION"),
+        "NO_ENGINE_SUBSTITUTION is honoured but not claimed — @@sql_mode says {claimed:?}"
+    );
+    let (errno, sqlstate, msg) = err_of(&mut s, "CREATE TABLE eng_ns (a INT) ENGINE=NONSUCH");
+    assert_eq!(
+        (errno, sqlstate.as_str()),
+        (1286, "42000"),
+        "an engine MySQL does not know must be refused as MySQL refuses it"
+    );
+    assert!(
+        msg.starts_with("Unknown storage engine"),
+        "MySQL 9.7.2's own wording, got: {msg}"
+    );
+    // The names in a real dump keep working — refusing those would be a
+    // worse defect than accepting a typo, and a quieter one.
+    // Numbered, not named after the engine: identifiers fold, so
+    // `eng_InnoDB` and `eng_innodb` would be ONE table and the second
+    // CREATE would fail for a reason with nothing to do with engines.
+    for (i, known) in ["InnoDB", "innodb", "MyISAM", "MEMORY", "ARCHIVE"]
+        .iter()
+        .enumerate()
+    {
+        exec_ok(
+            &mut s,
+            &format!("CREATE TABLE eng_ok_{i} (a INT) ENGINE={known}"),
+        );
+    }
+    // FEDERATED has a row in MySQL's own ENGINES table and is still
+    // refused there, because that build cannot provide it. A list copied
+    // from the table without reading `support` would accept it.
+    let (errno, _, _) = err_of(&mut s, "CREATE TABLE eng_fed (a INT) ENGINE=FEDERATED");
+    assert_eq!(
+        errno, 1286,
+        "FEDERATED is in the ENGINES table and still refused"
     );
     assert!(
         !claimed.contains("ONLY_FULL_GROUP_BY"),
