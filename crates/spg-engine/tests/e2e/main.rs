@@ -752,6 +752,7 @@ mod e2e_range_constructors;
 mod e2e_range_intersect_agg;
 mod e2e_range_predicates;
 mod e2e_range_round25;
+mod e2e_read_only_transaction_v739;
 mod e2e_real_float4;
 mod e2e_real_to_int_round112;
 mod e2e_real_to_numeric_round110;

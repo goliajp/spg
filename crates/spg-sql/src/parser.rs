@@ -4085,8 +4085,62 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("characteristics"))
                 {
                     self.advance(); // CHARACTERISTICS
+                    if matches!(self.peek(), Token::As) {
+                        self.advance();
+                    }
+                    if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction")) {
+                        self.advance();
+                    }
+                    // v7.39 — no longer a no-op. The note above said SPG
+                    // "doesn't yet honor session-set isolation across
+                    // statements"; it does now, through
+                    // `default_transaction_isolation`, and measured on
+                    // PG 18.6 this statement is exactly a way to set it:
+                    //
+                    //   SET SESSION CHARACTERISTICS AS TRANSACTION
+                    //       ISOLATION LEVEL REPEATABLE READ;
+                    //   current_setting('default_transaction_isolation')
+                    //       -> repeatable read
+                    //
+                    // pg_dump prepends this to fix the level for a
+                    // restore session, so accepting it and doing nothing
+                    // meant the restore ran at a level nobody chose.
+                    //
+                    // The trailing READ ONLY / [NOT] DEFERRABLE modes are
+                    // still consumed and dropped. `default_transaction_read_only`
+                    // exists in the GUC inventory but nothing enforces it,
+                    // and setting a value no code honours is the very
+                    // defect this version is about — a session told it
+                    // holds a guarantee it does not.
+                    let modes = self.parse_isolation_level_clauses()?;
                     self.consume_until_statement_boundary();
-                    return Ok(Statement::Empty);
+                    let mut pairs: alloc::vec::Vec<(
+                        alloc::string::String,
+                        crate::ast::SetValue,
+                    )> = alloc::vec::Vec::new();
+                    if let Some(level) = modes.isolation {
+                        pairs.push((
+                            alloc::string::String::from("default_transaction_isolation"),
+                            crate::ast::SetValue::String(alloc::string::String::from(
+                                level.as_pg_str(),
+                            )),
+                        ));
+                    }
+                    if let Some(ro) = modes.read_only {
+                        pairs.push((
+                            alloc::string::String::from("default_transaction_read_only"),
+                            crate::ast::SetValue::Ident(alloc::string::String::from(if ro {
+                                "on"
+                            } else {
+                                "off"
+                            })),
+                        ));
+                    }
+                    return Ok(if pairs.is_empty() {
+                        Statement::Empty
+                    } else {
+                        Statement::SetParameterList(pairs)
+                    });
                 }
                 // v7.37.17 (17.6 sibling) — PG `SET CONSTRAINTS
                 // { ALL | <name>[, ...] } { DEFERRED | IMMEDIATE }`.
@@ -4198,8 +4252,8 @@ impl Parser {
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("transaction"))
                 {
                     self.advance(); // TRANSACTION
-                    let level = self.parse_isolation_level_clauses()?.unwrap_or_default();
-                    return Ok(Statement::SetTransaction { isolation: level });
+                    let modes = self.parse_isolation_level_clauses()?;
+                    return Ok(Statement::SetTransaction { modes });
                 }
                 // v7.14.0 — MySQL `SET CHARACTER SET <charset>`
                 // alias — same accept-as-no-op as SET NAMES.
@@ -8320,9 +8374,14 @@ impl Parser {
     /// TRANSACTION. Returns `Some(level)` only when an explicit `ISOLATION
     /// LEVEL` clause was given, so a bare `BEGIN` / `BEGIN READ ONLY` keeps the
     /// session default rather than forcing READ COMMITTED.
-    fn parse_isolation_level_clauses(&mut self) -> Result<Option<IsolationLevel>, ParseError> {
+    fn parse_isolation_level_clauses(
+        &mut self,
+    ) -> Result<crate::ast::TransactionModes, ParseError> {
         let mut level = IsolationLevel::default();
         let mut have_level = false;
+        // v7.39 — READ ONLY / READ WRITE used to be consumed and dropped,
+        // so `BEGIN READ ONLY` opened an ordinary read-write transaction.
+        let mut read_only: Option<bool> = None;
         loop {
             // ISOLATION LEVEL …
             let saw_isolation =
@@ -8375,14 +8434,20 @@ impl Parser {
                 };
                 have_level = true;
             } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("read")) {
-                // READ ONLY | READ WRITE — parsed, not behaviorally honoured.
+                // v7.39 — READ ONLY | READ WRITE. The comment here used to
+                // read "parsed, not behaviorally honoured", and it was
+                // accurate: the clause was thrown away, so `BEGIN READ ONLY`
+                // opened an ordinary read-write transaction and accepted
+                // every write in it.
                 self.advance();
                 match self.peek().clone() {
                     Token::Ident(s) if s.eq_ignore_ascii_case("only") => {
                         self.advance();
+                        read_only = Some(true);
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("write") => {
                         self.advance();
+                        read_only = Some(false);
                     }
                     other => {
                         return Err(self.err(alloc::format!(
@@ -8411,7 +8476,10 @@ impl Parser {
                 self.advance();
             }
         }
-        Ok(have_level.then_some(level))
+        Ok(crate::ast::TransactionModes {
+            isolation: have_level.then_some(level),
+            read_only,
+        })
     }
 
     fn parse_wait_after_keyword(&mut self) -> Result<Statement, ParseError> {
@@ -28484,7 +28552,8 @@ mod tests {
 
     #[test]
     fn begin_commit_rollback_parse_as_unit_variants() {
-        assert_eq!(parse("BEGIN"), Statement::Begin(None));
+        let plain = crate::ast::TransactionModes::default();
+        assert_eq!(parse("BEGIN"), Statement::Begin(plain));
         assert_eq!(parse("COMMIT"), Statement::Commit);
         // r1066 — PG synonyms pgbench's tpcb script relies on.
         assert_eq!(parse("END"), Statement::Commit);
@@ -28492,19 +28561,54 @@ mod tests {
         assert_eq!(parse("COMMIT WORK"), Statement::Commit);
         assert_eq!(parse("ROLLBACK"), Statement::Rollback);
         // Trailing semicolons accepted too.
-        assert_eq!(parse("BEGIN;"), Statement::Begin(None));
+        assert_eq!(parse("BEGIN;"), Statement::Begin(plain));
         // v7.39 (read01 round 118, B3) — an explicit ISOLATION LEVEL rides the
         // statement (with or without the WORK/TRANSACTION noise word).
         assert_eq!(
             parse("BEGIN ISOLATION LEVEL REPEATABLE READ"),
-            Statement::Begin(Some(IsolationLevel::RepeatableRead))
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: Some(IsolationLevel::RepeatableRead),
+                read_only: None,
+            })
         );
         assert_eq!(
             parse("START TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
-            Statement::Begin(Some(IsolationLevel::Serializable))
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: Some(IsolationLevel::Serializable),
+                read_only: None,
+            })
         );
-        // A non-isolation mode keeps the session default (None).
-        assert_eq!(parse("BEGIN READ ONLY"), Statement::Begin(None));
+        // v7.39 — this line used to read
+        //
+        //     // A non-isolation mode keeps the session default (None).
+        //     assert_eq!(parse("BEGIN READ ONLY"), Statement::Begin(None));
+        //
+        // which pinned the defect rather than catching it: the READ ONLY
+        // was thrown away, so the statement opened an ordinary read-write
+        // transaction and every write inside it was accepted. The
+        // isolation level is still absent here, because this statement
+        // does not name one — that part was right.
+        assert_eq!(
+            parse("BEGIN READ ONLY"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: None,
+                read_only: Some(true),
+            })
+        );
+        assert_eq!(
+            parse("START TRANSACTION READ WRITE"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: None,
+                read_only: Some(false),
+            })
+        );
+        assert_eq!(
+            parse("BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: Some(IsolationLevel::Serializable),
+                read_only: Some(true),
+            })
+        );
     }
 
     // --- v1.2: pgvector distance ops + ::vector cast --------------------

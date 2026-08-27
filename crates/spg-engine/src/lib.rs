@@ -1530,6 +1530,10 @@ pub struct Engine {
     /// SQL surface; actual semantic differentiation (REPEATABLE READ
     /// snapshot / SERIALIZABLE SSI) lands in a separate train.
     pub(crate) current_isolation_level: spg_sql::ast::IsolationLevel,
+    /// v7.39 — is the open transaction read-only. `BEGIN READ ONLY` was
+    /// parsed and discarded, so the mode existed only in the SQL text and
+    /// every write inside such a transaction was accepted and committed.
+    pub(crate) current_tx_read_only: bool,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -1755,6 +1759,7 @@ impl Engine {
             ),
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
+            current_tx_read_only: false,
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2280,6 +2285,7 @@ impl Engine {
             ),
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
+            current_tx_read_only: false,
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2421,6 +2427,7 @@ impl Engine {
                     ),
                     redo_capture: false,
                     current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
+                    current_tx_read_only: false,
                     last_redo: Vec::new(),
                     table_change_seq: alloc::collections::BTreeMap::new(),
                     matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2508,6 +2515,7 @@ impl Engine {
         self.seq_currvals = incoming.seq_currvals;
         self.last_sequence_used = incoming.last_sequence_used;
         self.current_isolation_level = incoming.isolation_level;
+        self.current_tx_read_only = self.default_read_only();
         self.current_session = id;
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
@@ -3263,6 +3271,36 @@ impl Engine {
     /// defaults to REPEATABLE READ (measured: a fresh connection
     /// answers `REPEATABLE-READ`), so a MySQL application that relies
     /// on its own engine's default was silently given a weaker one.
+    /// v7.39 — whether a transaction that does not say defaults to
+    /// read-only. Measured on PG 18.6: `SET default_transaction_read_only
+    /// = on` makes the next plain `BEGIN` refuse writes, exactly as
+    /// `BEGIN READ ONLY` does. SPG had the GUC in its inventory and no
+    /// enforcement anywhere, so a session could set it, read it back, and
+    /// be told it held a guarantee nothing was keeping.
+    #[must_use]
+    pub fn default_read_only(&self) -> bool {
+        self.session_params
+            .get("default_transaction_read_only")
+            .is_some_and(|v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
+    }
+
+    /// v7.39 — what `transaction_read_only` reports: the open
+    /// transaction's mode inside a block, the session default outside
+    /// one. Same shape as `current_isolation_level`, and for the same
+    /// reason — the witness for "a block is open" is `tx_catalogs`, not
+    /// the session slot, which a connected session always holds.
+    #[must_use]
+    pub fn transaction_read_only(&self) -> bool {
+        if self
+            .current_tx
+            .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+        {
+            self.current_tx_read_only
+        } else {
+            self.default_read_only()
+        }
+    }
+
     #[must_use]
     pub fn default_isolation_level(&self) -> spg_sql::ast::IsolationLevel {
         if let Some(v) = self.session_params.get("default_transaction_isolation")

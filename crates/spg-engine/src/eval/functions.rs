@@ -15764,6 +15764,14 @@ fn apply_function_dispatch(
                     e.current_isolation_level().as_pg_str(),
                 )));
             }
+            // v7.39 — its sibling, live for the same reason.
+            if lname == "transaction_read_only"
+                && let Some(e) = ctx.engine
+            {
+                return Ok(Value::text(alloc::string::String::from(
+                    if e.transaction_read_only() { "on" } else { "off" },
+                )));
+            }
             let val = match lname.as_str() {
                 "server_version" => crate::PG_SERVER_VERSION,
                 "server_version_num" => crate::PG_SERVER_VERSION_NUM,

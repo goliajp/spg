@@ -857,6 +857,19 @@ impl Engine {
             "transaction_isolation" => {
                 alloc::string::String::from(self.current_isolation_level().as_pg_str())
             }
+            // v7.39 — measured on PG 18.6: `off` by default, `on` inside
+            // `BEGIN READ ONLY`, `on` outside any transaction once
+            // `default_transaction_read_only` is set, and `off` again
+            // after. Both report surfaces are wired in the same change;
+            // wiring one and leaving its sibling is the shape this
+            // version keeps finding.
+            "transaction_read_only" => {
+                alloc::string::String::from(if self.transaction_read_only() {
+                    "on"
+                } else {
+                    "off"
+                })
+            }
             "is_superuser" => alloc::string::String::from("on"),
             _ => {
                 // Canonical GUC? report the session override or its
@@ -1612,6 +1625,32 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // v7.39 — a read-only transaction refuses writes. SPG enforced
+        // nothing: `BEGIN READ ONLY; INSERT …` answered `INSERT 0 1` and
+        // committed, and `default_transaction_read_only = on` changed
+        // nothing either, though both GUCs were in the inventory and both
+        // read back the value they were given. Applications open
+        // read-only transactions as a SAFETY measure — a reporting
+        // connection, a read-only leg in a pool, a "this path must not
+        // write" discipline — so accepting the writes is the worst
+        // available answer.
+        //
+        // Here because this is the one point the simple-query and the
+        // prepared paths both pass through (see the note above on the
+        // warning-area clear, which is here for the same reason).
+        // `EXECUTE` and `DO` reach it again for their inner statement,
+        // which is how PG gets `DO $$ … INSERT … $$` to fail with
+        // `cannot execute INSERT` rather than something about DO.
+        if self.current_tx_read_only
+            && self
+                .current_tx
+                .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+            && let Some(tag) = stmt.read_only_violation_tag()
+        {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "cannot execute {tag} in a read-only transaction"
+            )));
+        }
         // v7.17.0 Phase 1.1 — pre-resolve nextval / currval /
         // setval calls in the statement tree. Walks SELECT
         // projection, INSERT VALUES, UPDATE SET, DELETE WHERE,
@@ -2369,12 +2408,12 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
-            Statement::Begin(isolation) if self.current_tx.is_some_and(|t| self.is_tx_open(t)) => {
+            Statement::Begin(modes) if self.current_tx.is_some_and(|t| self.is_tx_open(t)) => {
                 // MySQL dialect: commit what is open, then start fresh.
                 self.exec_commit()?;
-                self.exec_begin(isolation)
+                self.exec_begin(modes)
             }
-            Statement::Begin(isolation) => self.exec_begin(isolation),
+            Statement::Begin(modes) => self.exec_begin(modes),
             // v7.39 (round 435) — a bare COMMIT / ROLLBACK outside a
             // transaction is a no-op that SUCCEEDS. Measured on both
             // oracles: PG18 answers `WARNING: there is no transaction in
@@ -2704,7 +2743,7 @@ impl Engine {
             // transaction does not see a concurrent commit and a READ
             // COMMITTED one does. The comment outlived the code by
             // three versions.
-            Statement::SetTransaction { isolation } => {
+            Statement::SetTransaction { modes } => {
                 // v7.39 — outside a transaction block PG WARNS and does
                 // nothing. Measured on PG 18.6:
                 //
@@ -2743,7 +2782,15 @@ impl Engine {
                         "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
                     ));
                 }
-                self.current_isolation_level = isolation;
+                if let Some(isolation) = modes.isolation {
+                    self.current_isolation_level = isolation;
+                }
+                // v7.39 — the read/write half of the same statement. It was
+                // parsed and dropped with the rest of the clause.
+                if let Some(ro) = modes.read_only {
+                    self.current_tx_read_only = ro;
+                }
+                let isolation = self.current_isolation_level;
                 // v7.37.17 (Phase E2) — inside an open tx, switching to
                 // RR/SER BEFORE the first query freezes the tx's view by
                 // caching a snapshot now (PG allows the switch until the
