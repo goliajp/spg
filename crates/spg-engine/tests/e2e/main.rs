@@ -654,6 +654,7 @@ mod e2e_on_conflict_constraint;
 mod e2e_on_conflict_partial_index_v7385;
 mod e2e_on_conflict_returning_old_round129;
 mod e2e_on_conflict_round240;
+mod e2e_only_full_group_by_v7392;
 mod e2e_only_in_from_round644;
 mod e2e_operator_precedence_round760;
 mod e2e_operator_resolution_round238;

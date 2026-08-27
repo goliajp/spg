@@ -396,6 +396,10 @@ impl Engine {
             // Only a MySQL client or a mysqldump preamble sends this.
             self.speaks_mysql = true;
             self.refresh_name_folding();
+            // v7.39.2 — MySQL's default list carries this one, so a
+            // session that never sets sql_mode has it; a list without
+            // it restores the loose behaviour, which is MySQL's too.
+            self.mysql_only_full_group_by = upper.contains("ONLY_FULL_GROUP_BY");
             let ansi = upper.contains("ANSI_QUOTES");
             if ansi != self.mysql_ansi_quotes {
                 self.mysql_ansi_quotes = ansi;
