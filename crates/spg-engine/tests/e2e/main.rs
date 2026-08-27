@@ -261,6 +261,7 @@ mod e2e_dogfood_findings_v7387;
 mod e2e_domain_cast;
 mod e2e_domain_round259;
 mod e2e_domain_type;
+mod e2e_double_quote_dialect_v739;
 mod e2e_drop_column_drops_checks_v7382;
 mod e2e_drop_expression_if_exists_round187;
 mod e2e_drop_wider_pg_dump_compat;

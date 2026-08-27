@@ -1367,7 +1367,7 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut push_edges = |body: &str, self_oid: i64, rows: &mut Vec<Row<'static>>| {
         let Ok(spg_sql::ast::Statement::Select(sel)) =
-            spg_sql::parser::parse_statement_with(body, false)
+            spg_sql::parser::parse_statement_with(body, spg_sql::lexer::Dialect::PG)
         else {
             return;
         };

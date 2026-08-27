@@ -1509,3 +1509,96 @@ fn a_non_strict_session_still_bends_the_value() {
         );
     }
 }
+
+/// v7.39 — in a MySQL session `"…"` opens a STRING, not an identifier.
+///
+/// SPG behaved as though `ANSI_QUOTES` were always in `sql_mode`, which
+/// is PostgreSQL's rule applied to a MySQL client. `SELECT "abc"`
+/// answered `ERROR 1054 column "abc" does not exist` where MySQL 9.7.2
+/// answers `abc` — ordinary MySQL SQL failing with an error that names a
+/// column its author never wrote.
+///
+/// Every expectation here was read off MySQL 9.7.2.
+#[test]
+fn a_double_quoted_string_is_a_string_in_a_mysql_session() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut s, r#"SELECT "abc""#), "abc");
+    // Doubling the quote, and escaping it, both give one quote.
+    assert_eq!(query_scalar(&mut s, r#"SELECT "a""b""#), "a\"b");
+    assert_eq!(query_scalar(&mut s, r#"SELECT "a\"b""#), "a\"b");
+    // The OTHER quote is an ordinary character inside.
+    assert_eq!(query_scalar(&mut s, r#"SELECT "a'b""#), "a'b");
+    // And it is a string wherever a string goes, not just in a select
+    // list — the shape a WHERE clause written for MySQL takes.
+    assert_eq!(query_scalar(&mut s, r#"SELECT 1 WHERE "x" = "x""#), "1");
+}
+
+/// The escapes flag and the quoting rule are separate questions.
+///
+/// v7.39 — `in_mysql_dialect()` IS `backslash_escapes`, so
+/// `SET sql_mode='NO_BACKSLASH_ESCAPES'` used to stop the session being
+/// MySQL by that test. Harmless until something else asked, and `"…"`
+/// asks: the session got PostgreSQL's identifier rule back and
+/// `SELECT LENGTH("\n")` failed on a column named newline.
+#[test]
+fn turning_escapes_off_does_not_turn_the_quoting_rule_back() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut s, r#"SELECT LENGTH("\n")"#), "1");
+    exec_ok(&mut s, "SET sql_mode='NO_BACKSLASH_ESCAPES'");
+    // Two bytes now — and still a STRING, which is the half that broke.
+    assert_eq!(query_scalar(&mut s, r#"SELECT LENGTH("\n")"#), "2");
+    assert_eq!(query_scalar(&mut s, r#"SELECT "abc""#), "abc");
+}
+
+/// `ANSI_QUOTES` turns the rule back on, and only that rule.
+#[test]
+fn ansi_quotes_makes_the_double_quote_an_identifier_again() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "SET sql_mode='ANSI_QUOTES'");
+    // An identifier now, so this names a column that does not exist.
+    send_query(&mut s, r#"SELECT "abc""#);
+    let (_seq, err) = read_packet(&mut s);
+    assert_eq!(err[0], 0xff, "expected an error packet");
+    let errno = u16::from_le_bytes(err[1..3].try_into().unwrap());
+    assert_eq!(errno, 1054, "ER_BAD_FIELD_ERROR, as MySQL 9.7.2 answers");
+    assert_eq!(&err[4..9], b"42S22");
+    // Usable as one, too.
+    assert_eq!(query_scalar(&mut s, r#"SELECT 1 AS "x""#), "1");
+    // Single quotes are untouched by ANSI_QUOTES.
+    assert_eq!(query_scalar(&mut s, "SELECT 'abc'"), "abc");
+    // And dropping ANSI_QUOTES puts the string rule back.
+    exec_ok(&mut s, "SET sql_mode=''");
+    assert_eq!(query_scalar(&mut s, r#"SELECT "abc""#), "abc");
+}
+
+/// The quoting rule is per connection, like every other dialect flag.
+#[test]
+fn ansi_quotes_does_not_leak_between_connections() {
+    let (_guard, addr) = spawn();
+    let mut a = auth_open_mode(&addr);
+    exec_ok(&mut a, "SET sql_mode='ANSI_QUOTES'");
+    let mut b = auth_open_mode(&addr);
+    assert_eq!(
+        query_scalar(&mut b, r#"SELECT "abc""#),
+        "abc",
+        "a second connection starts from MySQL's default sql_mode"
+    );
+    // And A is unchanged by B having connected.
+    send_query(&mut a, r#"SELECT "abc""#);
+    let (_seq, err) = read_packet(&mut a);
+    assert_eq!(err[0], 0xff, "A still has ANSI_QUOTES");
+}
+
+/// Backtick identifiers are unaffected either way — they are how
+/// `mysqldump` writes every name.
+#[test]
+fn backtick_identifiers_are_unaffected_by_the_quoting_rule() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut s, "SELECT 1 AS `bt`"), "1");
+    exec_ok(&mut s, "SET sql_mode='ANSI_QUOTES'");
+    assert_eq!(query_scalar(&mut s, "SELECT 1 AS `bt`"), "1");
+}

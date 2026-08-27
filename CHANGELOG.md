@@ -64,6 +64,32 @@ the current build; this file is a release-organized view.
   now, and the three writers that each asked the witness separately go
   through one place.
 
+- **A MySQL session read `"…"` as an identifier.** `SELECT "abc"`
+  answered `ERROR 1054 column "abc" does not exist` where MySQL 9.7.2
+  answers `abc`. SPG behaved as though `ANSI_QUOTES` were always in
+  `sql_mode` — PostgreSQL's rule applied to a MySQL client — so ordinary
+  MySQL SQL that quotes a string with `"` failed with an error naming a
+  column its author never wrote. A great deal of MySQL SQL does that.
+
+  MySQL's own rules, all measured on 9.7.2 and all now matched:
+  `"a""b"` and `"a\"b"` are both `a"b`, `"a'b"` is `a'b`, `LENGTH("\n")`
+  is 1 unless the session says `NO_BACKSLASH_ESCAPES`, and `ANSI_QUOTES`
+  turns the identifier rule back on — for `"` alone, leaving `'` a
+  string. `ANSI_QUOTES` was not modelled at all before; `SET sql_mode`
+  accepted it and changed nothing.
+
+  Found underneath: `backslash_escapes` was answering two questions —
+  "does this session speak MySQL" and "do backslashes escape" — and
+  `NO_BACKSLASH_ESCAPES` separates them. By that test a MySQL session
+  that had turned escapes off stopped being MySQL, which nothing had
+  asked until `"…"` did. The MySQL-ness of a session is its own flag
+  now. The wider conflation (`in_mysql_dialect()` still IS the escapes
+  flag) is named rather than rewired here.
+
+  PostgreSQL sessions are untouched: `"…"` is an identifier there
+  whatever a MySQL `sql_mode` said, which the pins check in both
+  directions.
+
 - **Four surfaces, four answers, one question.** Asked whether
   `nosuch_guc` is a parameter, PostgreSQL 18.6 gives one answer four
   times. SPG gave: PG's error from `SET`, its own sentence from `SHOW`,
@@ -81,6 +107,33 @@ the current build; this file is a release-organized view.
   removed the name, so those read NULL and `SHOW` refused it —
   an application branching on `IS NULL` versus `= ''` branched the other
   way. A name never set still reads NULL, which PG agrees with.
+
+### Known gaps in this section
+
+Measured, not closed here, and written down rather than left implicit:
+
+- `SHOW VARIABLES` still omits `character_set_filesystem`,
+  `character_set_system` and `character_sets_dir`. The first two SPG
+  could answer truthfully; `character_sets_dir` names a directory SPG
+  does not have, and inventing a path would be a fabricated fact rather
+  than a compatibility gain. The five names a driver reads —
+  `character_set_client`, `_connection`, `_results`, `_database`,
+  `_server` — and all three `collation_*` now match MySQL 9.7.2 exactly
+  under an identical handshake.
+- `information_schema.SCHEMATA` has no `DEFAULT_CHARACTER_SET_NAME` /
+  `DEFAULT_COLLATION_NAME`, and `information_schema.COLUMNS` no
+  `CHARACTER_SET_NAME` / `COLLATION_NAME`. Schema-reflection tools read
+  these.
+- A MySQL session's unknown-column error says `column "x" does not
+  exist` where MySQL says `Unknown column 'x' in 'field list'`. The code
+  (1054) and SQLSTATE (42S22) match; the wording does not, and it is the
+  wording for every unknown column, not only the ones this release
+  touched.
+- Adjacent string literals concatenate only across a newline, which is
+  PG's rule; MySQL joins `"a" "b"` on one line too. This predates the
+  quoting change and applies to `'…'` equally.
+- `in_mysql_dialect()` is still the backslash-escapes flag. Only the
+  quoting rule was given its own answer here.
 
 ### Instruments
 

@@ -526,8 +526,8 @@ impl From<LexError> for ParseError {
 /// parser the statement path uses; this entry point just skips the
 /// statement dispatch.
 pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
-    let (tokens, offsets) =
-        lexer::tokenize_with_offsets(input, false).map_err(|e| shape_lex_error(&e, input))?;
+    let (tokens, offsets) = lexer::tokenize_with_offsets(input, lexer::Dialect::PG)
+        .map_err(|e| shape_lex_error(&e, input))?;
     let mut p = Parser::new(tokens);
     let expr = p
         .parse_expr(0)
@@ -539,15 +539,16 @@ pub fn parse_expression(input: &str) -> Result<Expr, ParseError> {
 /// Parse exactly one statement, swallow an optional trailing `;`, and require
 /// the token stream to end there. PG string semantics.
 pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
-    parse_statement_with(input, false)
+    parse_statement_with(input, lexer::Dialect::PG)
 }
 
 /// v7.22 (round-13 T3) — dialect-aware entry: `backslash_escapes`
 /// selects MySQL-style string lexing (see `lexer::tokenize_with`).
 /// The engine threads its session flag through here.
-pub fn parse_statement_with(input: &str, backslash_escapes: bool) -> Result<Statement, ParseError> {
-    let (tokens, offsets) = lexer::tokenize_with_offsets(input, backslash_escapes)
-        .map_err(|e| shape_lex_error(&e, input))?;
+pub fn parse_statement_with(input: &str, dialect: lexer::Dialect) -> Result<Statement, ParseError> {
+    let backslash_escapes = dialect.backslash_escapes;
+    let (tokens, offsets) =
+        lexer::tokenize_with_offsets(input, dialect).map_err(|e| shape_lex_error(&e, input))?;
     // The same session flag names the dialect for both the lexer and
     // the type mapping.
     let mut p = Parser::new_with_dialect(tokens, backslash_escapes).with_source(input, &offsets);
@@ -660,17 +661,17 @@ fn offending_lexeme<'a>(input: &'a str, offsets: &[usize], token_pos: usize) -> 
 /// a [`ParseError::token_pos`]. Kept off the `ParseError` struct (and so off
 /// every recursive `Result` slot) to protect the nesting-budget frame cliff:
 /// this re-tokenizes `input` on the cold error path to map the failing token
-/// index to its start byte, then to a character offset. `backslash_escapes`
+/// index to its start byte, then to a character offset. The dialect
 /// must match the parse that produced `token_pos` (it barely shifts offsets,
 /// but stay consistent). Returns `None` when the index has no offset or the
 /// byte isn't a char boundary. The wire attaches it as the ErrorResponse `P`.
 #[must_use]
 pub fn syntax_error_position(
     input: &str,
-    backslash_escapes: bool,
+    dialect: lexer::Dialect,
     token_pos: usize,
 ) -> Option<usize> {
-    let (_, offsets) = lexer::tokenize_with_offsets(input, backslash_escapes).ok()?;
+    let (_, offsets) = lexer::tokenize_with_offsets(input, dialect).ok()?;
     let byte_off = *offsets.get(token_pos)?;
     if byte_off > input.len() || !input.is_char_boundary(byte_off) {
         return None;

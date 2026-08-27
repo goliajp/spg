@@ -15637,9 +15637,23 @@ fn apply_function_dispatch(
                 // Measured on MySQL 9.7.2: 67108864 on both surfaces.
                 // `show.rs` already said so; this said 16777216.
                 "max_allowed_packet" => "67108864",
+                // v7.39 — `character_set_database` and
+                // `collation_database` were missing from both surfaces,
+                // so a MySQL session asking for either got
+                // `ERROR 1064 Unknown system variable` where MySQL 9.7.2
+                // answers `utf8mb4` / `utf8mb4_0900_ai_ci`. ORMs read
+                // them to reflect a schema; a hard error there is not a
+                // gap the caller can work around.
+                //
+                // The value is a true statement about this database:
+                // measured, a MySQL-dialect session compares `'A' = 'a'`
+                // as equal, which is what `utf8mb4_0900_ai_ci` means.
+                // Unlike the connection pair these do NOT follow
+                // `SET NAMES` — MySQL scopes them to the database.
                 "character_set_client" | "character_set_connection"
-                | "character_set_results" | "character_set_server" => "utf8mb4",
-                "collation_connection" | "collation_server" => {
+                | "character_set_results" | "character_set_server"
+                | "character_set_database" => "utf8mb4",
+                "collation_connection" | "collation_server" | "collation_database" => {
                     crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
                 }
                 "lower_case_table_names" => "0",
