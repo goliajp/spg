@@ -3826,6 +3826,7 @@ impl Expr {
             match e {
                 Self::Literal(_) | Self::Column(_) | Self::Placeholder(_) => {}
                 Self::NamedArg { expr, .. }
+                | Self::Collate { expr, .. }
                 | Self::Variadic(expr)
                 | Self::Unary { expr, .. }
                 | Self::Cast { expr, .. }
@@ -4382,6 +4383,22 @@ pub enum JoinKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
+    /// v7.39.2 — `<expr> COLLATE <name>`: the collation this expression
+    /// compares under, whatever the column or the database says.
+    ///
+    /// The parser used to refuse the locale names in this position and
+    /// SILENTLY ABSORB the byte-order ones, so `'a' COLLATE "C" < 'B'`
+    /// answered `t` where PostgreSQL 18.6 answers `f` — the one family
+    /// it let through is the one where dropping it changes the answer.
+    ///
+    /// Whether dropping is safe depends on the DATABASE's own collation,
+    /// which the parser cannot see: under `SPG_LC_COLLATE=C` absorbing
+    /// `COLLATE "C"` is exactly right. So the name rides along and the
+    /// engine, which knows, decides.
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
+    },
     Column(ColumnName),
     /// v7.39 (read01 round 77) — a NAMED call argument (`f(x := 1)`, or the
     /// older `f(x => 1)` spelling). Which slot the name fills depends on the
@@ -8473,6 +8490,11 @@ impl fmt::Display for Expr {
             // Round-trips as the spelling PG's docs lead with.
             Self::NamedArg { name, expr } => write!(f, "{} := {expr}", quote_ident(name)),
             Self::Variadic(expr) => write!(f, "VARIADIC {expr}"),
+            // Round-trips with the name quoted, which is how PG spells a
+            // collation everywhere: `"en_US.utf8"`, `"C"`.
+            Self::Collate { expr, collation } => {
+                write!(f, "{expr} COLLATE {}", quote_ident(collation))
+            }
             // v7.39 (round 311) — an AND / OR chain that nests to the
             // LEFT is one chain, and renders flat: `(a) AND (b) AND (c)`,
             // not `((a) AND (b)) AND (c)`. Explicit right nesting keeps

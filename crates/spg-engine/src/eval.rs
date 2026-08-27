@@ -4912,6 +4912,33 @@ pub fn eval_expr(
         return Err(EvalError::StackDepthExceeded);
     }
     match expr {
+        // v7.39.2 — a collation does not change the VALUE, only what
+        // comparing it means. So evaluation is the inner expression's,
+        // and the collation is read by the comparison sites rather than
+        // here. An arm rather than a traversal join, because that is a
+        // decision and not a walk.
+        Expr::Collate { expr, collation } => {
+            // The name is checked HERE rather than in a walk over every
+            // statement: a `COLLATE` that is never evaluated is never
+            // reached, and one that is reached is reached exactly once
+            // per evaluation. PG rejects an unknown name whether or not
+            // anything compares it — `SELECT 'a' COLLATE "nosuch"` is an
+            // error there — and evaluating the projection is that.
+            // A MySQL spelling on the PostgreSQL wire does not exist,
+            // which is PG's answer and what the round-371 pin has always
+            // asserted — it passed on the parser's old allow-list, and
+            // the reason belongs here now that the clause is a node.
+            let spg_only_here =
+                crate::collate::is_spg_only_spelling(collation) && !ctx.mysql_dialect;
+            if spg_only_here || !crate::collate::is_known(collation) {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "collation \"{collation}\" for encoding \"UTF8\" does not exist"
+                    ),
+                });
+            }
+            eval_expr(expr, row, ctx)
+        }
         Expr::AggregateOrdered { .. } => Err(EvalError::TypeMismatch {
             detail: "aggregate ORDER BY is only valid inside an aggregating SELECT".into(),
         }),

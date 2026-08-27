@@ -254,7 +254,7 @@ fn collect_table_ref(t: &TableRef, out: &mut Vec<String>) {
 
 fn collect_expr(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::NamedArg { expr, .. } => collect_expr(expr, out),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => collect_expr(expr, out),
         Expr::Variadic(expr) => collect_expr(expr, out),
         Expr::AggregateOrdered {
             call,

@@ -140,6 +140,7 @@ mod e2e_cold_tier_scan_gate_round943;
 mod e2e_collate;
 mod e2e_collate_derive_round692;
 mod e2e_collate_explicit_round691;
+mod e2e_collate_expression_v7392;
 mod e2e_collate_minmax_round690;
 mod e2e_collate_order_group;
 mod e2e_collate_order_round688;

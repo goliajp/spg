@@ -540,7 +540,28 @@ pub(crate) fn is_known(name: &str) -> bool {
     if lower == "case_insensitive" || lower == "nocase" {
         return true;
     }
-    lower == "binary" || lower.ends_with("_ci") || lower.ends_with("_cs") || lower.ends_with("_bin")
+    is_spg_only_spelling(&lower)
+}
+
+/// A collation name SPG has and PostgreSQL 18.6 does not.
+///
+/// v7.39.2 — [`is_known`] answers "does SPG have this", deliberately a
+/// superset, and its reasoning is about COLUMN DECLARATIONS: a column
+/// declared over one wire has to be declarable over the other. That
+/// argument does not reach an expression inside one session, where
+/// `SELECT 'a' = 'A' COLLATE utf8mb4_bin` on the PostgreSQL wire should
+/// answer what PostgreSQL answers, which is that no such collation
+/// exists. Before the `COLLATE` clause became a node, the parser's
+/// narrow allow-list refused it and the pin that says so passed for
+/// that reason; this keeps the behaviour with the reason spelled out.
+pub(crate) fn is_spg_only_spelling(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    lower == "case_insensitive"
+        || lower == "nocase"
+        || lower == "binary"
+        || lower.ends_with("_ci")
+        || lower.ends_with("_cs")
+        || lower.ends_with("_bin")
 }
 
 /// The message PostgreSQL 18.4 gives for a name that is not there.

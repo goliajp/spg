@@ -112,23 +112,27 @@ fn round670_text_orders_by_bytes() {
 /// not as a rule about how SPG sorts. The ledger's F36 records the DDL
 /// paths that accept what this one refuses.
 #[test]
-fn round670_a_locale_collation_is_refused_where_it_cannot_be_carried() {
+fn round670_a_locale_collation_is_carried_where_it_is_written() {
+    // v7.39.2 — this asserted the refusal and the wording of it. The
+    // refusal is gone: `Expr::Collate` carries the clause, and
+    // PostgreSQL 18.6 answers `t` here — `en_US` is in its
+    // `pg_collation`, measured, and so `'a' < 'B'` under it is true
+    // where byte order says false.
     let mut e = Engine::new();
-    let msg = err(&mut e, "SELECT 'a' < 'B' COLLATE \"en_US\"");
-    assert!(
-        msg.contains("not supported in this position"),
-        "the refusal is about the POSITION, not about SPG's sort order: {msg}"
+    assert_eq!(
+        one(&mut e, "SELECT 'a' < 'B' COLLATE \"en_US\""),
+        "true",
+        "PG 18.6 answers t for this"
     );
-    assert!(
-        msg.contains("column declaration") && msg.contains("ORDER BY key"),
-        "the refusal should name where the clause does work: {msg}"
-    );
-    assert!(
-        !msg.contains("orders text by bytes"),
-        "SPG performs locale collations; saying otherwise sends the \
-         reader to `COLLATE \"C\"` for a problem they do not have: {msg}"
+    assert_eq!(
+        one(&mut e, "SELECT 'a' < 'B' COLLATE \"C\""),
+        "false",
+        "and byte order answers f, which absorbing the clause could not say"
     );
 
+    // The INDEX key is a different position and is unchanged: its
+    // collation rides a side channel the key itself owns, and a locale
+    // one there is still refused.
     e.execute("CREATE TABLE ct(name TEXT)").unwrap();
     let msg = err(&mut e, "CREATE INDEX ON ct (name COLLATE \"en_US\")");
     assert!(msg.contains("not supported in this position"), "{msg}");

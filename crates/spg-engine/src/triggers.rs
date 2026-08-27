@@ -1654,7 +1654,9 @@ fn substitute_locals_visiting(
         }
     }
     match expr {
-        Expr::NamedArg { expr, .. } => substitute_locals_visiting(expr, locals, visit),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
+            substitute_locals_visiting(expr, locals, visit)
+        }
         Expr::Variadic(expr) => substitute_locals_visiting(expr, locals, visit),
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_locals_visiting(call, locals, visit);
@@ -1820,7 +1822,9 @@ pub(crate) fn substitute_new_old(
         }
     }
     match expr {
-        Expr::NamedArg { expr, .. } => substitute_new_old(expr, new_row, old_row, columns)?,
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
+            substitute_new_old(expr, new_row, old_row, columns)?
+        }
         Expr::Variadic(expr) => substitute_new_old(expr, new_row, old_row, columns)?,
         Expr::AggregateOrdered { call, order_by, .. } => {
             substitute_new_old(call, new_row, old_row, columns)?;

@@ -199,7 +199,9 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool, tz_offset: i64) {
         return;
     }
     match e {
-        Expr::NamedArg { expr, .. } => rewrite_expr_clock(expr, now, mysql, tz_offset),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
+            rewrite_expr_clock(expr, now, mysql, tz_offset)
+        }
         Expr::Variadic(expr) => rewrite_expr_clock(expr, now, mysql, tz_offset),
         Expr::AggregateOrdered { call, order_by, .. } => {
             rewrite_expr_clock(call, now, mysql, tz_offset);

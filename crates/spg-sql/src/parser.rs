@@ -16205,7 +16205,44 @@ impl Parser {
                         _ => None,
                     };
                 }
-                let key_expr = self.parse_expr(0)?;
+                // v7.39.2 — the clause is read by the LOOKAHEAD above and
+                // belongs to the KEY, not to the expression. Since
+                // `COLLATE` became a node, letting `parse_expr` build one
+                // here put the collation in twice and the key deparsed as
+                // `(c COLLATE "C" COLLATE "C")`. The ORDER-BY-key channel
+                // is the same idea and already exists, so this borrows it:
+                // absorb into the side channel, and the key's own
+                // lookahead is what carries it.
+                // v7.39.2 — and the key can only CARRY the byte-order
+                // spellings. Absorbing into the side channel accepts any
+                // name, so suppressing the node here without this check
+                // silently accepted `(name COLLATE "en_US")`, which SPG's
+                // index cannot honour — a refusal that was doing real
+                // work, removed by the suppression and put back here.
+                if let Some(name) = &key_collation {
+                    let lc = name.to_ascii_lowercase();
+                    let byte_order = matches!(
+                        lc.as_str(),
+                        "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
+                    );
+                    let mysql_ok = self.mysql_dialect
+                        && (lc.ends_with("_ci")
+                            || lc.ends_with("_bin")
+                            || lc == "binary"
+                            || matches!(lc.as_str(), "case_insensitive" | "nocase"));
+                    if !byte_order && !mysql_ok {
+                        return Err(self.err(alloc::format!(
+                            "COLLATE {name:?} is not supported in this position: an index \
+                             key carries the byte-order spellings only. Declare it on the \
+                             column (`x text COLLATE {name:?}`) instead"
+                        )));
+                    }
+                }
+                let saved_key_ctx = self.in_order_by_key;
+                self.in_order_by_key = true;
+                let key_expr = self.parse_expr(0);
+                self.in_order_by_key = saved_key_ctx;
+                let key_expr = key_expr?;
                 let primary = extract_first_column(&key_expr).ok_or_else(|| {
                     self.err("expression index key must reference at least one column".into())
                 })?;
@@ -22863,6 +22900,19 @@ impl Parser {
                 // left the SCHEMA as the name, so the clause was refused
                 // as an unsupported locale collation and no dump ran.
                 if matches!(self.peek(), Token::Dot) {
+                    // v7.39.2 — the qualifier is DROPPED (SPG is single
+                    // schema) but it is checked first. PostgreSQL 18.6
+                    // answers `schema "nosuch_schema" does not exist` for
+                    // one it has never heard of, and dropping it unread
+                    // meant `COLLATE nosuch_schema."C"` succeeded here —
+                    // a name that names nothing, accepted.
+                    let schema = cname.to_ascii_lowercase();
+                    if !matches!(
+                        schema.as_str(),
+                        "pg_catalog" | "public" | "information_schema"
+                    ) {
+                        return Err(self.err(alloc::format!("schema \"{cname}\" does not exist")));
+                    }
                     self.advance();
                     cname = match self.advance() {
                         Token::Ident(s) | Token::QuotedIdent(s) | Token::String(s) => s,
@@ -22907,11 +22957,29 @@ impl Parser {
                     self.order_key_collation = Some(cname);
                     continue;
                 }
-                if !matches!(
-                    lc.as_str(),
-                    "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
-                ) && !mysql_ci
-                {
+                // v7.39.2 — the clause becomes a NODE rather than being
+                // refused or absorbed.
+                //
+                // What stood here refused the locale names and SILENTLY
+                // DROPPED the byte-order ones, so `'a' COLLATE "C" < 'B'`
+                // answered `t` where PostgreSQL 18.6 answers `f`: the one
+                // family it let through is the one where dropping it
+                // changes the answer. Absorbing is only correct when the
+                // collation asked for is the one the comparison would use
+                // anyway, and that depends on the DATABASE — which the
+                // parser cannot see. So it rides along and the engine,
+                // which can, decides.
+                //
+                // `collate_derive` already modelled `Explicit(name)` and
+                // had no way to be handed one.
+                if !mysql_ci {
+                    expr = Expr::Collate {
+                        expr: alloc::boxed::Box::new(expr),
+                        collation: cname,
+                    };
+                    continue;
+                }
+                if false {
                     // v7.38.18 — the old message read "SPG orders text
                     // by bytes (the C collation); locale collations are
                     // not supported yet", and both halves were false by
@@ -26273,6 +26341,13 @@ fn extract_first_column(expr: &Expr) -> Option<String> {
         // sits under the `::text` cast inside the function arg. Without
         // descending here the key was rejected as "references no column".
         Expr::Cast { expr: e, .. } => extract_first_column(e),
+        // v7.39.2 — and a COLLATE wraps its operand the same way.
+        // `CREATE INDEX rc ON t (c COLLATE "C" DESC)` stopped naming a
+        // column the moment the clause became a node instead of being
+        // absorbed, and the key was rejected as referencing none. This
+        // is the shape the wildcard below silently produces, which is
+        // why it is spelled out.
+        Expr::Collate { expr: e, .. } => extract_first_column(e),
         _ => None,
     }
 }

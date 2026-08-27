@@ -2213,7 +2213,9 @@ impl Engine {
             return Ok(());
         }
         match e {
-            Expr::NamedArg { expr, .. } => self.resolve_expr_subqueries(expr, cancel)?,
+            Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
+                self.resolve_expr_subqueries(expr, cancel)?
+            }
             Expr::Variadic(expr) => self.resolve_expr_subqueries(expr, cancel)?,
             Expr::AggregateOrdered { call, order_by, .. } => {
                 self.resolve_expr_subqueries(call, cancel)?;

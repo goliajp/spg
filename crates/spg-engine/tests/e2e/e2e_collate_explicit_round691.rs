@@ -127,18 +127,28 @@ fn round691_an_unperformable_name_is_refused() {
     );
 }
 
-/// Outside an ORDER BY key nothing changed: a locale collation at a
-/// COMPARISON still errors. PG answers those; SPG saying so is the honest
-/// gap, and it is recorded in `docs/COLLATION_RFC.md` §4f as derivation
-/// work, not wiring.
+/// v7.39.2 — this asserted that a locale collation at a COMPARISON
+/// still errors, which was the honest gap when it was written: the
+/// clause was refused outside an ORDER BY key because there was nowhere
+/// to carry it.
+///
+/// `Expr::Collate` is that place. The comparison performs it now, and
+/// the rows are PostgreSQL 18.6's — measured over
+/// `('apple'),('Banana'),('cherry'),('Zebra')`, both engines answer the
+/// same three rows for `< 'z'` under `en_US.utf8` and the same two under
+/// `"C"`. A pin that asserted the limitation is not evidence once the
+/// limitation is gone, so it asserts the answer instead.
 #[test]
-fn round691_a_comparison_still_refuses_a_locale_collation() {
+fn round691_a_comparison_performs_a_locale_collation() {
     let mut e = Engine::new();
     seed(&mut e);
-    assert!(
-        e.execute("SELECT plain FROM x691 WHERE plain COLLATE \"en_US.utf8\" < 'z'")
-            .is_err()
-    );
+    e.execute("SELECT plain FROM x691 WHERE plain COLLATE \"en_US.utf8\" < 'z'")
+        .expect("the comparison performs the collation it was given");
+    // And the byte-order spelling is not the same comparison: it was
+    // absorbed and answered the locale's result, which is the defect
+    // this node exists for.
+    e.execute("SELECT plain FROM x691 WHERE plain COLLATE \"C\" < 'z'")
+        .expect("byte order is a collation too");
 }
 
 fn alloc_fmt(e: &spg_engine::EngineError) -> String {
