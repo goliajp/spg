@@ -12,6 +12,39 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`ONLY_FULL_GROUP_BY` was not enforced, and MySQL's default carries
+  it.** `SELECT g, v FROM t GROUP BY g` answered an arbitrary row's `v`
+  per group where MySQL 9.7.2 answers `ERROR 1055`. So did the same
+  column in `HAVING` and in `ORDER BY`.
+
+  The rule was already in the tree — it is PostgreSQL's, enforced on the
+  PG side and matching 18.6 sentence for sentence. The dialect switched
+  it off wholesale on a flag meaning "this session speaks MySQL",
+  without reading `sql_mode` at all, so it was off even under MySQL's
+  own default list. It asks `sql_mode` now, and the default list carries
+  the flag because it is kept: the reverse pin that held it ABSENT — put
+  there in 7.39.0 precisely so this moment would be noticed — now holds
+  it claimed AND enforced.
+
+  `SET sql_mode` to a list without the flag restores the loose
+  behaviour, which is also MySQL's. Functional dependency through a
+  grouped primary key is unaffected, and so are aggregates: both engines
+  allow those and a check that refused them would be the failure this
+  class invites.
+
+  Four other checks in `aggregate.rs` read the same flag and ask
+  different questions through it — MySQL's column naming, `HAVING`
+  aliases, collation folding. Only the two that are about GROUP BY were
+  changed; a grep and replace would have altered three unrelated
+  behaviours.
+
+  On the wire the refusal reads `1055 (42000)`, MySQL's own number for
+  it, where it used to read `1064` — a PARSE error, which is what an
+  unmapped message falls back to and is wrong about what happened. The
+  first version of that mapping sent `eval: type mismatch:` down the
+  wire with it: SPG's internal classification of the fault, which the PG
+  side has never emitted and no client asked for.
+
 - **In a MySQL session, two spellings of one relation name were two
   relations.** The lexer folds an unquoted identifier and leaves a
   backticked one alone, so `CREATE TABLE MyTable` stored `mytable`

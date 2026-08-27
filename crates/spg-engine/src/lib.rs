@@ -193,9 +193,12 @@ pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 ///   NO_ZERO_IN_DATE              DATE <- '2020-00-05'     -> refused
 ///   ERROR_FOR_DIVISION_BY_ZERO   INT <- 1/0               -> refused
 ///
-/// `ONLY_FULL_GROUP_BY` is MySQL's sixth default and SPG does not
-/// enforce it — it also never claimed to, which is why it is absent
-/// here rather than listed. The order is MySQL's own.
+/// v7.39.2 — `ONLY_FULL_GROUP_BY` is listed now because it is enforced
+/// now. It was absent rather than claimed-and-ignored, which was the
+/// honest state while a bare non-aggregated column was still allowed
+/// through; the rule itself already existed as PostgreSQL's, and the
+/// dialect had switched it off wholesale rather than reading sql_mode.
+/// The order is MySQL's own, and it comes first there.
 ///
 /// This is the DEFAULT only. `SET sql_mode = …` is honoured and read
 /// back faithfully, measured on both engines.
@@ -226,7 +229,7 @@ pub const MYSQL_KNOWN_ENGINES: &[&str] = &[
     "PERFORMANCE_SCHEMA",
 ];
 
-pub const MYSQL_DEFAULT_SQL_MODE: &str = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
+pub const MYSQL_DEFAULT_SQL_MODE: &str = "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION";
 
 pub const MYSQL_VERSION_COMMENT: &str = "SPG dual-stack engine (MySQL-compatible)";
 
@@ -925,6 +928,18 @@ pub(crate) struct SessionBag {
     /// underneath everything that reads it; this flag answers the one
     /// question this change asks.
     pub(crate) speaks_mysql: bool,
+    /// v7.39.2 — is `ONLY_FULL_GROUP_BY` in this session's `sql_mode`?
+    ///
+    /// MySQL's DEFAULT list carries it, and SPG's MySQL dialect ignored
+    /// it: `SELECT g, v FROM t GROUP BY g` answered an arbitrary row's
+    /// `v` per group where MySQL 9.7.2 answers `ERROR 1055`. The rule
+    /// SPG needs was already there — it is PostgreSQL's, enforced on
+    /// the PG side and switched off wholesale for the dialect.
+    ///
+    /// Starts TRUE, because MySQL's default has it. `SET sql_mode` to a
+    /// list without it restores the loose behaviour, which is also
+    /// MySQL's.
+    pub(crate) mysql_only_full_group_by: bool,
     /// v7.38.18 (C12) — the MySQL diagnostics area: what the last
     /// warning-generating statement bent, ready for `SHOW WARNINGS`
     /// and `@@warning_count`.
@@ -1051,6 +1066,7 @@ impl Default for SessionBag {
             mysql_strict: true,
             mysql_ansi_quotes: false,
             speaks_mysql: false,
+            mysql_only_full_group_by: true,
             session_params: BTreeMap::new(),
             backslash_escapes: false,
             mysql_warnings: Vec::new(),
@@ -1317,6 +1333,8 @@ pub struct Engine {
     mysql_ansi_quotes: bool,
     /// v7.39 — see [`SessionBag::speaks_mysql`].
     speaks_mysql: bool,
+    /// v7.39.2 — see [`SessionBag::mysql_only_full_group_by`].
+    mysql_only_full_group_by: bool,
     /// v7.38.18 (C12) — see [`SessionBag::mysql_warnings`]. Lives on
     /// the Engine like every other live-session field and swaps with
     /// the bag, because the server runs ONE Engine for every
@@ -1820,6 +1838,7 @@ impl Engine {
             mysql_strict: true,
             mysql_ansi_quotes: false,
             speaks_mysql: false,
+            mysql_only_full_group_by: true,
             mysql_warnings: Vec::new(),
             mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
@@ -2349,6 +2368,7 @@ impl Engine {
             mysql_strict: true,
             mysql_ansi_quotes: false,
             speaks_mysql: false,
+            mysql_only_full_group_by: true,
             mysql_warnings: Vec::new(),
             mysql_stmt_warnings: Vec::new(),
             lo_descriptors: BTreeMap::new(),
@@ -2493,6 +2513,7 @@ impl Engine {
                     mysql_strict: true,
                     mysql_ansi_quotes: false,
                     speaks_mysql: false,
+                    mysql_only_full_group_by: true,
                     mysql_warnings: Vec::new(),
                     mysql_stmt_warnings: Vec::new(),
                     lo_descriptors: BTreeMap::new(),
@@ -2623,6 +2644,7 @@ impl Engine {
             mysql_strict: self.mysql_strict,
             mysql_ansi_quotes: self.mysql_ansi_quotes,
             speaks_mysql: self.speaks_mysql,
+            mysql_only_full_group_by: self.mysql_only_full_group_by,
             mysql_warnings: core::mem::take(&mut self.mysql_warnings),
             prepared_statements: core::mem::take(&mut self.prepared_statements),
             lo_descriptors: core::mem::take(&mut self.lo_descriptors),
@@ -2647,6 +2669,7 @@ impl Engine {
         self.mysql_strict = incoming.mysql_strict;
         self.mysql_ansi_quotes = incoming.mysql_ansi_quotes;
         self.speaks_mysql = incoming.speaks_mysql;
+        self.mysql_only_full_group_by = incoming.mysql_only_full_group_by;
         self.refresh_name_folding();
         self.mysql_warnings = incoming.mysql_warnings;
         self.prepared_statements = incoming.prepared_statements;
@@ -2717,6 +2740,16 @@ impl Engine {
     /// than as a constant. It answered `0` — "names are case-sensitive
     /// and preserved" — while an unquoted name was being folded, which
     /// is a claim SPG did not keep either way.
+    /// Does this session let a non-aggregated column past a GROUP BY?
+    ///
+    /// v7.39.2 — the answer used to be "yes, whenever the dialect is
+    /// MySQL", ignoring `sql_mode` entirely, so it was yes even under
+    /// MySQL's own default list which forbids it.
+    #[must_use]
+    pub fn group_by_is_loose(&self) -> bool {
+        self.speaks_mysql && !self.mysql_only_full_group_by
+    }
+
     #[must_use]
     pub fn folds_relation_names(&self) -> bool {
         self.speaks_mysql
@@ -2822,6 +2855,7 @@ impl Engine {
             self.mysql_strict = true;
             self.mysql_ansi_quotes = false;
             self.speaks_mysql = false;
+            self.mysql_only_full_group_by = true;
             self.refresh_name_folding();
             self.lo_descriptors.clear();
             self.lo_next_fd = 0;

@@ -1342,10 +1342,23 @@ fn every_flag_sql_mode_claims_refuses_something() {
         errno, 1286,
         "FEDERATED is in the ENGINES table and still refused"
     );
+    // v7.39.2 — the reverse pin that stood here said the opposite:
+    // ONLY_FULL_GROUP_BY must be ABSENT from the claim while a bare
+    // non-aggregated column was still allowed through. It is enforced
+    // now, so the claim is honest and the pin holds both halves —
+    // claimed AND kept, which is the only pair worth pinning.
     assert!(
-        !claimed.contains("ONLY_FULL_GROUP_BY"),
-        "ONLY_FULL_GROUP_BY is claimed but a bare non-aggregated column is still allowed"
+        claimed.contains("ONLY_FULL_GROUP_BY"),
+        "ONLY_FULL_GROUP_BY is enforced but not claimed — @@sql_mode says {claimed:?}"
     );
+    exec_ok(&mut s, "CREATE TABLE ofgb (g INT, v INT)");
+    exec_ok(&mut s, "INSERT INTO ofgb VALUES (1, 10), (1, 20)");
+    let (errno, state, _) = err_of(&mut s, "SELECT g, v FROM ofgb GROUP BY g");
+    assert_eq!(
+        errno, 1055,
+        "ER_WRONG_FIELD_WITH_GROUP, as MySQL 9.7.2 answers"
+    );
+    assert_eq!(state, "42000");
 
     // Nothing above landed.
     assert_eq!(query_scalar(&mut s, "SELECT count(*) FROM modes"), "0");

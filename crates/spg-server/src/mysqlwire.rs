@@ -992,6 +992,29 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Unsupported(m) if m.starts_with("Duplicate column name ") => {
             (1060, "42S21", m.clone())
         }
+        // v7.39.2 — ONLY_FULL_GROUP_BY. The engine answers PostgreSQL's
+        // sentence for it, which is the rule SPG enforces; MySQL 9.7.2
+        // words it differently and numbers it 1055
+        // (ER_WRONG_FIELD_WITH_GROUP), and the number is what a driver
+        // branches on. It read 1064 here — a PARSE error — which is
+        // what an unmapped message falls back to and is wrong about
+        // what happened.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.contains("must appear in the GROUP BY clause") =>
+        {
+            // The DETAIL, not the whole error: `EngineError`'s Display
+            // prefixes `eval: ` and `EvalError`'s adds `type mismatch: `,
+            // and the first draft of this arm sent both of those down
+            // the wire. Those are SPG's own classification of the fault,
+            // which no client asked for and neither engine emits — the
+            // PG side already sends the sentence alone.
+            (1055, "42000", detail.clone())
+        }
+        spg_engine::EngineError::Unsupported(m)
+            if m.contains("must appear in the GROUP BY clause") =>
+        {
+            (1055, "42000", m.clone())
+        }
         // v7.39 — the strict-mode value-fitting refusals. The engine
         // words these exactly as MySQL 9.7.2 does, and each wording
         // belongs to one errno; measured, with `sql_mode` set both ways:

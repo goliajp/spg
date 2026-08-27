@@ -894,7 +894,13 @@ pub(crate) fn run(
     });
     let licensed = qualifiers_grouped_by_primary_key(stmt, &group_exprs, schema_cols, catalog);
     let fd_on_primary_key = !licensed.is_empty();
-    if group_keys_all_resolve && !engine.is_some_and(|e| e.backslash_escapes) {
+    // v7.39.2 — "the dialect is MySQL" used to be the whole test here,
+    // so the strict rule was off even under MySQL's own default
+    // `sql_mode`, which carries ONLY_FULL_GROUP_BY. It asks sql_mode
+    // now. The other four dialect checks in this file ask DIFFERENT
+    // questions through the same flag — column naming, HAVING aliases,
+    // collation folding — and are deliberately left alone.
+    if group_keys_all_resolve && !engine.is_some_and(crate::Engine::group_by_is_loose) {
         let offender = stmt
             .items
             .iter()
@@ -945,7 +951,7 @@ pub(crate) fn run(
     // exist`. Grouping by a primary key means one input row per group, so
     // "any value in the group" IS the value — the identical rewrite, reached
     // for a different and much narrower reason.
-    let mysql_loose = engine.is_some_and(|e| e.backslash_escapes);
+    let mysql_loose = engine.is_some_and(crate::Engine::group_by_is_loose);
     let loose_stmt;
     let stmt = if (mysql_loose || fd_on_primary_key) && !group_exprs.is_empty() {
         // The dialect claims every ungrouped column; the functional dependency
