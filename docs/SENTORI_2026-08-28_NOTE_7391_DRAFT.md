@@ -106,9 +106,21 @@ MySQL 9.7.2 keeps `MyTable`, reports it that way from `SHOW TABLES` and
 claim we do not keep.
 
 This is identifier handling in the parser, not a reporting surface, and
-changing it moves where existing data lives — so it gets its own
-measured pass rather than a corner of this release. **If any of your
-schema uses mixed-case names, tell us and it goes first.**
+changing it moves where existing data lives — so it did not go into
+7.39.1.
+
+**It is fixed now and will be in the next release.** A MySQL session
+compares relation names without case, which is MySQL's
+`lower_case_table_names = 1` — and that is what we report now, instead
+of the `0` above, which asserted a case-sensitivity we never performed.
+A table already created with its case kept keeps that name and becomes
+reachable under any spelling, rather than only its own: we did not fold
+at CREATE, because that would have made exactly those tables
+unreachable. Your PostgreSQL sessions are untouched, and pinned in both
+directions.
+
+**If any of your schema uses mixed-case names, tell us** — we would
+rather hear it before that release than after.
 
 Also open, and smaller: a MySQL session's unknown-column error says
 `column "x" does not exist` where MySQL says `Unknown column 'x' in
