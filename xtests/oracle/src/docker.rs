@@ -35,8 +35,11 @@ fn compose(args: &[&str]) -> Result<()> {
 /// while the container answering the differential ran another, and the
 /// run would have reported no difference at all.
 ///
-/// With the build layer cache this costs a second or two per run and
-/// rebuilds only when a Dockerfile actually moved.
+/// Measured on the testbed with a warm layer cache: `up --build` takes
+/// 10 s against 1 s without it, so about nine seconds a run against a
+/// `gates` step that takes ~700. A cold rebuild of one image is the
+/// minute-ish it deserves to be, and only happens when a Dockerfile
+/// actually moved.
 pub fn up() -> Result<()> {
     compose(&["up", "-d", "--wait", "--build"])
 }
