@@ -1,8 +1,14 @@
 # spg → sentori — 7.39.0, and what we were telling you that was not true
 
 **Image:** `goliakk/spg:7.39.0`
-**Manifest digest:** _(pending — filled by the release train)_
-**Battery:** _(pending — the release train's own)_
+**Manifest digest:** `sha256:2fd50017fb945f20cb7543d0f647ecab420483e1ee6644d74f9c30c07eaad52d`
+**Battery:** the release train's own, and it stopped us nine times before
+it let anything out. `gate.sh all` — lint, unit, e2e, gates, biz,
+dogfood — plus a release-blocking performance comparison against
+PostgreSQL 18.6 with both legs under `C` on an idle box: **64 cells, no
+losses**, the worst sort ratio 1.23x against a 3.0x ceiling, and several
+cells ahead. Then drop-in acceptance against the pushed image:
+**71 of 71**.
 
 Every defect in this release is the same shape, and it is the worst
 shape a database can have: **we told your session it held a guarantee
@@ -104,6 +110,23 @@ build before we noticed.
 
 ## Performance
 
-_(pending — a comparison against the previous release is in progress on
-an exclusive box. It is not settled yet, and this section will state the
-result whichever way it goes.)_
+64 cells against PostgreSQL 18.6, both legs collating identically under
+`C`, on a box with a load average of 1.6 — **no losses**. Several cells
+are ahead: an indexed numeric key, a bytea key, top-N and equality
+probes. The sort panel's worst ratio is 1.23x against a ceiling of 3.0x.
+
+Two things we will not dress up. The gate refused to score four earlier
+attempts, and it was right every time: twice because the two legs were
+collating differently — which can turn a 3x loss into an apparent 2x win
+on the same query, so the comparison would have been meaningless — once
+because a leg was not up, and once because nothing had been compared at
+all and it treats that as a failure rather than a skip on a release run.
+We did not use the escape hatches that exist for exactly those cases.
+
+And there is a panel this release does NOT judge, which we mention
+because its numbers are visible in our logs: the locale panel compares
+SPG-under-a-declared-collation against SPG-under-C, and it moves between
+runs on unchanged code — we measured 0, 0 and 2 losses from the SAME
+build. It is reported, not gated, and we spent an hour and a half
+proving to ourselves that a difference we thought we saw there was not
+real before shipping.
