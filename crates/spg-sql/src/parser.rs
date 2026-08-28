@@ -25778,6 +25778,73 @@ impl Parser {
             // SQL/XML `XMLFOREST(value [AS name], …)` — each `value AS name`
             // becomes a `<name>value</name>` element; a bare column infers its
             // own name. Lower to `xmlforest(name1, val1, name2, val2, …)`.
+            // v7.39.2 — MySQL's two CONVERT forms, neither of which parsed.
+            // `CONVERT(expr USING cs)` was a syntax error at USING, and
+            // `CONVERT(expr, CHAR)` was read as PostgreSQL's three-argument
+            // `convert(bytea, src, dest)` and answered `column "char" does
+            // not exist`. Both are casts in MySQL: measured on 9.7.2,
+            // `CONVERT(0x41 USING utf8mb4)` and `CONVERT(0x41, CHAR)` are
+            // both 'A', and `CONVERT(123, CHAR)` is '123'.
+            //
+            // The charset is checked against the same table the introducers
+            // use, so an unknown one is refused rather than quietly ignored.
+            if self.mysql_dialect
+                && first.eq_ignore_ascii_case("convert")
+                && !matches!(self.peek(), Token::RParen)
+            {
+                let save = self.pos;
+                let inner = self.parse_expr(0)?;
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+                    self.advance();
+                    let cs = match self.peek().clone() {
+                        Token::Ident(n) | Token::QuotedIdent(n) => {
+                            self.advance();
+                            n
+                        }
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected a charset after USING, got {other:?}"
+                            )));
+                        }
+                    };
+                    let lc = cs.to_ascii_lowercase();
+                    if lc != "binary" && crate::charset::charset_default_collation(&lc).is_none() {
+                        return Err(self.err(alloc::format!("unknown character set: '{cs}'")));
+                    }
+                    if !matches!(self.peek(), Token::RParen) {
+                        return Err(self.err(alloc::format!(
+                            "expected ')' after CONVERT … USING, got {:?}",
+                            self.peek()
+                        )));
+                    }
+                    self.advance();
+                    let target = if lc == "binary" {
+                        CastTarget::Named("binary".to_string())
+                    } else {
+                        CastTarget::Text
+                    };
+                    return self.finish_postfix_casts(Expr::Cast {
+                        expr: alloc::boxed::Box::new(inner),
+                        target,
+                    });
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    // A type name here is MySQL's cast form; anything else
+                    // (three string arguments) is PostgreSQL's `convert`,
+                    // which keeps its own path.
+                    if let Ok(target) = self.parse_cast_target()
+                        && matches!(self.peek(), Token::RParen)
+                    {
+                        self.advance();
+                        return self.finish_postfix_casts(Expr::Cast {
+                            expr: alloc::boxed::Box::new(inner),
+                            target,
+                        });
+                    }
+                }
+                self.pos = save;
+            }
             if first.eq_ignore_ascii_case("xmlforest") && !matches!(self.peek(), Token::RParen) {
                 let mut args: Vec<Expr> = Vec::new();
                 loop {

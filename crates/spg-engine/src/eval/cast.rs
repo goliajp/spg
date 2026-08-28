@@ -250,6 +250,19 @@ fn cast_mysql_binary(v: Value<'static>, name: &str) -> Result<Value<'static>, Ev
     let limit: Option<usize> = name
         .split_once('(')
         .and_then(|(_, rest)| rest.trim_end_matches(')').trim().parse().ok());
+    // v7.39.2 — a binary source STAYS binary. It used to be rendered
+    // with PG's bytea text, so `CAST(0x41 AS BINARY)` answered the six
+    // characters `\x41` where MySQL 9.7.2 answers the byte 'A', and
+    // `HEX(CAST(0x00FF AS BINARY))` would have described that text
+    // rather than the bytes. `(n)` truncates to n BYTES there —
+    // `HEX(CAST(0x4142 AS BINARY(1)))` is 41, measured.
+    if let Value::Bytes(b) = &v {
+        let bytes = match limit {
+            Some(n) if b.len() > n => b[..n].to_vec(),
+            _ => b.clone().into_owned(),
+        };
+        return Ok(Value::bytes(bytes));
+    }
     let text = match &v {
         Value::Null => return Ok(Value::Null),
         Value::Text(t) => t.to_string(),
@@ -414,6 +427,26 @@ pub fn cast_value_in(
 /// `id::REAL` — the same conversion under a name the parser leaves as
 /// `Named(String)` — allocated one just to hand the name over, and seven more
 /// re-deriving its lowercase form inside.
+/// v7.39.2 — is this cast target a character type, for the purpose of
+/// reading a binary string's bytes as its characters?
+///
+/// `BINARY` and `BINARY(n)` are deliberately absent: MySQL keeps those
+/// binary, and the bytes go out as bytes.
+fn cast_reads_bytes_as_characters(target: &CastTarget) -> bool {
+    match target {
+        CastTarget::Text => true,
+        CastTarget::Named(n) => {
+            let lc = n.to_ascii_lowercase();
+            let base = lc.split('(').next().unwrap_or(&lc);
+            matches!(
+                base,
+                "char" | "varchar" | "character" | "nchar" | "nvarchar" | "text"
+            )
+        }
+        _ => false,
+    }
+}
+
 pub fn cast_value_ref_in(
     v: Value<'static>,
     target: &CastTarget,
@@ -427,6 +460,23 @@ pub fn cast_value_ref_in(
     // implementation: whatever the variant does, the quoted form now does.
     // Round 894 fixed `tsvector` / `tsquery` the same way round and left
     // these open because this path had not been read; it has now.
+    // v7.39.2 — MySQL reads a binary string's BYTES when it casts to a
+    // character type. This path rendered it PG's way instead, so
+    // `CAST(0x41 AS CHAR)` answered the six characters `\x41`, and the
+    // answers built on it were wrong without saying so: measured on MySQL
+    // 9.7.2, `CAST(0x41 AS CHAR)='A'` is 1 and was 0 here, and
+    // `LENGTH(CAST(0x4142 AS CHAR))` is 2 and was 6.
+    //
+    // `CAST(x AS CHAR)` lowers onto `Text` in the MySQL dialect (it is
+    // UNBOUNDED there, round 352); `CHAR(n)` / `VARCHAR(n)` arrive named.
+    let v = match &v {
+        Value::Bytes(b) if mysql && cast_reads_bytes_as_characters(target) => Value::text(
+            b.iter()
+                .map(|&x| x as char)
+                .collect::<alloc::string::String>(),
+        ),
+        _ => v,
+    };
     if let CastTarget::Named(n) = target {
         if n.eq_ignore_ascii_case("regclass") {
             return cast_value_ref_in(v, &CastTarget::RegClass, mysql);
