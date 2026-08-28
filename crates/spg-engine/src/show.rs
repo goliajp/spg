@@ -555,21 +555,8 @@ impl Engine {
         // The names are aliases onto one database (see `CREATE
         // DATABASE`), which is what makes listing them honest rather
         // than a promise of isolation.
-        let mut names: alloc::collections::BTreeSet<alloc::string::String> =
-            ["information_schema", "mysql", "performance_schema", "sys"]
-                .into_iter()
-                .map(alloc::string::String::from)
-                .collect();
-        names.insert(
-            self.session_params
-                .get("spg.database")
-                .cloned()
-                .unwrap_or_else(|| alloc::string::String::from("spg")),
-        );
-        for n in self.catalog.created_databases() {
-            names.insert(n.clone());
-        }
-        let rows: Vec<Row<'static>> = names
+        let rows: Vec<Row<'static>> = self
+            .listed_database_names()
             .into_iter()
             .map(|n| Row::new(alloc::vec![Value::text(n)]))
             .collect();

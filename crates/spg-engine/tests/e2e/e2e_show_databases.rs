@@ -84,3 +84,58 @@ fn show_schemas_is_alias() {
         names(&mut e, "SHOW DATABASES")
     );
 }
+
+#[test]
+fn schemata_lists_databases_for_mysql_and_namespaces_for_postgres() {
+    // v7.39.2 — in MySQL a schema IS a database and this view lists
+    // databases; SPG answered PostgreSQL's three namespaces to both
+    // wires. A client asking "does database X exist" here got `public`,
+    // `pg_catalog` and `information_schema` — and a different answer
+    // from `SHOW DATABASES`, which is the same question spelled the
+    // other way.
+    let mut m = Engine::new();
+    m.set_mysql_dialect(true);
+    m.execute("CREATE DATABASE seen_by_both").expect("create");
+    let schemata = names(
+        &mut m,
+        "SELECT schema_name FROM information_schema.schemata",
+    );
+    assert_eq!(
+        schemata,
+        names(&mut m, "SHOW DATABASES"),
+        "one question, two spellings, one answer"
+    );
+    assert!(
+        schemata.contains(&"seen_by_both".to_string()),
+        "{schemata:?}"
+    );
+    assert!(
+        !schemata.contains(&"public".to_string()),
+        "MySQL has no `public`"
+    );
+    // MySQL's catalog column is `def`; PostgreSQL's is the database.
+    assert_eq!(
+        names(
+            &mut m,
+            "SELECT catalog_name FROM information_schema.schemata LIMIT 1"
+        ),
+        vec!["def".to_string()]
+    );
+
+    // The negative control: a PostgreSQL session keeps its namespaces.
+    let mut p = Engine::new();
+    let pg = names(
+        &mut p,
+        "SELECT schema_name FROM information_schema.schemata",
+    );
+    assert!(pg.contains(&"public".to_string()), "{pg:?}");
+    assert!(pg.contains(&"pg_catalog".to_string()), "{pg:?}");
+    assert!(!pg.contains(&"mysql".to_string()), "{pg:?}");
+    assert_eq!(
+        names(
+            &mut p,
+            "SELECT catalog_name FROM information_schema.schemata LIMIT 1"
+        ),
+        vec!["spg".to_string()]
+    );
+}

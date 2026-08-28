@@ -1433,6 +1433,7 @@ impl Engine {
                     let (schema, rows) = crate::system_catalog::synth_information_schema_schemata(
                         self.active_catalog(),
                         self.speaks_mysql,
+                        &self.listed_database_names(),
                     );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
