@@ -4924,13 +4924,11 @@ pub fn eval_expr(
             // per evaluation. PG rejects an unknown name whether or not
             // anything compares it — `SELECT 'a' COLLATE "nosuch"` is an
             // error there — and evaluating the projection is that.
-            // A MySQL spelling on the PostgreSQL wire does not exist,
-            // which is PG's answer and what the round-371 pin has always
-            // asserted — it passed on the parser's old allow-list, and
-            // the reason belongs here now that the clause is a node.
-            let spg_only_here =
-                crate::collate::is_spg_only_spelling(collation) && !ctx.mysql_dialect;
-            if spg_only_here || !crate::collate::is_known(collation) {
+            // The wire question is asked by the PARSER, which knows
+            // the session's dialect; this context does not always (the
+            // INSERT path builds one with `mysql_dialect: false`). Here
+            // it is only "does SPG have a collation by this name".
+            if !crate::collate::is_known(collation) {
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "collation \"{collation}\" for encoding \"UTF8\" does not exist"

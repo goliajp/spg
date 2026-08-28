@@ -550,6 +550,7 @@ mod e2e_mysql_int_temporal_round414;
 mod e2e_mysql_int_width_round386;
 mod e2e_mysql_interval_expr_round422;
 mod e2e_mysql_interval_fn_round409;
+mod e2e_mysql_introducer_v7392;
 mod e2e_mysql_is_true_round397;
 mod e2e_mysql_json;
 mod e2e_mysql_json_array;

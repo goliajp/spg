@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod charset;
 pub mod lexer;
 pub mod parser;
 
