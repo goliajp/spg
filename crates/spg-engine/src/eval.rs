@@ -2170,6 +2170,24 @@ fn collate_compare_hook(
     // `text_compare_of` from a MySQL collation NAME, and a PostgreSQL
     // database collating as `en_US.utf8` does not pad — inheritance
     // reaching that would make `'a' = 'a  '` true everywhere.
+    // v7.39.2 — an operand WRITTEN as `BINARY x`, `CAST(x AS BINARY)` or
+    // `x COLLATE utf8mb4_bin` asks for byte order, and the database's
+    // collation must not answer over it.
+    //
+    // The `_bin` spelling lowers onto the BINARY cast, so it never
+    // reaches `derive` as a collation at all — the fallback below then
+    // ordered by the database's locale. Measured on MySQL 9.7.2 against
+    // an image collating `en_US.utf8`: `'B' COLLATE utf8mb4_bin < 'a'`
+    // is 1 there and was 0 here, and `>` was wrong to match. The fold
+    // was already suppressed, so `=` was right and only the ORDERING
+    // comparisons were wrong — the half that works is what hid it.
+    //
+    // A COLUMN whose stored collation is `Binary` is NOT this: that is
+    // the struct's default and means "nothing was said", which is why
+    // `operand_is_binary_column` is deliberately not consulted here.
+    if crate::eval::is_binary_coerced(lhs) || crate::eval::is_binary_coerced(rhs) {
+        return None;
+    }
     let db = ctx
         .catalog
         .map(spg_storage::Catalog::db_collation)

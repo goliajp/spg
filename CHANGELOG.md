@@ -12,6 +12,25 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A written byte-order collation lost to the database's own.** On the
+  shipped image, which collates `en_US.utf8`, `'B' COLLATE utf8mb4_bin <
+  'a'` answered 0 where MySQL 9.7.2 answers 1 — 0x42 before 0x61 — and
+  `>` was wrong to match. `BINARY 'B' < 'a'` and `CAST('B' AS BINARY) <
+  'a'`, the other two spellings of the same request, went the same way,
+  and so did the predicate over a column.
+
+  The FOLD was already suppressed, so `=` was right; only the ordering
+  comparisons were wrong, and the half that worked is what hid it. The
+  cause: `COLLATE <…_bin>` lowers onto a BINARY cast, so the collation
+  derivation never saw a collation at all and the comparison fell back
+  to the DATABASE's. A comparison that asks for nothing still takes the
+  database's ordering — only a written binary operand overrides it, and
+  a column whose stored collation is the `Binary` default is not that.
+
+  It exists only on a database that collates by a locale, which is what
+  the image ships and what an in-process `Engine::new()` does not: every
+  row above was already right on a byte-ordered database.
+
 - **A collation name that does not exist was accepted and then
   ignored.** `SELECT 'a' COLLATE nosuch_ci` answered `a` on the MySQL
   wire, and `'B' COLLATE nosuch_ci < 'a'` answered whatever the session
