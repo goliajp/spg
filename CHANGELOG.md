@@ -12,6 +12,31 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **Casting a binary string to a character type answered PostgreSQL's hex
+  text, and `CONVERT` had neither of MySQL's two forms.** Measured against
+  MySQL 9.7.2:
+
+  | | MySQL 9.7.2 | SPG |
+  |---|---|---|
+  | `CAST(0x41 AS CHAR)` | `A` | `\x41` |
+  | `CAST(0x41 AS CHAR) = 'A'` | 1 | **0** |
+  | `LENGTH(CAST(0x4142 AS CHAR))` | 2 | **6** |
+  | `CAST(0x41 AS BINARY)` | `A` | `\x41` |
+  | `CONVERT(0x41, CHAR)` | `A` | `column "char" does not exist` |
+  | `CONVERT(0x41 USING utf8mb4)` | `A` | syntax error at `USING` |
+
+  The two middle rows are silent wrong answers — a comparison that misses
+  and a length six characters too long, both describing PostgreSQL's
+  rendering of the value rather than the value.
+
+  A cast to a character type now reads the bytes; `BINARY` keeps them as
+  bytes, which is what makes its comparison byte-wise and its `(n)`
+  truncate by byte. `CONVERT(expr, type)` and `CONVERT(expr USING
+  charset)` are both casts, with the charset checked against the same
+  table the introducers use so an unknown one is refused rather than
+  ignored. PostgreSQL's own three-argument `convert(bytea, src, dest)`
+  keeps its path.
+
 - **`SET sql_mode='NO_BACKSLASH_ESCAPES'` turned the entire MySQL dialect
   off.** One flag was answering two questions — "does `\` escape inside a
   string" and "does this session speak MySQL at all" — so a session that
