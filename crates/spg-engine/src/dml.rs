@@ -1105,6 +1105,7 @@ impl Engine {
         view_check: Option<ViewCheck>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        let mysql_dialect = self.backslash_escapes;
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
@@ -1859,7 +1860,7 @@ impl Engine {
                 .iter()
                 .map(|(_pos, new_vals)| new_vals.clone())
                 .collect();
-            apply_generated_stored_columns(&schema_cols, &mut staged)?;
+            apply_generated_stored_columns(&schema_cols, &mut staged, mysql_dialect)?;
             for ((_pos, new_vals), recomputed) in planned.iter_mut().zip(staged) {
                 *new_vals = recomputed;
             }
@@ -2097,7 +2098,7 @@ impl Engine {
                 // `NEW.v`. PG's order is BEFORE trigger → generated → write.
                 if !before_update_triggers.is_empty() {
                     let mut one = [core::mem::take(&mut new_row.values)];
-                    apply_generated_stored_columns(&schema_cols, &mut one)?;
+                    apply_generated_stored_columns(&schema_cols, &mut one, mysql_dialect)?;
                     new_row.values = core::mem::take(&mut one[0]);
                 }
                 applied_after_before.push((*pos, new_row, old_row));
@@ -4666,6 +4667,11 @@ impl Engine {
     }
 
     fn exec_insert_inner(&mut self, mut stmt: InsertStatement) -> Result<QueryResult, EngineError> {
+        // v7.39.2 — the session's dialect, read once here: the stored
+        // generated columns are computed both before the row loop and again
+        // inside `insert_parsed_rows`, which is a free fn holding the table's
+        // mutable borrow and so cannot reach `self`.
+        let insert_mysql_dialect = self.backslash_escapes;
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
         // leading WITH clause first (running any modifying CTE
         // bodies against the active catalog so their writes land
@@ -5004,7 +5010,7 @@ impl Engine {
         // (so the expression sees the materialised row)but BEFORE
         // FK / CHECK / UNIQUE so those guards reason about the
         // computed value the way they would for any literal column.
-        apply_generated_stored_columns(&column_meta, &mut all_values)?;
+        apply_generated_stored_columns(&column_meta, &mut all_values, insert_mysql_dialect)?;
         // v7.39 (round 141) — conditional DO INSTEAD NOTHING: drop the proposed
         // rows a rule's WHERE (over NEW = the post-default row) blocks, before any
         // constraint check, matching PG's query-rewrite ordering.
@@ -5241,6 +5247,7 @@ impl Engine {
                 trigger_session_cfg.as_deref(),
                 stmt.returning.is_some() || !also_ins.is_empty(),
                 &mut raised_notices,
+                insert_mysql_dialect,
             )?;
         let _ = skipped_count;
         // v7.12.7 — drop the table mut borrow and drain any
@@ -6845,6 +6852,11 @@ fn build_tuple_pos(
 pub(crate) fn apply_generated_stored_columns(
     column_meta: &[ColumnSchema],
     rows: &mut [Vec<Value<'static>>],
+    // v7.39.2 — the stored expression is evaluated once, at write time, and
+    // the answer lands on disk. Without the session's dialect here a MySQL
+    // client's `GENERATED ALWAYS AS (LENGTH(s)) STORED` stored PG's
+    // character count where MySQL counts bytes: `'中'` wrote 1, not 3.
+    mysql_dialect: bool,
 ) -> Result<(), EngineError> {
     use spg_engine_no_alias::ParsedExpr;
     let mut parsed: Vec<Option<ParsedExpr>> = Vec::with_capacity(column_meta.len());
@@ -6879,7 +6891,7 @@ pub(crate) fn apply_generated_stored_columns(
                 default_text_search_config: None,
                 sequence_resolver: None,
                 catalog: None,
-                mysql_dialect: false,
+                mysql_dialect,
                 session_gucs: None,
                 users: None,
                 fn_depth: 0,
@@ -7563,6 +7575,8 @@ fn insert_parsed_rows(
     // v7.39 (round 757, F31-B3) — RAISE messages surface here; the
     // caller queues them into the session (this is a free fn, no self).
     raised_notices: &mut Vec<(crate::NoticeSeverity, alloc::string::String)>,
+    // v7.39.2 — for the stored generated columns applied per row below.
+    mysql_dialect: bool,
 ) -> Result<
     (
         Vec<Vec<Value<'static>>>,
@@ -7656,7 +7670,7 @@ fn insert_parsed_rows(
         // over the trigger's output. (No-op when there are no generated columns.)
         if !before_insert_triggers.is_empty() {
             let mut one = [core::mem::take(&mut row.values)];
-            apply_generated_stored_columns(column_meta, &mut one)?;
+            apply_generated_stored_columns(column_meta, &mut one, mysql_dialect)?;
             row.values = core::mem::take(&mut one[0]);
         }
         if returning_enabled {
