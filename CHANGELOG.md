@@ -12,6 +12,21 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`information_schema.schemata` answered PostgreSQL's namespaces to a
+  MySQL client.** In MySQL a schema IS a database and that view lists
+  databases; SPG gave `public`, `pg_catalog` and `information_schema` to
+  both wires. A client asking "does database X exist" there got a
+  different answer from `SHOW DATABASES`, which is the same question
+  spelled the other way — and neither matched `pg_database`.
+
+  All three read one registry now. `catalog_name` also answers MySQL's
+  `def` on that side, where PostgreSQL names the database.
+
+  An existing pin asked this view about `public` and now asks it about
+  the database: `public` is a PostgreSQL namespace and MySQL has none, so
+  it is no longer a row on that wire. The charset and collation it checks
+  are still reported, on the row a MySQL client reads.
+
 - **`SHOW DATABASES` could not see a database this server had just been
   asked to create.** It was five hard-coded names, while `pg_database` —
   which the PostgreSQL wire answers the same question with — listed

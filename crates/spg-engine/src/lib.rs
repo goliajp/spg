@@ -2913,6 +2913,35 @@ impl Engine {
     /// string — failed against both oracles while the harness believed
     /// it had switched dialects. Two calls meaning one thing is the
     /// hazard; this is the one call.
+    /// v7.39.2 — the databases a MySQL session lists.
+    ///
+    /// MySQL's system schemas, the database this connection is on, and
+    /// every name `CREATE DATABASE` has been asked for — the same set
+    /// `pg_database` answers with, plus the four MySQL always shows. One
+    /// rule, because `SHOW DATABASES` and
+    /// `information_schema.schemata` are the same question asked twice
+    /// and they used to disagree with each other AND with `pg_database`.
+    #[must_use]
+    pub(crate) fn listed_database_names(
+        &self,
+    ) -> alloc::collections::BTreeSet<alloc::string::String> {
+        let mut names: alloc::collections::BTreeSet<alloc::string::String> =
+            ["information_schema", "mysql", "performance_schema", "sys"]
+                .into_iter()
+                .map(alloc::string::String::from)
+                .collect();
+        names.insert(
+            self.session_params
+                .get("spg.database")
+                .cloned()
+                .unwrap_or_else(|| alloc::string::String::from("spg")),
+        );
+        for n in self.catalog.created_databases() {
+            names.insert(n.clone());
+        }
+        names
+    }
+
     /// v7.39.2 — name the database this session is on.
     ///
     /// One database is served whatever the name (see `CREATE DATABASE`),

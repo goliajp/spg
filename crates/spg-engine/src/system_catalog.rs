@@ -791,6 +791,14 @@ pub(crate) fn synth_information_schema_tables(
 pub(crate) fn synth_information_schema_schemata(
     _cat: &Catalog,
     mysql: bool,
+    // v7.39.2 — the databases a MySQL session lists, from
+    // `Engine::listed_database_names`. In MySQL a schema IS a database
+    // and this view lists databases; SPG answered PostgreSQL's three
+    // namespaces to both wires, so a MySQL client asking "does database
+    // X exist" here got `public`, `pg_catalog` and `information_schema`
+    // — and a different answer from `SHOW DATABASES`, which is the same
+    // question spelled the other way.
+    mysql_databases: &alloc::collections::BTreeSet<alloc::string::String>,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.39 — the columns a MySQL reflection reads off a schema.
     // PostgreSQL 18.6 has `default_character_set_name` and leaves it
@@ -842,11 +850,22 @@ pub(crate) fn synth_information_schema_schemata(
     // materialise_meta_view is what found it; nothing had, because a row
     // is an untyped value list. Building the three rows from one shape
     // is why the width can no longer drift per row.
-    let rows: Vec<Row<'static>> = ["public", "pg_catalog", "information_schema"]
+    // v7.39.2 — MySQL's catalog is `def` (measured on 9.7.2); PG's is the
+    // database name, which SPG answers as `spg`.
+    let catalog_name = if mysql { "def" } else { "spg" };
+    let listed: Vec<alloc::string::String> = if mysql {
+        mysql_databases.iter().cloned().collect()
+    } else {
+        ["public", "pg_catalog", "information_schema"]
+            .into_iter()
+            .map(alloc::string::String::from)
+            .collect()
+    };
+    let rows: Vec<Row<'static>> = listed
         .into_iter()
         .map(|name| {
             let mut vals = alloc::vec![
-                Value::text("spg"),
+                Value::text(catalog_name),
                 Value::text(name),
                 Value::text("admin"),
                 Value::Null,

@@ -122,10 +122,18 @@ fn a_pg_spelling_in_a_collate_clause_is_not_echoed_as_a_mysql_collation() {
 fn the_schema_reports_its_default_charset_and_collation_to_mysql() {
     let mut e = Engine::new();
     e.execute("SET sql_mode=''").unwrap();
+    // v7.39.2 — asked about the DATABASE, not about `public`.
+    //
+    // In MySQL a schema IS a database and this view lists databases;
+    // `public` is a PostgreSQL namespace and MySQL has none, so it is no
+    // longer a row here. Asking for it found nothing and this test
+    // indexed row 0 of an empty answer — which is the right failure for
+    // the wrong subject, not a lost capability: the charset and
+    // collation are still reported, on the row a MySQL client reads.
     let got = rows(
         &mut e,
         "SELECT default_character_set_name, default_collation_name \
-         FROM information_schema.schemata WHERE schema_name = 'public'",
+         FROM information_schema.schemata WHERE schema_name = 'spg'",
     );
     assert_eq!(got[0], ["utf8mb4", "utf8mb4_0900_ai_ci"]);
 }
