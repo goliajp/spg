@@ -22936,7 +22936,15 @@ impl Parser {
                 // `is_binary_coerced`. A `_ci` family override folds, and
                 // under the MySQL dialect the default already folds, so it
                 // absorbs as a no-op; likewise the C / byte-order spellings.
-                if self.mysql_dialect && (lc.ends_with("_bin") || lc == "binary") {
+                // v7.39.2 — against MySQL's own list, not against the
+                // shape of the name. `nosuch_bin` took this shortcut and
+                // became a BINARY cast; `nosuch_ci` took the one below
+                // and was absorbed as a no-op. Either way the client
+                // named a collation that does not exist and was told
+                // nothing. An unknown name now falls through to the
+                // node, and the engine refuses it.
+                let real = crate::charset::is_mysql_collation(&lc);
+                if self.mysql_dialect && real && (lc.ends_with("_bin") || lc == "binary") {
                     expr = Expr::Cast {
                         expr: alloc::boxed::Box::new(expr),
                         target: CastTarget::Named("binary".to_string()),
@@ -22944,7 +22952,7 @@ impl Parser {
                     continue;
                 }
                 let mysql_ci = self.mysql_dialect
-                    && (lc.ends_with("_ci")
+                    && ((real && lc.ends_with("_ci"))
                         || matches!(lc.as_str(), "case_insensitive" | "nocase"));
                 // v7.39 (round 691/692) — inside an ORDER BY key EVERY name
                 // goes to the lowering channel, the byte-order spellings

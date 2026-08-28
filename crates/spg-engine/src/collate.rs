@@ -455,7 +455,16 @@ pub(crate) fn is_known(name: &str) -> bool {
     if lower == "case_insensitive" || lower == "nocase" {
         return true;
     }
-    is_spg_only_spelling(&lower)
+    // v7.39.2 — MySQL's names, from MySQL's own list rather than from
+    // the shape of the string.
+    //
+    // The rule here was a SUFFIX — anything ending in `_ci`, `_cs` or
+    // `_bin`. So `SELECT 'a' COLLATE nosuch_ci` was "known", and then
+    // silently ignored: the comparison did whatever the session would
+    // have done anyway and the client that named a collation was never
+    // told it had not been used. Measured on MySQL 9.7.2, that is
+    // `ERROR 1273 (HY000): Unknown collation: 'nosuch_ci'`.
+    spg_sql::charset::is_mysql_collation(&lower)
 }
 
 /// A collation name SPG has and PostgreSQL 18.6 does not.
@@ -479,11 +488,22 @@ pub(crate) fn is_spg_only_spelling(name: &str) -> bool {
         || lower.ends_with("_bin")
 }
 
-/// The message PostgreSQL 18.4 gives for a name that is not there.
-pub(crate) fn unknown_collation_error(name: &str) -> crate::EngineError {
-    crate::EngineError::Unsupported(alloc::format!(
-        "collation \"{name}\" for encoding \"UTF8\" does not exist"
-    ))
+/// What each engine says for a name that is not there.
+///
+/// v7.39.2 — MySQL 9.7.2: `Unknown collation: 'nosuch_ci'`, errno 1273.
+/// PostgreSQL 18.6: `collation "nosuch" for encoding "UTF8" does not
+/// exist`. Both measured. The wording is what the MySQL wire keys its
+/// errno off, the same way `Duplicate column name` does.
+pub(crate) fn unknown_collation_error(name: &str, mysql: bool) -> crate::EngineError {
+    crate::EngineError::Unsupported(unknown_collation_text(name, mysql))
+}
+
+pub(crate) fn unknown_collation_text(name: &str, mysql: bool) -> alloc::string::String {
+    if mysql {
+        alloc::format!("Unknown collation: '{name}'")
+    } else {
+        alloc::format!("collation \"{name}\" for encoding \"UTF8\" does not exist")
+    }
 }
 
 /// Whether this build can perform a collation by that name.

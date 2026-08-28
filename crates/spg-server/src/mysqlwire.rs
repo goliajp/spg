@@ -992,6 +992,14 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Unsupported(m) if m.starts_with("Duplicate column name ") => {
             (1060, "42S21", m.clone())
         }
+        // v7.39.2 — a collation name MySQL does not have. The engine
+        // words it as MySQL 9.7.2 does when the session is MySQL
+        // (`Unknown collation: 'nosuch_ci'`); this carries its errno.
+        // The PostgreSQL wording never reaches here, so the prefix
+        // cannot match a PG session's message by accident.
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Unknown collation: ") => {
+            (1273, "HY000", m.clone())
+        }
         // v7.39.2 — ONLY_FULL_GROUP_BY. The engine answers PostgreSQL's
         // sentence for it, which is the rule SPG enforces; MySQL 9.7.2
         // words it differently and numbers it 1055
@@ -999,6 +1007,13 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         // branches on. It read 1064 here — a PARSE error — which is
         // what an unmapped message falls back to and is wrong about
         // what happened.
+        // v7.39.2 — the same failure reached through an EXPRESSION
+        // (`SELECT 'a' COLLATE nosuch_ci`) rather than a declaration.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("Unknown collation: ") =>
+        {
+            (1273, "HY000", detail.clone())
+        }
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
             if detail.contains("must appear in the GROUP BY clause") =>
         {

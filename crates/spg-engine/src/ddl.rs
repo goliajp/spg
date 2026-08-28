@@ -1318,7 +1318,10 @@ impl Engine {
         if let Some((_, name)) = &collation
             && !crate::collate::is_known(name)
         {
-            return Err(crate::collate::unknown_collation_error(name));
+            return Err(crate::collate::unknown_collation_error(
+                name,
+                self.speaks_mysql,
+            ));
         }
         // v7.38.18 — the warning that used to stand here said range
         // comparisons "still compare by bytes". That stopped being true
@@ -3881,7 +3884,10 @@ impl Engine {
             if !crate::collate::is_known(name) {
                 // v7.38.18 (G2) — see the ALTER site: PG 18.4 refuses a
                 // name that is not in its catalogue, and so does this.
-                return Err(crate::collate::unknown_collation_error(name));
+                return Err(crate::collate::unknown_collation_error(
+                    name,
+                    self.speaks_mysql,
+                ));
             }
             if !crate::collate::is_supported(name) {
                 self.warning(alloc::format!(

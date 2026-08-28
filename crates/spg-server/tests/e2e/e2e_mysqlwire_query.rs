@@ -1674,3 +1674,23 @@ fn group_concat_over_binary_strings_prints_its_bytes() {
         "A,B"
     );
 }
+
+/// v7.39.2 — an unknown collation carries MySQL's errno, not 1064.
+///
+/// A driver branches on the number. Measured on MySQL 9.7.2:
+/// `ERROR 1273 (HY000): Unknown collation: 'nosuch_ci'`.
+#[test]
+fn an_unknown_collation_is_1273() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    // Through an EXPRESSION and through a DECLARATION — two different
+    // engine errors, and the errno has to be the same from both.
+    let (errno, state, msg) = err_of(&mut s, "SELECT 'a' COLLATE nosuch_ci");
+    assert_eq!((errno, state.as_str()), (1273, "HY000"), "{msg}");
+    assert_eq!(msg, "Unknown collation: 'nosuch_ci'");
+    let (errno, state, msg) = err_of(&mut s, "CREATE TABLE uc (s VARCHAR(8) COLLATE nosuch_ci)");
+    assert_eq!((errno, state.as_str()), (1273, "HY000"), "{msg}");
+    assert_eq!(msg, "Unknown collation: 'nosuch_ci'");
+    // The control: a name MySQL does have is not refused.
+    assert_eq!(query_scalar(&mut s, "SELECT 'a' COLLATE utf8mb4_bin"), "a");
+}
