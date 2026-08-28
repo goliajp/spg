@@ -427,7 +427,16 @@ pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
         Expr::Cast {
             target: spg_sql::ast::CastTarget::Named(n),
             ..
-        } if n.eq_ignore_ascii_case("binary") || n.to_ascii_lowercase().starts_with("binary(")
+        } if n.eq_ignore_ascii_case("binary")
+            || n.to_ascii_lowercase().starts_with("binary(")
+            // v7.39.2 — MySQL's `X'41'`, `0x41` and `b'…'` lower onto a
+            // bytea cast, and the binary character set does not fold case.
+            // Without this the fold applied to the TEXT side only, so
+            // `0x61 = 'a'` answered 1 (both already lower) while
+            // `X'41' = 'A'` answered 0 — the fold turned 'A' into 0x61 and
+            // compared it against the byte 0x41. MySQL 9.7.2 answers 1 and,
+            // for `X'41' = 'a'`, 0.
+            || n.eq_ignore_ascii_case("bytea")
     )
 }
 

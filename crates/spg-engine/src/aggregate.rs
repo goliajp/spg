@@ -461,7 +461,7 @@ pub(crate) struct AggState {
     /// used). Populated only on the general path when the call has a
     /// second argument; the fused lane is literal-separator only and
     /// keeps the single `separator` snapshot below.
-    item_seps: Vec<Option<String>>,
+    item_seps: Vec<Option<alloc::vec::Vec<u8>>>,
     /// v7.25 (round-17) — per-group dedupe set for DISTINCT
     /// aggregates (encoded values; NULLs never reach it because
     /// the caller's skip runs after the per-aggregate NULL rules).
@@ -497,7 +497,10 @@ pub(crate) struct AggState {
     /// default, DISTINCT fallback); the per-row truth lives in
     /// `item_seps` (the old note claimed "use the latest row's
     /// value" was PG's behaviour — measured false, PG is per-row).
-    separator: Option<String>,
+    // v7.39.2 — bytes, not a String: PG's `string_agg(bytea, bytea)`
+    // takes a bytea separator, and a bytea result must be joined with the
+    // separator's bytes. A text separator stores its own UTF-8.
+    separator: Option<alloc::vec::Vec<u8>>,
     /// v7.17.0 — running boolean accumulator for bool_and /
     /// bool_or / every. `None` until the first non-NULL input;
     /// at finalize None → SQL NULL.
@@ -1961,6 +1964,12 @@ fn render_string_agg_item(v: &Value<'_>) -> Option<Value<'static>> {
         Value::SmallInt(n) => Some(Value::text(n.to_string())),
         Value::Float(f) => Some(Value::text(f.to_string())),
         Value::Bool(b) => Some(Value::text(if *b { "1" } else { "0" })),
+        // v7.39.2 — PG18 answers `string_agg(bytea, ',')` with a BYTEA
+        // (`\x412c42` for 'A' and 'B' joined by a comma); SPG refused it on
+        // both dialects, which is also what made MySQL's
+        // `GROUP_CONCAT(X'41')` an error. The bytes stay bytes and the join
+        // below decides the result's type from them.
+        Value::Bytes(b) => Some(Value::bytes(b.clone().into_owned())),
         _ => None,
     }
 }
@@ -1987,8 +1996,14 @@ fn fill_states_from_fused(
                         state.item_keys = core::mem::take(&mut a.item_keys);
                     }
                 }
+                // v7.39.2 — no bytea arm here, deliberately: a bytea
+                // separator is always written as a CAST (`'\x2c'::bytea`,
+                // and MySQL's `X'2c'` lowers onto the same cast), never as
+                // a bare literal, so this fused lane — literal separators
+                // only — cannot see one. An arm was written and removed
+                // again when no shape could be found that reached it.
                 if let Some(Value::Text(sep)) = &arg2_literal_val[i] {
-                    state.separator = Some(sep.to_string());
+                    state.separator = Some(sep.as_bytes().to_vec());
                 }
                 let a = &accs[*slot];
                 state.num.count = a.num.count;
@@ -4364,7 +4379,8 @@ fn finalize_synth_rows(
                 // v7.39 (round 762, F31-C2) — the per-row separators
                 // travel with their items through the sort.
                 if sorted.item_seps.len() == sorted.items.len() {
-                    let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
+                    let mut new_seps: Vec<Option<alloc::vec::Vec<u8>>> =
+                        Vec::with_capacity(idx.len());
                     for &j in &idx {
                         new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
                     }
@@ -4486,7 +4502,7 @@ fn finalize_one_group(
             }
             // v7.39 (round 762, F31-C2) — separators travel with items.
             if sorted.item_seps.len() == sorted.items.len() {
-                let mut new_seps: Vec<Option<String>> = Vec::with_capacity(idx.len());
+                let mut new_seps: Vec<Option<alloc::vec::Vec<u8>>> = Vec::with_capacity(idx.len());
                 for &j in &idx {
                     new_seps.push(core::mem::take(&mut sorted.item_seps[j]));
                 }
@@ -5567,10 +5583,10 @@ pub(crate) fn update_state(
         // NULL".
         AggKind::StringAgg => {
             let has_arg2 = arg2.is_some();
-            if let Some(sep) = arg2
-                && let Value::Text(s) = sep
-            {
-                st.separator = Some(s.to_string());
+            match arg2 {
+                Some(Value::Text(s)) => st.separator = Some(s.as_bytes().to_vec()),
+                Some(Value::Bytes(b)) => st.separator = Some(b.to_vec()),
+                _ => {}
             }
             if is_null {
                 return Ok(());
@@ -5586,7 +5602,8 @@ pub(crate) fn update_state(
                 // rides with its item (NULL separator → None → empty).
                 if has_arg2 {
                     st.item_seps.push(match arg2 {
-                        Some(Value::Text(sp)) => Some(sp.to_string()),
+                        Some(Value::Text(sp)) => Some(sp.as_bytes().to_vec()),
+                        Some(Value::Bytes(sp)) => Some(sp.to_vec()),
                         _ => None,
                     });
                 }
@@ -6027,49 +6044,63 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             }
             // group_concat defaults to ',' (MySQL); xmlagg and a
             // separator-less string_agg join bare.
-            let sep = st.separator.clone().unwrap_or_else(|| {
+            let sep: alloc::vec::Vec<u8> = st.separator.clone().unwrap_or_else(|| {
                 if name == "group_concat" {
-                    ",".into()
+                    alloc::vec![b',']
                 } else {
-                    String::new()
+                    alloc::vec::Vec::new()
                 }
             });
             // v7.39 (round 762, F31-C2) — per-row separators, when the
             // accumulate path carried them (aligned with items).
-            let per_row: Option<&[Option<String>]> =
+            let per_row: Option<&[Option<alloc::vec::Vec<u8>>]> =
                 if !st.item_seps.is_empty() && st.item_seps.len() == st.items.len() {
                     Some(&st.item_seps)
                 } else {
                     None
                 };
-            let mut out = String::new();
+            // v7.39.2 — a bytea input aggregates to a bytea (PG18's
+            // `string_agg(bytea, bytea)`); every other input to text. The
+            // decision is the items', not the caller's: the aggregate is
+            // typed, so the first item speaks for all of them.
+            let binary = matches!(st.items.first(), Some(Value::Bytes(_)));
+            let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
             for (i, item) in st.items.iter().enumerate() {
                 if i > 0 {
                     match per_row {
                         Some(seps) => {
                             if let Some(sp) = &seps[i] {
-                                out.push_str(sp);
+                                out.extend_from_slice(sp);
                             }
                         }
-                        None => out.push_str(&sep),
+                        None => out.extend_from_slice(&sep),
                     }
                 }
                 match item {
-                    Value::Text(s) => out.push_str(s),
+                    Value::Text(s) => out.extend_from_slice(s.as_bytes()),
+                    Value::Bytes(b) => out.extend_from_slice(b),
                     // MySQL group_concat coerces scalars to text;
                     // harmless for string_agg (typed inputs are
                     // Text already).
-                    Value::Int(n) => out.push_str(&n.to_string()),
-                    Value::BigInt(n) => out.push_str(&n.to_string()),
-                    Value::SmallInt(n) => out.push_str(&n.to_string()),
-                    Value::Float(f) => out.push_str(&f.to_string()),
+                    Value::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
+                    Value::BigInt(n) => out.extend_from_slice(n.to_string().as_bytes()),
+                    Value::SmallInt(n) => out.extend_from_slice(n.to_string().as_bytes()),
+                    Value::Float(f) => out.extend_from_slice(f.to_string().as_bytes()),
                     Value::Bool(b) => {
-                        out.push_str(if *b { "1" } else { "0" });
+                        out.extend_from_slice(if *b { b"1" } else { b"0" });
                     }
                     _ => {}
                 }
             }
-            Value::text(out)
+            if binary {
+                return Value::bytes(out);
+            }
+            // Every non-binary arm above wrote UTF-8, so this cannot fail;
+            // a lossy conversion here would turn a bug into mojibake.
+            match alloc::string::String::from_utf8(out) {
+                Ok(text) => Value::text(text),
+                Err(err) => Value::bytes(err.into_bytes()),
+            }
         }
         // v7.17.0 — array_agg: collect into a typed array. NULL
         // elements are preserved per PG. Result type is decided
@@ -6674,8 +6705,13 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
                 scale: 0,
             },
         },
-        // v7.17.0 — string_agg always returns TEXT.
-        "string_agg" | "group_concat" | "xmlagg" => DataType::Text,
+        // v7.17.0 — string_agg returns TEXT. v7.39.2 — except over bytea,
+        // where PG18's `string_agg(bytea, bytea)` returns BYTEA and the
+        // finalize agrees.
+        "string_agg" | "group_concat" | "xmlagg" => match arg_ty {
+            Some(DataType::Bytes) => DataType::Bytes,
+            _ => DataType::Text,
+        },
         // v7.39 (read01 round 73) — the STATIC type follows the same rule the
         // finalize does, so `pg_typeof(array_agg(b))` is `boolean[]`.
         "array_agg" => match arg_ty {

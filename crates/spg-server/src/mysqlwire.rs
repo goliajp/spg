@@ -2096,6 +2096,12 @@ fn encode_text_row(values: &[Value], columns: &[ColumnSchema]) -> Vec<u8> {
                 // MySQL text protocol: NULL is a single byte 0xfb.
                 buf.push(0xfb);
             }
+            // v7.39.2 — a binary string goes out as its bytes. MySQL's
+            // `X'41'` is the byte 0x41 and prints as `A`; routing it
+            // through the text renderer gave PG's `\x41` form, and
+            // rendering it through a String would re-encode any byte
+            // above 0x7f as two UTF-8 bytes.
+            Value::Bytes(b) => encode_lenenc_string(&mut buf, b),
             other => {
                 // v7.39 (round 425) — a temporal column with a DECLARED
                 // fractional-seconds precision prints exactly that many
