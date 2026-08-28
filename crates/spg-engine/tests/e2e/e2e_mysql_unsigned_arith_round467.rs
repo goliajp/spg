@@ -15,7 +15,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn mysql_engine() -> Engine {
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("CREATE TABLE u (a INT UNSIGNED, b INT UNSIGNED, c BIGINT UNSIGNED, t TINYINT UNSIGNED, s SMALLINT UNSIGNED)").unwrap();
     e.execute("INSERT INTO u VALUES (1, 5, 1, 1, 1)").unwrap();
     e

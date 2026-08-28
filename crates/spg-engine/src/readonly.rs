@@ -228,7 +228,7 @@ impl Engine {
         rewrite_clock_calls(
             &mut stmt,
             now_micros,
-            self.backslash_escapes,
+            self.speaks_mysql,
             now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
         );
         if let Statement::Select(rewritten) = stmt {

@@ -1183,7 +1183,7 @@ impl Engine {
         // existing row. Column positions don't shift, so we
         // skip index rebuild.
         let clock = self.clock;
-        let add_mysql = self.backslash_escapes;
+        let add_mysql = self.speaks_mysql;
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -1335,7 +1335,7 @@ impl Engine {
                  by bytes (the C collation)"
             ));
         }
-        let mysql_dialect = self.backslash_escapes;
+        let mysql_dialect = self.speaks_mysql;
         // v7.39 — under in-place MVCC the row store carries tombstoned
         // versions; their dead values must not join the rewrite (an
         // INT corpse under a TEXT conversion would abort the whole
@@ -2802,7 +2802,7 @@ impl Engine {
                 idx_ref,
                 &snapshot_schema,
                 &snapshot_rows,
-                self.backslash_escapes,
+                self.speaks_mysql,
             ) {
                 let name = stmt.name.clone();
                 self.active_catalog_mut().drop_named_index(&name);
@@ -2900,7 +2900,7 @@ impl Engine {
             let col_name = col_def.name.clone();
             let nullable = col_def.nullable;
             let has_default = col_def.default.is_some() || col_def.auto_increment;
-            let col_schema = column_def_to_schema(col_def, self.backslash_escapes)?;
+            let col_schema = column_def_to_schema(col_def, self.speaks_mysql)?;
             let fill_value: Value<'static> = if has_default || col_schema.runtime_default.is_some()
             {
                 resolve_column_default_free(&col_schema, clock, None)?
@@ -3121,11 +3121,11 @@ impl Engine {
         // Before anything is created, like the ENGINE check above.
         if let Some(dup) = first_duplicate(
             stmt.columns.iter().map(|c| c.name.as_str()),
-            self.backslash_escapes,
+            self.speaks_mysql,
         ) {
             return Err(EngineError::Unsupported(duplicate_column_message(
                 &dup,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )));
         }
         // The same name twice inside one PRIMARY KEY or UNIQUE list.
@@ -3142,9 +3142,9 @@ impl Engine {
             };
             if let Some(dup) = first_duplicate(
                 cols.iter().map(alloc::string::String::as_str),
-                self.backslash_escapes,
+                self.speaks_mysql,
             ) {
-                return Err(EngineError::Unsupported(if self.backslash_escapes {
+                return Err(EngineError::Unsupported(if self.speaks_mysql {
                     alloc::format!("Duplicate column name '{dup}'")
                 } else {
                     alloc::format!("column \"{dup}\" appears twice in {kind} constraint")
@@ -3825,7 +3825,7 @@ impl Engine {
         // leading column (the existing single-column storage tier)
         // and registers a UniquenessConstraint on the schema for
         // INSERT-time enforcement of the full tuple. mailrs G1/G6.
-        let mysql = self.backslash_escapes;
+        let mysql = self.speaks_mysql;
         let cols = columns
             .into_iter()
             .map(|c| column_def_to_schema(c, mysql))
@@ -5124,11 +5124,11 @@ impl Engine {
         // the name after that was ambiguous.
         if let Some(dup) = first_duplicate(
             s.columns.iter().map(alloc::string::String::as_str),
-            self.backslash_escapes,
+            self.speaks_mysql,
         ) {
             return Err(EngineError::Unsupported(duplicate_column_message(
                 &dup,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )));
         }
         // v7.39 (round 469) — same as the temporary sequence above: the
@@ -5862,12 +5862,11 @@ impl Engine {
         // is also where PostgreSQL checks it (its target list, after
         // resolution). Before `create_table`, so a refusal leaves
         // nothing behind.
-        if let Some(dup) =
-            first_duplicate(cols.iter().map(|c| c.name.as_str()), self.backslash_escapes)
+        if let Some(dup) = first_duplicate(cols.iter().map(|c| c.name.as_str()), self.speaks_mysql)
         {
             return Err(EngineError::Unsupported(duplicate_column_message(
                 &dup,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )));
         }
         let schema = spg_storage::TableSchema::new(s.name.clone(), cols);

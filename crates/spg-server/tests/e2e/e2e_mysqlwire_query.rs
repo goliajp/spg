@@ -1644,6 +1644,19 @@ fn a_binary_string_prints_as_its_bytes() {
     // so the encoder cannot be passing through a String round-trip.
     assert_eq!(query_scalar(&mut s, "SELECT CONCAT(X'41',X'42')"), "AB");
     assert_eq!(query_scalar(&mut s, "SELECT LENGTH(X'00FF')"), "2");
+    // v7.39.2 — and `NO_BACKSLASH_ESCAPES` does not take the literal
+    // away with the escapes. `0x41` is lexed as a NUMBER when the
+    // session is not MySQL, so this answered 65 while the same
+    // connection still called itself MySQL.
+    exec_ok(&mut s, "SET sql_mode='NO_BACKSLASH_ESCAPES'");
+    assert_eq!(query_scalar(&mut s, "SELECT 0x41"), "A");
+    assert_eq!(query_scalar(&mut s, "SELECT X'41'"), "A");
+    assert_eq!(query_scalar(&mut s, "SELECT 7 DIV 2"), "3");
+    assert_eq!(query_scalar(&mut s, "SELECT 1 # a hash comment"), "1");
+    // MySQL's block comments do not nest, so the FIRST `*/` closes this
+    // one and the `1` is the whole statement. PG nests, and would still
+    // be looking for a closer. Measured on both.
+    assert_eq!(query_scalar(&mut s, "SELECT /* a /* b */ 1"), "1");
 }
 
 /// v7.39.2 — `GROUP_CONCAT` over binary strings answers their bytes.

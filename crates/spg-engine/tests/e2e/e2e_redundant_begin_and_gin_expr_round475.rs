@@ -40,7 +40,7 @@ fn scalar(e: &mut Engine, sql: &str) -> String {
 fn nested_begin_rows(mysql: bool) -> String {
     let mut e = Engine::new();
     if mysql {
-        e.set_backslash_escapes(true);
+        e.set_mysql_wire_session();
     }
     e.execute("CREATE TABLE t (a INT)").unwrap();
     e.execute("BEGIN").unwrap();

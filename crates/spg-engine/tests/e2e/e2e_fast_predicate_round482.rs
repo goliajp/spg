@@ -122,7 +122,7 @@ fn round482_mysql_truthiness_is_unchanged() {
     // The fast path ends in `predicate_is_true`, the same call the general
     // path makes, so a MySQL session keeps its own reading.
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("CREATE TABLE m (a INT)").unwrap();
     e.execute("INSERT INTO m VALUES (1),(2),(3)").unwrap();
     assert_eq!(n_rows(&mut e, "SELECT count(*) FROM m WHERE a = 2"), "1");

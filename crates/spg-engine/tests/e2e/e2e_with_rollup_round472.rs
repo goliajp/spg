@@ -21,7 +21,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn my() -> Engine {
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("CREATE TABLE s (region VARCHAR(8), product VARCHAR(8), amt INT)")
         .unwrap();
     e.execute(
@@ -82,7 +82,7 @@ fn round472_a_data_null_is_not_the_rollup_null() {
     // DATA-NULL group where a plain GROUP BY puts it — first — and only
     // the rollup's own NULL last. Both print as NULL.
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("CREATE TABLE n (g VARCHAR(8), amt INT)").unwrap();
     e.execute("INSERT INTO n VALUES ('a',1),(NULL,2),('b',3)")
         .unwrap();

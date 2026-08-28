@@ -1567,7 +1567,7 @@ impl Engine {
                     peer,
                     &combined_schema,
                     pipe.consumed_cols,
-                    self.backslash_escapes,
+                    self.speaks_mysql,
                 );
             // v7.39 (round 588) — an ANSI-89 join writes its condition in the
             // WHERE clause. Give the peer those keys too, so `FROM a, b WHERE
@@ -1586,7 +1586,7 @@ impl Engine {
                         // byte-wise and answered 0 while the `JOIN ... ON`
                         // spelling of the same query answered correctly.
                         let folds =
-                            equi_pair_folds(pair, peer, &combined_schema, self.backslash_escapes);
+                            equi_pair_folds(pair, peer, &combined_schema, self.speaks_mysql);
                         eq_pairs.push(pair);
                         eq_folds.push(folds);
                         if folds {
@@ -3871,7 +3871,7 @@ impl Engine {
             &stmt.items,
             &combined_schema,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let mut proj_memo = memoize::MemoizeCache::default();
@@ -4185,7 +4185,7 @@ impl Engine {
             &stmt.items,
             &combined_schema,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let mut proj_memo = memoize::MemoizeCache::default();

@@ -241,7 +241,7 @@ impl Runner {
         match record {
             Record::Halt => Outcome::Pass,
             Record::Dialect(mysql) => {
-                self.engine.set_backslash_escapes(*mysql);
+                self.engine.set_mysql_dialect(*mysql);
                 Outcome::Pass
             }
             Record::Statement {

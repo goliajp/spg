@@ -24,7 +24,7 @@ fn pg() -> Engine {
 
 fn my() -> Engine {
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e
 }
 

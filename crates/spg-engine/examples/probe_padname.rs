@@ -20,7 +20,7 @@ fn main() {
         ("utf8mb4_0900_bin", "4", "1"),
     ] {
         let mut e = Engine::new();
-        e.set_backslash_escapes(true);
+        e.set_mysql_wire_session();
         e.execute(&format!("CREATE TABLE t (s VARCHAR(32) COLLATE {name})"))
             .unwrap();
         e.execute("INSERT INTO t VALUES ('alpha'),('alpha  '),('Beta'),('beta')")

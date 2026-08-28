@@ -404,7 +404,7 @@ impl Engine {
                         tname,
                         &ucs,
                         &inserted_rows,
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                     ) {
                         return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
                     }
@@ -412,7 +412,7 @@ impl Engine {
                         &fresh,
                         tname,
                         &inserted_rows,
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                     ) {
                         return Err(EngineError::SerializationFailure(alloc::format!("{e}")));
                     }
@@ -788,7 +788,7 @@ impl Engine {
                         tname,
                         &ucs,
                         &inserted_rows,
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                     ) {
                         conflict = Some(alloc::format!("{e}"));
                         break 'merge;
@@ -797,7 +797,7 @@ impl Engine {
                         &fresh,
                         tname,
                         &inserted_rows,
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                     ) {
                         conflict = Some(alloc::format!("{e}"));
                         break 'merge;

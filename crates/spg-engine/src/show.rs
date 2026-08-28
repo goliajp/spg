@@ -583,7 +583,7 @@ impl Engine {
                     // instead (`SMALLINT`, `NUMERIC(20)`), which was never
                     // what MariaDB says and became visibly so once BIGINT
                     // UNSIGNED moved its storage to Numeric.
-                    Value::text(if self.backslash_escapes {
+                    Value::text(if self.speaks_mysql {
                         render_mysql_type(c)
                     } else {
                         alloc::format!("{}", c.ty)

@@ -546,12 +546,12 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// selects MySQL-style string lexing (see `lexer::tokenize_with`).
 /// The engine threads its session flag through here.
 pub fn parse_statement_with(input: &str, dialect: lexer::Dialect) -> Result<Statement, ParseError> {
-    let backslash_escapes = dialect.backslash_escapes;
     let (tokens, offsets) =
         lexer::tokenize_with_offsets(input, dialect).map_err(|e| shape_lex_error(&e, input))?;
-    // The same session flag names the dialect for both the lexer and
-    // the type mapping.
-    let mut p = Parser::new_with_dialect(tokens, backslash_escapes).with_source(input, &offsets);
+    // v7.39.2 — the grammar follows "is this MySQL", the lexer follows
+    // "does backslash escape". They used to be one flag, and a session
+    // that turned escapes off lost the grammar with them.
+    let mut p = Parser::new_with_dialect(tokens, dialect.speaks_mysql).with_source(input, &offsets);
     let stmt = (|| {
         let stmt = p.parse_one_statement()?;
         if matches!(p.peek(), Token::Semicolon) {

@@ -3657,7 +3657,7 @@ impl Engine {
                 })
                 .collect();
             for (uc, _) in &deferred_ucs {
-                validate_uniqueness_whole_table(&st.catalog, tname, uc, self.backslash_escapes)?;
+                validate_uniqueness_whole_table(&st.catalog, tname, uc, self.speaks_mysql)?;
             }
         }
         Ok(())

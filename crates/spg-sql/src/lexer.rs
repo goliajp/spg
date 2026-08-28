@@ -455,6 +455,14 @@ pub struct Dialect {
     /// PostgreSQL, always. MySQL only when `ANSI_QUOTES` is in
     /// `sql_mode`, which its default list does not carry.
     pub double_quoted_identifiers: bool,
+    /// v7.39.2 — does the session speak MySQL at all?
+    ///
+    /// The parser asked `backslash_escapes` this, which is a different
+    /// question: `SET sql_mode='NO_BACKSLASH_ESCAPES'` turned the
+    /// escapes off and took the whole grammar with it, so `7 DIV 2`
+    /// stopped parsing and `'a' || 'b'` went back to concatenating
+    /// where MySQL 9.7.2 answers 0.
+    pub speaks_mysql: bool,
 }
 
 impl Dialect {
@@ -462,6 +470,7 @@ impl Dialect {
     pub const PG: Self = Self {
         backslash_escapes: false,
         double_quoted_identifiers: true,
+        speaks_mysql: false,
     };
 }
 
@@ -486,6 +495,13 @@ pub fn tokenize_with_offsets(
     dialect: Dialect,
 ) -> Result<(Vec<Token>, Vec<usize>), LexError> {
     let backslash_escapes = dialect.backslash_escapes;
+    // v7.39.2 — three of the rules below are about MySQL's GRAMMAR, not
+    // about what `\` does inside a string: `#` starts a comment, block
+    // comments do not nest, and `0x41` is a binary-string literal. They
+    // read the escapes flag, so `SET sql_mode='NO_BACKSLASH_ESCAPES'`
+    // took all three away with the escapes; measured on MySQL 9.7.2,
+    // `0x41` then answered 65 instead of 'A'.
+    let speaks_mysql = dialect.speaks_mysql;
     let bytes = input.as_bytes();
     let mut i = 0usize;
     let mut out = Vec::new();
@@ -521,7 +537,7 @@ pub fn tokenize_with_offsets(
             // split rather than a fix: a MySQL session gains the
             // comment, a PostgreSQL session keeps the error. A
             // mysqldump carries these.
-            b'#' if backslash_escapes => {
+            b'#' if speaks_mysql => {
                 i += 1;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -595,7 +611,7 @@ pub fn tokenize_with_offsets(
                 // that satisfies both.
                 let mut depth = 1usize;
                 while i + 1 < bytes.len() {
-                    if !backslash_escapes && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    if !speaks_mysql && bytes[i] == b'/' && bytes[i + 1] == b'*' {
                         depth += 1;
                         i += 2;
                         continue;
@@ -720,13 +736,13 @@ pub fn tokenize_with_offsets(
                 out.push(keyword_or_ident_raw(raw));
             }
             b if b.is_ascii_digit() => {
-                let (tok, consumed) = lex_number(&input[i..], backslash_escapes)
+                let (tok, consumed) = lex_number(&input[i..], speaks_mysql)
                     .map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;
             }
             b'.' if peek_pred(bytes, i + 1, u8::is_ascii_digit) => {
-                let (tok, consumed) = lex_number(&input[i..], backslash_escapes)
+                let (tok, consumed) = lex_number(&input[i..], speaks_mysql)
                     .map_err(|kind| LexError { kind, pos: i })?;
                 out.push(tok);
                 i += consumed;

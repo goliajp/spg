@@ -12,6 +12,36 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`SET sql_mode='NO_BACKSLASH_ESCAPES'` turned the entire MySQL dialect
+  off.** One flag was answering two questions — "does `\` escape inside a
+  string" and "does this session speak MySQL at all" — so a session that
+  turned the escapes off stopped being MySQL in every other respect.
+  That `sql_mode` is what you set to make a dump portable, and mysqldump
+  preambles carry it.
+
+  Measured on MySQL 9.7.2, nine of thirteen probes diverged after it:
+
+  | | MySQL 9.7.2 | SPG |
+  |---|---|---|
+  | `LENGTH('中')` | 3 | 1 |
+  | `'A' = 'a'` | 1 | 0 |
+  | `'a' \|\| 'b'` | 0 | `ab` |
+  | `1 AND 2` | 1 | error |
+  | `7 DIV 2` | 3 | syntax error |
+  | `1/0` | NULL | error |
+  | `0x41` | `A` | 65 |
+  | `'3x' + 1` | 4 | error |
+  | `VERSION()` | `9.…` | `PostgreSQL …` |
+
+  The first two are silent wrong answers that decide rows in a `WHERE`
+  clause; the rest are refusals of ordinary MySQL SQL.
+
+  The two questions are now asked separately everywhere: ninety reads in
+  the engine, the parser's whole grammar switch, and three lexer rules
+  that are about MySQL's syntax rather than its escapes (`#` comments,
+  non-nesting block comments, and the `0x…` literal). Only the string
+  lexer still reads the escape flag, which is the one thing it names.
+
 - **A binary string compared case-insensitively, printed as PostgreSQL
   hex, and could not be aggregated at all.** MySQL's `X'41'`, `x'41'`,
   `0x41` and `b'1000001'` are all the byte 0x41. Measured against MySQL

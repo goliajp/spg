@@ -613,6 +613,7 @@ mod e2e_nested_over_computed_view_round155;
 mod e2e_nested_view_dml_round136;
 mod e2e_nested_with_round151;
 mod e2e_nesting_budget_round507;
+mod e2e_no_backslash_escapes_v7392;
 mod e2e_nontable_acl_round60;
 mod e2e_normalize;
 mod e2e_normalize_form;
