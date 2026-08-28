@@ -93,3 +93,39 @@ fn postgres_keeps_postgress_words_and_postgress_names() {
     );
     assert_eq!(answer(&mut e, "SELECT 'a' COLLATE \"C\""), "a");
 }
+
+#[test]
+fn mariadbs_own_collations_are_known_too() {
+    // SPG answers to MySQL AND MariaDB, and the first version of the
+    // name table was MySQL's alone. MariaDB 12.3.3 registers the
+    // UCA-14.0.0 family WITHOUT a character set — its
+    // `information_schema.collations` lists `uca1400_ai_ci` — and
+    // accepts either spelling in SQL, so the table refused the spelling
+    // everything is written with.
+    //
+    // `utf8mb4_uca1400_ai_ci` is what the drop-in acceptance suite
+    // declares its MariaDB column with. Refusing it made the CREATE
+    // TABLE fail and every query against that table return nothing:
+    // five cases red at once, in CI, on a suite the local gates do not
+    // run.
+    let mut e = mysql();
+    e.execute("CREATE TABLE md (k INT, s TEXT COLLATE utf8mb4_uca1400_ai_ci)")
+        .expect("MariaDB's spelling of its own collation");
+    e.execute("INSERT INTO md VALUES (1,'alpha'),(2,'alpha  '),(3,'Beta')")
+        .expect("insert");
+    // And it is PERFORMED, not merely accepted: `_ai_ci` folds.
+    assert_eq!(
+        answer(&mut e, "SELECT COUNT(*) FROM md WHERE s = 'ALPHA'"),
+        "2",
+        "accent- and case-insensitive, and PAD SPACE"
+    );
+    // The bare spelling MariaDB registers.
+    assert_eq!(answer(&mut e, "SELECT 'a' COLLATE uca1400_ai_ci"), "a");
+    // But not a charset MariaDB refuses it for: `latin1` has no UCA
+    // collation and 12.3.3 says so, measured.
+    let got = answer(&mut e, "SELECT 'a' COLLATE latin1_uca1400_ai_ci");
+    assert!(
+        got.contains("Unknown collation: 'latin1_uca1400_ai_ci'"),
+        "{got}"
+    );
+}

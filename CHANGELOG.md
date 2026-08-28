@@ -12,6 +12,23 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **The collation name table was MySQL's alone, and refused MariaDB's.**
+  SPG answers to both, and MariaDB 12.3.3 registers the UCA-14.0.0
+  family WITHOUT a character set — its `information_schema.collations`
+  lists `uca1400_ai_ci`, not `utf8mb4_uca1400_ai_ci` — while accepting
+  either spelling in SQL. The table therefore refused the spelling
+  everything is written with, `CREATE TABLE … COLLATE
+  utf8mb4_uca1400_ai_ci` failed, and every query against that table
+  returned nothing.
+
+  The table is the union of both engines' lists now (575 names; 289 are
+  MariaDB's alone, 23 MySQL's), and the prefixed spelling is resolved
+  against it for the five character sets MariaDB actually accepts it for
+  — `latin1_uca1400_ai_ci` is refused there too, measured.
+
+- **`chacha20 0.10.1` was yanked upstream** and reached the tree through
+  the benchmark's `tokio-postgres`. Moved to 0.10.2.
+
 - **`information_schema.schemata` answered PostgreSQL's namespaces to a
   MySQL client.** In MySQL a schema IS a database and that view lists
   databases; SPG gave `public`, `pg_catalog` and `information_schema` to

@@ -1,4 +1,10 @@
 # v7.17.0 Phase 3.P0-58 — MySQL SHOW DATABASES / SHOW SCHEMAS.
+#
+# v7.39.2 — the list is the REAL databases (the connected name plus every
+# name CREATE DATABASE was asked for) and MySQL's system schemas, read
+# from the registry `pg_database` reads. It used to be five hard-coded
+# names including `postgres`, which is present when a connection NAMES it
+# — this session names none, so it answers the `spg` default instead.
 
 dialect mysql
 
@@ -8,7 +14,7 @@ SHOW DATABASES
 information_schema
 mysql
 performance_schema
-postgres
+spg
 sys
 
 # SHOW SCHEMAS is an alias for SHOW DATABASES.
@@ -18,5 +24,20 @@ SHOW SCHEMAS
 information_schema
 mysql
 performance_schema
-postgres
+spg
+sys
+
+# A database this server was asked to create is listed, which is the
+# defect: `pg_database` had it and this did not.
+statement ok
+CREATE DATABASE made_in_slt
+
+query T rowsort
+SHOW DATABASES
+----
+information_schema
+made_in_slt
+mysql
+performance_schema
+spg
 sys
