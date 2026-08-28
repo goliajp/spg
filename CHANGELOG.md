@@ -12,6 +12,26 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A stored generated column was computed in PostgreSQL's dialect for
+  every session, and the answer is written to disk.** A MySQL client's
+  `n INT GENERATED ALWAYS AS (LENGTH(s)) STORED` stored **1** for `'中'`
+  where MySQL 9.7.2 stores **3**: `LENGTH` counts bytes there and
+  characters in PostgreSQL. The wrong value is persisted, so it survives
+  the session that wrote it and is read back by every later query,
+  index scan and dump.
+
+  The evaluation context for these expressions was built by hand with
+  `mysql_dialect: false` written into it, rather than taken from the
+  session. Every other expression path builds its context from the
+  engine, which is why the identical `SELECT LENGTH('中')` answered
+  3 on the same connection — the divergence only appeared once the
+  expression became a column.
+
+  All four places that compute the column now take the session's
+  dialect: the INSERT pre-loop, the two UPDATE passes, and the
+  recompute that runs after a `BEFORE INSERT` trigger rewrites `NEW`.
+  Reverting any one of them alone turns exactly one pin red.
+
 - **`ONLY_FULL_GROUP_BY` was not enforced, and MySQL's default carries
   it.** `SELECT g, v FROM t GROUP BY g` answered an arbitrary row's `v`
   per group where MySQL 9.7.2 answers `ERROR 1055`. So did the same

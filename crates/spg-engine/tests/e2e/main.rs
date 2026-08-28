@@ -331,6 +331,7 @@ mod e2e_fused_expr_round716;
 mod e2e_fused_extremes_round569;
 mod e2e_generate_series_string_step;
 mod e2e_generate_subscripts;
+mod e2e_generated_column_dialect_v7392;
 mod e2e_geo_float_round39;
 mod e2e_geo_ops_batch;
 mod e2e_geo_ops_batch2;
