@@ -69,7 +69,6 @@ fn is_dump_noise_statement(lc: &str) -> bool {
             // post-restore.
             | "optimize"
             | "check"
-            | "use"
             // PG psql backslash meta-commands that newer
             // pg_dump versions emit unescaped (\restrict /
             // \unrestrict). Real psql intercepts these; SPG's
@@ -2178,6 +2177,22 @@ impl Parser {
                     kind: crate::ast::ValidateOnlyKind::SecurityLabel,
                     names: Vec::new(),
                 });
+            }
+            // v7.39.2 — `USE <db>` is a real statement now, and only in
+            // the MySQL dialect. It used to be swallowed here with the
+            // dump noise, so `USE myapp; SELECT DATABASE()` answered the
+            // same constant it answered before — MySQL 9.7.2 answers
+            // `myapp`. PostgreSQL has no USE at all, and pg_dump does not
+            // emit one, but the swallow stays on that side: it was put
+            // there for restores and taking it away is not this defect.
+            if lc == "use" {
+                if self.mysql_dialect {
+                    self.advance();
+                    let name = self.expect_ident_like()?;
+                    return Ok(Statement::UseDatabase(name));
+                }
+                self.consume_until_statement_boundary();
+                return Ok(Statement::Empty);
             }
             if is_dump_noise_statement(&lc) {
                 self.consume_until_statement_boundary();

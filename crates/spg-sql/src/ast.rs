@@ -524,6 +524,17 @@ pub enum Statement {
     /// returns the canonical MySQL set so the mysql / MariaDB
     /// client populates its database selector.
     ShowDatabases,
+    /// v7.39.2 — MySQL `USE <db>`.
+    ///
+    /// It parsed as `Empty` and did nothing at all, so `USE myapp;
+    /// SELECT DATABASE()` answered the same constant it answered before
+    /// — measured against MySQL 9.7.2, which answers `myapp`. SPG serves
+    /// ONE database and answers to any name (see `CREATE DATABASE`), so
+    /// this does not switch catalogs; it records the NAME, which is the
+    /// half a client can observe and the half the PostgreSQL wire has
+    /// tracked since v7.39 (`current_database()` names what the startup
+    /// message asked for).
+    UseDatabase(String),
     /// v7.17.0 Phase 3.P0-59 — MySQL `SHOW CREATE TABLE <t>`
     /// returns a 2-column row `(Table, "Create Table")` carrying
     /// the synthesized DDL. mysqldump emits this for every
@@ -3680,6 +3691,7 @@ impl Statement {
             | Self::Empty
             | Self::ShowTables
             | Self::ShowDatabases
+            | Self::UseDatabase(_)
             | Self::ShowCreateTable { .. }
             | Self::ShowIndexes { .. }
             | Self::ShowStatus
@@ -5281,7 +5293,10 @@ impl Statement {
             | Statement::Kill { .. }
             // v7.39 (round 320, V53) — DISCARD throws session state away;
             // writer path, like SET / RESET.
-            | Statement::Discard(_) => false,
+            | Statement::Discard(_)
+            // v7.39.2 — `USE <db>` writes session state, the same way
+            // SET does, and takes the same path.
+            | Statement::UseDatabase(_) => false,
             // v7.39 (round 295, E3 Phase 1b) — a SELECT that asks for row
             // locks MUTATES the lock table, so it is not a read. Left as
             // a read it went to the read-only executor and the locking
@@ -5964,6 +5979,7 @@ impl fmt::Display for Statement {
             Self::ReleaseSavepoint(n) => write!(f, "RELEASE SAVEPOINT {}", quote_ident(n)),
             Self::ShowTables => f.write_str("SHOW TABLES"),
             Self::ShowDatabases => f.write_str("SHOW DATABASES"),
+            Self::UseDatabase(n) => write!(f, "USE {}", quote_ident(n)),
             Self::ShowCreateTable(t) => write!(f, "SHOW CREATE TABLE {}", quote_ident(t)),
             Self::ShowIndexes(t) => write!(f, "SHOW INDEXES FROM {}", quote_ident(t)),
             Self::ShowStatus => f.write_str("SHOW STATUS"),
