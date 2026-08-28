@@ -91,7 +91,7 @@ fn main() {
         ("C-distinct", "SELECT count(DISTINCT s) FROM c", "2", "2"),
     ];
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     setup(&mut e);
     let mut like_mysql = 0;
     let mut like_maria = 0;

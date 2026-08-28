@@ -356,7 +356,7 @@ impl crate::Engine {
             &lz.stmt.items,
             &cols,
             lz.alias.as_str(),
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // Same ceiling the materialising path charges through the
@@ -474,7 +474,7 @@ impl crate::Engine {
                     &sel.items,
                     &scols,
                     alias.as_str(),
-                    self.backslash_escapes,
+                    self.speaks_mysql,
                     Some(self.active_catalog()),
                 )?;
                 let columns: Vec<ColumnSchema> = projection

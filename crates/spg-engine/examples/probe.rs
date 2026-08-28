@@ -54,7 +54,7 @@ fn main() {
     // dialect, the same switch mysqlwire flips per connection. Without it a
     // MySQL differential probes the PG path and proves nothing.
     if std::env::var("SPG_PROBE_MYSQL").is_ok_and(|v| v == "1") {
-        e.set_backslash_escapes(true);
+        e.set_mysql_wire_session();
     }
     // v7.39 (round 221) — named-timezone lookups, same wiring as
     // spg-embedded / spg-server, so tz differentials probe the real path.

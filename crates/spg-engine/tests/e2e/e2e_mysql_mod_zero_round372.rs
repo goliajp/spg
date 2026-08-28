@@ -70,7 +70,7 @@ fn postgres_session_errors_on_modulo_by_zero() {
 #[test]
 fn round503_division_by_zero_is_null_in_mysql_and_raises_in_pg() {
     let mut my = Engine::new();
-    my.set_backslash_escapes(true);
+    my.set_mysql_wire_session();
     for sql in [
         "SELECT 1/0",
         "SELECT 5 DIV 0",

@@ -353,7 +353,7 @@ impl Engine {
         // the string name to an i64 with FNV-1a-64. NULL name → NULL for
         // every arm, matching MariaDB. Only under a MySQL session — a PG
         // session keeps errors on these names.
-        if self.backslash_escapes
+        if self.speaks_mysql
             && let Some(v) = self.eval_mysql_lock_call(lc, args)?
         {
             return Ok(Some(v));

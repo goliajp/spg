@@ -100,11 +100,11 @@ fn main() {
     ];
     for (label, q, mysql_says) in queries {
         let mut n = Engine::new();
-        n.set_backslash_escapes(true);
+        n.set_mysql_wire_session();
         setup(&mut n, false);
         let bare = rows(&mut n, q);
         let mut i = Engine::new();
-        i.set_backslash_escapes(true);
+        i.set_mysql_wire_session();
         setup(&mut i, true);
         let idx = rows(&mut i, q);
         let mark = |g: &str| if g == mysql_says { "ok " } else { "BAD" };

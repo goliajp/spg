@@ -470,7 +470,7 @@ impl Engine {
         rewrite_clock_calls(
             stmt,
             now_micros,
-            self.backslash_escapes,
+            self.speaks_mysql,
             now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
         );
         // r1042 — evaluate the constant parts of every predicate once,
@@ -802,7 +802,7 @@ impl Engine {
         // client library keys on; the parser folds the whole phrase to
         // this one sentinel so no GUC can collide with it. Same dialect
         // gate as `SHOW WARNINGS` above, for the same reason.
-        if self.backslash_escapes && name.eq_ignore_ascii_case("count(*) warnings") {
+        if self.speaks_mysql && name.eq_ignore_ascii_case("count(*) warnings") {
             let cols = alloc::vec![ColumnSchema::new(
                 alloc::string::String::from("@@session.warning_count"),
                 spg_storage::DataType::BigInt,
@@ -815,7 +815,7 @@ impl Engine {
             });
         }
 
-        if self.backslash_escapes && name.eq_ignore_ascii_case("warnings") {
+        if self.speaks_mysql && name.eq_ignore_ascii_case("warnings") {
             let cols = alloc::vec![
                 ColumnSchema::new(
                     alloc::string::String::from("Level"),
@@ -1711,7 +1711,7 @@ impl Engine {
         // elsewhere; `current_tx` is the connection's own slot here, set by
         // `execute_in_with_cancel` before dispatch.
         let in_own_tx = self.current_tx.is_some_and(|t| self.is_tx_open(t));
-        if self.backslash_escapes && in_own_tx && stmt.mysql_implicit_commit() {
+        if self.speaks_mysql && in_own_tx && stmt.mysql_implicit_commit() {
             self.exec_commit()?;
         }
         let result = match stmt {
@@ -2404,8 +2404,7 @@ impl Engine {
             // form makes connection B's BEGIN see connection A's transaction
             // (rounds 279 / 283 / 298 / 304 / 443 / 444 are the same trap).
             Statement::Begin(_)
-                if self.current_tx.is_some_and(|t| self.is_tx_open(t))
-                    && !self.backslash_escapes =>
+                if self.current_tx.is_some_and(|t| self.is_tx_open(t)) && !self.speaks_mysql =>
             {
                 self.warning(alloc::string::String::from(
                     "there is already a transaction in progress",
@@ -2431,7 +2430,7 @@ impl Engine {
             // above, which leaves a client's trailing ROLLBACK with nothing
             // to roll back.
             Statement::Commit | Statement::Rollback if !self.in_transaction() => {
-                if !self.backslash_escapes {
+                if !self.speaks_mysql {
                     self.warning(alloc::string::String::from(
                         "there is no transaction in progress",
                     ));

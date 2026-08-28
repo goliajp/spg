@@ -923,10 +923,14 @@ pub(crate) struct SessionBag {
     /// `SET sql_mode`, which only a MySQL client or a mysqldump preamble
     /// sends.
     ///
-    /// The wider conflation (`in_mysql_dialect()` IS
-    /// `backslash_escapes`) is left alone here rather than rewired
-    /// underneath everything that reads it; this flag answers the one
-    /// question this change asks.
+    /// v7.39.2 — the wider conflation is gone: every "is this session
+    /// MySQL" question in the engine reads THIS flag now, and only the
+    /// lexer reads `backslash_escapes`. Measured on MySQL 9.7.2, the
+    /// conflation turned `SET sql_mode='NO_BACKSLASH_ESCAPES'` — which
+    /// is what you set to make a dump portable — into a full exit from
+    /// the dialect: `LENGTH('中')` answered 1 instead of 3, `'A'='a'`
+    /// answered 0 instead of 1, `1/0` raised instead of answering NULL,
+    /// `DIV` stopped parsing, and `VERSION()` began with 'P'.
     pub(crate) speaks_mysql: bool,
     /// v7.39.2 — is `ONLY_FULL_GROUP_BY` in this session's `sql_mode`?
     ///
@@ -2896,6 +2900,7 @@ impl Engine {
             // escapes flag — `NO_BACKSLASH_ESCAPES` turns the latter off
             // without making the session any less MySQL.
             double_quoted_identifiers: !self.speaks_mysql || self.mysql_ansi_quotes,
+            speaks_mysql: self.speaks_mysql,
         }
     }
 
@@ -2909,16 +2914,33 @@ impl Engine {
     /// it had switched dialects. Two calls meaning one thing is the
     /// hazard; this is the one call.
     pub fn set_mysql_wire_session(&mut self) {
-        self.set_backslash_escapes(true);
-        if !self.speaks_mysql {
-            self.speaks_mysql = true;
-            self.plan_cache.clear();
-            self.refresh_name_folding();
+        self.set_mysql_dialect(true);
+    }
+
+    /// Enter or leave the MySQL dialect — every axis of it, in one call.
+    ///
+    /// v7.39.2 — the way in used to be `set_backslash_escapes(true)`,
+    /// which stopped meaning this when the escape rule and the dialect
+    /// were split. Leaving restores the same defaults a dropped session
+    /// restores, so a harness that switches back and forth cannot leave
+    /// one axis behind.
+    pub fn set_mysql_dialect(&mut self, on: bool) {
+        self.set_backslash_escapes(on);
+        if on == self.speaks_mysql {
+            return;
         }
+        self.speaks_mysql = on;
+        if !on {
+            self.mysql_strict = true;
+            self.mysql_ansi_quotes = false;
+            self.mysql_only_full_group_by = true;
+        }
+        self.plan_cache.clear();
+        self.refresh_name_folding();
     }
 
     pub fn in_mysql_dialect(&self) -> bool {
-        self.backslash_escapes
+        self.speaks_mysql
     }
 
     pub fn set_backslash_escapes(&mut self, flag: bool) {

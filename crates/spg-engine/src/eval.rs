@@ -429,10 +429,10 @@ impl<'a> EvalContext<'a> {
     #[must_use]
     /// v7.39 (read01 round 63) — thread the engine (see `engine`).
     pub const fn with_engine(mut self, engine: &'a crate::Engine) -> Self {
-        self.mysql_dialect = engine.backslash_escapes;
+        self.mysql_dialect = engine.speaks_mysql;
         // v7.39 (round 368, M20 P3) — the dialect also decides how a binary
         // string renders in a string context (latin-1 bytes vs PG `\x…`).
-        self.render_style.mysql = engine.backslash_escapes;
+        self.render_style.mysql = engine.speaks_mysql;
         self.engine = Some(engine);
         self
     }

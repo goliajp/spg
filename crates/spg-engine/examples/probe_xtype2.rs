@@ -81,7 +81,7 @@ fn main() {
         ),
     ];
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     for s in [
         "CREATE TABLE a (k INT, c CHAR(8), s VARCHAR(32))",
         "CREATE TABLE b (k INT, c CHAR(8), s VARCHAR(32))",

@@ -1105,7 +1105,7 @@ impl Engine {
         view_check: Option<ViewCheck>,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let mysql_dialect = self.backslash_escapes;
+        let mysql_dialect = self.speaks_mysql;
         // v7.37.43-T4.4 — writable CTE outer body (UPDATE).
         if !stmt.ctes.is_empty() {
             return self.exec_update_with_ctes(stmt.clone(), cancel);
@@ -1419,7 +1419,7 @@ impl Engine {
                 w,
                 &schema_cols,
                 stmt.table.as_str(),
-                self.backslash_escapes,
+                self.speaks_mysql,
                 // v7.38.18 (S2) — this table's database collation.
                 self.active_catalog()
                     .get(stmt.table.as_str())
@@ -1666,7 +1666,7 @@ impl Engine {
                 table,
                 stmt.table.as_str(),
                 &scan_snapshot,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )
         });
         let mut planned: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
@@ -1806,7 +1806,7 @@ impl Engine {
         // trigger / apply passes below see the ascending-row invariant.
         // UPDATE's ctx above does not thread the engine (a long-standing site,
         // not touched here), so read the dialect straight off the session.
-        if self.backslash_escapes
+        if self.speaks_mysql
             && let Some(ol) = stmt.order_limit.as_deref()
         {
             if !ol.order_by.is_empty() {
@@ -1941,7 +1941,7 @@ impl Engine {
                 &stmt.table,
                 &planned,
                 &changed_cols,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )?;
             // v7.39 (round 210) — EXCLUDE constraints on the post-update rows;
             // each updated row's pre-image is excluded from the scan.
@@ -1977,7 +1977,7 @@ impl Engine {
         let v = self.writer_version_for_current_stmt();
         // v7.39 (round 426) — read the dialect BEFORE the table mut-borrow
         // opens; the affected-count rule below needs it.
-        let mysql_changed_count = self.backslash_escapes;
+        let mysql_changed_count = self.speaks_mysql;
         // 7.38.1 S2.1 (MATRIX #20) — tuple locks on the UPDATE targets
         // BEFORE anything mutates. PG's RC serialises same-row writers
         // here; a conflict surfaces as LockWouldBlock and the server
@@ -3191,7 +3191,7 @@ impl Engine {
             &expanded,
             &syn,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let columns: Vec<ColumnSchema> = projection
@@ -3476,7 +3476,7 @@ impl Engine {
                 w,
                 &schema_cols,
                 stmt.table.as_str(),
-                self.backslash_escapes,
+                self.speaks_mysql,
                 // v7.38.18 (S2) — this table's database collation.
                 self.active_catalog()
                     .get(stmt.table.as_str())
@@ -3645,7 +3645,7 @@ impl Engine {
         // session dialect BEFORE the &mut catalog borrow below, which makes
         // `self` unreachable for the rest of the scan. (DELETE's ctx, like
         // UPDATE's, does not thread the engine — a long-standing site.)
-        let mysql_order_limit = if self.backslash_escapes {
+        let mysql_order_limit = if self.speaks_mysql {
             stmt.order_limit.as_deref()
         } else {
             None
@@ -3653,7 +3653,7 @@ impl Engine {
         // v7.39 (round 524) — with the session: `DELETE … WHERE
         // current_setting('app.tenant') = …` matched nothing.
         let sess = self.dml_session();
-        let mysql_dialect = self.backslash_escapes;
+        let mysql_dialect = self.speaks_mysql;
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -4671,7 +4671,7 @@ impl Engine {
         // generated columns are computed both before the row loop and again
         // inside `insert_parsed_rows`, which is a free fn holding the table's
         // mutable borrow and so cannot reach `self`.
-        let insert_mysql_dialect = self.backslash_escapes;
+        let insert_mysql_dialect = self.speaks_mysql;
         // v7.37.43-T4.4 — writable CTE outer body: materialise every
         // leading WITH clause first (running any modifying CTE
         // bodies against the active catalog so their writes land
@@ -4892,7 +4892,7 @@ impl Engine {
         // v7.39 (read01 round 55) — the catalog for user-named casts in VALUES.
         // Taken BEFORE the &mut borrow below (Catalog::clone is an Arc bump).
         let cat_for_insert = self.active_catalog().clone();
-        let insert_mysql = self.backslash_escapes;
+        let insert_mysql = self.speaks_mysql;
         // v7.39 (round 470) — read before the &mut borrow below, same
         // reason `cat_for_insert` is.
         let insert_non_strict = insert_mysql && !self.mysql_strict;
@@ -5154,7 +5154,7 @@ impl Engine {
         // Both run on the post-ON-CONFLICT row set: conflicting rows
         // already left `all_values` (DO NOTHING drop / DO UPDATE
         // reroute), so what remains must be genuinely unique.
-        let mysql = self.backslash_escapes;
+        let mysql = self.speaks_mysql;
         // v7.39 (round 427) — which MySQL upsert spelling produced the
         // DO UPDATE clause. Both lower onto the same AST; REPLACE is the one
         // whose assignment list is EMPTY (round 419's "take the incoming

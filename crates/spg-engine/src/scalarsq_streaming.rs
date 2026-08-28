@@ -335,7 +335,7 @@ impl Engine {
             &stmt.items,
             schema_cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // v7.37.42 (docker-fair SCALARSQ attack 2) — pre-resolve every

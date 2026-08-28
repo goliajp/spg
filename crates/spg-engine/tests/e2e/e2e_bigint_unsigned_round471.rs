@@ -18,7 +18,7 @@ use spg_engine::{Engine, QueryResult};
 
 fn my() -> Engine {
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("CREATE TABLE b (id INT, u BIGINT UNSIGNED, s BIGINT)")
         .unwrap();
     e.execute("INSERT INTO b VALUES (1, 18446744073709551615, 5)")

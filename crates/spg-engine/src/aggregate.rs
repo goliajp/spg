@@ -1213,7 +1213,7 @@ pub(crate) fn run(
         correlated_eval,
         defer_projection,
         catalog,
-        engine.is_some_and(|e| e.backslash_escapes),
+        engine.is_some_and(|e| e.speaks_mysql),
     )?;
 
     // (4) ORDER BY on the aggregated output (the caller applies LIMIT).
@@ -1255,7 +1255,7 @@ pub(crate) fn run(
             correlated_eval,
             keep_n,
             catalog,
-            engine.is_some_and(|e| e.backslash_escapes),
+            engine.is_some_and(|e| e.speaks_mysql),
         )?;
         kept_synth = sorted_synth;
         out_rows = sorted_out;
@@ -1329,7 +1329,7 @@ pub(crate) fn run(
         out_rows = crate::select::dedup_rows(
             out_rows,
             crate::select::FoldSpec::of_masks(
-                engine.is_some_and(|e| e.backslash_escapes),
+                engine.is_some_and(|e| e.speaks_mysql),
                 &crate::select::fold_mask_of_columns(&columns),
                 &crate::select::pad_mask_of_columns(&columns),
             ),

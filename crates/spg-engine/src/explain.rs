@@ -324,7 +324,7 @@ fn real_range_rows(
         table,
         alias.unwrap_or(name),
         &engine.current_snapshot(),
-        engine.backslash_escapes,
+        engine.speaks_mysql,
     )
 }
 
@@ -517,7 +517,7 @@ fn split_index_cond<'a>(
         cols,
         table,
         alias,
-        engine.backslash_escapes,
+        engine.speaks_mysql,
     ) {
         return (Some(where_), Vec::new());
     }
@@ -529,7 +529,7 @@ fn split_index_cond<'a>(
             table,
             alias,
             &snap,
-            engine.backslash_escapes,
+            engine.speaks_mysql,
         )
         .is_some()
         {
@@ -732,7 +732,7 @@ fn scan_node(
             table,
             a,
             &snap,
-            engine.backslash_escapes,
+            engine.speaks_mysql,
         )
         .map(|_| ())
         .or_else(|| crate::index_access::try_gin_jsonb_seek(w, cols, table, a, &snap).map(|_| ()))

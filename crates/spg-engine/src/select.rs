@@ -302,7 +302,7 @@ impl Engine {
                             table,
                             alias,
                             &snap,
-                            self.backslash_escapes,
+                            self.speaks_mysql,
                         )
                     });
                     match seek_positions {
@@ -707,7 +707,7 @@ impl Engine {
                     // answers `count`. Pin the name while the call the
                     // column is named for is still in hand.
                     let alias = if alias.is_none() && e != *expr {
-                        Some(default_output_name(expr, self.backslash_escapes))
+                        Some(default_output_name(expr, self.speaks_mysql))
                     } else {
                         alias.clone()
                     };
@@ -732,7 +732,7 @@ impl Engine {
             &rewritten_items,
             &ext_cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             window_nodes.len(),
             Some(self.active_catalog()),
         )?;
@@ -802,7 +802,7 @@ impl Engine {
             out_rows = dedup_rows(
                 out_rows,
                 FoldSpec::of_masks(
-                    self.backslash_escapes,
+                    self.speaks_mysql,
                     &fold_mask(&projection),
                     &pad_mask(&projection),
                 ),
@@ -865,6 +865,7 @@ impl Engine {
         temp.session_params.clone_from(&self.session_params);
         temp.users.clone_from(&self.users);
         temp.backslash_escapes = self.backslash_escapes;
+        temp.speaks_mysql = self.speaks_mysql;
         temp.mysql_strict = self.mysql_strict;
         temp.render_style = self.render_style;
         temp.tz_offset_fn = self.tz_offset_fn;
@@ -895,10 +896,8 @@ impl Engine {
             }
             match view.as_str() {
                 "__spg_info_columns" => {
-                    let (schema, rows) = synth_information_schema_columns(
-                        self.active_catalog(),
-                        self.backslash_escapes,
-                    );
+                    let (schema, rows) =
+                        synth_information_schema_columns(self.active_catalog(), self.speaks_mysql);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_info_tables" => {
@@ -1433,7 +1432,7 @@ impl Engine {
                 "__spg_info_schemata" => {
                     let (schema, rows) = crate::system_catalog::synth_information_schema_schemata(
                         self.active_catalog(),
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                     );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
@@ -2166,7 +2165,7 @@ impl Engine {
                             | Expr::RowCmpSubquery { .. }
                     )
                 {
-                    *alias = Some(default_output_name(expr, self.backslash_escapes));
+                    *alias = Some(default_output_name(expr, self.speaks_mysql));
                 }
                 self.resolve_expr_subqueries(expr, cancel)?;
             }
@@ -2421,7 +2420,7 @@ impl Engine {
                         core::slice::from_ref(item),
                         schema_cols,
                         table_alias,
-                        self.backslash_escapes,
+                        self.speaks_mysql,
                         Some(self.active_catalog()),
                     )
                     .ok()
@@ -2683,7 +2682,7 @@ impl Engine {
             table,
             alias_name,
             pos,
-            self.backslash_escapes,
+            self.speaks_mysql,
         )
         .is_some()
     }
@@ -2715,7 +2714,7 @@ impl Engine {
             alias_name,
             &self.current_snapshot(),
             pos,
-            self.backslash_escapes,
+            self.speaks_mysql,
         ) else {
             return Ok(None);
         };
@@ -2787,7 +2786,7 @@ impl Engine {
             alias_name,
             &snapshot,
             pos,
-            self.backslash_escapes,
+            self.speaks_mysql,
             &mut |v: spg_storage::Value<'_>| {
                 if !wrote_header {
                     emit(crate::StreamItem::Header(&schema))?;
@@ -2848,7 +2847,7 @@ impl Engine {
                 .iter()
                 .map(|o| (o.desc, o.nulls_first))
                 .collect();
-            let mysql = self.backslash_escapes;
+            let mysql = self.speaks_mysql;
             let better = |a: &Row<'static>, b: &Row<'static>| -> bool {
                 for (k, (desc, nf)) in tail_dirs.iter().enumerate() {
                     let av = a.values.get(ord_start + k).unwrap_or(&Value::Null);
@@ -3218,7 +3217,7 @@ impl Engine {
             // v7.39 (round 410) — under MySQL, set-op dedup / matching folds
             // text by the session collation (CI + accent + PAD SPACE), like
             // GROUP BY. PG stays byte-exact.
-            let mysql = self.backslash_escapes;
+            let mysql = self.speaks_mysql;
             // v7.38.14 — the mask, which 7.38.13 recorded as impossible here
             // and was wrong about. `columns` and `peer_cols` are both in
             // scope; what was actually missing is that the branches' output
@@ -3868,7 +3867,7 @@ impl Engine {
             &stmt.items,
             &schema_cols,
             &alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
@@ -4127,7 +4126,7 @@ impl Engine {
             &stmt.items,
             &schema_cols,
             &alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // v7.39 (round 621) — and here, for the same reason.
@@ -4526,14 +4525,8 @@ impl Engine {
                 .into_iter()
                 .filter_map(|i| table.rows().get(i).map(Cow::Borrowed))
                 .collect();
-            return materialise_in_order(
-                stmt,
-                schema_cols,
-                alias,
-                &ordered,
-                self.backslash_escapes,
-            )
-            .map(Some);
+            return materialise_in_order(stmt, schema_cols, alias, &ordered, self.speaks_mysql)
+                .map(Some);
         }
 
         // v7.34.5 — ORDER BY <indexed col> [DESC|ASC] LIMIT N drives
@@ -4552,9 +4545,9 @@ impl Engine {
             alias,
             self,
             cancel,
-            self.backslash_escapes,
+            self.speaks_mysql,
         ) {
-            return materialise_in_order(stmt, schema_cols, alias, &walked, self.backslash_escapes)
+            return materialise_in_order(stmt, schema_cols, alias, &walked, self.speaks_mysql)
                 .map(Some);
         }
 
@@ -5665,7 +5658,7 @@ impl Engine {
             &stmt.items,
             &schema_cols,
             &alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let mut projected_rows: alloc::vec::Vec<Row<'static>> =
@@ -5904,7 +5897,7 @@ impl Engine {
             &stmt.items,
             &schema_cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // v7.39 (round 621) — a target-list SRF expands here too. This tail
@@ -6078,7 +6071,7 @@ impl Engine {
             &stmt.items,
             &empty_schema,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // `SELECT … WHERE cond` with no FROM — the one conceptual
@@ -6554,7 +6547,7 @@ impl Engine {
             table,
             alias,
             snapshot,
-            self.backslash_escapes,
+            self.speaks_mysql,
         )?;
         let columns = alloc::vec![ColumnSchema::new(
             "count".to_string(),
@@ -6905,7 +6898,7 @@ impl Engine {
             &stmt.items,
             schema_cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // v7.19 P5 — single-table SELECT path for SRF
@@ -7995,7 +7988,7 @@ impl Engine {
             &stmt.items,
             &cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let order_by = stmt.order_by.clone();
@@ -8371,7 +8364,7 @@ impl Engine {
             &stmt.items,
             &cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
@@ -8685,7 +8678,7 @@ impl Engine {
             &stmt.items,
             &cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let columns: Vec<ColumnSchema> = projection.iter().map(|p| p.to_column_schema()).collect();
@@ -8819,7 +8812,7 @@ impl Engine {
         // test per row: the short-circuit means the comparison never runs
         // and `prev` is never written.
         let dedup_mask = fold_mask(&projection);
-        let fold = FoldSpec::of(self.backslash_escapes, &dedup_mask);
+        let fold = FoldSpec::of(self.speaks_mysql, &dedup_mask);
         let mut count = 0usize;
         let mut prev: Option<&[Value<'static>]> = None;
         for (_, _, vals) in &sorted {
@@ -8966,7 +8959,7 @@ impl Engine {
             &stmt.items,
             &cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         let order_by = stmt.order_by.clone();
@@ -9229,7 +9222,7 @@ impl Engine {
             &stmt.items,
             &cols,
             alias,
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
 
@@ -9302,7 +9295,7 @@ impl Engine {
                 table,
                 alias,
                 &snapshot,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )
         });
 
@@ -9573,7 +9566,7 @@ impl Engine {
             &stmt.items,
             combined_schema,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // Every projection item must be a bound qualified column —
@@ -9782,7 +9775,7 @@ impl Engine {
             &stmt.items,
             combined_schema,
             "",
-            self.backslash_escapes,
+            self.speaks_mysql,
             Some(self.active_catalog()),
         )?;
         // v7.39 (round 734) — a set-returning projection over a JOIN.

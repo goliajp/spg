@@ -68,7 +68,7 @@ fn main() {
         ("clean insert  ", "INSERT INTO w VALUES (5,'ok')", "cmd ok"),
     ];
     let mut e = Engine::new();
-    e.set_backslash_escapes(true);
+    e.set_mysql_wire_session();
     e.execute("SET sql_mode = ''").unwrap();
     e.execute("CREATE TABLE w (i INT, s VARCHAR(3))").unwrap();
     let mut bad = 0;

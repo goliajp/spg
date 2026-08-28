@@ -86,12 +86,12 @@ fn main() {
         println!("=== {ty} ===");
         for (label, q, mysql_says) in queries {
             let mut a = Engine::new();
-            a.set_backslash_escapes(true);
+            a.set_mysql_wire_session();
             setup(&mut a, ty, None);
             let bare = rows(&mut a, q);
 
             let mut b = Engine::new();
-            b.set_backslash_escapes(true);
+            b.set_mysql_wire_session();
             setup(&mut b, ty, Some("CREATE INDEX t_s ON t (s)"));
             let idx = rows(&mut b, q);
 
@@ -104,7 +104,7 @@ fn main() {
         }
         // A unique index has its own answer to give.
         let mut c = Engine::new();
-        c.set_backslash_escapes(true);
+        c.set_mysql_wire_session();
         c.execute(&format!("CREATE TABLE u (k INT, s {ty})"))
             .unwrap();
         c.execute("CREATE UNIQUE INDEX u_s ON u (s)").unwrap();

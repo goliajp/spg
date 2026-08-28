@@ -356,7 +356,7 @@ impl crate::Engine {
                 table,
                 alias_or_name,
                 &snap,
-                self.backslash_escapes,
+                self.speaks_mysql,
             )
         });
         // v7.38.2 (R1, red-first pin) — lock by the row's REAL RowId.
