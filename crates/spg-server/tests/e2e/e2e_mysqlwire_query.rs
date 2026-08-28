@@ -1615,3 +1615,49 @@ fn backtick_identifiers_are_unaffected_by_the_quoting_rule() {
     exec_ok(&mut s, "SET sql_mode='ANSI_QUOTES'");
     assert_eq!(query_scalar(&mut s, "SELECT 1 AS `bt`"), "1");
 }
+
+/// v7.39.2 — a binary string goes out as its bytes.
+///
+/// MySQL's `X'41'`, `x'41'`, `0x41` and `b'1000001'` are all the byte
+/// 0x41, and MySQL 9.7.2 prints every one of them as `A`. SPG routed
+/// them through the engine's canonical rendering, which is PostgreSQL's
+/// `\x41` hex form — measured on all four spellings, and on the same
+/// value reached through `COALESCE` and through a `UNION`.
+///
+/// This is a wire test because the divergence is in the wire encoder:
+/// the engine's own `value_to_text` is PG's, correctly, and the MySQL
+/// text row is where the two renderings part.
+#[test]
+fn a_binary_string_prints_as_its_bytes() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    for sql in [
+        "SELECT X'41'",
+        "SELECT x'41'",
+        "SELECT 0x41",
+        "SELECT b'1000001'",
+        "SELECT COALESCE(X'41','z')",
+    ] {
+        assert_eq!(query_scalar(&mut s, sql), "A", "{sql}");
+    }
+    // Two bytes, and a byte that is not printable ASCII on its own,
+    // so the encoder cannot be passing through a String round-trip.
+    assert_eq!(query_scalar(&mut s, "SELECT CONCAT(X'41',X'42')"), "AB");
+    assert_eq!(query_scalar(&mut s, "SELECT LENGTH(X'00FF')"), "2");
+}
+
+/// v7.39.2 — `GROUP_CONCAT` over binary strings answers their bytes.
+/// It refused them outright ("string_agg requires text value, got
+/// bytea") until the aggregate learned PG18's bytea form.
+#[test]
+fn group_concat_over_binary_strings_prints_its_bytes() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    assert_eq!(
+        query_scalar(
+            &mut s,
+            "SELECT GROUP_CONCAT(v ORDER BY v) FROM (SELECT X'42' v UNION ALL SELECT X'41') z"
+        ),
+        "A,B"
+    );
+}

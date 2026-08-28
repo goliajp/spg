@@ -83,6 +83,7 @@ mod e2e_bc_dates;
 mod e2e_begin_isolation_round118;
 mod e2e_bigint_unsigned_round471;
 mod e2e_binary_prefix_round355;
+mod e2e_binary_string_v7392;
 mod e2e_bit_agg_integer;
 mod e2e_bit_count;
 mod e2e_bit_count_bitstring;

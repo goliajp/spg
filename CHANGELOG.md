@@ -12,6 +12,31 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A binary string compared case-insensitively, printed as PostgreSQL
+  hex, and could not be aggregated at all.** MySQL's `X'41'`, `x'41'`,
+  `0x41` and `b'1000001'` are all the byte 0x41. Measured against MySQL
+  9.7.2, SPG diverged on three of them at once:
+
+  * `X'41' = 'A'` answered **0** where MySQL answers 1. The case fold
+    applied to the text side only, turning `'A'` into 0x61 and comparing
+    it against the byte 0x41. `0x61 = 'a'` answered 1 — both already
+    lower — and that half working is what kept this hidden. The binary
+    character set does not fold, so `X'41' = 'a'` must stay 0, and both
+    answers now move together. The same comparison in a `WHERE` clause
+    and in `IN (…)` was wrong the same way.
+  * Every spelling printed as `\x41` instead of `A`, including through
+    `COALESCE` and `UNION`. The engine's own rendering is PostgreSQL's,
+    correctly; the MySQL text row was routing binary strings through it
+    rather than sending their bytes.
+  * `GROUP_CONCAT(X'41')` failed with "string_agg requires text value,
+    got bytea". So did `string_agg(bytea_col, ',')` on the PostgreSQL
+    side — where PG18 answers with a **bytea**, `\x412c42`, and gives
+    the column that type. One refusal, visible from both wires.
+
+  The aggregate now joins bytes and answers bytea for a bytea input, on
+  both dialects, with the separator's own bytes; `CREATE TABLE … AS
+  SELECT string_agg(b, ',')` gets a bytea column instead of failing.
+
 - **A stored generated column was computed in PostgreSQL's dialect for
   every session, and the answer is written to disk.** A MySQL client's
   `n INT GENERATED ALWAYS AS (LENGTH(s)) STORED` stored **1** for `'中'`
