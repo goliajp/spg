@@ -12,6 +12,26 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A collation name that does not exist was accepted and then
+  ignored.** `SELECT 'a' COLLATE nosuch_ci` answered `a` on the MySQL
+  wire, and `'B' COLLATE nosuch_ci < 'a'` answered whatever the session
+  would have answered without the clause. A client that named a
+  collation got no signal that it had not been used. MySQL 9.7.2
+  answers `ERROR 1273 (HY000): Unknown collation: 'nosuch_ci'`.
+
+  Two suffix rules were behind it, each letting a different family
+  through. The parser lowered any `_bin` name onto a BINARY cast and
+  absorbed any `_ci` name as a no-op — reasoning that is true of a real
+  `_ci` collation and says nothing about `nosuch_ci` — and the engine's
+  own "is there a collation by this name" ended in *anything ending in
+  `_ci`, `_cs` or `_bin`*. Both ask MySQL's own list now: 286 names read
+  from its `information_schema.collations`, with a test that holds the
+  table in byte order because the server does not return it that way.
+
+  A declaration was already refused, in PostgreSQL's words; on the MySQL
+  wire it now carries MySQL's words and its errno (1273), which is what
+  a driver branches on.
+
 - **Casting a binary string to a character type answered PostgreSQL's hex
   text, and `CONVERT` had neither of MySQL's two forms.** Measured against
   MySQL 9.7.2:

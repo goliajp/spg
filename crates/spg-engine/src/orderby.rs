@@ -1879,7 +1879,10 @@ pub(crate) fn order_by_collations(
                 // here too, with PG's own message. It used to be
                 // accepted and silently ordered by ICU's root fallback.
                 if !crate::collate::is_known(name) {
-                    return Err(crate::collate::unknown_collation_error(name));
+                    return Err(crate::collate::unknown_collation_error(
+                        name,
+                        ctx.mysql_dialect,
+                    ));
                 }
                 // v7.38.22 — and the TYPE has to be able to carry one.
                 // PostgreSQL 18.4: `ORDER BY n COLLATE "en_US.utf8"` over

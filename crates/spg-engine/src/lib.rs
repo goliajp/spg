@@ -3388,7 +3388,10 @@ impl Engine {
         // collation. Before this, ICU's fallback to root made `zz_ZZ` a
         // perfectly acceptable database collation.
         if !crate::collate::is_known(name) {
-            return Err(crate::collate::unknown_collation_error(name));
+            return Err(crate::collate::unknown_collation_error(
+                name,
+                self.speaks_mysql,
+            ));
         }
         if !crate::collate::is_supported(name) {
             return Err(EngineError::Unsupported(alloc::format!(
@@ -3415,7 +3418,10 @@ impl Engine {
     /// build cannot perform — the same two refusals as the other path.
     pub fn declare_database_collation(&mut self, name: &str) -> Result<bool, EngineError> {
         if !crate::collate::is_known(name) {
-            return Err(crate::collate::unknown_collation_error(name));
+            return Err(crate::collate::unknown_collation_error(
+                name,
+                self.speaks_mysql,
+            ));
         }
         if !crate::collate::is_supported(name) {
             return Err(EngineError::Unsupported(alloc::format!(

@@ -4937,9 +4937,7 @@ pub fn eval_expr(
             // it is only "does SPG have a collation by this name".
             if !crate::collate::is_known(collation) {
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "collation \"{collation}\" for encoding \"UTF8\" does not exist"
-                    ),
+                    detail: crate::collate::unknown_collation_text(collation, ctx.mysql_dialect),
                 });
             }
             eval_expr(expr, row, ctx)
