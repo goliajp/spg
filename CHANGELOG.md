@@ -12,6 +12,23 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **Three MySQL-wire failures all reported 1064, a parse error, when the
+  statement had parsed perfectly well.** A driver branches on the number,
+  and 1064 sends the caller down "the statement is malformed". Measured
+  against MySQL 9.7.2:
+
+  | | MySQL 9.7.2 | SPG |
+  |---|---|---|
+  | `INSERT INTO t VALUES (1,2)` into one column | 1136 (21S01) | 1064 (42000) |
+  | `SELECT @@nosuchvar` | 1193 (HY000) | 1064 (42000) |
+  | `SELECT nosuchfunc(1)` | 1305 (42000) | 1064 (42000) |
+
+  The column-count failure also takes MySQL's own sentence — one for
+  both directions, where PostgreSQL has two and keeps them on its own
+  wire. The other two keep SPG's sentence: the system-variable one is
+  already MySQL's word for word, and the function one names the argument
+  types, which says more about why nothing matched.
+
 - **A written byte-order collation lost to the database's own.** On the
   shipped image, which collates `en_US.utf8`, `'B' COLLATE utf8mb4_bin <
   'a'` answered 0 where MySQL 9.7.2 answers 1 — 0x42 before 0x61 — and

@@ -992,6 +992,36 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Unsupported(m) if m.starts_with("Duplicate column name ") => {
             (1060, "42S21", m.clone())
         }
+        // v7.39.2 — an INSERT whose value count does not match its column
+        // count. MySQL 9.7.2: `ERROR 1136 (21S01) Column count doesn't
+        // match value count at row 1`, one sentence for both directions;
+        // SPG carries PostgreSQL's two, which say which way round it is
+        // and are what the PG wire keeps. This is the one place the
+        // dialect is certain, so the MySQL sentence is written here
+        // rather than threaded through the free function that raises it.
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("INSERT has more ") => (
+            1136,
+            "21S01",
+            "Column count doesn't match value count at row 1".to_string(),
+        ),
+        // v7.39.2 — an unknown `@@variable`. The engine already words it
+        // as MySQL does; only the number was wrong, and 1064 says the
+        // statement would not parse, which is not what happened.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("Unknown system variable ") =>
+        {
+            (1193, "HY000", detail.clone())
+        }
+        // v7.39.2 — a function that does not resolve. MySQL 9.7.2 numbers
+        // it 1305 (`FUNCTION bench.nosuchfunc does not exist`); SPG keeps
+        // its own sentence, which names the ARGUMENT TYPES and so says
+        // more about why nothing matched — the same choice the
+        // ONLY_FULL_GROUP_BY arm below makes.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("function ") && detail.ends_with(" does not exist") =>
+        {
+            (1305, "42000", detail.clone())
+        }
         // v7.39.2 — a collation name MySQL does not have. The engine
         // words it as MySQL 9.7.2 does when the session is MySQL
         // (`Unknown collation: 'nosuch_ci'`); this carries its errno.

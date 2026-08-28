@@ -1694,3 +1694,41 @@ fn an_unknown_collation_is_1273() {
     // The control: a name MySQL does have is not refused.
     assert_eq!(query_scalar(&mut s, "SELECT 'a' COLLATE utf8mb4_bin"), "a");
 }
+
+/// v7.39.2 — three failures that were all reported as 1064, a PARSE
+/// error, which is not what happened in any of them. A driver branches
+/// on the number: 1064 sends a caller down "the statement is malformed"
+/// when the statement parsed perfectly well.
+///
+/// Every pair measured against MySQL 9.7.2.
+#[test]
+fn three_failures_carry_their_own_errno() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    // 1136 / 21S01, one sentence for both directions — MySQL's own,
+    // where SPG carries PostgreSQL's two on the other wire.
+    exec_ok(&mut s, "CREATE TABLE ec (a INT)");
+    let (errno, state, msg) = err_of(&mut s, "INSERT INTO ec VALUES (1,2)");
+    assert_eq!((errno, state.as_str()), (1136, "21S01"), "{msg}");
+    assert_eq!(msg, "Column count doesn't match value count at row 1");
+    exec_ok(&mut s, "CREATE TABLE ed (a INT, b INT)");
+    let (errno, state, msg) = err_of(&mut s, "INSERT INTO ed (a,b) VALUES (1)");
+    assert_eq!((errno, state.as_str()), (1136, "21S01"), "{msg}");
+    assert_eq!(msg, "Column count doesn't match value count at row 1");
+
+    // 1193 / HY000. The sentence was already MySQL's; only the number
+    // was wrong.
+    let (errno, state, msg) = err_of(&mut s, "SELECT @@nosuchvar");
+    assert_eq!((errno, state.as_str()), (1193, "HY000"), "{msg}");
+    assert_eq!(msg, "Unknown system variable 'nosuchvar'");
+
+    // 1305 / 42000. SPG keeps its own sentence, which names the argument
+    // types and so says more about why nothing matched.
+    let (errno, state, msg) = err_of(&mut s, "SELECT nosuchfunc(1)");
+    assert_eq!((errno, state.as_str()), (1305, "42000"), "{msg}");
+    assert!(msg.contains("nosuchfunc"), "{msg}");
+
+    // The control: a statement that really IS malformed still says so.
+    let (errno, _state, msg) = err_of(&mut s, "SELECT FROM");
+    assert_eq!(errno, 1064, "{msg}");
+}
