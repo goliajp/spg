@@ -541,16 +541,37 @@ impl Engine {
     /// PG-compatible database too.
     pub(crate) fn exec_show_databases(&self) -> QueryResult {
         let columns = alloc::vec![ColumnSchema::new("Database", DataType::Text, false)];
-        let names = [
-            "information_schema",
-            "mysql",
-            "performance_schema",
-            "sys",
-            "postgres",
-        ];
+        // v7.39.2 — the REAL databases, from the same place `pg_database`
+        // reads them, plus MySQL's system schemas.
+        //
+        // It was a fixed list, so a database this server had just been
+        // asked to create was absent from it while `pg_database` listed
+        // it — the two wires answering the same question differently.
+        // That is the defect sentori reported against 7.38.18 for
+        // `pg_database` itself ("a migration tool's 'does this database
+        // exist', and a backup script that enumerates all"); the MySQL
+        // spelling of the question was never given the same treatment.
+        //
+        // The names are aliases onto one database (see `CREATE
+        // DATABASE`), which is what makes listing them honest rather
+        // than a promise of isolation.
+        let mut names: alloc::collections::BTreeSet<alloc::string::String> =
+            ["information_schema", "mysql", "performance_schema", "sys"]
+                .into_iter()
+                .map(alloc::string::String::from)
+                .collect();
+        names.insert(
+            self.session_params
+                .get("spg.database")
+                .cloned()
+                .unwrap_or_else(|| alloc::string::String::from("spg")),
+        );
+        for n in self.catalog.created_databases() {
+            names.insert(n.clone());
+        }
         let rows: Vec<Row<'static>> = names
-            .iter()
-            .map(|n| Row::new(alloc::vec![Value::text::<String>((*n).into())]))
+            .into_iter()
+            .map(|n| Row::new(alloc::vec![Value::text(n)]))
             .collect();
         QueryResult::Rows { columns, rows }
     }

@@ -12,6 +12,23 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`SHOW DATABASES` could not see a database this server had just been
+  asked to create.** It was five hard-coded names, while `pg_database` —
+  which the PostgreSQL wire answers the same question with — listed
+  `CREATE DATABASE`'s names. `CREATE DATABASE d9; SHOW DATABASES` did not
+  mention `d9`, and `SELECT datname FROM pg_database` did: one server,
+  two answers, and the MySQL half is what a mysqldump script and a
+  client's database picker read.
+
+  That is the defect sentori reported against 7.38.18 for `pg_database`
+  itself; the MySQL spelling of the question kept its canned answer. It
+  reads the same registry now, so the two cannot drift apart again.
+
+  Two assertions in the existing pin changed with it, and both were about
+  the fixed list rather than about a rule: that `postgres` is always
+  present — it is present when a connection NAMES it, the same condition
+  `pg_database` applies — and that there are exactly five rows.
+
 - **`USE <db>` did nothing, and `DATABASE()` answered a constant.** `USE`
   was swallowed with the dump noise and parsed as an empty statement, so
   `USE myapp; SELECT DATABASE()` answered the same thing it answered
