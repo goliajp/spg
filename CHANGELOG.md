@@ -286,28 +286,27 @@ the current build; this file is a release-organized view.
   collation from the COLUMN and never read the field. Both spellings now
   agree with PG 18.6 over the same four rows.
 
-- **MySQL's introducers, and why a syntax-only version would be worse
-  than the error.** `SELECT _utf8mb4'x'`, `N'y'`, `_binary'z'` and
-  `_latin1'w'` are `ERROR 1064 syntax error` here; all four answer the
-  literal on MySQL 9.7.2. Accepting the syntax and dropping the charset
-  would fix three of them and break the fourth in the worse direction:
-  measured, `_binary'A' = 'a'` is **0** on MySQL because `_binary` makes
-  the comparison byte-wise, and SPG — comparing under the session
-  collation — would answer **1**. A hard error is an honest answer; a
-  silently wrong comparison is not.
+- **MySQL's charset introducers.** `SELECT _utf8mb4'x'`, `N'y'`,
+  `_binary'z'` and `_latin1'w'` were each `ERROR 1064 syntax error`
+  here; all four answer the literal on MySQL 9.7.2, and do now.
 
-  Carrying that requires a collation on an arbitrary expression, and the
-  parser says in its own words that there is no `Expr::Collate` to carry
-  one. That node is the prerequisite, not the introducer syntax.
+  This is the item that waited for `Expr::Collate` above, and the reason
+  is one row: measured, `_binary'A' = 'a'` is **0** on MySQL because
+  `_binary` makes the comparison byte-wise, while
+  `_utf8mb4'A' = _utf8mb4'a'` is **1**. Accepting the syntax and
+  dropping the charset would have fixed three forms and broken that one
+  in the worse direction — a silently wrong comparison in place of a
+  hard error. Both rows match now.
 
-  Two details a naive version would also miss: MySQL allows a space
-  (`_utf8mb4 'x'`), and an UNKNOWN charset is not an introducer at all —
-  `_nosuch'x'` answers `Unknown column '_nosuch' in 'field list'`,
-  because it parses as a column reference followed by a string.
+  An unknown charset is NOT an introducer: MySQL parses `_nosuch'x'` as
+  a column reference followed by a string. The charset table decides,
+  and it moved to `spg-sql` so that the parser and `SET NAMES` read one
+  list rather than two.
 
-
-
-Measured, not closed here, and written down rather than left implicit:
+  Two rows of that differential still differ and neither is new: SPG
+  answers `_nosuch'x'` with a syntax error (1064) where MySQL answers
+  `Unknown column '_nosuch'` (1054), and `X'41'` renders as `\x41`
+  where MySQL renders `A`.
 
 - `SHOW VARIABLES` omits `character_sets_dir`, and only that one: it
   names a directory of charset definitions SPG does not have, and a path

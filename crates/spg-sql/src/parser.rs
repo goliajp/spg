@@ -22972,6 +22972,29 @@ impl Parser {
                 //
                 // `collate_derive` already modelled `Explicit(name)` and
                 // had no way to be handed one.
+                // v7.39.2 — a MySQL spelling does not exist on the
+                // PostgreSQL wire, and THIS is where the wire is known.
+                //
+                // The check lived in the evaluator first and asked
+                // `ctx.mysql_dialect`, which the INSERT path builds as a
+                // hard-coded `false` — so `INSERT … VALUES (_utf8mb4'x')`
+                // in a MySQL session was refused for a collation that
+                // does not exist on a wire it was not on. Making that
+                // context truthful would change INSERT-time evaluation
+                // in other ways as a side effect; the parser already
+                // gates the introducer on the same flag and is the
+                // honest place to ask.
+                if !self.mysql_dialect
+                    && (lc.ends_with("_ci")
+                        || lc.ends_with("_cs")
+                        || lc.ends_with("_bin")
+                        || lc == "binary"
+                        || matches!(lc.as_str(), "case_insensitive" | "nocase"))
+                {
+                    return Err(self.err(alloc::format!(
+                        "collation \"{cname}\" for encoding \"UTF8\" does not exist"
+                    )));
+                }
                 if !mysql_ci {
                     expr = Expr::Collate {
                         expr: alloc::boxed::Box::new(expr),
@@ -25481,6 +25504,58 @@ impl Parser {
     }
 
     fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {
+        // v7.39.2 — MySQL's charset INTRODUCER: `_utf8mb4'x'`, `N'y'`,
+        // `_binary'z'`. All three were `ERROR 1064 syntax error` here
+        // and all three answer the literal on MySQL 9.7.2.
+        //
+        // It is not only syntax, which is why it waited for
+        // `Expr::Collate`: measured, `_binary'A' = 'a'` is 0 on MySQL
+        // because `_binary` makes the comparison byte-wise, while
+        // `_utf8mb4'A' = _utf8mb4'a'` is 1. Accepting the syntax and
+        // dropping the charset would have turned a hard error into a
+        // silently wrong comparison — worse than the error it replaced.
+        //
+        // An UNKNOWN charset is NOT an introducer: MySQL answers
+        // `Unknown column '_nosuch'`, because it parses as a column
+        // reference followed by a string. So the table decides, and it
+        // is the same table `SET NAMES` reads.
+        //
+        // A space is allowed between the two (`_utf8mb4 'x'`), which
+        // falls out of asking the token stream rather than the bytes.
+        if self.mysql_dialect
+            && let Token::String(_) = self.peek()
+        {
+            let lower = first.to_ascii_lowercase();
+            let charset = if lower == "n" {
+                // `N'…'` is the national character set, which MySQL
+                // documents as utf8 — utf8mb3 in 9.7.2's spelling.
+                //
+                // utf8mb3 and utf8mb4 both fold case in their default
+                // collations, so nothing SPG can be asked distinguishes
+                // the two here: an ablation swapping this to utf8mb4
+                // reddens no pin. Recorded rather than implied — the
+                // spelling follows MySQL's documentation, not a
+                // measurement.
+                Some("utf8mb3")
+            } else {
+                // No filter here: the lookup below IS the test for
+                // "is this a charset". An ablation that removed a filter
+                // in this spot reddened nothing, which is how the two
+                // were found to be one check written twice.
+                lower.strip_prefix('_')
+            };
+            if let Some(cs) = charset
+                && let Some(collation) = crate::charset::charset_default_collation(cs)
+            {
+                let Token::String(body) = self.advance() else {
+                    unreachable!("peeked a string");
+                };
+                return Ok(Expr::Collate {
+                    expr: Box::new(Expr::Literal(Literal::String(body))),
+                    collation: String::from(collation),
+                });
+            }
+        }
         if matches!(self.peek(), Token::Dot) {
             self.advance();
             let name = self.expect_ident_like()?;
