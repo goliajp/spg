@@ -57,6 +57,26 @@ fn a_binary_string_compares_without_folding_case() {
 }
 
 #[test]
+fn a_binary_string_beside_a_number_still_reads_as_a_number() {
+    // The other half of the same operand, and the half that broke while
+    // the half above was being fixed. `0x10 = 16` is 1 on MySQL: beside a
+    // number a binary string reads as its big-endian integer. That pair
+    // used to reach the coercion only because a MySQL session folded
+    // EVERY comparison, so the moment a binary operand stopped folding it
+    // fell through to "operator does not exist: bytea = integer". Two
+    // separate questions, asked separately now.
+    let mut e = mysql();
+    for (sql, want) in [
+        ("SELECT 0x10 = 16", "true"),
+        ("SELECT 16 = 0x10", "true"),
+        ("SELECT X'41' + 0", "65"),
+        ("SELECT 0x10 = 17", "false"),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn a_binary_string_in_a_where_clause_finds_the_row() {
     let mut e = mysql();
     e.execute("CREATE TABLE b (s VARCHAR(4))").expect("create");

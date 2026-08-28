@@ -878,7 +878,14 @@ pub(crate) fn mysql_operand_reading_pair(
 
 /// Is this a mixed string/number pair, which MySQL compares numerically?
 fn mysql_mixed_pair(l: &Value<'_>, r: &Value<'_>) -> bool {
-    matches!((l, r), (Value::Text(_), o) | (o, Value::Text(_))
+    // v7.39.2 — a BINARY string beside a number is a mixed pair too: the
+    // coercion above reads `0x10` as 16. Until now the pair reached the
+    // owned path only because a MySQL session folded EVERY comparison, so
+    // `compare_is_case_insensitive` said yes for an unrelated reason; the
+    // moment a binary operand stopped folding, `0x10 = 16` fell through to
+    // "operator does not exist: bytea = integer". The two questions are
+    // separate and are now asked separately.
+    matches!((l, r), (Value::Text(_) | Value::Bytes(_), o) | (o, Value::Text(_) | Value::Bytes(_))
         if o.data_type().is_some_and(is_numeric_type))
 }
 
