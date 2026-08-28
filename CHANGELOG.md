@@ -12,6 +12,30 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`USE <db>` did nothing, and `DATABASE()` answered a constant.** `USE`
+  was swallowed with the dump noise and parsed as an empty statement, so
+  `USE myapp; SELECT DATABASE()` answered the same thing it answered
+  before. Measured on MySQL 9.7.2, `DATABASE()` has three states and SPG
+  answered `spg` in all of them:
+
+  | | MySQL 9.7.2 | SPG |
+  |---|---|---|
+  | no database at handshake | NULL | `spg` |
+  | a database at handshake | that name | `spg` |
+  | after `USE myapp` | `myapp` | `spg` |
+
+  SPG serves one database and answers to any name — what `CREATE
+  DATABASE` already documents, and this does not change it. What it
+  changes is the NAME, which is the half a client can observe and the
+  half the PostgreSQL wire has recorded since v7.39. All four doors the
+  name arrives through now reach it: the handshake, `COM_INIT_DB` (a
+  driver's `mysql_select_db`, a pool's reset), a `USE` query, and the
+  PostgreSQL startup message. `SCHEMA()`, MySQL's synonym, answers the
+  same.
+
+  The embedded engine keeps the `spg` it has always answered: it is not
+  a MySQL client, and NULL there would be a state it cannot be in.
+
 - **Three MySQL-wire failures all reported 1064, a parse error, when the
   statement had parsed perfectly well.** A driver branches on the number,
   and 1064 sends the caller down "the statement is malformed". Measured

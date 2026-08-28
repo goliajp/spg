@@ -18847,12 +18847,35 @@ fn apply_function_dispatch(
         // v7.39 (read01 misc.c) — the connection's database name (the
         // wire layer records it in the session GUC map at startup);
         // "spg" stays the embedded default.
-        "current_database" | "database" => Ok(Value::text(
+        "current_database" => Ok(Value::text(
             ctx.session_gucs
                 .and_then(|g| g.get("spg.database"))
                 .cloned()
                 .unwrap_or_else(|| String::from("spg")),
         )),
+        // v7.39.2 — MySQL's spelling answers NULL when no database has
+        // been selected, where PostgreSQL's always names one. Measured on
+        // MySQL 9.7.2: a connection opened without a database answers
+        // NULL, and after `USE myapp` it answers `myapp`. SPG answered
+        // the constant `spg` in all three states.
+        "database" | "schema" => Ok(ctx
+            .session_gucs
+            .and_then(|g| g.get("spg.database"))
+            .filter(|d| !d.is_empty())
+            .map_or_else(
+                || {
+                    // NULL only for a session that speaks MySQL, where a
+                    // connection really can have no database. The embedded
+                    // engine is not a MySQL client and keeps the `spg`
+                    // default it has always answered.
+                    if ctx.mysql_dialect {
+                        Value::Null
+                    } else {
+                        Value::text("spg")
+                    }
+                },
+                |d| Value::text(d.clone()),
+            )),
         // v7.39 (round 320, V53) — the first EXISTING schema on the
         // session's search_path, as PG resolves it: `SET search_path TO
         // app` reports `app` once that schema exists and NULL while it

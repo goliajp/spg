@@ -2913,6 +2913,19 @@ impl Engine {
     /// string — failed against both oracles while the harness believed
     /// it had switched dialects. Two calls meaning one thing is the
     /// hazard; this is the one call.
+    /// v7.39.2 — name the database this session is on.
+    ///
+    /// One database is served whatever the name (see `CREATE DATABASE`),
+    /// so this records the NAME and nothing else — which is the half a
+    /// client can observe, through `DATABASE()` on the MySQL wire and
+    /// `current_database()` on PostgreSQL's.
+    pub fn set_session_database(&mut self, name: &str) {
+        self.set_session_param(
+            alloc::string::String::from("spg.database"),
+            spg_sql::ast::SetValue::String(alloc::string::String::from(name)),
+        );
+    }
+
     pub fn set_mysql_wire_session(&mut self) {
         self.set_mysql_dialect(true);
     }

@@ -647,6 +647,14 @@ fn command_loop(
             engine.set_current_session(session_id);
             // Sets both axes; see `Engine::set_mysql_wire_session`.
             engine.set_mysql_wire_session();
+            // v7.39.2 — the database this client named at handshake, in
+            // the same session GUC the PostgreSQL wire has used since
+            // v7.39. `DATABASE()` read a constant before this and
+            // answered `spg` in all three of MySQL's states: NULL with no
+            // database, the handshake name, and the name after `USE`.
+            if !database.is_empty() {
+                engine.set_session_database(&database);
+            }
             engine.alloc_tx_id()
         }
         Err(_) => spg_engine::IMPLICIT_TX,
@@ -811,6 +819,13 @@ fn run_command_loop(
                     if let Ok(mut g) = conn_state.database.write() {
                         g.clear();
                         g.push_str(db_name);
+                    }
+                    // v7.39.2 — and where `DATABASE()` reads it. A client
+                    // that switches with COM_INIT_DB rather than a `USE`
+                    // query goes through here and nowhere else.
+                    if let Ok(mut engine) = state.engine.write() {
+                        engine.set_current_session(session_id);
+                        engine.set_session_database(db_name);
                     }
                     write_packet(
                         stream,

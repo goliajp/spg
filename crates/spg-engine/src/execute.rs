@@ -2447,6 +2447,21 @@ impl Engine {
             Statement::ReleaseSavepoint(name) => self.exec_release_savepoint(&name),
             Statement::ShowTables => Ok(self.exec_show_tables()),
             Statement::ShowDatabases => Ok(self.exec_show_databases()),
+            // v7.39.2 — record the NAME. SPG serves one database and
+            // answers to any name, so there is no catalog to switch; what
+            // a client can observe is `DATABASE()`, and it answered a
+            // constant. The PostgreSQL wire has recorded the same thing
+            // in the same place since v7.39.
+            Statement::UseDatabase(name) => {
+                self.set_session_param(
+                    alloc::string::String::from("spg.database"),
+                    spg_sql::ast::SetValue::String(name),
+                );
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: false,
+                })
+            }
             Statement::ShowCreateTable(name) => self.exec_show_create_table(&name),
             Statement::ShowIndexes(name) => self.exec_show_indexes(&name),
             Statement::ShowStatus => Ok(self.exec_show_status()),

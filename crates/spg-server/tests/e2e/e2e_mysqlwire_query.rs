@@ -83,6 +83,36 @@ fn auth_open_mode(addr: &str) -> TcpStream {
     s
 }
 
+/// v7.39.2 — a handshake that NAMES a database, which is the door the
+/// name arrives through for an ordinary client and which
+/// `build_handshake_response` could not open: it never set
+/// CLIENT_CONNECT_WITH_DB (0x0008), so every test connected with none.
+fn build_handshake_response_with_db(username: &str, db: &str) -> Vec<u8> {
+    let caps: u32 = 0x0000_0200 | 0x0000_8000 | 0x0008_0000 | 0x0000_0008;
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&caps.to_le_bytes());
+    payload.extend_from_slice(&16_777_215u32.to_le_bytes());
+    payload.push(0xff);
+    payload.extend_from_slice(&[0u8; 23]);
+    payload.extend_from_slice(username.as_bytes());
+    payload.push(0);
+    payload.push(0); // auth_response empty → open mode accepts
+    payload.extend_from_slice(db.as_bytes());
+    payload.push(0);
+    payload.extend_from_slice(b"mysql_native_password\0");
+    payload
+}
+
+fn auth_open_mode_with_db(addr: &str, db: &str) -> TcpStream {
+    let mut s = common::connect_to(addr);
+    s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
+    let (_seqno, _greeting) = read_packet(&mut s);
+    write_packet(&mut s, 1, &build_handshake_response_with_db("anyone", db));
+    let (_seqno, ok) = read_packet(&mut s);
+    assert_eq!(ok[0], 0x00, "expected OK after auth, got {:#x}", ok[0]);
+    s
+}
+
 fn send_query(s: &mut TcpStream, sql: &str) {
     let mut payload = Vec::with_capacity(1 + sql.len());
     payload.push(0x03); // COM_QUERY
@@ -1731,4 +1761,40 @@ fn three_failures_carry_their_own_errno() {
     // The control: a statement that really IS malformed still says so.
     let (errno, _state, msg) = err_of(&mut s, "SELECT FROM");
     assert_eq!(errno, 1064, "{msg}");
+}
+
+/// v7.39.2 — `DATABASE()` on the wire names the connection's database.
+///
+/// It answered the constant `spg` in all three of MySQL's states. This
+/// is the wire half: the handshake name arrives here and nowhere else,
+/// and a client that switches with COM_INIT_DB rather than a `USE`
+/// query goes through a different door again.
+#[test]
+fn the_wire_names_the_connections_database() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    // `auth_open_mode` sends no database, which is MySQL's NULL state.
+    assert_eq!(query_scalar(&mut s, "SELECT DATABASE()"), "");
+    exec_ok(&mut s, "USE myapp");
+    assert_eq!(query_scalar(&mut s, "SELECT DATABASE()"), "myapp");
+    // Per connection, not per server: a second one starts from NULL.
+    let mut b = auth_open_mode(&addr);
+    assert_eq!(query_scalar(&mut b, "SELECT DATABASE()"), "");
+    // And A is unchanged by B having connected.
+    assert_eq!(query_scalar(&mut s, "SELECT DATABASE()"), "myapp");
+    // The third door: the name given at HANDSHAKE, which no test could
+    // reach until this file learned to set CLIENT_CONNECT_WITH_DB.
+    let mut c = auth_open_mode_with_db(&addr, "fromhandshake");
+    assert_eq!(query_scalar(&mut c, "SELECT DATABASE()"), "fromhandshake");
+    // And the fourth: COM_INIT_DB, which is what a driver's
+    // `mysql_select_db()` and a pool's connection reset send. The `mysql`
+    // CLI sends `USE x` as a QUERY, so no test reaches this by writing
+    // SQL — reverting the wiring behind it left every other assertion
+    // here green.
+    let mut payload = vec![0x02u8];
+    payload.extend_from_slice(b"viainitdb");
+    write_packet(&mut c, 0, &payload);
+    let (_seq, ok) = read_packet(&mut c);
+    assert_eq!(ok[0], 0x00, "expected OK for COM_INIT_DB, got {:#x}", ok[0]);
+    assert_eq!(query_scalar(&mut c, "SELECT DATABASE()"), "viainitdb");
 }
