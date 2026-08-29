@@ -18752,6 +18752,31 @@ impl Parser {
                 alias: None,
             });
         }
+        // v7.39.2 — MySQL lets a STRING name a projection item, with or
+        // without `AS`: `SELECT 1 'x'`, `SELECT COUNT(*) 'total'`,
+        // `SELECT 1 'a b'` (which is why one quotes it). SPG answered
+        // `syntax error at or near "'x'"` to all of them.
+        //
+        // Only here, not in `parse_optional_alias`: that one also names
+        // TABLES, and MySQL 9.7.2 refuses a string there — `FROM t 'ta'`
+        // and `FROM t AS 'ta'` are both syntax errors, measured. And only
+        // after the lexer's own rule has joined adjacent literals, or
+        // `SELECT 'a' 'b'` would read as a literal aliased `b` where
+        // MySQL answers the concatenation `ab`.
+        if self.mysql_dialect {
+            let at_as = matches!(self.peek(), Token::As)
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::String(_)));
+            if at_as {
+                self.advance();
+            }
+            if let Token::String(name) = self.peek().clone() {
+                self.advance();
+                return Ok(SelectItem::Expr {
+                    expr,
+                    alias: Some(name),
+                });
+            }
+        }
         let alias = match self.parse_optional_alias()? {
             Some(a) => Some(a),
             None => self.mysql_item_label(&expr, start_tok, end_tok),

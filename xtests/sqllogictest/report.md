@@ -6,7 +6,7 @@ Per-corpus pass / fail / skip:
 |---|---|---|---|---|---|
 | `15_regressions` | 284 | 0 | 0 | 100.0% | postgres × 21 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
-| `mysql` | 449 | 0 | 0 | 100.0% | mysql × 27 |
+| `mysql` | 451 | 0 | 0 | 100.0% | mysql × 27 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
@@ -97,7 +97,7 @@ Per-corpus pass / fail / skip:
 | `12_collation_index_agreement.test` | 38 | 0 | 0 | mysql |
 | `12_unique_collation.test` | 22 | 0 | 0 | mysql |
 | `13_pad_semantics.test` | 20 | 0 | 0 | mysql |
-| `13_show_databases.test` | 3 | 0 | 0 | mysql |
+| `13_show_databases.test` | 5 | 0 | 0 | mysql |
 | `14_mixed_type_compare.test` | 16 | 0 | 0 | mysql |
 | `14_show_create_table.test` | 4 | 0 | 0 | mysql |
 | `15_pad_by_collation_name.test` | 21 | 0 | 0 | mysql |
