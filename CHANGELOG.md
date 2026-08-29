@@ -12,6 +12,61 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **Two error wordings the differential corpus had been carrying as
+  accepted divergences, and the second was never the parser's fault.**
+  `to_number('x','999')` answered SPG's own `to_number(): could not
+  parse "x"`; PostgreSQL 18.6 extracts per the format and hands the
+  leftover to `numeric_in`, which fails on the blank it is given —
+  `invalid input syntax for type numeric: " "`, one space, whatever the
+  input and whatever the format width (measured with '9', '999' and
+  '99999').
+
+  `SELECT 1 +;` answered `syntax error at end of input` where
+  PostgreSQL names the token it stopped at, `syntax error at or near
+  ";"`, keeping `end of input` for the same text WITHOUT a semicolon.
+  SPG's parser already drew that distinction exactly — called directly
+  it gives PostgreSQL's answer to both — but the PostgreSQL wire took
+  the terminator off before the parser could see it, so the two shapes
+  collapsed onto one message. The executor is handed what the client
+  sent now; the routing above it (SET / SHOW / COPY intent, canned
+  responses) still matches on the trimmed form, and `parse_statement`
+  swallows a trailing `;` itself, so no valid statement changes meaning.
+
+  `14-errors-sqlstate` in the differential corpus is now byte-identical
+  to PostgreSQL 18.6 (it carried six divergent lines), and `18-sqlstate`
+  is down from four to two. The one left there is a wrong-arity call:
+  PostgreSQL words it `function lower() does not exist`, naming the
+  argument types it could not match, where SPG says `lower() takes 1
+  arg, got 0`. That is 339 hand-written messages across ten files and it
+  gets its own cycle rather than a partial pass here.
+
+- **`ONLY_FULL_GROUP_BY` answered PostgreSQL's one sentence and one
+  errno where MySQL has four answers and three numbers.** The rule
+  itself was already enforced — the ledger's "capability gap, large"
+  entry was stale — but every shape came back as errno 1055 with
+  `column "g.b" must appear in the GROUP BY clause or be used in an
+  aggregate function`. Measured on MySQL 9.7.2:
+
+  | query | MySQL |
+  |---|---|
+  | `SELECT a, b … GROUP BY a` | 1055, `Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'db.g.b' …` |
+  | `… GROUP BY a ORDER BY b` | 1055, the same with `ORDER BY clause` |
+  | `SELECT a, COUNT(*) FROM g` | **1140**, `In aggregated query without GROUP BY, expression #1 …` |
+  | `… GROUP BY a HAVING b > 1` | **1054**, `Unknown column 'b' in 'having clause'` |
+
+  Two of those are not 1055 at all, and a driver branches on the
+  number: an aggregated query with no GROUP BY is a different fault
+  (`ER_MIX_OF_GROUP_FUNC_AND_FIELDS`), and HAVING is not this error
+  there at all — a grouped query's HAVING sees only the grouped columns
+  and the aggregates, so an ungrouped name is an unknown COLUMN.
+
+  The message names the clause, the 1-based expression position and the
+  three-part `db.table.column`, with the schema following the session
+  as every other qualified name on that wire now does. A PostgreSQL
+  session keeps PostgreSQL's sentence; the pin that covered this used
+  one constant for both legs and so described SPG rather than either
+  engine.
+
 - **A qualified missing column lost its alias.** PostgreSQL 18.6 prints
   a qualified reference unquoted and dotted — `column ea.no_such does
   not exist` — and an unqualified one quoted: `column "no_such" does not

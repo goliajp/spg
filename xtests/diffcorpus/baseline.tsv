@@ -12,9 +12,9 @@
 11-view-trigger-seq	0
 12-domain-enum-range	0
 13-partition-inherit	2
-14-errors-sqlstate	6
+14-errors-sqlstate	0
 15-catalog	0
 16-copy-prepare-cursor	0
 17-acl-rls-fts	2
-18-sqlstate	4
+18-sqlstate	2
 19-sqlstate-codes	0

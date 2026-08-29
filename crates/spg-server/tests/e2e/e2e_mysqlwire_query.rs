@@ -1932,3 +1932,74 @@ fn a_float_renders_mysqls_way_over_the_wire() {
         );
     }
 }
+
+/// v7.39.2 — MySQL's own ONLY_FULL_GROUP_BY sentences, and its two
+/// DIFFERENT errnos.
+///
+/// SPG enforced the rule (it is PostgreSQL's, and the same rule) but
+/// answered PostgreSQL's one sentence and errno 1055 to every shape.
+/// Measured on MySQL 9.7.2 there are four distinct answers, and two of
+/// them are not 1055 at all — a driver branching on the number could
+/// not tell an aggregated-query-without-GROUP-BY from an ungrouped
+/// select-list column, and read a HAVING scope error as either.
+#[test]
+fn only_full_group_by_speaks_mysqls_words_and_numbers() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE DATABASE testdb");
+    exec_ok(&mut s, "USE testdb");
+    exec_ok(&mut s, "CREATE TABLE g (a INT, b INT, c INT)");
+    exec_ok(
+        &mut s,
+        "INSERT INTO g VALUES (1,10,100),(1,20,200),(2,30,300)",
+    );
+
+    let ungrouped = |what: &str, col: &str| {
+        format!(
+            "Expression #{} is not in GROUP BY clause and contains nonaggregated \
+             column '{col}' which is not functionally dependent on columns in GROUP \
+             BY clause; this is incompatible with sql_mode=only_full_group_by",
+            what
+        )
+    };
+
+    let (errno, state, msg) = err_of(&mut s, "SELECT a, b FROM g GROUP BY a");
+    assert_eq!((errno, state.as_str()), (1055, "42000"), "{msg}");
+    assert_eq!(msg, ungrouped("2 of SELECT list", "testdb.g.b"));
+
+    let (errno, state, msg) = err_of(&mut s, "SELECT a FROM g GROUP BY a ORDER BY b");
+    assert_eq!((errno, state.as_str()), (1055, "42000"), "{msg}");
+    assert_eq!(msg, ungrouped("1 of ORDER BY clause", "testdb.g.b"));
+
+    // A different fault, and MySQL numbers it differently: 1140,
+    // ER_MIX_OF_GROUP_FUNC_AND_FIELDS.
+    let (errno, state, msg) = err_of(&mut s, "SELECT a, COUNT(*) FROM g");
+    assert_eq!((errno, state.as_str()), (1140, "42000"), "{msg}");
+    assert_eq!(
+        msg,
+        "In aggregated query without GROUP BY, expression #1 of SELECT list contains \
+         nonaggregated column 'testdb.g.a'; this is incompatible with \
+         sql_mode=only_full_group_by"
+    );
+
+    // And HAVING is not this error there at all: a grouped query's
+    // HAVING sees only the grouped columns and the aggregates.
+    let (errno, state, msg) = err_of(&mut s, "SELECT a FROM g GROUP BY a HAVING b > 1");
+    assert_eq!((errno, state.as_str()), (1054, "42S22"), "{msg}");
+    assert_eq!(msg, "Unknown column 'b' in 'having clause'");
+
+    // The schema name follows the session, as every other
+    // `db.table.column` on this wire does.
+    exec_ok(&mut s, "USE other");
+    let (_e, _st, msg) = err_of(&mut s, "SELECT a, b FROM g GROUP BY a");
+    assert!(msg.contains("'other.g.b'"), "{msg}");
+
+    // The control: turning the mode off runs the loose query.
+    exec_ok(&mut s, "SET sql_mode=''");
+    assert_eq!(
+        // Two groups, so this is not a scalar without the LIMIT — the
+        // helper reads exactly one row.
+        query_scalar(&mut s, "SELECT b FROM g GROUP BY a ORDER BY a LIMIT 1"),
+        "10"
+    );
+}

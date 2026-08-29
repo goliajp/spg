@@ -53,7 +53,19 @@ fn seeded(e: &mut Engine) {
     .unwrap();
 }
 
-const REFUSAL: &str = "must appear in the GROUP BY clause";
+// v7.39.2 — the sentence a MYSQL session gets. It used to be
+// PostgreSQL's (`column "t.v" must appear in the GROUP BY clause …`),
+// which is the rule SPG enforces but not what MySQL 9.7.2 says.
+// Measured there: the clause, the 1-based expression position and the
+// three-part `db.table.column`, and a DIFFERENT errno when there is no
+// GROUP BY at all (1140, not 1055).
+const REFUSAL: &str = "is not in GROUP BY clause and contains nonaggregated column";
+
+/// PostgreSQL's own sentence, which a PG session still gets. The two
+/// engines word the same rule differently, so one constant cannot serve
+/// both legs — the first draft used the PG one for all three and went
+/// green on the MySQL legs by describing SPG rather than MySQL.
+const PG_REFUSAL: &str = "must appear in the GROUP BY clause";
 
 #[test]
 fn a_mysql_session_refuses_a_bare_non_aggregated_column() {
@@ -66,15 +78,19 @@ fn a_mysql_session_refuses_a_bare_non_aggregated_column() {
 
     // The default list DOES carry it.
     ask(&mut e, 1, IMPLICIT_TX, "SET sql_mode='ONLY_FULL_GROUP_BY'").unwrap();
-    for sql in [
-        "SELECT g, v FROM t GROUP BY g",
-        "SELECT g FROM t GROUP BY g HAVING v > 1",
-        "SELECT g FROM t GROUP BY g ORDER BY v",
+    // Measured on MySQL 9.7.2. HAVING is NOT this error there: a
+    // grouped query's HAVING can only see the grouped columns and the
+    // aggregates, so an ungrouped name is an unknown COLUMN, 1054.
+    for (sql, want) in [
+        ("SELECT g, v FROM t GROUP BY g", REFUSAL),
+        (
+            "SELECT g FROM t GROUP BY g HAVING v > 1",
+            "Unknown column 'v' in 'having clause'",
+        ),
+        ("SELECT g FROM t GROUP BY g ORDER BY v", REFUSAL),
     ] {
         assert!(
-            ask(&mut e, 1, IMPLICIT_TX, sql)
-                .unwrap_err()
-                .contains(REFUSAL),
+            ask(&mut e, 1, IMPLICIT_TX, sql).unwrap_err().contains(want),
             "{sql} must be refused under ONLY_FULL_GROUP_BY"
         );
     }
@@ -129,7 +145,7 @@ fn a_postgresql_session_was_already_strict_and_still_is() {
     assert!(
         ask(&mut e, 1, IMPLICIT_TX, "SELECT g, v FROM t GROUP BY g")
             .unwrap_err()
-            .contains(REFUSAL)
+            .contains(PG_REFUSAL)
     );
     // And its functional dependency is unchanged.
     assert_eq!(

@@ -8559,9 +8559,18 @@ fn apply_function_dispatch(
                 }
             }
             if cleaned.is_empty() {
+                // v7.39.2 — PostgreSQL's own words. `to_number` there
+                // extracts per the format and hands the leftover to
+                // `numeric_in`, which fails on the blank it is given:
+                // `invalid input syntax for type numeric: " "`, one
+                // space, whatever the input and whatever the format
+                // width (measured on 18.6 with '9', '999' and '99999').
+                // SPG named its own function and echoed the input,
+                // which is neither PostgreSQL's wording nor its
+                // SQLSTATE class.
                 return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "to_number(): could not parse {raw:?}"
+                    detail: alloc::string::String::from(
+                        "invalid input syntax for type numeric: \" \"",
                     ),
                 });
             }
@@ -8574,7 +8583,9 @@ fn apply_function_dispatch(
             match crate::numeric::parse_numeric_text(&cleaned) {
                 Some((scaled, scale)) => Ok(Value::Numeric { scaled, scale, kind: spg_storage::NumericKind::Finite }),
                 None => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("to_number(): could not parse {cleaned:?}"),
+                    detail: alloc::format!(
+                        "invalid input syntax for type numeric: \"{cleaned}\""
+                    ),
                 }),
             }
         }
