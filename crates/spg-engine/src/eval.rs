@@ -654,6 +654,14 @@ pub enum EvalError {
     },
     UnknownQualifier {
         qualifier: String,
+        /// v7.39.2 — the column that was written after it.
+        ///
+        /// PostgreSQL names only the missing table; MySQL 9.7.2 names
+        /// the whole reference — `Unknown column 'zz.a' in 'where
+        /// clause'` — and numbers it 1054, a COLUMN error. SPG answered
+        /// 1146, which is what a driver reads as "that table is gone".
+        /// The name has to travel for the MySQL wire to say it.
+        column: String,
     },
     DivisionByZero,
     TypeMismatch {
@@ -684,7 +692,7 @@ impl core::fmt::Display for EvalError {
             // qualifier that names no table in scope is "missing
             // FROM-clause entry for table \"x\"". The old "unknown table
             // qualifier" matched nothing a driver branches on.
-            Self::UnknownQualifier { qualifier } => {
+            Self::UnknownQualifier { qualifier, .. } => {
                 write!(f, "missing FROM-clause entry for table \"{qualifier}\"")
             }
             Self::DivisionByZero => f.write_str("division by zero"),

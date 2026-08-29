@@ -1052,6 +1052,91 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         // branches on. It read 1064 here — a PARSE error — which is
         // what an unmapped message falls back to and is wrong about
         // what happened.
+        // v7.39.2 — a qualifier that names no source. PostgreSQL names the
+        // missing TABLE (`missing FROM-clause entry for table "zz"`) and
+        // SPG numbered it 1146, which a driver reads as "that table is
+        // gone". MySQL 9.7.2 names the whole reference and numbers it a
+        // COLUMN error: `Unknown column 'zz.a' in 'where clause'`,
+        // measured. The clause is `'field list'` here because the check
+        // that knows the clause deliberately lets an unknown qualifier
+        // through — a correlated subquery's outer alias is unknown at the
+        // inner level and refusing it would be a worse defect.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::UnknownQualifier {
+            qualifier,
+            column,
+        }) => {
+            if column == "*" {
+                // `zz.*` names no column, and MySQL 9.7.2 calls that a
+                // TABLE error: `ERROR 1051 (42S02) Unknown table 'zz'`.
+                // Measured — the same reference without the star is a
+                // COLUMN error, and the two carry different numbers.
+                (1051, "42S02", format!("Unknown table '{qualifier}'"))
+            } else {
+                (
+                    1054,
+                    "42S22",
+                    format!("Unknown column '{qualifier}.{column}' in 'field list'"),
+                )
+            }
+        }
+        // v7.39.2 — an unknown column with no clause attached is MySQL's
+        // `'field list'`: the projection, an UPDATE's SET list and an
+        // INSERT's target columns all say that on 9.7.2, measured, and
+        // all three raise PostgreSQL's clause-free sentence here.
+        //
+        // The clause-bearing sentences are produced by the SELECT
+        // validator, which is the only place the clause is still known,
+        // and they arrive as TypeMismatch (below) rather than as this.
+        // A predicate over a JOIN still reaches here without one and is
+        // therefore labelled `'field list'` where MySQL would say
+        // `'where clause'` — the number, the SQLSTATE and the column
+        // name are right, the clause is not, and that is recorded.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::ColumnNotFound { name }) => (
+            1054,
+            "42S22",
+            format!("Unknown column '{name}' in 'field list'"),
+        ),
+        // The tail matters: `column "a" of relation "t" ALREADY EXISTS` is
+        // the duplicate-column error (1060), and the first version of this
+        // arm matched it on the prefix alone and renumbered it 1054. The
+        // pin round 429 wrote for that errno said so.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("column \"")
+                && m.contains("\" of relation \"")
+                && m.ends_with("does not exist") =>
+        {
+            let col = m.split('"').nth(1).unwrap_or_default().to_string();
+            (
+                1054,
+                "42S22",
+                format!("Unknown column '{col}' in 'field list'"),
+            )
+        }
+        // v7.39.2 — a column name that matches more than one source.
+        // MySQL 9.7.2: `ERROR 1052 (23000) Column 'a' in field list is
+        // ambiguous`; SPG carries PostgreSQL's `column reference "a" is
+        // ambiguous`, which the PG wire keeps, and answered 1064 here —
+        // a parse error, which is not what happened.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("column reference \"") && detail.ends_with("\" is ambiguous") =>
+        {
+            let col = detail.split('"').nth(1).unwrap_or_default().to_string();
+            (
+                1052,
+                "23000",
+                format!("Column '{col}' in field list is ambiguous"),
+            )
+        }
+        // v7.39.2 — an unknown column, worded and numbered as MySQL does.
+        // The engine names the CLAUSE (`in 'where clause'`), which is
+        // what 9.7.2 does and what PostgreSQL does not; the errno that
+        // goes with those words is 1054 / 42S22, the same pair the PG
+        // SQLSTATE already maps to.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("Unknown column '") =>
+        {
+            (1054, "42S22", detail.clone())
+        }
         // v7.39.2 — the same failure reached through an EXPRESSION
         // (`SELECT 'a' COLLATE nosuch_ci`) rather than a declaration.
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })

@@ -659,7 +659,8 @@ fn qualified_column_with_wrong_alias_errors() {
     let err = e.execute("SELECT x.id FROM users AS u").unwrap_err();
     assert!(matches!(
         err,
-        EngineError::Eval(EvalError::UnknownQualifier { ref qualifier }) if qualifier == "x"
+        EngineError::Eval(EvalError::UnknownQualifier { ref qualifier, .. })
+            if qualifier == "x"
     ));
 }
 

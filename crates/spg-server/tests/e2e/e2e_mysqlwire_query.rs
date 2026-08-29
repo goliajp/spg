@@ -1798,3 +1798,97 @@ fn the_wire_names_the_connections_database() {
     assert_eq!(ok[0], 0x00, "expected OK for COM_INIT_DB, got {:#x}", ok[0]);
     assert_eq!(query_scalar(&mut c, "SELECT DATABASE()"), "viainitdb");
 }
+
+/// v7.39.2 — an unknown column says which CLAUSE, the way MySQL does.
+///
+/// SPG carried PostgreSQL's clause-free `column "x" does not exist` to
+/// the MySQL wire. MySQL 9.7.2 names the clause in six different ways
+/// and a driver's error handling reads the sentence as well as the
+/// number. Every expectation below is measured against 9.7.2.
+///
+/// The clause is known only in the SELECT validator — by the time a
+/// row-time resolver meets the name, the expression has been detached
+/// from the statement that held it — so the shapes that validator
+/// declines fall back to `'field list'`, which is what the projection,
+/// an UPDATE's SET list and an INSERT's target columns all say anyway.
+#[test]
+fn an_unknown_column_names_its_clause() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE TABLE uc (a INT)");
+    exec_ok(&mut s, "CREATE TABLE u2 (b INT)");
+    for (sql, want) in [
+        (
+            "SELECT nosuch FROM uc",
+            "Unknown column 'nosuch' in 'field list'",
+        ),
+        (
+            "UPDATE uc SET nosuch = 1",
+            "Unknown column 'nosuch' in 'field list'",
+        ),
+        (
+            "INSERT INTO uc (nosuch) VALUES (1)",
+            "Unknown column 'nosuch' in 'field list'",
+        ),
+        (
+            "SELECT a FROM uc WHERE nosuch = 1",
+            "Unknown column 'nosuch' in 'where clause'",
+        ),
+        (
+            "SELECT a FROM uc ORDER BY nosuch",
+            "Unknown column 'nosuch' in 'order clause'",
+        ),
+        (
+            "SELECT a FROM uc GROUP BY nosuch",
+            "Unknown column 'nosuch' in 'group statement'",
+        ),
+        (
+            "SELECT a FROM uc GROUP BY a HAVING nosuch > 1",
+            "Unknown column 'nosuch' in 'having clause'",
+        ),
+        (
+            "SELECT a FROM uc JOIN u2 ON uc.nosuch = u2.b",
+            "Unknown column 'uc.nosuch' in 'on clause'",
+        ),
+        // A join keeps the clause too — the validator reads every source,
+        // not just the first.
+        (
+            "SELECT a FROM uc JOIN u2 ON uc.a = u2.b WHERE nosuch = 1",
+            "Unknown column 'nosuch' in 'where clause'",
+        ),
+        // The qualifier travels with the name.
+        (
+            "SELECT a FROM uc x WHERE x.nosuch = 1",
+            "Unknown column 'x.nosuch' in 'where clause'",
+        ),
+        // A qualifier that names no source at all. PostgreSQL calls this
+        // a missing FROM-clause entry and SPG numbered it 1146, which a
+        // driver reads as "that table is gone"; MySQL calls it a COLUMN.
+        (
+            "SELECT a FROM uc WHERE zz.a = 1",
+            "Unknown column 'zz.a' in 'where clause'",
+        ),
+    ] {
+        let (errno, state, msg) = err_of(&mut s, sql);
+        assert_eq!((errno, state.as_str()), (1054, "42S22"), "{sql}: {msg}");
+        assert_eq!(msg, want, "{sql}");
+    }
+
+    // `q.*` is a TABLE error on MySQL, not a column one, and carries a
+    // different number: pinning only the row above would have let the
+    // star share it.
+    let (errno, state, msg) = err_of(&mut s, "SELECT zz.* FROM uc");
+    assert_eq!((errno, state.as_str()), (1051, "42S02"), "{msg}");
+    assert_eq!(msg, "Unknown table 'zz'");
+
+    // A name that matches two sources.
+    exec_ok(&mut s, "CREATE TABLE u3 (a INT)");
+    let (errno, state, msg) = err_of(&mut s, "SELECT a FROM uc JOIN u3 ON uc.a = u3.a");
+    assert_eq!((errno, state.as_str()), (1052, "23000"), "{msg}");
+    assert_eq!(msg, "Column 'a' in field list is ambiguous");
+
+    // The controls: a real syntax error is still 1064, and a column that
+    // does resolve still runs.
+    assert_eq!(err_of(&mut s, "SELECT FROM").0, 1064);
+    assert_eq!(query_scalar(&mut s, "SELECT COUNT(*) FROM uc"), "0");
+}

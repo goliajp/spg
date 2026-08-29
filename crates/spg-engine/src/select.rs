@@ -11458,6 +11458,7 @@ pub(crate) fn resolve_projection_column<'a>(
         if !qualifier_known {
             return Err(EngineError::Eval(EvalError::UnknownQualifier {
                 qualifier: q.clone(),
+                column: c.name.clone(),
             }));
         }
         return Err(EngineError::Eval(EvalError::ColumnNotFound {
@@ -11748,8 +11749,10 @@ pub(crate) fn build_projection_hiding_tail(
                     });
                 }
                 if matched == 0 {
+                    // `q.*` names no column, so the reference IS the star.
                     return Err(EngineError::Eval(EvalError::UnknownQualifier {
                         qualifier: q.clone(),
+                        column: alloc::string::String::from("*"),
                     }));
                 }
             }
@@ -13768,41 +13771,59 @@ impl crate::Engine {
         let Some(from) = &stmt.from else {
             return Ok(());
         };
-        if !from.joins.is_empty() || !stmt.ctes.is_empty() {
+        if !stmt.ctes.is_empty() {
             return Ok(());
         }
-        let t = &from.primary;
-        if t.unnest_expr.is_some()
-            || t.generate_series_args.is_some()
-            || t.lateral_subquery.is_some()
-            || t.jsonb_each_text_arg.is_some()
-            || t.table_fn_call.is_some()
-            || t.rows_from.is_some()
-            || t.json_table.is_some()
-            || t.scalar_fn_item
-        {
-            return Ok(());
-        }
-        let Some(table) = self.active_catalog().get(&t.name) else {
-            return Ok(());
+        // v7.39.2 — every source, not just the first. A join is checkable
+        // for the same reason one table is: with no CTE and no
+        // subquery-shaped source, a bare name has to come from one of
+        // them. Refusing the check for joins left `SELECT … FROM a JOIN b
+        // … WHERE nosuch = 1` labelled `'field list'` where MySQL 9.7.2
+        // says `'where clause'`.
+        let plain = |t: &spg_sql::ast::TableRef| -> bool {
+            t.unnest_expr.is_none()
+                && t.generate_series_args.is_none()
+                && t.lateral_subquery.is_none()
+                && t.jsonb_each_text_arg.is_none()
+                && t.table_fn_call.is_none()
+                && t.rows_from.is_none()
+                && t.json_table.is_none()
+                && !t.scalar_fn_item
         };
-        let alias = t.alias.clone().unwrap_or_else(|| t.name.clone());
+        let cat = self.active_catalog();
+        let mut sources: Vec<(String, &spg_storage::Table)> = Vec::new();
+        for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+            if !plain(t) {
+                return Ok(());
+            }
+            let Some(table) = cat.get(&t.name) else {
+                return Ok(());
+            };
+            sources.push((t.alias.clone().unwrap_or_else(|| t.name.clone()), table));
+        }
         let known = |c: &spg_sql::ast::ColumnName| -> bool {
-            if let Some(q) = &c.qualifier
-                && q != &alias
-                && q != &t.name
-            {
-                // A qualifier this statement does not introduce is out of
-                // scope for this check.
+            // A system column is not in a table's list and is a perfectly
+            // good predicate: `WHERE ctid = '(0,4)'::tid` and `WHERE
+            // tableoid::regclass::text = 'pm_a'` are both real, and the
+            // first draft of this check refused them. The e2e suite said
+            // so immediately, which is what it is for.
+            if is_system_column(&c.name) {
                 return true;
             }
-            // A system column is not in the table's list and is a
-            // perfectly good predicate: `WHERE ctid = '(0,4)'::tid` and
-            // `WHERE tableoid::regclass::text = 'pm_a'` are both real,
-            // and the first draft of this check refused them. The e2e
-            // suite said so immediately, which is what it is for.
-            is_system_column(&c.name)
-                || table.schema().columns.iter().any(|sc| sc.name == c.name)
+            if let Some(q) = &c.qualifier {
+                // A qualifier must name one of this statement's sources,
+                // and that source must carry the column. An alias
+                // REPLACES the written name, which is PostgreSQL's rule
+                // and MySQL's: `FROM pg_cast c WHERE pg_cast.oid <> 0`
+                // is an error on both.
+                return match sources.iter().find(|(a, _)| a == q) {
+                    Some((_, t)) => t.schema().columns.iter().any(|sc| sc.name == c.name),
+                    None => false,
+                };
+            }
+            sources
+                .iter()
+                .any(|(_, t)| t.schema().columns.iter().any(|sc| sc.name == c.name))
                 // An output name the statement itself defines: ORDER BY,
                 // GROUP BY and HAVING may all name one.
                 || stmt.items.iter().any(|it| match it {
@@ -13812,28 +13833,72 @@ impl crate::Engine {
                     }
                     _ => false,
                 })
-            // No escape for `SELECT *`: with ONE base table the
-            // wildcard expands to exactly the columns already checked
-            // above, so letting it wave everything through only meant
-            // `SELECT * FROM t WHERE nosuch = 1` kept the defect.
         };
-        let mut refs: Vec<spg_sql::ast::ColumnName> = Vec::new();
+        // v7.39.2 — the CLAUSE travels with the reference, because MySQL
+        // names it: `Unknown column 'x' in 'where clause'`, `'order
+        // clause'`, `'group statement'`, `'having clause'`. Measured on
+        // 9.7.2, and a driver's error handling reads the sentence as well
+        // as the number. PostgreSQL says only `column "x" does not
+        // exist`, with no clause, so its wording is unchanged.
+        //
+        // This walk is the only place the clause is still known: by the
+        // time a row-time resolver meets the name, the expression has
+        // been detached from the statement that held it.
+        let mut refs: Vec<(spg_sql::ast::ColumnName, &'static str)> = Vec::new();
+        let mut push = |e: &Expr, ctx: &'static str, out: &mut Vec<_>| {
+            let mut here: Vec<spg_sql::ast::ColumnName> = Vec::new();
+            collect_plain_column_refs(e, &mut here);
+            out.extend(here.into_iter().map(|c| (c, ctx)));
+        };
         if let Some(w) = &stmt.where_ {
-            collect_plain_column_refs(w, &mut refs);
+            push(w, "where clause", &mut refs);
         }
         if let Some(g) = &stmt.group_by {
             for e in g {
-                collect_plain_column_refs(e, &mut refs);
+                push(e, "group statement", &mut refs);
             }
         }
         if let Some(h) = &stmt.having {
-            collect_plain_column_refs(h, &mut refs);
+            push(h, "having clause", &mut refs);
         }
         for o in &stmt.order_by {
-            collect_plain_column_refs(&o.expr, &mut refs);
+            push(&o.expr, "order clause", &mut refs);
         }
-        for c in &refs {
+        // v7.39.2 — and the join predicates, which MySQL calls the `on
+        // clause`. Measured on 9.7.2: `Unknown column 'j1.nosuch' in 'on
+        // clause'`, qualifier and all.
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                push(on, "on clause", &mut refs);
+            }
+        }
+        for (c, ctx) in &refs {
             if !known(c) {
+                if self.speaks_mysql {
+                    // The QUALIFIER travels with it: MySQL 9.7.2 answers
+                    // `Unknown column 'j1.nosuch' in 'on clause'`, not the
+                    // bare name. Measured.
+                    let shown = match &c.qualifier {
+                        Some(q) => alloc::format!("{q}.{}", c.name),
+                        None => c.name.clone(),
+                    };
+                    return Err(EngineError::Eval(EvalError::TypeMismatch {
+                        detail: alloc::format!("Unknown column '{shown}' in '{ctx}'"),
+                    }));
+                }
+                // PostgreSQL 18.6 names the missing TABLE when the
+                // qualifier is the part that resolves to nothing
+                // (`missing FROM-clause entry for table "pg_cast"`) and
+                // the COLUMN otherwise. Raising the column error for both
+                // dropped the table name a caller matches on.
+                if let Some(q) = &c.qualifier
+                    && !sources.iter().any(|(a, _)| a == q)
+                {
+                    return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                        qualifier: q.clone(),
+                        column: c.name.clone(),
+                    }));
+                }
                 return Err(EngineError::Eval(EvalError::ColumnNotFound {
                     name: c.name.clone(),
                 }));

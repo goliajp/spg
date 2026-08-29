@@ -156,6 +156,7 @@ fn unknown_qualifier_propagates_from_eval() {
     let err = engine.execute("SELECT bogus.id FROM t").unwrap_err();
     assert!(matches!(
         err,
-        EngineError::Eval(EvalError::UnknownQualifier { ref qualifier }) if qualifier == "bogus"
+        EngineError::Eval(EvalError::UnknownQualifier { ref qualifier, .. })
+            if qualifier == "bogus"
     ));
 }

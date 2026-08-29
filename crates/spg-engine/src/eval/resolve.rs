@@ -609,10 +609,12 @@ pub(crate) fn locate_column(
         }
         let expected = ctx.table_alias.ok_or_else(|| EvalError::UnknownQualifier {
             qualifier: q.clone(),
+            column: c.name.clone(),
         })?;
         if q != expected {
             return Err(EvalError::UnknownQualifier {
                 qualifier: q.clone(),
+                column: c.name.clone(),
             });
         }
     }

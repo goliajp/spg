@@ -12,6 +12,36 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **An unknown column named the wrong clause on the MySQL wire — or no
+  clause at all.** MySQL 9.7.2 says which clause the name failed in:
+  `Unknown column 'x' in 'where clause'`, and `'order clause'`,
+  `'group statement'`, `'having clause'`, `'on clause'` (that one with
+  the qualifier: `'t1.nope'`), `'field list'` for the projection, an
+  UPDATE's SET list and an INSERT's column list. SPG carried
+  PostgreSQL's clause-free `column "x" does not exist` to all eight.
+
+  A driver reads the sentence as well as the number, and the previous
+  ledger entry concluded this needed the clause threaded through 41
+  raise sites across six files, so it was left in the gap list. That was
+  wrong in an instructive way: by the time a row-time resolver meets the
+  name, the expression has been detached from the statement that held
+  it — which is exactly why those 41 sites cannot name a clause. The
+  clause is only knowable in the SELECT validator, where the statement
+  is still whole, and that validator already had to exist for the empty
+  table defect above. Eight shapes, one place.
+
+  Two more numbers were wrong, not just the prose. A qualifier naming no
+  source at all (`WHERE zz.a = 1`) answered 1146 `Unknown table`, which
+  a driver reads as "that table is gone"; MySQL calls it a COLUMN, 1054.
+  And `SELECT zz.*` is the reverse — MySQL calls THAT one a table, 1051
+  `Unknown table 'zz'` — so the two had to be separated rather than
+  merged.
+
+  The first version of the wire arm matched
+  `column "a" of relation "t" …` on its prefix and renumbered the
+  DUPLICATE-column error 1060 as 1054. The pin round 429 wrote for that
+  errno caught it.
+
 - **An unknown column in `WHERE` / `ORDER BY` / `GROUP BY` / `HAVING` was
   silently accepted whenever the table happened to be empty.** The
   projection resolves its names before the scan; a predicate only met
