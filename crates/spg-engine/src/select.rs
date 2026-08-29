@@ -896,12 +896,19 @@ impl Engine {
             }
             match view.as_str() {
                 "__spg_info_columns" => {
-                    let (schema, rows) =
-                        synth_information_schema_columns(self.active_catalog(), self.speaks_mysql);
+                    let (schema, rows) = synth_information_schema_columns(
+                        self.active_catalog(),
+                        self.speaks_mysql,
+                        &self.mysql_schema_name(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_info_tables" => {
-                    let (schema, rows) = synth_information_schema_tables(self.active_catalog());
+                    let (schema, rows) = synth_information_schema_tables(
+                        self.active_catalog(),
+                        self.speaks_mysql,
+                        &self.mysql_schema_name(),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_class" => {

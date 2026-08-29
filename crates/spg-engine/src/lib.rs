@@ -2942,6 +2942,24 @@ impl Engine {
         names
     }
 
+    /// v7.39.2 — the schema name a MySQL session's own tables live under.
+    ///
+    /// MySQL's schema IS its database, and the canonical reflection
+    /// query is `WHERE table_schema = DATABASE()`. SPG answered
+    /// PostgreSQL's `public` there, so that query — Django's
+    /// introspection, Rails' schema dumper, every JDBC browser — matched
+    /// nothing and reported a database with no tables in it. One
+    /// database is served whatever the name, so the tables appear under
+    /// the name this session is using, which is the same rule
+    /// `SHOW DATABASES` and `USE` already follow.
+    #[must_use]
+    pub(crate) fn mysql_schema_name(&self) -> alloc::string::String {
+        self.session_params
+            .get("spg.database")
+            .cloned()
+            .unwrap_or_else(|| alloc::string::String::from("spg"))
+    }
+
     /// v7.39.2 — name the database this session is on.
     ///
     /// One database is served whatever the name (see `CREATE DATABASE`),

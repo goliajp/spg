@@ -378,6 +378,7 @@ mod e2e_info_schema_ccu;
 mod e2e_info_schema_check_constraints;
 mod e2e_info_schema_columns_widened;
 mod e2e_info_schema_domains_round330;
+mod e2e_info_schema_mysql_shape_v7392;
 mod e2e_info_schema_sequences;
 mod e2e_info_schema_triggers;
 mod e2e_infoschema_column_type_round362;
