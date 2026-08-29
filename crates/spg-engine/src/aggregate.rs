@@ -904,26 +904,35 @@ pub(crate) fn run(
     // questions through the same flag — column naming, HAVING aliases,
     // collation folding — and are deliberately left alone.
     if group_keys_all_resolve && !engine.is_some_and(crate::Engine::group_by_is_loose) {
+        // v7.39.2 — WHERE the offender was found, and at which 1-based
+        // position. PostgreSQL's sentence needs neither; MySQL's names
+        // both ("Expression #2 of SELECT list", "Expression #1 of ORDER
+        // BY clause"), so the search has to keep what it used to throw
+        // away the moment it found a column.
         let offender = stmt
             .items
             .iter()
-            .find_map(|it| match it {
+            .enumerate()
+            .find_map(|(i, it)| match it {
                 SelectItem::Expr { expr, .. } => {
                     first_ungrouped_column(expr, &group_exprs, schema_cols, &licensed)
+                        .map(|c| (c, "SELECT list", i + 1))
                 }
                 _ => None,
             })
             .or_else(|| {
-                stmt.order_by.iter().find_map(|o| {
+                stmt.order_by.iter().enumerate().find_map(|(i, o)| {
                     first_ungrouped_column(&o.expr, &group_exprs, schema_cols, &licensed)
+                        .map(|c| (c, "ORDER BY clause", i + 1))
                 })
             })
             .or_else(|| {
-                stmt.having
-                    .as_ref()
-                    .and_then(|h| first_ungrouped_column(h, &group_exprs, schema_cols, &licensed))
+                stmt.having.as_ref().and_then(|h| {
+                    first_ungrouped_column(h, &group_exprs, schema_cols, &licensed)
+                        .map(|c| (c, "HAVING clause", 1))
+                })
             });
-        if let Some(c) = offender {
+        if let Some((c, origin, position)) = offender {
             // PG qualifies the column with the alias when there is one, and
             // with the table name otherwise.
             let qual = c
@@ -932,6 +941,55 @@ pub(crate) fn run(
                 .or(table_alias)
                 .or_else(|| stmt.from.as_ref().map(|f| f.primary.name.as_str()))
                 .unwrap_or("");
+            // v7.39.2 — MySQL 9.7.2's own sentences, measured. It names
+            // the clause, the 1-based expression position and the
+            // three-part `db.table.column`, and it uses a DIFFERENT
+            // errno when there is no GROUP BY at all: 1140
+            // (ER_MIX_OF_GROUP_FUNC_AND_FIELDS) rather than 1055. SPG
+            // answered PostgreSQL's one sentence and 1055 to all of
+            // them, so a driver branching on the number could not tell
+            // the two faults apart.
+            //
+            // The HAVING case is not this error there at all: measured,
+            // `HAVING b > 1` over a query grouped by `a` answers 1054
+            // `Unknown column 'b' in 'having clause'`, because a grouped
+            // query's HAVING can only see the grouped columns and the
+            // aggregates. That is the scope rule, not the wording.
+            if engine.is_some_and(|e| e.speaks_mysql) {
+                let schema = engine.map_or_else(
+                    || alloc::string::String::from("spg"),
+                    crate::Engine::mysql_schema_name,
+                );
+                let table = c
+                    .qualifier
+                    .as_deref()
+                    .or(table_alias)
+                    .or_else(|| stmt.from.as_ref().map(|f| f.primary.name.as_str()))
+                    .unwrap_or("");
+                let full = alloc::format!("{schema}.{table}.{}", c.name);
+                if origin == "HAVING clause" {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!("Unknown column '{}' in 'having clause'", c.name),
+                    });
+                }
+                if stmt.group_by.is_none() {
+                    return Err(EvalError::TypeMismatch {
+                        detail: alloc::format!(
+                            "In aggregated query without GROUP BY, expression #{position} of \
+                             {origin} contains nonaggregated column '{full}'; this is \
+                             incompatible with sql_mode=only_full_group_by"
+                        ),
+                    });
+                }
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "Expression #{position} of {origin} is not in GROUP BY clause and \
+                         contains nonaggregated column '{full}' which is not functionally \
+                         dependent on columns in GROUP BY clause; this is incompatible with \
+                         sql_mode=only_full_group_by"
+                    ),
+                });
+            }
             return Err(EvalError::TypeMismatch {
                 detail: alloc::format!(
                     "column \"{qual}.{}\" must appear in the GROUP BY clause or be used in an aggregate function",

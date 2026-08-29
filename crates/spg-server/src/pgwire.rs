@@ -454,6 +454,21 @@ fn handle_pg_simple_query(
     // `execute_with_role`, `persist_wire_write`) all take `&str`,
     // so the slice form is drop-in.
     let sql: &str = sql_str.trim_end_matches(';').trim();
+    // v7.39.2 — what the ENGINE is given keeps its terminator.
+    //
+    // PostgreSQL names the token it stopped at: `SELECT 1 +;` is
+    // `syntax error at or near ";"` there and `SELECT 1 +` (no
+    // semicolon) is `syntax error at end of input`. SPG's parser already
+    // draws exactly that distinction — but this line took the semicolon
+    // off before the parser could see it, so both shapes came back as
+    // `end of input`, and the differential corpus recorded a divergence
+    // that was never the parser's.
+    //
+    // Only the executor gets the terminator back: the routing helpers
+    // below (SET / SHOW / COPY intent, canned responses) match on the
+    // trimmed form and are left alone. `parse_statement` swallows a
+    // trailing `;` itself, so no valid statement changes meaning.
+    let sql_exec: &str = sql_str.trim();
     // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
     // multi-frame protocol; intercept before the regular
     // execute path tries to parse them.
@@ -1107,7 +1122,7 @@ fn handle_pg_simple_query(
         None => (
             execute_with_role(
                 state,
-                sql,
+                sql_exec,
                 role,
                 cancel,
                 matches!(*tx_state, b'T' | b'E'),
@@ -1280,6 +1295,21 @@ fn handle_pg_simple_query_one_into_wbuf(
         return Ok(());
     };
     let sql: &str = sql_str.trim_end_matches(';').trim();
+    // v7.39.2 — what the ENGINE is given keeps its terminator.
+    //
+    // PostgreSQL names the token it stopped at: `SELECT 1 +;` is
+    // `syntax error at or near ";"` there and `SELECT 1 +` (no
+    // semicolon) is `syntax error at end of input`. SPG's parser already
+    // draws exactly that distinction — but this line took the semicolon
+    // off before the parser could see it, so both shapes came back as
+    // `end of input`, and the differential corpus recorded a divergence
+    // that was never the parser's.
+    //
+    // Only the executor gets the terminator back: the routing helpers
+    // below (SET / SHOW / COPY intent, canned responses) match on the
+    // trimmed form and are left alone. `parse_statement` swallows a
+    // trailing `;` itself, so no valid statement changes meaning.
+    let sql_exec: &str = sql_str.trim();
     if sql.is_empty() {
         // Empty statement after splitter trim — emit the PG
         // canonical EmptyQueryResponse marker via CommandComplete
@@ -1394,7 +1424,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         None => (
             execute_with_role(
                 state,
-                sql,
+                sql_exec,
                 role,
                 cancel,
                 matches!(*tx_state, b'T' | b'E'),

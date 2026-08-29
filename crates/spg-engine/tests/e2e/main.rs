@@ -695,6 +695,7 @@ mod e2e_pg_catalog_probe_funcs;
 mod e2e_pg_catalog_reach_round541;
 mod e2e_pg_column_size;
 mod e2e_pg_dump_blockers_round539;
+mod e2e_pg_error_wording_v7392;
 mod e2e_pg_filesystem_probes;
 mod e2e_pg_get_constraintdef;
 mod e2e_pg_get_indexdef;

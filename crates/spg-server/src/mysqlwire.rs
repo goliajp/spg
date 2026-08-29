@@ -1167,6 +1167,20 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
             // PG side already sends the sentence alone.
             (1055, "42000", detail.clone())
         }
+        // v7.39.2 — MySQL's own two sentences for the same rule. The
+        // aggregated-query-without-GROUP-BY one is errno 1140
+        // (ER_MIX_OF_GROUP_FUNC_AND_FIELDS), NOT 1055, and a driver
+        // branches on the number: SPG answered 1055 to both.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("In aggregated query without GROUP BY") =>
+        {
+            (1140, "42000", detail.clone())
+        }
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.contains("is not in GROUP BY clause and contains nonaggregated column") =>
+        {
+            (1055, "42000", detail.clone())
+        }
         spg_engine::EngineError::Unsupported(m)
             if m.contains("must appear in the GROUP BY clause") =>
         {
