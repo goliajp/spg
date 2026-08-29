@@ -12,6 +12,39 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **The MySQL wire's catalog views answered PostgreSQL's, so the standard
+  reflection query found no tables at all.**
+  `SELECT … FROM information_schema.tables WHERE table_schema =
+  DATABASE()` is how Django's introspection, Rails' schema dumper and
+  every JDBC browser ask what a database contains. SPG put PostgreSQL's
+  `public` in `TABLE_SCHEMA`, so that query matched nothing and reported
+  an empty database. MySQL's schema IS its database; SPG serves one
+  database under whatever name, so the tables now appear under the name
+  the session is using — the same rule `SHOW DATABASES` and `USE`
+  already follow.
+
+  The shapes were PostgreSQL's too, with a MySQL column or two bolted on
+  the end. Measured on MySQL 9.7.2, `COLUMNS` has 22 columns in its own
+  order and six were absent (`CHARACTER_OCTET_LENGTH`, `COLUMN_KEY`,
+  `EXTRA`, `PRIVILEGES`, `COLUMN_COMMENT`, `SRS_ID`); `TABLES` has 21
+  and SPG served twelve, so `SELECT ENGINE, TABLE_COLLATION FROM
+  information_schema.TABLES` was a "column does not exist"; `SCHEMATA`
+  has six where SPG served seven plus one, which put `admin` where a
+  positional reader expects the charset.
+
+  Where the names agreed the VALUES still differed, so each dialect gets
+  its own answer rather than one shared wrong one: an INT reports
+  `NUMERIC_PRECISION` 10 (decimal digits) on MySQL and 32 (bits) on
+  PostgreSQL; TEXT and BLOB report 65535 for both length columns where
+  PostgreSQL reports NULL; `DATETIME_PRECISION` is 0 rather than 6. And
+  an AUTO_INCREMENT column's `COLUMN_DEFAULT` is NULL with `EXTRA =
+  auto_increment`, where SPG answered PostgreSQL's
+  `nextval('t_id_seq'::regclass)` — a reflection copying that into MySQL
+  DDL writes a statement MySQL cannot parse.
+
+  A PostgreSQL session is unchanged, `column_type` included: it is
+  MySQL's column and still does not resolve there.
+
 - **An unknown column named the wrong clause on the MySQL wire — or no
   clause at all.** MySQL 9.7.2 says which clause the name failed in:
   `Unknown column 'x' in 'where clause'`, and `'order clause'`,

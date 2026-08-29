@@ -288,7 +288,16 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
 pub(crate) fn synth_information_schema_columns(
     cat: &Catalog,
     mysql: bool,
+    // v7.39.2 — the name a MySQL session calls its database. Every row's
+    // `TABLE_SCHEMA` carries it, because the canonical MySQL reflection
+    // query is `WHERE table_schema = DATABASE()` and this view answered
+    // `public` to it — so Django's introspection, Rails' schema dumper
+    // and every JDBC tool were told the database has no tables at all.
+    schema_name: &str,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    if mysql {
+        return mysql_info_columns(cat, schema_name);
+    }
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
@@ -350,15 +359,6 @@ pub(crate) fn synth_information_schema_columns(
     // exactly that, and the tell was a half-right answer — the charset
     // filled in and the collation still NULL. The existing column
     // answers in MySQL's terms on a MySQL session instead.
-    let mut schema = schema;
-    if mysql {
-        schema.push(ColumnSchema::new("column_type", DataType::Text, false));
-        schema.push(ColumnSchema::new(
-            "character_set_name",
-            DataType::Text,
-            true,
-        ));
-    }
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
         // v7.39 (round 536) — a MATERIALIZED VIEW is not in this view.
@@ -373,13 +373,7 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            let mut row = info_column_row(&tname, ordinal, col, None, mysql);
-            if mysql {
-                row.values
-                    .push(Value::text(crate::show::render_mysql_type(col)));
-                row.values.push(mysql_column_charset(col));
-            }
-            rows.push(row);
+            rows.push(info_column_row(&tname, ordinal, col, None, false));
         }
     }
     // v7.39 (round 268) — view columns. The view reported NO rows for a
@@ -402,14 +396,318 @@ pub(crate) fn synth_information_schema_columns(
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             let writable = updatable && simple.iter().any(|n| n == &col.name);
-            let mut row = info_column_row(vname, ordinal, col, Some(writable), mysql);
-            if mysql {
-                row.values
-                    .push(Value::text(crate::show::render_mysql_type(col)));
-                row.values.push(mysql_column_charset(col));
-            }
-            rows.push(row);
+            rows.push(info_column_row(vname, ordinal, col, Some(writable), false));
         }
+    }
+    (schema, rows)
+}
+
+/// v7.39.2 — `information_schema.COLUMNS` in MySQL's shape.
+///
+/// SPG served PostgreSQL's view to the MySQL wire with `column_type`
+/// and `character_set_name` bolted onto the end, which matched neither
+/// engine: MySQL 9.7.2 has 22 columns in its own order, six of which
+/// were simply absent (`CHARACTER_OCTET_LENGTH`, `COLUMN_KEY`,
+/// `EXTRA`, `PRIVILEGES`, `COLUMN_COMMENT`, `SRS_ID`), and a client
+/// reading by position got PostgreSQL's `udt_name` where MySQL puts
+/// `COLUMN_TYPE`.
+///
+/// The values differ too, not only the shape. Measured against 9.7.2:
+/// an INT reports `NUMERIC_PRECISION` 10 (decimal digits) where PG
+/// reports 32 (bits); TEXT reports 65535 for both length columns where
+/// PG reports NULL; an AUTO_INCREMENT column's `COLUMN_DEFAULT` is NULL
+/// with `EXTRA = auto_increment`, where SPG answered PG's
+/// `nextval('t_id_seq'::regclass)` — a reflection tool copying that
+/// into MySQL DDL writes a statement MySQL cannot parse.
+fn mysql_info_columns(cat: &Catalog, schema_name: &str) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("column_name", DataType::Text, false),
+        ColumnSchema::new("ordinal_position", DataType::Int, false),
+        ColumnSchema::new("column_default", DataType::Text, true),
+        ColumnSchema::new("is_nullable", DataType::Text, false),
+        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("character_maximum_length", DataType::BigInt, true),
+        ColumnSchema::new("character_octet_length", DataType::BigInt, true),
+        ColumnSchema::new("numeric_precision", DataType::BigInt, true),
+        ColumnSchema::new("numeric_scale", DataType::BigInt, true),
+        ColumnSchema::new("datetime_precision", DataType::Int, true),
+        ColumnSchema::new("character_set_name", DataType::Text, true),
+        ColumnSchema::new("collation_name", DataType::Text, true),
+        ColumnSchema::new("column_type", DataType::Text, false),
+        ColumnSchema::new("column_key", DataType::Text, false),
+        ColumnSchema::new("extra", DataType::Text, false),
+        ColumnSchema::new("privileges", DataType::Text, false),
+        ColumnSchema::new("column_comment", DataType::Text, false),
+        ColumnSchema::new("generation_expression", DataType::Text, false),
+        ColumnSchema::new("srs_id", DataType::Int, true),
+    ];
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.visible_table_names() {
+        if cat.materialized_views().contains_key(&tname) {
+            continue;
+        }
+        let Some(t) = cat.get(&tname) else { continue };
+        for (i, col) in t.schema().columns.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(mysql_info_column_row(
+                schema_name,
+                &tname,
+                ordinal,
+                col,
+                mysql_column_key(t, i),
+            ));
+        }
+    }
+    for (vname, _) in cat.views_all() {
+        let Some(vname) = cat.listed_name(vname) else {
+            continue;
+        };
+        for (i, col) in crate::describe::describe_view_columns(cat, vname)
+            .iter()
+            .enumerate()
+        {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(mysql_info_column_row(schema_name, vname, ordinal, col, ""));
+        }
+    }
+    (schema, rows)
+}
+
+/// What MySQL puts in `COLUMN_KEY`, measured on 9.7.2: `PRI` for a
+/// primary-key column, `UNI` for the leading column of a unique key that
+/// is not the primary one, `MUL` for the leading column of an ordinary
+/// index, and the empty string otherwise.
+fn mysql_column_key(t: &spg_storage::Table, pos: usize) -> &'static str {
+    let ucs = &t.schema().uniqueness_constraints;
+    if ucs
+        .iter()
+        .any(|uc| uc.is_primary_key && uc.columns.contains(&pos))
+    {
+        return "PRI";
+    }
+    if ucs
+        .iter()
+        .any(|uc| !uc.is_primary_key && uc.columns.first() == Some(&pos))
+    {
+        return "UNI";
+    }
+    for idx in t.indices() {
+        if idx.column_position == pos {
+            return if idx.is_unique { "UNI" } else { "MUL" };
+        }
+    }
+    ""
+}
+
+/// The two length columns, measured on MySQL 9.7.2. A character type
+/// reports its declared limit and that limit in bytes (four per
+/// character for utf8mb4); a binary type reports the same number twice;
+/// TEXT and BLOB report 65535 for both, where SPG answered NULL.
+fn mysql_char_lengths(col: &ColumnSchema) -> (Value<'static>, Value<'static>) {
+    let pair = |chars: i64, bytes: i64| (Value::BigInt(chars), Value::BigInt(bytes));
+    match col.ty {
+        DataType::Varchar(n) | DataType::Char(n) => {
+            let n = i64::from(n);
+            pair(n, n * 4)
+        }
+        DataType::Text => pair(65535, 65535),
+        DataType::Bytes => pair(65535, 65535),
+        _ => (Value::Null, Value::Null),
+    }
+}
+
+/// `NUMERIC_PRECISION` / `NUMERIC_SCALE` in MySQL's terms. MySQL states
+/// an integer's precision in DECIMAL DIGITS (int → 10) where PG states
+/// it in bits (int → 32), so the same column has two right answers and
+/// each dialect gets its own.
+fn mysql_numeric_precision(col: &ColumnSchema) -> (Value<'static>, Value<'static>) {
+    use spg_storage::MysqlIntWidth as W;
+    let int_digits = |w: Option<W>| -> Option<i64> {
+        Some(match w? {
+            W::Tiny => 3,
+            W::Small => 5,
+            W::Medium => 7,
+            W::Int => 10,
+            // Measured: signed BIGINT reports 19, unsigned 20 — the
+            // sign costs a digit.
+            W::Big => {
+                if col.is_unsigned {
+                    20
+                } else {
+                    19
+                }
+            }
+        })
+    };
+    if let Some(d) = int_digits(col.mysql_int_width) {
+        return (Value::BigInt(d), Value::BigInt(0));
+    }
+    match col.ty {
+        DataType::SmallInt => (Value::BigInt(5), Value::BigInt(0)),
+        DataType::Int => (Value::BigInt(10), Value::BigInt(0)),
+        DataType::BigInt => (
+            Value::BigInt(if col.is_unsigned { 20 } else { 19 }),
+            Value::BigInt(0),
+        ),
+        DataType::Bool => (Value::BigInt(3), Value::BigInt(0)),
+        DataType::Real => (Value::BigInt(12), Value::Null),
+        DataType::Float => (Value::BigInt(22), Value::Null),
+        DataType::Numeric { precision: 0, .. } => (Value::Null, Value::Null),
+        DataType::Numeric { precision, scale } => (
+            Value::BigInt(i64::from(precision)),
+            Value::BigInt(i64::from(scale.max(0))),
+        ),
+        _ => (Value::Null, Value::Null),
+    }
+}
+
+/// One `information_schema.COLUMNS` row in MySQL's order.
+fn mysql_info_column_row(
+    schema_name: &str,
+    rel: &str,
+    ordinal: i32,
+    col: &ColumnSchema,
+    column_key: &str,
+) -> Row<'static> {
+    // Measured on 9.7.2: an AUTO_INCREMENT column has NULL here and
+    // says so in EXTRA; a CURRENT_TIMESTAMP default is spelled without
+    // parentheses and marked DEFAULT_GENERATED; a generated column has
+    // NULL here and its source text in GENERATION_EXPRESSION.
+    let default_text: Value<'static> = if col.auto_increment || col.generated_stored_expr.is_some()
+    {
+        Value::Null
+    } else if let Some(txt) = &col.default_text {
+        Value::text(txt.clone())
+    } else {
+        Value::Null
+    };
+    let extra = if col.auto_increment {
+        "auto_increment"
+    } else if col.generated_stored_expr.is_some() {
+        "STORED GENERATED"
+    } else if col
+        .default_text
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case("CURRENT_TIMESTAMP"))
+    {
+        "DEFAULT_GENERATED"
+    } else {
+        ""
+    };
+    let (char_max, char_oct) = mysql_char_lengths(col);
+    let (num_prec, num_scale) = mysql_numeric_precision(col);
+    // Measured: `datetime`/`time`/`timestamp` report their fractional
+    // digits, defaulting to 0; SPG reported PG's 6.
+    let dt_prec: Value<'static> = match col.ty {
+        DataType::Time | DataType::Timestamp | DataType::Timestamptz => Value::Int(0),
+        _ => Value::Null,
+    };
+    Row::new(alloc::vec![
+        Value::text("def"),
+        Value::text(alloc::string::String::from(schema_name)),
+        Value::text(rel.to_string()),
+        Value::text(col.name.clone()),
+        Value::Int(ordinal),
+        default_text,
+        Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
+        Value::text(mysql_data_type_text(col.ty, col.mysql_int_width)),
+        char_max,
+        char_oct,
+        num_prec,
+        num_scale,
+        dt_prec,
+        mysql_column_charset(col),
+        mysql_column_collation(col),
+        Value::text(crate::show::render_mysql_type(col)),
+        Value::text::<&str>(column_key),
+        Value::text::<&str>(extra),
+        Value::text("select,insert,update,references"),
+        Value::text(""),
+        match &col.generated_stored_expr {
+            Some(e) => Value::text(e.clone()),
+            None => Value::text(""),
+        },
+        Value::Null,
+    ])
+}
+
+/// v7.39.2 — `information_schema.TABLES` in MySQL's shape (21 columns,
+/// measured on 9.7.2). SPG answered PostgreSQL's twelve, so
+/// `SELECT ENGINE, TABLE_COLLATION FROM information_schema.TABLES` —
+/// what a MySQL reflection reads to learn a table's storage engine and
+/// its collation — was a "column does not exist" error, and
+/// `WHERE table_schema = DATABASE()` matched nothing.
+fn mysql_info_tables(cat: &Catalog, schema_name: &str) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = alloc::vec![
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
+        ColumnSchema::new("table_name", DataType::Text, false),
+        ColumnSchema::new("table_type", DataType::Text, false),
+        ColumnSchema::new("engine", DataType::Text, true),
+        ColumnSchema::new("version", DataType::Int, true),
+        ColumnSchema::new("row_format", DataType::Text, true),
+        ColumnSchema::new("table_rows", DataType::BigInt, true),
+        ColumnSchema::new("avg_row_length", DataType::BigInt, true),
+        ColumnSchema::new("data_length", DataType::BigInt, true),
+        ColumnSchema::new("max_data_length", DataType::BigInt, true),
+        ColumnSchema::new("index_length", DataType::BigInt, true),
+        ColumnSchema::new("data_free", DataType::BigInt, true),
+        ColumnSchema::new("auto_increment", DataType::BigInt, true),
+        ColumnSchema::new("create_time", DataType::Timestamp, true),
+        ColumnSchema::new("update_time", DataType::Timestamp, true),
+        ColumnSchema::new("check_time", DataType::Timestamp, true),
+        ColumnSchema::new("table_collation", DataType::Text, true),
+        ColumnSchema::new("checksum", DataType::BigInt, true),
+        ColumnSchema::new("create_options", DataType::Text, true),
+        ColumnSchema::new("table_comment", DataType::Text, false),
+    ];
+    // A VIEW carries NULL through the storage columns on MySQL, which is
+    // how a reflection tells the two apart beyond TABLE_TYPE.
+    let row = |name: alloc::string::String, is_view: bool| -> Row<'static> {
+        let storage = |v: Value<'static>| if is_view { Value::Null } else { v };
+        Row::new(alloc::vec![
+            Value::text("def"),
+            Value::text(alloc::string::String::from(schema_name)),
+            Value::text(name),
+            Value::text::<&str>(if is_view { "VIEW" } else { "BASE TABLE" }),
+            storage(Value::text("InnoDB")),
+            storage(Value::Int(10)),
+            storage(Value::text("Dynamic")),
+            storage(Value::BigInt(0)),
+            storage(Value::BigInt(0)),
+            storage(Value::BigInt(0)),
+            storage(Value::BigInt(0)),
+            storage(Value::BigInt(0)),
+            storage(Value::BigInt(0)),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            storage(Value::text(alloc::string::String::from(
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
+            ))),
+            Value::Null,
+            storage(Value::text("")),
+            Value::text(""),
+        ])
+    };
+    let mut rows: Vec<Row<'static>> = Vec::new();
+    for tname in cat.visible_table_names() {
+        if cat.materialized_views().contains_key(&tname) {
+            continue;
+        }
+        rows.push(row(tname.clone(), false));
+    }
+    for (name, _) in cat.views_all() {
+        let Some(name) = cat.listed_name(name) else {
+            continue;
+        };
+        rows.push(row(name.to_string(), true));
     }
     (schema, rows)
 }
@@ -710,7 +1008,12 @@ pub(crate) fn synth_pg_prepared_statements(
 /// v7.16.2 — synthesise `information_schema.tables`.
 pub(crate) fn synth_information_schema_tables(
     cat: &Catalog,
+    mysql: bool,
+    schema_name: &str,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    if mysql {
+        return mysql_info_tables(cat, schema_name);
+    }
     let schema = alloc::vec![
         ColumnSchema::new("table_catalog", DataType::Text, false),
         ColumnSchema::new("table_schema", DataType::Text, false),
@@ -810,22 +1113,30 @@ pub(crate) fn synth_information_schema_schemata(
     // Appended in the MySQL dialect only, which is how `column_type`
     // joins `information_schema.columns`: the view's shape stays PG's on
     // a PG session.
-    let mut schema = alloc::vec![
-        ColumnSchema::new("catalog_name", DataType::Text, false),
-        ColumnSchema::new("schema_name", DataType::Text, false),
-        ColumnSchema::new("schema_owner", DataType::Text, false),
-        ColumnSchema::new("default_character_set_catalog", DataType::Text, true),
-        ColumnSchema::new("default_character_set_schema", DataType::Text, true),
-        ColumnSchema::new("default_character_set_name", DataType::Text, true),
-        ColumnSchema::new("sql_path", DataType::Text, true),
-    ];
-    if mysql {
-        schema.push(ColumnSchema::new(
-            "default_collation_name",
-            DataType::Text,
-            true,
-        ));
-    }
+    // v7.39.2 — MySQL's SCHEMATA is its own six columns in its own
+    // order (measured on 9.7.2), not PG's seven with a collation
+    // appended: a client reading by position found `admin` where the
+    // charset belongs, and `DEFAULT_ENCRYPTION` was absent entirely.
+    let schema = if mysql {
+        alloc::vec![
+            ColumnSchema::new("catalog_name", DataType::Text, false),
+            ColumnSchema::new("schema_name", DataType::Text, false),
+            ColumnSchema::new("default_character_set_name", DataType::Text, true),
+            ColumnSchema::new("default_collation_name", DataType::Text, true),
+            ColumnSchema::new("sql_path", DataType::Text, true),
+            ColumnSchema::new("default_encryption", DataType::Text, false),
+        ]
+    } else {
+        alloc::vec![
+            ColumnSchema::new("catalog_name", DataType::Text, false),
+            ColumnSchema::new("schema_name", DataType::Text, false),
+            ColumnSchema::new("schema_owner", DataType::Text, false),
+            ColumnSchema::new("default_character_set_catalog", DataType::Text, true),
+            ColumnSchema::new("default_character_set_schema", DataType::Text, true),
+            ColumnSchema::new("default_character_set_name", DataType::Text, true),
+            ColumnSchema::new("sql_path", DataType::Text, true),
+        ]
+    };
     // The charset name goes in the column PG already has, so a MySQL
     // client reading `DEFAULT_CHARACTER_SET_NAME` finds it where MySQL
     // puts it.
@@ -864,17 +1175,25 @@ pub(crate) fn synth_information_schema_schemata(
     let rows: Vec<Row<'static>> = listed
         .into_iter()
         .map(|name| {
-            let mut vals = alloc::vec![
+            if mysql {
+                let mut vals = alloc::vec![Value::text(catalog_name), Value::text(name)];
+                vals.push(charset(true));
+                vals.extend(coll(true));
+                // MySQL's SQL_PATH is always NULL and DEFAULT_ENCRYPTION
+                // is `NO` on every schema (measured on 9.7.2).
+                vals.push(Value::Null);
+                vals.push(Value::text("NO"));
+                return Row::new(vals);
+            }
+            Row::new(alloc::vec![
                 Value::text(catalog_name),
                 Value::text(name),
                 Value::text("admin"),
                 Value::Null,
                 Value::Null,
-                charset(mysql),
+                charset(false),
                 Value::Null,
-            ];
-            vals.extend(coll(mysql));
-            Row::new(vals)
+            ])
         })
         .collect();
     (schema, rows)
