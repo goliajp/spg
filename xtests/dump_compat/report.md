@@ -1,6 +1,6 @@
 # SPG dump-compat report
 
-Generated 2026-08-26T23:01:53Z against SPG `local-build`.
+Generated 2026-08-29T00:15:07Z against SPG `local-build`.
 
 | Dialect | App | Status | Stmts pass/total | First error |
 |---|---|---|---:|---|

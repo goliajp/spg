@@ -12,6 +12,28 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A string could not name a projection item, and two adjacent strings
+  would not join on one line.** `SELECT 1 'x'`, `SELECT 1 AS 'x'`,
+  `SELECT COUNT(*) 'total'` and `SELECT 1 'a b'` are all ordinary MySQL
+  SQL, and all answered `syntax error at or near "'x'"`.
+
+  The two rules had to move together. MySQL joins adjacent string
+  literals with no line break between them — `SELECT 'a' 'b'` is `ab`
+  there, and a syntax error on PostgreSQL 18.6, which joins them only
+  across one — and SPG required the break on both wires. Without that
+  settled first, `'a' 'b'` would read as a literal aliased `b`.
+
+  A string names a projection item and NOT a table: `FROM t 'ta'` and
+  `FROM t AS 'ta'` are both syntax errors on MySQL 9.7.2, so the rule
+  sits in the projection rather than in the shared alias parser.
+  PostgreSQL refuses both spellings, unchanged.
+
+  `SELECT _nosuch'x'` was the same defect wearing a charset introducer's
+  clothes: MySQL reads it as the column `_nosuch` aliased `x` and answers
+  `ERROR 1054`. It now answers 1054 / 42S22 here too — only the sentence
+  still differs, which is the unknown-column wording already on the
+  ledger.
+
 - **The collation name table was MySQL's alone, and refused MariaDB's.**
   SPG answers to both, and MariaDB 12.3.3 registers the UCA-14.0.0
   family WITHOUT a character set — its `information_schema.collations`

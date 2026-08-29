@@ -396,7 +396,7 @@ impl fmt::Display for LexError {
 /// The newline is what tells a continued literal from two arguments
 /// someone forgot a comma between, which is why `'a' 'b'` must stay an
 /// error.
-fn gap_continues_a_literal(gap: &str) -> bool {
+fn gap_continues_a_literal(gap: &str, speaks_mysql: bool) -> bool {
     let mut newline = false;
     let mut rest = gap;
     loop {
@@ -417,7 +417,15 @@ fn gap_continues_a_literal(gap: &str) -> bool {
                 // Unterminated: nothing follows it, so nothing to join.
                 None => return false,
             },
-            None => return trimmed.is_empty() && newline,
+            // v7.39.2 — MySQL does not want the newline. Measured on
+            // 9.7.2, `SELECT 'a' 'b'` on ONE line answers `ab`, where
+            // PostgreSQL 18.6 answers `syntax error at or near "'b'"`
+            // and only joins them across a line break. Requiring the
+            // newline on both sides made ordinary MySQL SQL a syntax
+            // error, and it is also what the string-ALIAS rule needs
+            // decided first: without this, `'a' 'b'` would look like a
+            // literal aliased `b`.
+            None => return trimmed.is_empty() && (newline || speaks_mysql),
         }
     }
 }
@@ -668,7 +676,7 @@ pub fn tokenize_with_offsets(
                 // migration written for PostgreSQL failed to apply.
                 if let (Token::String(body), Some(prev_end)) = (&tok, last_string_end)
                     && let Some(gap) = input.get(prev_end..i)
-                    && gap_continues_a_literal(gap)
+                    && gap_continues_a_literal(gap, speaks_mysql)
                     && let Some(Token::String(head)) = out.last_mut()
                 {
                     head.push_str(body);

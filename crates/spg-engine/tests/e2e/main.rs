@@ -1294,6 +1294,7 @@ mod e2e_sqrt;
 mod e2e_srf_unnest_projection;
 mod e2e_statement_resolved_call_names;
 mod e2e_string_agg;
+mod e2e_string_alias_v7392;
 mod e2e_strpos;
 mod e2e_subquery_pg_differential;
 mod e2e_substring_from_for;
