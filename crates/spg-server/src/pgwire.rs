@@ -5249,6 +5249,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             "42701"
         } else if msg.contains("column \"") && msg.contains("does not exist") {
             "42703"
+        // v7.39.2 — PG's QUALIFIED form carries no quotes: `column
+        // ea.no_such does not exist`. The quoted pattern above cannot
+        // see it, and without this the state fell through to the
+        // generic one.
+        } else if msg.starts_with("column ") && msg.ends_with(" does not exist") {
+            "42703"
         // v7.39 (read01 round 47) — constraint errors must be classified
         // BEFORE the table/relation patterns below: PG's RENAME CONSTRAINT
         // wording ("constraint \"c\" for table \"t\" does not exist") also

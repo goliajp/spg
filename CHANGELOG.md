@@ -12,6 +12,19 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A qualified missing column lost its alias.** PostgreSQL 18.6 prints
+  a qualified reference unquoted and dotted — `column ea.no_such does
+  not exist` — and an unqualified one quoted: `column "no_such" does not
+  exist`. The clause validator added earlier in this release raised the
+  bare form for both, so `HAVING BOOL_OR(ea.no_such_column)` answered a
+  message with no `ea.` in it, and a caller matching on the alias found
+  nothing.
+
+  It was caught by CI, in `spg-sqlx`'s own pin, after three pushes: the
+  local precommit tier runs `--lib --bins` over the affected crates by
+  design, so another crate's integration tests never ran here. The
+  workspace test set now runs before a push that touches the engine.
+
 - **`DOUBLE(10,2)` failed the whole `CREATE TABLE`, and a MySQL `FLOAT`
   silently kept precision MySQL drops.** Four defects in one family,
   all measured against MySQL 9.7.2:
