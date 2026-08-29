@@ -649,6 +649,13 @@ pub(crate) fn session_read_temporal_text(
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalError {
+    /// v7.39.2 — a qualified reference whose QUALIFIER resolves but
+    /// whose column does not. PostgreSQL prints it unquoted and dotted;
+    /// see the Display impl.
+    QualifiedColumnNotFound {
+        qualifier: String,
+        column: String,
+    },
     ColumnNotFound {
         name: String,
     },
@@ -688,6 +695,15 @@ impl core::fmt::Display for EvalError {
             // matched none of the wire layer's `does not exist` patterns, so a
             // missing column reached the client as the generic error class.
             Self::ColumnNotFound { name } => write!(f, "column \"{name}\" does not exist"),
+            // v7.39.2 — a QUALIFIED reference prints unquoted and
+            // dotted on PostgreSQL 18.6: `column ea.no_such does not
+            // exist`, where the bare form is `column "no_such" does not
+            // exist` (both measured). The two shapes are not
+            // interchangeable — a caller matching on `ea.no_such` finds
+            // nothing in the quoted one.
+            Self::QualifiedColumnNotFound { qualifier, column } => {
+                write!(f, "column {qualifier}.{column} does not exist")
+            }
             // v7.39 (round 241) — PG's wording (and 42P01 trigger): a
             // qualifier that names no table in scope is "missing
             // FROM-clause entry for table \"x\"". The old "unknown table

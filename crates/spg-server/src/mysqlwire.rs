@@ -1096,6 +1096,18 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
             "42S22",
             format!("Unknown column '{name}' in 'field list'"),
         ),
+        // v7.39.2 — the qualified twin. A MySQL session takes the
+        // clause-naming path above rather than raising this, so nothing
+        // reaches here today; mapping it anyway is what keeps a future
+        // raise site from arriving as an unclassified error.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::QualifiedColumnNotFound {
+            qualifier,
+            column,
+        }) => (
+            1054,
+            "42S22",
+            format!("Unknown column '{qualifier}.{column}' in 'field list'"),
+        ),
         // The tail matters: `column "a" of relation "t" ALREADY EXISTS` is
         // the duplicate-column error (1060), and the first version of this
         // arm matched it on the prefix alone and renumbered it 1054. The

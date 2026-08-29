@@ -13906,6 +13906,18 @@ impl crate::Engine {
                         column: c.name.clone(),
                     }));
                 }
+                // v7.39.2 — and a qualified reference whose qualifier
+                // DOES resolve prints the whole thing, unquoted:
+                // `column ea.no_such does not exist` (measured on PG
+                // 18.6). The bare `column "no_such" does not exist` drops
+                // the alias a caller matches on, which is what the
+                // sqlx round-20 pin says.
+                if let Some(q) = &c.qualifier {
+                    return Err(EngineError::Eval(EvalError::QualifiedColumnNotFound {
+                        qualifier: q.clone(),
+                        column: c.name.clone(),
+                    }));
+                }
                 return Err(EngineError::Eval(EvalError::ColumnNotFound {
                     name: c.name.clone(),
                 }));
