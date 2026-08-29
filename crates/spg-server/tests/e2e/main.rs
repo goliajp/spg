@@ -533,6 +533,7 @@ mod e2e_two_tier_server;
 #[allow(unused_mut, unused_variables)]
 mod e2e_tx;
 mod e2e_tx_single_fsync_round177;
+mod e2e_unknown_column_empty_v7392;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_update_delete;
 mod e2e_vector;

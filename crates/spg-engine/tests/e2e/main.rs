@@ -975,6 +975,7 @@ mod e2e_unicode_string;
 mod e2e_unistr;
 mod e2e_unix_timestamp_round356;
 mod e2e_unknown_collation_v7392;
+mod e2e_unknown_column_streaming_v7392;
 mod e2e_unknown_literal_bool_round620;
 mod e2e_unlogged_table;
 mod e2e_unnest_tsvector_round758;

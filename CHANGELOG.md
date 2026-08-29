@@ -12,6 +12,35 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **An unknown column in `WHERE` / `ORDER BY` / `GROUP BY` / `HAVING` was
+  silently accepted whenever the table happened to be empty.** The
+  projection resolves its names before the scan; a predicate only met
+  them per row, so `SELECT a FROM t WHERE nosuch = 1` answered zero rows
+  and no error over an empty table, and raised over the same table with
+  one row in it. PostgreSQL 18.6 and MySQL 9.7.2 both refuse it whatever
+  the row count.
+
+  A typo'd predicate therefore passed a test written against an empty
+  fixture and failed in production — or ran nightly over an empty window
+  and reported nothing.
+
+  The check is deliberately narrow: ONE plain base table, and it does not
+  descend into a subquery. A join, a CTE, a lateral or function source,
+  or a correlated reference all bring a second scope into which a name
+  may legitimately resolve, and refusing one of those would be a worse
+  defect than the one this closes. Those shapes keep the old behaviour.
+
+  Four entries had to be told, which is what took the longest: the SELECT
+  entry, and three streaming routes that run below it. The PostgreSQL
+  wire's autocommit SELECT takes one of them, so `WHERE` and `ORDER BY`
+  went on answering zero rows there while `GROUP BY` and `HAVING` — the
+  shapes the shortcut declines — raised. The ACL check had been patched
+  into the same three entries, for the same reason, in v7.39.
+
+  The first draft refused `WHERE ctid = '(0,4)'::tid`: a system column is
+  not in the table's list and is a perfectly good predicate. The e2e
+  suite said so immediately.
+
 - **A string could not name a projection item, and two adjacent strings
   would not join on one line.** `SELECT 1 'x'`, `SELECT 1 AS 'x'`,
   `SELECT COUNT(*) 'total'` and `SELECT 1 'a b'` are all ordinary MySQL
