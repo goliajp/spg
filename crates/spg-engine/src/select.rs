@@ -3060,6 +3060,13 @@ impl Engine {
         };
         self.acl_check_select_as(stmt, as_role)?;
         validate_aggregate_placement(stmt)?;
+        // BEFORE the fast paths below, not after: a name that resolves to
+        // nothing is not a question the count fast path or the index-only
+        // scan should get to answer first. Placed after them at first,
+        // and the two of them swallowed `WHERE` and `ORDER BY` while
+        // `GROUP BY` and `HAVING`, which cannot take those routes, raised
+        // — the same statement answering two ways depending on the plan.
+        self.validate_clause_columns(stmt)?;
         // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
         // privilege gate above. Placed before it at first, and the
         // security-definer e2e caught it immediately: a SECURITY INVOKER
@@ -13733,6 +13740,134 @@ fn setof_column_shape(
 /// outright came back looking like it had taken locks.
 ///
 /// Every wording read off live PG 18.4.
+impl crate::Engine {
+    /// v7.39.2 — a column name in WHERE / ORDER BY / GROUP BY / HAVING
+    /// that names nothing is refused before the scan, not when a row
+    /// reaches it.
+    ///
+    /// The projection resolves its names eagerly; a predicate only meets
+    /// them per row. So on an EMPTY table `SELECT a FROM t WHERE nosuch
+    /// = 1` answered zero rows and no error, and the same statement over
+    /// a table with one row raised. Measured on PostgreSQL 18.6 and
+    /// MySQL 9.7.2: both refuse it whatever the row count. A typo in a
+    /// predicate therefore passed a test written against an empty
+    /// fixture and failed in production — or, worse, ran nightly over an
+    /// empty window and reported nothing.
+    ///
+    /// Deliberately narrow: ONE plain base table, nothing else. A join,
+    /// a CTE, a set operation, a lateral or function source, or a
+    /// subquery in the clause all bring a second scope into which a name
+    /// may legitimately resolve, and refusing one of those would be a
+    /// worse defect than the one this closes. Those shapes keep the
+    /// old behaviour; the walk below does not descend into a subquery
+    /// for the same reason.
+    pub(crate) fn validate_clause_columns(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let Some(from) = &stmt.from else {
+            return Ok(());
+        };
+        if !from.joins.is_empty() || !stmt.ctes.is_empty() {
+            return Ok(());
+        }
+        let t = &from.primary;
+        if t.unnest_expr.is_some()
+            || t.generate_series_args.is_some()
+            || t.lateral_subquery.is_some()
+            || t.jsonb_each_text_arg.is_some()
+            || t.table_fn_call.is_some()
+            || t.rows_from.is_some()
+            || t.json_table.is_some()
+            || t.scalar_fn_item
+        {
+            return Ok(());
+        }
+        let Some(table) = self.active_catalog().get(&t.name) else {
+            return Ok(());
+        };
+        let alias = t.alias.clone().unwrap_or_else(|| t.name.clone());
+        let known = |c: &spg_sql::ast::ColumnName| -> bool {
+            if let Some(q) = &c.qualifier
+                && q != &alias
+                && q != &t.name
+            {
+                // A qualifier this statement does not introduce is out of
+                // scope for this check.
+                return true;
+            }
+            // A system column is not in the table's list and is a
+            // perfectly good predicate: `WHERE ctid = '(0,4)'::tid` and
+            // `WHERE tableoid::regclass::text = 'pm_a'` are both real,
+            // and the first draft of this check refused them. The e2e
+            // suite said so immediately, which is what it is for.
+            is_system_column(&c.name)
+                || table.schema().columns.iter().any(|sc| sc.name == c.name)
+                // An output name the statement itself defines: ORDER BY,
+                // GROUP BY and HAVING may all name one.
+                || stmt.items.iter().any(|it| match it {
+                    SelectItem::Expr { expr, alias } => {
+                        alias.as_deref() == Some(c.name.as_str())
+                            || matches!(expr, Expr::Column(pc) if pc.name == c.name)
+                    }
+                    _ => false,
+                })
+            // No escape for `SELECT *`: with ONE base table the
+            // wildcard expands to exactly the columns already checked
+            // above, so letting it wave everything through only meant
+            // `SELECT * FROM t WHERE nosuch = 1` kept the defect.
+        };
+        let mut refs: Vec<spg_sql::ast::ColumnName> = Vec::new();
+        if let Some(w) = &stmt.where_ {
+            collect_plain_column_refs(w, &mut refs);
+        }
+        if let Some(g) = &stmt.group_by {
+            for e in g {
+                collect_plain_column_refs(e, &mut refs);
+            }
+        }
+        if let Some(h) = &stmt.having {
+            collect_plain_column_refs(h, &mut refs);
+        }
+        for o in &stmt.order_by {
+            collect_plain_column_refs(&o.expr, &mut refs);
+        }
+        for c in &refs {
+            if !known(c) {
+                return Err(EngineError::Eval(EvalError::ColumnNotFound {
+                    name: c.name.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// v7.39.2 — the column references of an expression, NOT descending into
+/// a subquery.
+///
+/// A correlated subquery resolves its names against an outer scope this
+/// walk cannot see, so descending would refuse valid queries. Missing a
+/// typo inside one is the safe direction; refusing a good query is not.
+fn collect_plain_column_refs(e: &Expr, out: &mut Vec<spg_sql::ast::ColumnName>) {
+    match e {
+        Expr::Column(c) => out.push(c.clone()),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_plain_column_refs(lhs, out);
+            collect_plain_column_refs(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_plain_column_refs(expr, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_plain_column_refs(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_locking_clause(stmt: &SelectStatement) -> Result<(), EngineError> {
     let Some(lock) = &stmt.locking else {
         return Ok(());

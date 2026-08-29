@@ -292,6 +292,14 @@ impl Engine {
         // the scalarsq streaming executor, below `exec_select_cancel` and its
         // gate. Check here too.
         self.acl_check_select(s)?;
+        // v7.39.2 — and the same for the unknown-column check, for the same
+        // reason and found the same way. `SELECT a FROM t WHERE nosuch = 1`
+        // over an EMPTY table answered zero rows on the PostgreSQL wire
+        // while raising in-process and on the MySQL wire: this path is
+        // streamable and `GROUP BY` / `HAVING` are not, so the same
+        // statement answered two ways depending on which executor its
+        // shape reached.
+        self.validate_clause_columns(s)?;
         if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
             return self.exec_scalarsq_streaming(s, cancel, arena, emit);
         }
@@ -336,6 +344,12 @@ impl Engine {
         // v7.39 (read01 round 57) — same story: the joined-streaming shortcut
         // runs below `exec_select_cancel`.
         self.acl_check_select(s)?;
+        // v7.39.2 — and the unknown-column check, same story again. THIS is
+        // the route an autocommit SELECT takes over the PostgreSQL wire,
+        // which is why `WHERE nosuch = 1` over an empty table answered
+        // zero rows there while raising in-process, on the MySQL wire, and
+        // for `GROUP BY` / `HAVING` — shapes this shortcut declines.
+        self.validate_clause_columns(s)?;
         if !crate::expr_tree_has_subquery(s)
             && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
         {
@@ -386,6 +400,8 @@ impl Engine {
         // that needs the full result (aggregate, ORDER BY, DISTINCT,
         // subqueries, etc.) — the caller's `Vec<Row<'static>>` round-trip
         // still wins because Engine::execute path keeps materialising.
+        // v7.39.2 — before the shortcut, for the reason above.
+        self.validate_clause_columns(&s)?;
         if !crate::expr_tree_has_subquery(&s)
             && let Some(n) = self.try_exec_joined_streaming(&s, cancel, &mut emit)?
         {
