@@ -12,6 +12,47 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`DOUBLE(10,2)` failed the whole `CREATE TABLE`, and a MySQL `FLOAT`
+  silently kept precision MySQL drops.** Four defects in one family,
+  all measured against MySQL 9.7.2:
+
+  `DOUBLE(10,2)` — how every legacy MySQL schema spells money — answered
+  `syntax error at or near "("`. The guard accepting MySQL's `(m,d)`
+  display form tested for `float` while its comment claimed both
+  spellings, so the whole statement failed and the table was never
+  created.
+
+  A bare `FLOAT` is FOUR bytes on MySQL and eight on PostgreSQL, where
+  it is `float8`'s spelling. SPG used PostgreSQL's for both, so a MySQL
+  FLOAT column kept precision MySQL discards — `3.14159265358979` reads
+  back `3.14159` there and came back whole here — and reported itself as
+  `double` to every reflection. This is the mirror of the REAL split SPG
+  already honoured (MySQL's REAL is a synonym for DOUBLE); one half had
+  been done and the other had not.
+
+  MySQL prints a FLOAT to SIX significant digits, and keeps BOTH widths
+  in fixed notation for decimal exponents in `[-15, 14]` — so
+  `123456789` reads `123457000`, `1e15` reads `1e15`, and `1e-15` reads
+  `0.000000000000001`. SPG printed PostgreSQL's shortest round-trip in
+  PostgreSQL's much narrower window.
+
+  And the wire had its own copy of that rendering — Rust's `Display`
+  for f64, PostgreSQL's `float4out` for f32 — so the engine's rule could
+  not reach a client however the session was configured.
+
+  One more surfaced while fixing it: `DataType::Real` was missing from
+  the wire's column-type map and fell to the VAR_STRING catch-all, while
+  the binary encoder wrote four raw little-endian bytes for it. A
+  prepared-statement client was told "string" and handed a float's
+  bytes. Nothing declared a Real column on the MySQL wire until FLOAT
+  stopped widening, which is what brought it into view.
+
+  Residual, measured and not fixed: the `(m,d)` digits are not a display
+  hint — MySQL ROUNDS on write (`3.14159265358979` into either
+  `FLOAT(10,2)` or `DOUBLE(10,2)` stores `3.14`) and reports
+  `float(10,2)` in `COLUMN_TYPE`. Recording the pair needs a catalog
+  field of its own.
+
 - **`DESCRIBE` answered three columns of SPG's own where MySQL answers
   six, and the DDL was spelled as an engine SPG does not claim to be.**
   `DESCRIBE` / `SHOW COLUMNS` is the most-used introspection command on

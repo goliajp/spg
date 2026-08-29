@@ -539,6 +539,7 @@ mod e2e_mysql_enum_order_round401;
 mod e2e_mysql_enum_ordinal_round402;
 mod e2e_mysql_escape_table_round332;
 mod e2e_mysql_extract_string_round382;
+mod e2e_mysql_float_v7392;
 mod e2e_mysql_format;
 mod e2e_mysql_format_round_round399;
 mod e2e_mysql_fsp_render_round425;

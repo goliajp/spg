@@ -71,7 +71,10 @@ fn the_columns_round_trip() {
     e.execute("INSERT INTO d VALUES ('hello', NULL, NULL, 1.5)")
         .unwrap();
     assert_eq!(one(&mut e, "SELECT t FROM d"), Value::text("hello"));
-    assert_eq!(one(&mut e, "SELECT f FROM d"), Value::Float(1.5));
+    // v7.39.2 — a MySQL FLOAT is four bytes there (measured:
+    // 3.14159265358979 reads back 3.14159), so `FLOAT(10,2)` lands in
+    // SPG's own 4-byte type rather than being widened to a double.
+    assert_eq!(one(&mut e, "SELECT f FROM d"), Value::Real(1.5));
     assert_eq!(one(&mut e, "SELECT b FROM d"), Value::Null);
 
     // The byte columns hold bytes — shown on a PG session, where the
