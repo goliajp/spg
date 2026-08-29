@@ -5,7 +5,14 @@
 # dropped (no semantic effect — SPG holds the value in the signed twin)".
 # It no longer is: BIGINT UNSIGNED carries its full 0..2^64-1 range, and
 # SHOW COLUMNS reports the DECLARED type in a MySQL session rather than
-# the storage tag. The expectations below are a live MariaDB 11 run.
+# the storage tag.
+#
+# v7.39.2 — RE-CALIBRATED. The header said "a live MariaDB 11 run" while
+# the rows below were SPG's own three columns (name / type / a raw 0 or
+# 1): MariaDB and MySQL alike answer SIX — Field, Type, Null, Key,
+# Default, Extra. The rows are now a MySQL 9.7.2 run, which is the engine
+# SPG advertises itself as, and MySQL dropped the integer display width
+# in 8.0.19.
 
 # v7.39 (round 274) — declare the session's dialect the way a mysqldump
 # preamble does. PG's REAL is 4-byte and MySQL's REAL is a synonym for
@@ -27,30 +34,51 @@ CREATE TABLE mixed (
 )
 
 # SHOW COLUMNS surfaces the storage type after the alias rewrite.
-query TTI nosort
+query TTTTTT nosort
 SHOW COLUMNS FROM mixed
 ----
 tiny_v
-tinyint(4)
-0
+tinyint
+NO
+(empty)
+NULL
+(empty)
 mid_v
-mediumint(9)
-0
+mediumint
+NO
+(empty)
+NULL
+(empty)
 int_v
-int(11)
-0
+int
+NO
+(empty)
+NULL
+(empty)
 big_v
-bigint(20) unsigned
-0
+bigint unsigned
+NO
+(empty)
+NULL
+(empty)
 d_v
 double
-1
+YES
+(empty)
+NULL
+(empty)
 r_v
 double
-1
+YES
+(empty)
+NULL
+(empty)
 flag
 tinyint(1)
-1
+YES
+(empty)
+NULL
+(empty)
 
 statement ok
 INSERT INTO mixed VALUES (12, 1000, 100000, 9999999999, 3.14, 2.71, TRUE)

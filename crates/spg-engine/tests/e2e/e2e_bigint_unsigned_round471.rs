@@ -113,7 +113,10 @@ fn round471_out_of_range_still_raises_with_mysqls_wording() {
 #[test]
 fn round471_it_still_reports_as_a_bigint() {
     // The storage tag moved to Numeric; every surface a client reads must
-    // still say bigint, as MariaDB does.
+    // still say bigint, as MySQL does.
+    // v7.39.2 — and without a display width: MySQL 9.7.2 writes
+    // `bigint unsigned`, MariaDB `bigint(20) unsigned`, and SPG says it
+    // is MySQL.
     let mut e = my();
     assert_eq!(
         one(
@@ -121,18 +124,15 @@ fn round471_it_still_reports_as_a_bigint() {
             "SELECT column_type, data_type FROM information_schema.columns \
              WHERE table_name='b' AND column_name='u'"
         ),
-        "bigint(20) unsigned|bigint"
+        "bigint unsigned|bigint"
     );
     let create = one(&mut e, "SHOW CREATE TABLE b");
     assert!(
-        create.contains("`u` bigint(20) unsigned"),
+        create.contains("`u` bigint unsigned"),
         "SHOW CREATE said: {create}"
     );
     // A signed BIGINT is untouched by any of this.
-    assert!(
-        create.contains("`s` bigint(20)"),
-        "SHOW CREATE said: {create}"
-    );
+    assert!(create.contains("`s` bigint "), "SHOW CREATE said: {create}");
 }
 
 #[test]

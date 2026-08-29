@@ -12,6 +12,52 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **`DESCRIBE` answered three columns of SPG's own where MySQL answers
+  six, and the DDL was spelled as an engine SPG does not claim to be.**
+  `DESCRIBE` / `SHOW COLUMNS` is the most-used introspection command on
+  MySQL — SQLAlchemy's mysql dialect reflects with it — and it answers
+  `Field, Type, Null, Key, Default, Extra`. SPG answered `name`, `type`
+  and a raw 0-or-1 `nullable`, so a tool reading `row['Default']` or
+  `row['Extra']` found no such key and could not learn a column's
+  default, its key membership, or that it is AUTO_INCREMENT.
+
+  The corpus fixture covering it asserted SPG's own three columns under
+  a header that said "a live MariaDB 11 run". MariaDB answers the same
+  six MySQL does; nothing in that fixture had ever been compared with
+  either engine.
+
+  That was the smaller half. SPG advertises itself as MySQL 9.7.2 —
+  one constant feeds the handshake, `@@version` and `VERSION()` — while
+  its type and DDL rendering was calibrated against MariaDB, which
+  spells this differently. Measured against 9.7.2, now all MySQL's:
+
+  | | MySQL 9.7.2 | MariaDB 12.3.3 | SPG was |
+  |---|---|---|---|
+  | integer | `int` | `int(11)` | `int(11)` |
+  | unsigned | `bigint unsigned` | `bigint(20) unsigned` | `bigint(20) unsigned` |
+  | literal default | `DEFAULT '7'` | `DEFAULT 7` | `DEFAULT 7` |
+  | clock default | `DEFAULT CURRENT_TIMESTAMP` | `current_timestamp()` | `current_timestamp()` |
+  | a TEXT column | `text` | `text DEFAULT NULL` | `text DEFAULT NULL` |
+
+  MySQL dropped the integer display width in 8.0.19, so a reflection
+  reading it back recovered a length MySQL never reports. `tinyint(1)`
+  is not that case and keeps its parentheses in both engines: it is how
+  BOOLEAN is spelled.
+
+  The `AUTO_INCREMENT=n` table option is now omitted while the next
+  value is still 1, as MySQL omits it — SPG printed `AUTO_INCREMENT=1`
+  on a table that had never been written to, so a freshly created table
+  and its own dump did not compare equal.
+
+  JSON is not one of the types that loses `DEFAULT NULL`: the first
+  draft grouped it with TEXT and BLOB and the differential said so.
+
+  Known gaps, both measured and both needing the declared spelling
+  recorded rather than a rendering change: a declared `TIMESTAMP` still
+  reports `datetime` (MySQL and MariaDB agree on `timestamp`), and a
+  declared `FLOAT` still reports `double` because SPG widens it to
+  8 bytes at CREATE TABLE.
+
 - **The MySQL wire's catalog views answered PostgreSQL's, so the standard
   reflection query found no tables at all.**
   `SELECT … FROM information_schema.tables WHERE table_schema =

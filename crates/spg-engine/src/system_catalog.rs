@@ -482,7 +482,7 @@ fn mysql_info_columns(cat: &Catalog, schema_name: &str) -> (Vec<ColumnSchema>, V
 /// primary-key column, `UNI` for the leading column of a unique key that
 /// is not the primary one, `MUL` for the leading column of an ordinary
 /// index, and the empty string otherwise.
-fn mysql_column_key(t: &spg_storage::Table, pos: usize) -> &'static str {
+pub(crate) fn mysql_column_key(t: &spg_storage::Table, pos: usize) -> &'static str {
     let ucs = &t.schema().uniqueness_constraints;
     if ucs
         .iter()
