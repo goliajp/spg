@@ -10,14 +10,23 @@
 //!     table's own `AUTO_INCREMENT=n` option with it.
 //!
 //! A client dumping and reloading lost its defaults and its indexes
-//! without a word. The rest is fidelity: MariaDB 11 prints types in
-//! lower case with a display width, `DEFAULT NULL` for a nullable column
-//! that has none, `current_timestamp()` for the clock default, and its
-//! keys in the order PRIMARY, UNIQUE, KEY.
+//! without a word. The rest is fidelity: types in lower case,
+//! `DEFAULT NULL` for a nullable column that has none, and the keys in
+//! the order PRIMARY, UNIQUE, KEY.
 //!
-//! The expected text below is the MariaDB 11 output for this schema,
-//! with the two differences SPG cannot honestly produce noted in the
-//! test itself.
+//! v7.39.2 — RE-CALIBRATED. The expectations below were a MariaDB 11
+//! run, and SPG advertises itself as MySQL 9.7.2 — one constant,
+//! `MYSQL_SERVER_VERSION`, feeds the handshake, `@@version` and
+//! `VERSION()`. The two engines print this statement differently, so
+//! measuring against the one SPG does not claim to be pinned the wrong
+//! text: MySQL dropped the integer display width in 8.0.19 (`int`, not
+//! `int(11)`), quotes a literal default (`DEFAULT '7'`), spells the
+//! clock default `CURRENT_TIMESTAMP` rather than `current_timestamp()`,
+//! and writes a bare `text` where MariaDB writes `text DEFAULT NULL`.
+//! Every expectation below is now a MySQL 9.7.2 run of this schema.
+//!
+//! The container's own `COLLATE utf8mb4_bin` is its configuration, not
+//! MySQL's default, and is not part of what is pinned here.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -57,20 +66,20 @@ fn fixture() -> Engine {
     e
 }
 
-/// The whole statement, as MariaDB renders it.
+/// The whole statement, as MySQL 9.7.2 renders it.
 #[test]
-fn it_renders_mariadbs_shape() {
+fn it_renders_mysqls_shape() {
     let mut e = fixture();
     assert_eq!(
         ddl(&mut e, "sc"),
         "CREATE TABLE `sc` (\n  \
-         `id` int(11) NOT NULL AUTO_INCREMENT,\n  \
-         `n` int(11) DEFAULT NULL,\n  \
-         `b` bigint(20) NOT NULL DEFAULT 7,\n  \
-         `t` text DEFAULT NULL,\n  \
+         `id` int NOT NULL AUTO_INCREMENT,\n  \
+         `n` int DEFAULT NULL,\n  \
+         `b` bigint NOT NULL DEFAULT '7',\n  \
+         `t` text,\n  \
          `v` varchar(20) NOT NULL,\n  \
          `d` decimal(10,2) DEFAULT NULL,\n  \
-         `ts` datetime DEFAULT current_timestamp(),\n  \
+         `ts` datetime DEFAULT CURRENT_TIMESTAMP,\n  \
          `f` double DEFAULT NULL,\n  \
          PRIMARY KEY (`id`),\n  \
          UNIQUE KEY `uq_v` (`v`),\n  \
@@ -86,7 +95,7 @@ fn nothing_is_dropped_any_more() {
     let mut e = fixture();
     let out = ddl(&mut e, "sc");
     assert!(
-        out.contains("NOT NULL DEFAULT 7"),
+        out.contains("NOT NULL DEFAULT '7'"),
         "a column default: {out}"
     );
     assert!(
@@ -125,6 +134,9 @@ fn the_shape_without_an_identity_column() {
         .unwrap();
     let out = ddl(&mut e, "p");
     assert!(!out.contains("AUTO_INCREMENT"), "{out}");
-    assert!(out.contains("`a` int(11) NOT NULL,"), "{out}");
-    assert!(out.contains("`b` text DEFAULT NULL"), "{out}");
+    assert!(out.contains("`a` int NOT NULL,"), "{out}");
+    // MySQL writes a bare `text`: the type cannot carry a literal
+    // default, so there is no `DEFAULT NULL` to print.
+    assert!(out.contains("`b` text"), "{out}");
+    assert!(!out.contains("text DEFAULT NULL"), "{out}");
 }

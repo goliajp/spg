@@ -55,12 +55,24 @@ impl Engine {
                 } else {
                     ""
                 };
-                // MariaDB prints the declared default, and `DEFAULT NULL`
+                // MySQL prints the declared default, and `DEFAULT NULL`
                 // for a nullable column that has none; a NOT NULL column
                 // without one gets nothing.
+                //
+                // v7.39.2 — and a TEXT or BLOB column gets nothing
+                // either, whether or not it is nullable: those types
+                // cannot carry a literal default, so MySQL 9.7.2 writes
+                // a bare `text` where SPG wrote `text DEFAULT NULL`
+                // (measured). Replaying SPG's line into MySQL is a
+                // syntax MySQL accepts but does not itself emit, so a
+                // round-tripped schema stopped comparing equal.
+                // JSON is NOT one of them: measured, MySQL writes
+                // `json DEFAULT NULL`. The first draft grouped it with
+                // the other two and the differential said so.
+                let cannot_default = matches!(c.ty, DataType::Text | DataType::Bytes);
                 let default = match (&c.default_text, c.nullable, c.auto_increment) {
                     (Some(d), _, _) => alloc::format!(" DEFAULT {}", mysql_default_text(d)),
-                    (None, true, false) => " DEFAULT NULL".into(),
+                    (None, true, false) if !cannot_default => " DEFAULT NULL".into(),
                     _ => String::new(),
                 };
                 alloc::format!("  `{}` {}{}{}{}", c.name, ty, nullable, default, auto)
@@ -157,12 +169,17 @@ impl Engine {
         // v7.39 (round 358, M16) — the AUTO_INCREMENT table option, which
         // is the next value the table would hand out (MariaDB prints
         // `AUTO_INCREMENT=3` after two rows).
+        // v7.39.2 — and only once the table has handed one out: MySQL
+        // 9.7.2 omits the option entirely while the next value is still
+        // 1 (measured), where SPG printed `AUTO_INCREMENT=1` on a table
+        // that had never been written to.
         let auto_opt = t
             .schema()
             .columns
             .iter()
             .position(|c| c.auto_increment)
             .and_then(|i| t.next_auto_value(i))
+            .filter(|n| *n > 1)
             .map_or_else(String::new, |n| alloc::format!(" AUTO_INCREMENT={n}"));
         let ddl = alloc::format!(
             "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{} DEFAULT CHARSET=utf8mb4",
@@ -572,6 +589,79 @@ impl Engine {
                 .ok_or_else(|| StorageError::TableNotFound {
                     name: table_name.into(),
                 })?;
+        // v7.39.2 — `SHOW COLUMNS` (and `DESCRIBE`, its synonym) is the
+        // most-used introspection command on MySQL — SQLAlchemy's mysql
+        // dialect reflects with it — and it answers six columns there:
+        // Field, Type, Null, Key, Default, Extra. SPG answered three of
+        // its own (`name` / `type` / a raw 0-or-1 `nullable`), so a tool
+        // reading `row['Default']` or `row['Extra']` found no such key
+        // and could not learn a column's default, its key membership, or
+        // that it is AUTO_INCREMENT.
+        //
+        // The fixture that covered this asserted SPG's own three columns
+        // while its header said "a live MariaDB 11 run" — MariaDB
+        // answers the same six MySQL does.
+        //
+        // `SHOW COLUMNS` is not PostgreSQL syntax at all, so a non-MySQL
+        // session keeps the shape it had.
+        if self.speaks_mysql {
+            let columns = alloc::vec![
+                ColumnSchema::new("Field", DataType::Text, false),
+                ColumnSchema::new("Type", DataType::Text, false),
+                ColumnSchema::new("Null", DataType::Text, false),
+                ColumnSchema::new("Key", DataType::Text, false),
+                ColumnSchema::new("Default", DataType::Text, true),
+                ColumnSchema::new("Extra", DataType::Text, false),
+            ];
+            let rows: Vec<Row<'static>> = table
+                .schema()
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    // Measured on MySQL 9.7.2: an AUTO_INCREMENT column
+                    // and a generated one both show NULL here and say
+                    // what they are in Extra; a clock default is spelled
+                    // CURRENT_TIMESTAMP, unquoted, and marked
+                    // DEFAULT_GENERATED.
+                    let default = if c.auto_increment || c.generated_stored_expr.is_some() {
+                        Value::Null
+                    } else {
+                        match &c.default_text {
+                            Some(d)
+                                if d.eq_ignore_ascii_case("current_timestamp")
+                                    || d.eq_ignore_ascii_case("now()") =>
+                            {
+                                Value::text("CURRENT_TIMESTAMP")
+                            }
+                            Some(d) => Value::text(d.clone()),
+                            None => Value::Null,
+                        }
+                    };
+                    let extra = if c.auto_increment {
+                        "auto_increment"
+                    } else if c.generated_stored_expr.is_some() {
+                        "STORED GENERATED"
+                    } else if c.default_text.as_deref().is_some_and(|d| {
+                        d.eq_ignore_ascii_case("current_timestamp")
+                            || d.eq_ignore_ascii_case("now()")
+                    }) {
+                        "DEFAULT_GENERATED"
+                    } else {
+                        ""
+                    };
+                    Row::new(alloc::vec![
+                        Value::text(c.name.clone()),
+                        Value::text(render_mysql_type(c)),
+                        Value::text::<&str>(if c.nullable { "YES" } else { "NO" }),
+                        Value::text::<&str>(crate::system_catalog::mysql_column_key(table, i)),
+                        default,
+                        Value::text::<&str>(extra),
+                    ])
+                })
+                .collect();
+            return Ok(QueryResult::Rows { columns, rows });
+        }
         let columns = alloc::vec![
             ColumnSchema::new("name", DataType::Text, false),
             ColumnSchema::new("type", DataType::Text, false),
@@ -584,18 +674,7 @@ impl Engine {
             .map(|c| {
                 Row::new(alloc::vec![
                     Value::text(c.name.clone()),
-                    // v7.39 (round 471) — a MySQL session reads the DECLARED
-                    // type, the same rendering SHOW CREATE and
-                    // information_schema already give: `tinyint(4)`,
-                    // `bigint(20) unsigned`. This reported the storage tag
-                    // instead (`SMALLINT`, `NUMERIC(20)`), which was never
-                    // what MariaDB says and became visibly so once BIGINT
-                    // UNSIGNED moved its storage to Numeric.
-                    Value::text(if self.speaks_mysql {
-                        render_mysql_type(c)
-                    } else {
-                        alloc::format!("{}", c.ty)
-                    }),
+                    Value::text(alloc::format!("{}", c.ty)),
                     Value::Bool(c.nullable),
                 ])
             })
@@ -658,30 +737,24 @@ pub(crate) fn mysql_int_base_name(
     }
 }
 
-/// The display width MariaDB prints for an integer type — one narrower for
-/// UNSIGNED (no sign character): `int(11)` / `int(10) unsigned`.
-fn mysql_int_display_width(base: &str, unsigned: bool) -> u8 {
-    match (base, unsigned) {
-        ("tinyint", false) => 4,
-        ("tinyint", true) => 3,
-        ("smallint", false) => 6,
-        ("smallint", true) => 5,
-        ("mediumint", false) => 9,
-        ("mediumint", true) => 8,
-        ("int", false) => 11,
-        ("int", true) => 10,
-        _ => 20, // bigint (signed and unsigned both 20)
-    }
-}
-
 /// v7.39 (round 358, M16) — MySQL's spelling of a column type: lower
 /// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`),
 /// the narrow name (`tinyint(4)`, `mediumint(9)`) and the ` unsigned`
 /// suffix (round 389, epic P4a).
 pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
     if let Some(base) = mysql_int_base_name(col.ty, col.mysql_int_width) {
-        let width = mysql_int_display_width(base, col.is_unsigned);
-        let mut s = alloc::format!("{base}({width})");
+        // v7.39.2 — no display width. SPG advertises itself as MySQL
+        // 9.7.2 (one constant, `MYSQL_SERVER_VERSION`), and MySQL
+        // dropped the integer display width in 8.0.19: `int`, `bigint`,
+        // `int unsigned`. This rendering was calibrated against MariaDB,
+        // which keeps `int(11)` — so SPG spelled types as an engine it
+        // does not claim to be, and a reflection reading the width back
+        // recovered a length MySQL never reports.
+        //
+        // `tinyint(1)` is NOT this case: it survives in MySQL because it
+        // is how BOOLEAN is spelled, and it is rendered from
+        // `DataType::Bool` below rather than through the width table.
+        let mut s = alloc::string::String::from(base);
         if col.is_unsigned {
             s.push_str(" unsigned");
         }
@@ -710,10 +783,19 @@ pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
 /// stored text.
 fn mysql_default_text(d: &str) -> String {
     let t = d.trim();
+    // v7.39.2 — MySQL 9.7.2 writes `DEFAULT CURRENT_TIMESTAMP`, upper
+    // case and without parentheses; the parenthesised lower-case form
+    // this used to emit is MariaDB's, and SPG claims to be MySQL.
     if t.eq_ignore_ascii_case("current_timestamp") || t.eq_ignore_ascii_case("now()") {
-        return "current_timestamp()".into();
+        return "CURRENT_TIMESTAMP".into();
     }
-    alloc::string::String::from(t)
+    // And a literal default is QUOTED there — `DEFAULT '5'`, not
+    // `DEFAULT 5` — measured across the numeric and string types alike.
+    // A quoted one keeps the quotes it was written with.
+    if t.starts_with('\'') || t.eq_ignore_ascii_case("NULL") {
+        return alloc::string::String::from(t);
+    }
+    alloc::format!("'{t}'")
 }
 
 fn render_data_type(ty: DataType) -> String {

@@ -11,6 +11,13 @@
 //! bare `smallint`. A PostgreSQL session is unchanged.
 //!
 //! Every value / rendering is copied from a MariaDB 11 run.
+//!
+//! v7.39.2 — RE-CALIBRATED against MySQL 9.7.2, which is the engine SPG
+//! advertises itself as (`MYSQL_SERVER_VERSION` feeds the handshake,
+//! `@@version` and `VERSION()`). These expectations were a MariaDB run,
+//! and MySQL dropped the integer display width in 8.0.19: `int`, not
+//! `int(11)`; `int unsigned`, not `int(10) unsigned`. `tinyint(1)`
+//! survives there because it is how BOOLEAN is spelled.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::{MysqlIntWidth, Value};
@@ -103,14 +110,15 @@ fn info_schema_rendering() {
             (s(&r.values[0]), s(&r.values[1]), s(&r.values[2]))
         })
         .collect();
+    // Measured on MySQL 9.7.2.
     let want = [
-        ("a", "tinyint(4)", "tinyint"),
-        ("b", "tinyint(3) unsigned", "tinyint"),
-        ("c", "smallint(5) unsigned", "smallint"),
-        ("d", "mediumint(8) unsigned", "mediumint"),
-        ("f", "int(10) unsigned", "int"),
-        ("g", "smallint(6)", "smallint"),
-        ("h", "int(11)", "int"),
+        ("a", "tinyint", "tinyint"),
+        ("b", "tinyint unsigned", "tinyint"),
+        ("c", "smallint unsigned", "smallint"),
+        ("d", "mediumint unsigned", "mediumint"),
+        ("f", "int unsigned", "int"),
+        ("g", "smallint", "smallint"),
+        ("h", "int", "int"),
     ];
     for (i, (name, ct, dt)) in want.iter().enumerate() {
         assert_eq!(got[i].0, *name);
@@ -132,9 +140,18 @@ fn show_create_rendering() {
         },
         other => panic!("{other:?}"),
     };
-    assert!(text.contains("smallint(5) unsigned"), "{text}");
-    assert!(text.contains("int(10) unsigned"), "{text}");
-    assert!(text.contains("tinyint(4)"), "{text}");
+    assert!(text.contains("smallint unsigned"), "{text}");
+    assert!(text.contains("int unsigned"), "{text}");
+    assert!(text.contains("tinyint"), "{text}");
+    // And no integer display width anywhere in the statement. (The
+    // first draft banned every `(`, which the statement's own opening
+    // paren trips.)
+    for w in ["int(", "tinyint(4)", "smallint(", "bigint(", "mediumint("] {
+        assert!(
+            !text.contains(w),
+            "a display width crept back ({w}): {text}"
+        );
+    }
 }
 
 /// The widened storage type + annotation survive a snapshot round-trip.

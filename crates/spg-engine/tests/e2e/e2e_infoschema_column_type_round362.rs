@@ -1,9 +1,9 @@
 //! read01 round 362 (MySQL differential, M18 tail) — the column_type column.
 //!
 //! MySQL's `information_schema.columns` carries a `column_type` column PG
-//! has no equivalent of: the full declared type WITH its display width
-//! (`int(11)`, `varchar(10)`, `decimal(10,2)`), which SQLAlchemy's mysql
-//! reflection reads to recover a column's length and unsigned-ness.
+//! has no equivalent of: the full declared type with its length and its
+//! unsigned-ness (`varchar(10)`, `decimal(10,2)`, `int unsigned`), which
+//! SQLAlchemy's mysql reflection reads.
 //! Naming it on a MySQL session errored, `column "column_type" does not
 //! exist`, so a reflection pass could not complete.
 //!
@@ -11,10 +11,9 @@
 //! on a PG session — where naming `column_type` still errors, as it does
 //! in PG.
 //!
-//! Measured on MariaDB 11; the one difference is `g`: a TINYINT is stored
-//! as SMALLINT at CREATE time (recorded at round 358), so it reads
-//! `smallint(6)` here where MariaDB reads `tinyint(4)` — data_type and
-//! column_type stay internally consistent.
+//! v7.39.2 — RE-CALIBRATED against MySQL 9.7.2, the engine SPG
+//! advertises itself as. These were a MariaDB 11 run, and MySQL dropped
+//! the integer display width in 8.0.19.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -50,18 +49,18 @@ fn col_types(e: &mut Engine) -> Vec<(String, String)> {
 }
 
 #[test]
-fn column_type_carries_the_display_width() {
+fn column_type_carries_the_declared_type() {
     let mut e = mysql();
     assert_eq!(
         col_types(&mut e),
         vec![
-            ("int".into(), "int(11)".into()),
+            ("int".into(), "int".into()),
             ("varchar".into(), "varchar(10)".into()),
             ("text".into(), "text".into()),
             ("decimal".into(), "decimal(10,2)".into()),
             ("datetime".into(), "datetime".into()),
             ("date".into(), "date".into()),
-            ("bigint".into(), "bigint(20)".into()),
+            ("bigint".into(), "bigint".into()),
             ("double".into(), "double".into()),
             ("blob".into(), "blob".into()),
         ],
