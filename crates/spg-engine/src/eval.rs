@@ -65,8 +65,8 @@ pub use format::{
 // v7.39 (GUC knife 3) — session render styles + styled formatters.
 pub use format::{
     DateOrder, DateStyleKind, IntervalStyleKind, RenderStyle, format_date_array_styled,
-    format_date_styled, format_float_array_styled, format_float_styled,
-    format_interval_array_styled, format_interval_styled, format_real_styled,
+    format_date_styled, format_float_array_styled, format_float_mysql, format_float_styled,
+    format_interval_array_styled, format_interval_styled, format_real_mysql, format_real_styled,
     format_timestamp_array_styled, format_timestamp_styled, format_timestamptz_styled,
     format_timestamptz_tz, parse_date_literal_ordered, parse_timestamp_literal_ordered,
     parse_timestamp_literal_tz_ordered,

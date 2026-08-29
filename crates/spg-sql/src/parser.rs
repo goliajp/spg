@@ -16669,18 +16669,31 @@ impl Parser {
                     } else {
                         ColumnTypeName::Real
                     }
-                } else if ty_ident.eq_ignore_ascii_case("float")
-                    && self.mysql_dialect
+                } else if self.mysql_dialect
                     && matches!(self.peek(), Token::LParen)
                     && self.peek_paren_has_comma()
                 {
                     // v7.39 (round 360) — MySQL's `FLOAT(m,d)` / `DOUBLE(m,d)`
                     // display form (`FLOAT(10,2)`), which PG has no
                     // equivalent of. It was `syntax error at or near ","`,
-                    // so the whole CREATE failed. The digits are a display
-                    // hint only; SPG stores the full double.
+                    // so the whole CREATE failed.
+                    //
+                    // v7.39.2 — the guard said `float` while the comment
+                    // said both, so `DOUBLE(10,2)` — which every legacy
+                    // MySQL schema uses for money — still failed the
+                    // whole CREATE with `syntax error at or near "("`.
+                    // Measured on 9.7.2: both forms are accepted, and the
+                    // digits are NOT a display hint, they round on write
+                    // (3.14159265358979 into either stores 3.14). The
+                    // rounding is recorded as a residual; accepting the
+                    // syntax and keeping the width is the half this
+                    // change makes.
                     self.consume_optional_paren_size();
-                    ColumnTypeName::Float
+                    if ty_ident.eq_ignore_ascii_case("float") {
+                        ColumnTypeName::Real
+                    } else {
+                        ColumnTypeName::Float
+                    }
                 } else if ty_ident.eq_ignore_ascii_case("float")
                     && matches!(self.peek(), Token::LParen)
                 {
@@ -16697,6 +16710,19 @@ impl Parser {
                     } else {
                         ColumnTypeName::Float
                     }
+                } else if ty_ident.eq_ignore_ascii_case("float") && self.mysql_dialect {
+                    // v7.39.2 — MySQL's bare FLOAT is FOUR bytes; PG's is
+                    // eight (it is `float8`'s spelling there). SPG used
+                    // PG's for both, so a MySQL FLOAT column silently
+                    // kept more precision than MySQL does — measured,
+                    // 3.14159265358979 comes back as 3.14159 there and
+                    // came back whole here — and reported itself as
+                    // `double` to every reflection.
+                    //
+                    // This is the mirror of the REAL split above: the
+                    // two dialects disagree about which spelling means
+                    // which width, and one of them was already honoured.
+                    ColumnTypeName::Real
                 } else {
                     ColumnTypeName::Float
                 }

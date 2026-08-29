@@ -2271,8 +2271,15 @@ fn value_to_mysql_text(v: &Value) -> String {
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),
-        Value::Float(f) => format!("{f}"),
-        Value::Real(x) => spg_engine::eval::format_real(*x),
+        // v7.39.2 — the wire had its OWN float rendering here: Rust's
+        // Display for f64 and PostgreSQL's `float4out` for f32, so
+        // neither followed MySQL's rule however the engine was
+        // configured. The engine's MySQL renderers are the one
+        // implementation — measured on 9.7.2, a FLOAT prints to six
+        // significant digits and both widths stay in fixed notation for
+        // decimal exponents in [-15, 14].
+        Value::Float(f) => spg_engine::eval::format_float_mysql(*f),
+        Value::Real(x) => spg_engine::eval::format_real_mysql(*x),
         Value::Text(s) | Value::Json(s) => s.to_string(),
         // v7.39 (bpchar epic) — MySQL strips CHAR(n) trailing pad on retrieval.
         Value::BpChar(s) => s.trim_end_matches(' ').to_string(),
@@ -2299,11 +2306,19 @@ fn format_timestamp_mysql(us: i64) -> String {
 
 fn mysql_field_type(ty: DataType) -> u8 {
     match ty {
-        DataType::Bool => 0x01,      // MYSQL_TYPE_TINY
-        DataType::SmallInt => 0x02,  // MYSQL_TYPE_SHORT
-        DataType::Int => 0x03,       // MYSQL_TYPE_LONG
-        DataType::BigInt => 0x08,    // MYSQL_TYPE_LONGLONG
-        DataType::Float => 0x05,     // MYSQL_TYPE_DOUBLE
+        DataType::Bool => 0x01,     // MYSQL_TYPE_TINY
+        DataType::SmallInt => 0x02, // MYSQL_TYPE_SHORT
+        DataType::Int => 0x03,      // MYSQL_TYPE_LONG
+        DataType::BigInt => 0x08,   // MYSQL_TYPE_LONGLONG
+        DataType::Float => 0x05,    // MYSQL_TYPE_DOUBLE
+        // v7.39.2 — a 4-byte float. `Real` was absent from this map and
+        // fell to the VAR_STRING catch-all below, while
+        // `encode_binary_value` wrote four raw little-endian bytes for
+        // it: a prepared-statement client was told "string" and handed
+        // a float's bytes, and read them as text. Nothing declared a
+        // Real column on the MySQL wire until FLOAT stopped widening to
+        // 8 bytes, which is what brought it into view.
+        DataType::Real => 0x04,      // MYSQL_TYPE_FLOAT
         DataType::Date => 0x0a,      // MYSQL_TYPE_DATE
         DataType::Timestamp => 0x07, // MYSQL_TYPE_TIMESTAMP
         DataType::Timestamptz => 0x07,
@@ -2325,6 +2340,7 @@ fn column_length_for(ty: DataType) -> u32 {
         DataType::Int => 11,
         DataType::BigInt => 20,
         DataType::Float => 22,
+        DataType::Real => 12,
         DataType::Date => 10,
         DataType::Timestamp | DataType::Timestamptz => 26,
         DataType::Numeric { precision, .. } => u32::from(precision) + 2,

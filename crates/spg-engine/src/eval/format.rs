@@ -549,6 +549,9 @@ fn format_g(x: f64, prec: usize) -> String {
 /// PG `float8out` under `extra_float_digits`: >= 1 → shortest
 /// round-trip (`format_float`); <= 0 → `%.{15+n}g`.
 pub fn format_float_styled(x: f64, style: &RenderStyle) -> String {
+    if style.mysql {
+        return format_float_mysql(x);
+    }
     if style.extra_float_digits >= 1 {
         return format_float(x);
     }
@@ -565,9 +568,88 @@ pub fn format_float_styled(x: f64, style: &RenderStyle) -> String {
     format_g(x, prec)
 }
 
+/// v7.39.2 — MySQL's float rendering, measured on 9.7.2.
+///
+/// Two rules differ from PostgreSQL's, and both were visible on every
+/// non-trivial value: MySQL prints a FLOAT to SIX significant digits
+/// (`3.14159265358979` reads back `3.14159`, where SPG printed the f32
+/// shortest round-trip `3.1415927`), and it stays in FIXED notation for
+/// a much wider band of exponents — `[-15, 14]` for both widths, so
+/// `123456789` reads `123457000` rather than `1.2345679e+08` and `1e15`
+/// reads `1e15` rather than `1000000000000000`.
+///
+/// A DOUBLE's digits already agreed (MySQL is shortest-round-trip there
+/// too: `0.1+0.2` prints all seventeen), so only the window moves.
+///
+/// The exponent form carries no `+` and no zero padding: `1e15`,
+/// `1.23457e15`, `1e-16`, `1.7976931348623157e308`.
+fn format_mysql_float(sci: &str, mant: &str, exp_val: i32) -> String {
+    if (-15..=14).contains(&exp_val) {
+        // Trailing zeros go, in both shapes: the six-digit rounding
+        // leaves them (`0.1` came out `0.100000`, `1` came out
+        // `1.00000`) and MySQL prints neither.
+        let fixed = fixed_from_sci(sci, exp_val);
+        if fixed.contains('.') {
+            return alloc::string::String::from(fixed.trim_end_matches('0').trim_end_matches('.'));
+        }
+        return fixed;
+    }
+    let mant = if mant.contains('.') {
+        mant.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        mant
+    };
+    alloc::format!("{mant}e{exp_val}")
+}
+
+/// Split a `{:e}`-shaped string into its mantissa and exponent.
+fn split_sci(sci: &str) -> (&str, i32) {
+    let epos = sci.find('e').expect("{:e} always has an 'e'");
+    (&sci[..epos], sci[epos + 1..].parse().unwrap_or(0))
+}
+
 /// PG `float4out` under `extra_float_digits`: >= 1 → shortest
 /// round-trip (`format_real`); <= 0 → `%.{6+n}g`.
+///
+/// On a MySQL session neither applies — see `format_mysql_float`.
+pub fn format_real_mysql(x: f32) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    // Six significant digits, then MySQL's window.
+    let sci = alloc::format!("{:.*e}", 5, f64::from(x));
+    let (mant, exp_val) = split_sci(&sci);
+    format_mysql_float(&sci, mant, exp_val)
+}
+
+/// The f64 half of the same rule — see `format_real_mysql`.
+pub fn format_float_mysql(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return if x.is_sign_negative() { "-0" } else { "0" }.into();
+    }
+    // The digits are the shortest round-trip, as MySQL's are; only the
+    // fixed/scientific window differs from PostgreSQL's.
+    let sci = shortest_float_sci(x);
+    let (mant, exp_val) = split_sci(&sci);
+    format_mysql_float(&sci, mant, exp_val)
+}
+
 pub fn format_real_styled(x: f32, style: &RenderStyle) -> String {
+    if style.mysql {
+        return format_real_mysql(x);
+    }
     if style.extra_float_digits >= 1 {
         return format_real(x);
     }

@@ -1892,3 +1892,43 @@ fn an_unknown_column_names_its_clause() {
     assert_eq!(err_of(&mut s, "SELECT FROM").0, 1064);
     assert_eq!(query_scalar(&mut s, "SELECT COUNT(*) FROM uc"), "0");
 }
+
+/// v7.39.2 — a float renders MySQL's way ON THE WIRE.
+///
+/// The wire had its own copy of this: Rust's `Display` for f64 and
+/// PostgreSQL's `float4out` for f32, in `value_to_mysql_text`, so the
+/// engine's MySQL rule could not reach it however the session was
+/// configured. The ablation that put that copy back left every engine
+/// pin green, which is what said this surface had none of its own.
+///
+/// Measured on MySQL 9.7.2: a FLOAT prints to six significant digits,
+/// and both widths stay in fixed notation for decimal exponents in
+/// `[-15, 14]`.
+#[test]
+fn a_float_renders_mysqls_way_over_the_wire() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE TABLE wf (f FLOAT, d DOUBLE)");
+    for (input, want_float, want_double) in [
+        ("3.14159265358979", "3.14159", "3.14159265358979"),
+        ("123456789", "123457000", "123456789"),
+        ("1e14", "100000000000000", "100000000000000"),
+        ("1e15", "1e15", "1e15"),
+        ("1e-16", "1e-16", "1e-16"),
+        ("0.1", "0.1", "0.1"),
+        ("1.0", "1", "1"),
+    ] {
+        exec_ok(&mut s, "DELETE FROM wf");
+        exec_ok(&mut s, &format!("INSERT INTO wf VALUES ({input}, {input})"));
+        assert_eq!(
+            query_scalar(&mut s, "SELECT f FROM wf"),
+            want_float,
+            "float {input}"
+        );
+        assert_eq!(
+            query_scalar(&mut s, "SELECT d FROM wf"),
+            want_double,
+            "double {input}"
+        );
+    }
+}

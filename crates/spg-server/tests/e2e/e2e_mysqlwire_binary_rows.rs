@@ -335,8 +335,13 @@ fn binary_row_multi_column_packs_in_declared_order() {
     let _ = read_packet(&mut s);
 }
 
+/// v7.39.2 — a MySQL FLOAT is FOUR bytes, and its column definition
+/// says MYSQL_TYPE_FLOAT (0x04). This asserted eight, because SPG
+/// widened a declared FLOAT to a double; the payload width and the
+/// declared type byte have to agree or a prepared-statement client
+/// reads the wrong number of bytes. A DOUBLE column still sends eight.
 #[test]
-fn binary_row_float_column_encodes_as_8_bytes_le_double() {
+fn binary_row_float_column_encodes_as_4_bytes_le_float() {
     let (_guard, addr) = spawn();
     let mut s = auth_open(&addr);
     send_query(&mut s, "CREATE TABLE t (x FLOAT NOT NULL)");
@@ -350,6 +355,27 @@ fn binary_row_float_column_encodes_as_8_bytes_le_double() {
     let _ = read_packet(&mut s); // column_def
     read_columns_eof(&mut s);
     let (_seq, pkt) = read_packet(&mut s);
+    let v = f32::from_le_bytes(pkt[2..6].try_into().unwrap());
+    assert!((v - 3.141_592_7).abs() < 1e-6, "got {v}");
+    let _ = read_packet(&mut s);
+}
+
+/// The DOUBLE half, so the two widths cannot drift into each other.
+#[test]
+fn binary_row_double_column_encodes_as_8_bytes_le_double() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open(&addr);
+    send_query(&mut s, "CREATE TABLE td (x DOUBLE NOT NULL)");
+    let _ = read_packet(&mut s);
+    send_query(&mut s, "INSERT INTO td VALUES (3.14159265358979)");
+    let _ = read_packet(&mut s);
+    send_prepare(&mut s, "SELECT x FROM td");
+    let (stmt_id, _nc, _np) = read_prepare_ok(&mut s);
+    execute_no_params(&mut s, stmt_id);
+    let _ = read_packet(&mut s);
+    let _ = read_packet(&mut s);
+    read_columns_eof(&mut s);
+    let (_seq, pkt) = read_packet(&mut s);
     let v = f64::from_le_bytes(pkt[2..10].try_into().unwrap());
     assert!((v - 3.14159265358979).abs() < 1e-15, "got {v}");
     let _ = read_packet(&mut s);
@@ -360,4 +386,47 @@ fn binary_row_float_column_encodes_as_8_bytes_le_double() {
 #[allow(dead_code)]
 fn _anchor(b: &[u8], n: usize) -> Vec<Option<Vec<u8>>> {
     parse_binary_row(b, n)
+}
+
+/// v7.39.2 — a FLOAT column's DEFINITION says MYSQL_TYPE_FLOAT (0x04).
+///
+/// `DataType::Real` was absent from the column-type map and fell to the
+/// VAR_STRING catch-all, while `encode_binary_value` wrote four raw
+/// little-endian bytes for it: a prepared-statement client was told
+/// "string" and handed a float's bytes. Nothing declared a Real column
+/// on this wire until FLOAT stopped widening to eight bytes, which is
+/// what brought the mismatch into view.
+///
+/// The column_def payload is: catalog, schema, table, org_table, name,
+/// org_name (all lenenc strings), then a 0x0c length byte, 2-byte
+/// charset, 4-byte column length, and the type byte.
+#[test]
+fn a_float_column_definition_says_mysql_type_float() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open(&addr);
+    send_query(&mut s, "CREATE TABLE tf (f FLOAT, d DOUBLE)");
+    let _ = read_packet(&mut s);
+    send_prepare(&mut s, "SELECT f, d FROM tf");
+    let (stmt_id, _nc, _np) = read_prepare_ok(&mut s);
+    execute_no_params(&mut s, stmt_id);
+    let _ = read_packet(&mut s); // column_count
+    let (_seq, fdef) = read_packet(&mut s);
+    let (_seq, ddef) = read_packet(&mut s);
+    assert_eq!(type_byte_of(&fdef), 0x04, "FLOAT: {fdef:?}");
+    assert_eq!(type_byte_of(&ddef), 0x05, "DOUBLE: {ddef:?}");
+    read_columns_eof(&mut s);
+    let _ = read_packet(&mut s);
+}
+
+fn type_byte_of(def: &[u8]) -> u8 {
+    let mut i = 0usize;
+    // Six lenenc strings; every name here is short, so the length is a
+    // single byte.
+    for _ in 0..6 {
+        let n = def[i] as usize;
+        i += 1 + n;
+    }
+    // 0x0c filler, then charset (2) + column length (4), then the type.
+    assert_eq!(def[i], 0x0c, "expected the 0x0c filler at {i}: {def:?}");
+    def[i + 1 + 2 + 4]
 }
