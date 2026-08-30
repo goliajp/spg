@@ -345,6 +345,55 @@ fn random_in_range(lo: &Value<'_>, hi: &Value<'_>) -> Result<Value<'static>, Eva
     }
 }
 
+/// v7.39.2 — does the dispatch REFUSE this argument count?
+///
+/// The wrong-arity check lives inside the row-time dispatch, so a query
+/// over an EMPTY table never reaches it: `SELECT lower(t, n) FROM t`
+/// answers zero rows and no error while `t` is empty, and raises the
+/// moment it has one row — the same shape as the unknown-column defect
+/// closed earlier in this release.
+///
+/// Refusing before the scan needs the accepted counts as DATA. This is
+/// how that data is derived: ask the dispatch itself, with NULL
+/// arguments, and record only the counts it answers `WrongArity` to.
+/// Anything else — a value error, a type refusal, success — counts as
+/// ACCEPTED, so a function whose guard is not arity-first, and a
+/// variadic one that never raises `WrongArity` at all, are both
+/// recorded as accepting everything. The table can under-refuse; it
+/// cannot over-refuse, and that is the property that makes it safe to
+/// consult before a scan.
+///
+/// It is called from the generator test, never at run time — some of
+/// these functions have side effects (`nextval`), which is exactly why
+/// the probing happens once, offline, rather than per query.
+#[cfg(test)]
+pub(crate) fn probe_refuses_arity(name: &str, argc: usize) -> bool {
+    let cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    let args: alloc::vec::Vec<Value<'static>> = (0..argc).map(|_| Value::Null).collect();
+    // v7.39.2 — BOTH dialects have to refuse it.
+    //
+    // The first version of this probed one dialect and the table was
+    // consulted in both, so a count that only the MySQL grammar accepts
+    // came back refused: `JSON_OBJECT('k', 1, 'v', 2)` — a perfectly
+    // ordinary variadic call — was rejected before the scan. That is
+    // precisely the over-refusal this table is supposed to be incapable
+    // of, and the claim was wrong until this line. The round-391 pin
+    // caught it within the minute.
+    let mut ctx = crate::eval::EvalContext::new(&cols, None);
+    let pg = matches!(
+        apply_function(name, &args, &ctx),
+        Err(EvalError::WrongArity { .. })
+    );
+    if !pg {
+        return false;
+    }
+    ctx.mysql_dialect = true;
+    matches!(
+        apply_function(name, &args, &ctx),
+        Err(EvalError::WrongArity { .. })
+    )
+}
+
 pub(super) fn apply_function(
     name: &str,
     args: &[Value<'_>],
@@ -19945,5 +19994,108 @@ fn oid_arg(v: Option<&Value>) -> Option<i64> {
         Value::BigInt(n) => Some(*n),
         Value::SmallInt(n) => Some(i64::from(*n)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod arity_table_generator {
+    /// v7.39.2 — the candidate names, taken from the dispatch's own match
+    /// arms.
+    ///
+    /// Reading the source is mechanical and both failure modes are safe:
+    /// a name missed is a name the table does not judge, and a string
+    /// picked up that is not a function answers "unknown function" to
+    /// every count, so no count is marked refused. Under-refusing is the
+    /// only direction this can be wrong in.
+    pub(super) fn dispatch_names() -> alloc::vec::Vec<alloc::string::String> {
+        let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for src in [
+            include_str!("functions.rs"),
+            include_str!("datetime.rs"),
+            include_str!("regexp.rs"),
+        ] {
+            for line in src.lines() {
+                let t = line.trim();
+                if !t.ends_with("=> {") && !t.ends_with("=>") {
+                    continue;
+                }
+                // `"a" | "b" | "c" => {` — take every quoted lowercase
+                // identifier on an arm line.
+                let mut rest = t;
+                while let Some(i) = rest.find('"') {
+                    rest = &rest[i + 1..];
+                    let Some(j) = rest.find('"') else { break };
+                    let name = &rest[..j];
+                    rest = &rest[j + 1..];
+                    if !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    {
+                        out.push(alloc::string::String::from(name));
+                    }
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// v7.39.2 — the checked-in table still describes this dispatch.
+    ///
+    /// A generated table that nothing re-derives is a table that drifts.
+    /// This re-derives it and fails on any difference, so changing a
+    /// function's accepted counts without regenerating `eval/arity.rs`
+    /// is a red test rather than a query silently refused — or silently
+    /// allowed — before the scan.
+    #[test]
+    fn arity_table_is_current() {
+        let mut derived: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<usize>)> =
+            alloc::vec::Vec::new();
+        for name in dispatch_names() {
+            let refused: alloc::vec::Vec<usize> = (0..=8)
+                .filter(|n| super::probe_refuses_arity(&name, *n))
+                .collect();
+            if !refused.is_empty() {
+                derived.push((name, refused));
+            }
+        }
+        let checked = crate::eval::arity::REFUSED_ARITIES;
+        assert_eq!(
+            derived.len(),
+            checked.len(),
+            "eval/arity.rs has {} rows, this dispatch derives {} — regenerate it",
+            checked.len(),
+            derived.len()
+        );
+        for ((dn, dr), (cn, cr)) in derived.iter().zip(checked.iter()) {
+            assert_eq!(dn.as_str(), *cn, "row order or membership changed");
+            assert_eq!(dr.as_slice(), *cr, "{dn}: accepted counts changed");
+        }
+    }
+
+    /// Print the table this build derives, so it can be checked in.
+    /// Ignored by default — it is a generator, not an assertion.
+    #[test]
+    #[ignore]
+    fn print_arity_table() {
+        let mut rows: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for name in dispatch_names() {
+            let refused: alloc::vec::Vec<usize> = (0..=8)
+                .filter(|n| super::probe_refuses_arity(&name, *n))
+                .collect();
+            if refused.is_empty() {
+                continue;
+            }
+            rows.push(alloc::format!("    (\"{name}\", &{refused:?}),"));
+        }
+        // The crate is `no_std`, so the table comes out through the
+        // one channel a test always has: the panic message.
+        panic!(
+            "ARITY_TABLE_BEGIN\n{}\nARITY_TABLE_END rows={}",
+            rows.join("\n"),
+            rows.len()
+        );
     }
 }

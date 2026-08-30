@@ -300,6 +300,7 @@ impl Engine {
         // statement answered two ways depending on which executor its
         // shape reached.
         self.validate_clause_columns(s)?;
+        self.validate_function_arity(s)?;
         if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
             return self.exec_scalarsq_streaming(s, cancel, arena, emit);
         }
@@ -350,6 +351,7 @@ impl Engine {
         // zero rows there while raising in-process, on the MySQL wire, and
         // for `GROUP BY` / `HAVING` — shapes this shortcut declines.
         self.validate_clause_columns(s)?;
+        self.validate_function_arity(s)?;
         if !crate::expr_tree_has_subquery(s)
             && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
         {
@@ -402,6 +404,7 @@ impl Engine {
         // still wins because Engine::execute path keeps materialising.
         // v7.39.2 — before the shortcut, for the reason above.
         self.validate_clause_columns(&s)?;
+        self.validate_function_arity(&s)?;
         if !crate::expr_tree_has_subquery(&s)
             && let Some(n) = self.try_exec_joined_streaming(&s, cancel, &mut emit)?
         {

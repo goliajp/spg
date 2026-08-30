@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use spg_sql::ast::{BinOp, CastTarget, ColumnName, Expr, Literal};
 use spg_storage::{ColumnSchema, Row, Value};
 
+pub(crate) mod arity;
 pub(crate) mod binop;
 mod cast;
 pub mod compiled;
