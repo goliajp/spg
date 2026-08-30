@@ -557,6 +557,11 @@ fn mysql_numeric_precision(col: &ColumnSchema) -> (Value<'static>, Value<'static
     if let Some(d) = int_digits(col.mysql_int_width) {
         return (Value::BigInt(d), Value::BigInt(0));
     }
+    // v7.39.3 — a declared `(m,d)` is what MySQL reports here
+    // (measured: `double(10,2)` reads precision 10, scale 2).
+    if let Some((m, d)) = col.mysql_float_md {
+        return (Value::BigInt(i64::from(m)), Value::BigInt(i64::from(d)));
+    }
     match col.ty {
         DataType::SmallInt => (Value::BigInt(5), Value::BigInt(0)),
         DataType::Int => (Value::BigInt(10), Value::BigInt(0)),

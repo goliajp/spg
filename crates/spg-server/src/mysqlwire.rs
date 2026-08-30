@@ -1128,6 +1128,15 @@ fn mysql_error_parts(e: &spg_engine::EngineError, db: &str) -> (u16, &'static st
         // the same sentence, so only a distinct variant can tell them
         // apart here. Measured: `SELECT LOWER()` and `SELECT LOWER(1,2)`
         // both answer 1582.
+        // v7.39.3 — a value wider than a column's declared width. MySQL
+        // 9.7.2 numbers it 1264 / 22003; SPG's TypeMismatch fell to the
+        // unmapped 1064, which reads as a PARSE error and is wrong about
+        // what happened.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("Out of range value for column ") =>
+        {
+            (1264, "22003", detail.clone())
+        }
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::WrongArity { name, .. }) => (
             1582,
             "42000",
@@ -1628,6 +1637,7 @@ fn handle_com_stmt_prepare(
                 // v7.39.2 — a prepared-statement placeholder has no
                 // declared spelling.
                 mysql_declared_timestamp: false,
+                mysql_float_md: None,
                 collation_name: None,
                 user_composite_type: None,
                 acl: Vec::new(),

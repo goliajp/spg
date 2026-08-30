@@ -1784,6 +1784,7 @@ impl Engine {
                     sc.as_ref(),
                 );
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
+                let coerced = crate::conversions::round_to_column_float_md(coerced, col)?;
                 check_unsigned_range(&coerced, col, *pos)?;
                 new_vals[*pos] = coerced;
             }
@@ -7383,6 +7384,7 @@ fn parse_insert_rows(
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
+                let coerced = crate::conversions::round_to_column_float_md(coerced, col)?;
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }
@@ -7491,6 +7493,7 @@ fn parse_insert_rows(
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
+                let coerced = crate::conversions::round_to_column_float_md(coerced, col)?;
                 check_unsigned_range(&coerced, col, i)?;
                 out.push(coerced);
             }

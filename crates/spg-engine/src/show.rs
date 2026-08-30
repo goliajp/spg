@@ -787,6 +787,18 @@ pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
         }
         return s;
     }
+    // v7.39.3 — a declared `(m,d)` is part of the type MySQL reports,
+    // and it is not cosmetic: it rounds on write.
+    if let Some((m, d)) = col.mysql_float_md
+        && matches!(col.ty, DataType::Float | DataType::Real)
+    {
+        let base = if matches!(col.ty, DataType::Real) {
+            "float"
+        } else {
+            "double"
+        };
+        return alloc::format!("{base}({m},{d})");
+    }
     match col.ty {
         DataType::Float => "double".into(),
         DataType::Real => "float".into(),

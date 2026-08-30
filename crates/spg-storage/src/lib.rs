@@ -1753,6 +1753,19 @@ pub struct ColumnSchema {
     /// Persisted in the FILE_VERSION 93+ sparse appendix; older
     /// catalogs deserialise as `false`.
     pub mysql_declared_timestamp: bool,
+    /// v7.39.3 — a MySQL `FLOAT(m,d)` / `DOUBLE(m,d)`'s declared pair.
+    ///
+    /// The digits are NOT a display hint, which is what SPG's comment
+    /// claimed and 7.39.2 recorded as a residual: MySQL 9.7.2 ROUNDS on
+    /// write (3.14159265358979 into either stores 3.14) and refuses a
+    /// value wider than `m` with errno 1264. SPG accepted the syntax and
+    /// kept the full double, so a column declared for money held more
+    /// precision than the schema said and every reader saw a different
+    /// number from MySQL's.
+    ///
+    /// Persisted in the FILE_VERSION 94+ sparse appendix; older catalogs
+    /// deserialise as None, which is "no declared pair".
+    pub mysql_float_md: Option<(u8, u8)>,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -9015,6 +9028,7 @@ impl ColumnSchema {
             mysql_int_width: None,
             mysql_fsp: None,
             mysql_declared_timestamp: false,
+            mysql_float_md: None,
         }
     }
 
@@ -9406,7 +9420,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 93;
+const FILE_VERSION: u8 = 94;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -10334,6 +10348,25 @@ impl Catalog {
             );
             for pos in declared_ts {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+            }
+            // v7.39.3 — the FLOAT/DOUBLE (m,d) appendix (FILE_VERSION
+            // 94+). Sparse: only columns declared with the pair.
+            // Layout: `[u16 count]([u16 col_pos][u8 m][u8 d]) × count`.
+            let float_mds: Vec<(usize, u8, u8)> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.mysql_float_md.map(|(m, d)| (i, m, d)))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(float_mds.len()).expect("≤ 65k (m,d) columns/table"),
+            );
+            for (pos, m, d) in float_mds {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
+                out.push(m);
+                out.push(d);
             }
             // v7.39 (round 652) — CHECK-validated appendix (FILE_VERSION
             // 87+). Sparse the other way round from the ones above: the

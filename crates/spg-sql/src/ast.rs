@@ -2743,6 +2743,9 @@ pub struct ColumnDef {
     /// `DATETIME` in a MySQL session. The engine copies it to
     /// `ColumnSchema.mysql_declared_timestamp` at CREATE TABLE.
     pub mysql_declared_timestamp: bool,
+    /// v7.39.3 — a MySQL `FLOAT(m,d)` / `DOUBLE(m,d)` pair, copied to
+    /// `ColumnSchema.mysql_float_md` at CREATE TABLE.
+    pub mysql_float_md: Option<(u8, u8)>,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced

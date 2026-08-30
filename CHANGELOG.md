@@ -12,6 +12,35 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A MySQL `FLOAT(m,d)` / `DOUBLE(m,d)` kept more precision than its
+  schema said.** 7.39.2 made the syntax parse — before it,
+  `DOUBLE(10,2)` failed the whole `CREATE TABLE` — and recorded the rest
+  as a residual: the digits are not a display hint. Measured on MySQL
+  9.7.2, `3.14159265358979` into either stores **3.14**, and a value
+  wider than `m` is refused with errno 1264 rather than stored. SPG
+  accepted the declaration and kept the full double, so a column
+  declared for money held a different number from the one MySQL holds,
+  and `COLUMN_TYPE` read `double` where MySQL reads `double(10,2)`.
+
+  The tie rule is measured, not reasoned. At `d >= 1` it is
+  round-half-to-EVEN on the value's true binary magnitude — eleven
+  exactly-representable ties agree (`0.25 → 0.2`, `0.75 → 0.8`,
+  `1.25 → 1.2`, `1.75 → 1.8`, and the negatives). At `d = 0` the ties go
+  toward NEGATIVE INFINITY instead (`0.5 → 0`, `1.5 → 1`, `2.5 → 2`,
+  `-0.5 → -1`) while non-ties round normally (`1.6 → 2`). Why MySQL
+  differs between the two is not explained here; this matches it.
+
+  The first implementation scaled by `10^d` and rounded the product,
+  which lands `2.3455 * 1000.0` just ABOVE the tie in f64 and stored
+  2.346 where MySQL stores 2.345 — the value itself is just below it.
+  The differential caught it on the first run.
+
+  Stored values, `information_schema` and the errno are byte-identical
+  to MySQL 9.7.2 for the probed set. The pair is persisted in a
+  FILE_VERSION 94 sparse appendix — the thirteenth, and the v52
+  compatibility test asked for its two bytes as it has for every one
+  before it.
+
 - **A wrong-argument-count call over an EMPTY table answered zero rows
   and no error**, and raised the moment the table had one row in it —
   the last open gap from 7.39.2, and the same shape as the

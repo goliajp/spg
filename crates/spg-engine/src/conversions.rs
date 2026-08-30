@@ -2987,6 +2987,69 @@ pub(crate) fn truncate_to_column_fsp(v: Value<'static>, schema: &ColumnSchema) -
     }
 }
 
+/// v7.39.3 — apply a MySQL `FLOAT(m,d)` / `DOUBLE(m,d)`'s declared pair
+/// to a value on its way in.
+///
+/// The digits are NOT a display hint, which is what SPG's comment
+/// claimed: measured on MySQL 9.7.2, `3.14159265358979` into either
+/// `FLOAT(10,2)` or `DOUBLE(10,2)` stores `3.14`, and a value wider than
+/// `m` is refused with errno 1264 rather than stored. SPG accepted the
+/// syntax and kept the full double, so a column declared for money held
+/// more precision than its schema said.
+///
+/// The tie rule is measured, not reasoned. At `d >= 1` it is
+/// round-half-to-EVEN — eleven exactly-representable ties agree
+/// (`0.25 -> 0.2`, `0.75 -> 0.8`, `1.25 -> 1.2`, `1.75 -> 1.8`, and the
+/// negatives). At `d = 0` the ties go toward NEGATIVE INFINITY instead
+/// (`0.5 -> 0`, `1.5 -> 1`, `2.5 -> 2`, `-0.5 -> -1`), which is a
+/// different rule; non-ties round normally there (`1.6 -> 2`). Why MySQL
+/// differs between the two is not explained here — this matches the
+/// behaviour, which is what the rule about learning from PG and MySQL
+/// asks for.
+pub(crate) fn round_to_column_float_md(
+    v: Value<'static>,
+    schema: &ColumnSchema,
+) -> Result<Value<'static>, EvalError> {
+    let Some((m, d)) = schema.mysql_float_md else {
+        return Ok(v);
+    };
+    let round = |x: f64| -> f64 {
+        if d == 0 {
+            // Measured: ties toward negative infinity, non-ties normal.
+            let f = x.floor();
+            return if x - f == 0.5 { f } else { x.round() };
+        }
+        // For d >= 1 the rule is round-half-to-even on the value's TRUE
+        // binary magnitude, which is what formatting to `d` places does.
+        // Scaling by `10^d` first does not: `2.3455 * 1000.0` lands just
+        // ABOVE the tie in f64 and rounded up to 2.346, where MySQL
+        // stores 2.345 because the value itself is just below it. The
+        // differential said so on the first run.
+        alloc::format!("{x:.*}", usize::from(d))
+            .parse::<f64>()
+            .unwrap_or(x)
+    };
+    // `m` counts ALL digits, so the integral part may hold `m - d` of
+    // them. MySQL refuses a wider value outright (1264) rather than
+    // storing a number the schema does not describe.
+    let limit = 10f64.powi(i32::from(m.saturating_sub(d)));
+    let checked = |x: f64| -> Result<f64, EvalError> {
+        let r = round(x);
+        if r.abs() >= limit {
+            return Err(EvalError::TypeMismatch {
+                detail: alloc::format!("Out of range value for column '{}' at row 1", schema.name),
+            });
+        }
+        Ok(r)
+    };
+    match v {
+        Value::Float(x) => Ok(Value::Float(checked(x)?)),
+        #[allow(clippy::cast_possible_truncation)]
+        Value::Real(x) => Ok(Value::Real(checked(f64::from(x))? as f32)),
+        other => Ok(other),
+    }
+}
+
 /// v7.39 (round 434) — the integer bounds a column actually accepts: the
 /// declared MySQL width when one is annotated (TINYINT / MEDIUMINT store in a
 /// wider tag), otherwise the storage type's own range. Shared by the strict
