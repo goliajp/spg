@@ -7,3 +7,8 @@ orig.spg_jsonb_at_op.sql
 # orig.mysql_family_literals excluded: `"abc"` is an IDENTIFIER on this
 # leg, which is PostgreSQL's rule and the very difference the fixture
 # measures. Running it here would assert that PG is MySQL.
+# orig.mysql_introducers excluded: PostgreSQL has no introducer syntax
+# (`_utf8mb4'x'`), so every line is a parse error there.
+# orig.mysql_session_collation excluded: `SET NAMES` sets the client
+# ENCODING on this leg, not a collation, so there is no session
+# collation for it to change and the fixture would assert nothing.

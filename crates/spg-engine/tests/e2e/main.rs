@@ -841,6 +841,7 @@ mod e2e_seek_skips_dead_round490;
 mod e2e_sequence_functions_round244;
 mod e2e_sequence_last_value;
 mod e2e_sequence_sqlstate_round698;
+mod e2e_session_collation_v7393;
 mod e2e_session_identity_probes;
 mod e2e_session_identity_round51;
 mod e2e_session_in_catalog_scan_round522;

@@ -327,7 +327,7 @@ fn run_on_spg(fixture: &Path, oracle: Oracle) -> Result<String> {
             )
         })?;
         if let QueryResult::Rows { columns, rows } = r {
-            out_blocks.push(format_rows_psql_aligned(&columns, &rows));
+            out_blocks.push(format_rows_psql_aligned(&columns, &rows, mysql_family));
         }
     }
     Ok(out_blocks.join("\n\n"))
@@ -463,10 +463,16 @@ fn split_sql_statements(body: &str, backslash_escapes: bool) -> Vec<String> {
 fn format_rows_psql_aligned(
     columns: &[spg_storage::ColumnSchema],
     rows: &[spg_storage::Row<'static>],
+    mysql_family: bool,
 ) -> String {
     let cells: Vec<Vec<String>> = rows
         .iter()
-        .map(|r| r.values.iter().map(spg_value_to_psql_text).collect())
+        .map(|r| {
+            r.values
+                .iter()
+                .map(|v| spg_value_to_psql_text(v, mysql_family))
+                .collect()
+        })
         .collect();
 
     // Column widths = max(header.len(), max cell.len()) per col.
@@ -513,11 +519,24 @@ fn format_rows_psql_aligned(
 /// Map a single SPG `Value` to its psql-style text form. PG renders
 /// `NULL` as empty in aligned mode by default; we follow suit since
 /// `AdjustNullDisplay` does its own normalisation downstream.
-fn spg_value_to_psql_text(v: &spg_storage::Value<'_>) -> String {
+fn spg_value_to_psql_text(v: &spg_storage::Value<'_>, mysql_family: bool) -> String {
     use spg_storage::Value;
     match v {
         Value::Null => String::new(),
-        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        // v7.39.3 — a boolean is `t`/`f` on the PostgreSQL wire and
+        // `1`/`0` on the MySQL one, and SPG's own MySQL wire really does
+        // send `1`/`0` (`mysqlwire.rs`). Rendering `t` against a MySQL
+        // oracle made the harness misreport SPG rather than compare it,
+        // which is why no fixture here could hold a comparison — the one
+        // shape a collation fixture is made of. Same class as the differ
+        // that ran SPG in PostgreSQL semantics against these two legs.
+        Value::Bool(b) => match (*b, mysql_family) {
+            (true, true) => "1",
+            (false, true) => "0",
+            (true, false) => "t",
+            (false, false) => "f",
+        }
+        .to_string(),
         Value::SmallInt(n) => n.to_string(),
         Value::Int(n) => n.to_string(),
         Value::BigInt(n) => n.to_string(),

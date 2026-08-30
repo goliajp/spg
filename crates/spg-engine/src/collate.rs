@@ -370,6 +370,34 @@ pub(crate) fn pads_space(collation: Option<&str>) -> bool {
     !(lower.contains("_0900_") || lower.contains("nopad"))
 }
 
+/// v7.39.3 — does a collation of this name compare `'AB'` and `'ab'`
+/// equal?
+///
+/// Measured on MySQL 9.7.2, both operands introduced as utf8mb4:
+///
+/// ```text
+/// utf8mb4_general_ci   1
+/// utf8mb4_0900_ai_ci   1   (the default)
+/// utf8mb4_0900_as_cs   0
+/// utf8mb4_bin          0
+/// ```
+///
+/// So a `_cs` name is as case-sensitive as a `_bin` one, and only the
+/// second was ever asked. The fold decision read the DIALECT — "this is
+/// a MySQL session, therefore fold" — and consulted the collation name
+/// only for padding, so `SET NAMES utf8mb4 COLLATE utf8mb4_bin` left
+/// two literals comparing case-insensitively: a silent wrong answer to
+/// a session that had asked, in its first packet, for the opposite.
+pub(crate) fn folds_case(collation: &str) -> bool {
+    if is_byte_wise(collation) {
+        return false;
+    }
+    !collation
+        .trim()
+        .rsplit_once('_')
+        .is_some_and(|(_, tail)| tail.eq_ignore_ascii_case("cs"))
+}
+
 pub(crate) fn is_byte_wise(collation: &str) -> bool {
     // v7.38.18 (S0) — one owner, and it is storage, because storage has
     // to ask the same question about an index's column.
