@@ -39,7 +39,7 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
     {
         return Some(s.collation);
     }
-    if let Some(s) = ctx.columns.iter().find(|s| s.name == c.name) {
+    if let Some(s) = ctx.columns.iter().find(|s| ctx.col_eq(&s.name, &c.name)) {
         return Some(s.collation);
     }
     // Bare-name fallback for joined schemas (same shape as
@@ -79,7 +79,7 @@ pub(crate) fn column_collation_name(e: &Expr, ctx: &EvalContext<'_>) -> Option<S
     };
     ctx.columns
         .iter()
-        .find(|s| s.name == c.name || ends_with_dot_name(&s.name))
+        .find(|s| ctx.col_eq(&s.name, &c.name) || ends_with_dot_name(&s.name))
         .and_then(|s| s.collation_name.clone())
 }
 
@@ -471,7 +471,11 @@ pub(crate) fn find_column_pos(c: &ColumnName, ctx: &EvalContext<'_>) -> Option<u
             return Some(pos);
         }
     }
-    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+    if let Some(pos) = ctx
+        .columns
+        .iter()
+        .position(|s| ctx.col_eq(&s.name, &c.name))
+    {
         return Some(pos);
     }
     // v7.37 (round 823) — the bare-name fallback `resolve_column` has carried
@@ -535,7 +539,11 @@ pub(super) fn resolve_column_borrowed<'r, 'a>(
             return Ok(row.values.get(pos));
         }
     }
-    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+    if let Some(pos) = ctx
+        .columns
+        .iter()
+        .position(|s| ctx.col_eq(&s.name, &c.name))
+    {
         if is_composite(pos) {
             return Ok(None);
         }
@@ -618,7 +626,11 @@ pub(crate) fn locate_column(
             });
         }
     }
-    if let Some(pos) = ctx.columns.iter().position(|s| s.name == c.name) {
+    if let Some(pos) = ctx
+        .columns
+        .iter()
+        .position(|s| ctx.col_eq(&s.name, &c.name))
+    {
         return Ok(Some(pos));
     }
     // Bare-name fallback for joined schemas: match any single composite
