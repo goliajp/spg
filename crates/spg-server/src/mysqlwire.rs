@@ -975,8 +975,55 @@ fn now_micros() -> i64 {
 /// in its unknown-function sentence: `FUNCTION testdb.nosuchfn does not
 /// exist` (measured on 9.7.2, and it qualifies an explicitly-qualified
 /// call with the schema written).
-fn mysql_error_parts(e: &spg_engine::EngineError, db: &str) -> (u16, &'static str, String) {
+/// v7.39.3 — MySQL's own sentence for a syntax error.
+///
+/// Measured on 9.7.2, and it is one sentence with two variables:
+///
+///     You have an error in your SQL syntax; check the manual that
+///     corresponds to your MySQL server version for the right syntax to
+///     use near '<the rest of the statement>' at line <N>
+///
+/// The snippet is the source from the failing token onward, cut at 80
+/// characters (measured with a padded alias), and the line is the
+/// 1-based line the token sits on within the statement. SPG answered its
+/// own `syntax error at or near "x"` here, which is PostgreSQL's shape
+/// with MySQL's errno on it: a client or a test matching what MySQL says
+/// found nothing, and every MySQL syntax error looked like a different
+/// product's.
+fn mysql_syntax_error_text(sql: &str, token_pos: usize) -> String {
+    // The lexer has to be asked in the dialect the statement was parsed
+    // in, or the token index maps to the wrong byte.
+    let dialect = spg_sql::lexer::Dialect {
+        backslash_escapes: true,
+        double_quoted_identifiers: false,
+        speaks_mysql: true,
+    };
+    let skip = spg_sql::parser::syntax_error_position(sql, dialect, token_pos)
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let rest: String = sql.chars().skip(skip).collect();
+    // MySQL does not carry the statement terminator into the snippet.
+    let rest = rest.trim_end().trim_end_matches(';').trim_end();
+    let snippet: String = rest.chars().take(80).collect();
+    let line = sql.chars().take(skip).filter(|c| *c == '\n').count() + 1;
+    format!(
+        "You have an error in your SQL syntax; check the manual that \
+         corresponds to your MySQL server version for the right syntax \
+         to use near '{snippet}' at line {line}"
+    )
+}
+
+fn mysql_error_parts(
+    e: &spg_engine::EngineError,
+    db: &str,
+    sql: &str,
+) -> (u16, &'static str, String) {
     match e {
+        // v7.39.3 — a parse error gets MySQL's own sentence, not
+        // PostgreSQL's with a MySQL errno stapled on.
+        spg_engine::EngineError::Parse(p) => {
+            (1064, "42000", mysql_syntax_error_text(sql, p.token_pos))
+        }
         spg_engine::EngineError::UnknownThreadId(_) => (1094, "HY000", e.to_string()),
         spg_engine::EngineError::ConnectionKilled => (1927, "70100", e.to_string()),
         // Measured: a MariaDB statement stopped by `KILL QUERY` reports
@@ -1457,7 +1504,7 @@ fn handle_com_query(
                     .unwrap_or("spg")
                     .to_string()
             };
-            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db);
+            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db, sql);
             write_packet(
                 stream,
                 start_seqno,
@@ -1817,7 +1864,7 @@ fn handle_com_stmt_execute(
                     .unwrap_or("spg")
                     .to_string()
             };
-            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db);
+            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db, &entry.sql);
             write_packet(
                 stream,
                 start_seqno,

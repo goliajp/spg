@@ -30,6 +30,9 @@ fn inet_arg_text(v: &Value<'_>) -> Option<alloc::string::String> {
 }
 
 pub(super) fn inet_host(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("host", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -47,6 +50,9 @@ pub(super) fn inet_host(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
 }
 
 pub(super) fn inet_network(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("network", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -110,6 +116,9 @@ fn ipv4_to_u32(host: &str) -> Option<u32> {
 /// v7.37.17 (17.6 siblings) — family(inet) returns 4 for IPv4,
 /// 6 for IPv6.
 pub(super) fn inet_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("family", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -133,6 +142,9 @@ pub(super) fn inet_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 /// v7.37.17 (17.6 siblings) — netmask(inet) builds the dotted-quad
 /// netmask from the prefix length (IPv4 only for now).
 pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("netmask", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -170,6 +182,9 @@ pub(super) fn inet_netmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 /// v7.37.17 (17.6 siblings) — hostmask(inet) — the complement of
 /// netmask (IPv4).
 pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("hostmask", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -206,6 +221,9 @@ pub(super) fn inet_hostmask(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 /// v7.37.17 (17.6 siblings) — broadcast(inet) — network address
 /// with host bits set to 1 (IPv4).
 pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("broadcast", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -251,6 +269,9 @@ pub(super) fn inet_broadcast(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
 /// families" when families differ, text passthrough of the first
 /// arg when both are IPv6).
 pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(crate::eval::functions::wrong_arity("inet_merge", args));
+    }
     // v7.39 (read01 inet family) — typed rewrite: the smallest network
     // containing both arguments (longest common prefix capped by both
     // masks), PG inet_merge.
@@ -313,6 +334,12 @@ pub(super) fn inet_merge(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
 /// the 7th bit (0x02, locally-administered) of the first byte,
 /// converting an EUI-64 into a modified EUI-64 for IPv6 autoconf.
 pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity(
+            "macaddr8_set7bit",
+            args,
+        ));
+    }
     // v7.38 (read01) — PG's macaddr8_set7bit takes (and returns) a macaddr8.
     // An unadorned string literal is the unknown-type form PG casts for you.
     let mut out: [u8; 8] = match args {
@@ -342,6 +369,12 @@ pub(super) fn macaddr8_set7bit(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 
 /// v7.37.17 (17.6 siblings) — inet_same_family(a, b).
 pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 {
+        return Err(crate::eval::functions::wrong_arity(
+            "inet_same_family",
+            args,
+        ));
+    }
     // v7.39 (read01 inet family) — typed rewrite (values arrive as
     // Value::Inet/Cidr since the typed-inet work; text stays accepted).
     let fam = |v: &Value<'_>| -> Option<u8> {
@@ -367,6 +400,9 @@ pub(super) fn inet_same_family(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 }
 
 pub(super) fn inet_masklen(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("masklen", args));
+    }
     let s = match args {
         [Value::Text(s)] => s.clone(),
         [Value::Inet { family, bits, addr }] | [Value::Cidr { family, bits, addr }] => {
@@ -661,6 +697,9 @@ pub(super) fn inet_op_bool_result(
 /// address as a BigInt. Invalid input → NULL (MySQL semantics, not
 /// an error).
 pub(super) fn mysql_inet_aton(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("inet_aton", args));
+    }
     let s = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Text(s)] => s,
@@ -684,6 +723,9 @@ pub(super) fn mysql_inet_aton(args: &[Value<'_>]) -> Result<Value<'static>, Eval
 /// v7.37.17 (17.6 siblings) — MySQL INET_NTOA(n) → dotted-quad text.
 /// Out-of-range input → NULL (MySQL semantics).
 pub(super) fn mysql_inet_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("inet_ntoa", args));
+    }
     let n = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Int(n)] => i64::from(*n),
@@ -769,6 +811,9 @@ fn format_ipv6(bytes: &[u8; 16]) -> alloc::string::String {
 /// as VARBINARY: 16 bytes for IPv6, 4 bytes for IPv4 (MySQL keeps
 /// the shorter form for v4 input). Invalid → NULL.
 pub(super) fn mysql_inet6_aton(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("inet6_aton", args));
+    }
     let s = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Text(s)] => s,
@@ -791,6 +836,9 @@ pub(super) fn mysql_inet6_aton(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 /// 4-byte input renders dotted-quad; 16-byte renders RFC 5952
 /// compressed IPv6. Anything else → NULL.
 pub(super) fn mysql_inet6_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("inet6_ntoa", args));
+    }
     let bytes = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Bytes(b)] => b.as_ref(),
@@ -825,6 +873,9 @@ pub(super) fn mysql_inet6_ntoa(args: &[Value<'_>]) -> Result<Value<'static>, Eva
 
 /// v7.37.17 (17.6 siblings) — MySQL IS_IPV4(text) / IS_IPV6(text).
 pub(super) fn mysql_is_ipv4(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("is_ipv4", args));
+    }
     match args {
         [Value::Null] => Ok(Value::Null),
         [Value::Text(s)] => Ok(Value::Bool(parse_ipv4(s).is_some())),
@@ -835,6 +886,9 @@ pub(super) fn mysql_is_ipv4(args: &[Value<'_>]) -> Result<Value<'static>, EvalEr
 }
 
 pub(super) fn mysql_is_ipv6(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("is_ipv6", args));
+    }
     match args {
         [Value::Null] => Ok(Value::Null),
         [Value::Text(s)] => Ok(Value::Bool(!s.is_empty() && parse_ipv6(s).is_some())),

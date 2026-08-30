@@ -1062,7 +1062,7 @@ pub(crate) fn run(
     // per-aggregate contract so a malformed call (e.g.
     // `array_agg()` or `string_agg(x)`) surfaces as a SQL error
     // rather than silently coercing to a degenerate aggregate.
-    validate_agg_arities(stmt, &agg_specs)?;
+    validate_agg_arities(stmt, &agg_specs, schema_cols)?;
     validate_within_group(&agg_specs, schema_cols, stmt.group_by.as_deref())?;
 
     // v7.38.18 (S2) — the database's collation, for the columns that
@@ -5070,8 +5070,12 @@ fn sort_synth_by_order_by(
 /// rather than inside `collect_aggregates` so the collector stays
 /// infallible; callers in `run()` can do a single early-error
 /// exit before any per-row work.
-fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<(), EvalError> {
-    fn walk(e: &Expr) -> Result<(), EvalError> {
+fn validate_agg_arities(
+    stmt: &SelectStatement,
+    _specs: &[AggSpec],
+    cols: &[ColumnSchema],
+) -> Result<(), EvalError> {
+    fn walk(e: &Expr, cols: &[ColumnSchema]) -> Result<(), EvalError> {
         if let Expr::FunctionCall { name, args } = e {
             let lower = name.to_ascii_lowercase();
             let expected: Option<usize> = match lower.as_str() {
@@ -5111,40 +5115,54 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             if let Some(want) = expected
                 && args.len() != want
             {
-                // v7.39.2 — like `setval`, this check runs BEFORE
-                // evaluation, over unevaluated `Expr`s, so it cannot
-                // name the argument types PostgreSQL's sentence
-                // carries. The two of them are the only arity sites
-                // that keep their own wording.
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{lower}() takes {want} arg(s), got {}", args.len()),
-                });
+                // v7.39.3 — this check runs BEFORE evaluation, over
+                // unevaluated `Expr`s, so the argument types come from
+                // the lexeme and the schema rather than from values:
+                // PostgreSQL names a bare literal `unknown` here and a
+                // column by its declared type (both measured against
+                // 18.6). An argument neither of those covers — an
+                // arithmetic expression, a nested call — has no static
+                // type to name, and rather than invent one the old
+                // sentence stands for that call.
+                let named: Option<alloc::vec::Vec<alloc::string::String>> = args
+                    .iter()
+                    .map(|a| crate::select::static_arg_type(a, cols))
+                    .collect();
+                return Err(named.map_or_else(
+                    || EvalError::TypeMismatch {
+                        detail: alloc::format!("{lower}() takes {want} arg(s), got {}", args.len()),
+                    },
+                    |t| EvalError::WrongArity {
+                        name: lower.clone(),
+                        types: t.join(", "),
+                    },
+                ));
             }
             for a in args {
-                walk(a)?;
+                walk(a, cols)?;
             }
         } else if let Expr::Binary { lhs, rhs, .. } = e {
-            walk(lhs)?;
-            walk(rhs)?;
+            walk(lhs, cols)?;
+            walk(rhs, cols)?;
         } else if let Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::BoolTest { expr, .. } = e
         {
-            walk(expr)?;
+            walk(expr, cols)?;
         }
         Ok(())
     }
     for item in &stmt.items {
         if let SelectItem::Expr { expr, .. } = item {
-            walk(expr)?;
+            walk(expr, cols)?;
         }
     }
     for o in &stmt.order_by {
-        walk(&o.expr)?;
+        walk(&o.expr, cols)?;
     }
     if let Some(h) = &stmt.having {
-        walk(h)?;
+        walk(h, cols)?;
     }
     Ok(())
 }

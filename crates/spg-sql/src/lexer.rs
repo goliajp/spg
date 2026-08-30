@@ -502,6 +502,24 @@ pub fn tokenize_with_offsets(
     input: &str,
     dialect: Dialect,
 ) -> Result<(Vec<Token>, Vec<usize>), LexError> {
+    tokenize_with_merges(input, dialect).map(|(t, o, _)| (t, o))
+}
+
+/// v7.39.3 — like [`tokenize_with_offsets`], and additionally: for each
+/// string literal this lexer built by IMPLICIT CONCATENATION, the byte
+/// length of its first segment inside the merged body.
+///
+/// MySQL 9.7.2 labels `SELECT 'a' 'b'` `a` while its value is `ab`
+/// (measured) — the label is the first literal as written, and the
+/// merge happens here, so the length has to leave here too. Recovering
+/// it from the source afterwards would mean decoding escapes a second
+/// time, in a second place, which is exactly the kind of pair that
+/// drifts.
+#[allow(clippy::too_many_lines)] // big match — splitting would obscure the dispatch table
+pub fn tokenize_with_merges(
+    input: &str,
+    dialect: Dialect,
+) -> Result<(Vec<Token>, Vec<usize>, Vec<(usize, usize)>), LexError> {
     let backslash_escapes = dialect.backslash_escapes;
     // v7.39.2 — three of the rules below are about MySQL's GRAMMAR, not
     // about what `\` does inside a string: `#` starts a comment, block
@@ -523,6 +541,9 @@ pub fn tokenize_with_offsets(
     // per-push-site bookkeeping is needed. (The only `continue` inside a
     // token-producing arm — the lone `@` — was rewritten to fall through.)
     let mut offsets: Vec<usize> = Vec::new();
+    // v7.39.3 — (token index, byte length of the first segment) for every
+    // literal built by implicit concatenation.
+    let mut merges: Vec<(usize, usize)> = Vec::new();
 
     while i < bytes.len() {
         let start = i;
@@ -674,11 +695,15 @@ pub fn tokenize_with_offsets(
                 //
                 // sentori hit it in a `COMMENT ON`, which is how a
                 // migration written for PostgreSQL failed to apply.
+                let idx_of_last = out.len().saturating_sub(1);
                 if let (Token::String(body), Some(prev_end)) = (&tok, last_string_end)
                     && let Some(gap) = input.get(prev_end..i)
                     && gap_continues_a_literal(gap, speaks_mysql)
                     && let Some(Token::String(head)) = out.last_mut()
                 {
+                    if merges.last().is_none_or(|(k, _)| *k != idx_of_last) {
+                        merges.push((idx_of_last, head.len()));
+                    }
                     head.push_str(body);
                     i += consumed;
                     last_string_end = Some(i);
@@ -1209,7 +1234,7 @@ pub fn tokenize_with_offsets(
     }
     out.push(Token::Eof);
     offsets.push(bytes.len());
-    Ok((out, offsets))
+    Ok((out, offsets, merges))
 }
 
 fn peek_eq(bytes: &[u8], i: usize, target: u8) -> bool {

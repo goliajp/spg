@@ -18,8 +18,9 @@ use super::EvalError;
 /// hex.
 pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("encode() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("encode"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
@@ -74,8 +75,9 @@ pub(super) fn encode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 /// equivalent if SPG adds bytea later).
 pub(super) fn decode_text(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("decode() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("decode"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
@@ -199,6 +201,9 @@ fn wrap_base64_76(body: &str) -> String {
 /// ASCII-armor (RFC 4880 §6) — base64 body in 76-char lines plus a
 /// CRC-24 trailer line.
 pub(super) fn pgp_armor(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("armor", args));
+    }
     let bytes: &[u8] = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Bytes(b)] => b.as_ref(),
@@ -228,6 +233,9 @@ pub(super) fn pgp_armor(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
 /// and armor headers, base64-decodes the body, and verifies the
 /// CRC-24 trailer when present.
 pub(super) fn pgp_dearmor(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 {
+        return Err(crate::eval::functions::wrong_arity("dearmor", args));
+    }
     let text = match args {
         [Value::Null] => return Ok(Value::Null),
         [Value::Text(s)] => s.as_ref(),

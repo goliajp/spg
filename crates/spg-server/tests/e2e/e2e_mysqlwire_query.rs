@@ -1350,6 +1350,16 @@ fn every_flag_sql_mode_claims_refuses_something() {
         msg.starts_with("Unknown storage engine"),
         "MySQL 9.7.2's own wording, got: {msg}"
     );
+    // v7.39.3 — and the name AS WRITTEN. MySQL 9.7.2 quotes it back
+    // exactly: `Unknown storage engine 'NoSuchEng'`. The lexer folds a
+    // bare identifier, so the message quoted a name the dump did not
+    // contain — which is the one thing this message is for, since the
+    // reader's next move is to search their dump for it.
+    let (_, _, mixed) = err_of(&mut s, "CREATE TABLE eng_mx (a INT) ENGINE=NoSuchEng");
+    assert_eq!(mixed, "Unknown storage engine 'NoSuchEng'", "{mixed}");
+    // Quoted, too — the quotes are not part of the name.
+    let (_, _, quoted) = err_of(&mut s, "CREATE TABLE eng_q (a INT) ENGINE='NoSuchEng'");
+    assert_eq!(quoted, "Unknown storage engine 'NoSuchEng'", "{quoted}");
     // The names in a real dump keep working — refusing those would be a
     // worse defect than accepting a typo, and a quieter one.
     // Numbered, not named after the engine: identifiers fold, so
@@ -2067,4 +2077,53 @@ fn a_nullable_timestamp_says_null_out_loud() {
     ] {
         assert!(ddl.contains(want), "missing {want}:\n{ddl}");
     }
+}
+
+/// v7.39.3 — MySQL's own sentence for a syntax error.
+///
+/// Measured on 9.7.2, one sentence with two variables:
+///
+///     You have an error in your SQL syntax; check the manual that
+///     corresponds to your MySQL server version for the right syntax to
+///     use near '<the rest of the statement>' at line <N>
+///
+/// SPG answered `syntax error at or near "x"` with 1064 stapled on —
+/// PostgreSQL's shape wearing MySQL's number. A client or a migration
+/// tool matching what MySQL says found nothing, and this is the errno
+/// every unrecognised statement lands on, so it is the sentence a MySQL
+/// user sees most often.
+///
+/// The snippet runs from the failing token to the end, cut at 80
+/// characters (measured with a padded alias), and the terminator is not
+/// part of it.
+#[test]
+fn a_syntax_error_says_what_mysql_says() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    let head = "You have an error in your SQL syntax; check the manual that \
+                corresponds to your MySQL server version for the right syntax \
+                to use near ";
+    // A table alias written as a STRING. MySQL: near '"al"' at line 1.
+    let (errno, state, msg) = err_of(&mut s, "SELECT 1 FROM (SELECT 1) \"al\"");
+    assert_eq!((errno, state.as_str()), (1064, "42000"), "{msg}");
+    assert_eq!(msg, format!("{head}'\"al\"' at line 1"), "{msg}");
+    // The line number is the token's, not the statement's first.
+    let (_, _, msg) = err_of(&mut s, "SELECT 1\nFROM (SELECT 1) \"al\"");
+    assert_eq!(msg, format!("{head}'\"al\"' at line 2"), "{msg}");
+    // The terminator is not carried into the snippet.
+    let (_, _, msg) = err_of(&mut s, "SELECT 1 FROM (SELECT 1) \"al\";");
+    assert_eq!(msg, format!("{head}'\"al\"' at line 1"), "{msg}");
+    // Cut at 80 characters, measured against 9.7.2 with a padded alias.
+    let pad = "aliaslongenough_padding_padding_padding_padding_padding_padding_\
+               padding_padding_padding_END";
+    let (_, _, msg) = err_of(&mut s, &format!("SELECT 1 FROM (SELECT 1) \"{pad}\""));
+    let near = msg
+        .rsplit_once("near '")
+        .and_then(|(_, t)| t.rsplit_once("' at line"))
+        .map(|(t, _)| t.to_string())
+        .unwrap_or_default();
+    assert_eq!(near.chars().count(), 80, "{msg}");
+    // The control: a statement that parses is not made into an error by
+    // any of this.
+    assert_eq!(query_scalar(&mut s, "SELECT 1 FROM (SELECT 1) t"), "1");
 }

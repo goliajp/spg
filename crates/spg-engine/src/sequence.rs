@@ -596,9 +596,10 @@ impl Engine {
             return Ok(Value::BigInt(v));
         }
         if args.is_empty() {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "{op}() takes at least one argument"
-            )));
+            return Err(EngineError::Eval(crate::eval::EvalError::WrongArity {
+                name: alloc::string::String::from(op),
+                types: alloc::string::String::new(),
+            }));
         }
         let seq_name = match &args[0] {
             Expr::Literal(spg_sql::ast::Literal::String(s)) => {

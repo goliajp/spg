@@ -5609,6 +5609,9 @@ pub(crate) fn like_match_str(text: &str, pat: &[char], mut pi: usize) -> Result<
 
 /// v7.24 (round-15) — `string_to_array(text, delimiter)`.
 fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(crate::eval::functions::wrong_arity("string_to_array", args));
+    }
     // v7.37.17 (17.6 siblings) — the 3-arg PG form adds
     // `null_string`: elements equal to it become SQL NULL.
     let (text_arg, delim_arg, null_arg) = match args {

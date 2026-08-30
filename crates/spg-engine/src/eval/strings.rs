@@ -71,8 +71,9 @@ pub(super) fn string_left_right(
     mysql: bool,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("{fn_name}() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -162,8 +163,9 @@ pub(super) fn string_pad(
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 && args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("{fn_name}() takes 2 or 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -229,6 +231,12 @@ pub(super) fn string_trim(
     side: TrimSide,
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
+        });
+    }
     // v7.39 (read01 oracle_compat.c) — bytea trim variants work on BYTES
     // (byteatrim/ltrim/rtrim): trim any byte present in the set argument,
     // returning bytea — the text path would eat the \x prefix.
@@ -1977,8 +1985,9 @@ pub(super) fn to_char_in_zone(
 ) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("to_char() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("to_char"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {

@@ -12,6 +12,7 @@ mod e2e_acc_converge_round665;
 mod e2e_acl_functions;
 mod e2e_acl_round57;
 mod e2e_add_column_inline_check_v7383;
+mod e2e_adjacent_literal_label_v7393;
 mod e2e_age_single_arg;
 mod e2e_age_wallclock_round97;
 mod e2e_age_xid;

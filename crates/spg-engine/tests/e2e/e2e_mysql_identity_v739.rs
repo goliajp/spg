@@ -301,8 +301,8 @@ fn no_corpus_file_asserts_a_version_we_no_longer_report() {
     );
 }
 
-/// v7.39.2 — the two remaining `character_set_*` names SPG can answer
-/// truthfully, and the one it cannot.
+/// v7.39.2 — the remaining `character_set_*` names, and what each one
+/// is a claim about.
 ///
 /// `character_set_system` is what the server stores IDENTIFIERS in.
 /// MySQL 9.7.2 answers `utf8mb3` because it cannot hold a four-byte
@@ -310,15 +310,20 @@ fn no_corpus_file_asserts_a_version_we_no_longer_report() {
 /// `z4b😀`. So the true answer differs from MySQL's, and matching
 /// MySQL's would be a claim about SPG that its own catalog contradicts.
 ///
-/// `character_sets_dir` names a directory of charset definitions that
-/// SPG does not have. It stays absent: a path invented to fill the row
-/// would be a fabricated fact, not a compatibility gain.
+/// v7.39.3 — `character_sets_dir` is answered now. It used to be left
+/// out because SPG has no such directory and a path would be invented;
+/// what that weighed against was a DIFFERENT string, while what a
+/// client actually got was `Unknown system variable`. An error is not a
+/// more honest answer than a path, it is a broken session — the same
+/// reasoning that put `time_zone` in this table, without which no
+/// mysqldump could be restored at all.
 #[test]
 fn the_charset_names_spg_can_answer_and_the_one_it_cannot() {
     let mut e = mysql();
     for (var, want) in [
         ("character_set_system", "utf8mb4"),
         ("character_set_filesystem", "binary"),
+        ("character_sets_dir", spg_engine::MYSQL_CHARACTER_SETS_DIR),
     ] {
         // Both surfaces, because one answering and the other not is the
         // shape this file exists to catch — and this pair answered
@@ -329,10 +334,21 @@ fn the_charset_names_spg_can_answer_and_the_one_it_cannot() {
         let shown = show.trim_start_matches(var).trim();
         assert_eq!(shown, want, "SHOW VARIABLES LIKE '{var}'");
     }
-    // And the one that has no truthful answer is not invented.
+    // The version in the path is the version SPG answers as — if one
+    // moves without the other the answer becomes a claim about a MySQL
+    // that is not the one this server says it is.
+    let ver = spg_engine::MYSQL_SERVER_VERSION;
+    let line = ver.split('-').next().unwrap_or(ver);
+    let mut parts = line.split('.');
+    let short = format!(
+        "{}.{}",
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or("")
+    );
     assert!(
-        e.execute("SELECT @@character_sets_dir").is_err(),
-        "character_sets_dir names a directory SPG does not have"
+        spg_engine::MYSQL_CHARACTER_SETS_DIR.contains(&short),
+        "the charsets dir names {short:?} nowhere: {}",
+        spg_engine::MYSQL_CHARACTER_SETS_DIR
     );
 }
 

@@ -14055,7 +14055,7 @@ impl crate::Engine {
 /// can be known without a row: a column of a source table, or a
 /// literal. `None` for anything else, which is what keeps the pre-scan
 /// refusal from printing a worse sentence than the row-time one.
-fn static_arg_type(e: &Expr, cols: &[ColumnSchema]) -> Option<alloc::string::String> {
+pub(crate) fn static_arg_type(e: &Expr, cols: &[ColumnSchema]) -> Option<alloc::string::String> {
     use spg_sql::ast::Literal as L;
     match e {
         Expr::Column(c) => cols
