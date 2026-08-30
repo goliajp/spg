@@ -233,6 +233,12 @@ struct CommitTask {
     /// all-async group's append skips `sync_data` and the flusher
     /// bounds the loss window.
     sync_commit: bool,
+    /// v7.39.2 — the statement was issued on a MySQL session.
+    ///
+    /// Recovery replays the SQL TEXT, so the dialect has to travel with
+    /// it or every MySQL-only column marker is parsed away — measured
+    /// on 7.39.1, `TINYINT` came back `smallint` after a restart.
+    mysql: bool,
 }
 
 /// v4.42 — shared commit-barrier state. The mutex serialises queue
@@ -298,6 +304,9 @@ pub(crate) fn commit_queue_execute(
             cancel_flag: Arc::clone(cancel_flag),
             ack: ack_tx,
             sync_commit: session_sync_commit(state),
+            // The dialect the statement is being executed in, read from
+            // the one engine the server runs. Recovery needs it.
+            mysql: state.engine.read().is_ok_and(|e| e.in_mysql_dialect()),
         };
         if std::env::var("SPG_COMMIT_TRACE").is_ok() {
             use std::sync::atomic::Ordering;

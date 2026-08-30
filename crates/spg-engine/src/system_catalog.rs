@@ -166,6 +166,16 @@ pub(crate) fn pg_check_connames(
 /// v7.39 (round 360, M18) — MariaDB's `information_schema.data_type`
 /// name (bare, no display width — that is the separate `column_type`
 /// column). Measured on MariaDB 11.
+pub(crate) fn mysql_data_type_text_of(col: &ColumnSchema) -> alloc::string::String {
+    // v7.39.2 — `timestamp` and `datetime` are two types on MySQL and
+    // this reported the latter for both; the declared spelling decides.
+    if col.mysql_declared_timestamp && matches!(col.ty, DataType::Timestamp | DataType::Timestamptz)
+    {
+        return alloc::string::String::from("timestamp");
+    }
+    mysql_data_type_text(col.ty, col.mysql_int_width)
+}
+
 pub(crate) fn mysql_data_type_text(
     ty: DataType,
     width: Option<spg_storage::MysqlIntWidth>,
@@ -615,7 +625,7 @@ fn mysql_info_column_row(
         Value::Int(ordinal),
         default_text,
         Value::text::<&str>(if col.nullable { "YES" } else { "NO" }),
-        Value::text(mysql_data_type_text(col.ty, col.mysql_int_width)),
+        Value::text(mysql_data_type_text_of(col)),
         char_max,
         char_oct,
         num_prec,
@@ -888,7 +898,7 @@ fn info_column_row(
         // this to pick the column's Python/Java type, so the PG name
         // on a MySQL session sent it down the wrong branch.
         Value::text(if mysql {
-            mysql_data_type_text(col.ty, col.mysql_int_width)
+            mysql_data_type_text_of(col)
         } else {
             pg_data_type_text(col.ty)
         }),

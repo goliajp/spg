@@ -656,6 +656,19 @@ pub enum EvalError {
         qualifier: String,
         column: String,
     },
+    /// v7.39.2 — a built-in called with the wrong NUMBER of arguments.
+    ///
+    /// Its own variant rather than a formatted string, because the two
+    /// wires word it differently AND number it differently, and one of
+    /// them has to tell it apart from "no such function": MySQL 9.7.2
+    /// answers 1582 `Incorrect parameter count in the call to native
+    /// function 'LOWER'` here and 1305 for a name it does not know,
+    /// where PostgreSQL gives BOTH the same sentence.
+    WrongArity {
+        name: String,
+        /// The argument types, PostgreSQL's own names, comma-joined.
+        types: String,
+    },
     ColumnNotFound {
         name: String,
     },
@@ -694,6 +707,14 @@ impl core::fmt::Display for EvalError {
             // `column "x" does not exist`, 42703. The old "column not found: x"
             // matched none of the wire layer's `does not exist` patterns, so a
             // missing column reached the client as the generic error class.
+            // PostgreSQL 18.6 makes no distinction between a missing
+            // function and a missing overload — `nosuchfn(text, integer,
+            // date)` and `lower(text, integer)` get the identical
+            // sentence (measured) — so this is the engine's canonical
+            // rendering and the MySQL wire re-words it.
+            Self::WrongArity { name, types } => {
+                write!(f, "function {name}({types}) does not exist")
+            }
             Self::ColumnNotFound { name } => write!(f, "column \"{name}\" does not exist"),
             // v7.39.2 — a QUALIFIED reference prints unquoted and
             // dotted on PostgreSQL 18.6: `column ea.no_such does not
@@ -5630,8 +5651,9 @@ fn fn_string_to_array(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 /// expression without wrapping it in COALESCE + raise hacks.
 fn error_on_null(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("error_on_null() takes 1 arg, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("error_on_null"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(args[0], Value::Null) {

@@ -946,6 +946,19 @@ fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalE
     })
 }
 
+/// v7.39.2 — the argument types of a call, PostgreSQL's own names,
+/// comma-joined; `unknown` for a bare literal that carries no type.
+///
+/// SPG wrote its own arithmetic at every wrong-arity site — `lower()
+/// takes 1 arg, got 0`, 339 of them across ten files — and neither
+/// engine says that. What each says is in `EvalError::WrongArity`.
+pub(crate) fn arg_type_list(args: &[Value<'_>]) -> alloc::string::String {
+    args.iter()
+        .map(|a| crate::conversions::pg_type_name_for_error_opt(a.data_type()))
+        .collect::<alloc::vec::Vec<_>>()
+        .join(", ")
+}
+
 /// v7.39 (round 704) — the sentence PG18 gives `substring(42 FROM 1)`:
 /// `function pg_catalog.substring(integer, integer, integer) does not
 /// exist` — the missing OVERLOAD, with the signature spelled out and the
@@ -1126,9 +1139,7 @@ fn apply_function_dispatch(
         // v7.17.0 Phase 1.1 — SEQUENCE accessor functions.
         "nextval" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("nextval() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("nextval"), types: arg_type_list(args) });
             }
             let seq_name = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -1152,9 +1163,7 @@ fn apply_function_dispatch(
         }
         "currval" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("currval() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("currval"), types: arg_type_list(args) });
             }
             let seq_name = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -1178,9 +1187,7 @@ fn apply_function_dispatch(
         }
         "setval" => {
             if args.len() != 2 && args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("setval() takes 2 or 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("setval"), types: arg_type_list(args) });
             }
             let seq_name = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -1270,9 +1277,7 @@ fn apply_function_dispatch(
         },
         "length" | "char_length" | "character_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("length() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -1367,9 +1372,7 @@ fn apply_function_dispatch(
         // to length() for bytea by design.
         "octet_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("octet_length() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("octet_length"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -1408,9 +1411,7 @@ fn apply_function_dispatch(
         // Real implementation, multi-byte-safe via chars().
         "overlay" => {
             if args.len() < 3 || args.len() > 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("overlay() takes 3 or 4 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("overlay"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -1578,9 +1579,7 @@ fn apply_function_dispatch(
         // byte / bit access.
         "get_byte" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("get_byte() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("get_byte"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -1617,9 +1616,7 @@ fn apply_function_dispatch(
         }
         "get_bit" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("get_bit() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("get_bit"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -1687,9 +1684,7 @@ fn apply_function_dispatch(
         // get_bit; returns modified bytea copy.
         "set_byte" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("set_byte() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("set_byte"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -1742,9 +1737,7 @@ fn apply_function_dispatch(
         }
         "set_bit" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("set_bit() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("set_bit"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -2035,12 +2028,7 @@ fn apply_function_dispatch(
         // queue with v7.40 array-model widening.
         "array_to_json" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_to_json() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_to_json"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -2092,9 +2080,7 @@ fn apply_function_dispatch(
         // so we mirror that. NULL passthrough.
         "justify_days" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("justify_days() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("justify_days"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2133,9 +2119,7 @@ fn apply_function_dispatch(
         }
         "justify_hours" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("justify_hours() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("justify_hours"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2177,9 +2161,7 @@ fn apply_function_dispatch(
         }
         "justify_interval" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("justify_interval() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("justify_interval"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2465,9 +2447,7 @@ fn apply_function_dispatch(
         // handed out; PG errors on it rather than guessing.
         "txid_status" | "pg_xact_status" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let id = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -2520,9 +2500,7 @@ fn apply_function_dispatch(
         // input (matches PG).
         "jsonb_object_keys" | "json_object_keys" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2572,9 +2550,7 @@ fn apply_function_dispatch(
         // even if null (matches PG semantics).
         "jsonb_strip_nulls" | "json_strip_nulls" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1-2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             // v7.39 (read01 jsonfuncs.c, PG17) — optional strip_in_arrays:
             // when true, null ELEMENTS of arrays are removed too.
@@ -2691,9 +2667,7 @@ fn apply_function_dispatch(
         // "json_pretty" is MySQL's spelling.
         "jsonb_pretty" | "json_pretty" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("jsonb_pretty() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2775,9 +2749,7 @@ fn apply_function_dispatch(
         // (not JSON null — that returns text 'null').
         "jsonb_typeof" | "json_typeof" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2814,9 +2786,7 @@ fn apply_function_dispatch(
         // passthrough.
         "jsonb_array_length" | "json_array_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -2868,9 +2838,7 @@ fn apply_function_dispatch(
         | "jsonb_array_elements_text"
         | "json_array_elements_text" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -2887,9 +2855,7 @@ fn apply_function_dispatch(
         // ser bytes size approximation via alloc::format.
         "pg_column_size" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_column_size() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_column_size"), types: arg_type_list(args) });
             }
             let size = match &args[0] {
                 Value::Null => 0i32,
@@ -2919,12 +2885,7 @@ fn apply_function_dispatch(
         // NULL for others.
         "pg_column_compression" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_column_compression() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_column_compression"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Text(_) | Value::Bytes(_) => Ok(Value::text::<String>("plain".into())),
@@ -3062,9 +3023,7 @@ fn apply_function_dispatch(
         // exists). Negative n = error, PG's sentence.
         "factorial" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("factorial() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("factorial"), types: arg_type_list(args) });
             }
             let n = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -3137,12 +3096,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Int(bucket));
             }
             if args.len() != 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "width_bucket() takes 4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("width_bucket"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -3238,9 +3192,7 @@ fn apply_function_dispatch(
         // initcap(text). PG-standard string builders.
         "chr" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("chr() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("chr"), types: arg_type_list(args) });
             }
             // v7.39 (read01 oracle_compat.c) — PG's chr errors: chr(0) is
             // "null character not permitted" (54000-adjacent 22P02-shaped);
@@ -3279,9 +3231,7 @@ fn apply_function_dispatch(
         }
         "ascii" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("ascii() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ascii"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -3301,9 +3251,7 @@ fn apply_function_dispatch(
         }
         "initcap" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("initcap() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("initcap"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -3354,9 +3302,7 @@ fn apply_function_dispatch(
         // radians(x) / degrees(x)
         "ln" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("ln() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ln"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -3470,16 +3416,12 @@ fn apply_function_dispatch(
                 }
                 Ok(Value::Float(f64_ln(x) / f64_ln(b)))
             } else {
-                Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 or 2 args, got {arg_count}"),
-                })
+                Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) })
             }
         }
         "exp" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("exp() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("exp"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -3501,9 +3443,7 @@ fn apply_function_dispatch(
         }
         "cbrt" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("cbrt() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("cbrt"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -3522,9 +3462,7 @@ fn apply_function_dispatch(
         }
         "pi" => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pi() takes no args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pi"), types: arg_type_list(args) });
             }
             Ok(Value::Float(core::f64::consts::PI))
         }
@@ -3549,9 +3487,7 @@ fn apply_function_dispatch(
         },
         "point" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("point() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("point"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -3960,13 +3896,7 @@ fn apply_function_dispatch(
                 } else {
                     (a.y - b.y).abs() <= EPS
                 })),
-                (a, b) => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{name}() takes two points, got {:?} and {:?}",
-                        a.data_type(),
-                        b.data_type()
-                    ),
-                }),
+                (a, b) => Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) }),
             }
         }
         // v7.39 (read01 geo_ops.c) — slope of two points: PG's point_sl
@@ -3993,9 +3923,7 @@ fn apply_function_dispatch(
         }
         "gcd" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("gcd() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("gcd"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -4041,9 +3969,7 @@ fn apply_function_dispatch(
         }
         "lcm" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("lcm() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("lcm"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -4094,9 +4020,7 @@ fn apply_function_dispatch(
         }
         "radians" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("radians() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("radians"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4113,9 +4037,7 @@ fn apply_function_dispatch(
         }
         "degrees" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("degrees() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("degrees"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4134,9 +4056,7 @@ fn apply_function_dispatch(
         // integer-to-hex-string conversion. Returns TEXT.
         "to_hex" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("to_hex() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_hex"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4152,9 +4072,7 @@ fn apply_function_dispatch(
         // to_hex's `as u32` / `as u64`).
         "to_bin" | "to_oct" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let oct = name == "to_oct";
             match &args[0] {
@@ -4184,12 +4102,7 @@ fn apply_function_dispatch(
         // "random_bytes" is MySQL's spelling of gen_random_bytes.
         "gen_random_bytes" | "random_bytes" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "gen_random_bytes() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let n = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -4256,12 +4169,7 @@ fn apply_function_dispatch(
         // ciphers (blowfish/DES) queue with the pgcrypto epic.
         "gen_salt" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "gen_salt() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("gen_salt"), types: arg_type_list(args) });
             }
             let scheme = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -4315,9 +4223,7 @@ fn apply_function_dispatch(
         // exactly like PG. bcrypt/DES salts error honestly.
         "crypt" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("crypt() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("crypt"), types: arg_type_list(args) });
             }
             let (password, salt_full) = match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
@@ -4437,9 +4343,7 @@ fn apply_function_dispatch(
         // with the sha1/sha2 backends already in the dep graph.
         "hmac" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hmac() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("hmac"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -4546,9 +4450,7 @@ fn apply_function_dispatch(
         // Recognize the standard pgcrypto names.
         "digest" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("digest() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("digest"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -4629,9 +4531,7 @@ fn apply_function_dispatch(
         // the historical PG spec: md5() is text-in / text-out.
         "md5" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("md5() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("md5"), types: arg_type_list(args) });
             }
             use md5::{Digest, Md5};
             let input: &[u8] = match &args[0] {
@@ -4669,9 +4569,7 @@ fn apply_function_dispatch(
         // (Bytes); invalid input → NULL, not an error.
         "to_base64" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("to_base64() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_base64"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4702,9 +4600,7 @@ fn apply_function_dispatch(
         }
         "from_base64" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("from_base64() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("from_base64"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4736,9 +4632,7 @@ fn apply_function_dispatch(
         // SHA2(str, bits) with bits 0|224|256|384|512 (0 = 256).
         "sha" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("sha() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("sha"), types: arg_type_list(args) });
             }
             use sha1::{Digest, Sha1};
             let input: &[u8] = match &args[0] {
@@ -4764,9 +4658,7 @@ fn apply_function_dispatch(
         }
         "sha2" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("sha2() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("sha2"), types: arg_type_list(args) });
             }
             if args.iter().any(|a| matches!(a, Value::Null)) {
                 return Ok(Value::Null);
@@ -4824,9 +4716,7 @@ fn apply_function_dispatch(
         // a hex-text shape).
         "sha1" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("sha1() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("sha1"), types: arg_type_list(args) });
             }
             use sha1::{Digest, Sha1};
             let digest = match &args[0] {
@@ -4863,9 +4753,7 @@ fn apply_function_dispatch(
         }
         "sha224" | "sha256" | "sha384" | "sha512" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
             let input: &[u8] = match &args[0] {
@@ -4910,9 +4798,7 @@ fn apply_function_dispatch(
         // the 1-bits (popcount) in a bytea or integer input.
         "bit_count" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("bit_count() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("bit_count"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -4948,9 +4834,7 @@ fn apply_function_dispatch(
         // rules — TEXT (UTF-8 bytes) or BYTEA.
         "bit_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("bit_length() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("bit_length"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -5004,9 +4888,7 @@ fn apply_function_dispatch(
         // just work.
         "cardinality" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("cardinality() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("cardinality"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5033,9 +4915,7 @@ fn apply_function_dispatch(
         // ignored (SPG arrays are 1-based).
         "array_fill" => {
             if args.len() != 2 && args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_fill() takes 2 or 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_fill"), types: arg_type_list(args) });
             }
             let dims: &[Option<i32>] = match &args[1] {
                 Value::IntArray(d) => d,
@@ -5103,9 +4983,7 @@ fn apply_function_dispatch(
         }
         "array_length" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_length() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_length"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -5157,9 +5035,7 @@ fn apply_function_dispatch(
         //   array_dims(arr)  → '[1:N]' text or NULL for empty
         "array_upper" | "array_lower" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -5207,9 +5083,7 @@ fn apply_function_dispatch(
         }
         "array_ndims" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_ndims() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_ndims"), types: arg_type_list(args) });
             }
             if array_2d_dims(&args[0]).is_some() {
                 return Ok(Value::Int(2));
@@ -5232,9 +5106,7 @@ fn apply_function_dispatch(
         }
         "array_dims" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_dims() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_dims"), types: arg_type_list(args) });
             }
             if matches!(&args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5267,9 +5139,7 @@ fn apply_function_dispatch(
             // subscript `start` (probed: a start past the end answers
             // NULL, and a NULL start is an error).
             if !(2..=3).contains(&args.len()) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_position() takes 2 or 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_position"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5336,9 +5206,7 @@ fn apply_function_dispatch(
         // dimension reversed, lbound kept (SPG arrays are lbound-1).
         "array_reverse" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_reverse() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_reverse"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -5385,9 +5253,7 @@ fn apply_function_dispatch(
         // NULLS default LAST asc / FIRST desc (PG sort convention).
         "array_sort" => {
             if args.is_empty() || args.len() > 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_sort() takes 1-3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_sort"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5463,9 +5329,7 @@ fn apply_function_dispatch(
         // internal prng_next_u64 splitter.
         "array_shuffle" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_shuffle() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_shuffle"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -5513,9 +5377,7 @@ fn apply_function_dispatch(
         // Fisher-Yates — pick n distinct indices).
         "array_sample" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_sample() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_sample"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5603,9 +5465,7 @@ fn apply_function_dispatch(
         // somebody else's problem, which is the only way this stays complete.
         "array_remove" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_remove() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_remove"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5640,9 +5500,7 @@ fn apply_function_dispatch(
         // replaces NULL items with to.
         "array_replace" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_replace() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_replace"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5673,9 +5531,7 @@ fn apply_function_dispatch(
         }
         "array_positions" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_positions() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_positions"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -5719,12 +5575,7 @@ fn apply_function_dispatch(
         // than duplicated here.
         "__array_assign_slice" => {
             if args.len() != 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "__array_assign_slice() takes 4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("__array_assign_slice"), types: arg_type_list(args) });
             }
             let bound = |v: &Value<'_>| -> Result<Option<i64>, EvalError> {
                 match v {
@@ -5778,9 +5629,7 @@ fn apply_function_dispatch(
         // element, NULL-padding the array when i exceeds its current length.
         "__array_assign" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("__array_assign() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("__array_assign"), types: arg_type_list(args) });
             }
             let idx: i64 = match &args[1] {
                 Value::SmallInt(n) => i64::from(*n),
@@ -5890,9 +5739,7 @@ fn apply_function_dispatch(
         }
         "array_append" | "array_prepend" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             // Normalize to (array, element, prepend?).
             let (arr_v, el_v, prepend) = if name == "array_append" {
@@ -6001,9 +5848,7 @@ fn apply_function_dispatch(
         // side yields the other side unchanged (PG semantics).
         "array_cat" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("array_cat() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_cat"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, other) | (other, Value::Null) => {
@@ -6066,9 +5911,7 @@ fn apply_function_dispatch(
         // matches parse_range_element's shapes.
         "int4range" | "int8range" | "numrange" | "daterange" | "tsrange" | "tstzrange" => {
             if !matches!(args.len(), 2 | 3) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 or 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             use spg_storage::RangeKind as K;
             let kind = match name {
@@ -6286,12 +6129,7 @@ fn apply_function_dispatch(
         // empty set — PG's behaviour for a missing dimension.
         "generate_subscripts" => {
             if !matches!(args.len(), 2 | 3) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "generate_subscripts() takes 2 or 3 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("generate_subscripts"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -6349,9 +6187,7 @@ fn apply_function_dispatch(
         // exceeds the array length.
         "trim_array" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("trim_array() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("trim_array"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -6411,9 +6247,7 @@ fn apply_function_dispatch(
         // "mid" is the MySQL alias for 3-arg substring.
         "substring" | "substr" | "mid" => {
             if !matches!(args.len(), 2 | 3) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("substring() takes 2 or 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|a| matches!(a, Value::Null)) {
                 return Ok(Value::Null);
@@ -6618,9 +6452,7 @@ fn apply_function_dispatch(
         // call the function-call form.)
         "position" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("position() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("position"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -6670,9 +6502,7 @@ fn apply_function_dispatch(
         // or of a string's bytes.
         "hex" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hex() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("hex"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -6711,9 +6541,7 @@ fn apply_function_dispatch(
         // invalid input (MySQL semantics, not an error).
         "unhex" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("unhex() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("unhex"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -6746,9 +6574,7 @@ fn apply_function_dispatch(
         // (2-36). Negative to_base renders as signed.
         "conv" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("conv() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("conv"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -6830,9 +6656,7 @@ fn apply_function_dispatch(
         // MySQL bin(n) / oct(n) — binary / octal digit strings.
         "bin" | "oct" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let n = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -6866,9 +6690,7 @@ fn apply_function_dispatch(
         // PG has no such functions, so this only resolves under the dialect.
         "charset" | "collation" if ctx.mysql_dialect => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let is_text = matches!(
                 &args[0],
@@ -6885,9 +6707,7 @@ fn apply_function_dispatch(
         }
         "ord" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("ord() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ord"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -6915,9 +6735,7 @@ fn apply_function_dispatch(
         // MySQL lcase / ucase — aliases of lower / upper.
         "upper" | "ucase" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("upper() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -6942,9 +6760,7 @@ fn apply_function_dispatch(
         }
         "lower" | "lcase" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("lower() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -6978,9 +6794,7 @@ fn apply_function_dispatch(
         }
         "abs" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("abs() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("abs"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -7040,9 +6854,7 @@ fn apply_function_dispatch(
         // add to origin.
         "date_bin" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("date_bin() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("date_bin"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -7130,9 +6942,7 @@ fn apply_function_dispatch(
         "dayname" | "monthname" | "dayofweek" | "dayofyear" | "weekofyear"
         | "last_day" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let days: i32 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -7210,9 +7020,7 @@ fn apply_function_dispatch(
         // escaping; SQL NULL renders as the word NULL (no quotes).
         "quote" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("quote() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("quote"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::text::<String>("NULL".into())),
@@ -7243,12 +7051,7 @@ fn apply_function_dispatch(
         // one on/off string per bit, LSB first.
         "export_set" => {
             if !(3..=5).contains(&args.len()) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "export_set() takes 3-5 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("export_set"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -7311,12 +7114,7 @@ fn apply_function_dispatch(
         // bit is set, comma-joined; NULL members skipped.
         "make_set" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "make_set() takes 2+ args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("make_set"), types: arg_type_list(args) });
             }
             let bits = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -7347,9 +7145,7 @@ fn apply_function_dispatch(
         // MySQL report shape (`SELECT MONTH(created_at) ...`).
         "day" | "dayofmonth" | "month" | "year" | "weekday" | "week" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let days: i32 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -7404,9 +7200,7 @@ fn apply_function_dispatch(
         // second on time text or timestamps.
         "hour" | "minute" | "second" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let us: i64 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -7454,9 +7248,7 @@ fn apply_function_dispatch(
         // period arithmetic.
         "period_add" | "period_diff" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -7632,9 +7424,7 @@ fn apply_function_dispatch(
                     // with no arity check took the server down on a zero-arg
                     // call.
                     let Some(first) = args.first() else {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "time_to_sec() takes 1 arg, got 0".into(),
-                        });
+                        return Err(EvalError::WrongArity { name: alloc::string::String::from("time_to_sec"), types: arg_type_list(args) });
                     };
                     let Some(us) = time_arg(first, "time_to_sec()")? else {
                         return Ok(Value::Null);
@@ -7644,9 +7434,7 @@ fn apply_function_dispatch(
                 "sec_to_time" => {
                     // v7.39 (round 636) — same class.
                     if args.is_empty() {
-                        return Err(EvalError::TypeMismatch {
-                            detail: "sec_to_time() takes 1 arg, got 0".into(),
-                        });
+                        return Err(EvalError::WrongArity { name: alloc::string::String::from("sec_to_time"), types: arg_type_list(args) });
                     }
                     let secs = match &args[0] {
                         Value::Null => return Ok(Value::Null),
@@ -7666,12 +7454,7 @@ fn apply_function_dispatch(
                 }
                 "maketime" => {
                     if args.len() != 3 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "maketime() takes 3 args, got {}",
-                                args.len()
-                            ),
-                        });
+                        return Err(EvalError::WrongArity { name: alloc::string::String::from("maketime"), types: arg_type_list(args) });
                     }
                     if args.iter().any(|v| matches!(v, Value::Null)) {
                         return Ok(Value::Null);
@@ -7705,12 +7488,7 @@ fn apply_function_dispatch(
                 }
                 "addtime" | "subtime" | "timediff" => {
                     if args.len() != 2 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: format!(
-                                "{name}() takes 2 args, got {}",
-                                args.len()
-                            ),
-                        });
+                        return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
                     }
                     // v7.39 (round 418) — MySQL's ADDTIME / SUBTIME accept a
                     // DATETIME as the first operand and return a DATETIME
@@ -7764,12 +7542,7 @@ fn apply_function_dispatch(
                     // as round 626's to_char crash: a user-reachable index
                     // out of bounds.
                     if args.len() != 1 {
-                        return Err(EvalError::TypeMismatch {
-                            detail: alloc::format!(
-                                "microsecond() takes 1 arg, got {}",
-                                args.len()
-                            ),
-                        });
+                        return Err(EvalError::WrongArity { name: alloc::string::String::from("microsecond"), types: arg_type_list(args) });
                     }
                     let Some(us) = time_arg(&args[0], "microsecond()")? else {
                         return Ok(Value::Null);
@@ -7783,9 +7556,7 @@ fn apply_function_dispatch(
         // handling as the accessor batch above.
         "quarter" | "to_days" | "yearweek" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let days: i32 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -7836,12 +7607,7 @@ fn apply_function_dispatch(
         // MySQL from_days(n) — inverse of to_days.
         "from_days" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "from_days() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("from_days"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -7862,12 +7628,7 @@ fn apply_function_dispatch(
         // 0 or negative → NULL (MySQL semantics).
         "makedate" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "makedate() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("makedate"), types: arg_type_list(args) });
             }
             let int_of = |v: &Value<'_>| -> Option<i64> {
                 match v {
@@ -7895,12 +7656,7 @@ fn apply_function_dispatch(
         // MySQL datediff(a, b) — a - b in days (date parts only).
         "datediff" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "datediff() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("datediff"), types: arg_type_list(args) });
             }
             let to_days = |v: &Value<'_>| -> Result<Option<i32>, EvalError> {
                 match v {
@@ -7932,9 +7688,7 @@ fn apply_function_dispatch(
         // MySQL strcmp(a, b) — -1 / 0 / 1 string comparison.
         "strcmp" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("strcmp() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("strcmp"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -7952,9 +7706,7 @@ fn apply_function_dispatch(
         }
         "isfinite" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("isfinite() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("isfinite"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -7981,9 +7733,7 @@ fn apply_function_dispatch(
         // make_timestamp / make_interval constructors.
         "make_date" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("make_date() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("make_date"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8043,9 +7793,7 @@ fn apply_function_dispatch(
         }
         "make_time" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("make_time() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("make_time"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8109,12 +7857,7 @@ fn apply_function_dispatch(
             };
             let args = if tz_arg.is_some() { &args[..6] } else { args };
             if args.len() != 6 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "make_timestamp() takes 6 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8208,12 +7951,7 @@ fn apply_function_dispatch(
             // mins, secs) — all optional positional (PG uses named
             // args; positional zero-padding accepted here).
             if args.len() > 7 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "make_interval() takes 0-7 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("make_interval"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8261,9 +7999,7 @@ fn apply_function_dispatch(
         // ORM query builders emit these).
         "date_add" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("date_add() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("date_add"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8323,9 +8059,7 @@ fn apply_function_dispatch(
         // stays a DATE, anything else is a TIMESTAMP.
         "adddate" | "subdate" | "date_sub" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8386,9 +8120,7 @@ fn apply_function_dispatch(
         }
         "date_subtract" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("date_subtract() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("date_subtract"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8480,9 +8212,7 @@ fn apply_function_dispatch(
         // masks that we can safely ignore.
         "to_number" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("to_number() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_number"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -8596,9 +8326,7 @@ fn apply_function_dispatch(
         // pg_trgm's alt-search paths.
         "soundex" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("soundex() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("soundex"), types: arg_type_list(args) });
             }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -8662,9 +8390,7 @@ fn apply_function_dispatch(
         // ORM idiom for name-similarity thresholds.
         "difference" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("difference() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("difference"), types: arg_type_list(args) });
             }
             fn soundex_str(v: &Value<'_>) -> Result<Option<alloc::string::String>, EvalError> {
                 let s = match v {
@@ -8742,12 +8468,7 @@ fn apply_function_dispatch(
         // fuzzy-match idiom + PG regression suite uses this.
         "levenshtein" | "levenshtein_less_equal" => {
             if args.len() < 2 || args.len() > 5 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "levenshtein() takes 2-5 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let a = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -8824,12 +8545,7 @@ fn apply_function_dispatch(
             // Delegate to pg_size_pretty by re-dispatching the same
             // arm inline.
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_bytes_pretty() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_bytes_pretty"), types: arg_type_list(args) });
             }
             let n: i64 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -8886,9 +8602,7 @@ fn apply_function_dispatch(
         // for a deterministic-per-run answer.
         "hashint4" | "hashint2" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hashint4() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -8912,9 +8626,7 @@ fn apply_function_dispatch(
         }
         "hashint8" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hashint8() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("hashint8"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -8936,9 +8648,7 @@ fn apply_function_dispatch(
         }
         "hashtext" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hashtext() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("hashtext"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -8961,9 +8671,7 @@ fn apply_function_dispatch(
         }
         "hashbytea" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("hashbytea() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("hashbytea"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -8999,12 +8707,7 @@ fn apply_function_dispatch(
         | "regtype_to_text" | "regoper_to_text" | "regoperator_to_text"
         | "regproc_to_text" | "regprocedure_to_text" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "regclass_to_text() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("regclass_to_text"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -9028,9 +8731,7 @@ fn apply_function_dispatch(
             // it as an xml value. Trivial to implement without a
             // real xml type — return a text-shaped result.
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("xmlcomment() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("xmlcomment"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -9060,12 +8761,7 @@ fn apply_function_dispatch(
         | "xml_is_well_formed_document"
         | "xml_is_well_formed_content" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "xml_is_well_formed() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("xml_is_well_formed"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -9099,12 +8795,7 @@ fn apply_function_dispatch(
         // node (&, <, > get entity-escaped). Real implementation.
         "xmltext" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "xmltext() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("xmltext"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -9331,12 +9022,7 @@ fn apply_function_dispatch(
         // the cast and reports success.
         "pg_input_is_valid" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_input_is_valid() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_input_is_valid"), types: arg_type_list(args) });
             }
             let (input, ty) = match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
@@ -9394,12 +9080,7 @@ fn apply_function_dispatch(
         // (4 for UTF-8).
         "pg_encoding_max_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_encoding_max_length() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_encoding_max_length"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -9443,9 +9124,7 @@ fn apply_function_dispatch(
         //   \UXXXXXXXX → hex codepoint (8 hex digits, alt syntax)
         "unistr" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("unistr() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("unistr"), types: arg_type_list(args) });
             }
             let s: alloc::string::String = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -9527,9 +9206,7 @@ fn apply_function_dispatch(
         // Amazon RDS / CockroachDB compat.
         "starts_with" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("starts_with() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("starts_with"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -9547,9 +9224,7 @@ fn apply_function_dispatch(
         }
         "ends_with" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("ends_with() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ends_with"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -9569,9 +9244,7 @@ fn apply_function_dispatch(
         // is a PG internal alias for starts_with.
         "text_starts_with" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("text_starts_with() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("text_starts_with"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -9591,9 +9264,7 @@ fn apply_function_dispatch(
         // rejected in strict mode (default true).
         "parse_ident" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("parse_ident() takes 1 or 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("parse_ident"), types: arg_type_list(args) });
             }
             let s: alloc::string::String = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -9717,9 +9388,7 @@ fn apply_function_dispatch(
         // No unit → bytes.
         "pg_size_bytes" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_size_bytes() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_size_bytes"), types: arg_type_list(args) });
             }
             let raw: alloc::string::String = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -9788,12 +9457,7 @@ fn apply_function_dispatch(
         // Tokens: YYYY YY MM DD MON MONTH + literal separators.
         "to_date" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "to_date() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_date"), types: arg_type_list(args) });
             }
             let (input, fmt) = match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
@@ -9851,12 +9515,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Timestamp(utc));
             }
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "to_timestamp() takes 1 arg (numeric epoch) or 2 args (text, fmt), got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_timestamp"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -10000,9 +9659,7 @@ fn apply_function_dispatch(
         // in MySQL (mysqlbinlog emits these).
         "name_const" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("name_const() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("name_const"), types: arg_type_list(args) });
             }
             Ok(args[1].clone().into_owned())
         }
@@ -10194,9 +9851,7 @@ fn apply_function_dispatch(
         "random" if args.len() == 2 => random_in_range(&args[0], &args[1]),
         "random" => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("random() takes 0 or 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("random"), types: arg_type_list(args) });
             }
             Ok(Value::Float(prng_next_f64()))
         }
@@ -10348,9 +10003,7 @@ fn apply_function_dispatch(
         // multi-byte text is safe.
         "insert" => {
             if args.len() != 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("insert() takes 4 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("insert"), types: arg_type_list(args) });
             }
             if args.iter().any(|a| matches!(a, Value::Null)) {
                 return Ok(Value::Null);
@@ -10392,9 +10045,7 @@ fn apply_function_dispatch(
         }
         "is_uuid" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("is_uuid() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("is_uuid"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -10422,9 +10073,7 @@ fn apply_function_dispatch(
         "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
         | "sinh" | "cosh" | "tanh" | "asinh" | "acosh" | "atanh" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let x: f64 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -10470,9 +10119,7 @@ fn apply_function_dispatch(
         // batch above.
         "cot" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("cot() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("cot"), types: arg_type_list(args) });
             }
             let x = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -10498,9 +10145,7 @@ fn apply_function_dispatch(
         // + common in analytics SQL).
         "log2" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("log2() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("log2"), types: arg_type_list(args) });
             }
             let x = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -10529,9 +10174,7 @@ fn apply_function_dispatch(
         // atan2(y, x) takes 2 args.
         "atan2" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("atan2() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("atan2"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -10564,9 +10207,7 @@ fn apply_function_dispatch(
             const R2D: f64 = 180.0 / core::f64::consts::PI;
             if name == "atan2d" {
                 if args.len() != 2 {
-                    return Err(EvalError::TypeMismatch {
-                        detail: format!("atan2d() takes 2 args, got {}", args.len()),
-                    });
+                    return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
                 }
                 if args.iter().any(|v| matches!(v, Value::Null)) {
                     return Ok(Value::Null);
@@ -10593,9 +10234,7 @@ fn apply_function_dispatch(
                 return Ok(Value::Float(libm::atan2(y, x) * R2D));
             }
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let x: f64 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -10743,9 +10382,7 @@ fn apply_function_dispatch(
         // widths are common. Also supports random_int(min, max) alias.
         "random_int" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("random_int() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("random_int"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -10807,9 +10444,7 @@ fn apply_function_dispatch(
         // refuses, measured). Returns void (NULL).
         "setseed" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("setseed() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("setseed"), types: arg_type_list(args) });
             }
             let seed = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -10855,12 +10490,7 @@ fn apply_function_dispatch(
         // the internal prng.
         "random_normal" => {
             if args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "random_normal() takes 0-2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("random_normal"), types: arg_type_list(args) });
             }
             let mean = if args.is_empty() {
                 0.0
@@ -10926,9 +10556,7 @@ fn apply_function_dispatch(
         }
         "gen_random_uuid" | "uuid_generate_v4" => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{name}() takes 0 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             Ok(Value::Uuid(gen_random_uuid_bytes()))
         }
@@ -10950,9 +10578,7 @@ fn apply_function_dispatch(
         // bytes are zeroed and the UUID is effectively v4-random.
         "uuid" if ctx.mysql_dialect => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("uuid() takes 0 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid"), types: arg_type_list(args) });
             }
             let mut b = gen_random_uuid_bytes();
             // Overlay 48-bit unix_ts_ms in big-endian across bytes 0..6.
@@ -10982,9 +10608,7 @@ fn apply_function_dispatch(
         // + uuid_generate_v5 (SHA-1 name-based) + v3 (MD5).
         "uuid_nil" => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("uuid_nil() takes 0 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid_nil"), types: arg_type_list(args) });
             }
             Ok(Value::Uuid([0u8; 16]))
         }
@@ -11008,12 +10632,7 @@ fn apply_function_dispatch(
         // Deterministic: same (ns, name) always yields the same UUID.
         "uuid_generate_v5" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "uuid_generate_v5() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid_generate_v5"), types: arg_type_list(args) });
             }
             let ns = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -11053,12 +10672,7 @@ fn apply_function_dispatch(
         // uuid_generate_v3(namespace, name) — MD5 name-based UUID.
         "uuid_generate_v3" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "uuid_generate_v3() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid_generate_v3"), types: arg_type_list(args) });
             }
             let ns = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -11139,9 +10753,7 @@ fn apply_function_dispatch(
                     }
                 },
                 n => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!("{name}() takes 0 or 1 args, got {n}"),
-                    });
+                    return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
                 }
             };
             const ANCHOR_MS: u64 = 1_577_836_800_000;
@@ -11177,12 +10789,7 @@ fn apply_function_dispatch(
         // PG 18 uuid_extract_version(uuid) — the version nibble.
         "uuid_extract_version" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "uuid_extract_version() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid_extract_version"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -11199,12 +10806,7 @@ fn apply_function_dispatch(
         // prefix of a v7 UUID as a timestamp. NULL for non-v7.
         "uuid_extract_timestamp" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "uuid_extract_timestamp() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("uuid_extract_timestamp"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -11231,9 +10833,7 @@ fn apply_function_dispatch(
         }
         "sign" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("sign() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("sign"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -11267,9 +10867,7 @@ fn apply_function_dispatch(
         }
         "sqrt" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("sqrt() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("sqrt"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -11312,9 +10910,7 @@ fn apply_function_dispatch(
         }
         "power" | "pow" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("power() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -11672,9 +11268,7 @@ fn apply_function_dispatch(
         // dispatches int/bigint/float.
         "div" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("div() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("div"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -11727,9 +11321,7 @@ fn apply_function_dispatch(
         // Gauss error function + complement, via libm.
         "erf" | "erfc" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let x = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -11754,9 +11346,7 @@ fn apply_function_dispatch(
         }
         "mod" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("mod() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("mod"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -11859,9 +11449,7 @@ fn apply_function_dispatch(
         // unlike the variadic concat() which skips NULLs).
         "textcat" | "byteacat" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -11942,9 +11530,7 @@ fn apply_function_dispatch(
         | "bpchar_larger" | "bpchar_smaller" | "tidlarger" | "tidsmaller"
         | "cashlarger" | "cashsmaller" | "xid8_larger" | "xid8_smaller" => {
             if args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{name}() takes at least 1 arg"),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             // v7.39 (round 641) — GREATEST / LEAST need an ordering, and a
             // transaction id has none: PG answers "could not identify a
@@ -12085,12 +11671,7 @@ fn apply_function_dispatch(
         // first), the reverse of PG's strpos.
         "locate" => {
             if !(2..=3).contains(&args.len()) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "locate() takes 2 or 3 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("locate"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -12141,9 +11722,7 @@ fn apply_function_dispatch(
         // MySQL instr(str, substr) — same as locate with swapped args.
         "instr" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("instr() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("instr"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -12166,12 +11745,7 @@ fn apply_function_dispatch(
         // right.
         "substring_index" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "substring_index() takes 3 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("substring_index"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -12237,12 +11811,7 @@ fn apply_function_dispatch(
         // a comma-separated list, 0 when absent.
         "find_in_set" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "find_in_set() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("find_in_set"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -12269,12 +11838,7 @@ fn apply_function_dispatch(
         // (1-based); NULL when out of range.
         "elt" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "elt() takes 2+ args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("elt"), types: arg_type_list(args) });
             }
             let n = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -12312,12 +11876,7 @@ fn apply_function_dispatch(
         // the rest; 0 when absent or str is NULL.
         "field" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "field() takes 2+ args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("field"), types: arg_type_list(args) });
             }
             // A NULL search value never matches.
             if matches!(args[0], Value::Null) {
@@ -12367,9 +11926,7 @@ fn apply_function_dispatch(
         // doubles, strings via their leading-numeric prefix.
         "interval" if ctx.mysql_dialect => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("interval() takes 2+ args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("interval"), types: arg_type_list(args) });
             }
             let n = match mysql_field_f64(&args[0]) {
                 None => return Ok(Value::Int(-1)),
@@ -12419,9 +11976,7 @@ fn apply_function_dispatch(
         }
         "ifnull" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("ifnull() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ifnull"), types: arg_type_list(args) });
             }
             for v in args {
                 if !matches!(v, Value::Null) {
@@ -12435,12 +11990,7 @@ fn apply_function_dispatch(
         // Integer condition: nonzero is true.
         "if" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "if() takes 3 args (cond, then, else), got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("if"), types: arg_type_list(args) });
             }
             let truthy = match &args[0] {
                 Value::Null => false,
@@ -12460,9 +12010,7 @@ fn apply_function_dispatch(
         }
         "nullif" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("nullif() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("nullif"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) => Ok(Value::Null),
@@ -12649,9 +12197,7 @@ fn apply_function_dispatch(
                     };
                     Ok(Value::Float(result))
                 }
-                _ => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("trunc() takes 1 or 2 args, got {}", args.len()),
-                }),
+                _ => Err(EvalError::WrongArity { name: alloc::string::String::from("trunc"), types: arg_type_list(args) }),
             }
         }
         "round" => {
@@ -12820,16 +12366,12 @@ fn apply_function_dispatch(
                     };
                     Ok(Value::Float(result))
                 }
-                _ => Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("round() takes 1 or 2 args, got {}", args.len()),
-                }),
+                _ => Err(EvalError::WrongArity { name: alloc::string::String::from("round"), types: arg_type_list(args) }),
             }
         }
         "ceil" | "ceiling" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("ceil() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -12858,9 +12400,7 @@ fn apply_function_dispatch(
         }
         "floor" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("floor() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("floor"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -12890,12 +12430,7 @@ fn apply_function_dispatch(
         "right" => string_left_right(args, false, "right", ctx.mysql_dialect),
         "strpos" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "strpos() takes 2 args (haystack, needle), got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("strpos"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -12968,9 +12503,7 @@ fn apply_function_dispatch(
         // to_lowercase also handles).
         "casefold" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("casefold() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("casefold"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13007,9 +12540,7 @@ fn apply_function_dispatch(
         // char sequence. Multi-byte-safe via chars() iterator.
         "reverse" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("reverse() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("reverse"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13034,9 +12565,7 @@ fn apply_function_dispatch(
         }
         "repeat" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("repeat() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("repeat"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13079,12 +12608,7 @@ fn apply_function_dispatch(
         }
         "split_part" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "split_part() takes 3 args (string, delim, n), got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("split_part"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13139,9 +12663,7 @@ fn apply_function_dispatch(
         // the FIRST occurrence's mapping wins. NULL → NULL.
         "translate" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("translate() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("translate"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13173,12 +12695,7 @@ fn apply_function_dispatch(
         }
         "replace" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "replace() takes 3 args (string, from, to), got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("replace"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13251,9 +12768,7 @@ fn apply_function_dispatch(
         // support functions callable by name.
         "texteq" | "textne" | "text_lt" | "text_le" | "text_gt" | "text_ge" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13280,9 +12795,7 @@ fn apply_function_dispatch(
         "__substring_similar" => super::regexp::substring_similar(args),
         "similar_to_escape" => {
             if !matches!(args.len(), 1 | 2) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("similar_to_escape() takes 1-2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("similar_to_escape"), types: arg_type_list(args) });
             }
             let Value::Text(pat) = &args[0] else {
                 return Ok(Value::Null);
@@ -13297,9 +12810,7 @@ fn apply_function_dispatch(
         }
         "similar_escape" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("similar_escape() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("similar_escape"), types: arg_type_list(args) });
             }
             let Value::Text(pat) = &args[0] else {
                 return Ok(Value::Null);
@@ -13337,9 +12848,7 @@ fn apply_function_dispatch(
                 args.len() == 1
             };
             if !ok_arity {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             // v7.39 (round 603) — PG's to_json / to_jsonb / row_to_json /
             // row_to_jsonb are STRICT: a NULL argument gives a NULL result,
@@ -13401,9 +12910,7 @@ fn apply_function_dispatch(
         // regtype carries the type NAME.
         "pg_basetype" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_basetype() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_basetype"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13451,9 +12958,7 @@ fn apply_function_dispatch(
         // convention (PG's ESCAPE-clause helper function).
         "like_escape" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("like_escape() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("like_escape"), types: arg_type_list(args) });
             }
             let (pat, esc) = match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
@@ -13492,9 +12997,7 @@ fn apply_function_dispatch(
         }
         "json_scalar" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_scalar() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_scalar"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -13503,9 +13006,7 @@ fn apply_function_dispatch(
         }
         "json_serialize" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_serialize() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_serialize"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13528,56 +13029,31 @@ fn apply_function_dispatch(
         // operators — same helpers the operators use.
         "jsonb_exists" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_exists() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_exists"), types: arg_type_list(args) });
             }
             crate::json::key_exists(&args[0], &args[1])
         }
         "jsonb_exists_any" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_exists_any() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_exists_any"), types: arg_type_list(args) });
             }
             crate::json::keys_any(&args[0], &args[1])
         }
         "jsonb_exists_all" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_exists_all() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_exists_all"), types: arg_type_list(args) });
             }
             crate::json::keys_all(&args[0], &args[1])
         }
         "jsonb_contains" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_contains() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_contains"), types: arg_type_list(args) });
             }
             crate::json::contains(&args[0], &args[1])
         }
         "jsonb_contained" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_contained() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_contained"), types: arg_type_list(args) });
             }
             // a <@ b  ==  b @> a.
             crate::json::contains(&args[1], &args[0])
@@ -13596,9 +13072,7 @@ fn apply_function_dispatch(
         | "json_array_element_text"
         | "jsonb_array_element_text" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13644,12 +13118,7 @@ fn apply_function_dispatch(
         | "json_extract_path_text"
         | "jsonb_extract_path_text" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "{name}() takes at least 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -13694,9 +13163,7 @@ fn apply_function_dispatch(
                 return crate::json::build_object(args).map(crate::json::canonicalize_value);
             }
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_object() takes 1 or 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -13850,9 +13317,7 @@ fn apply_function_dispatch(
         // errors: invalid JSON is simply false.
         "pg_is_json" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_is_json() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_is_json"), types: arg_type_list(args) });
             }
             let Value::Text(kind) = &args[1] else {
                 return Err(EvalError::TypeMismatch {
@@ -13883,9 +13348,7 @@ fn apply_function_dispatch(
         }
         "json_valid" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_valid() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_valid"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13899,9 +13362,7 @@ fn apply_function_dispatch(
         // distinction (unlike PG's lowercase jsonb_typeof).
         "json_type" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_type() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_type"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13946,9 +13407,7 @@ fn apply_function_dispatch(
         // count, scalar → 1.
         "json_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_length() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_length"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -13977,9 +13436,7 @@ fn apply_function_dispatch(
         // array (["a","b"]), not a SQL array.
         "json_keys" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_keys() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_keys"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -14025,9 +13482,7 @@ fn apply_function_dispatch(
         // each level of nesting adds 1.
         "json_depth" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_depth() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_depth"), types: arg_type_list(args) });
             }
             fn depth(v: &crate::json::JsonValue) -> i32 {
                 match v {
@@ -14061,9 +13516,7 @@ fn apply_function_dispatch(
         // MySQL JSON_QUOTE: wrap a string as a JSON string literal.
         "json_quote" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_quote() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_quote"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -14097,9 +13550,7 @@ fn apply_function_dispatch(
         // JSON values render as their compact text.
         "json_unquote" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("json_unquote() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_unquote"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -14132,12 +13583,7 @@ fn apply_function_dispatch(
         // byte length (real for SPG's storage model).
         "json_storage_size" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "json_storage_size() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("json_storage_size"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -14171,12 +13617,7 @@ fn apply_function_dispatch(
         //   return_target / delete_key
         "jsonb_set_lax" => {
             if !(3..=5).contains(&args.len()) {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_set_lax() takes 3-5 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("jsonb_set_lax"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null)
             {
@@ -14241,11 +13682,7 @@ fn apply_function_dispatch(
                 2 => (&args[0], &args[1]),
                 3 => (&args[1], &args[2]),
                 n => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "{name}() takes 2 or 3 args, got {n}"
-                        ),
-                    });
+                    return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
                 }
             };
             let doc_text = match doc_arg {
@@ -14455,12 +13892,7 @@ fn apply_function_dispatch(
         // else errors like PG ("collations are not supported").
         "pg_collation_for" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_collation_for() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_collation_for"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -14495,17 +13927,13 @@ fn apply_function_dispatch(
         // function forms of || and - operators.
         "jsonb_concat" | "json_concat" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("jsonb_concat() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             crate::json::concat(&args[0], &args[1])
         }
         "jsonb_delete" | "json_delete" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("jsonb_delete() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             crate::json::delete_key(&args[0], &args[1])
         }
@@ -14516,12 +13944,7 @@ fn apply_function_dispatch(
         // evaluation queues with the jsonpath engine widening).
         "jsonb_path_exists" | "json_path_exists" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_path_exists() takes 2+ args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args[..2].iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -14539,12 +13962,7 @@ fn apply_function_dispatch(
         }
         "jsonb_path_match" | "json_path_match" => {
             if args.len() < 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "jsonb_path_match() takes 2+ args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             if args[..2].iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -14588,12 +14006,7 @@ fn apply_function_dispatch(
         // structural errors (our lax evaluator already does).
         "jsonb_path_query" | "json_path_query" => {
             if args.len() < 2 || args.len() > 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "jsonb_path_query() takes 2-4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let vars = match args.get(2) {
                 Some(v) => crate::json::parse_path_vars(v)?,
@@ -14603,12 +14016,7 @@ fn apply_function_dispatch(
         }
         "jsonb_path_query_first" | "json_path_query_first" => {
             if args.len() < 2 || args.len() > 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "jsonb_path_query_first() takes 2-4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let vars = match args.get(2) {
                 Some(v) => crate::json::parse_path_vars(v)?,
@@ -14618,12 +14026,7 @@ fn apply_function_dispatch(
         }
         "jsonb_path_query_array" | "json_path_query_array" => {
             if args.len() < 2 || args.len() > 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "jsonb_path_query_array() takes 2-4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let vars = match args.get(2) {
                 Some(v) => crate::json::parse_path_vars(v)?,
@@ -14666,12 +14069,7 @@ fn apply_function_dispatch(
         // wall-clock stubs until v7.38 wall-clock plumbing.
         "timeofday" => {
             if !args.is_empty() {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "timeofday() takes no args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("timeofday"), types: arg_type_list(args) });
             }
             // 2020-01-01 00:00:00 UTC was a Wednesday.
             Ok(Value::text::<String>(
@@ -14715,12 +14113,7 @@ fn apply_function_dispatch(
         // queues with the collation/encoding epic.
         "convert_from" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "convert_from() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("convert_from"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -14799,9 +14192,7 @@ fn apply_function_dispatch(
         }
         "convert_to" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("convert_to() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("convert_to"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -14874,9 +14265,7 @@ fn apply_function_dispatch(
         // Text whose UTF-8 bytes are the same bytea, so accept both.
         "convert" => {
             if args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("convert() takes 3 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("convert"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -14950,12 +14339,7 @@ fn apply_function_dispatch(
         // unless null_string is given (then they're replaced).
         "array_to_string" => {
             if args.len() < 2 || args.len() > 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_to_string() takes 2 or 3 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_to_string"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -15043,9 +14427,7 @@ fn apply_function_dispatch(
         // the :pos suffixes.
         "strip" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("strip() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("strip"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15094,12 +14476,7 @@ fn apply_function_dispatch(
         // counts whitespace-separated lexemes.
         "tsvector_length" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "tsvector_length() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("tsvector_length"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15121,9 +14498,7 @@ fn apply_function_dispatch(
         // Approximation: count words + explicit operators.
         "numnode" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("numnode() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("numnode"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15150,9 +14525,7 @@ fn apply_function_dispatch(
         // SPG's simple form returns the input minus negated terms.
         "querytree" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("querytree() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("querytree"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15188,12 +14561,7 @@ fn apply_function_dispatch(
         // 'word:pos' pairs; match on the word part.
         "ts_delete" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "ts_delete() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ts_delete"), types: arg_type_list(args) });
             }
             let targets: alloc::vec::Vec<alloc::string::String> = match &args[1]
             {
@@ -15250,12 +14618,7 @@ fn apply_function_dispatch(
         // a TextArray.
         "ts_filter" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "ts_filter() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ts_filter"), types: arg_type_list(args) });
             }
             let vec_text = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -15323,12 +14686,7 @@ fn apply_function_dispatch(
         // hand-written literals round-trip like PG.
         "tsvector_to_array" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "tsvector_to_array() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("tsvector_to_array"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15368,12 +14726,7 @@ fn apply_function_dispatch(
         // NULL elements.
         "array_to_tsvector" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "array_to_tsvector() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("array_to_tsvector"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -15429,12 +14782,7 @@ fn apply_function_dispatch(
         // NULL from snowball/simple — those always recognise the token).
         "ts_lexize" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "ts_lexize() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("ts_lexize"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -15494,12 +14842,7 @@ fn apply_function_dispatch(
         }
         "tsquery_phrase" => {
             if args.len() != 2 && args.len() != 3 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "tsquery_phrase() takes 2 or 3 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("tsquery_phrase"), types: arg_type_list(args) });
             }
             // v7.39 (read01 tsquery) — accept a TsQuery value (rendered)
             // or its text form.
@@ -15758,12 +15101,7 @@ fn apply_function_dispatch(
         }
         "current_setting" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "current_setting() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("current_setting"), types: arg_type_list(args) });
             }
             let name = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -16224,12 +15562,7 @@ fn apply_function_dispatch(
         // that at least never NULLs out.
         "pg_get_serial_sequence" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_get_serial_sequence() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_get_serial_sequence"), types: arg_type_list(args) });
             }
             let table = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -16473,12 +15806,7 @@ fn apply_function_dispatch(
         // Rounds to nearest integer at each unit boundary.
         "pg_size_pretty" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_size_pretty() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_size_pretty"), types: arg_type_list(args) });
             }
             let n: i64 = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -16663,11 +15991,7 @@ fn apply_function_dispatch(
                 2 => (&args[0], &args[1]),
                 3 => (&args[1], &args[2]),
                 n => {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "has_table_privilege() takes 2 or 3 args, got {n}"
-                        ),
-                    });
+                    return Err(EvalError::WrongArity { name: alloc::string::String::from("has_table_privilege"), types: arg_type_list(args) });
                 }
             };
             if matches!(tbl_arg, Value::Null) || matches!(priv_arg, Value::Null) {
@@ -17118,9 +16442,7 @@ fn apply_function_dispatch(
         // typmod = ((precision << 16) | scale) + 4).
         "_pg_char_max_length" | "_pg_char_octet_length" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let int_of = |v: &Value<'_>| -> Option<i64> {
                 match v {
@@ -17150,9 +16472,7 @@ fn apply_function_dispatch(
         }
         "_pg_numeric_precision" | "_pg_numeric_scale" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let int_of = |v: &Value<'_>| -> Option<i64> {
                 match v {
@@ -17185,9 +16505,7 @@ fn apply_function_dispatch(
         }
         "_pg_datetime_precision" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let int_of = |v: &Value<'_>| -> Option<i64> {
                 match v {
@@ -17593,9 +16911,7 @@ fn apply_function_dispatch(
             };
             // v7.39 (round 636) — same class: a zero-arg call panicked here.
             let Some(first) = args.first() else {
-                return Err(EvalError::TypeMismatch {
-                    detail: "obj_description() takes 1 or 2 args, got 0".into(),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("obj_description"), types: arg_type_list(args) });
             };
             let Some(name) = regclass_name_of(first) else {
                 return Ok(Value::Null);
@@ -17650,12 +16966,7 @@ fn apply_function_dispatch(
         // owner's name comes from the oid, as `pg_get_userbyid` does.
         "acldefault" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "acldefault() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("acldefault"), types: arg_type_list(args) });
             }
             // v7.39 (round 522) — this REJECTED the type it documents.
             // PG declares the parameter `"char"`, so `acldefault('r'::"char",
@@ -17750,12 +17061,7 @@ fn apply_function_dispatch(
         // non-zero oid 'admin'.
         "makeaclitem" => {
             if args.len() != 4 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "makeaclitem() takes 4 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("makeaclitem"), types: arg_type_list(args) });
             }
             if args.iter().any(|v| matches!(v, Value::Null)) {
                 return Ok(Value::Null);
@@ -17992,9 +17298,7 @@ fn apply_function_dispatch(
         // NFD, NFKC, NFKD.
         "normalize" | "is_normalized" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 or 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -18049,12 +17353,7 @@ fn apply_function_dispatch(
         // NFD-decompose, drop combining marks, keep the rest.
         "to_ascii" => {
             if args.is_empty() || args.len() > 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "to_ascii() takes 1 or 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("to_ascii"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);
@@ -18075,12 +17374,7 @@ fn apply_function_dispatch(
         // Accepts numeric-ish input (SPG stores money as numeric).
         "cash_words" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "cash_words() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("cash_words"), types: arg_type_list(args) });
             }
             // Normalize the input to (dollars: i64, cents: i64).
             let (dollars, cents, negative) = match &args[0] {
@@ -18242,9 +17536,7 @@ fn apply_function_dispatch(
         //   trim_scale(numeric) — value with trailing zeroes removed
         "scale" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("scale() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("scale"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -18266,9 +17558,7 @@ fn apply_function_dispatch(
         }
         "min_scale" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("min_scale() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("min_scale"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -18296,9 +17586,7 @@ fn apply_function_dispatch(
         }
         "trim_scale" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("trim_scale() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("trim_scale"), types: arg_type_list(args) });
             }
             match &args[0] {
                 Value::Null => Ok(Value::Null),
@@ -18370,9 +17658,7 @@ fn apply_function_dispatch(
         // pg_lsn type yet; text is the wire format PG uses too).
         "pg_lsn_larger" | "pg_lsn_smaller" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             fn as_lsn(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
                 let s = match v {
@@ -18441,9 +17727,7 @@ fn apply_function_dispatch(
         // pg_lsn_hash returns a hash for the LSN (for hash indexes).
         "pg_lsn_hash" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_lsn_hash() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_lsn_hash"), types: arg_type_list(args) });
             }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -18524,12 +17808,7 @@ fn apply_function_dispatch(
         // simple stream-cipher / mask ops.
         "bytea_xor" | "byteaxor" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "bytea_xor() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -18562,9 +17841,7 @@ fn apply_function_dispatch(
         // bytea_and / bytea_or — similar shape.
         "bytea_and" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("bytea_and() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("bytea_and"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -18592,9 +17869,7 @@ fn apply_function_dispatch(
         }
         "bytea_or" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("bytea_or() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("bytea_or"), types: arg_type_list(args) });
             }
             match (&args[0], &args[1]) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
@@ -18626,9 +17901,7 @@ fn apply_function_dispatch(
         // implementation via table-free polynomial.
         "crc32" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("crc32() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("crc32"), types: arg_type_list(args) });
             }
             let bytes: &[u8] = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -18655,9 +17928,7 @@ fn apply_function_dispatch(
         }
         "crc32c" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("crc32c() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("crc32c"), types: arg_type_list(args) });
             }
             let bytes: &[u8] = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -18785,12 +18056,7 @@ fn apply_function_dispatch(
         // internally, but ORM callers pass literal LSN text.
         "pg_wal_lsn_diff" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "pg_wal_lsn_diff() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_wal_lsn_diff"), types: arg_type_list(args) });
             }
             fn lsn_bytes(v: &Value<'_>) -> Result<Option<i64>, EvalError> {
                 let s = match v {
@@ -19015,9 +18281,7 @@ fn apply_function_dispatch(
         // where lower_inc is true.)
         "lower_inc" | "upper_inc" | "lower_inf" | "upper_inf" | "isempty" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("{name}() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let s = match &args[0] {
                 Value::Null => return Ok(Value::Null),
@@ -19089,9 +18353,7 @@ fn apply_function_dispatch(
         // exactly one bound with no gap and no overlap.
         "range_adjacent" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("range_adjacent() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("range_adjacent"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -19142,12 +18404,7 @@ fn apply_function_dispatch(
                 };
             }
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!(
-                        "range_merge() takes 2 args, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("range_merge"), types: arg_type_list(args) });
             }
             // Typed range values (the common `range_merge(int4range(...), ...)`
             // shape) merge via the range machinery in `binop`.
@@ -19236,12 +18493,7 @@ fn apply_function_dispatch(
         // that matched PG.
         "pg_partition_root" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "pg_partition_root() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_partition_root"), types: arg_type_list(args) });
             }
             let name = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -19277,12 +18529,7 @@ fn apply_function_dispatch(
         // (single-row containing the input name).
         "pg_partition_ancestors" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "pg_partition_ancestors() takes 1 arg, got {}",
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_partition_ancestors"), types: arg_type_list(args) });
             }
             let name = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -19322,13 +18569,7 @@ fn apply_function_dispatch(
         // issue found.
         "bt_index_check" | "spg_bt_index_check" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{}() takes 1 arg, got {}",
-                        name,
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let table = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -19352,13 +18593,7 @@ fn apply_function_dispatch(
         }
         "verify_heapam" | "spg_verify_heapam" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "{}() takes 1 arg, got {}",
-                        name,
-                        args.len()
-                    ),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from(name), types: arg_type_list(args) });
             }
             let table = match &args[0] {
                 Value::Text(s) => s.to_string(),
@@ -19388,9 +18623,7 @@ fn apply_function_dispatch(
         // PG semantics.
         "pg_typeof" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("pg_typeof() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_typeof"), types: arg_type_list(args) });
             }
             Ok(Value::text::<String>(pg_typeof_name(&args[0]).into()))
         }
@@ -19438,9 +18671,7 @@ fn apply_function_dispatch(
         // any NULL arg.
         "similarity" => {
             if args.len() != 2 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("similarity() takes 2 args, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("similarity"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
                 return Ok(Value::Null);
@@ -19469,9 +18700,7 @@ fn apply_function_dispatch(
         }
         "show_trgm" => {
             if args.len() != 1 {
-                return Err(EvalError::TypeMismatch {
-                    detail: format!("show_trgm() takes 1 arg, got {}", args.len()),
-                });
+                return Err(EvalError::WrongArity { name: alloc::string::String::from("show_trgm"), types: arg_type_list(args) });
             }
             if matches!(args[0], Value::Null) {
                 return Ok(Value::Null);

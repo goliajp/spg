@@ -6799,6 +6799,7 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
     // precision of a MySQL temporal column. Drives write-path truncation
     // and render padding; None keeps PG's full-microsecond behaviour.
     schema.mysql_fsp = c.mysql_fsp;
+    schema.mysql_declared_timestamp = c.mysql_declared_timestamp;
     // v7.39 (round 389, type-fidelity epic P4a) — a "real" SMALLINT /
     // INT UNSIGNED holds a range its signed storage tag cannot (65535 /
     // 4294967295), so widen the storage one step and record the declared

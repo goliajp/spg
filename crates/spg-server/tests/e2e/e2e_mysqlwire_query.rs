@@ -2003,3 +2003,68 @@ fn only_full_group_by_speaks_mysqls_words_and_numbers() {
         "10"
     );
 }
+
+/// v7.39.2 — MySQL's wrong-parameter-count sentence and its OWN errno.
+///
+/// SPG said `lower() takes 1 arg, got 0` at 339 sites. MySQL 9.7.2 says
+/// `Incorrect parameter count in the call to native function 'LOWER'`
+/// and numbers it 1582 — a DIFFERENT number from 1305, which is what it
+/// gives a name it does not know. PostgreSQL words both the same, so
+/// only a distinct error variant can keep them apart on this wire.
+#[test]
+fn wrong_arity_counts_the_parameters() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(&mut s, "CREATE DATABASE testdb");
+    exec_ok(&mut s, "USE testdb");
+    for sql in ["SELECT LOWER()", "SELECT LOWER('a','b')"] {
+        let (errno, state, msg) = err_of(&mut s, sql);
+        assert_eq!((errno, state.as_str()), (1582, "42000"), "{sql}: {msg}");
+        assert_eq!(
+            msg, "Incorrect parameter count in the call to native function 'LOWER'",
+            "{sql}"
+        );
+    }
+    // The other number, and MySQL's own wording for it: schema-qualified,
+    // upper-case FUNCTION, no argument types.
+    let (errno, state, msg) = err_of(&mut s, "SELECT nosuchfn(1)");
+    assert_eq!((errno, state.as_str()), (1305, "42000"), "{msg}");
+    assert_eq!(msg, "FUNCTION testdb.nosuchfn does not exist");
+    // It follows the session, like every other qualified name here.
+    exec_ok(&mut s, "USE other");
+    assert_eq!(
+        err_of(&mut s, "SELECT nosuchfn(1)").2,
+        "FUNCTION other.nosuchfn does not exist"
+    );
+    // The control: the right arity still runs.
+    assert_eq!(query_scalar(&mut s, "SELECT LOWER('AB')"), "ab");
+}
+
+/// v7.39.2 — MySQL writes an explicit `NULL` for a nullable TIMESTAMP.
+///
+/// TIMESTAMP is NOT NULL by default there, so the word is what says
+/// otherwise: `timestamp NULL DEFAULT NULL` (measured on 9.7.2), where
+/// DATETIME — nullable by default — prints nothing. SPG wrote the
+/// DATETIME form for both, so replaying its own dump made the column
+/// NOT NULL.
+#[test]
+fn a_nullable_timestamp_says_null_out_loud() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    exec_ok(
+        &mut s,
+        "CREATE TABLE tn (a TIMESTAMP NULL, b DATETIME, c TIMESTAMP NOT NULL, \
+         d TIMESTAMP(3) NULL)",
+    );
+    let ddl = query_rows(&mut s, "SHOW CREATE TABLE tn")[0][1]
+        .clone()
+        .expect("ddl");
+    for want in [
+        "`a` timestamp NULL DEFAULT NULL",
+        "`b` datetime DEFAULT NULL",
+        "`c` timestamp NOT NULL",
+        "`d` timestamp(3) NULL DEFAULT NULL",
+    ] {
+        assert!(ddl.contains(want), "missing {want}:\n{ddl}");
+    }
+}

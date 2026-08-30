@@ -12,6 +12,99 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A restart silently rewrote a MySQL table's declared types.** Recovery
+  replays the SQL TEXT, and the recovering engine speaks PostgreSQL, so
+  every MySQL-only column marker was parsed away. Measured on 7.39.1,
+  after a bounce that replayed the WAL:
+
+  | declared | before the restart | after |
+  |---|---|---|
+  | `TINYINT` | `tinyint` | `smallint` |
+  | `MEDIUMINT` | `mediumint` | `int` |
+  | `TIMESTAMP` | `datetime` * | `datetime` |
+  | `DATETIME(3)` | truncates to `.123` | stores `.123456` |
+
+  A `mysqldump` taken after a restart wrote a DIFFERENT schema from the
+  one that had been created, and nothing said so. The WAL carries the
+  dialect now, in a v3 frame type of its own; a PostgreSQL session still
+  writes the frames it always did, so a PG-only deployment's WAL is
+  byte-identical to 7.39.1's.
+
+  \* `TIMESTAMP` reported `datetime` in BOTH columns because SPG stored
+  the two as one type and reported the wrong name for one of them. MySQL
+  9.7.2 and MariaDB 12.3.3 keep them apart everywhere a client reads the
+  type back, and MySQL's TIMESTAMP is not DATETIME — a different range,
+  and UTC conversion on the way in and out. The declared spelling is
+  recorded now (a FILE_VERSION 93 sparse appendix, the twelfth; the v52
+  compatibility test caught it within the hour of it being written), so
+  `SHOW CREATE TABLE`, `DESCRIBE` and `information_schema` all say what
+  was written. The storage and the semantics are unchanged, and that
+  gap is written down rather than papered over.
+
+  Two more the same measurement turned up: a temporal type never printed
+  its declared fractional-seconds precision (`datetime(3)`, `time(6)`)
+  though SPG stored it and truncates on write — so the column behaved
+  one way and described itself another — and a nullable `TIMESTAMP` did
+  not print MySQL's explicit `NULL`, so replaying SPG's own dump made
+  the column NOT NULL.
+
+  Coverage gap, stated rather than glossed: the write-side frame CHOICE
+  is pinned at the encoder, not end-to-end through a restarting server —
+  the e2e harness would not hand the second process a MySQL handshake in
+  the time available, and the behaviour is verified by differential
+  probe instead.
+
+- **A built-in called with the wrong number of arguments answered SPG's
+  own arithmetic, at 339 sites across ten files.** `lower() takes 1 arg,
+  got 0` is not what either engine says. Measured:
+
+  | | says |
+  |---|---|
+  | PostgreSQL 18.6 | `function lower() does not exist` / `function lower(text, integer) does not exist` |
+  | MySQL 9.7.2 | `Incorrect parameter count in the call to native function 'LOWER'`, errno **1582** |
+
+  PostgreSQL draws no line between a missing FUNCTION and a missing
+  OVERLOAD — `nosuchfn(text, integer, date)` and `lower(text, integer)`
+  get the identical sentence — so its rendering is the engine's
+  canonical one and both now come from one place, with the argument
+  types spelled PostgreSQL's way. MySQL DOES draw that line and numbers
+  the two differently (1582 against 1305), which is why this is its own
+  error variant rather than a formatted string the wire would have to
+  guess the meaning of.
+
+  Its unknown-function sentence is MySQL's now too: `FUNCTION
+  testdb.nosuchfn does not exist`, schema-qualified and following the
+  session. The comment there had said SPG keeps its own wording because
+  it "names the argument types and so says more about why nothing
+  matched" — a reason to prefer SPG's answer over the one the client
+  asked for. That surfaced a second defect: the wire read its own
+  `conn_state.database` copy, which only `COM_INIT_DB` writes, so a
+  connection that had said `USE testdb` was told `spg`. It reads the
+  engine's `spg.database` — the one home for that fact — now.
+
+  Twenty-one sites had hard-coded one alias's name where several share
+  an arm, so `substr(t)` reported `function substring(text) …`; they use
+  the name that was written. Two keep their own wording and the reason
+  is not taste: the `setval` and aggregate arity checks run BEFORE
+  evaluation, over unevaluated expressions, and cannot name argument
+  types.
+
+  `18-sqlstate` in the differential corpus is byte-identical to
+  PostgreSQL 18.6 now; with `14-errors-sqlstate` closed earlier in this
+  release, six of the twenty corpus files still carry a divergence,
+  down from eight.
+
+  Known gap, measured with a repro and NOT fixed: this check still runs
+  per ROW, so `SELECT lower(t, n) FROM t` over an EMPTY table answers
+  zero rows and no error, and raises over the same table with one row in
+  it — the same shape as the empty-table predicate defect closed earlier
+  in this release. Two candidate oracles for a pre-scan check were tried
+  and both refuted: `PG_PROC_FUNCS`' argument counts reject dozens of
+  legitimate calls (its rows do not describe SPG's overloads), and the
+  catalog's volatility column omits `nextval` and `setval`, so probing a
+  call at plan time could advance a sequence — changing data to improve
+  a message. Closing it needs an arity model SPG does not yet have.
+
 - **Two error wordings the differential corpus had been carrying as
   accepted divergences, and the second was never the parser's fault.**
   `to_number('x','999')` answered SPG's own `to_number(): could not

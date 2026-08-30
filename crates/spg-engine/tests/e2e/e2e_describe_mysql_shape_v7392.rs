@@ -81,9 +81,12 @@ fn describe_answers_mysqls_six_columns() {
             ["m", "int", "YES", "MUL", "NULL", ""],
             ["s", "int", "YES", "", "5", ""],
             ["t", "text", "YES", "", "NULL", ""],
+            // v7.39.2 — `timestamp`, not `datetime`: the declared
+            // spelling is recorded now (re-measured on MySQL 9.7.2 for
+            // this exact schema).
             [
                 "ts",
-                "datetime",
+                "timestamp",
                 "YES",
                 "",
                 "CURRENT_TIMESTAMP",

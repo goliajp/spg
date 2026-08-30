@@ -49,7 +49,20 @@ impl Engine {
             .iter()
             .map(|c| {
                 let ty = render_mysql_type(c);
-                let nullable = if c.nullable { "" } else { " NOT NULL" };
+                // v7.39.2 — a NULLABLE `TIMESTAMP` prints an explicit
+                // `NULL` on MySQL (`timestamp NULL DEFAULT NULL`),
+                // because TIMESTAMP is NOT NULL by default there and
+                // the word is what says otherwise. DATETIME, which is
+                // nullable by default, prints nothing. Measured on
+                // 9.7.2; SPG wrote the DATETIME form for both, so a
+                // replayed dump made the column NOT NULL.
+                let nullable = if !c.nullable {
+                    " NOT NULL"
+                } else if c.mysql_declared_timestamp {
+                    " NULL"
+                } else {
+                    ""
+                };
                 let auto = if c.auto_increment {
                     " AUTO_INCREMENT"
                 } else {
@@ -741,6 +754,20 @@ pub(crate) fn mysql_int_base_name(
 /// case, with the display width MariaDB prints (`int(11)`, `bigint(20)`),
 /// the narrow name (`tinyint(4)`, `mediumint(9)`) and the ` unsigned`
 /// suffix (round 389, epic P4a).
+/// v7.39.2 — a temporal type carries its declared fractional-seconds
+/// precision in `COLUMN_TYPE`, `SHOW COLUMNS` and `SHOW CREATE TABLE`:
+/// `datetime(3)`, `timestamp(3)`, `time(6)` (measured on MySQL 9.7.2).
+/// SPG stored the precision — it truncates on write and pads on render
+/// — and then printed the bare name, so a client reading the type back
+/// saw a column that behaved one way and described itself another. A
+/// bare spelling is precision 0 there and prints no parentheses.
+fn mysql_temporal_with_fsp(base: &str, col: &ColumnSchema) -> String {
+    match col.mysql_fsp {
+        Some(n) if n > 0 => alloc::format!("{base}({n})"),
+        _ => alloc::string::String::from(base),
+    }
+}
+
 pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
     if let Some(base) = mysql_int_base_name(col.ty, col.mysql_int_width) {
         // v7.39.2 — no display width. SPG advertises itself as MySQL
@@ -769,8 +796,19 @@ pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
         DataType::Bool => "tinyint(1)".into(),
         DataType::Numeric { precision, scale } => alloc::format!("decimal({precision},{scale})"),
         DataType::Date => "date".into(),
-        DataType::Timestamp | DataType::Timestamptz => "datetime".into(),
-        DataType::Time => "time".into(),
+        // v7.39.2 — the DECLARED spelling. MySQL 9.7.2 and MariaDB
+        // 12.3.3 both keep `timestamp` and `datetime` apart here, and
+        // SPG said `datetime` to both, so a dump and reload changed the
+        // column's type without a word.
+        DataType::Timestamp | DataType::Timestamptz => {
+            let base = if col.mysql_declared_timestamp {
+                "timestamp"
+            } else {
+                "datetime"
+            };
+            mysql_temporal_with_fsp(base, col)
+        }
+        DataType::Time => mysql_temporal_with_fsp("time", col),
         DataType::Bytes => "blob".into(),
         DataType::Json | DataType::Jsonb => "json".into(),
         // Anything without a MySQL spelling keeps SPG's own, lower-cased.

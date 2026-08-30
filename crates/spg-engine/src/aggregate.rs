@@ -5111,6 +5111,11 @@ fn validate_agg_arities(stmt: &SelectStatement, _specs: &[AggSpec]) -> Result<()
             if let Some(want) = expected
                 && args.len() != want
             {
+                // v7.39.2 — like `setval`, this check runs BEFORE
+                // evaluation, over unevaluated `Expr`s, so it cannot
+                // name the argument types PostgreSQL's sentence
+                // carries. The two of them are the only arity sites
+                // that keep their own wording.
                 return Err(EvalError::TypeMismatch {
                     detail: alloc::format!("{lower}() takes {want} arg(s), got {}", args.len()),
                 });

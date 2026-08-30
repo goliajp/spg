@@ -62,8 +62,17 @@ fn round636_zero_arg_calls_do_not_panic() {
         "SELECT obj_description()",
     ] {
         let m = err(&mut e, sql);
+        // v7.39.2 — the sentence changed and the two questions merged.
+        // PostgreSQL 18.6 gives a missing function and a missing
+        // OVERLOAD the identical wording (measured: `nosuchfn(text,
+        // integer, date)` and `lower(text, integer)` both read `function
+        // … does not exist`), so SPG says that now instead of its own
+        // `takes N arg, got 0`. What this round pinned — these four
+        // reach an ERROR rather than indexing `args[0]` and taking the
+        // process down — is unchanged, and the assertion below that the
+        // engine still answers is what carries it.
         assert!(
-            m.contains("takes") && m.contains("got 0"),
+            m.contains("does not exist"),
             "{sql}: wanted an arity error, said {m:?}"
         );
     }

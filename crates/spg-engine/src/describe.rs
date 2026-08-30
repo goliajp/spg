@@ -376,6 +376,12 @@ fn describe_select_items(
                 });
                 let name = alias.clone().unwrap_or(desc.name);
                 out.push(ColumnSchema {
+                    // v7.39.2 — a view column is not a declared column,
+                    // so it carries no MySQL spelling. Listed rather
+                    // than defaulted: this rebuild has dropped a new
+                    // field before, and a struct literal makes the
+                    // compiler ask.
+                    mysql_declared_timestamp: false,
                     collation_name: None,
                     user_composite_type: None,
                     acl: alloc::vec::Vec::new(),
