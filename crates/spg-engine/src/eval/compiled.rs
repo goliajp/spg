@@ -828,11 +828,11 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
             // v7.39 (round 364, M4 P2) — a MySQL session folds every text
             // comparison, so it needs the CI step too (the step chooses
             // the accent-aware fold at run time).
-            let ci = ci || (cmp && super::resolve::mysql_text_fold_applies(lhs, rhs, ctx));
             // v7.38.18 — the same resolver the interpreted path uses.
             // A byte-wise collation that PADS still needs the step: it
             // does not fold case, but trailing spaces do not count.
             let tc = super::resolve::text_compare_of(lhs, rhs, ctx);
+            let ci = ci || (cmp && tc.fold_case);
             // v7.38.19 — `BinaryCi` exists to FOLD: case, and padding.
             // An ordering collation needs neither, and asking
             // `is_plain_bytes()` -- which also answers false when an

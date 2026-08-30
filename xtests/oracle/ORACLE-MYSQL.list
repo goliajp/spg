@@ -5,3 +5,5 @@ port.select_implicit.sql
 port.subquery_correlated_agg.sql
 orig.collation_pad_matrix.sql
 orig.mysql_family_literals.sql
+orig.mysql_introducers.sql
+orig.mysql_session_collation.sql

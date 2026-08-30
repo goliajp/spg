@@ -23169,33 +23169,26 @@ impl Parser {
                         "collation \"{cname}\" for encoding \"UTF8\" does not exist"
                     )));
                 }
-                if !mysql_ci {
-                    expr = Expr::Collate {
-                        expr: alloc::boxed::Box::new(expr),
-                        collation: cname,
-                    };
-                    continue;
-                }
-                if false {
-                    // v7.38.18 — the old message read "SPG orders text
-                    // by bytes (the C collation); locale collations are
-                    // not supported yet", and both halves were false by
-                    // the time it was read. This build performs locale
-                    // collations: declared on a column or written in an
-                    // ORDER BY key, `en_US.utf8` orders `apple, client,
-                    // DateStyle, Zebra` exactly as PG 18.4 does. What it
-                    // cannot do is carry a collation on an arbitrary
-                    // expression, because there is no `Expr::Collate` to
-                    // carry it — so say that, and say where the clause
-                    // does work rather than telling the reader to drop it.
-                    return Err(self.err(alloc::format!(
-                        "COLLATE {cname:?} is not supported in this position: \
-                         SPG carries a collation on a column declaration and \
-                         on an ORDER BY key, not on an arbitrary expression. \
-                         Declare it on the column (`x text COLLATE \
-                         {cname:?}`) or move it into the ORDER BY key"
-                    )));
-                }
+                // v7.39.3 — the node is built for EVERY name, `_ci`
+                // included.
+                //
+                // A MySQL `_ci` spelling used to be absorbed here on the
+                // reasoning that a MySQL session folds anyway, so the
+                // clause asked for what it would have got. That stopped
+                // being true when the fold learned to read the session's
+                // collation NAME: under `SET NAMES utf8mb4 COLLATE
+                // utf8mb4_bin`, `'AB' COLLATE utf8mb4_general_ci = 'ab'`
+                // is 1 on MySQL 9.7.2 and was 0 here, because the clause
+                // that would have made it 1 had been dropped in the
+                // parser. Absorbing is only ever correct when the
+                // collation asked for is the one the comparison would use
+                // anyway, and the parser cannot know that — the same
+                // reasoning already written above for the byte-order
+                // spellings, applied to the family it had exempted.
+                expr = Expr::Collate {
+                    expr: alloc::boxed::Box::new(expr),
+                    collation: cname,
+                };
                 continue;
             }
             return Ok(expr);

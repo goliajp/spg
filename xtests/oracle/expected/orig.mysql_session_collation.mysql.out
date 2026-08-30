@@ -1,0 +1,14 @@
+default_ci
+1
+default_order
+1
+binary_eq
+0
+binary_order
+0
+binary_order_reversed
+1
+explicit_wins
+1
+back_to_ci
+1

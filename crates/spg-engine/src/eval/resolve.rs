@@ -68,6 +68,21 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
 /// answers whether it PADS, and the two are independent:
 /// `utf8mb4_bin` is byte-wise AND `PAD SPACE`, which is the
 /// combination easiest to get backwards.
+/// v7.39.3 — the collation an operand names EXPLICITLY, `x COLLATE c`.
+///
+/// It outranks the session's. Measured on MySQL 9.7.2 under
+/// `SET NAMES utf8mb4 COLLATE utf8mb4_bin`: `'AB' COLLATE
+/// utf8mb4_general_ci = 'ab'` is 1, while the same pair without the
+/// COLLATE is 0. Reading only the session there — which is what the
+/// first version of the fold fix did — turned an explicit request into
+/// a silently ignored one, the same defect in the other direction.
+pub(crate) fn explicit_collation_name(e: &Expr) -> Option<String> {
+    match e {
+        Expr::Collate { collation, .. } => Some(collation.clone()),
+        _ => None,
+    }
+}
+
 pub(crate) fn column_collation_name(e: &Expr, ctx: &EvalContext<'_>) -> Option<String> {
     let Expr::Column(c) = e else {
         return None;
@@ -153,7 +168,9 @@ pub(crate) fn text_compare_of(
     // PostgreSQL database collating as `en_US.utf8` does not pad, and
     // feeding an inherited name to `pads_space` there would make
     // `'a' = 'a  '` true for every text column in it.
-    let name = column_collation_name(lhs, ctx)
+    let name = explicit_collation_name(lhs)
+        .or_else(|| explicit_collation_name(rhs))
+        .or_else(|| column_collation_name(lhs, ctx))
         .or_else(|| column_collation_name(rhs, ctx))
         .or_else(|| session_collation_name(ctx));
     // v7.38.18 (S2) — the ordering collation is asked SEPARATELY, and
@@ -166,7 +183,16 @@ pub(crate) fn text_compare_of(
         .or_else(|| column_ordering_collation(rhs, ctx))
         .filter(|n| !crate::collate::is_byte_wise(n) && crate::collate::is_supported(n));
     crate::collate::TextCompare {
-        fold_case: !byte_wise && (ci || ctx.mysql_dialect),
+        // v7.39.3 — the session's collation NAME decides whether to
+        // fold, not the dialect alone. `SET NAMES utf8mb4 COLLATE
+        // utf8mb4_bin` is in the first packet of a client that wants
+        // byte comparison, and two literals under it still compared
+        // case-insensitively here while MySQL 9.7.2 answers 0
+        // (measured). `name` already falls back to the session value
+        // for padding; this asks the same name the other question.
+        fold_case: !byte_wise
+            && (ci
+                || (ctx.mysql_dialect && name.as_deref().is_none_or(crate::collate::folds_case))),
         pads: crate::collate::pads_space(name.as_deref()),
         // v7.38.18 (S2) — `byte_wise` must NOT zero this. It is true
         // whenever a column carries `Collation::Binary`, which is the
@@ -361,13 +387,15 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
 /// side is `BINARY`-coerced (which forces byte-wise). Shared by the
 /// interpreter and the compiled stepper so they cannot disagree.
 pub(super) fn mysql_text_fold_applies(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> bool {
-    ctx.mysql_dialect
-        && !is_binary_coerced(lhs)
-        && !is_binary_coerced(rhs)
-        // v7.39 (round 370, M4 P4a) — an explicit `COLLATE utf8mb4_bin`
-        // column stays byte-wise even on the compiled comparison path.
-        && !operand_is_binary_column(lhs, ctx)
-        && !operand_is_binary_column(rhs, ctx)
+    // v7.39.3 — ONE owner. This was the same question as
+    // `text_compare_of(..).fold_case`, written a second time, and the
+    // two answered differently the moment the first learned to read the
+    // session's collation NAME: `SET NAMES utf8mb4 COLLATE utf8mb4_bin`
+    // stopped folding on the interpreted path and kept folding here,
+    // and here is the path a projection takes — so the fix looked like
+    // it had not landed at all. Same shape as `collation_server` and
+    // `version` answering from two tables.
+    text_compare_of(lhs, rhs, ctx).fold_case
 }
 
 /// Is this expression coerced to the binary collation — `BINARY x` or
