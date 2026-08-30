@@ -2728,7 +2728,15 @@ pub(crate) fn persist_wire_write(
         if *modified_catalog && state.audit_path.is_some() {
             crate::append_audit_pub(state, sql)?;
         }
-        crate::append_wal(state, sql, crate::session_sync_commit(state) && !in_tx)?;
+        // v7.39.2 — the dialect travels with the statement; see
+        // `append_wal_dialect`.
+        let mysql = state.engine.read().is_ok_and(|e| e.in_mysql_dialect());
+        crate::wal::append_wal_dialect(
+            state,
+            sql,
+            crate::session_sync_commit(state) && !in_tx,
+            mysql,
+        )?;
     } else if *modified_catalog && state.db_path.is_some() {
         // No-WAL mode: capture the current committed state.
         let bytes = state

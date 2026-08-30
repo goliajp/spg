@@ -81,6 +81,23 @@ pub(crate) const WAL_V3_TYPE_DURABILITY_CHECKPOINT: u8 = 0x02;
 /// `spg_crypto::lzss::compress(sql.as_bytes())`. Replay decompresses
 /// and routes through `Engine::execute` exactly like type 0x01.
 pub(crate) const WAL_V3_TYPE_COMPRESSED_SQL: u8 = 0x03;
+/// v7.39.2 — an auto-commit statement executed in the MySQL DIALECT.
+///
+/// Recovery replays the SQL TEXT, and the recovering engine speaks
+/// PostgreSQL, so every MySQL-only marker a column carries was parsed
+/// away: measured on 7.39.1, `TINYINT` came back `smallint`, `MEDIUMINT`
+/// came back `int`, a declared `TIMESTAMP` came back `datetime`, and
+/// `DATETIME(3)` lost its fractional-seconds precision and started
+/// storing microseconds. A `mysqldump` taken after a bounce wrote a
+/// DIFFERENT schema from the one that was created, and nothing said so.
+///
+/// The payload is `[u8 algo][bytes]` — algo `0x00` raw, `0x01` LZSS —
+/// so one tag covers both the compressed and uncompressed cases. A
+/// PostgreSQL session still writes 0x01 / 0x03 exactly as before, so a
+/// WAL from a PG-only deployment is byte-identical to 7.39.1's.
+pub(crate) const WAL_V3_TYPE_MYSQL_SQL: u8 = 0x04;
+/// The `algo` byte for an uncompressed `WAL_V3_TYPE_MYSQL_SQL` payload.
+pub(crate) const WAL_COMPRESS_ALGO_NONE: u8 = 0x00;
 pub(crate) const WAL_COMPRESS_ALGO_LZSS: u8 = 0x01;
 /// Compression threshold (bytes). SQL payloads smaller than this
 /// skip the encoder — LZSS overhead doesn't pay off below ~256 B.
@@ -140,6 +157,43 @@ pub(crate) fn encode_wal_v3_record(type_tag: u8, payload: &[u8]) -> std::io::Res
 /// v6.6.3 — increments `Metrics.wal_bytes_uncompressed_in` and
 /// `wal_bytes_compressed_out` so the `/metrics` endpoint can
 /// derive the live ratio.
+/// v7.39.2 — `mysql` says the statement ran in the MySQL dialect, so
+/// recovery can parse it the same way it was parsed the first time.
+pub(crate) fn encode_wal_auto_commit_sql_mysql(
+    sql: &str,
+    metrics: &observability::Metrics,
+) -> std::io::Result<Vec<u8>> {
+    use std::sync::atomic::Ordering;
+    metrics
+        .wal_bytes_uncompressed_in
+        .fetch_add(sql.len() as u64, Ordering::Relaxed);
+    let threshold = wal_compression_min_bytes();
+    let payload = if !wal_compression_enabled() || sql.len() < threshold {
+        let mut p = Vec::with_capacity(1 + sql.len());
+        p.push(WAL_COMPRESS_ALGO_NONE);
+        p.extend_from_slice(sql.as_bytes());
+        p
+    } else {
+        let compressed = spg_crypto::lzss::compress(sql.as_bytes());
+        if compressed.len() + 1 >= sql.len() {
+            let mut p = Vec::with_capacity(1 + sql.len());
+            p.push(WAL_COMPRESS_ALGO_NONE);
+            p.extend_from_slice(sql.as_bytes());
+            p
+        } else {
+            let mut p = Vec::with_capacity(1 + compressed.len());
+            p.push(WAL_COMPRESS_ALGO_LZSS);
+            p.extend_from_slice(&compressed);
+            p
+        }
+    };
+    let out = encode_wal_v3_record(WAL_V3_TYPE_MYSQL_SQL, &payload)?;
+    metrics
+        .wal_bytes_compressed_out
+        .fetch_add(out.len() as u64, Ordering::Relaxed);
+    Ok(out)
+}
+
 pub(crate) fn encode_wal_auto_commit_sql_metrics(
     sql: &str,
     metrics: &observability::Metrics,
@@ -923,8 +977,12 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                 // statement can't be rolled back individually after
                 // the fact (the old tx wrap could). A failed encode
                 // now skips the task with zero side effects.
-                let wal_bytes = match encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
-                {
+                let encoded = if task.mysql {
+                    encode_wal_auto_commit_sql_mysql(&task.sql, &state.metrics)
+                } else {
+                    encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
+                };
+                let wal_bytes = match encoded {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = task.ack.send(CommitResult {
@@ -1135,11 +1193,35 @@ pub(crate) fn wal_fsync_now(state: &ServerState) -> std::io::Result<()> {
 }
 
 pub(crate) fn append_wal(state: &ServerState, sql: &str, sync: bool) -> std::io::Result<()> {
+    append_wal_dialect(state, sql, sync, false)
+}
+
+/// v7.39.2 — `mysql` records that the statement ran in the MySQL
+/// dialect, so recovery re-parses it the same way.
+///
+/// Recovery replays the SQL TEXT and the recovering engine speaks
+/// PostgreSQL, so `CREATE TABLE t (a TINYINT)` from a MySQL session
+/// came back as `smallint` — in `SHOW CREATE TABLE`, in `DESCRIBE` and
+/// in `information_schema` alike. Measured on 7.39.1, together with
+/// `MEDIUMINT` → `int`, a declared `TIMESTAMP` → `datetime`, and
+/// `DATETIME(3)` losing its precision and storing microseconds again.
+/// A `mysqldump` taken after a bounce wrote a different schema from the
+/// one that had been created, and nothing said so.
+pub(crate) fn append_wal_dialect(
+    state: &ServerState,
+    sql: &str,
+    sync: bool,
+    mysql: bool,
+) -> std::io::Result<()> {
     let Some(wal) = state.wal.as_ref() else {
         return Ok(());
     };
     WAL_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let entry = encode_wal_record(sql)?;
+    let entry = if mysql {
+        encode_wal_auto_commit_sql_mysql(sql, &state.metrics)?
+    } else {
+        encode_wal_record(sql)?
+    };
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
@@ -1280,6 +1362,38 @@ pub(crate) fn dispatch_v3_record(
                 std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
             })?;
             replay_execute_quarantining(engine, sql, frame_off);
+            Ok(true)
+        }
+        WAL_V3_TYPE_MYSQL_SQL => {
+            // v7.39.2 — replay it in the dialect it was written in, so
+            // the column markers a MySQL CREATE TABLE carries survive
+            // recovery. The dialect is restored afterwards: the frames
+            // are replayed onto ONE engine and the next one may be a
+            // PostgreSQL statement.
+            if payload.is_empty() {
+                return Err(std::io::Error::other(format!(
+                    "WAL mysql_sql at offset {frame_off}: empty payload"
+                )));
+            }
+            let raw = match payload[0] {
+                WAL_COMPRESS_ALGO_NONE => payload[1..].to_vec(),
+                WAL_COMPRESS_ALGO_LZSS => {
+                    spg_crypto::lzss::decompress(&payload[1..]).map_err(|e| {
+                        std::io::Error::other(format!("WAL mysql_sql at offset {frame_off}: {e:?}"))
+                    })?
+                }
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "WAL mysql_sql at offset {frame_off}: unknown algo {other:#x}"
+                    )));
+                }
+            };
+            let sql = core::str::from_utf8(&raw)
+                .map_err(|_| std::io::Error::other("v3 mysql_sql payload has non-UTF-8 SQL"))?;
+            let was = engine.in_mysql_dialect();
+            engine.set_mysql_dialect(true);
+            replay_execute_quarantining(engine, sql, frame_off);
+            engine.set_mysql_dialect(was);
             Ok(true)
         }
         WAL_V3_TYPE_COMPRESSED_SQL => {
@@ -1579,5 +1693,108 @@ mod wal_sync_tests {
         f.sync_data().expect("the strict primitive still works too");
         assert_eq!(std::fs::read(&path).unwrap(), b"barrier-me");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod wal_mysql_dialect_tests {
+    use super::{
+        Engine, WAL_COMPRESS_ALGO_NONE, WAL_V3_TYPE_AUTO_COMMIT_SQL, WAL_V3_TYPE_MYSQL_SQL,
+        encode_wal_v3_record, replay_wal_bytes,
+    };
+
+    fn show_create(e: &mut Engine, table: &str) -> String {
+        match e.execute(&format!("SHOW CREATE TABLE {table}")) {
+            Ok(spg_engine::QueryResult::Rows { rows, .. }) => {
+                spg_engine::eval::value_to_text(&rows[0].values[1])
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const DDL: &str = "CREATE TABLE w (t TINYINT, m MEDIUMINT, ts TIMESTAMP NULL, d DATETIME(3))";
+
+    /// v7.39.2 — recovery replays the SQL TEXT, so the dialect has to
+    /// travel with it.
+    ///
+    /// Measured on 7.39.1: after a restart that replayed the WAL, a
+    /// MySQL `TINYINT` column read back `smallint`, `MEDIUMINT` read
+    /// `int`, a declared `TIMESTAMP` read `datetime`, and `DATETIME(3)`
+    /// had lost its fractional-seconds precision and stored microseconds
+    /// again. A `mysqldump` taken after a bounce wrote a different
+    /// schema from the one that had been created, and nothing said so.
+    #[test]
+    fn a_mysql_ddl_replays_in_the_dialect_it_was_written_in() {
+        let mut payload = alloc_payload(DDL);
+        let frame = encode_wal_v3_record(WAL_V3_TYPE_MYSQL_SQL, &payload).expect("encode");
+        payload.clear();
+        let mut e = Engine::new();
+        replay_wal_bytes(&frame, &mut e).expect("replay");
+        let ddl = show_create(&mut e, "w");
+        for want in [
+            "`t` tinyint",
+            "`m` mediumint",
+            "`ts` timestamp",
+            "`d` datetime(3)",
+        ] {
+            assert!(ddl.contains(want), "missing {want}:\n{ddl}");
+        }
+    }
+
+    /// The control that names the mechanism: the SAME text replayed
+    /// through the dialect-less frame loses every one of those markers.
+    /// That is what 7.39.1 did to a MySQL DDL, and it is still what a
+    /// PostgreSQL statement's frame means.
+    #[test]
+    fn the_dialect_less_frame_is_what_lost_them() {
+        let frame =
+            encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, DDL.as_bytes()).expect("encode");
+        let mut e = Engine::new();
+        replay_wal_bytes(&frame, &mut e).expect("replay");
+        let ddl = show_create(&mut e, "w");
+        assert!(!ddl.contains("tinyint"), "{ddl}");
+        assert!(!ddl.contains("mediumint"), "{ddl}");
+    }
+
+    /// And the dialect does not leak into the frames after it: they are
+    /// replayed onto ONE engine.
+    #[test]
+    fn the_dialect_does_not_leak_past_its_frame() {
+        let mut bytes =
+            encode_wal_v3_record(WAL_V3_TYPE_MYSQL_SQL, &alloc_payload(DDL)).expect("encode");
+        bytes.extend_from_slice(
+            &encode_wal_v3_record(WAL_V3_TYPE_AUTO_COMMIT_SQL, b"CREATE TABLE p (a SMALLINT)")
+                .expect("encode"),
+        );
+        let mut e = Engine::new();
+        replay_wal_bytes(&bytes, &mut e).expect("replay");
+        assert!(!e.in_mysql_dialect(), "the dialect outlived its frame");
+    }
+
+    /// v7.39.2 — the WRITE side picks the dialect-carrying frame.
+    ///
+    /// The two tests above build the frame by hand, so ablating the
+    /// CHOICE — `in_mysql_dialect()` at the persist site — left them
+    /// green. This pins the encoder that choice reaches for: a MySQL
+    /// statement gets type 0x04, a PostgreSQL one keeps 0x01, and a
+    /// PG-only deployment's WAL is therefore byte-identical to 7.39.1's.
+    #[test]
+    fn the_mysql_encoder_writes_its_own_frame_type() {
+        let m = crate::observability::Metrics::default();
+        let mysql = super::encode_wal_auto_commit_sql_mysql("SELECT 1", &m).expect("encode");
+        let pg = super::encode_wal_auto_commit_sql_metrics("SELECT 1", &m).expect("encode");
+        // `[u32 len|sentinel][u32 crc][u8 type]…`
+        assert_eq!(mysql[8], WAL_V3_TYPE_MYSQL_SQL, "{mysql:?}");
+        assert_eq!(pg[8], WAL_V3_TYPE_AUTO_COMMIT_SQL, "{pg:?}");
+        // And the MySQL payload carries its algo byte before the SQL.
+        assert_eq!(mysql[9], WAL_COMPRESS_ALGO_NONE);
+        assert_eq!(&mysql[10..], b"SELECT 1");
+    }
+
+    fn alloc_payload(sql: &str) -> Vec<u8> {
+        let mut p = Vec::with_capacity(1 + sql.len());
+        p.push(WAL_COMPRESS_ALGO_NONE);
+        p.extend_from_slice(sql.as_bytes());
+        p
     }
 }

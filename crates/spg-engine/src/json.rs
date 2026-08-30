@@ -3524,8 +3524,9 @@ fn format_value_as_text(v: &Value) -> String {
 ///   * Type mismatch (e.g. step on a scalar) → no-op (PG semantics).
 pub fn set(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("jsonb_set() takes 3 or 4 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("jsonb_set"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().take(3).any(|v| matches!(v, Value::Null)) {
@@ -3577,8 +3578,9 @@ pub fn delete_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 
 fn delete_path_inner(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("jsonb_delete_path() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("jsonb_delete_path"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -3715,8 +3717,9 @@ fn resolve_array_index(step: &str, len: usize) -> Option<usize> {
 ///     has no effect for objects.
 pub fn insert(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(3..=4).contains(&args.len()) {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("jsonb_insert() takes 3 or 4 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("jsonb_insert"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().take(3).any(|v| matches!(v, Value::Null)) {
@@ -4153,11 +4156,9 @@ pub fn mysql_path_get<'a>(doc: &'a JsonValue, steps: &[MysqlPathStep]) -> Option
 /// when none did).
 pub fn mysql_json_extract(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "json_extract() takes a document and at least one path, got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_extract"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4215,11 +4216,9 @@ pub fn mysql_json_extract(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 /// 'one'|'all', path...).
 pub fn mysql_json_contains_path(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "json_contains_path() takes a document, one/all, and at least one path, got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_contains_path"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4371,11 +4370,9 @@ fn mysql_json_mutate(
     fn_name: &str,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() < 3 || args.len() % 2 == 0 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "{fn_name}() takes a document plus (path, value) pairs, got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(args[0], Value::Null) {
@@ -4438,11 +4435,9 @@ pub fn mysql_json_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalErro
 /// Removing the root path `$` errors, as in MySQL.
 pub fn mysql_json_remove(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "json_remove() takes a document and at least one path, got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_remove"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4541,11 +4536,9 @@ fn mysql_doc_and_pairs<'a>(
     fn_name: &str,
 ) -> Result<Option<(JsonValue, &'a [Value<'a>])>, EvalError> {
     if args.len() < 3 || args.len() % 2 == 0 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "{fn_name}() takes a document plus (path, value) pairs, got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4672,8 +4665,9 @@ fn mysql_contains(target: &JsonValue, cand: &JsonValue) -> bool {
 /// [, path]).
 pub fn mysql_json_contains(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !matches!(args.len(), 2 | 3) {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("json_contains() takes 2 or 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_contains"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4780,8 +4774,9 @@ fn mysql_json_merge(
     combine: fn(JsonValue, JsonValue) -> JsonValue,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("{fn_name}() takes at least 2 documents, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(fn_name),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4830,8 +4825,9 @@ pub fn mysql_json_merge_preserve(args: &[Value<'_>]) -> Result<Value<'static>, E
 /// compare equal; an array vs a scalar checks membership.
 pub fn mysql_json_overlaps(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("json_overlaps() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_overlaps"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -4918,11 +4914,9 @@ fn push_path_step(out: &mut String, step_key: Option<&str>, step_idx: Option<usi
 /// optional path args narrow where the walk starts.
 pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!(
-                "json_search() takes doc, one/all, pattern [, escape [, path...]], got {} args",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_search"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args[..3].iter().any(|a| matches!(a, Value::Null)) {
@@ -5051,8 +5045,9 @@ pub fn mysql_json_search(args: &[Value<'_>]) -> Result<Value<'static>, EvalError
 /// NULL. The RETURNING clause is parser syntax and queued.
 pub fn mysql_json_value(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("json_value() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("json_value"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {

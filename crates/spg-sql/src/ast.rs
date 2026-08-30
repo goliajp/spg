@@ -2739,6 +2739,10 @@ pub struct ColumnDef {
     /// can pad. None under the PG dialect, where temporal columns keep full
     /// microseconds.
     pub mysql_fsp: Option<u8>,
+    /// v7.39.2 — the column was written `TIMESTAMP` rather than
+    /// `DATETIME` in a MySQL session. The engine copies it to
+    /// `ColumnSchema.mysql_declared_timestamp` at CREATE TABLE.
+    pub mysql_declared_timestamp: bool,
 }
 
 /// v7.17.0 Phase 2.5 — text collation classification surfaced

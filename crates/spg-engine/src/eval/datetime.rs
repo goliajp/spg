@@ -453,8 +453,9 @@ fn civil_components(days: i32) -> (i32, u32, u32) {
 pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use spg_sql::ast::ExtractField as F;
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("date_part() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("date_part"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
@@ -557,8 +558,9 @@ pub(super) fn date_part(args: &[Value<'_>]) -> Result<Value<'static>, EvalError>
 /// explicitly so the clock reference is visible at the SQL layer.
 pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.is_empty() || args.len() > 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("age() takes 1 or 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("age"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -700,8 +702,9 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 pub(super) fn date_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     use core::fmt::Write as _;
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("date_format() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("date_format"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
@@ -1054,8 +1057,9 @@ fn reckon_week(days: i32, start: u32) -> (i32, u32) {
 /// this arm.
 pub(super) fn unix_timestamp_of(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 1 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("unix_timestamp() takes 0 or 1 arg, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("unix_timestamp"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     match &args[0] {
@@ -1123,8 +1127,9 @@ fn text_unix_seconds(t: &str) -> Value<'static> {
 /// applies MySQL date_format on top, returning TEXT.
 pub(super) fn from_unixtime(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if !(1..=2).contains(&args.len()) {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("from_unixtime() takes 1 or 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("from_unixtime"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|v| matches!(v, Value::Null)) {
@@ -1197,8 +1202,9 @@ pub(super) fn date_trunc(
         return Ok(Value::Timestamp(utc));
     }
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("date_trunc() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("date_trunc"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
@@ -1348,8 +1354,9 @@ pub(super) fn date_trunc(
 /// TIMESTAMP.
 pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("str_to_date() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("str_to_date"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
@@ -1575,8 +1582,9 @@ pub(super) fn str_to_date_mysql(args: &[Value<'_>]) -> Result<Value<'static>, Ev
 /// time-of-day) or an 'HH:MM[:SS[.ffffff]]' text value.
 pub(super) fn time_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("time_format() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("time_format"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if matches!(&args[0], Value::Null) || matches!(&args[1], Value::Null) {
@@ -1733,8 +1741,9 @@ fn add_months(ts: i64, n: i64) -> i64 {
 /// The parser lowers the bare unit keyword onto a string literal.
 pub(super) fn timestampadd_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("timestampadd() takes 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("timestampadd"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1784,8 +1793,9 @@ pub(super) fn timestampadd_mysql(args: &[Value<'_>]) -> Result<Value<'static>, E
 /// the count of COMPLETE units from `from` to `to` (signed).
 pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("timestampdiff() takes 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("timestampdiff"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1842,8 +1852,9 @@ pub(super) fn timestampdiff_mysql(args: &[Value<'_>]) -> Result<Value<'static>, 
 /// keyword onto a string literal.
 pub(super) fn get_format_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("get_format() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("get_format"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1893,8 +1904,9 @@ pub(super) fn timezone_pg(
     ctx: &super::EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() != 2 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("timezone() takes 2 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("timezone"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -2129,8 +2141,9 @@ fn parse_tz_offset(s: &str) -> Option<i64> {
 /// aren't loaded (SPG carries no tzdata).
 pub(super) fn convert_tz_mysql(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("convert_tz() takes 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("convert_tz"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {

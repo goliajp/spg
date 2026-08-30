@@ -1879,8 +1879,9 @@ pub(super) fn regexp_matches(args: &[Value<'_>]) -> Result<Value<'static>, EvalE
             )
         }
         n => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("regexp_matches() takes 2 or 3 args, got {n}"),
+            return Err(EvalError::WrongArity {
+                name: alloc::string::String::from("regexp_matches"),
+                types: crate::eval::functions::arg_type_list(args),
             });
         }
     };
@@ -1939,8 +1940,9 @@ pub(crate) fn regexp_matches_rows(args: &[Value<'_>]) -> Result<Vec<Value<'stati
             )
         }
         n => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("regexp_matches() takes 2 or 3 args, got {n}"),
+            return Err(EvalError::WrongArity {
+                name: alloc::string::String::from("regexp_matches"),
+                types: crate::eval::functions::arg_type_list(args),
             });
         }
     };
@@ -1985,8 +1987,9 @@ pub(super) fn regexp_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
     let (text, pat) = match args.len() {
         2 | 3 => (text_arg(&args[0])?, text_arg(&args[1])?),
         n => {
-            return Err(EvalError::TypeMismatch {
-                detail: alloc::format!("regexp_match() takes 2 or 3 args, got {n}"),
+            return Err(EvalError::WrongArity {
+                name: alloc::string::String::from("regexp_match"),
+                types: crate::eval::functions::arg_type_list(args),
             });
         }
     };
@@ -2030,8 +2033,9 @@ pub(super) fn regexp_match(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 /// every match from `start`; N >= 1 replaces exactly the Nth.
 pub(super) fn regexp_replace(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 3 || args.len() > 6 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_replace() takes 3-6 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_replace"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2212,8 +2216,9 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
     // regexp function here already takes; only the two-argument form
     // existed, so `regexp_split_to_array(s, p, 'i')` was an arity error.
     if args.len() != 2 && args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_split_to_array() takes 2-3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_split_to_array"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2260,8 +2265,9 @@ pub(super) fn regexp_split_to_array(args: &[Value<'_>]) -> Result<Value<'static>
 /// Returns 0 if no match.
 pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 7 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_instr() takes 2-7 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_instr"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2375,8 +2381,9 @@ pub(super) fn regexp_instr(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
 /// Returns NULL if no match.
 pub(super) fn regexp_substr(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 5 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_substr() takes 2-5 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_substr"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2492,8 +2499,9 @@ pub(crate) fn compiled_is_match(re: &CompiledRe, text: &str) -> Result<bool, Eva
 
 pub(super) fn regexp_like(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_like() takes 2 or 3 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_like"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;
@@ -2597,8 +2605,9 @@ fn fold_case(node: &mut ReNode) {
 /// ignored — SPG's re engine has no case-insensitive flag).
 pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
     if args.len() < 2 || args.len() > 4 {
-        return Err(EvalError::TypeMismatch {
-            detail: alloc::format!("regexp_count() takes 2-4 args, got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("regexp_count"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     let text = text_arg(&args[0])?;

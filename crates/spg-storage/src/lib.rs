@@ -1735,6 +1735,24 @@ pub struct ColumnSchema {
     /// Persisted in the FILE_VERSION 82+ sparse appendix; older catalogs
     /// deserialise as None.
     pub mysql_fsp: Option<u8>,
+    /// v7.39.2 — this column was DECLARED `TIMESTAMP` in a MySQL
+    /// session.
+    ///
+    /// MySQL and MariaDB both keep `timestamp` and `datetime` apart in
+    /// `SHOW CREATE TABLE`, `SHOW COLUMNS` and `information_schema`
+    /// (measured on 9.7.2 and 12.3.3); SPG stores both as
+    /// `DataType::Timestamp` and so reported `datetime` for both. A
+    /// client dumping and reloading had the column's declared type
+    /// SILENTLY CHANGED — and MySQL's TIMESTAMP is not DATETIME: it has
+    /// a different range and converts to and from UTC.
+    ///
+    /// What this records is the SPELLING, which is the half a dump
+    /// round-trips. The storage and the semantics are unchanged, and
+    /// that gap is written down rather than papered over.
+    ///
+    /// Persisted in the FILE_VERSION 93+ sparse appendix; older
+    /// catalogs deserialise as `false`.
+    pub mysql_declared_timestamp: bool,
 }
 
 /// v7.17.0 Phase 2.5 — column-level text collation. Drives the
@@ -8996,6 +9014,7 @@ impl ColumnSchema {
             scalar_row_source: false,
             mysql_int_width: None,
             mysql_fsp: None,
+            mysql_declared_timestamp: false,
         }
     }
 
@@ -9387,7 +9406,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 92;
+const FILE_VERSION: u8 = 93;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -10296,6 +10315,25 @@ impl Catalog {
             for (pos, fsp) in fsps {
                 write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
                 out.push(fsp);
+            }
+            // v7.39.2 — the declared-TIMESTAMP appendix (FILE_VERSION
+            // 93+). Sparse: only the columns written as `TIMESTAMP` in a
+            // MySQL session. Layout: `[u16 count]([u16 col_pos]) × count`.
+            // v92-and-below readers stop after the CHECK appendix below,
+            // leaving every column at `false` — which is what they meant.
+            let declared_ts: Vec<usize> = t
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.mysql_declared_timestamp.then_some(i))
+                .collect();
+            write_u16(
+                &mut out,
+                u16::try_from(declared_ts.len()).expect("≤ 65k timestamp columns/table"),
+            );
+            for pos in declared_ts {
+                write_u16(&mut out, u16::try_from(pos).expect("≤ 65k columns/table"));
             }
             // v7.39 (round 652) — CHECK-validated appendix (FILE_VERSION
             // 87+). Sparse the other way round from the ones above: the

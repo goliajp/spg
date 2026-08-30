@@ -1027,6 +1027,7 @@ mod e2e_with_reloptions;
 mod e2e_with_rollup_round472;
 mod e2e_work_mem_verified_round555;
 mod e2e_write_skew_round552;
+mod e2e_wrong_arity_v7392;
 mod e2e_xact_id_probes;
 mod e2e_xid_operators_round641;
 mod e2e_xid_type_round640;

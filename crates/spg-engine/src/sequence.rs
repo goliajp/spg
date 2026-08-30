@@ -738,10 +738,13 @@ impl Engine {
             }
             "setval" => {
                 if args.len() < 2 || args.len() > 3 {
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "setval() takes 2 or 3 arguments, got {}",
-                        args.len()
-                    )));
+                    return Err(EngineError::Unsupported(
+                        // v7.39.2 — the ONE arity site that keeps its own
+                        // sentence: this check runs before evaluation, on
+                        // unevaluated `Expr`s, so it cannot name the
+                        // argument types PostgreSQL's message carries.
+                        alloc::format!("setval() takes 2 or 3 arguments, got {}", args.len()),
+                    ));
                 }
                 let value = match &args[1] {
                     Expr::Literal(spg_sql::ast::Literal::Integer(n)) => *n,

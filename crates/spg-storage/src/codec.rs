@@ -65,6 +65,7 @@ pub(crate) fn deserialize_table(
             scalar_row_source: false,
             mysql_int_width: None,
             mysql_fsp: None,
+            mysql_declared_timestamp: false,
         });
     }
     let n_cols = cols.len();
@@ -587,6 +588,16 @@ pub(crate) fn deserialize_table(
             }
             if let Some(col) = t.schema_mut().columns.get_mut(pos) {
                 col.mysql_fsp = Some(fsp);
+            }
+        }
+    }
+    // v7.39.2 — the declared-TIMESTAMP appendix (FILE_VERSION 93+).
+    if version >= 93 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let pos = cur.read_u16()? as usize;
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.mysql_declared_timestamp = true;
             }
         }
     }

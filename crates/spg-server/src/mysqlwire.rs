@@ -971,7 +971,11 @@ fn now_micros() -> i64 {
 /// MariaDB's own codes, measured against MariaDB 11:
 ///   * `KILL <unknown id>` → `ERROR 1094 (HY000) Unknown thread id: N`
 ///   * `KILL <own id>`     → `ERROR 1927 (70100) Connection was killed`
-fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String) {
+/// v7.39.2 — `db` is the session's current database, which MySQL puts
+/// in its unknown-function sentence: `FUNCTION testdb.nosuchfn does not
+/// exist` (measured on 9.7.2, and it qualifies an explicitly-qualified
+/// call with the schema written).
+fn mysql_error_parts(e: &spg_engine::EngineError, db: &str) -> (u16, &'static str, String) {
     match e {
         spg_engine::EngineError::UnknownThreadId(_) => (1094, "HY000", e.to_string()),
         spg_engine::EngineError::ConnectionKilled => (1927, "70100", e.to_string()),
@@ -1035,7 +1039,33 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
             if detail.starts_with("function ") && detail.ends_with(" does not exist") =>
         {
-            (1305, "42000", detail.clone())
+            // v7.39.2 — MySQL's own sentence. The comment here used to
+            // say SPG keeps its own because it "names the argument types
+            // and so says more about why nothing matched" — which is a
+            // reason to prefer SPG's answer over the one the client
+            // asked for. Measured on 9.7.2: `FUNCTION testdb.nosuchfn
+            // does not exist`, upper-case FUNCTION, schema-qualified,
+            // no types. An already-qualified call keeps the schema it
+            // was written with.
+            let bare = detail
+                .trim_start_matches("function ")
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim();
+            // A session that never named a database still has one:
+            // SPG serves a single database under whatever name, and
+            // `spg` is what it answers to by default. MySQL refuses the
+            // statement outright there (1046, "No database selected"),
+            // which SPG has no reason to copy.
+            let shown = if bare.contains('.') {
+                bare.to_string()
+            } else if db.is_empty() {
+                format!("spg.{bare}")
+            } else {
+                format!("{db}.{bare}")
+            };
+            (1305, "42000", format!("FUNCTION {shown} does not exist"))
         }
         // v7.39.2 — a collation name MySQL does not have. The engine
         // words it as MySQL 9.7.2 does when the session is MySQL
@@ -1091,6 +1121,21 @@ fn mysql_error_parts(e: &spg_engine::EngineError) -> (u16, &'static str, String)
         // therefore labelled `'field list'` where MySQL would say
         // `'where clause'` — the number, the SQLSTATE and the column
         // name are right, the clause is not, and that is recorded.
+        // v7.39.2 — a built-in called with the wrong NUMBER of
+        // arguments. MySQL 9.7.2 numbers this 1582 and words it without
+        // types, and it is a DIFFERENT number from 1305, which is the
+        // one for a name MySQL does not know — PostgreSQL gives both
+        // the same sentence, so only a distinct variant can tell them
+        // apart here. Measured: `SELECT LOWER()` and `SELECT LOWER(1,2)`
+        // both answer 1582.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::WrongArity { name, .. }) => (
+            1582,
+            "42000",
+            format!(
+                "Incorrect parameter count in the call to native function '{}'",
+                name.to_uppercase()
+            ),
+        ),
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::ColumnNotFound { name }) => (
             1054,
             "42S22",
@@ -1392,7 +1437,18 @@ fn handle_com_query(
     );
     match outcome {
         Err(e) => {
-            let (errno, sqlstate, msg) = mysql_error_parts(&e);
+            // v7.39.2 — the session's database has ONE home, and it is
+            // the engine's `spg.database` GUC: `USE` writes there and
+            // the wire's own `conn_state.database` copy is only written
+            // by COM_INIT_DB, so reading that copy answered `spg` for a
+            // connection that had said `USE testdb`.
+            let db = {
+                let eng = state.engine.read().expect("engine");
+                eng.session_param("spg.database")
+                    .unwrap_or("spg")
+                    .to_string()
+            };
+            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db);
             write_packet(
                 stream,
                 start_seqno,
@@ -1569,6 +1625,9 @@ fn handle_com_stmt_prepare(
             // wire-correct. EXECUTE then dispatches on the
             // type byte the client sent.
             let placeholder = ColumnSchema {
+                // v7.39.2 — a prepared-statement placeholder has no
+                // declared spelling.
+                mysql_declared_timestamp: false,
                 collation_name: None,
                 user_composite_type: None,
                 acl: Vec::new(),
@@ -1737,7 +1796,18 @@ fn handle_com_stmt_execute(
     };
     match outcome {
         Err(e) => {
-            let (errno, sqlstate, msg) = mysql_error_parts(&e);
+            // v7.39.2 — the session's database has ONE home, and it is
+            // the engine's `spg.database` GUC: `USE` writes there and
+            // the wire's own `conn_state.database` copy is only written
+            // by COM_INIT_DB, so reading that copy answered `spg` for a
+            // connection that had said `USE testdb`.
+            let db = {
+                let eng = state.engine.read().expect("engine");
+                eng.session_param("spg.database")
+                    .unwrap_or("spg")
+                    .to_string()
+            };
+            let (errno, sqlstate, msg) = mysql_error_parts(&e, &db);
             write_packet(
                 stream,
                 start_seqno,
