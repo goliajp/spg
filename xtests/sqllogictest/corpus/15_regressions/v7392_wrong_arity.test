@@ -1,0 +1,51 @@
+# v7.39.2 — a built-in called with the wrong number of arguments.
+#
+# SPG answered its own arithmetic — `lower() takes 1 arg, got 0` — at
+# 339 sites across ten files. PostgreSQL 18.6 names the signature it
+# could not match, and makes no distinction between a missing FUNCTION
+# and a missing OVERLOAD: `nosuchfn(text, integer, date)` and
+# `lower(text, integer)` get the identical sentence.
+
+# The runner asserts THAT a statement errors, not its wording; the exact
+# sentences above are pinned in the Rust e2e suite, where an ablation can
+# bite them. What this file adds is the SQL itself, running in the gate.
+
+statement ok
+CREATE TABLE ar (t TEXT, n INT, f FLOAT)
+
+statement ok
+INSERT INTO ar VALUES ('a', 1, 1.5)
+
+# expects: function lower() does not exist
+statement error
+SELECT lower()
+
+# expects: function lower(text, integer) does not exist
+statement error
+SELECT lower(t, n) FROM ar
+
+# expects: function substr(text) does not exist
+statement error
+SELECT substr(t) FROM ar
+
+# expects: function round(double precision, integer, text) does not exist
+statement error
+SELECT round(f, n, t) FROM ar
+
+# The four that once took the whole process down (round 636).
+# expects: function microsecond() does not exist
+statement error
+SELECT microsecond()
+
+# expects: function obj_description() does not exist
+statement error
+SELECT obj_description()
+
+# The control: the right arity still runs.
+query T
+SELECT lower(t) FROM ar
+----
+a
+
+statement ok
+DROP TABLE ar

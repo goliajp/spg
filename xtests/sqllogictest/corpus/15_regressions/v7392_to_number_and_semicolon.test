@@ -1,0 +1,27 @@
+# v7.39.2 — two PostgreSQL wordings the differential corpus carried as
+# accepted divergences until this version.
+#
+# `to_number` extracts per the format and hands the leftover to
+# `numeric_in`, which fails on the blank it is given — one space,
+# whatever the input and whatever the format width (measured on 18.6
+# with '9', '999' and '99999'). SPG said `to_number(): could not parse
+# "x"`, which is its own sentence, not PostgreSQL's.
+
+# expects: invalid input syntax for type numeric: " "
+statement error
+SELECT to_number('x','999')
+
+# expects: invalid input syntax for type numeric: " "
+statement error
+SELECT to_number('abc','99999')
+
+# The ones that DO extract digits still answer.
+query I
+SELECT to_number('12x','999')
+----
+12
+
+query I
+SELECT to_number('1,2','9,9')
+----
+12
