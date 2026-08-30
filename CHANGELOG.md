@@ -39,11 +39,9 @@ the current build; this file is a release-organized view.
   identifier is case-SENSITIVE there, and folding it would break every
   column that relies on the quotes.
 
-  Known gap: the DECLARED SPELLING is still not kept — `SHOW COLUMNS`
-  and `information_schema` report `mycol` for a column created
-  unquoted as `MyCol`, where MySQL reports `MyCol`. That is a schema-diff
-  nuisance rather than a broken query, and it needs the storage to carry
-  the written case.
+  (The declared SPELLING was still not kept at that point — `SHOW
+  COLUMNS` reported `mycol` for a column created unquoted as `MyCol`.
+  That is closed below.)
 
 - **A MySQL `FLOAT(m,d)` / `DOUBLE(m,d)` kept more precision than its
   schema said.** 7.39.2 made the syntax parse — before it,
@@ -109,6 +107,72 @@ the current build; this file is a release-organized view.
 
   A generated table nothing re-derives is a table that drifts, so
   `arity_table_is_current` re-derives it and fails on any difference.
+
+- **A MySQL client was answered in words MySQL does not use**, in six
+  places. Each `want` below was measured against MySQL 9.7.2 and
+  PostgreSQL 18.6 in their own containers.
+
+  - A **column keeps the spelling it was declared with**. `MyCol` folded
+    to `mycol` in `SHOW COLUMNS`, in `information_schema` and in
+    `SHOW CREATE TABLE` — every surface an ORM reads to diff a schema,
+    so the migration it generated dropped and re-added a column that had
+    never changed. (This closes the "Known gap" recorded above.)
+
+  - An unknown `ENGINE=` is **named back as written**:
+    `Unknown storage engine 'NoSuchEng'`. The lexer folds a bare
+    identifier, so the message quoted a name the dump did not contain —
+    the one thing that message is for.
+
+  - A **wrong argument count** gives PostgreSQL's sentence everywhere:
+    `function ltrim(unknown, unknown, unknown) does not exist`, and
+    errno **1582** on the MySQL wire. Fifteen files still wrote their
+    own arithmetic. Only the COUNT raises it — a right-count call with
+    wrong types keeps its own error, because 1582 reads *Incorrect
+    parameter count*, which would be a lie.
+
+  - A **syntax error gets MySQL's own sentence**: `You have an error in
+    your SQL syntax; … near '<the rest of the statement>' at line N`,
+    cut at 80 characters. SPG answered PostgreSQL's shape with MySQL's
+    errno stapled on, and 1064 is the error a MySQL user meets most
+    often.
+
+  - **`character_sets_dir` is answered.** It was omitted because SPG has
+    no such directory; what that weighed against was a different
+    *string*, while what a client got was `Unknown system variable`.
+
+  - **`SELECT 'a' 'b'` is named `a`.** It is one literal whose value is
+    `ab` on both engines, and MySQL labels it by the first segment as
+    written.
+
+  - A **bad bit-string literal points at itself**. These five errors
+    were raised at the token AFTER the literal, so PostgreSQL's caret
+    landed one token late and the MySQL wire — whose sentence quotes
+    the source from the reported position to the end — quoted nothing:
+    `SELECT x'123'` answered `near ''` where MySQL says `near 'x'123''`.
+    The sentence is PostgreSQL's too: `"g" is not a valid hexadecimal
+    digit`.
+
+- **`SET NAMES … COLLATE utf8mb4_bin` did not reach a literal.** It is
+  in the first packet of a MySQL client that wants byte comparison, and
+  SPG carried that collation as far as PADDING and no further: whether
+  to fold case read the DIALECT. Measured on MySQL 9.7.2 under that
+  session, `'AB' = 'ab'` is **0** and SPG answered 1 — a silent wrong
+  answer to a session that had asked, in its first packet, for the
+  opposite. `'a' < 'B'` is the same defect in ordering.
+
+  An explicit `COLLATE` outranks the session, and fixing the above
+  exposed the other direction: the parser had been DROPPING an explicit
+  `_ci` name in a MySQL session on the reasoning that the dialect folds
+  anyway — true until the fold started reading the session. A `_cs`
+  name is as case-sensitive as a `_bin` one; only `_bin` was recognised.
+
+  Found by two new three-engine differential fixtures (introducers, and
+  this), run against PostgreSQL 18.6 / MySQL 9.7.2 / MariaDB 12.3.3.
+  One of the three defects the first run exposed was in the harness
+  itself: it rendered SPG's booleans as `t`/`f` while standing in for a
+  MySQL session, where SPG's own MySQL wire sends `1`/`0` — so that
+  corpus could not hold a comparison, which is the one shape a
+  collation fixture is made of.
 
 ## [7.39.2] — 2026-08-30
 

@@ -1,0 +1,47 @@
+# v7.39.3 — a column keeps the spelling it was declared with.
+#
+# MySQL 9.7.2 reports `MyCol` for a column created unquoted as `MyCol`
+# (measured); SPG folded it, so every catalog surface an ORM reads to
+# diff a schema named a column the application had never written.
+#
+# This file runs on the PostgreSQL path, where the rule is the opposite
+# and must stay so: an unquoted name folds, a quoted one keeps its case
+# and needs the quotes back. That is the side a regression would break
+# silently, since the MySQL side has its own dialect pins.
+
+statement ok
+CREATE TABLE spell (MyCol INT, "KeepCase" INT)
+
+statement ok
+INSERT INTO spell VALUES (1, 2)
+
+# Unquoted folds, so every spelling of it resolves.
+query I
+SELECT mycol FROM spell
+----
+1
+
+query I
+SELECT MYCOL FROM spell
+----
+1
+
+# The quoted one keeps its case and does NOT answer to the folded form.
+query I
+SELECT "KeepCase" FROM spell
+----
+2
+
+statement error
+SELECT keepcase FROM spell
+
+# The catalog reports what was stored.
+query T
+SELECT column_name FROM information_schema.columns
+WHERE table_name = 'spell' ORDER BY ordinal_position
+----
+mycol
+KeepCase
+
+statement ok
+DROP TABLE spell

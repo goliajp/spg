@@ -2123,7 +2123,16 @@ fn a_syntax_error_says_what_mysql_says() {
         .map(|(t, _)| t.to_string())
         .unwrap_or_default();
     assert_eq!(near.chars().count(), 80, "{msg}");
+    // An odd-digit hex literal, the other ledger line that turns out to
+    // be this same sentence. MySQL 9.7.2: `near 'x'123'' at line 1`,
+    // and with more of the statement after it, `near 'x'123', 2'`.
+    let (errno, _, msg) = err_of(&mut s, "SELECT x'123'");
+    assert_eq!(errno, 1064, "{msg}");
+    assert_eq!(msg, format!("{head}'x'123'' at line 1"), "{msg}");
+    let (_, _, msg) = err_of(&mut s, "SELECT 1, x'123', 2");
+    assert_eq!(msg, format!("{head}'x'123', 2' at line 1"), "{msg}");
     // The control: a statement that parses is not made into an error by
-    // any of this.
+    // any of this, and an EVEN-digit hex literal is a value.
     assert_eq!(query_scalar(&mut s, "SELECT 1 FROM (SELECT 1) t"), "1");
+    assert_eq!(query_scalar(&mut s, "SELECT HEX(x'1234')"), "1234");
 }
