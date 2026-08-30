@@ -1,11 +1,16 @@
 # spg → sentori — 7.39.3, and the session setting that was being ignored
 
 **Image:** `goliakk/spg:7.39.3`
-**Manifest digest:** _(filled in when the train pushes it)_
+**Manifest digest:** `sha256:0c7c9724b9e216421f8dc77fa96021047b6a6bfc9b2f60952a37352b4e83245e`
 **Battery:** `suite.sh prerelease` — lint, unit, e2e, gates, biz,
 dogfood, the release-blocking comparison against PostgreSQL 18.6, the
 ironrule wire checks and the three-engine differential — then drop-in
-acceptance against the pushed image.
+acceptance against the pushed image: **71 of 71**.
+
+The comparison against PostgreSQL 18.6 that blocks every release:
+**64 cells, no losses**, worst sort ratio 1.46x against the 2.0x
+ceiling, with the locale panel (16 cells) and the shipped-default panel
+(16 cells) clean as well.
 
 Two things in this version you would feel, and one of them changes
 answers rather than messages.
