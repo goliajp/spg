@@ -1,0 +1,73 @@
+# v7.39.2 — what a MySQL session reads back about its own schema.
+#
+# `SELECT … FROM information_schema.tables WHERE table_schema =
+# DATABASE()` is THE reflection query on MySQL — Django's
+# introspection, Rails' schema dumper, every JDBC browser. SPG put
+# PostgreSQL's `public` in that column, so the query matched nothing
+# and reported an empty database.
+#
+# The rest is type fidelity: SPG spelled types as MariaDB does while
+# advertising itself as MySQL 9.7.2, stored a declared TIMESTAMP as
+# DATETIME, and widened a MySQL FLOAT to eight bytes. Every expectation
+# below is a MySQL 9.7.2 run.
+
+dialect mysql
+
+statement ok
+USE appdb
+
+statement ok
+CREATE TABLE cat (id INT AUTO_INCREMENT PRIMARY KEY, u VARCHAR(8) UNIQUE,
+                  n INT, f FLOAT, d DOUBLE, ts TIMESTAMP NULL, dt DATETIME(3))
+
+# The reflection query finds its tables, under the name this session
+# is using.
+query I
+SELECT COUNT(*) FROM information_schema.tables
+ WHERE table_schema = DATABASE() AND table_name = 'cat'
+----
+1
+
+# No integer display width: MySQL dropped it in 8.0.19, MariaDB kept
+# `int(11)`, and SPG says it is MySQL.
+query T
+SELECT column_type FROM information_schema.columns
+ WHERE table_name = 'cat' AND column_name = 'id'
+----
+int
+
+# A declared TIMESTAMP is not a DATETIME — a different range, and UTC
+# conversion on the way in and out.
+query T
+SELECT column_type FROM information_schema.columns
+ WHERE table_name = 'cat' AND column_name = 'ts'
+----
+timestamp
+
+# And a temporal type carries its declared precision.
+query T
+SELECT column_type FROM information_schema.columns
+ WHERE table_name = 'cat' AND column_name = 'dt'
+----
+datetime(3)
+
+# A MySQL FLOAT is FOUR bytes; PostgreSQL's is eight (it is float8's
+# spelling there). SPG used PostgreSQL's for both, so the column kept
+# precision MySQL discards.
+query T
+SELECT column_type FROM information_schema.columns
+ WHERE table_name = 'cat' AND column_name = 'f'
+----
+float
+
+# COLUMN_KEY, EXTRA and the length columns were absent entirely.
+query TTT
+SELECT column_key, extra, privileges FROM information_schema.columns
+ WHERE table_name = 'cat' AND column_name = 'id'
+----
+PRI
+auto_increment
+select,insert,update,references
+
+statement ok
+DROP TABLE cat
