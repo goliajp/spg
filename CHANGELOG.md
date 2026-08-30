@@ -10,6 +10,8 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.39.3] — 2026-08-31
+
 ### Fixed
 
 - **A table restored from a `mysqldump` had every mixed-case column
@@ -125,10 +127,10 @@ the current build; this file is a release-organized view.
 
   - A **wrong argument count** gives PostgreSQL's sentence everywhere:
     `function ltrim(unknown, unknown, unknown) does not exist`, and
-    errno **1582** on the MySQL wire. Fifteen files still wrote their
-    own arithmetic. Only the COUNT raises it — a right-count call with
-    wrong types keeps its own error, because 1582 reads *Incorrect
-    parameter count*, which would be a lie.
+    errno **1582** on the MySQL wire. Thirty-four sites across nine
+    files still wrote their own arithmetic. Only the COUNT raises it —
+    a right-count call with wrong types keeps its own error, because
+    1582 reads *Incorrect parameter count*, which would be a lie.
 
   - A **syntax error gets MySQL's own sentence**: `You have an error in
     your SQL syntax; … near '<the rest of the statement>' at line N`,
