@@ -382,6 +382,7 @@ fn describe_select_items(
                     // field before, and a struct literal makes the
                     // compiler ask.
                     mysql_declared_timestamp: false,
+                    mysql_float_md: None,
                     collation_name: None,
                     user_composite_type: None,
                     acl: alloc::vec::Vec::new(),

@@ -595,6 +595,8 @@ pub(crate) fn apply_on_conflict_assignments(
         let v = eval::eval_expr(&sub, &existing, &ctx)?;
         let coerced = coerce_value(v, schema_cols[target_idx].ty, col_name, target_idx)?;
         let coerced = crate::conversions::truncate_to_column_fsp(coerced, &schema_cols[target_idx]);
+        let coerced =
+            crate::conversions::round_to_column_float_md(coerced, &schema_cols[target_idx])?;
         check_unsigned_range(&coerced, &schema_cols[target_idx], target_idx)?;
         new_values[target_idx] = coerced;
     }

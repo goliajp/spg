@@ -5727,7 +5727,7 @@ impl Parser {
         // v7.39 (round 259) — keep the raw type NAME when the base is not
         // a builtin: it is how `CREATE DOMAIN child AS parent` records its
         // parent domain.
-        let (base_type, _, _, base_user_ref, _, _, _, _, _, _, _, _, _) =
+        let (base_type, _, _, base_user_ref, _, _, _, _, _, _, _, _, _, _) =
             self.parse_type_with_implied_flags()?;
         let mut default: Option<Expr> = None;
         let mut not_null = false;
@@ -5842,7 +5842,7 @@ impl Parser {
                 // v7.39 (round 264) — keep the raw type name when it is not
                 // a builtin: that is how a NESTED composite field records
                 // which composite it holds.
-                let (field_type, _, _, field_user_ref, _, _, _, _, _, _, _, _, _) =
+                let (field_type, _, _, field_user_ref, _, _, _, _, _, _, _, _, _, _) =
                     self.parse_type_with_implied_flags()?;
                 fields.push((field_name, field_type));
                 field_user_types.push(field_user_ref);
@@ -11604,7 +11604,7 @@ impl Parser {
                 // `parse_column_type_name` discarded it: `ALTER COLUMN t
                 // TYPE text COLLATE "C"` parsed clean and changed
                 // nothing. Keep the clause; the engine re-collates.
-                let (new_type, _, _, _, coll, coll_explicit, coll_name, _, _, _, _, _, _) =
+                let (new_type, _, _, _, coll, coll_explicit, coll_name, _, _, _, _, _, _, _) =
                     self.parse_type_with_implied_flags()?;
                 let collation = if coll_explicit {
                     coll_name.map(|n| (coll, n))
@@ -16493,7 +16493,7 @@ impl Parser {
     /// shorthands — callers that don't expect those (ALTER COLUMN
     /// TYPE) can discard them.
     fn parse_column_type_name(&mut self) -> Result<ColumnTypeName, ParseError> {
-        let (ty, _, _, _, _, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
+        let (ty, _, _, _, _, _, _, _, _, _, _, _, _, _) = self.parse_type_with_implied_flags()?;
         Ok(ty)
     }
 
@@ -16531,6 +16531,9 @@ impl Parser {
             // `Timestamp`, so the spelling has to travel separately or
             // a dump silently rewrites the column.
             bool,
+            // v7.39.3 — a MySQL `FLOAT(m,d)` / `DOUBLE(m,d)` pair. Not a
+            // display hint: it rounds on write.
+            Option<(u8, u8)>,
         ),
         ParseError,
     > {
@@ -16576,6 +16579,7 @@ impl Parser {
         // for PG (whose temporal columns keep full microseconds).
         let mut mysql_fsp: Option<u8> = None;
         let mut mysql_declared_timestamp = false;
+        let mut mysql_float_md: Option<(u8, u8)> = None;
         let mut ty = match ty_ident.as_str() {
             // PG SERIAL family. Implies NOT NULL + AUTO_INCREMENT.
             "smallserial" | "serial2" => {
@@ -16694,7 +16698,16 @@ impl Parser {
                     // rounding is recorded as a residual; accepting the
                     // syntax and keeping the width is the half this
                     // change makes.
-                    self.consume_optional_paren_size();
+                    // v7.39.3 — keep the pair. The digits are not a
+                    // display hint: MySQL 9.7.2 ROUNDS on write and
+                    // refuses a value wider than `m` (errno 1264), so a
+                    // column declared for money held more precision here
+                    // than its schema said.
+                    let (m, d) = self.parse_optional_numeric_params()?;
+                    mysql_float_md = Some((
+                        u8::try_from(m).unwrap_or(u8::MAX),
+                        u8::try_from(d.max(0)).unwrap_or(u8::MAX),
+                    ));
                     if ty_ident.eq_ignore_ascii_case("float") {
                         ColumnTypeName::Real
                     } else {
@@ -17331,6 +17344,7 @@ impl Parser {
             mysql_int_width,
             mysql_fsp,
             mysql_declared_timestamp,
+            mysql_float_md,
         ))
     }
 
@@ -17376,6 +17390,7 @@ impl Parser {
             mysql_int_width,
             mysql_fsp,
             mysql_declared_timestamp,
+            mysql_float_md,
         ) = self.parse_type_with_implied_flags()?;
         // Column constraints: `DEFAULT <expr>`, `NOT NULL`, and the
         // MySQL-flavoured `AUTO_INCREMENT` may appear in any order;
@@ -17826,6 +17841,7 @@ impl Parser {
             mysql_int_width,
             mysql_fsp,
             mysql_declared_timestamp,
+            mysql_float_md,
         })
     }
 

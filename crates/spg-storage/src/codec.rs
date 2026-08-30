@@ -66,6 +66,7 @@ pub(crate) fn deserialize_table(
             mysql_int_width: None,
             mysql_fsp: None,
             mysql_declared_timestamp: false,
+            mysql_float_md: None,
         });
     }
     let n_cols = cols.len();
@@ -598,6 +599,18 @@ pub(crate) fn deserialize_table(
             let pos = cur.read_u16()? as usize;
             if let Some(col) = t.schema_mut().columns.get_mut(pos) {
                 col.mysql_declared_timestamp = true;
+            }
+        }
+    }
+    // v7.39.3 — the FLOAT/DOUBLE (m,d) appendix (FILE_VERSION 94+).
+    if version >= 94 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let pos = cur.read_u16()? as usize;
+            let m = cur.read_u8()?;
+            let d = cur.read_u8()?;
+            if let Some(col) = t.schema_mut().columns.get_mut(pos) {
+                col.mysql_float_md = Some((m, d));
             }
         }
     }
