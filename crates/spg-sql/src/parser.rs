@@ -1102,6 +1102,16 @@ impl Parser {
         }
     }
 
+    /// v7.39.3 — like [`Parser::err`] but pointing at a token the caller
+    /// names rather than at the current one.
+    ///
+    /// The position is not decoration on the MySQL wire: its syntax-error
+    /// sentence quotes the source from there to the end of the statement,
+    /// so an error raised after the construct it is about quotes nothing.
+    fn err_at(&self, token_pos: usize, message: String) -> ParseError {
+        ParseError { message, token_pos }
+    }
+
     fn expect_eof(&self) -> Result<(), ParseError> {
         if matches!(self.peek(), Token::Eof) {
             Ok(())
@@ -22348,6 +22358,14 @@ impl Parser {
         if !matches!(self.tokens.get(self.pos + 1), Some(Token::String(_))) {
             return None;
         }
+        // v7.39.3 — where the LITERAL starts, because the errors below
+        // are about the literal and both engines point at it. `err`
+        // reports the CURRENT token, which by then is the one after the
+        // string: `SELECT x'123'` pointed at Eof, so the MySQL wire's
+        // `near '…'` snippet — which runs from the reported position to
+        // the end — came out empty where MySQL 9.7.2 says `near
+        // 'x'123''`.
+        let lit_pos = self.pos;
         self.advance();
         let Token::String(body) = self.advance() else {
             unreachable!("guarded above");
@@ -22360,23 +22378,26 @@ impl Parser {
         if self.mysql_dialect {
             if is_hex {
                 if body.len() % 2 == 1 {
-                    return Some(Err(self.err(alloc::format!(
-                        "invalid hex string literal X'{body}': odd digit count"
-                    ))));
+                    return Some(Err(self.err_at(
+                        lit_pos,
+                        alloc::format!("invalid hex string literal X'{body}': odd digit count"),
+                    )));
                 }
                 for c in body.chars() {
                     if !c.is_ascii_hexdigit() {
-                        return Some(Err(
-                            self.err(alloc::format!("invalid hexadecimal digit {c:?} in X'…'"))
-                        ));
+                        return Some(Err(self.err_at(
+                            lit_pos,
+                            alloc::format!("invalid hexadecimal digit {c:?} in X'…'"),
+                        )));
                     }
                 }
                 return Some(self.finish_postfix_casts(hex_literal_to_bytea_expr(&body)));
             }
             if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
-                return Some(Err(
-                    self.err(alloc::format!("invalid binary digit {bad:?} in b'…'"))
-                ));
+                return Some(Err(self.err_at(
+                    lit_pos,
+                    alloc::format!("invalid binary digit {bad:?} in b'…'"),
+                )));
             }
             return Some(self.finish_postfix_casts(bits_literal_to_bytea_expr(&body)));
         }
@@ -22384,18 +22405,23 @@ impl Parser {
             let mut out = String::with_capacity(body.len() * 4);
             for c in body.chars() {
                 let Some(d) = c.to_digit(16) else {
-                    return Some(Err(self.err(alloc::format!(
-                        "invalid hexadecimal digit {c:?} in X'…' bit string"
-                    ))));
+                    // v7.39.3 — PostgreSQL 18.6's own sentence, and its
+                    // own quoting: `"g" is not a valid hexadecimal
+                    // digit` (measured, with the caret on the literal).
+                    return Some(Err(self.err_at(
+                        lit_pos,
+                        alloc::format!("\"{c}\" is not a valid hexadecimal digit"),
+                    )));
                 };
                 out.push_str(&alloc::format!("{d:04b}"));
             }
             out
         } else {
             if let Some(bad) = body.chars().find(|c| *c != '0' && *c != '1') {
-                return Some(Err(self.err(alloc::format!(
-                    "invalid binary digit {bad:?} in B'…' bit string"
-                ))));
+                return Some(Err(self.err_at(
+                    lit_pos,
+                    alloc::format!("\"{bad}\" is not a valid binary digit"),
+                )));
             }
             body
         };

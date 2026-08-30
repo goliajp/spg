@@ -1,0 +1,85 @@
+# v7.39.3 — the families that were still writing their own
+# wrong-argument-count arithmetic.
+#
+# Fifteen files said things like `ltrim() takes 2 or 3 args, got 4`.
+# PostgreSQL 18.6 names the signature it could not match — measured —
+# and the table of refused counts is what lets the check run BEFORE the
+# scan, so an empty table stops hiding the call.
+#
+# The runner asserts THAT a statement errors, not its wording; the exact
+# sentences are pinned in the Rust e2e suite, where an ablation can bite
+# them. What this file adds is the SQL itself, running in the gate.
+
+statement ok
+CREATE TABLE fam (t TEXT, n INT)
+
+statement ok
+INSERT INTO fam VALUES ('a', 1)
+
+# expects: function host() does not exist
+statement error
+SELECT host()
+
+# expects: function host(unknown, unknown) does not exist
+statement error
+SELECT host('a','b')
+
+# expects: function masklen(text, integer) does not exist
+statement error
+SELECT masklen(t, n) FROM fam
+
+# expects: function encode(unknown) does not exist
+statement error
+SELECT encode('a')
+
+# expects: function ltrim(unknown, unknown, unknown) does not exist
+statement error
+SELECT ltrim('a','b','c')
+
+# expects: function string_to_array(unknown) does not exist
+statement error
+SELECT string_to_array('a')
+
+# expects: function to_tsvector(unknown, unknown, unknown) does not exist
+statement error
+SELECT to_tsvector('a','b','c')
+
+# expects: function to_char(integer) does not exist
+statement error
+SELECT to_char(n) FROM fam
+
+# A window function and an aggregate reach it through their own doors.
+# expects: function lag() does not exist
+statement error
+SELECT lag() OVER () FROM fam
+
+# expects: function count(integer, integer) does not exist
+statement error
+SELECT count(1, 2) FROM fam
+
+# expects: function nextval() does not exist
+statement error
+SELECT nextval()
+
+# The controls. Right arity still runs, and a variadic call routed by
+# the VALUE of an argument must survive the pre-scan — five arguments to
+# json_insert is ordinary, and one version of the table refused it.
+query T
+SELECT lower(t) FROM fam
+----
+a
+
+query I
+SELECT count(n) FROM fam
+----
+1
+
+# json_insert only CREATES a missing key, so `$.a` keeps its value; the
+# point here is that the call is not REFUSED for having five arguments.
+query T
+SELECT json_insert('{"a": 1}', '$.a', 99, '$.b', 2) FROM fam
+----
+{"a": 1, "b": 2}
+
+statement ok
+DROP TABLE fam

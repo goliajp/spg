@@ -74,3 +74,38 @@ fn a_postgres_session_is_unaffected() {
     assert_eq!(value, "ab");
     assert_eq!(name, "?column?");
 }
+
+/// v7.39.3 — a bad bit-string literal points AT the literal, and says
+/// what PostgreSQL says.
+///
+/// Measured on PostgreSQL 18.6:
+///
+/// ```text
+/// SELECT x'12g';        "g" is not a valid hexadecimal digit
+/// LINE 1: SELECT x'12g';
+///                ^
+/// SELECT 1, b'102', 3;  "2" is not a valid binary digit
+/// LINE 1: SELECT 1, b'102', 3;
+///                   ^
+/// ```
+///
+/// SPG wrote its own sentence and raised it at the token AFTER the
+/// literal. The position is not decoration: PostgreSQL renders a caret
+/// from it, and the MySQL wire quotes the source from it to the end of
+/// the statement — so `SELECT x'123'` in a MySQL session produced
+/// `near ''`, an empty snippet, where MySQL 9.7.2 says `near 'x'123''`.
+#[test]
+fn a_bad_bit_string_says_what_postgres_says() {
+    let mut e = Engine::new();
+    for (sql, want) in [
+        ("SELECT x'12g'", "\"g\" is not a valid hexadecimal digit"),
+        ("SELECT 1, b'102', 3", "\"2\" is not a valid binary digit"),
+    ] {
+        let msg = format!("{}", e.execute(sql).unwrap_err());
+        assert!(msg.contains(want), "{sql}: {msg}");
+    }
+    // The controls: the valid forms are still values, and PostgreSQL
+    // accepts an ODD number of hex digits here (four bits each).
+    assert_eq!(one(&mut e, "SELECT x'123'").1, "000100100011");
+    assert_eq!(one(&mut e, "SELECT b'101'").1, "101");
+}
