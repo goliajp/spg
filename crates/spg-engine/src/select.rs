@@ -3074,6 +3074,7 @@ impl Engine {
         // `GROUP BY` and `HAVING`, which cannot take those routes, raised
         // — the same statement answering two ways depending on the plan.
         self.validate_clause_columns(stmt)?;
+        self.validate_function_arity(stmt)?;
         // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
         // privilege gate above. Placed before it at first, and the
         // security-definer e2e caught it immediately: a SECURITY INVOKER
@@ -13771,6 +13772,87 @@ impl crate::Engine {
     /// worse defect than the one this closes. Those shapes keep the
     /// old behaviour; the walk below does not descend into a subquery
     /// for the same reason.
+    /// v7.39.2 — refuse a call whose argument count no overload accepts,
+    /// BEFORE the scan rather than per row.
+    ///
+    /// `SELECT lower(t, n) FROM t` answered zero rows and no error over
+    /// an EMPTY table and raised the moment the table had one row in it,
+    /// because the arity check lives inside the row-time dispatch. It is
+    /// the same shape as the unknown-column-in-a-predicate defect closed
+    /// earlier in this release, and it hides in the same place: a query
+    /// written against an empty fixture passes its test.
+    ///
+    /// The accepted counts come from `eval::arity::REFUSED_ARITIES`,
+    /// which is derived by asking the dispatch itself offline and can
+    /// only ever UNDER-refuse — see that file for why the two other
+    /// candidate oracles were refuted.
+    pub(crate) fn validate_function_arity(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let mut calls: Vec<(alloc::string::String, Vec<Expr>)> = Vec::new();
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                collect_function_calls(expr, &mut calls);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            collect_function_calls(w, &mut calls);
+        }
+        for o in &stmt.order_by {
+            collect_function_calls(&o.expr, &mut calls);
+        }
+        // The columns a name in this statement could resolve to. Only
+        // plain base tables; anything else and the types are not
+        // statically knowable, so nothing is refused early.
+        let cat = self.active_catalog();
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if let Some(table) = cat.get(&t.name) {
+                    cols.extend(table.schema().columns.iter().cloned());
+                }
+            }
+        }
+        for (name, args) in calls {
+            let Ok(i) = crate::eval::arity::REFUSED_ARITIES
+                .binary_search_by(|(n, _)| (*n).cmp(name.as_str()))
+            else {
+                continue;
+            };
+            if !crate::eval::arity::REFUSED_ARITIES[i]
+                .1
+                .contains(&args.len())
+            {
+                continue;
+            }
+            // v7.39.2 — PostgreSQL names the SIGNATURE it could not
+            // match, and before the scan there are no values to read a
+            // type from. Where every argument's type is knowable
+            // statically — a column of a source table, or a literal —
+            // the sentence is PostgreSQL's exactly; where one is not,
+            // this leaves the call to the row-time raise, which has the
+            // values. Refusing early with a WORSE message would trade
+            // one defect for another.
+            let mut types: Vec<alloc::string::String> = Vec::new();
+            for a in &args {
+                let Some(t) = static_arg_type(a, &cols) else {
+                    types.clear();
+                    break;
+                };
+                types.push(t);
+            }
+            if types.len() != args.len() {
+                continue;
+            }
+            return Err(EngineError::Eval(EvalError::WrongArity {
+                name,
+                types: types.join(", "),
+            }));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_clause_columns(
         &self,
         stmt: &SelectStatement,
@@ -13933,6 +14015,50 @@ impl crate::Engine {
 /// A correlated subquery resolves its names against an outer scope this
 /// walk cannot see, so descending would refuse valid queries. Missing a
 /// typo inside one is the safe direction; refusing a good query is not.
+/// v7.39.2 — the type PostgreSQL would name for an argument, when it
+/// can be known without a row: a column of a source table, or a
+/// literal. `None` for anything else, which is what keeps the pre-scan
+/// refusal from printing a worse sentence than the row-time one.
+fn static_arg_type(e: &Expr, cols: &[ColumnSchema]) -> Option<alloc::string::String> {
+    use spg_sql::ast::Literal as L;
+    match e {
+        Expr::Column(c) => cols
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&c.name))
+            .map(|s| crate::conversions::pg_type_name_for_error(s.ty)),
+        // A bare literal has no type yet on PostgreSQL — it names it
+        // `unknown` in this very sentence — except where the lexeme
+        // fixes one.
+        Expr::Literal(L::String(_)) | Expr::Literal(L::Null) => {
+            Some(alloc::string::String::from("unknown"))
+        }
+        Expr::Literal(L::Integer(_)) => Some(alloc::string::String::from("integer")),
+        Expr::Literal(L::Bool(_)) => Some(alloc::string::String::from("boolean")),
+        _ => None,
+    }
+}
+
+/// v7.39.2 — the function calls of an expression, name and argument
+/// count, NOT descending into a subquery (its scope is its own).
+fn collect_function_calls(e: &Expr, out: &mut Vec<(alloc::string::String, Vec<Expr>)>) {
+    match e {
+        Expr::FunctionCall { name, args } => {
+            out.push((name.to_ascii_lowercase(), args.clone()));
+            for a in args {
+                collect_function_calls(a, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_function_calls(lhs, out);
+            collect_function_calls(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_function_calls(expr, out);
+        }
+        _ => {}
+    }
+}
+
 fn collect_plain_column_refs(e: &Expr, out: &mut Vec<spg_sql::ast::ColumnName>) {
     match e {
         Expr::Column(c) => out.push(c.clone()),

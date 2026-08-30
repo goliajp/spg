@@ -78,3 +78,55 @@ fn postgresql_names_the_signature_it_could_not_match() {
 // MySQL's own sentence is rendered at the WIRE (it carries an errno
 // PostgreSQL has no equivalent of), so it is pinned in the server suite:
 // `e2e_mysqlwire_query::wrong_arity_counts_the_parameters`.
+
+/// v7.39.2 — a wrong-arity call is refused BEFORE the scan, so an empty
+/// table stops hiding it.
+///
+/// `SELECT lower(t, n) FROM t` answered zero rows and no error while
+/// `t` was empty and raised the moment it had one row in it, because
+/// the arity check lives inside the row-time dispatch. Same shape as
+/// the unknown-column-in-a-predicate defect, in a different place: a
+/// query written against an empty fixture passed its test.
+///
+/// The accepted counts come from `eval::arity`, derived by asking the
+/// dispatch itself offline — see that file for the two oracles that
+/// were tried and refuted, and for the over-refusal the first version
+/// of the probe caused.
+#[test]
+fn an_empty_table_stops_hiding_a_wrong_arity_call() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE et (t TEXT, n INT)").expect("ddl");
+    // Empty, and it is refused — with PostgreSQL's own signature.
+    assert_eq!(
+        err(&mut e, "SELECT lower(t, n) FROM et"),
+        "function lower(text, integer) does not exist"
+    );
+    assert_eq!(
+        err(&mut e, "SELECT substr(t) FROM et"),
+        "function substr(text) does not exist"
+    );
+    // The same answer once there IS a row — the point is that the two
+    // agree, which is what they did not do before.
+    e.execute("INSERT INTO et VALUES ('a', 1)").expect("insert");
+    assert_eq!(
+        err(&mut e, "SELECT lower(t, n) FROM et"),
+        "function lower(text, integer) does not exist"
+    );
+}
+
+/// The control: a variadic call is NOT refused early. The first version
+/// of the probe asked one dialect and the table was consulted in both,
+/// so this exact call came back rejected before the scan.
+#[test]
+fn a_variadic_call_is_not_refused_early() {
+    let mut e = Engine::new();
+    e.set_mysql_dialect(true);
+    e.execute("CREATE TABLE vt (a INT)").expect("ddl");
+    assert!(
+        e.execute("SELECT JSON_OBJECT('k', 1, 'v', 2) FROM vt")
+            .is_ok(),
+        "a variadic call must survive the pre-scan check"
+    );
+    assert!(e.execute("SELECT CONCAT('a','b','c') FROM vt").is_ok());
+    assert!(e.execute("SELECT COALESCE(a, 1, 2) FROM vt").is_ok());
+}

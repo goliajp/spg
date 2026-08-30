@@ -8,6 +8,46 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A wrong-argument-count call over an EMPTY table answered zero rows
+  and no error**, and raised the moment the table had one row in it —
+  the last open gap from 7.39.2, and the same shape as the
+  unknown-column-in-a-predicate defect closed there. A query written
+  against an empty fixture passed its test.
+
+  Refusing before the scan needs the accepted counts as DATA, and
+  7.39.2 recorded two candidate oracles as refuted: `PG_PROC_FUNCS`
+  does not describe SPG's overloads (dozens of legitimate calls came
+  back refused), and the catalog's volatility column omits `nextval`
+  and `setval`, so probing a call at plan time could advance a sequence
+  — changing data to improve a message.
+
+  The table is derived from the dispatch ITSELF, offline: each name is
+  called with N NULL arguments and only the counts it answers
+  `WrongArity` to are recorded. Anything else — a value error, a type
+  refusal, success — counts as ACCEPTED, so a function whose guard is
+  not arity-first, and a variadic one that never raises `WrongArity` at
+  all, are both recorded as accepting everything. It can under-refuse;
+  it cannot over-refuse.
+
+  That last claim was FALSE in its first version and a pin caught it:
+  the probe asked one dialect while the table is consulted in both, so
+  `JSON_OBJECT('k', 1, 'v', 2)` — an ordinary variadic call — was
+  rejected before the scan. Both dialects have to refuse a count now.
+
+  The pre-scan sentence is PostgreSQL's exactly, or there is none:
+  where every argument's type is knowable without a row (a column of a
+  source table, or a literal) it names the signature as PostgreSQL
+  does; where one is not, the call is left to the row-time raise, which
+  has the values. Refusing early with a worse message would have traded
+  one defect for another.
+
+  A generated table nothing re-derives is a table that drifts, so
+  `arity_table_is_current` re-derives it and fails on any difference.
+
 ## [7.39.2] — 2026-08-30
 
 ### Fixed
