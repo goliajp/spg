@@ -1,0 +1,56 @@
+# v7.39.2 — MySQL prints a FLOAT to six significant digits, and keeps
+# BOTH widths in fixed notation for decimal exponents in [-15, 14].
+#
+# SPG printed PostgreSQL's shortest round-trip in PostgreSQL's much
+# narrower window, so `123456789` read `1.2345679e+08` where MySQL
+# reads `123457000`. Every expectation is a MySQL 9.7.2 run.
+
+dialect mysql
+
+statement ok
+CREATE TABLE fr (x FLOAT, d DOUBLE)
+
+statement ok
+INSERT INTO fr VALUES (3.14159265358979, 3.14159265358979)
+
+query TT
+SELECT CAST(x AS CHAR), CAST(d AS CHAR) FROM fr
+----
+3.14159
+3.14159265358979
+
+statement ok
+DELETE FROM fr
+
+statement ok
+INSERT INTO fr VALUES (123456789, 123456789)
+
+query TT
+SELECT CAST(x AS CHAR), CAST(d AS CHAR) FROM fr
+----
+123457000
+123456789
+
+statement ok
+DELETE FROM fr
+
+# The window: fixed through exponent 14, scientific from 15.
+statement ok
+INSERT INTO fr VALUES (1e15, 1e15)
+
+query TT
+SELECT CAST(x AS CHAR), CAST(d AS CHAR) FROM fr
+----
+1e15
+1e15
+
+# `DOUBLE(10,2)` failed the whole CREATE before this version — how
+# every legacy MySQL schema spells money.
+statement ok
+CREATE TABLE money_shape (a DOUBLE(10,2), b FLOAT(10,2))
+
+statement ok
+DROP TABLE money_shape
+
+statement ok
+DROP TABLE fr
