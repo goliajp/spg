@@ -17,10 +17,20 @@
 //! variant rather than a formatted string the wire would have to guess
 //! the meaning of.
 //!
-//! Two sites keep their own wording, and the reason is not taste: the
-//! `setval` and aggregate arity checks run BEFORE evaluation, over
-//! unevaluated expressions, so they cannot name the argument types
-//! PostgreSQL's sentence carries.
+//! v7.39.3 finishes the sweep: the families that still wrote their own
+//! arithmetic — inet, encode/decode, the text-search calls, trim, the
+//! window functions, `nextval`, the aggregates — all answer the one
+//! sentence now. The aggregate check runs BEFORE evaluation, over
+//! unevaluated expressions, so it takes the argument types from the
+//! lexeme and the schema (`unknown` for a bare literal, the declared
+//! type for a column, both measured); a call whose argument has no
+//! static type to name keeps the old sentence rather than inventing
+//! one.
+//!
+//! Only the COUNT raises this. A right-count call with wrong types
+//! gets the same sentence from PostgreSQL but a different errno from
+//! MySQL (1582 is `Incorrect parameter count`, which would be a lie),
+//! so those keep whatever their own guard gives.
 
 use spg_engine::Engine;
 
@@ -129,4 +139,139 @@ fn a_variadic_call_is_not_refused_early() {
     );
     assert!(e.execute("SELECT CONCAT('a','b','c') FROM vt").is_ok());
     assert!(e.execute("SELECT COALESCE(a, 1, 2) FROM vt").is_ok());
+    // v7.39.3 — and the second over-refusal, which the workspace suite
+    // caught before this pin existed. `json_insert` / `json_set` are
+    // routed by the VALUE of their second argument — a `$`-path picks
+    // MySQL's implementation, anything else picks PostgreSQL's, which
+    // takes 3 or 4 arguments. The table's probe called them with NULLs,
+    // never reached the MySQL arm, and recorded five arguments as
+    // refused. Five is ordinary MySQL.
+    assert!(
+        e.execute("SELECT JSON_INSERT('{\"a\": 1}', '$.a', 99, '$.b', 2) FROM vt")
+            .is_ok(),
+        "a value-routed variadic call must survive the pre-scan check"
+    );
+    assert!(
+        e.execute("SELECT JSON_SET('{\"a\": 1}', '$.a', 10, '$.c', 2) FROM vt")
+            .is_ok()
+    );
+    assert!(
+        e.execute("SELECT JSON_ARRAY_APPEND('[1]', '$', 2, '$', 3) FROM vt")
+            .is_ok()
+    );
+}
+
+/// v7.39.3 — the families that were still writing their own arithmetic.
+///
+/// Every `want` below is the sentence PostgreSQL 18.6 gives for that
+/// exact SQL, measured against the oracle container, not derived from
+/// SPG's own output.
+#[test]
+fn the_remaining_families_say_it_too() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE fam (t TEXT, n INT)").expect("ddl");
+    e.execute("INSERT INTO fam VALUES ('a', 1)")
+        .expect("insert");
+    for (sql, want) in [
+        // inet
+        ("SELECT host()", "function host() does not exist"),
+        (
+            "SELECT host('a','b')",
+            "function host(unknown, unknown) does not exist",
+        ),
+        (
+            "SELECT masklen(t, n) FROM fam",
+            "function masklen(text, integer) does not exist",
+        ),
+        // encode / decode
+        (
+            "SELECT encode('a')",
+            "function encode(unknown) does not exist",
+        ),
+        (
+            "SELECT decode('a')",
+            "function decode(unknown) does not exist",
+        ),
+        // trim family
+        (
+            "SELECT ltrim('a','b','c')",
+            "function ltrim(unknown, unknown, unknown) does not exist",
+        ),
+        // arrays
+        (
+            "SELECT string_to_array('a')",
+            "function string_to_array(unknown) does not exist",
+        ),
+        // full-text search
+        (
+            "SELECT to_tsvector('a','b','c')",
+            "function to_tsvector(unknown, unknown, unknown) does not exist",
+        ),
+        (
+            "SELECT setweight('a')",
+            "function setweight(unknown) does not exist",
+        ),
+        // formatting
+        (
+            "SELECT to_char(n) FROM fam",
+            "function to_char(integer) does not exist",
+        ),
+    ] {
+        assert_eq!(err(&mut e, sql), want, "{sql}");
+    }
+}
+
+/// The two shapes that reach it through a different door: a window
+/// function (validated while the partition is built) and an aggregate
+/// (validated over the unevaluated statement, before any row work).
+#[test]
+fn a_window_and_an_aggregate_say_it_too() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE wf (a INT, t TEXT)").expect("ddl");
+    e.execute("INSERT INTO wf VALUES (1, 'x')").expect("insert");
+    for (sql, want) in [
+        (
+            "SELECT lag() OVER () FROM wf",
+            "function lag() does not exist",
+        ),
+        (
+            "SELECT first_value() OVER () FROM wf",
+            "function first_value() does not exist",
+        ),
+        // The aggregate check names a bare literal `unknown` and a
+        // column by its declared type, the way PostgreSQL does.
+        (
+            "SELECT count(1, 2) FROM wf",
+            "function count(integer, integer) does not exist",
+        ),
+        (
+            "SELECT sum(a, t) FROM wf",
+            "function sum(integer, text) does not exist",
+        ),
+        (
+            "SELECT max('a', 'b') FROM wf",
+            "function max(unknown, unknown) does not exist",
+        ),
+        ("SELECT nextval()", "function nextval() does not exist"),
+    ] {
+        assert_eq!(err(&mut e, sql), want, "{sql}");
+    }
+    // Right arity still runs — the guard must not have swallowed them.
+    assert!(e.execute("SELECT lag(a) OVER () FROM wf").is_ok());
+    assert!(e.execute("SELECT count(a) FROM wf").is_ok());
+    assert!(e.execute("SELECT sum(a) FROM wf").is_ok());
+}
+
+/// The control for the aggregate path: an argument with no static type
+/// keeps the older sentence rather than being given an invented one.
+#[test]
+fn an_aggregate_argument_with_no_static_type_is_not_invented() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE ag (a INT)").expect("ddl");
+    let msg = err(&mut e, "SELECT count(a + 1, a * 2) FROM ag");
+    assert!(
+        !msg.contains("unknown"),
+        "an expression must not be called `unknown`: {msg}"
+    );
+    assert!(msg.contains("count("), "{msg}");
 }

@@ -235,6 +235,9 @@ pub(super) fn fts_to_tsvector(
 /// v7.24 (round-16 C) — `setweight(tsvector, "char")`. Relabels
 /// every lexeme with the given PG weight letter (A=3 B=2 C=1 D=0).
 pub(super) fn fts_setweight(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(crate::eval::functions::wrong_arity("setweight", args));
+    }
     // v7.39 (round 517) — PG's third argument names the lexemes to weight;
     // the rest keep theirs. Measured: `setweight('cat:1 dog:2','B','{cat}')`
     // is `'cat':1B 'dog':2`.
@@ -359,6 +362,12 @@ fn parse_fts_args(
     args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<(crate::fts::TsConfig, Option<String>), EvalError> {
+    if args.len() != 1 && args.len() != 2 {
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from(name),
+            types: crate::eval::functions::arg_type_list(args),
+        });
+    }
     let (config_arg, text_arg) = match args {
         [t] => (None, t),
         [c, t] => (Some(c), t),
@@ -933,6 +942,9 @@ pub(super) fn fts_ts_headline(
     args: &[Value<'_>],
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    if args.len() < 2 || args.len() > 4 {
+        return Err(crate::eval::functions::wrong_arity("ts_headline", args));
+    }
     // Disambiguate the 2-4 arg forms by where the tsquery sits.
     let is_queryish = |v: &Value<'_>| matches!(v, Value::TsQuery(_));
     let (config_arg, doc_arg, query_arg, opts_arg) = match args {
@@ -1487,11 +1499,9 @@ pub(super) fn fts_ts_rewrite(
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
     if args.len() != 3 {
-        return Err(EvalError::TypeMismatch {
-            detail: format!(
-                "ts_rewrite() takes 3 args (query, target, substitute), got {}",
-                args.len()
-            ),
+        return Err(EvalError::WrongArity {
+            name: alloc::string::String::from("ts_rewrite"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {
@@ -1566,8 +1576,9 @@ pub(super) fn fts_tsquery_bool(
 ) -> Result<Value<'static>, EvalError> {
     let arity = if op == "not" { 1 } else { 2 };
     if args.len() != arity {
-        return Err(EvalError::TypeMismatch {
-            detail: format!("tsquery_{op}() takes {arity} arg(s), got {}", args.len()),
+        return Err(EvalError::WrongArity {
+            name: alloc::format!("tsquery_{op}"),
+            types: crate::eval::functions::arg_type_list(args),
         });
     }
     if args.iter().any(|a| matches!(a, Value::Null)) {

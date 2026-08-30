@@ -545,12 +545,14 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
 /// selects MySQL-style string lexing (see `lexer::tokenize_with`).
 /// The engine threads its session flag through here.
 pub fn parse_statement_with(input: &str, dialect: lexer::Dialect) -> Result<Statement, ParseError> {
-    let (tokens, offsets) =
-        lexer::tokenize_with_offsets(input, dialect).map_err(|e| shape_lex_error(&e, input))?;
+    let (tokens, offsets, merges) =
+        lexer::tokenize_with_merges(input, dialect).map_err(|e| shape_lex_error(&e, input))?;
     // v7.39.2 — the grammar follows "is this MySQL", the lexer follows
     // "does backslash escape". They used to be one flag, and a session
     // that turned escapes off lost the grammar with them.
-    let mut p = Parser::new_with_dialect(tokens, dialect.speaks_mysql).with_source(input, &offsets);
+    let mut p = Parser::new_with_dialect(tokens, dialect.speaks_mysql)
+        .with_source(input, &offsets)
+        .with_merges(merges);
     let stmt = (|| {
         let stmt = p.parse_one_statement()?;
         if matches!(p.peek(), Token::Semicolon) {
@@ -732,6 +734,9 @@ struct Parser {
     /// spacing and all. Only filled for a MySQL session — a PG one names
     /// columns from the parsed shape and pays nothing for this.
     src: Option<(String, Vec<usize>)>,
+    /// v7.39.3 — (token index, first-segment byte length) for every
+    /// string literal the lexer built by implicit concatenation.
+    merges: Vec<(usize, usize)>,
 }
 
 /// Max expr/select parser nesting (parens, subqueries, CASE, …).
@@ -1008,6 +1013,7 @@ impl Parser {
             suppress_in_tail: false,
             last_consumed: 0,
             src: None,
+            merges: Vec::new(),
         }
     }
 
@@ -1017,6 +1023,25 @@ impl Parser {
             self.src = Some((input.to_string(), offsets.to_vec()));
         }
         self
+    }
+
+    /// v7.39.3 — the implicit-concatenation log from the lexer, so a
+    /// merged literal can still be LABELLED by its first segment the way
+    /// MySQL 9.7.2 labels it.
+    fn with_merges(mut self, merges: Vec<(usize, usize)>) -> Self {
+        if self.mysql_dialect {
+            self.merges = merges;
+        }
+        self
+    }
+
+    /// The byte length of the first segment of the literal at `tok`, when
+    /// that literal was built by implicit concatenation.
+    fn merged_first_len(&self, tok: usize) -> Option<usize> {
+        self.merges
+            .iter()
+            .find(|(k, _)| *k == tok)
+            .map(|(_, len)| *len)
     }
 
     /// The source text spanning tokens `start ..= end`, trimmed.
@@ -15320,7 +15345,21 @@ impl Parser {
             match self.peek().clone() {
                 Token::Ident(v) | Token::QuotedIdent(v) | Token::String(v) => {
                     if name_lc == "engine" {
-                        engine = Some(v);
+                        // v7.39.3 — as WRITTEN. MySQL 9.7.2 refuses an
+                        // engine it does not know and names it back
+                        // exactly: `Unknown storage engine 'NoSuchEng'`,
+                        // measured. The lexer folds a bare identifier, so
+                        // the message quoted a name the dump did not
+                        // contain, which is the one thing that message is
+                        // for. Guarded the same way the column spelling
+                        // is: the span runs to the next token, so what
+                        // comes back has to be the same word.
+                        let written = self
+                            .source_span(self.pos, self.pos)
+                            .map(|raw| raw.trim().trim_matches('`').trim_matches('\''))
+                            .filter(|raw| raw.eq_ignore_ascii_case(&v))
+                            .map(alloc::string::String::from);
+                        engine = Some(written.unwrap_or(v));
                     }
                     self.advance();
                 }
@@ -17375,7 +17414,26 @@ impl Parser {
                  (malformed table constraint?)"
             )));
         }
+        let name_tok = self.pos;
         let name = self.expect_ident_like()?;
+        // v7.39.3 — MySQL 9.7.2 reports a column by the SPELLING it was
+        // declared with: `MyCol` stays `MyCol` in SHOW COLUMNS, in
+        // information_schema, and in SHOW CREATE (measured). SPG folded
+        // an unquoted name, so a table restored from a dump reported
+        // names the application had never written.
+        //
+        // The written form comes back from the source span, which only
+        // the MySQL dialect keeps. The span runs to the START of the
+        // next token, so a comment or unusual spacing between them
+        // arrives with it — hence the check that what came back is the
+        // same identifier. It is not decoration: without it,
+        // `CREATE TABLE t (MyCol /* c */ INT)` names the column
+        // `MyCol /* c */`.
+        let name = self
+            .source_span(name_tok, name_tok)
+            .map(|raw| raw.trim().trim_matches('`').trim_matches('"'))
+            .filter(|raw| raw.eq_ignore_ascii_case(&name))
+            .map_or(name, alloc::string::String::from);
         let (
             ty,
             implied_auto_increment,
@@ -18874,7 +18932,15 @@ impl Parser {
             // A column already reports its own name downstream; naming it
             // again here would only re-state the qualifier the label drops.
             Expr::Column(_) => None,
-            Expr::Literal(Literal::String(v)) => Some(v.clone()),
+            // v7.39.3 — `SELECT 'a' 'b'` is ONE literal whose value is
+            // `ab`, and MySQL 9.7.2 names the column `a`: the label is
+            // the first segment as written, not the joined value
+            // (measured). The lexer logs where it joined them.
+            Expr::Literal(Literal::String(v)) => Some(
+                self.merged_first_len(start_tok)
+                    .and_then(|n| v.get(..n))
+                    .map_or_else(|| v.clone(), String::from),
+            ),
             _ => self.source_span(start_tok, end_tok).map(str::to_string),
         }
     }

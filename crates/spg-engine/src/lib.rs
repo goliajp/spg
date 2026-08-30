@@ -218,6 +218,16 @@ pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 /// substitutes for all of these. What it can honour is the half that
 /// matters to a client: a name MySQL would reject is rejected here too,
 /// rather than a typo in a dump silently becoming SPG's storage.
+/// v7.39.3 — the directory MySQL reports its charset definitions live
+/// in.
+///
+/// Answered rather than omitted: see the note in `eval/functions.rs`.
+/// The path is MySQL 9.7.2's own, measured on the oracle, because
+/// 9.7.2 is what SPG answers as; SPG's charsets are compiled in and
+/// there is no directory. A claim about the shape of the answer, like
+/// `ENGINE=InnoDB` for a table stored SPG's own way.
+pub const MYSQL_CHARACTER_SETS_DIR: &str = "/usr/share/mysql-9.7/charsets/";
+
 pub const MYSQL_KNOWN_ENGINES: &[&str] = &[
     "ARCHIVE",
     "BLACKHOLE",

@@ -368,30 +368,67 @@ fn random_in_range(lo: &Value<'_>, hi: &Value<'_>) -> Result<Value<'static>, Eva
 /// the probing happens once, offline, rather than per query.
 #[cfg(test)]
 pub(crate) fn probe_refuses_arity(name: &str, argc: usize) -> bool {
-    let cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-    let args: alloc::vec::Vec<Value<'static>> = (0..argc).map(|_| Value::Null).collect();
-    // v7.39.2 — BOTH dialects have to refuse it.
+    // v7.39.3 — SEVERAL argument fillings, and what counts as evidence.
     //
-    // The first version of this probed one dialect and the table was
-    // consulted in both, so a count that only the MySQL grammar accepts
-    // came back refused: `JSON_OBJECT('k', 1, 'v', 2)` — a perfectly
-    // ordinary variadic call — was rejected before the scan. That is
-    // precisely the over-refusal this table is supposed to be incapable
-    // of, and the claim was wrong until this line. The round-391 pin
-    // caught it within the minute.
-    let mut ctx = crate::eval::EvalContext::new(&cols, None);
-    let pg = matches!(
-        apply_function(name, &args, &ctx),
-        Err(EvalError::WrongArity { .. })
-    );
-    if !pg {
-        return false;
+    // A count is ACCEPTED the moment any filling runs it. It is REFUSED
+    // only when no filling runs and at least one answers `WrongArity`.
+    // A filling that fails for some other reason — a type the function
+    // will not take — says nothing either way, which is the distinction
+    // the first version of this missed in both directions:
+    //
+    //   * NULL alone was too narrow. Some arms route on the VALUE:
+    //     `"jsonb_insert" | "json_insert" if args.len() >= 3 &&
+    //     matches!(&args[1], Value::Text(p) if p.starts_with('$'))`
+    //     sends a MySQL-shaped call to MySQL's implementation and
+    //     everything else to PostgreSQL's, which takes 3 or 4. Probed
+    //     with NULLs the MySQL arm was never reached, so five arguments
+    //     — ordinary MySQL — came back recorded as refused.
+    //
+    //   * Requiring EVERY filling to refuse was too wide. `ltrim(1,1,1)`
+    //     is stopped by the type guard ahead of the dispatch, which
+    //     answers a type error rather than `WrongArity`, so a genuine
+    //     arity refusal was read as acceptance and `ltrim('a','b','c')`
+    //     fell through to row time — where a literal has already become
+    //     `text`, and the sentence read `ltrim(text, text, text)` where
+    //     PostgreSQL 18.6 says `ltrim(unknown, unknown, unknown)`.
+    //
+    // Both dialects still have to refuse it.
+    let ctx_cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    for mysql in [false, true] {
+        let mut ctx = crate::eval::EvalContext::new(&ctx_cols, None);
+        ctx.mysql_dialect = mysql;
+        let mut saw_wrong_arity = false;
+        for fill in 0..PROBE_FILLINGS {
+            let args: alloc::vec::Vec<Value<'static>> =
+                (0..argc).map(|i| probe_arg(fill, i)).collect();
+            match apply_function(name, &args, &ctx) {
+                Ok(_) => return false,
+                Err(EvalError::WrongArity { .. }) => saw_wrong_arity = true,
+                Err(_) => {}
+            }
+        }
+        if !saw_wrong_arity {
+            return false;
+        }
     }
-    ctx.mysql_dialect = true;
-    matches!(
-        apply_function(name, &args, &ctx),
-        Err(EvalError::WrongArity { .. })
-    )
+    true
+}
+
+/// How many argument fillings [`probe_refuses_arity`] tries.
+const PROBE_FILLINGS: usize = 4;
+
+/// One filling. `0` is all-NULL (what this probe used to be), `1` is a
+/// JSON document followed by `$`-paths and values — the shape the
+/// value-routed arms look for — `2` is all text, `3` all integers.
+fn probe_arg(fill: usize, i: usize) -> Value<'static> {
+    match fill {
+        1 if i == 0 => Value::Text(alloc::borrow::Cow::Borrowed("{\"a\": 1}")),
+        1 if i % 2 == 1 => Value::Text(alloc::borrow::Cow::Borrowed("$.a")),
+        1 => Value::Int(1),
+        2 => Value::Text(alloc::borrow::Cow::Borrowed("a")),
+        3 => Value::Int(1),
+        _ => Value::Null,
+    }
 }
 
 pub(super) fn apply_function(
@@ -1001,6 +1038,22 @@ fn reject_non_text_first_arg(name: &str, args: &[Value<'_>]) -> Result<(), EvalE
 /// SPG wrote its own arithmetic at every wrong-arity site — `lower()
 /// takes 1 arg, got 0`, 339 of them across ten files — and neither
 /// engine says that. What each says is in `EvalError::WrongArity`.
+/// v7.39.3 — the error for a call whose ARGUMENT COUNT no overload
+/// accepts.
+///
+/// PostgreSQL 18.6 answers `function lower(integer) does not exist`
+/// whether the count or the types are wrong — both measured — but the
+/// MySQL wire numbers the two apart (1582 `Incorrect parameter count`
+/// against 1305 for a name it does not know), so only a COUNT raises
+/// this. A right-count call with wrong types keeps whatever error its
+/// own guard gives.
+pub(crate) fn wrong_arity(name: &str, args: &[Value<'_>]) -> EvalError {
+    EvalError::WrongArity {
+        name: alloc::string::String::from(name),
+        types: arg_type_list(args),
+    }
+}
+
 pub(crate) fn arg_type_list(args: &[Value<'_>]) -> alloc::string::String {
     args.iter()
         .map(|a| crate::conversions::pg_type_name_for_error_opt(a.data_type()))
@@ -15071,12 +15124,36 @@ fn apply_function_dispatch(
                 // means names are used as bytes rather than transcoded.
                 // That is true here too.
                 //
-                // `character_sets_dir` is NOT answered: it names a
-                // directory of charset definitions that SPG does not
-                // have, and a path invented to fill the row would be a
-                // fabricated fact rather than a compatibility gain.
                 "character_set_system" => "utf8mb4",
                 "character_set_filesystem" => "binary",
+                // v7.39.3 — `character_sets_dir` IS answered now, and the
+                // reasoning that left it out has to be written down
+                // because it was good reasoning about the wrong cost.
+                //
+                // It names a directory of charset definition files.
+                // SPG has no such directory — its charsets are compiled
+                // in — so the note here said a path invented to fill the
+                // row would be a fabricated fact rather than a
+                // compatibility gain. What that weighed against was a
+                // DIFFERENT string; what a client actually gets is
+                // `ERROR: Unknown system variable`, and an error is not
+                // a more honest answer than a path, it is a broken
+                // session. `time_zone` is in this list for exactly that
+                // reason: without it no mysqldump could be restored at
+                // all, because every dump reads it on line five.
+                //
+                // The value is the path MySQL 9.7.2 reports, because
+                // that is the version SPG answers as
+                // (`MYSQL_SERVER_VERSION`), measured on the oracle:
+                // `/usr/share/mysql-9.7/charsets/`. It is a claim about
+                // the SHAPE of the answer, not about this filesystem —
+                // the same kind of claim as reporting `ENGINE=InnoDB`
+                // for a table SPG stores its own way, which the drop-in
+                // has made since it had an ENGINE clause at all. No
+                // client can observe the difference across the wire; one
+                // that opens the path would fail against a real MySQL
+                // whose directory had moved, too.
+                "character_sets_dir" => crate::MYSQL_CHARACTER_SETS_DIR,
                 "collation_connection" | "collation_server" | "collation_database" => {
                     crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
                 }
@@ -20009,19 +20086,45 @@ mod arity_table_generator {
     /// only direction this can be wrong in.
     pub(super) fn dispatch_names() -> alloc::vec::Vec<alloc::string::String> {
         let mut out: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        // v7.39.3 — every source the dispatch spans, and every arm
+        // SHAPE.
+        //
+        // This read three files and only arms that ENDED in `=>` or
+        // `=> {`, so a one-line arm — `"host" => inet::inet_host(args),`,
+        // which is most of them — was invisible. The consequence was not
+        // a missing row but a WRONG SENTENCE: names outside the table are
+        // never refused before the scan, so `SELECT host('"'"'a'"'"','"'"'b'"'"')` fell
+        // through to row time, where a literal has become `text` and the
+        // signature read `host(text, text)` where PostgreSQL 18.6 says
+        // `host(unknown, unknown)`.
+        //
+        // Both failure modes stay safe: a name missed is a name the table
+        // does not judge, and a string picked up that is not a function
+        // answers "unknown function" to every count, so no count is
+        // marked refused. Under-refusing remains the only direction this
+        // can be wrong in.
         for src in [
             include_str!("functions.rs"),
             include_str!("datetime.rs"),
             include_str!("regexp.rs"),
+            include_str!("strings.rs"),
+            include_str!("encoding.rs"),
+            include_str!("inet.rs"),
+            include_str!("textsearch.rs"),
+            include_str!("format.rs"),
+            include_str!("math.rs"),
+            include_str!("values.rs"),
+            include_str!("cast.rs"),
+            include_str!("binop.rs"),
         ] {
             for line in src.lines() {
                 let t = line.trim();
-                if !t.ends_with("=> {") && !t.ends_with("=>") {
+                // Everything left of the arm'"'"'s `=>`; a line without one
+                // is not an arm.
+                let Some(head) = t.split_once("=>").map(|(h, _)| h) else {
                     continue;
-                }
-                // `"a" | "b" | "c" => {` — take every quoted lowercase
-                // identifier on an arm line.
-                let mut rest = t;
+                };
+                let mut rest = head;
                 while let Some(i) = rest.find('"') {
                     rest = &rest[i + 1..];
                     let Some(j) = rest.find('"') else { break };

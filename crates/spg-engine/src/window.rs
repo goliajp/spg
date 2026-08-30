@@ -565,9 +565,10 @@ pub(crate) fn compute_window_partition(
             // lag(expr [, offset [, default]])
             // lead(expr [, offset [, default]])
             if args.is_empty() {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "{lower}() requires at least one argument"
-                )));
+                return Err(EngineError::Eval(crate::eval::EvalError::WrongArity {
+                    name: lower.clone(),
+                    types: alloc::string::String::new(),
+                }));
             }
             let offset: i64 = if args.len() >= 2 {
                 let v = eval::eval_expr(&args[1], filtered_rows[slice[0].2], ctx)
@@ -645,9 +646,10 @@ pub(crate) fn compute_window_partition(
         }
         "first_value" | "last_value" | "nth_value" => {
             if args.is_empty() {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "{lower}() requires at least one argument"
-                )));
+                return Err(EngineError::Eval(crate::eval::EvalError::WrongArity {
+                    name: lower.clone(),
+                    types: alloc::string::String::new(),
+                }));
             }
             let values: Vec<Value<'static>> = slice
                 .iter()
