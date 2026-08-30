@@ -1,6 +1,6 @@
 # SPG drop-in acceptance report
 
-- image: `goliakk/spg:7.39.1`
+- image: `goliakk/spg:7.39.2`
 - panel cases: 71  (pass 71  / fail 0)
 
 This report describes the image named above and nothing else. The
@@ -90,7 +90,7 @@ the record for a given release is
 ## Reproducer
 
 ```bash
-scripts/dropin-acceptance.sh --image goliakk/spg:7.39.1 --port 25433 \
+scripts/dropin-acceptance.sh --image goliakk/spg:7.39.2 --port 25433 \
   --fixture scripts/fixtures/mailrs-pg-extensions.sql \
   --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql
 ```
