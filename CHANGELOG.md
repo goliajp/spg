@@ -12,6 +12,39 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A table restored from a `mysqldump` had every mixed-case column
+  unreachable from ordinary SQL.** mysqldump backquotes every
+  identifier, so the dumped DDL keeps its case — and SPG's lexer folds
+  an UNQUOTED one, while its column comparison was byte for byte:
+
+  ```text
+  CREATE TABLE `Orders` (`OrderID` INT)   -- from the dump
+  SELECT `OrderID` FROM `Orders`          -- worked
+  SELECT OrderID FROM Orders              -- 1054, unknown column
+  ```
+
+  MySQL's column names are case-INSENSITIVE (measured on 9.7.2: `mycol`,
+  `MYCOL` and a backquoted `MyCol` all resolve a column declared
+  `MyCol`). This is the same "two spellings, two things" defect v7.39.1
+  closed for RELATION names, left open for columns — and the direction
+  that bites is the common one, because a dump quotes and hand-written
+  application SQL usually does not.
+
+  The comparison asks the dialect at all three places that decide
+  whether a name refers to a column: the resolver, the projection, and
+  the clause validator. Fixing only the first left the query still
+  failing, which is how the other two were found.
+
+  PostgreSQL's rule is the opposite and is untouched: a quoted
+  identifier is case-SENSITIVE there, and folding it would break every
+  column that relies on the quotes.
+
+  Known gap: the DECLARED SPELLING is still not kept — `SHOW COLUMNS`
+  and `information_schema` report `mycol` for a column created
+  unquoted as `MyCol`, where MySQL reports `MyCol`. That is a schema-diff
+  nuisance rather than a broken query, and it needs the storage to carry
+  the written case.
+
 - **A MySQL `FLOAT(m,d)` / `DOUBLE(m,d)` kept more precision than its
   schema said.** 7.39.2 made the syntax parse — before it,
   `DOUBLE(10,2)` failed the whole `CREATE TABLE` — and recorded the rest

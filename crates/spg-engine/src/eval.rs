@@ -279,6 +279,37 @@ pub enum SequenceOp {
 }
 
 impl<'a> EvalContext<'a> {
+    /// v7.39.3 — do these two column names refer to the same column?
+    ///
+    /// MySQL's column names are case-INSENSITIVE (measured on 9.7.2:
+    /// `mycol`, `MYCOL` and `MyCol` all resolve a column declared
+    /// `MyCol`, and a backquoted spelling resolves too). SPG compared
+    /// them byte for byte, and its lexer folds an UNQUOTED identifier —
+    /// so a table restored from a `mysqldump`, where every identifier
+    /// is backquoted and keeps its case, had every mixed-case column
+    /// unreachable from ordinary unquoted SQL:
+    ///
+    /// ```text
+    /// CREATE TABLE `Orders` (`OrderID` INT)   -- from the dump
+    /// SELECT `OrderID` FROM `Orders`          -- works
+    /// SELECT OrderID FROM Orders              -- 1054, unknown column
+    /// ```
+    ///
+    /// That is the same "two spellings, two things" defect v7.39.1
+    /// closed for relation NAMES, still live for columns.
+    ///
+    /// PostgreSQL's rule is the opposite and stays: a quoted identifier
+    /// is case-sensitive there, and folding it would break every column
+    /// that relies on it.
+    #[must_use]
+    pub fn col_eq(&self, a: &str, b: &str) -> bool {
+        if self.mysql_dialect {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    }
+
     pub const fn new(columns: &'a [ColumnSchema], table_alias: Option<&'a str>) -> Self {
         Self {
             columns,

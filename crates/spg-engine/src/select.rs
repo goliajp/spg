@@ -11440,20 +11440,37 @@ fn whole_row_projection_schema(alias: &str) -> ColumnSchema {
     s
 }
 
+/// v7.39.3 — `mysql` makes the name comparison case-INSENSITIVE, which
+/// is MySQL's rule for column names (measured on 9.7.2: `mycol`,
+/// `MYCOL` and a backquoted `MyCol` all resolve the same column).
+///
+/// SPG compared byte for byte and its lexer folds an UNQUOTED
+/// identifier, so a table restored from a `mysqldump` — where every
+/// identifier is backquoted and keeps its case — had every mixed-case
+/// column unreachable from ordinary unquoted SQL. Same "two spellings,
+/// two things" defect v7.39.1 closed for relation names.
 pub(crate) fn resolve_projection_column<'a>(
     c: &ColumnName,
     schema_cols: &'a [ColumnSchema],
     table_alias: &str,
+    mysql: bool,
 ) -> Result<Cow<'a, ColumnSchema>, EngineError> {
+    let same = |a: &str, b: &str| {
+        if mysql {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
     if let Some(q) = &c.qualifier {
         let composite = alloc::format!("{q}.{name}", name = c.name);
-        if let Some(s) = schema_cols.iter().find(|s| s.name == composite) {
+        if let Some(s) = schema_cols.iter().find(|s| same(&s.name, &composite)) {
             return Ok(Cow::Borrowed(s));
         }
         // Single-table case: the qualifier may equal the active alias —
         // then look for the bare column name.
-        if q == table_alias
-            && let Some(s) = schema_cols.iter().find(|s| s.name == c.name)
+        if same(q, table_alias)
+            && let Some(s) = schema_cols.iter().find(|s| same(&s.name, &c.name))
         {
             return Ok(Cow::Borrowed(s));
         }
@@ -11462,7 +11479,7 @@ pub(crate) fn resolve_projection_column<'a>(
         // mismatch alone is enough.
         let prefix = alloc::format!("{q}.");
         let qualifier_known =
-            q == table_alias || schema_cols.iter().any(|s| s.name.starts_with(&prefix));
+            same(q, table_alias) || schema_cols.iter().any(|s| s.name.starts_with(&prefix));
         if !qualifier_known {
             return Err(EngineError::Eval(EvalError::UnknownQualifier {
                 qualifier: q.clone(),
@@ -11473,7 +11490,7 @@ pub(crate) fn resolve_projection_column<'a>(
             name: c.name.clone(),
         }));
     }
-    if let Some(s) = schema_cols.iter().find(|s| s.name == c.name) {
+    if let Some(s) = schema_cols.iter().find(|s| same(&s.name, &c.name)) {
         return Ok(Cow::Borrowed(s));
     }
     let suffix = alloc::format!(".{name}", name = c.name);
@@ -11772,7 +11789,7 @@ pub(crate) fn build_projection_hiding_tail(
                 // concat(…)` → Text). Falls back to nullable Text
                 // for shapes the describe path can't resolve.
                 if let Expr::Column(c) = expr {
-                    let sch = resolve_projection_column(c, schema_cols, table_alias)?;
+                    let sch = resolve_projection_column(c, schema_cols, table_alias, mysql)?;
                     let output_name = alias.clone().unwrap_or_else(|| c.name.clone());
                     out.push(ProjectedItem {
                         expr: expr.clone(),
@@ -13786,6 +13803,16 @@ impl crate::Engine {
     /// which is derived by asking the dispatch itself offline and can
     /// only ever UNDER-refuse — see that file for why the two other
     /// candidate oracles were refuted.
+    /// v7.39.3 — MySQL's column names are case-insensitive; PostgreSQL's
+    /// quoted ones are not. See `EvalContext::col_eq`.
+    fn col_name_eq(&self, a: &str, b: &str) -> bool {
+        if self.speaks_mysql {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    }
+
     pub(crate) fn validate_function_arity(
         &self,
         stmt: &SelectStatement,
@@ -13906,13 +13933,22 @@ impl crate::Engine {
                 // and MySQL's: `FROM pg_cast c WHERE pg_cast.oid <> 0`
                 // is an error on both.
                 return match sources.iter().find(|(a, _)| a == q) {
-                    Some((_, t)) => t.schema().columns.iter().any(|sc| sc.name == c.name),
+                    Some((_, t)) => t
+                        .schema()
+                        .columns
+                        .iter()
+                        .any(|sc| self.col_name_eq(&sc.name, &c.name)),
                     None => false,
                 };
             }
             sources
                 .iter()
-                .any(|(_, t)| t.schema().columns.iter().any(|sc| sc.name == c.name))
+                .any(|(_, t)| {
+                    t.schema()
+                        .columns
+                        .iter()
+                        .any(|sc| self.col_name_eq(&sc.name, &c.name))
+                })
                 // An output name the statement itself defines: ORDER BY,
                 // GROUP BY and HAVING may all name one.
                 || stmt.items.iter().any(|it| match it {
