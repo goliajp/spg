@@ -54,6 +54,33 @@ the current build; this file is a release-organized view.
   charge, do not move. The `_cs` pin does not bite either, and says so
   in its own doc rather than counting as coverage it does not provide.
 
+- **A restart changed every text `ORDER BY` answer.** A database
+  created under a locale came back ordering by BYTES.
+
+  ```text
+  same container, SPG_LC_COLLATE=en_US.utf8, same table, same query
+  before restart   a,A,b,B                        the collator's order
+  after restart    A,B,a,b                        byte order
+  startup line     database collation "C"
+  ```
+
+  A collation lives in the catalog, and a catalog reaches disk only at
+  a checkpoint — so every crash and every plain `kill` starts from an
+  empty one and rebuilds from the WAL, with no collation in it.
+  v7.38.19 moved the environment's declaration to run AFTER replay, so
+  that a `LANG` could not silently redeclare a database that already
+  had one. That guard is right and is unchanged. What was missing is
+  anything durable for it to consult: seeing replayed tables and no
+  collation, it could only refuse, and refusing is what produced the
+  byte order.
+
+  A `<wal>.collation` sidecar — the same shape as `.cluster_id`, for
+  the same reason — is written when a collation is established and read
+  BEFORE replay. Both directions are pinned now: a locale database
+  keeps its collation across a bounce, and a `C` database still cannot
+  be upgraded by an environment variable. The ablation reddens exactly
+  the first pin and leaves the second alone.
+
 - **A `UNIQUE` text column admitted a duplicate** when the database
   named a collation — which the published image always does.
 
