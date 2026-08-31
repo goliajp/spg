@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.39.5] — 2026-09-01
 
 ### Fixed
 
@@ -67,6 +67,14 @@ the current build; this file is a release-organized view.
   summarising every integer row as `u64::MAX` left the pins green.
 
 ## [7.39.4] — 2026-08-31
+
+> Tagged, never published. Its release gate reported one of the
+> sixty-four performance cells as a loss against PostgreSQL 18, so the
+> train stopped at preflight: no crate and no image left the building.
+> Everything below shipped in 7.39.5, together with the fix for that
+> cell. A pushed tag is not rewritten, which is why the number is
+> skipped rather than reused.
+
 
 ### Fixed
 
