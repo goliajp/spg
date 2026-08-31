@@ -8,6 +8,37 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Testing
+
+- **The wire panel declared no collation, so it ran under the
+  operator's shell.** `proclib` declares `SPG_LC_COLLATE=C` for the
+  servers it starts; the spg-server test harness is a different one,
+  and it clears three variables and inherits the rest. Both machines
+  here export `LANG=en_US.UTF-8`, so 734 wire tests had been ordering
+  text by a LOCALE while every fixture in them was authored under `C`
+  — and a runner with `LANG` unset was running a different panel from
+  the one anybody had looked at.
+
+  `ServerBuilder` now DECLARES it: `C` by default, for the reason
+  `proclib` gives, and `SPG_E2E_DB_COLLATION` switches the panel. A
+  test that names its own collation still wins.
+
+  `gate.sh e2e` runs the whole spg-server surface a second time under
+  `en_US.utf8`, the collation the published image ships — the same
+  shape the sqllogictest corpus has had since v7.39.4.
+
+  Measured before any of this: 734 tests under `C`, all 734 under
+  `en_US.utf8`, green both ways. A second panel no fixture can
+  distinguish is theatre, so `e2e_panel_collation_v7395` asks for an
+  ordering the two answer differently — `Bob,Zebra,apple` by bytes,
+  `apple,Bob,Zebra` by `en_US` — and reads the server's own
+  `pg_database.datcollate` before judging it, so a declaration that
+  never reached the child reds instead of being scored against a panel
+  it is not in. Removing the declaration reds it with exactly that
+  sentence.
+
 ## [7.39.5] — 2026-09-01
 
 ### Fixed

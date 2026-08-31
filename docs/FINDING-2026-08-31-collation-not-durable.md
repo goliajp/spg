@@ -93,9 +93,34 @@ The pin added here does not depend on the default — it names
 a byte-ordering default cannot see the defect. Three versions have now
 been caught by that same rule.
 
-**Still open:** the server-side e2e surface runs only under `C`. The
-engine's answers are covered both ways (the corpus runs twice from
-v7.39.4); the wire's are not. Closing it means deciding, for each
-fixture that asserts an ordering, which panel it belongs to — the same
-`skipif spg-collated` judgement the corpus needed, times the e2e
-suite.
+**Closed in v7.39.5, and the sentence above was wrong about how.**
+
+The wire panel did not run under `C`. It ran under whatever the person
+typing the command had in their shell. `proclib` declares
+`SPG_LC_COLLATE=C` for the servers IT starts — the sweep legs, the dump
+round-trip, the released-directory open — but the spg-server test
+harness is a different one: it clears three variables and inherits the
+rest. Both machines here export `LANG=en_US.UTF-8`, so the panel had
+been ordering text by a locale, silently, while every fixture in it was
+authored under `C`; a CI runner with `LANG` unset was running a
+different panel from the one anybody had looked at. Reading the
+declaration in one harness and writing it down as if it were the
+other's is what put the wrong sentence here.
+
+Measured before changing anything: 734 wire tests under
+`SPG_LC_COLLATE=C`, then all 734 under `en_US.utf8` — green both ways,
+no fixture disagreeing. So the `skipif`-per-fixture judgement the
+sentence above anticipated was not needed at all. What was needed was
+the opposite: something that CAN tell the panels apart. A second panel
+no fixture can distinguish is theatre.
+
+v7.39.5 therefore does three things. `ServerBuilder` DECLARES the
+collation (`C` by default, the same reasoning `proclib` wrote down),
+with `SPG_E2E_DB_COLLATION` to switch the panel. `gate.sh e2e` runs the
+whole spg-server surface a second time under `en_US.utf8`. And
+`e2e_panel_collation_v7395` asks for an ordering the two collations
+answer differently — `Bob,Zebra,apple` by bytes, `apple,Bob,Zebra` by
+`en_US` — and checks the server's own `pg_database.datcollate` first,
+so a declaration that fails to reach the child reds rather than being
+judged against a panel it is not in. Removing the declaration reds it
+with exactly that sentence.

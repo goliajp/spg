@@ -159,6 +159,39 @@ impl Default for ServerBuilder {
     }
 }
 
+/// The collation every server in this panel DECLARES, and the knob that
+/// switches the panel to the other one.
+///
+/// v7.39.5 — it was declared nowhere, so it was the operator's shell:
+/// `ServerBuilder` clears three variables and inherits the rest, and
+/// both of this project's machines export `LANG=en_US.UTF-8`. The wire
+/// panel has therefore been ordering text by a LOCALE, silently, while
+/// the servers `proclib` starts declare `C` and every fixture in the
+/// suite was authored under `C`. A panel whose configuration comes from
+/// whoever typed the command is not a panel — a CI runner with `LANG`
+/// unset was running a different one.
+///
+/// `C` is the default for the same reason `proclib` chose it. The knob
+/// exists so the gate can run the whole panel a second time under the
+/// collation the published image actually ships, the way the
+/// sqllogictest corpus has run twice since v7.39.4.
+///
+/// A test that sets `SPG_LC_COLLATE` itself still wins: `extra_env` is
+/// applied after this.
+#[must_use]
+pub fn panel_collation() -> String {
+    std::env::var("SPG_E2E_DB_COLLATION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "C".to_string())
+}
+
+/// Whether this panel orders text by a locale rather than by bytes.
+#[must_use]
+pub fn panel_is_collated() -> bool {
+    !panel_collation().eq_ignore_ascii_case("C")
+}
+
 /// Env vars cleared by every test by default — these would otherwise
 /// leak from the caller's shell (a developer running `cargo test`
 /// with `SPG_PASSWORD=foo bash -c …` would auth-fail every test).
@@ -308,6 +341,9 @@ impl ServerBuilder {
         for k in &self.env_remove {
             cmd.env_remove(k);
         }
+        // Declared, not inherited — see `panel_collation`. Applied
+        // before `extra_env` so a test that names its own wins.
+        cmd.env("SPG_LC_COLLATE", panel_collation());
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
@@ -340,6 +376,7 @@ impl ServerBuilder {
         for k in &self.env_remove {
             cmd.env_remove(k);
         }
+        cmd.env("SPG_LC_COLLATE", panel_collation());
         for (k, v) in &self.extra_env {
             cmd.env(k, v);
         }
