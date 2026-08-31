@@ -292,6 +292,7 @@ mod e2e_nowal_returning_round182;
     unused_variables
 )]
 mod e2e_observability;
+mod e2e_panel_collation_v7395;
 mod e2e_parallel_freezer;
 #[allow(unused_mut, unused_variables)]
 mod e2e_persistence;

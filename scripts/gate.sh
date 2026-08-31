@@ -106,6 +106,26 @@ run_e2e() {
     # empty under debug, so this stays a functional sweep).
     cargo test --workspace --locked --tests -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
 
+    # v7.39.5 — and the wire panel a second time, under the collation the
+    # published image ships.
+    #
+    # Until this version the panel declared no collation at all: the
+    # harness clears three variables and inherits the rest, so what these
+    # servers ordered text by was the operator's shell. Both machines
+    # here export `LANG=en_US.UTF-8`, so the panel had been running under
+    # a locale while every fixture in it was authored under `C` — and a
+    # runner with `LANG` unset was running a different panel.
+    #
+    # `C` is the declared default now, and this leg is the other one. It
+    # is the whole spg-server test surface, not a subset: the point is
+    # that a locale changes ANSWERS, and there is no telling in advance
+    # which fixture notices. Measured when it was added: 734 tests, green
+    # both ways, which is why `e2e_panel_collation_v7395` exists — a
+    # second panel that no fixture can distinguish is theatre.
+    banner "e2e: shipped collation"
+    SPG_E2E_DB_COLLATION=en_US.utf8 \
+        cargo test --locked -p spg-server --tests -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+
     # v7.38 element B — permutation matrix runner. Fast tier walks
     # 3 core permutations (embedded / server_simple / topk_off) over
     # the fast_tier_sample corpus subset (~15 fixtures). Full tier
