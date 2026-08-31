@@ -41,6 +41,7 @@ Zebra
 # ...and the undeclared one beside it does not. SPG's database collation
 # is `C`, so this is byte order. Read the note above before comparing
 # this block with PostgreSQL.
+skipif spg-collated
 query T
 SELECT y FROM cd ORDER BY y
 ----

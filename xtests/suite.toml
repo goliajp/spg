@@ -61,7 +61,7 @@ budget_s = 10
 tier = "precommit"
 name = "slt-smoke"
 impl = "external"
-cmd = "cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+cmd = "cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list"
 # v7.38.18 — 45, and the number is two things, not one.
 #
 # The corpus itself is 1.5-2.0 s: 413 cases, measured twice on a warm

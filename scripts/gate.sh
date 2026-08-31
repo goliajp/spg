@@ -176,6 +176,23 @@ run_gates() {
 run_biz() {
     banner biz
     cargo run --release --locked -p sqllogictest
+    # v7.39.4 — the same corpus under the collation the PRODUCT SHIPS.
+    #
+    # The image carries `LANG=en_US.utf8` and says so on the way up
+    # (`spg-server: database collation "en_US.utf8"`); every record above
+    # runs on a catalog that orders by BYTES. A defect that needs the
+    # database to name a collation is invisible in the first run no
+    # matter how many records it grows, which is how v7.39.3 shipped a
+    # session collation that reached equality and not ordering.
+    #
+    # The first run of this panel found two more, neither about
+    # ordering: a UNIQUE text column ADMITTED A DUPLICATE, and MySQL
+    # `MATCH … AGAINST` over a FULLTEXT index answered no rows. Both are
+    # fixed in this version; this leg is what keeps them fixed.
+    #
+    # Records that assert byte order say `skipif spg-collated` and are
+    # skipped here — nowhere else.
+    SPG_SLT_DB_COLLATION=en_US.utf8 cargo run --release --locked -p sqllogictest
     xtests/dump_compat/run.sh local-build
     xtests/data_compat/run.sh local-build
     # v7.39 (round 666) — the differential corpus joins the protocol.

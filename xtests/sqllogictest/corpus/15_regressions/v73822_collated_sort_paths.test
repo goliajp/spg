@@ -35,7 +35,12 @@ Banana
 Cherry
 date
 
-# No collation named: a `C` database still orders bytes, unchanged.
+# No collation named: a `C` database still orders bytes, unchanged —
+# which is a property of THIS database, so the record is true of the
+# byte-ordering panel and false of the one that runs under the
+# collation the image ships with. It says which rather than failing in
+# a panel it was never about.
+skipif spg-collated
 query T
 SELECT s FROM coll_paths ORDER BY s
 ----

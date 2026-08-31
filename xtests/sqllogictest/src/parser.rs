@@ -139,7 +139,7 @@ pub fn parse_str(text: &str) -> Result<Vec<Record>, ParseError> {
             // next record on us" only when the engine is `spg`; otherwise
             // accept (we don't know that other engine).
             let engine = trimmed.trim_start_matches("skipif ").trim();
-            if engine.eq_ignore_ascii_case("spg") {
+            if engine.eq_ignore_ascii_case("spg") || is_us(engine) {
                 pending_directive.skip = true;
             }
             lines.next();
@@ -147,7 +147,7 @@ pub fn parse_str(text: &str) -> Result<Vec<Record>, ParseError> {
         }
         if trimmed.starts_with("onlyif ") {
             let engine = trimmed.trim_start_matches("onlyif ").trim();
-            if engine.eq_ignore_ascii_case("spg") {
+            if engine.eq_ignore_ascii_case("spg") || is_us(engine) {
                 pending_directive.only = true;
             } else {
                 pending_directive.skip = true;
@@ -335,6 +335,24 @@ where
         lines.next();
     }
     ExpectedQuery::Values(values)
+}
+
+/// v7.39.4 — is `engine` a name for the panel we are running RIGHT NOW?
+///
+/// `spg-collated` names the run under the collation the product ships
+/// with (`SPG_SLT_DB_COLLATION`), as distinct from the byte-ordering
+/// default the corpus was authored under. A record that asserts an
+/// ORDER of text — `A`, `B`, `a`, `b` for byte order against `a`, `A`,
+/// `b`, `B` for a dictionary one — is true of exactly one of them, and
+/// says which with `skipif spg-collated` rather than being left to fail
+/// in a panel it was never about.
+///
+/// Only ordering assertions carry it. Everything else in those files —
+/// the DDL, the inserts, the equality — runs in both panels, which is
+/// where a collation defect would hide.
+fn is_us(engine: &str) -> bool {
+    engine.eq_ignore_ascii_case("spg-collated")
+        && std::env::var("SPG_SLT_DB_COLLATION").is_ok_and(|v| !v.is_empty())
 }
 
 #[cfg(test)]

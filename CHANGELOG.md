@@ -44,13 +44,81 @@ the current build; this file is a release-organized view.
   that did not.
 
   **Why every gate passed.** The defect cannot exist on a database that
-  orders by bytes, and that is what the test engine had; the server
-  ships collating `en_US.UTF-8`, which its own startup line prints.
+  orders by bytes, and that is what the test engine had. The published
+  image carries `LANG=en_US.utf8` and says so on the way up —
+  `spg-server: database collation "en_US.utf8"` — so the shipped
+  product orders by a locale and the suite ordered by bytes.
   Three of the pins now set the shipped collation explicitly, and the
   ablation bites exactly the one written for this fix — the others,
   including a PostgreSQL control that keeps the database's collator in
   charge, do not move. The `_cs` pin does not bite either, and says so
   in its own doc rather than counting as coverage it does not provide.
+
+- **A `UNIQUE` text column admitted a duplicate** when the database
+  named a collation — which the published image always does.
+
+  ```text
+  CREATE TABLE t (id INT NOT NULL, code TEXT NOT NULL UNIQUE);
+  INSERT INTO t VALUES (1, 'a');
+  INSERT INTO t VALUES (2, 'a');   -- accepted
+  SELECT code FROM t;              -- a, a
+  ```
+
+  The constraint is enforced by descending the column's B-tree when one
+  discriminates. A locale-collated tree is keyed by ICU sort keys the
+  engine supplies and is empty until a refresh fills it, so a lookup by
+  the RAW value answers "no locators" — and the chooser reads that as
+  the most selective candidate, takes it, and never compares the
+  conflicting row. It now declines such a tree and folds the table
+  instead, which is the path that ran before the probe existed and is
+  what a byte-ordering database has been taking all along.
+
+- **MySQL `MATCH … AGAINST` over a `FULLTEXT KEY` returned no rows**,
+  and `LIKE '%…%'` over a `gin_trgm_ops` index did the same, on a
+  database that names a collation.
+
+  A GIN keys on lexemes and trigrams the engine derives — a different
+  keyspace with a different key type — and a locale collation has
+  nothing to say about it. The question "does this index take a
+  supplied key" was answered from the column's type and the database's
+  collation without asking what KIND of index it was, so every GIN over
+  a text column was routed into the ICU path and answered nothing.
+
+  The pins for this took two tries, and the ablation is what said so.
+  The first fulltext pin ran in a MySQL session — where the column
+  carries `Collation::CaseInsensitive` and the classification returns
+  early, so the defect is unreachable there — and the first trigram pin
+  inserted both rows before `CREATE INDEX`, which is the seeded path
+  and works either way. Both passed with the fix removed. What bites is
+  a PostgreSQL session and a row inserted AFTER the index exists: it is
+  the incremental maintenance that took the supplied-key branch.
+
+### Testing
+
+- **The corpus now runs twice: once ordering by bytes, once under the
+  collation the product ships with.** Every one of its records had only
+  ever run on a catalog that orders by bytes, so a defect that needs
+  the database to name a collation could not appear no matter how many
+  records were added — which is how the ordering half of 7.39.3's fix
+  shipped past nine green gate steps. The second panel's first run
+  found the two defects above, neither of them about ordering. Records
+  that assert byte order say `skipif spg-collated`; four do.
+
+- **Forty-three regression fixtures had never run at precommit.** The
+  subset list's header says "all of 15_regressions" and there are two
+  directories by that name; it enumerated one. Every regression written
+  since v7.38.13 — including this version's — was in the other. The
+  header also said the tier warned on strays; nothing did. The runner
+  now FAILS on a `15_regressions` fixture missing from the list, and
+  the subset goes from 508 records to 1,116 in each of the two panels.
+
+- **The tracked conformance report was stale.** It described
+  `15_regressions` as 284 records over 21 files; the directory holds 360
+  over 29. Nothing had regenerated it since the v7.39.2 corpus chore.
+  Regenerated here, and the shipped-collation panel deliberately does
+  not write it — the report describes the byte-ordering baseline, and a
+  second run that overwrote it would leave every gate run with a dirty
+  tree.
 
 
 ## [7.39.3] — 2026-08-31

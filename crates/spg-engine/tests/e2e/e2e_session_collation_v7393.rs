@@ -137,8 +137,12 @@ fn a_postgres_session_is_unaffected() {
 ///
 /// The pins above were written on an engine whose database collates by
 /// BYTES, and they passed. The server ships with a locale collation —
-/// its own startup line says `database collation "en_US.UTF-8"` — and
-/// there `'a' < 'B'` is TRUE by the collator, so a session that asked
+/// the published image carries `LANG=en_US.utf8` and its own startup
+/// line says `database collation "en_US.utf8"`. That exact spelling is
+/// what these pins install, rather than a neighbouring one that happens
+/// to classify the same way.
+///
+/// There `'a' < 'B'` is TRUE by the collator, so a session that asked
 /// for `utf8mb4_bin` gets the collator's order instead of the bytes it
 /// asked for. Measured against MySQL 9.7.2, which answers 0, and
 /// against the published 7.39.3 image, which answers 1.
@@ -150,7 +154,7 @@ fn a_postgres_session_is_unaffected() {
 fn a_binary_session_beats_a_locale_database_collation() {
     let mut e = mysql();
     assert!(
-        e.set_database_collation("en_US.UTF-8")
+        e.set_database_collation("en_US.utf8")
             .expect("db collation"),
         "the shipped default has to be in place for this to mean anything"
     );
@@ -194,7 +198,7 @@ fn a_binary_session_beats_a_locale_database_collation() {
 fn a_case_sensitive_session_beats_a_locale_database_collation() {
     let mut e = mysql();
     assert!(
-        e.set_database_collation("en_US.UTF-8")
+        e.set_database_collation("en_US.utf8")
             .expect("db collation")
     );
     e.execute("SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs")
@@ -210,7 +214,7 @@ fn a_case_sensitive_session_beats_a_locale_database_collation() {
 fn a_postgres_session_still_orders_by_the_database_collation() {
     let mut e = Engine::new();
     assert!(
-        e.set_database_collation("en_US.UTF-8")
+        e.set_database_collation("en_US.utf8")
             .expect("db collation")
     );
     assert_eq!(one(&mut e, "SELECT 'a' < 'B'"), "true");

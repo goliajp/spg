@@ -802,6 +802,30 @@ fn uc_probe_choice<'t>(
         let Some(idx) = probe_btree(table, col) else {
             continue;
         };
+        // v7.39.4 — a locale-collated tree cannot answer this probe, and
+        // answering it wrongly ADMITS A DUPLICATE.
+        //
+        // Measured on the corpus under the collation the image ships
+        // with (`LANG=en_US.utf8`): `code TEXT NOT NULL UNIQUE`, insert
+        // `'a'`, insert `'a'` again — accepted, and the table then holds
+        // two rows both `'a'` in a column declared UNIQUE. Under byte
+        // order the same file rejects the second row, which is why every
+        // run of this corpus so far said the constraint held.
+        //
+        // Such a tree is keyed by ICU sort keys the engine produces, and
+        // is EMPTY until a refresh fills it. `lookup_eq` of a RAW value
+        // therefore answers "no locators" either way — the chooser reads
+        // that as the most selective candidate, takes it, and the
+        // conflicting row is never compared. Declining sends the
+        // constraint down the whole-table fold, which folds through
+        // `collated_key_cell` and is what ran before the probe existed.
+        //
+        // This is the same rule the read paths already keep in
+        // `Table::index_for_column`: an index whose keys cannot answer
+        // the question must not stand in for one that can.
+        if table.index_collation(idx).is_some() {
+            continue;
+        }
         let Some(ik) = sample.get(col).and_then(spg_storage::IndexKey::from_value) else {
             continue;
         };

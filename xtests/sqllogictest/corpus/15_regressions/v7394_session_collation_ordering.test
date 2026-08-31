@@ -19,7 +19,11 @@ CREATE TABLE ordcoll (s TEXT)
 statement ok
 INSERT INTO ordcoll VALUES ('a'), ('B'), ('b'), ('A')
 
-# Byte order is what this database has, so upper case sorts first.
+# Byte order is what this database has, so upper case sorts first —
+# which makes this record, and the count below it, true of the
+# byte-ordering panel only. The shipped-collation panel skips them and
+# runs everything else in the file.
+skipif spg-collated
 query T
 SELECT s FROM ordcoll ORDER BY s
 ----
@@ -28,6 +32,7 @@ B
 a
 b
 
+skipif spg-collated
 # And the comparison agrees with the ordering.
 query I
 SELECT count(*) FROM ordcoll WHERE s < 'a'
