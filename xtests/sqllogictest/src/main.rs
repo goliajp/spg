@@ -179,8 +179,18 @@ fn main() -> ExitCode {
     }
     groups.sort_by(|a, b| a.name.cmp(&b.name));
 
-    write_json(&report_json, &groups).expect("write report.json");
-    write_md(&report_md, &groups).expect("write report.md");
+    // v7.39.4 — the SHIPPED-COLLATION panel does not write these.
+    //
+    // `report.json` and `report.md` are tracked, and they describe the
+    // byte-ordering run the corpus was authored under. `gate.sh biz`
+    // runs the corpus twice; if the second run wrote them, every gate
+    // run would leave a dirty tree and the release check that reads it
+    // would be reporting the panel rather than the baseline.
+    let collated_panel = std::env::var("SPG_SLT_DB_COLLATION").is_ok_and(|v| !v.is_empty());
+    if !collated_panel {
+        write_json(&report_json, &groups).expect("write report.json");
+        write_md(&report_md, &groups).expect("write report.md");
+    }
 
     println!("\n=== SPG conformance baseline ===");
     for g in &groups {
@@ -197,8 +207,12 @@ fn main() -> ExitCode {
             g.name, g.pass, g.fail, g.skip, pct
         );
     }
-    println!("\nreport.json -> {}", report_json.display());
-    println!("report.md   -> {}", report_md.display());
+    if collated_panel {
+        println!("\n(shipped-collation panel: reports not written)");
+    } else {
+        println!("\nreport.json -> {}", report_json.display());
+        println!("report.md   -> {}", report_md.display());
+    }
 
     // v7.39 (round 664) — this used to return SUCCESS unconditionally, so a
     // failing conformance test left no trace an automated caller could see.
@@ -351,10 +365,14 @@ fn run_list(workspace_root: &Path, list_rel: &str) -> ExitCode {
             path.parent().and_then(claimed_dialect),
         ));
     }
+    let unlisted = unlisted_regressions(workspace_root, list_rel, &text);
     let pass: usize = reports.iter().map(|f| f.pass).sum();
-    let fail: usize = reports.iter().map(|f| f.fail).sum::<usize>() + missing;
+    let fail: usize = reports.iter().map(|f| f.fail).sum::<usize>() + missing + unlisted.len();
     let skip: usize = reports.iter().map(|f| f.skip).sum();
     write_diffs(workspace_root, &diffs);
+    for f in &unlisted {
+        eprintln!("sqllogictest: regression fixture not in {list_rel}: {f}");
+    }
     println!("TOTAL          pass={pass} fail={fail} skip={skip} (list: {list_rel})");
     if fail == 0 {
         return ExitCode::SUCCESS;
@@ -760,6 +778,57 @@ fn write_diffs(workspace_root: &Path, diffs: &[String]) {
     if fs::write(&path, diffs.join("\n")).is_ok() {
         println!("diffs -> {}", path.display());
     }
+}
+
+/// v7.39.4 — the list's own header says "all of 15_regressions", and
+/// until this function existed nothing checked it.
+///
+/// Measured when the shipped-collation panel was added: the file named
+/// ONE of the two `15_regressions` directories. Forty-three fixtures —
+/// every regression written since v7.38.13, including the ones this
+/// version added — had never run at precommit at all. They were being
+/// written, committed, and counted, and the tier whose stated reason to
+/// exist is regressions ran none of them.
+///
+/// Same rule as [`DIALECT_DIRS`] one screen down: a name is an
+/// assertion, so something has to compare it against the tree. A
+/// fixture missing from the list is a FAILURE and not a warning —
+/// a warning is how forty-three of them accumulated.
+///
+/// Applies to the precommit list only; a hand-written `--list` is a
+/// question about specific files and makes no such claim.
+fn unlisted_regressions(workspace_root: &Path, list_rel: &str, text: &str) -> Vec<String> {
+    if !list_rel.ends_with("PRECOMMIT.list") {
+        return Vec::new();
+    }
+    let listed: std::collections::HashSet<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    let mut missing = Vec::new();
+    let mut stack = vec![workspace_root.join("xtests/sqllogictest/corpus")];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let here = dir.file_name().and_then(|n| n.to_str()) == Some("15_regressions");
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if here && p.extension().and_then(|x| x.to_str()) == Some("test") {
+                let rel = p
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .into_owned();
+                if !listed.contains(rel.as_str()) {
+                    missing.push(rel);
+                }
+            }
+        }
+    }
+    missing.sort();
+    missing
 }
 
 #[cfg(test)]

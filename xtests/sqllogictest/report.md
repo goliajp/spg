@@ -4,7 +4,7 @@ Per-corpus pass / fail / skip:
 
 | corpus | pass | fail | skip | % pass | ran in |
 |---|---|---|---|---|---|
-| `15_regressions` | 284 | 0 | 0 | 100.0% | postgres × 21 |
+| `15_regressions` | 360 | 0 | 0 | 100.0% | mysql × 2, postgres × 27 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 451 | 0 | 0 | 100.0% | mysql × 27 |
 | `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
@@ -53,6 +53,14 @@ Per-corpus pass / fail / skip:
 | `v73819_pseudo_types.test` | 11 | 0 | 0 | postgres |
 | `v73821_collated_topn.test` | 6 | 0 | 0 | postgres |
 | `v73822_collated_sort_paths.test` | 9 | 0 | 0 | postgres |
+| `v7392_empty_table_predicate.test` | 9 | 0 | 0 | postgres |
+| `v7392_mysql_catalog_and_types.test` | 10 | 0 | 0 | mysql |
+| `v7392_mysql_float_rendering.test` | 13 | 0 | 0 | mysql |
+| `v7392_to_number_and_semicolon.test` | 4 | 0 | 0 | postgres |
+| `v7392_wrong_arity.test` | 10 | 0 | 0 | postgres |
+| `v7393_arity_families.test` | 17 | 0 | 0 | postgres |
+| `v7393_declared_spelling.test` | 8 | 0 | 0 | postgres |
+| `v7394_session_collation_ordering.test` | 5 | 0 | 0 | postgres |
 
 ### `duckdb/`
 

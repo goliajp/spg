@@ -2097,6 +2097,26 @@ impl Table {
         if !idx.extra_column_positions.is_empty() {
             return None;
         }
+        // v7.39.4 — only a plain B-tree keys on the COLUMN'S OWN VALUE,
+        // which is the only key an ICU sort key can stand in for.
+        //
+        // A GIN keys on lexemes or trigrams the engine already derives —
+        // a different keyspace with a different key TYPE (`String`, not
+        // `IndexKey`) — and a locale collation has nothing to say about
+        // it. Reported as supplied-key, such an index took the ICU path
+        // and answered nothing: measured on the corpus under the
+        // collation the image ships with, MySQL `MATCH(body) AGAINST
+        // ('brown')` over a `FULLTEXT KEY` returned no rows where byte
+        // order returns one, and `LIKE '%own%'` over a `gin_trgm_ops`
+        // index did the same. Eight records across two files, none of
+        // which could have been about a locale.
+        //
+        // Same shape as the expression-index and composite exclusions
+        // above: an index whose keys live in another space must not be
+        // reported as one whose keys the collator supplies.
+        if !matches!(idx.kind, IndexKind::BTree(_)) {
+            return None;
+        }
         let col = schema.columns.get(idx.column_position)?;
         if !matches!(
             col.ty,

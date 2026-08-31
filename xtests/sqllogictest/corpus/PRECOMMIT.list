@@ -1,8 +1,12 @@
 # PRECOMMIT.list — the slt-smoke subset (design D6).
 # One path per line, from the REPOSITORY ROOT — not relative to this
 # file or to the corpus directory. A path of the other shape is reported
-# as `listed file missing`, which reads like a deleted corpus file. Every NEW 15_regressions corpus file's
-# commit must also touch this list (the tier warns on strays).
+# as `listed file missing`, which reads like a deleted corpus file.
+#
+# Every `15_regressions` fixture must appear here, and the runner FAILS
+# on one that does not (`unlisted_regressions`). It used to say the tier
+# warned on strays; nothing did, and by v7.39.4 forty-three fixtures —
+# every regression written since v7.38.13 — had never run at precommit.
 #
 # All of 15_regressions — regressions are precommit's reason to exist:
 xtests/sqllogictest/corpus/spg_baseline/15_regressions/distinct_index_walk.test
@@ -40,3 +44,59 @@ xtests/sqllogictest/corpus/spg_baseline/16_isolation/set_transaction_isolation_l
 # v7.39 — read-only transactions were not enforced at all, and a
 # safety mechanism that does nothing belongs in the tier that runs first.
 xtests/sqllogictest/corpus/spg_baseline/16_isolation/read_only_transaction.test
+
+# v7.39.4 — the OTHER `15_regressions` directory. The header above
+# says "all of 15_regressions" and meant it; measured, none of these
+# twenty-nine had ever run at precommit, which is every regression
+# fixture written since v7.38.13 including this version's own.
+xtests/sqllogictest/corpus/15_regressions/v73813_bare_group_by.test
+xtests/sqllogictest/corpus/15_regressions/v73814_explain_names_the_index.test
+xtests/sqllogictest/corpus/15_regressions/v73814_insert_select_tsvector.test
+xtests/sqllogictest/corpus/15_regressions/v73814_temp_namespace.test
+xtests/sqllogictest/corpus/15_regressions/v73816_expression_index.test
+xtests/sqllogictest/corpus/15_regressions/v73816_gin_expression.test
+xtests/sqllogictest/corpus/15_regressions/v73818_analyze_same_query_string.test
+xtests/sqllogictest/corpus/15_regressions/v73818_collated_index_is_used.test
+xtests/sqllogictest/corpus/15_regressions/v73818_collation_survives_dump.test
+xtests/sqllogictest/corpus/15_regressions/v73818_comments.test
+xtests/sqllogictest/corpus/15_regressions/v73818_expr_index_is_not_a_column_index.test
+xtests/sqllogictest/corpus/15_regressions/v73818_locale_collation_index.test
+xtests/sqllogictest/corpus/15_regressions/v73818_pg_collation.test
+xtests/sqllogictest/corpus/15_regressions/v73818_pg_settings_full.test
+xtests/sqllogictest/corpus/15_regressions/v73818_pg_stats.test
+xtests/sqllogictest/corpus/15_regressions/v73818_scalar_subquery_types.test
+xtests/sqllogictest/corpus/15_regressions/v73818_two_gin_indexes.test
+xtests/sqllogictest/corpus/15_regressions/v73819_interval_infinity.test
+xtests/sqllogictest/corpus/15_regressions/v73819_pseudo_types.test
+xtests/sqllogictest/corpus/15_regressions/v73821_collated_topn.test
+xtests/sqllogictest/corpus/15_regressions/v73822_collated_sort_paths.test
+xtests/sqllogictest/corpus/15_regressions/v7392_empty_table_predicate.test
+xtests/sqllogictest/corpus/15_regressions/v7392_mysql_catalog_and_types.test
+xtests/sqllogictest/corpus/15_regressions/v7392_mysql_float_rendering.test
+xtests/sqllogictest/corpus/15_regressions/v7392_to_number_and_semicolon.test
+xtests/sqllogictest/corpus/15_regressions/v7392_wrong_arity.test
+xtests/sqllogictest/corpus/15_regressions/v7393_arity_families.test
+xtests/sqllogictest/corpus/15_regressions/v7393_declared_spelling.test
+xtests/sqllogictest/corpus/15_regressions/v7394_session_collation_ordering.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v73811_brin_prune.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v73812_gin_brin_intersect.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7381_ledger_fixes.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7382_collate_c_escape_hatch.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7382_drop_column_checks.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7382_returning_xmax_is_new.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7383_add_column_inline_check.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7384_array_returning_function.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7385_on_conflict_partial_index.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7388_jsonb_column_validates.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7388_qual_order.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7389_jsonb_containment.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/v7389_jsonb_string_result.test
+xtests/sqllogictest/corpus/spg_baseline/15_regressions/wire_streaming_declines.test
+
+# v7.39.4 — the three files the shipped-collation panel found defects
+# in. Each is small, and each covers a path where an index answering
+# from the wrong keyspace is silent: a UNIQUE that admitted a
+# duplicate, and two GINs that answered no rows.
+xtests/sqllogictest/corpus/spg_baseline/09_indexes/btree_unique.test
+xtests/sqllogictest/corpus/pg_regress/22_fulltext_index.test
+xtests/sqllogictest/corpus/pg_regress/12_pg_trgm.test

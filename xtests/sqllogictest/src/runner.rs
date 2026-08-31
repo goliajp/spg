@@ -103,6 +103,35 @@ impl Runner {
             }
             _ => {}
         }
+        // v7.39.4 — run the corpus under the collation the PRODUCT ships
+        // with, not the one the harness happens to default to.
+        //
+        // The published image carries `LANG=en_US.utf8` and says so on
+        // the way up: `spg-server: database collation "en_US.utf8"`.
+        // Every record in this corpus, meanwhile, has always run on a
+        // catalog that orders by BYTES. A defect that can only exist
+        // when the database names a collation is therefore invisible
+        // here no matter how many records are added — which is how
+        // v7.39.3 shipped a session collation that reached equality and
+        // not ordering, past nine green gate steps.
+        //
+        // `SPG_SLT_DB_COLLATION` names the collation to install before
+        // the first record runs. Unset is the byte-ordering default the
+        // whole corpus was authored under; the suite sets it for the
+        // second panel.
+        if let Ok(name) = std::env::var("SPG_SLT_DB_COLLATION")
+            && !name.is_empty()
+        {
+            match engine.set_database_collation(&name) {
+                Ok(true) => {}
+                Ok(false) => panic!(
+                    "SPG_SLT_DB_COLLATION={name}: engine declined it — \
+                     a panel that silently keeps byte order is the bug \
+                     this knob exists to catch"
+                ),
+                Err(e) => panic!("SPG_SLT_DB_COLLATION={name}: {e}"),
+            }
+        }
         Self {
             engine,
             pending_diff: None,

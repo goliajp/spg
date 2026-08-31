@@ -862,6 +862,7 @@ mod e2e_setop_index_round591;
 mod e2e_setop_multiplicity_round121;
 mod e2e_setop_types_round233;
 mod e2e_setseed;
+mod e2e_shipped_collation_indexes_v7394;
 mod e2e_show_all;
 mod e2e_show_create_table_round358;
 mod e2e_show_pg_defaults;
