@@ -121,3 +121,75 @@ fn an_existing_database_keeps_its_collation() {
         "and every row must still sort the way it did before the restart"
     );
 }
+
+/// v7.39.4 — and the other direction, which the guard above could not
+/// tell apart from the one it was built for.
+///
+/// A database created under a LOCALE and killed without a checkpoint
+/// came back declaring `C`. The collation lived only in the catalog,
+/// and a catalog is on disk only after a checkpoint; replay rebuilt one
+/// without it, and the guard — running after replay, correctly — then
+/// refused to install the environment's collation because tables were
+/// already there. Nothing was wrong with the guard. There was simply
+/// nothing durable for it to consult.
+///
+/// Measured on the published 7.39.3 image, same container, same
+/// `SPG_LC_COLLATE=en_US.utf8`, same table, same query: `a,A,b,B`
+/// before the restart and `A,B,a,b` after it, with the startup line
+/// saying `database collation "C"`. Every text sort in the database
+/// changed answer across a bounce.
+///
+/// A `<wal>.collation` sidecar — the same shape as `.cluster_id`, for
+/// the same reason — is written when a collation is established and
+/// read BEFORE replay. The test above still passes: a `C` database is
+/// still not upgradable by an environment variable.
+#[test]
+fn a_locale_database_keeps_its_collation_across_a_restart() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = common::tmp_base().join(format!("spg-coll-locale-restart-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("d.spgdb");
+    let wal = dir.join("d.wal");
+
+    let build = || {
+        common::ServerBuilder::new()
+            .arg_path(&db)
+            .arg("-")
+            .arg_path(&wal)
+    };
+
+    let (child, addrs) = build().env("SPG_LC_COLLATE", "en_US.utf8").spawn();
+    {
+        let _guard = common::ChildGuard(child);
+        let mut s = common::connect_to(&addrs.native);
+        send(&mut s, "CREATE TABLE t (s text)");
+        send(&mut s, "INSERT INTO t VALUES ('a'),('B'),('b'),('A')");
+        assert_eq!(
+            first(&mut s, "SELECT string_agg(s, ',' ORDER BY s) FROM t"),
+            "a,A,b,B",
+            "the collator's order, which is what this database was created with"
+        );
+        // Killed with no checkpoint, exactly as above.
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let (child2, addrs2) = build().env("SPG_LC_COLLATE", "en_US.utf8").spawn();
+    let _guard = common::ChildGuard(child2);
+    let mut s = common::connect_to(&addrs2.native);
+    assert_eq!(
+        first(
+            &mut s,
+            "SELECT datcollate FROM pg_database WHERE datname = current_database()"
+        ),
+        "en_US.utf8",
+        "the database recorded its own collation and must come back with it"
+    );
+    assert_eq!(
+        first(&mut s, "SELECT string_agg(s, ',' ORDER BY s) FROM t"),
+        "a,A,b,B",
+        "and every row must still sort the way it did before the restart"
+    );
+}

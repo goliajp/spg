@@ -1546,6 +1546,73 @@ fn cluster_id_sidecar_path(wal_path: Option<&Path>, db_path: Option<&Path>) -> O
     Some(base.with_file_name(name))
 }
 
+/// v7.39.4 — `<base>.collation`, the same sidecar shape as
+/// `.cluster_id`, and it exists because a collation was not durable.
+///
+/// A database's collation lives in the catalog, and a catalog is only
+/// on disk after a checkpoint. Every crash and every plain `kill`
+/// therefore starts from an EMPTY catalog and rebuilds from the WAL —
+/// with no collation in it. `apply_database_collation` runs after
+/// replay (v7.38.19, deliberately, so an environment variable cannot
+/// change a database that already has one), sees a catalog full of
+/// replayed tables and no collation, and refuses. The database comes
+/// back ordering by BYTES.
+///
+/// Measured on the published 7.39.3 image, same container, same
+/// `SPG_LC_COLLATE=en_US.utf8`, same table, same query:
+///
+/// ```text
+/// before restart   a,A,b,B      the collator's order
+/// after restart    A,B,a,b      byte order
+/// startup line     database collation "C"
+/// ```
+///
+/// The v7.38.19 guard is right and stays: what was missing is anything
+/// durable for it to consult. This file is that. It is written when a
+/// collation is first established and read BEFORE replay, so the
+/// catalog carries the database's own collation into recovery and the
+/// guard then compares like with like.
+fn collation_sidecar_path(wal_path: Option<&Path>, db_path: Option<&Path>) -> Option<PathBuf> {
+    let base = wal_path.or(db_path)?;
+    let mut name = base
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".collation");
+    Some(base.with_file_name(name))
+}
+
+/// The collation this database was created with, if it recorded one.
+fn read_collation_sidecar(wal_path: Option<&Path>, db_path: Option<&Path>) -> Option<String> {
+    let p = collation_sidecar_path(wal_path, db_path)?;
+    let text = std::fs::read_to_string(&p).ok()?;
+    let name = text.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// Record it, once. A write that fails is reported and not fatal: the
+/// server still serves, and the next restart is the one that suffers,
+/// which is exactly what the message says.
+fn write_collation_sidecar(wal_path: Option<&Path>, db_path: Option<&Path>, name: &str) {
+    let Some(p) = collation_sidecar_path(wal_path, db_path) else {
+        return;
+    };
+    if p.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::write(&p, name) {
+        eprintln!(
+            "spg-server: collation sidecar write to {} failed: {e} — \
+             this database will come back ordering by bytes if it is \
+             restarted before a checkpoint",
+            p.display()
+        );
+    }
+}
+
 fn load_or_generate_cluster_id(wal_path: Option<&Path>, db_path: Option<&Path>) -> u64 {
     if let Some(p) = cluster_id_sidecar_path(wal_path, db_path) {
         if p.exists()
@@ -1977,6 +2044,25 @@ fn run(
         None => AuditLog::new(),
     };
 
+    // v7.39.4 — the database's OWN collation, before replay puts tables
+    // in the catalog and the guard below has nothing left to compare.
+    //
+    // `declare_db_collation` and not `set_db_collation`: this is not a
+    // request from the environment, it is what this database recorded
+    // about itself, and it is installed while the catalog is still
+    // empty. If the sidecar is absent (a database from before this
+    // version, or one that never had a collation) nothing happens and
+    // the old behaviour stands.
+    if let Some(recorded) = read_collation_sidecar(wal_path.as_deref(), db_path.as_deref()) {
+        match engine.declare_database_collation(&recorded) {
+            Ok(true) => {}
+            Ok(false) | Err(_) => eprintln!(
+                "spg-server: the recorded collation {recorded:?} could not be \
+                 installed before replay — this start orders by bytes"
+            ),
+        }
+    }
+
     replay_wal_into_engine(&mut engine, wal_path.as_deref(), manifest_wal_baseline)?;
 
     // v7.38.19 — AFTER replay, and the ordering is the whole guard.
@@ -1999,6 +2085,17 @@ fn run(
     // cluster and a later `LANG` does not touch it. Running after
     // replay is what makes SPG's guard mean the same thing.
     apply_database_collation(&mut engine);
+
+    // v7.39.4 — and record whatever is now in force, so the next start
+    // does not have to ask the environment. Written once; a database
+    // that already has the file keeps it.
+    // `C` is the default and needs no file: a database with no sidecar
+    // reads back as `C` already, and writing one would only add a way
+    // for the two to disagree.
+    let effective = engine.database_collation().to_string();
+    if !effective.eq_ignore_ascii_case("C") {
+        write_collation_sidecar(wal_path.as_deref(), db_path.as_deref(), &effective);
+    }
 
     bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
 
