@@ -2265,11 +2265,36 @@ fn collate_compare_hook(
     if crate::eval::is_binary_coerced(lhs) || crate::eval::is_binary_coerced(rhs) {
         return None;
     }
+    // v7.39.4 — the SESSION sits between the two, and it was missing.
+    //
+    // The chain here was "what the operands declare, else the DATABASE",
+    // and a session collation declares nothing on an operand. So under
+    // `SET NAMES utf8mb4 COLLATE utf8mb4_bin` on a database collating
+    // `en_US.UTF-8` — which is what the server ships — `'a' < 'B'`
+    // answered 1 where MySQL 9.7.2 answers 0: the collator was handed
+    // the database's locale and the session was never consulted.
+    // Measured against the published 7.39.3 image, side by side with
+    // MySQL, and reproduced here only after the test engine was given
+    // the SHIPPED database collation — on a byte-ordering database the
+    // defect cannot exist, which is why every pin passed.
+    //
+    // A byte-wise session ends the chain rather than choosing a name:
+    // returning `None` hands the comparison back to byte order, which is
+    // what `utf8mb4_bin` means. The comment above explains why `=` was
+    // right all along — the fold reads the session already, and only the
+    // ordering operators come through here.
+    let session = ctx
+        .mysql_dialect
+        .then(|| crate::eval::resolve::session_collation_name(ctx))
+        .flatten();
+    if derived.name().is_none() && session.as_deref().is_some_and(crate::collate::is_byte_wise) {
+        return None;
+    }
     let db = ctx
         .catalog
         .map(spg_storage::Catalog::db_collation)
         .filter(|d| !crate::collate::is_byte_wise(d));
-    let ord = crate::collate::compare(derived.name().or(db)?, a, b)?;
+    let ord = crate::collate::compare(derived.name().or(session.as_deref()).or(db)?, a, b)?;
     let b = match op {
         BinOp::Lt => ord == core::cmp::Ordering::Less,
         BinOp::LtEq => ord != core::cmp::Ordering::Greater,

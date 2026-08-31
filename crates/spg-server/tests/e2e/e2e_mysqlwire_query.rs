@@ -2136,3 +2136,46 @@ fn a_syntax_error_says_what_mysql_says() {
     assert_eq!(query_scalar(&mut s, "SELECT 1 FROM (SELECT 1) t"), "1");
     assert_eq!(query_scalar(&mut s, "SELECT HEX(x'1234')"), "1234");
 }
+
+/// v7.39.4 — the half of the session collation that did NOT reach the
+/// wire.
+///
+/// 7.39.3 made `SET NAMES utf8mb4 COLLATE utf8mb4_bin` reach EQUALITY,
+/// and the pins for it passed — on the EMBEDDED path. Run against the
+/// published image, the same session answers:
+///
+/// ```text
+///                        MySQL 9.7.2   spg 7.39.3
+///     'a' = 'B'               0             0
+///     STRCMP('a','B')         1             1
+///     'a' < 'B'               0             1
+///     'a' > 'B'               1             0
+/// ```
+///
+/// and the default (case-folding) session gives the SAME answer for
+/// `<`, which is what says the relational operators are not reading the
+/// session at all. This pin is on the WIRE for that reason: the pin
+/// that passed was measuring a path the customer does not take.
+#[test]
+fn a_binary_session_collation_reaches_the_relational_operators_too() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    // The control first: the default session folds, so 'a' sorts before
+    // 'B' the way a case-insensitive collation puts it.
+    assert_eq!(query_scalar(&mut s, "SELECT 'a' < 'B'"), "1");
+    exec_ok(&mut s, "SET NAMES utf8mb4 COLLATE utf8mb4_bin");
+    assert_eq!(
+        query_scalar(&mut s, "SELECT @@collation_connection"),
+        "utf8mb4_bin",
+        "the session has to have taken it for the rest to mean anything"
+    );
+    // Equality — this is what 7.39.3 fixed.
+    assert_eq!(query_scalar(&mut s, "SELECT 'AB' = 'ab'"), "0");
+    // Ordering — measured on MySQL 9.7.2: 'a' is 0x61, 'B' is 0x42.
+    assert_eq!(query_scalar(&mut s, "SELECT 'a' < 'B'"), "0");
+    assert_eq!(query_scalar(&mut s, "SELECT 'a' > 'B'"), "1");
+    assert_eq!(query_scalar(&mut s, "SELECT 'B' < 'a'"), "1");
+    // And back, so the session is read live rather than sampled once.
+    exec_ok(&mut s, "SET NAMES utf8mb4");
+    assert_eq!(query_scalar(&mut s, "SELECT 'a' < 'B'"), "1");
+}
