@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A BRIN index created on a table that already had rows pruned
+  nothing, for the life of the table.** Summaries were only ever
+  widened by an INSERT, so an index added afterwards — which is how an
+  index is normally added — held none, and an absent summary is read as
+  "cannot be skipped". It cost every write and bought no read.
+  Measured on the published 7.39.5 image, 200,000 rows:
+
+  ```text
+  WHERE v > 999999999 (matches nothing)   SPG 7.39.5    fixed     PG18
+    no index                                7.55 ms    6.53 ms   4.57 ms
+    BRIN created AFTER the rows             7.53 ms    0.21 ms   0.35 ms
+    tail predicate, 1000 rows               7.48 ms    0.30 ms   1.20 ms
+  ```
+
+  A `CHECKPOINT` did not repair it and neither did a restart. The
+  rebuild path has summarised the rows since v7.38.11, and its comment
+  says why — an empty summary "silently turns pruning off for the rest
+  of the table's life, which is the kind of regression nothing would
+  report". The same sentence was true one function away, and both now
+  make the same single pass.
+
+  The pins do not time anything: they ask the storage layer which slots
+  a predicate may skip and check the answer is the narrow one, with the
+  index built the other way round as the control. Without the fix a
+  predicate matching no row leaves the whole table to scan, and `v >
+  2500` over 5,000 rows leaves `0..5000` where it should leave
+  `2048..5000`.
+
+- **A composite index over a TEXT leading column bought nothing on the
+  collation the image ships.** `CREATE INDEX … (a, b)` then
+  `WHERE a = … AND b = …` read the whole table. Measured on the
+  published 7.39.5 image, 200,000 rows:
+
+  ```text
+  WHERE a = 'k00012345' AND b = 45      SPG 7.39.5    fixed     PG18
+    no index                               7.53 ms   5.33 ms   4.59 ms
+    with (a, b)                            7.49 ms   0.21 ms   0.39 ms
+    a value matching nothing               7.85 ms   0.20 ms   0.38 ms
+  ```
+
+  The seek declined whenever the leading column collated, on the
+  grounds that the tree is keyed in a space the probe is not built in.
+  The two spaces were real but not the ones named: `probe_key` is the
+  single funnel for equality probes and range bounds, and it encodes a
+  collated column's probe as an ICU sort key — right for a
+  single-column B-tree, whose entries are sort keys, and wrong for a
+  COMPOSITE one, whose entries `compose_multi_key` builds from the raw
+  cell. Entries raw, probe encoded: the lookup found nothing, and
+  declining hid that at the price of the index.
+
+  The composite seek now builds its probe the way its entries were
+  built, and byte equality answers the predicate because the collation
+  is deterministic — `'a' = 'A'`, `'a ' = 'a'` and `'é' = 'e'` are
+  false on PostgreSQL 18 and here alike. The RANGE twin still declines,
+  and must: an interval in collated order is not an interval in byte
+  order. MySQL's folded column never reaches either, `probe_key`
+  declines it first.
+
+  Probing in the wrong space returns NOTHING rather than something
+  wrong, so the pins ask for rows that exist: the matching row, the
+  case and padding and accent variants that byte equality keeps apart,
+  and the second component still narrowing. Restoring the encoded probe
+  reds three of the five.
+
 ### Testing
 
 - **The wire panel declared no collation, so it ran under the

@@ -800,6 +800,7 @@ pub(crate) fn try_index_seek_positions(
                 schema_cols,
                 col_pos,
                 &key,
+                &value,
                 db_coll,
             )?);
             &composite
@@ -847,19 +848,50 @@ fn try_leading_composite_prefix(
     schema_cols: &[ColumnSchema],
     col_pos: usize,
     key: &IndexKey,
+    value: &Value<'_>,
     db_coll: &str,
 ) -> Option<Vec<spg_storage::RowLocator>> {
-    // A collated leading column keys the tree in a space this probe is
-    // not built in — the two-spaces problem v7.38.18 (G3) handled inside
-    // the AND branch by stopping the prefix at that component. Stopping
-    // at the FIRST component leaves no prefix at all, so decline and let
-    // the scan answer it correctly.
-    if schema_cols
+    // v7.39.6 — a collated leading column made this decline, and that
+    // cost every composite index over a text column its whole purpose
+    // on the image we ship. It is fixed by probing in the space the
+    // COMPOSITE tree is actually built in, not by ignoring the problem.
+    //
+    // The two spaces are real, but they are not the ones the old
+    // comment named. `probe_key` is the single funnel for equality
+    // probes and range bounds, and it encodes a collated column's probe
+    // as an ICU sort key — right for a single-column B-tree, whose
+    // entries are sort keys. A COMPOSITE tree's are not:
+    // `compose_multi_key` builds every component with
+    // `IndexKey::from_value`, the raw cell, which is why
+    // `Table::index_collation` excludes composite indexes. So the
+    // ENTRIES were raw and the PROBE was a sort key, and the lookup
+    // found nothing; declining hid that, at the price of the index.
+    //
+    // Build the probe the way the entries were built, and byte equality
+    // answers the predicate, because the collation is deterministic:
+    // `'a' = 'A'`, `'a ' = 'a'` and `'é' = 'e'` are false on
+    // PostgreSQL 18 and here alike. The one equality this engine does
+    // not settle by bytes is MySQL's folded column, and `probe_key`
+    // declines that before anything reaches here.
+    //
+    // The RANGE twin below still declines, and must: an interval in
+    // collated order is not an interval in byte order.
+    //
+    // Measured on the published 7.39.5 image, 200,000 rows,
+    // `WHERE a = 'zzz-nosuch' AND b = 42` over `(a, b)`: 7.88 ms with
+    // the index and 7.53 without. The same table on a byte-ordering
+    // server answered in 0.23 ms, and the same index over an INTEGER
+    // leading column in 0.26.
+    let raw;
+    let key = if schema_cols
         .get(col_pos)
         .is_some_and(|c| collated_column(c, db_coll).is_some())
     {
-        return None;
-    }
+        raw = IndexKey::from_value(value)?;
+        &raw
+    } else {
+        key
+    };
     // The same bargain the prefix walk makes everywhere: never
     // materialise more than a quarter of the table, or the seek costs
     // more than the scan it replaces. The floor keeps tiny tables
@@ -2105,6 +2137,7 @@ pub(crate) fn try_index_seek<'a>(
                 schema_cols,
                 col_pos,
                 &key,
+                &value,
                 db_coll,
             )?);
             &composite
@@ -2219,28 +2252,36 @@ fn try_inlist_seek<'a>(
     // way its entries were. Building the key here with
     // `from_value_for_column` was a fourth copy of that decision and
     // would have probed a sort-key tree with raw text.
-    let mut keys: Vec<IndexKey> = Vec::with_capacity(list.len());
+    // v7.39.6 — the VALUE travels beside its encoded key. A composite
+    // tree is keyed on raw cells, so its probe has to be built from the
+    // value again rather than from the sort key `probe_key` produced.
+    let mut keys: Vec<(IndexKey, Value<'static>)> = Vec::with_capacity(list.len());
     for e in list {
         let Expr::Literal(l) = e else {
             return None;
         };
         let v = literal_as_column_value(l, col, col_pos)?;
-        keys.push(probe_key(schema_cols, col_pos, &v, mysql, db_coll)?);
+        let k = probe_key(schema_cols, col_pos, &v, mysql, db_coll)?;
+        keys.push((k, v.into_owned()));
     }
     let table_name = table.schema().name.as_str();
     let mut out: Vec<Cow<'a, Row>> = Vec::new();
-    for key in &keys {
+    for (key, value) in &keys {
         let composite;
-        let locators: &spg_storage::posting::PostingList =
-            match single {
-                Some(idx) => idx.lookup_eq(key),
-                None => {
-                    composite = spg_storage::posting::PostingList::from(
-                        try_leading_composite_prefix(table, schema_cols, col_pos, key, db_coll)?,
-                    );
-                    &composite
-                }
-            };
+        let locators: &spg_storage::posting::PostingList = match single {
+            Some(idx) => idx.lookup_eq(key),
+            None => {
+                composite = spg_storage::posting::PostingList::from(try_leading_composite_prefix(
+                    table,
+                    schema_cols,
+                    col_pos,
+                    key,
+                    value,
+                    db_coll,
+                )?);
+                &composite
+            }
+        };
         for loc in locators {
             match *loc {
                 spg_storage::RowLocator::Hot(i) => {
@@ -2269,7 +2310,7 @@ fn try_inlist_seek<'a>(
     // for its value.
     let exact = schema_cols
         .get(col_pos)
-        .is_some_and(|c| keys.iter().all(|k| key_stands_for_the_value(c, k)));
+        .is_some_and(|c| keys.iter().all(|(k, _)| key_stands_for_the_value(c, k)));
     Some(Seeked { rows: out, exact })
 }
 
