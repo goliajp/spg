@@ -81,4 +81,21 @@ while its environment still said `en_US.utf8`.
 The lesson is the one this whole version is about: **the shipped
 configuration is where these live.** Nothing in the suite restarts a
 server that collates, because nothing in the suite collates —
-`proclib` declares `SPG_LC_COLLATE=C` for every server it starts.
+`proclib` declares `SPG_LC_COLLATE=C` for every server it starts, at
+all six spawn sites, deliberately (v7.38.19: every fixture was authored
+under `C`, and inheriting the machine's locale had already produced a
+panel that compared `en_US` against itself).
+
+That default is right for the fixtures that exist. What is missing is a
+second panel beside it, the way the sqllogictest corpus now has one.
+The pin added here does not depend on the default — it names
+`en_US.utf8` itself, because a pin for a collation defect that inherits
+a byte-ordering default cannot see the defect. Three versions have now
+been caught by that same rule.
+
+**Still open:** the server-side e2e surface runs only under `C`. The
+engine's answers are covered both ways (the corpus runs twice from
+v7.39.4); the wire's are not. Closing it means deciding, for each
+fixture that asserts an ordering, which panel it belongs to — the same
+`skipif spg-collated` judgement the corpus needed, times the e2e
+suite.
