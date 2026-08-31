@@ -1,0 +1,38 @@
+# v7.39.4 — a byte-wise session collation must reach the ORDERING
+# operators, not only equality.
+#
+# 7.39.3 fixed `=` and announced the defect closed. Run against the
+# image that version published, `'a' < 'B'` still answered 1 where
+# MySQL 9.7.2 answers 0: the chain that picks a collation for an
+# ordering comparison read "what the operands declare, else the
+# DATABASE", and a session collation declares nothing on an operand.
+#
+# This file runs on the PostgreSQL path, where the database's own
+# collation stays in charge — which is the side a fix like this could
+# break silently. The MySQL-session behaviour is pinned in the Rust e2e
+# suite, three of whose pins set the SHIPPED database collation,
+# because on a byte-ordering database the defect cannot exist at all.
+
+statement ok
+CREATE TABLE ordcoll (s TEXT)
+
+statement ok
+INSERT INTO ordcoll VALUES ('a'), ('B'), ('b'), ('A')
+
+# Byte order is what this database has, so upper case sorts first.
+query T
+SELECT s FROM ordcoll ORDER BY s
+----
+A
+B
+a
+b
+
+# And the comparison agrees with the ordering.
+query I
+SELECT count(*) FROM ordcoll WHERE s < 'a'
+----
+2
+
+statement ok
+DROP TABLE ordcoll

@@ -13,7 +13,9 @@ ceiling, with the locale panel (16 cells) and the shipped-default panel
 (16 cells) clean as well.
 
 Two things in this version you would feel, and one of them changes
-answers rather than messages.
+answers rather than messages. The first one is half-fixed, and the note
+says which half — we would rather tell you that than let you read
+"fixed" and test the wrong thing.
 
 ## `SET NAMES … COLLATE utf8mb4_bin` was not reaching your literals
 
@@ -25,15 +27,24 @@ Measured against MySQL 9.7.2 under that exact session:
 
 ```
 SET NAMES utf8mb4 COLLATE utf8mb4_bin;
-SELECT 'AB' = 'ab';     MySQL 0    spg 1     <- wrong answer, no error
-SELECT 'a' < 'B';       MySQL 0    spg 1     <- and the ordering with it
+SELECT 'AB' = 'ab';     MySQL 0    was 1, now 0
+SELECT 'a' < 'B';       MySQL 0    was 1, now 0
 ```
 
-That is a silent wrong answer to a session that had asked, in its first
-packet, for the opposite. **What to check:** any query whose results
-depend on case where the connection sets a `_bin` or `_cs` collation.
-Nothing was corrupted — the stored data is untouched — but a comparison
-may have matched rows it should not have.
+Both halves are fixed, but they shipped in two versions, and the second
+one exists because of how we found it. 7.39.3 fixed EQUALITY, and we
+told you it fixed the ordering too. It did not. We found that after
+publishing, by running the query against the image we had just pushed
+rather than against our own test harness — which was answering
+correctly on a database that orders by bytes, while the server ships
+collating `en_US.UTF-8`, where the defect lives. **7.39.4 fixes the
+ordering.** If you are on 7.39.3, take 7.39.4.
+
+**What to check:** any query whose RESULTS depend on case where the
+connection sets a `_bin` or `_cs` collation — equality filters, range
+predicates and `ORDER BY` alike. Nothing was corrupted; the stored data
+is untouched. What may be wrong is a report's row set or row order,
+computed while one of those two versions was serving.
 
 Fixing it exposed the other direction, which we fixed in the same
 version: an explicit `COLLATE` on an expression outranks the session,

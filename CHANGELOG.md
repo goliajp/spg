@@ -10,6 +10,49 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`SET NAMES … COLLATE utf8mb4_bin` reached equality but not
+  ORDERING** — the other half of the defect 7.39.3 announced as fixed.
+  Found after that version was published, by running the query against
+  the image we had just pushed rather than against our own harness.
+  Measured side by side with MySQL 9.7.2, same client, same statements:
+
+  ```text
+  SET NAMES utf8mb4 COLLATE utf8mb4_bin;
+                      MySQL 9.7.2   spg 7.39.3
+  'AB' = 'ab'              0             0        fixed in 7.39.3
+  STRCMP('a','B')          1             1
+  'a' < 'B'                0             1        <- this
+  'a' > 'B'                1             0        <- and this
+  ```
+
+  The chain that picks the collation for an ORDERING comparison read
+  "what the operands declare, else the DATABASE", and a session
+  collation declares nothing on an operand. So the collator was handed
+  the database's locale and the session was never consulted:
+
+  ```text
+  collate::compare collation="en_US.UTF-8" a="a" b="B"
+  ```
+
+  The session sits between the two, and is in the chain now. A
+  byte-wise session ENDS the chain rather than naming a collation —
+  handing the comparison back to byte order, which is what
+  `utf8mb4_bin` means. Equality was right all along because the fold
+  reads the session already; the half that worked is what hid the half
+  that did not.
+
+  **Why every gate passed.** The defect cannot exist on a database that
+  orders by bytes, and that is what the test engine had; the server
+  ships collating `en_US.UTF-8`, which its own startup line prints.
+  Three of the pins now set the shipped collation explicitly, and the
+  ablation bites exactly the one written for this fix — the others,
+  including a PostgreSQL control that keeps the database's collator in
+  charge, do not move. The `_cs` pin does not bite either, and says so
+  in its own doc rather than counting as coverage it does not provide.
+
+
 ## [7.39.3] — 2026-08-31
 
 ### Fixed
