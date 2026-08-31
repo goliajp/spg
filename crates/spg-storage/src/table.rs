@@ -2472,9 +2472,55 @@ impl Table {
         Ok(())
     }
 
+    /// v7.39.6 — the summaries a BRIN index over `column_position`
+    /// would hold if every row already there had been inserted under
+    /// it.
+    ///
+    /// Derived from the rows in one pass, which is why they are not
+    /// serialised: they can never disagree with what is stored.
+    pub(crate) fn brin_summaries_for(&self, column_position: usize) -> Vec<Option<(i64, i64)>> {
+        let n = self.rows.len();
+        let mut sums: Vec<Option<(i64, i64)>> =
+            alloc::vec![None; n.div_ceil(crate::BRIN_RANGE_ROWS)];
+        let mut cur = self.rows.run_cursor();
+        for i in 0..n {
+            let Some(row) = cur.get(i) else { continue };
+            let Some(v) = row.values.get(column_position) else {
+                continue;
+            };
+            if let Some(k) = crate::brin_scalar(v) {
+                let r = i / crate::BRIN_RANGE_ROWS;
+                sums[r] = Some(match sums[r] {
+                    Some((lo, hi)) => (lo.min(k), hi.max(k)),
+                    None => (k, k),
+                });
+            }
+        }
+        sums
+    }
+
     /// v6.7.1 — public CREATE INDEX counterpart for BRIN. Creates
     /// the index entry with a snapshot of the indexed column's
     /// current `DataType`.
+    ///
+    /// v7.39.6 — and SUMMARISES the rows already there.
+    ///
+    /// Summaries were only ever widened by an insert, so an index
+    /// created on a populated table — which is how an index is usually
+    /// added — held none, and an absent summary is read as "cannot be
+    /// skipped". The index then cost every write and pruned nothing,
+    /// for the life of the table. Measured on the published 7.39.5
+    /// image, 200,000 rows, `WHERE v > 999999999` matching none of
+    /// them: 7.42 ms with the index created after the rows, 0.27 ms
+    /// with it created before, and PostgreSQL 18 answers the same
+    /// query in 0.34 ms against 4.68 without. A `CHECKPOINT` did not
+    /// repair it and neither did a restart.
+    ///
+    /// The rebuild path has done this since v7.38.11, and its comment
+    /// says why: an empty summary "silently turns pruning off for the
+    /// rest of the table's life, which is the kind of regression
+    /// nothing would report". The same sentence was true one function
+    /// away.
     pub fn add_brin_index(&mut self, name: String, column_name: &str) -> Result<(), StorageError> {
         if self.indices.iter().any(|i| i.name == name) {
             return Err(StorageError::DuplicateIndex { name });
@@ -2485,8 +2531,12 @@ impl Table {
             }
         })?;
         let column_type = self.schema.columns[column_position].ty;
-        self.indices
-            .push(Index::new_brin(name, column_position, column_type));
+        let summaries = self.brin_summaries_for(column_position);
+        let mut idx = Index::new_brin(name, column_position, column_type);
+        if let crate::IndexKind::Brin { summaries: s, .. } = &mut idx.kind {
+            *s = summaries;
+        }
+        self.indices.push(idx);
         Ok(())
     }
 
@@ -3960,23 +4010,8 @@ impl Table {
                     // off for the rest of the table's life, which is the
                     // kind of regression nothing would report.
                     let idx_pos = self.indices.len() - 1;
-                    let n = self.rows.len();
-                    let mut sums: Vec<Option<(i64, i64)>> =
-                        alloc::vec![None; n.div_ceil(crate::BRIN_RANGE_ROWS)];
-                    let mut cur = self.rows.run_cursor();
-                    for i in 0..n {
-                        let Some(row) = cur.get(i) else { continue };
-                        let Some(v) = row.values.get(column_position) else {
-                            continue;
-                        };
-                        if let Some(k) = crate::brin_scalar(v) {
-                            let r = i / crate::BRIN_RANGE_ROWS;
-                            sums[r] = Some(match sums[r] {
-                                Some((lo, hi)) => (lo.min(k), hi.max(k)),
-                                None => (k, k),
-                            });
-                        }
-                    }
+                    // v7.39.6 — the same pass `add_brin_index` makes.
+                    let sums = self.brin_summaries_for(column_position);
                     if let crate::IndexKind::Brin { summaries, .. } =
                         &mut self.indices[idx_pos].kind
                     {
