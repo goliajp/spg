@@ -1,14 +1,15 @@
-# spg → sentori — 7.39.4, and a restart that changed your sort order
+# spg → sentori — 7.39.5, and a restart that changed your sort order
 
-**Image:** `goliakk/spg:7.39.4`
-**Manifest digest:** `<filled at publish>`
+**Image:** `goliakk/spg:7.39.5`
+**Manifest digest:** `sha256:9487397066d7fd9b26d74ca7c769ae107b398c7af1193a61c851b730c3da56b7`
 **Battery:** `suite.sh prerelease` — lint, unit, e2e, gates, biz,
 dogfood, the release-blocking comparison against PostgreSQL 18.6, the
 ironrule wire checks and the three-engine differential — then drop-in
-acceptance against the pushed image: **<filled at publish>**.
+acceptance against the pushed image: **71 of 71 cases pass**.
 
 The comparison against PostgreSQL 18.6 that blocks every release:
-**<filled at publish>**.
+**sixty-four cells, no losses** — and the same panel is why this is
+7.39.5 and not 7.39.4. See the last section.
 
 Four things in this version change ANSWERS rather than messages. One
 of them changed every text `ORDER BY` in the database whenever the
@@ -18,7 +19,7 @@ run against your own data.
 
 This note also covers 7.39.3, which we published and then found to be
 half of a fix; it never went out as a note of its own. If you are on
-7.39.3, take 7.39.4.
+7.39.3, take 7.39.5.
 
 ## A restart was changing your sort order
 
@@ -104,8 +105,8 @@ told you it fixed the ordering too. It did not. We found that after
 publishing, by running the query against the image we had just pushed
 rather than against our own test harness — which was answering
 correctly on a database that orders by bytes, while the server ships
-collating `en_US.UTF-8`, where the defect lives. **7.39.4 fixes the
-ordering.** If you are on 7.39.3, take 7.39.4.
+collating `en_US.UTF-8`, where the defect lives. **7.39.5 fixes the
+ordering.** If you are on 7.39.3, take 7.39.5.
 
 **What to check:** any query whose RESULTS depend on case where the
 connection sets a `_bin` or `_cs` collation — equality filters, range
@@ -197,3 +198,28 @@ that with you than hand you a script.
 The rest is not blocking. If you run connections with a `_bin` or `_cs`
 collation, the collation section is worth a look at any report whose
 row counts you have reason to doubt.
+
+## Why this is 7.39.5
+
+7.39.4 was tagged and never published. Its release gate compares
+sixty-four query shapes against PostgreSQL 18.6, on the same box in the
+same window, and reported one of them as a loss: `ORDER BY <integer>
+… LIMIT 10` over 400,000 rows, at 11.3–16.2 ms against PostgreSQL's
+11.1–12.5. Nothing in that version's diff touches sorting, and
+reverting all of it left the shape just as slow — what the new code had
+done was move a hot loop that was fragile in the first place, because
+it built a sort key for every one of the 400,000 rows in order to keep
+ten. The same binary ran that shape at 12.4 ms in some server starts and
+15.7 in others, decided at startup, which is a thing you would have felt
+as "the same query, sometimes slower, and nothing changed".
+
+So we removed the work instead of moving it back. A gate we already had
+turns a decisively losing row away on the leading eight bytes of its
+sort value, before the key is built; it read text only, and now it reads
+integers, dates, timestamps and money as well. That shape is now
+7.4–8.1 ms — faster than 7.39.3, which was 11.7–12.7, and faster than
+PostgreSQL — and it no longer varies from one start to the next.
+
+No crate and no image ever carried 7.39.4. A pushed tag is not
+rewritten, so the number is skipped rather than reused; everything
+7.39.4 would have given you is in 7.39.5.
