@@ -2190,15 +2190,48 @@ pub(crate) fn build_order_keys_into(
     build_order_keys_bound(order_by, &[], &[], row, ctx, keys)
 }
 
+/// Which kind of value a prefix summarises. The two halves of the pair
+/// are only comparable when they say the same thing: a text prefix and
+/// an integer prefix are both eight bytes and mean nothing to each
+/// other, and a column holding both would otherwise have one compared
+/// against the other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PrefixKind {
+    Text,
+    Int,
+}
+
+/// An [`OrderKey::Int`] as eight order-preserving bytes.
+///
+/// v7.39.4 — the key is `i128` and the prefix is 64 bits, so values
+/// outside `i64` saturate. The gate rejects only on a STRICT `>`, and
+/// saturation is monotone, so a pair that saturates to the same bits
+/// compares equal and takes the ordinary path — it costs the win on
+/// those rows, never an answer.
+fn int_prefix(n: i128) -> u64 {
+    let clamped = n.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    (clamped as u64) ^ (1u64 << 63)
+}
+
 /// The same eight bytes, read off a KEY rather than a row — the other
 /// half of the pair, used to summarise the top-N boundary.
 ///
 /// v7.38.20 — `None` for any key that is not text, which turns the fast
 /// path off rather than guessing at it.
+/// v7.39.4 — and integers, which is what `ORDER BY k LIMIT 10` over an
+/// INT column is. That shape built 400,000 keys to keep ten, exactly as
+/// the text one did before v7.38.20; the mechanism was already here and
+/// only text could reach it.
 #[must_use]
-pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<(u64, bool)> {
-    let OrderKey::Text(t) = key else { return None };
-    Some(text_prefix(t.as_str().as_bytes()))
+pub(crate) fn order_key_prefix(key: &OrderKey) -> Option<(PrefixKind, u64, bool)> {
+    match key {
+        OrderKey::Text(t) => {
+            let (bits, ordered) = text_prefix(t.as_str().as_bytes());
+            Some((PrefixKind::Text, bits, ordered))
+        }
+        OrderKey::Int(n) => Some((PrefixKind::Int, int_prefix(*n), true)),
+        _ => None,
+    }
 }
 
 /// The first ORDER BY key's leading eight bytes, read straight off the
@@ -2237,10 +2270,28 @@ pub(crate) fn order_key_text_prefix(key: &OrderKey) -> Option<(u64, bool)> {
 /// whole batch. It is asked here per row rather than per batch because a
 /// streaming top-N has no batch to ask about.
 #[must_use]
-pub(crate) fn first_key_prefix(bound: &[Option<usize>], row: &Row<'static>) -> Option<(u64, bool)> {
+pub(crate) fn first_key_prefix(
+    bound: &[Option<usize>],
+    row: &Row<'static>,
+) -> Option<(PrefixKind, u64, bool)> {
     let idx = (*bound.first()?)?;
+    // The arms here are the ones `value_to_order_key` turns into an
+    // `OrderKey` of the matching kind, and nothing else: a prefix that
+    // summarised a value the ordinary path keys differently would
+    // reject a row the comparison would have kept.
     match row.values.get(idx)? {
-        Value::Text(t) => Some(text_prefix(t.as_bytes())),
+        Value::Text(t) => {
+            let (bits, ordered) = text_prefix(t.as_bytes());
+            Some((PrefixKind::Text, bits, ordered))
+        }
+        Value::SmallInt(n) => Some((PrefixKind::Int, int_prefix(i128::from(*n)), true)),
+        Value::Int(n) => Some((PrefixKind::Int, int_prefix(i128::from(*n)), true)),
+        Value::BigInt(n) => Some((PrefixKind::Int, int_prefix(i128::from(*n)), true)),
+        Value::Date(d) => Some((PrefixKind::Int, int_prefix(i128::from(*d)), true)),
+        Value::Timestamp(t) => Some((PrefixKind::Int, int_prefix(i128::from(*t)), true)),
+        Value::Time(us) => Some((PrefixKind::Int, int_prefix(i128::from(*us)), true)),
+        Value::Year(y) => Some((PrefixKind::Int, int_prefix(i128::from(*y)), true)),
+        Value::Money(c) => Some((PrefixKind::Int, int_prefix(i128::from(*c)), true)),
         _ => None,
     }
 }

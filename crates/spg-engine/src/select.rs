@@ -7141,7 +7141,7 @@ impl Engine {
         // every row down the ordinary path.
         // v7.38.21 — and whether those bytes may be trusted under the
         // collation in force, which is the boundary's own text to answer.
-        let mut topk_boundary_prefix: Option<(u64, bool)> = None;
+        let mut topk_boundary_prefix: Option<(crate::orderby::PrefixKind, u64, bool)> = None;
         // v7.39 (round 582) — resolve each ORDER BY column once, not
         // once per row. See `order_by_bound_positions`.
         let order_bound =
@@ -7241,9 +7241,10 @@ impl Engine {
                     && !descs.first().copied().unwrap_or(false)
                     && order_by.len() == 1
                     && boundary_collations_permit
-                    && let Some((bp, boundary_is_ascii)) = topk_boundary_prefix
-                    && let Some((rp, row_is_ascii)) =
+                    && let Some((bkind, bp, boundary_is_ascii)) = topk_boundary_prefix
+                    && let Some((rkind, rp, row_is_ascii)) =
                         crate::orderby::first_key_prefix(&order_bound, row)
+                    && bkind == rkind
                     && (boundary_no_collation || (boundary_is_ascii && row_is_ascii))
                     && rp > bp
                 {
@@ -7458,7 +7459,7 @@ impl Engine {
                 topk_boundary_prefix = topk_boundary
                     .as_ref()
                     .and_then(|b| b.first())
-                    .and_then(crate::orderby::order_key_text_prefix);
+                    .and_then(crate::orderby::order_key_prefix);
             }
             Ok(())
         };

@@ -945,6 +945,7 @@ mod e2e_tokenizer_round651;
 mod e2e_topk_boundary_round581;
 mod e2e_topk_floor_round580;
 mod e2e_topk_recycle_round571;
+mod e2e_topn_int_prefix_v7394;
 mod e2e_tranche5_fixes_round769;
 mod e2e_tranche6_fixes_round770;
 mod e2e_trig;

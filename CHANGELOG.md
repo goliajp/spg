@@ -8,7 +8,73 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.39.5] — 2026-09-01
+
+### Fixed
+
+- **`ORDER BY <integer> LIMIT 10` built a sort key for every row.** Over
+  400,000 rows the shape `SELECT pad FROM t ORDER BY k LIMIT 10` built
+  400,000 keys and kept ten. Measured against PostgreSQL 18 on the
+  release panel, same box, same window:
+
+  ```text
+  400,000 rows, top-N LIMIT 10        SPG            PG18
+  v7.39.3                        11.7-12.7 ms   11.1-12.5 ms
+  v7.39.4                        11.3-16.2 ms   11.1-12.5 ms   <- the gate refused this
+  now                             7.4-8.1 ms    11.1-12.5 ms
+  ```
+
+  The mechanism that avoids the key already existed: v7.38.20 added a
+  boundary gate that turns a decisively losing row away on the leading
+  eight bytes of its first ORDER BY value, before the key is built. It
+  read TEXT and nothing else — deliberately, because "a type whose order
+  is not its bytes" was the thing it refused to guess at. An integer's
+  order IS its bytes once the sign bit is flipped, so integers now reach
+  the same gate: `SmallInt`, `Int`, `BigInt`, `Date`, `Timestamp`,
+  `Time`, `Year` and `Money`, which are exactly the values the ordinary
+  path keys as `OrderKey::Int`.
+
+  The two halves of the pair now carry the KIND they summarise. A text
+  prefix and an integer prefix are both eight bytes and mean nothing to
+  each other, and a column holding both would otherwise have had one
+  compared against the other.
+
+  Beyond `i64` the prefix saturates. The gate rejects only on a strict
+  difference and saturation is monotone, so a pair that saturates to the
+  same bits compares equal and takes the ordinary path — it costs the
+  win on those rows, never an answer.
+
+  **How this was found, and what the pins for it cost.** v7.39.4 was
+  tagged and its release gate then reported this cell as a LOSS against
+  PG18 — the one cell in sixty-four. Nothing in that version's diff
+  touches this path: three engine lines about collated indexes and a
+  startup sidecar. Reverting all three left the shape just as slow, and
+  so did marking the new startup code `#[cold]`. What the binary had
+  done was move a hot loop, and the loop was fragile because it
+  allocated a key per row: the same binary ran the shape at 12.4 ms in
+  some processes and 15.7 in others, decided at process start, with
+  v7.39.3 landing on the fast side every time in thirty starts and
+  v7.39.4 about a third of the time. Removing the per-row key removes
+  the sensitivity along with the work — the fixed build measures
+  7.4-8.1 ms across every start.
+
+  Three ablations that did NOT bite shaped the pins. The gate stands in
+  the branch that builds keys from the ROW, so a query whose ordering
+  names an output column sorts by the projection instead and skips it;
+  the accumulator's boundary only exists after the first trim at 1,024
+  rows; and values inserted before the padding are already inside the
+  accumulator when that boundary appears. With any one of those wrong,
+  summarising every integer row as `u64::MAX` left the pins green.
+
 ## [7.39.4] — 2026-08-31
+
+> Tagged, never published. Its release gate reported one of the
+> sixty-four performance cells as a loss against PostgreSQL 18, so the
+> train stopped at preflight: no crate and no image left the building.
+> Everything below shipped in 7.39.5, together with the fix for that
+> cell. A pushed tag is not rewritten, which is why the number is
+> skipped rather than reused.
+
 
 ### Fixed
 
