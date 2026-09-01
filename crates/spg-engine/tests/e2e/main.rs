@@ -243,6 +243,7 @@ mod e2e_ddl_errors_round89;
 mod e2e_ddl_object_errors_round700;
 mod e2e_decimal_spelling_round345;
 mod e2e_default_in_values;
+mod e2e_default_text_follows_v7399;
 mod e2e_deferrable;
 mod e2e_deferrable_fk_round288;
 mod e2e_deferrable_trailer_round621;

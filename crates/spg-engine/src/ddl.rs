@@ -207,7 +207,21 @@ impl Engine {
             T::AddColumn {
                 column,
                 if_not_exists,
-            } => self.alter_add_column(tbl, column, if_not_exists),
+                position,
+            } => self.alter_add_column(tbl, column, if_not_exists, position),
+            // v7.39.9 — MySQL's own ALTER TABLE vocabulary.
+            T::ModifyColumn {
+                column,
+                rename_to,
+                definition,
+                position,
+            } => self.alter_modify_column(tbl, column, rename_to, definition, position),
+            T::RenameIndex { old, new } => self.alter_rename_index(tbl, &old, &new),
+            T::SetTableAutoIncrement(n) => self.alter_set_table_auto_increment(tbl, n),
+            T::SetEngine(name) => Self::alter_set_engine(&name),
+            T::ConvertToCharacterSet { charset, collate } => {
+                Self::alter_convert_charset(&charset, collate.as_deref())
+            }
             T::AlterColumnType {
                 column,
                 new_type,
@@ -523,7 +537,22 @@ impl Engine {
                     "column {column:?} of relation {tbl:?} does not exist"
                 ))
             })?;
+        // v7.39.9 — the source text follows the default, which it did
+        // not.
+        //
+        // `default_text` is what `information_schema.columns`,
+        // `pg_attrdef` and the DUMP all read, and it was written once at
+        // CREATE TABLE and never again. So after `ALTER TABLE t ALTER
+        // COLUMN b DROP DEFAULT` — PostgreSQL's own spelling — the
+        // catalog held no default and `dump_sql` still wrote
+        // `DEFAULT 5`: restoring that dump brought the default back, and
+        // the schema you got was not the schema you dumped. `SET
+        // DEFAULT 9` had the mirror problem, reporting and dumping the
+        // value it replaced.
+        let ty = table.schema().columns[pos].ty;
+        let text = deparse_default(&default_expr, ty);
         let col = &mut table.schema_mut().columns[pos];
+        col.default_text = Some(text);
         if is_runtime {
             col.runtime_default = Some(display);
             col.default = None;
@@ -555,6 +584,8 @@ impl Engine {
         let col = &mut table.schema_mut().columns[pos];
         col.default = None;
         col.runtime_default = None;
+        // v7.39.9 — and the source text the views and the dump read.
+        col.default_text = None;
         Ok(())
     }
 
@@ -1177,11 +1208,180 @@ impl Engine {
         )))
     }
 
+    /// v7.39.9 — MySQL's `MODIFY COLUMN c <def>` and `CHANGE COLUMN old
+    /// new <def>`.
+    ///
+    /// Both REPLACE the definition, and that is the whole difficulty:
+    /// measured on MySQL 9.7.2, a column declared `INT NOT NULL DEFAULT
+    /// 5` is `bigint`, NULLABLE, with NO default after `MODIFY COLUMN b
+    /// BIGINT`. Restating them keeps them; omitting them drops them. A
+    /// version that only changed the type would silently keep a NOT
+    /// NULL the statement removed, which is a constraint the migration
+    /// asked to lift.
+    fn alter_modify_column(
+        &mut self,
+        tbl: &str,
+        column: String,
+        rename_to: Option<String>,
+        definition: ColumnDef,
+        position: Option<spg_sql::ast::ColumnPosition>,
+    ) -> Result<(), EngineError> {
+        let exists = self
+            .active_catalog()
+            .get(tbl)
+            .ok_or_else(|| EngineError::Storage(StorageError::TableNotFound { name: tbl.into() }))?
+            .schema()
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&column));
+        if !exists {
+            return Err(EngineError::Storage(StorageError::ColumnNotFound {
+                column: column.clone(),
+            }));
+        }
+        // The type first, under the name it still has.
+        self.alter_column_type(tbl, column.clone(), definition.ty, None, None)?;
+        // Then the rest of the definition, replaced rather than amended.
+        if definition.nullable {
+            self.alter_column_drop_not_null(tbl, column.clone())?;
+        } else {
+            self.alter_column_set_not_null(tbl, column.clone())?;
+        }
+        match definition.default.clone() {
+            Some(d) => self.alter_column_set_default(tbl, column.clone(), d)?,
+            None => self.alter_column_drop_default(tbl, column.clone())?,
+        }
+        // v7.39.9 — MySQL moves the column when the statement says so,
+        // and the move has to happen with the column's data: this is
+        // the same rewrite `ADD … AFTER` does.
+        if let Some(pos) = position {
+            self.move_column(tbl, &column, &pos)?;
+        }
+        if let Some(new) = rename_to
+            && !new.eq_ignore_ascii_case(&column)
+        {
+            self.alter_rename_column(tbl, column, new)?;
+        }
+        Ok(())
+    }
+
+    /// v7.39.9 — move an existing column to a position, carrying its
+    /// values. Used by `MODIFY … AFTER c` / `… FIRST`.
+    fn move_column(
+        &mut self,
+        tbl: &str,
+        column: &str,
+        pos: &spg_sql::ast::ColumnPosition,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let from = table
+            .schema()
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(column))
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::ColumnNotFound {
+                    column: column.into(),
+                })
+            })?;
+        let to = match pos {
+            spg_sql::ast::ColumnPosition::First => 0,
+            spg_sql::ast::ColumnPosition::After(after) => {
+                let a = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(after))
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::ColumnNotFound {
+                            column: after.clone(),
+                        })
+                    })?;
+                if a < from { a + 1 } else { a }
+            }
+        };
+        if to != from {
+            table.move_column(from, to);
+        }
+        Ok(())
+    }
+
+    /// v7.39.9 — MySQL's `RENAME {INDEX|KEY} old TO new`.
+    fn alter_rename_index(&mut self, tbl: &str, old: &str, new: &str) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        if table.rename_index(old, new) {
+            Ok(())
+        } else {
+            Err(EngineError::Storage(StorageError::IndexNotFound {
+                name: old.into(),
+            }))
+        }
+    }
+
+    /// v7.39.9 — MySQL's `ALTER TABLE t AUTO_INCREMENT = n`: the value
+    /// the NEXT insert takes. Measured on 9.7.2: after `= 100`, the
+    /// next row's id is 100.
+    fn alter_set_table_auto_increment(&mut self, tbl: &str, n: i64) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        table.set_auto_increment_next(n);
+        Ok(())
+    }
+
+    /// v7.39.9 — MySQL's `ENGINE = <name>`.
+    ///
+    /// SPG has one storage engine and substitutes for every name MySQL
+    /// knows, which is what `CREATE TABLE` already does. A name MySQL
+    /// does not know is refused with its own sentence, because a typo
+    /// in a migration must not quietly become SPG's storage — the same
+    /// reasoning, and the same list, as the CREATE path.
+    fn alter_set_engine(name: &str) -> Result<(), EngineError> {
+        if crate::MYSQL_KNOWN_ENGINES
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(name))
+        {
+            Ok(())
+        } else {
+            Err(EngineError::Unsupported(alloc::format!(
+                "Unknown storage engine '{name}'"
+            )))
+        }
+    }
+
+    /// v7.39.9 — MySQL's `CONVERT TO CHARACTER SET <cs> [COLLATE <c>]`.
+    ///
+    /// SPG stores UTF-8 throughout, so a charset that IS UTF-8 is
+    /// accepted and anything else is refused with MySQL's sentence.
+    /// Measured on 9.7.2: `utf8mb4` succeeds, `nosuchcs` answers
+    /// `ERROR 1115 (42000) Unknown character set: 'nosuchcs'`.
+    fn alter_convert_charset(charset: &str, _collate: Option<&str>) -> Result<(), EngineError> {
+        // The charsets SPG can represent, which is UTF-8 and its
+        // MySQL spellings. A conversion to anything else would change
+        // what the bytes mean, so it is refused rather than accepted
+        // and ignored.
+        if ["utf8mb4", "utf8mb3", "utf8", "ascii", "binary"]
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(charset))
+        {
+            Ok(())
+        } else {
+            Err(EngineError::Unsupported(alloc::format!(
+                "Unknown character set: '{charset}'"
+            )))
+        }
+    }
+
     fn alter_add_column(
         &mut self,
         tbl: &str,
         column: ColumnDef,
         if_not_exists: bool,
+        position: Option<spg_sql::ast::ColumnPosition>,
     ) -> Result<(), EngineError> {
         // v7.13.0 — mailrs round-5 G1. Append-only column add
         // with back-fill of the DEFAULT (or NULL) into every
@@ -1245,7 +1445,29 @@ impl Engine {
                 "column \"{col_name}\" of relation \"{tbl}\" contains null values"
             )));
         };
-        table.add_column(col_schema, fill_value);
+        // v7.39.9 — MySQL says where the column goes, and means it:
+        // measured on 9.7.2, `AFTER a` lands it at ordinal 3 and pushes
+        // the old third column to 4. Appending instead would answer a
+        // different `SELECT *`.
+        match &position {
+            None => table.add_column(col_schema, fill_value),
+            Some(spg_sql::ast::ColumnPosition::First) => {
+                table.add_column_at(0, col_schema, fill_value);
+            }
+            Some(spg_sql::ast::ColumnPosition::After(after)) => {
+                let Some(at) = table
+                    .schema()
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(after))
+                else {
+                    return Err(EngineError::Storage(StorageError::ColumnNotFound {
+                        column: after.clone(),
+                    }));
+                };
+                table.add_column_at(at + 1, col_schema, fill_value);
+            }
+        }
         // The column exists before the CHECK is validated, because the
         // predicate is written in terms of it. PG validates against the
         // rows already there and refuses the whole statement if any fails

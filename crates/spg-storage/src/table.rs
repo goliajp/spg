@@ -3031,6 +3031,157 @@ impl Table {
         self.rows = new_rows;
     }
 
+    /// v7.39.9 — the same, at a POSITION rather than at the end.
+    ///
+    /// `ALTER TABLE t ADD COLUMN c INT AFTER a` and `… FIRST` put the
+    /// column where the statement says, and MySQL means it: measured on
+    /// 9.7.2, `AFTER a` lands the new column at ordinal 3 and pushes the
+    /// old third column to 4. Appending instead would answer a different
+    /// `SELECT *`, which is a wrong answer rather than a missing
+    /// feature — so the column really moves.
+    ///
+    /// Everything [`Table::drop_column`] shifts DOWN, this shifts UP,
+    /// and for the same reasons: the row encoding is positional, and
+    /// every index, uniqueness constraint and foreign key holds column
+    /// positions rather than names.
+    pub fn add_column_at(&mut self, at: usize, col: ColumnSchema, fill_value: Value<'static>) {
+        let at = at.min(self.schema.columns.len());
+        if at == self.schema.columns.len() {
+            self.add_column(col, fill_value);
+            return;
+        }
+        // A range-exclusion index keyed by position cannot survive the
+        // shift; `drop_column` drops them for the same reason and the
+        // enforcement falls back to a scan until they are rebuilt.
+        self.excl_indexes.clear();
+        self.schema.columns.insert(at, col);
+        let mut new_rows: PersistentVec<Row<'static>> = PersistentVec::new();
+        for row in self.rows.iter() {
+            let mut values = row.values.clone();
+            if at <= values.len() {
+                values.insert(at, fill_value.clone());
+            } else {
+                values.push(fill_value.clone());
+            }
+            new_rows.push_mut(Row::new(values));
+        }
+        self.invalidate_expr_indices();
+        self.rows = new_rows;
+        for idx in &mut self.indices {
+            if idx.column_position >= at {
+                idx.column_position += 1;
+            }
+            for inc in &mut idx.included_columns {
+                if *inc >= at {
+                    *inc += 1;
+                }
+            }
+            for extra in &mut idx.extra_column_positions {
+                if *extra >= at {
+                    *extra += 1;
+                }
+            }
+        }
+        for uc in &mut self.schema.uniqueness_constraints {
+            for c in &mut uc.columns {
+                if *c >= at {
+                    *c += 1;
+                }
+            }
+        }
+        for fk in &mut self.schema.foreign_keys {
+            for c in &mut fk.local_columns {
+                if *c >= at {
+                    *c += 1;
+                }
+            }
+        }
+        self.rebuild_indices();
+    }
+
+    /// v7.39.9 — move the column at `from` to `to`, carrying its
+    /// values. Same bookkeeping as [`Table::add_column_at`], and for
+    /// the same reason: positions are what indexes, uniqueness
+    /// constraints and foreign keys hold.
+    pub fn move_column(&mut self, from: usize, to: usize) {
+        let n = self.schema.columns.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        self.excl_indexes.clear();
+        let col = self.schema.columns.remove(from);
+        self.schema.columns.insert(to, col);
+        let mut new_rows: PersistentVec<Row<'static>> = PersistentVec::new();
+        for row in self.rows.iter() {
+            let mut values = row.values.clone();
+            if from < values.len() {
+                let v = values.remove(from);
+                let at = to.min(values.len());
+                values.insert(at, v);
+            }
+            new_rows.push_mut(Row::new(values));
+        }
+        self.invalidate_expr_indices();
+        self.rows = new_rows;
+        let remap = |p: &mut usize| {
+            if *p == from {
+                *p = to;
+            } else if from < to && *p > from && *p <= to {
+                *p -= 1;
+            } else if to < from && *p >= to && *p < from {
+                *p += 1;
+            }
+        };
+        for idx in &mut self.indices {
+            remap(&mut idx.column_position);
+            for inc in &mut idx.included_columns {
+                remap(inc);
+            }
+            for extra in &mut idx.extra_column_positions {
+                remap(extra);
+            }
+        }
+        for uc in &mut self.schema.uniqueness_constraints {
+            for c in &mut uc.columns {
+                remap(c);
+            }
+        }
+        for fk in &mut self.schema.foreign_keys {
+            for c in &mut fk.local_columns {
+                remap(c);
+            }
+        }
+        self.rebuild_indices();
+    }
+
+    /// v7.39.9 — rename an index in place. `false` when this table has
+    /// no index of that name, which is the caller's error to report.
+    pub fn rename_index(&mut self, old: &str, new: &str) -> bool {
+        let Some(idx) = self
+            .indices
+            .iter_mut()
+            .find(|i| i.name.eq_ignore_ascii_case(old))
+        else {
+            return false;
+        };
+        idx.name = new.to_string();
+        true
+    }
+
+    /// v7.39.9 — MySQL's `ALTER TABLE t AUTO_INCREMENT = n`: the value
+    /// the NEXT insert takes.
+    ///
+    /// Lands on the same `auto_restart` floor `ALTER COLUMN … RESTART`
+    /// uses, so the two spellings cannot come to disagree. A table with
+    /// no auto-increment column is a no-op, as it is on MySQL.
+    pub fn set_auto_increment_next(&mut self, n: i64) {
+        for col in &mut self.schema.columns {
+            if col.auto_increment {
+                col.auto_restart = Some(n);
+            }
+        }
+    }
+
     /// v7.15.0 — replace the partial-index predicate source on
     /// the index at slot `idx`. Used by `ALTER TABLE … RENAME
     /// COLUMN` after the engine rewrites column-identifier
