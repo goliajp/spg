@@ -261,3 +261,103 @@ fn foreign_key_violation_is_1452() {
         (1452, "23000".to_string())
     );
 }
+
+/// Run `sql`, require an ERR packet, and return `(errno, sqlstate,
+/// message)` — the sentence too, because for the two below the sentence
+/// is the thing that was wrong.
+fn err_full(s: &mut TcpStream, sql: &str) -> (u16, String, String) {
+    send_query(s, sql);
+    let (_seq, err) = read_packet(s);
+    assert_eq!(
+        err[0],
+        0xff,
+        "{sql} should have failed, got {:?}",
+        String::from_utf8_lossy(&err)
+    );
+    let errno = u16::from_le_bytes(err[1..3].try_into().unwrap());
+    let state = String::from_utf8_lossy(&err[4..9]).to_string();
+    let msg = String::from_utf8_lossy(&err[9..]).to_string();
+    (errno, state, msg)
+}
+
+/// v7.39.7 — `DROP INDEX i ON t` is how MySQL drops an index, and its
+/// failures carry MySQL's own numbers and words.
+///
+/// Measured on MySQL 9.7.2 and on the published 7.39.6 image, same
+/// statements, same client:
+///
+/// ```text
+///                                 MySQL 9.7.2          spg 7.39.6
+///   DROP INDEX ix ON c1              works          1064 syntax error
+///   DROP INDEX ix ON c2       1091 Can't DROP 'ix'  1064 syntax error
+///   DROP INDEX nosuch ON c1   1091 Can't DROP …     1064 syntax error
+///   DROP INDEX ix             1064 syntax error        accepted
+/// ```
+#[test]
+fn v7397_drop_index_on_table_is_mysqls_own_spelling() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    ok_query(&mut s, "CREATE TABLE c1(id INT PRIMARY KEY, a VARCHAR(64))");
+    ok_query(&mut s, "CREATE TABLE c2(id INT PRIMARY KEY, a VARCHAR(64))");
+    ok_query(&mut s, "CREATE INDEX ix ON c1 (a)");
+
+    // The index is on c1, so naming c2 is `Can't DROP` — not a syntax
+    // error, and not a missing table.
+    assert_eq!(
+        err_full(&mut s, "DROP INDEX ix ON c2"),
+        (
+            1091,
+            "42000".to_string(),
+            "Can't DROP 'ix'; check that column/key exists".to_string()
+        )
+    );
+    assert_eq!(
+        err_full(&mut s, "DROP INDEX nosuch ON c1"),
+        (
+            1091,
+            "42000".to_string(),
+            "Can't DROP 'nosuch'; check that column/key exists".to_string()
+        )
+    );
+    // MySQL has no IF EXISTS here, and the bare PostgreSQL form is a
+    // syntax error there.
+    assert_eq!(
+        err_of(&mut s, "DROP INDEX IF EXISTS ix ON c1").0,
+        1064,
+        "MySQL answers 1064 for IF EXISTS on DROP INDEX"
+    );
+    assert_eq!(
+        err_of(&mut s, "DROP INDEX ix").0,
+        1064,
+        "the PostgreSQL spelling is a syntax error on this wire"
+    );
+    // And the statement MySQL actually uses works.
+    ok_query(&mut s, "DROP INDEX ix ON c1");
+}
+
+/// v7.39.7 — a missing table says what MySQL says.
+///
+/// The errno has been 1146 since round 429, which is what a client
+/// branches on. The words were still PostgreSQL's — `relation "t" does
+/// not exist` — on every statement: measured on the published image
+/// against MySQL 9.7.2 for SELECT, INSERT, ALTER TABLE and DROP INDEX
+/// alike. MySQL prefixes its database, and `DATABASE()` on this wire
+/// already answers the same name.
+#[test]
+fn v7397_missing_table_says_what_mysql_says() {
+    let (_guard, addr) = spawn();
+    let mut s = auth_open_mode(&addr);
+    for sql in [
+        "SELECT * FROM nosuchtable",
+        "INSERT INTO nosuchtable VALUES (1)",
+        "ALTER TABLE nosuchtable ADD COLUMN z INT",
+        "DROP INDEX ix ON nosuchtable",
+    ] {
+        let (errno, state, msg) = err_full(&mut s, sql);
+        assert_eq!((errno, state.as_str()), (1146, "42S02"), "{sql}");
+        assert!(
+            msg.ends_with("nosuchtable' doesn't exist") && msg.starts_with("Table '"),
+            "{sql} answered {msg:?}, not MySQL's sentence"
+        );
+    }
+}

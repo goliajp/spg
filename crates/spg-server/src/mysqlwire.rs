@@ -1318,12 +1318,59 @@ fn mysql_error_parts(
         }
         _ => {
             let (pg_state, msg) = crate::pgwire::engine_error_to_wire(e);
+            let msg = crate::strip_internal_error_prefixes(&msg).to_string();
+            // v7.39.7 — an index this table does not have.
+            //
+            // PostgreSQL calls a missing index 42704 UNDEFINED_OBJECT,
+            // which is right for it and covers missing types, text
+            // search configurations and operator classes too — none of
+            // which MySQL would number the same way. So this is matched
+            // on the message rather than added to the SQLSTATE table.
+            //
+            // Measured on MySQL 9.7.2, both for an index on ANOTHER
+            // table and for a name no table has: `ERROR 1091 (42000)
+            // Can't DROP 'ix'; check that column/key exists`. It read
+            // 1064 here, which a driver takes for a syntax error.
+            if pg_state == "42704"
+                && let Some(name) = msg
+                    .strip_prefix("index \"")
+                    .and_then(|r| r.strip_suffix("\" does not exist"))
+            {
+                return (
+                    1091,
+                    "42000",
+                    format!("Can't DROP '{name}'; check that column/key exists"),
+                );
+            }
+            // v7.39.7 — and a missing TABLE gets MySQL's sentence, not
+            // PostgreSQL's under MySQL's number.
+            //
+            // The errno has been right since v7.39 (round 429): 1146,
+            // which is what a client branches on. The words were still
+            // PostgreSQL's — `relation "t" does not exist` — on every
+            // statement, measured on the published image against MySQL
+            // 9.7.2 for SELECT, INSERT, ALTER TABLE and DROP INDEX
+            // alike. MySQL prefixes its database: `Table
+            // 'bench.nosuchtable' doesn't exist`, and `DATABASE()`
+            // already answers `bench` here, so the two agree on which
+            // database it is.
+            if pg_state == "42P01"
+                && let Some(name) = msg
+                    .strip_prefix("relation \"")
+                    .and_then(|r| r.strip_suffix("\" does not exist"))
+            {
+                return (
+                    1146,
+                    "42S02",
+                    if db.is_empty() {
+                        format!("Table '{name}' doesn't exist")
+                    } else {
+                        format!("Table '{db}.{name}' doesn't exist")
+                    },
+                );
+            }
             let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
-            (
-                errno,
-                my_state,
-                crate::strip_internal_error_prefixes(&msg).to_string(),
-            )
+            (errno, my_state, msg)
         }
     }
 }
