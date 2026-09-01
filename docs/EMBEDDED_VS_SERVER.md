@@ -99,9 +99,8 @@ Every dialect/engine capability ships on both hosts by construction
 (shared engine). Host-level features are allowed to differ (table
 above), but **acceptance shapes must be pinned on both**: the
 embedded e2e suites AND the dropin panel (psql against the docker
-image = the server path) — see `docs/TESTING.md` § acceptance-shape
-conventions. A capability proven on one host only is treated as
-unshipped.
+image = the server path). A capability proven on one host only is
+treated as unshipped.
 
 ## Open audit items (the not-yet-sharp edges)
 

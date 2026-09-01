@@ -1955,8 +1955,7 @@ not fixed here.
   from 2013.7 ms to 3526.7. So: marked or plain, never keyed.
   `build_order_keys_rederived` is that rule.
 
-  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md` measured the sort
-  that MATERIALISES and closed it; this is the other half of the same
+  The measurement of the sort that MATERIALISES closed that half; this is the other half of the same
   query, and that document now carries an addendum saying so — including
   the two things about its own reach it did not know: that seven of the
   nine sort-panel cells never spill, and that both pins written for
@@ -2634,7 +2633,7 @@ had been reporting the machine.
   same binary, `short text distinct` measured 1.02x and 1.33x, and
   `LIMIT 10` over long text measured 0.99x and 1.37x. Every one of those
   was measured, and each single one implied a steadiness the cell does
-  not have. `docs/BENCH_PROTOCOL.md` now asks for two independent runs,
+  not have. The bench protocol now asks for two independent runs,
   a range rather than a sample, and the conditions the number depends on
   — row count, `work_mem`, and what BOTH sides were collating by, which
   this repository has published several times without naming.
@@ -3066,8 +3065,8 @@ uncovered was worse than the one it replaced, which is the point.
   2.8 GB); asking once per value and letting the key carry the answer
   gave 395.6.
 
-  `docs/PERF-FINDING-2026-08-24-collated-text-sort.md` has the whole
-  path, including the invariant that was not one — reading the promise
+  The investigation behind it walked the whole path, including the
+  invariant that was not one — reading the promise
   off the key's variant held everywhere except the join path, and
   `round688` said so.
 
@@ -3173,8 +3172,8 @@ uncovered was worse than the one it replaced, which is the point.
   `information_schema.columns` also printed `nextval(('zs')::regclass)`
   where PostgreSQL prints `nextval('zs'::regclass)`.
 
-  Two things this does not close, both measured, both now **RD-12** in
-  `docs/RECORDED_DELTAS.md`: we number from the table's maximum plus one
+  Two things this does not close, both measured, both recorded as
+  **RD-12**: we number from the table's maximum plus one
   where PostgreSQL reads a counter that ignores the table (`1, 50, 51`
   against their `1, 2, 50`), and max-plus-one is a scan, so one INSERT
   into a 200,000-row table costs 3.666 ms against their flat 1.375 and
@@ -3907,7 +3906,7 @@ check.
   sort key, which makes the byte-ordered B-tree order by the locale —
   so the seek is back rather than traded for a scan. Equality, `IN` and
   range bounds all go through one funnel, so they cannot disagree with
-  each other. `docs/DESIGN-2026-08-23-collation.md` has the design.
+  each other.
 
 - **A column's collation did not survive a dump.** `dump.rs` never
   emitted `COLLATE`, so a column declared `COLLATE "en_US.utf8"` came
@@ -3935,8 +3934,8 @@ check.
   cannot do is carry a collation on an arbitrary expression, so the
   refusal says that and names the two positions where the clause works.
 
-  The database-level collation is a wider matter and is written up
-  rather than changed: `docs/FINDING-2026-08-23-database-collation.md`.
+  The database-level collation is a wider matter and was written up
+  rather than changed.
   `pg_database.datcollate` is fixed at `C` and `CREATE DATABASE ...
   LC_COLLATE` is accepted and ignored, so an undeclared text column
   sorts by bytes where a stock PostgreSQL sorts by locale. Closing it
@@ -4847,7 +4846,6 @@ a cold-tier segment's sidecar, and no query path reads them back — for
 hot data none exist at all. Given an index it can use, the same window
 query answers in 0.105 ms against PG's 1.2, so the machinery is not the
 problem; the index the customer created is the one that does nothing.
-Written up in `docs/PERF-FINDING-2026-08-20-sentori-shapes.md`.
 
 ---
 
@@ -4909,9 +4907,9 @@ interleaved: window count over a day 21.4 ms to 5.0, group by kind
 at 0.06 against 0.17. What remains is the jsonb representation itself —
 `Value::Json(Cow<str>)` is a string at rest, so a field access is 173 ns
 against PG's 7.5 — and the containment operator, which parses both
-documents on every row including the constant. Both are written up in
-`docs/PERF-FINDING-2026-08-20-sentori-shapes.md` with the attack that
-was implemented, measured, and reverted for taking the wrong layer.
+documents on every row including the constant. Both were written up
+with the attack that was implemented, measured, and reverted for taking
+the wrong layer.
 
 ---
 
@@ -5120,8 +5118,8 @@ every concurrency level tested.
   glibc PostgreSQL 18 — same ordering, same rows out of a text
   `BETWEEN` — which is what lets a deployment use it as the escape
   hatch for anything a machine reads. A release-gating corpus case
-  fails if that ever stops being true. `docs/COLLATION_RFC.md` gains
-  the field data behind it: sentori's divergence instrument found that
+  fails if that ever stops being true. The collation design gained the
+  field data behind it: sentori's divergence instrument found that
   `postgres:18` and `postgres:18-alpine` disagree on the same eight
   probes that separate SPG from glibc PostgreSQL, so the divergence is
   between two builds of PostgreSQL itself, not something SPG
@@ -5948,8 +5946,8 @@ for errors sees none of it.
 
 ## [7.37.18] — 2026-08-14
 
-Working the memory half of mailrs's 2026-08-13 report, plan and measurements
-in `docs/V7_37_18_GIN_MEMORY_PLAN.md`.
+Working the memory half of mailrs's 2026-08-13 report, against a written
+plan with its own measurements.
 
 ### Added
 
@@ -5989,7 +5987,7 @@ in `docs/V7_37_18_GIN_MEMORY_PLAN.md`.
 
 ### Measured, not fixed
 
-Phase A of `docs/V7_37_18_GIN_MEMORY_PLAN.md` ran, and three of the things
+Phase A of that plan ran, and three of the things
 this version was expected to contain were withdrawn by their own
 measurements.
 
@@ -6091,7 +6089,7 @@ does not finish.
   disk. A design difference rather than a leak, and closing it means delta
   and varint encoding for posting lists. Size for it until then.
 
-  Planned for 7.37.18 — `docs/V7_37_18_GIN_MEMORY_PLAN.md`. It does not
+  Planned for 7.37.18. It does not
   start with the encoder: the only evidence that posting lists dominate is
   one ablation at 14,000 rows, and scaling it by rows under-predicts the
   full file by more than half, so something is unaccounted for. Phase A is
@@ -7281,7 +7279,7 @@ text-replay harness structurally couldn't see.
   (lint / unit / e2e / gates / biz) behind `scripts/gate.sh`, with
   fast/full tiers; standalone `perf_*` binaries folded into
   per-crate `perf_gate` targets; `scripts/test-on-mini.sh` offloads
-  the cargo categories to the LAN testbed. See `docs/TESTING.md`.
+  the cargo categories to the LAN testbed.
 - WAL format gains record type 0x12 (tx-commit). Older binaries
   cannot read WALs containing it (newer binaries read old WALs
   unchanged) — hence the minor-version bump.
@@ -8566,7 +8564,7 @@ the `@@` match operator, true GIN inverted index, and a
 row-level `CREATE TRIGGER` system so PG's standard
 `AFTER INSERT/UPDATE … UPDATE search_vector` idiom works
 without application changes. Tracked in
-`.claude/internal-docs/V7_12_DESIGN.md` (to be drafted).
+an internal design note (to be drafted).
 
 Sub-versions:
 
@@ -8583,7 +8581,7 @@ Sub-versions:
 Opens the v7.11 series. Three epics planned: read concurrency
 (this release), array operators / `unnest`, and type widening
 (`INT[]` / `BIGINT[]` / BYTEA scalar ops). Full plan in
-`.claude/internal-docs/V7_11_DESIGN.md`.
+an internal design note.
 
 **Epic 1 — read fan-out (this release).** mailrs's tokio cement
 is read-heavy (IMAP FETCH traffic per session). v7.10's
@@ -8802,7 +8800,7 @@ Sub-versions:
   v7.10.13 Epic 2 — wire OID 1009 + text-mode encoder
   v7.10.14 Epic 2 ship rollup — tag v7.10.2 + crates.io + docker
 
-The full v7.10 sub-version index lives in `.claude/internal-docs/V7_10_DESIGN.md`.
+The full v7.10 sub-version index is kept internally.
 
 ---
 
