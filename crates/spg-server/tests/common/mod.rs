@@ -80,19 +80,84 @@ pub fn startup_timeout() -> Duration {
 /// evidence means no forgiveness, so the caller fails exactly as it did
 /// before rather than assuming the host was at fault.
 pub fn spawn_control_latency() -> Option<Duration> {
-    let bin = ["/usr/bin/true", "/bin/true"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())?;
+    // v7.39.8 — the control is the BINARY UNDER TEST, not `/usr/bin/true`.
+    //
+    // `/usr/bin/true` is signed, tiny and long since validated by the
+    // kernel; the server is ~13 MB, freshly linked and unsigned. On
+    // macOS the FIRST execution of such a file pays a one-time
+    // validation the second does not, and a control that never pays it
+    // cannot see it. Measured on the development box, quiet:
+    //
+    // ```text
+    //                              this box      the testbed
+    //   a never-run copy, 1st run   212.0 ms        3.3 ms
+    //   the same copy afterwards      3.1 ms        2.2 ms
+    //   /usr/bin/true                 2.0 ms        1.4 ms
+    // ```
+    //
+    // Under load the first run reached 9.1 s here — inside a 10 s
+    // startup deadline, with several tests spawning at once. Thirteen
+    // of them failed saying "the host starts processes promptly, so
+    // this is the server", and the child was in fact still in `dyld`,
+    // before `main`. The control was right about `/usr/bin/true` and
+    // wrong about the question.
+    //
+    // `--replay-only` is the server's own immediate-exit path, so this
+    // measures the same file through the same loader and returns.
+    let dir = tmp_base().join(format!("spg-spawn-control-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
     let t = Instant::now();
-    Command::new(bin).status().ok()?;
-    Some(t.elapsed())
+    let status = Command::new(env!("CARGO_BIN_EXE_spg-server"))
+        .arg("--replay-only")
+        .arg(dir.join("a.db"))
+        .arg(dir.join("a.wal"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let elapsed = t.elapsed();
+    let _ = std::fs::remove_dir_all(&dir);
+    status.ok()?;
+    Some(elapsed)
+}
+
+/// Pay the binary's first-launch cost ONCE, before any deadline is
+/// running.
+///
+/// This is the other half of the note on [`spawn_control_latency`], and
+/// it is the half that stops the failures rather than explaining them.
+/// The cost is per FILE, so every rebuild brings it back, and
+/// `cargo test` rebuilds before it runs — which is why the first test
+/// to spawn was the one that paid, inside its own startup deadline.
+///
+/// Costs 2-3 ms on a machine that does not do this at all.
+fn warm_the_binary_under_test() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let dir = tmp_base().join(format!("spg-spawn-warm-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let _ = Command::new(env!("CARGO_BIN_EXE_spg-server"))
+            .arg("--replay-only")
+            .arg(dir.join("a.db"))
+            .arg(dir.join("a.wal"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 /// The control reading above which this host is not starting processes
 /// promptly.
 ///
-/// Measured on the development box at load 8.5: `/usr/bin/true` starts in
-/// 0.9-2.1 ms across sixty samples. 20 ms is ten times the worst of those
+/// v7.39.8 — recalibrated for the control it now measures, which is the
+/// server binary itself rather than `/usr/bin/true`. Measured warm:
+/// 3.1 ms on the development box, 2.2 ms on the testbed. 20 ms is
+/// several times the worst of those and two orders below what a host
+/// doing first-launch validation produces — 212 ms quiet here, 9.1 s
+/// under load. The old reading is kept because the number did not need
+/// to change: `/usr/bin/true` starts in 0.9-2.1 ms across sixty samples
 /// — far enough out that a working machine cannot reach it, and far below
 /// what a machine deep in swap produces (the run that prompted this had
 /// load 66-126 with 21.76 GB of 22.5 GB swap in use).
@@ -332,6 +397,7 @@ impl ServerBuilder {
     ///   - the timeout elapsing first,
     ///   - stderr read error.
     pub fn spawn(self) -> (Child, ServerAddrs) {
+        warm_the_binary_under_test();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
         cmd.arg("127.0.0.1:0");
         for a in &self.extra_args {
@@ -367,6 +433,7 @@ impl ServerBuilder {
     /// reader so the caller can poll `try_wait` and assert the exit
     /// status. stderr/stdout both go to `/dev/null`.
     pub fn spawn_expecting_startup_failure(self) -> Child {
+        warm_the_binary_under_test();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_spg-server"));
         cmd.arg("127.0.0.1:0");
         for a in &self.extra_args {

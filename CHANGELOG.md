@@ -8,6 +8,49 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Testing
+
+- **The spawn deadline blamed the server for a stall that happened
+  before `main`.** When a server misses its startup deadline the
+  harness says whose fault it is, comparing against a control — and the
+  control was `/usr/bin/true`: signed, tiny, long since validated by
+  the kernel. The binary under test is ~13 MB, freshly linked and
+  unsigned, and on macOS the FIRST execution of such a file pays a
+  one-time validation the second does not. A control that never pays it
+  cannot see it.
+
+  ```text
+                               development box    the testbed
+    a never-run copy, 1st run       212.0 ms         3.3 ms
+    the same copy afterwards          3.1 ms         2.2 ms
+    /usr/bin/true                     2.0 ms         1.4 ms
+  ```
+
+  Under load the first run reached 9.1 s — inside a 10 s deadline, with
+  several tests spawning at once. Thirteen of them failed saying "the
+  host starts processes promptly, so this is the server", while the
+  child was still in `dyld`, before `main`. The testbed does none of
+  this, which is why the same suite was green there and red here, and
+  why a whole investigation went looking for a server defect that did
+  not exist.
+
+  The control is now the binary under test, run through its own
+  `--replay-only` immediate-exit path — same file, same signing state,
+  same loader. And the first-launch cost is paid once, deliberately,
+  before any deadline is running: it is a per-FILE cost and `cargo
+  test` rebuilds before it runs, so the first test to spawn was the one
+  that paid it, inside its own deadline.
+
+  The verdict rule is now pinned in both directions, which it never
+  was. The warm-up is deliberately not pinned by a test: on a quiet
+  machine the cost it removes fits inside the deadline anyway, so
+  removing it flips nothing, and a pin that only reddens on a loaded
+  machine is a pin on the machine. Writing the pins measured it from
+  inside the suite instead — a control with nothing ahead of it to warm
+  the file read 5.08 s.
+
 ## [7.39.7] — 2026-09-01
 
 ### Fixed
