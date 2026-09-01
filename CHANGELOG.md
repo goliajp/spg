@@ -71,6 +71,28 @@ the current build; this file is a release-organized view.
   reasoning `CREATE TABLE`'s ENGINE check already used: a typo in a
   migration must not quietly become SPG's storage or SPG's encoding.
 
+- **And the other four from the same sweep.** `RENAME TABLE a TO b [, c
+  TO d]`, which is how a MySQL migration renames — PostgreSQL only has
+  `ALTER TABLE … RENAME TO`, so the spelling had nowhere to go.
+  `ALTER TABLE t RENAME INDEX old TO new`, whose missing-key failure is
+  MySQL's 1176 `Key 'k' doesn't exist in table 't'` — a DIFFERENT
+  number from the 1091 `DROP INDEX` answers, so a client can tell
+  "rename what is not there" from "cannot drop". `ANALYZE TABLE t`,
+  which MySQL answers with a RESULT SET rather than a command tag
+  (`bench.m1  analyze  status  OK`), so the shape now follows the
+  dialect. And `SELECT STRAIGHT_JOIN …`, a join-order hint SPG does not
+  need but which was being read as a COLUMN NAME: `SELECT
+  STRAIGHT_JOIN a FROM t` answered `Unknown column 'straight_join'`
+  where MySQL returns the rows. It is accepted only in the position
+  MySQL accepts it, and only on the MySQL dialect — under PostgreSQL
+  `straight_join` really is a column name.
+
+  A charset SPG cannot represent now carries MySQL's 1115 rather than
+  falling to 1064.
+
+  After all eleven: the sweep's thirty-seven shapes agree with MySQL
+  9.7.2 on every one.
+
 ## [7.39.8] — 2026-09-01
 
 ### Testing

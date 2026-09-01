@@ -515,6 +515,7 @@ mod e2e_multirange_ops;
 mod e2e_multirange_round256;
 mod e2e_mysql_advisory_lock_round417;
 mod e2e_mysql_alter_index_round431;
+mod e2e_mysql_alter_spellings_v7399;
 mod e2e_mysql_auto_increment_zero_round433;
 mod e2e_mysql_base64_sha2;
 mod e2e_mysql_binary_literal_round367;

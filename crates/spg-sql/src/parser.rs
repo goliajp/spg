@@ -3662,6 +3662,36 @@ impl Parser {
             // [CASCADE | RESTRICT]. Clears every row from each named
             // table. Parses at the top level; the engine dispatcher
             // walks Statement::Truncate.
+            // v7.39.9 — MySQL's top-level `RENAME TABLE a TO b [, c TO d]`.
+            //
+            // PostgreSQL renames a table through `ALTER TABLE … RENAME
+            // TO`, which SPG already had, so this spelling answered 1064
+            // — and it is what a MySQL migration writes. Measured on
+            // 9.7.2: several pairs in one statement are accepted, and
+            // renaming onto a name that exists is 1050.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("rename") => {
+                self.advance();
+                if matches!(self.peek(), Token::Table) {
+                    self.advance();
+                }
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                loop {
+                    let from = self.expect_ident_like()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                    } else {
+                        self.expect_keyword_ident("to")?;
+                    }
+                    let to = self.expect_ident_like()?;
+                    pairs.push((from, to));
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Statement::RenameTables(pairs))
+            }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("truncate") => {
                 self.advance();
                 // Optional TABLE noise word — PG accepts both the reserved
@@ -3994,6 +4024,14 @@ impl Parser {
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("analyze") => {
                 self.advance();
+                // v7.39.9 — MySQL spells it `ANALYZE TABLE t`. The
+                // keyword is noise to the parse; what differs is the
+                // ANSWER, which MySQL returns as a result set — see the
+                // executor.
+                let mysql_table_kw = matches!(self.peek(), Token::Table);
+                if mysql_table_kw {
+                    self.advance();
+                }
                 let target = match self.peek() {
                     Token::Eof | Token::Semicolon => None,
                     Token::Ident(_) | Token::QuotedIdent(_) => {
@@ -13701,6 +13739,21 @@ impl Parser {
             )));
         }
         self.advance();
+        // v7.39.9 — MySQL's `SELECT STRAIGHT_JOIN …` join-order hint.
+        //
+        // It sits where `DISTINCT` sits and tells the optimiser to join
+        // in the written order. SPG plans its own joins, so the hint is
+        // accepted and not acted on — but it has to PARSE, because as a
+        // bare identifier it became a column: measured on the published
+        // image, `SELECT STRAIGHT_JOIN a FROM t` answered `Unknown
+        // column 'straight_join' in 'field list'` where MySQL 9.7.2
+        // returns the rows. Only in this position, which is the only one
+        // MySQL accepts either — a trailing `STRAIGHT_JOIN` is its 1064.
+        if self.mysql_dialect
+            && matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("straight_join"))
+        {
+            self.advance();
+        }
         let distinct = if matches!(self.peek(), Token::Distinct) {
             self.advance();
             true

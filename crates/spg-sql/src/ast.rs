@@ -677,6 +677,10 @@ pub enum Statement {
     /// `spg_statistic` with per-column null_frac + n_distinct +
     /// 100-bucket equi-depth histogram.
     Analyze(Option<String>),
+    /// v7.39.9 — MySQL's top-level `RENAME TABLE a TO b [, c TO d]`.
+    /// PostgreSQL has only `ALTER TABLE … RENAME TO`, so this spelling
+    /// had nowhere to go; it is what a MySQL migration writes.
+    RenameTables(Vec<(String, String)>),
     /// v7.39 (round 535) — `REINDEX { INDEX | TABLE | SCHEMA | DATABASE
     /// | SYSTEM } [CONCURRENTLY] <name>` and `CLUSTER [VERBOSE]
     /// [<table> [USING <index>]]`.
@@ -3642,6 +3646,9 @@ impl Statement {
     #[must_use]
     pub fn read_only_violation_tag(&self) -> Option<&'static str> {
         match self {
+            // v7.39.9 — MySQL's RENAME TABLE is DDL, refused read-only
+            // for the same reason ALTER TABLE … RENAME TO is.
+            Self::RenameTables(_) => Some("RENAME TABLE"),
             // ---- writes rows -------------------------------------------
             Self::Insert { .. } => Some("INSERT"),
             Self::Update { .. } => Some("UPDATE"),
@@ -5330,6 +5337,7 @@ impl Statement {
     #[must_use]
     pub fn is_readonly(&self) -> bool {
         match self {
+            Statement::RenameTables(_) => false,
             // v7.39 (round 288) — SET CONSTRAINTS changes transaction
             // state, and IMMEDIATE can run the deferred checks there and
             // then; writer-path.
@@ -6182,6 +6190,16 @@ impl fmt::Display for Statement {
                 write!(f, "WAIT FOR WAL POSITION {pos}")?;
                 if let Some(ms) = timeout_ms {
                     write!(f, " WITH TIMEOUT {ms}")?;
+                }
+                Ok(())
+            }
+            Self::RenameTables(pairs) => {
+                f.write_str("RENAME TABLE ")?;
+                for (i, (from, to)) in pairs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{} TO {}", quote_ident(from), quote_ident(to))?;
                 }
                 Ok(())
             }

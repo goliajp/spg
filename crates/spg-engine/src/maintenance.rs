@@ -150,6 +150,39 @@ impl Engine {
                 self.plan_cache.clear();
             }
         }
+        // v7.39.9 — MySQL answers `ANALYZE TABLE` with a RESULT SET, not
+        // a command tag: measured on 9.7.2, one row per table carrying
+        // `bench.m1  analyze  status  OK`. A client reading those rows
+        // gets nothing from a command tag, so the shape follows the
+        // dialect.
+        if self.speaks_mysql {
+            let cols = alloc::vec![
+                spg_storage::ColumnSchema::new("Table", spg_storage::DataType::Text, false),
+                spg_storage::ColumnSchema::new("Op", spg_storage::DataType::Text, false),
+                spg_storage::ColumnSchema::new("Msg_type", spg_storage::DataType::Text, false),
+                spg_storage::ColumnSchema::new("Msg_text", spg_storage::DataType::Text, false),
+            ];
+            let db = self.session_param("spg.database").unwrap_or_default();
+            let rows = names
+                .iter()
+                .map(|n| {
+                    spg_storage::Row::new(alloc::vec![
+                        spg_storage::Value::text(if db.is_empty() {
+                            n.clone()
+                        } else {
+                            alloc::format!("{db}.{n}")
+                        }),
+                        spg_storage::Value::text("analyze"),
+                        spg_storage::Value::text("status"),
+                        spg_storage::Value::text("OK"),
+                    ])
+                })
+                .collect();
+            return Ok(QueryResult::Rows {
+                columns: cols,
+                rows,
+            });
+        }
         Ok(QueryResult::CommandOk {
             affected: analysed,
             modified_catalog: true,

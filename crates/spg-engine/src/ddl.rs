@@ -1316,9 +1316,15 @@ impl Engine {
         if table.rename_index(old, new) {
             Ok(())
         } else {
-            Err(EngineError::Storage(StorageError::IndexNotFound {
-                name: old.into(),
-            }))
+            // MySQL's own sentence, and a DIFFERENT one from the drop
+            // path's: measured on 9.7.2, `RENAME INDEX k_none TO k_new`
+            // answers `Key 'k_none' doesn't exist in table 'm1'` (1176)
+            // where `DROP INDEX k_none ON m1` answers `Can't DROP …`
+            // (1091). A client branching on the number can tell the two
+            // apart, so they must not collapse into one.
+            Err(EngineError::Unsupported(alloc::format!(
+                "Key '{old}' doesn't exist in table '{tbl}'"
+            )))
         }
     }
 

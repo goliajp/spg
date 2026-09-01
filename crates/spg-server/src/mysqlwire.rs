@@ -1342,6 +1342,23 @@ fn mysql_error_parts(
                     format!("Can't DROP '{name}'; check that column/key exists"),
                 );
             }
+            // v7.39.9 — a charset SPG cannot represent. MySQL numbers it
+            // 1115, measured: `ERROR 1115 (42000) Unknown character
+            // set: 'nosuchcs'`. It fell to 1064, a syntax error.
+            if msg.starts_with("Unknown character set: ") {
+                return (1115, "42000", msg);
+            }
+            // v7.39.9 — a key the table does not have, which is a
+            // DIFFERENT failure from one that cannot be dropped.
+            // Measured on 9.7.2: `ALTER TABLE m1 RENAME INDEX k_none TO
+            // k_new` answers `ERROR 1176 (42000) Key 'k_none' doesn't
+            // exist in table 'm1'`, where `DROP INDEX k_none ON m1`
+            // answers 1091. Two spellings, two numbers, and a client
+            // branching on them can tell "rename what is not there"
+            // from "cannot drop".
+            if msg.starts_with("Key '") && msg.contains("doesn't exist in table") {
+                return (1176, "42000", msg);
+            }
             // v7.39.7 — and a missing TABLE gets MySQL's sentence, not
             // PostgreSQL's under MySQL's number.
             //
