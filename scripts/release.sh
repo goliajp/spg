@@ -14,7 +14,8 @@
 #                  latest, --push; manifest digest captured to stdout
 #                  and target/release-digest-vX.Y.Z.txt
 #   4. acceptance  drop-in panel against the freshly pushed image →
-#                  scripts/dropin-acceptance-report-vX.Y.Z.md
+#                  tmp/reports/dropin-acceptance-report-vX.Y.Z.md
+#                  (untracked: internal working material)
 #   5. checklist   prints what remains human: check in the report on
 #                  develop, mailrs ack (include the digest)
 #
@@ -220,16 +221,19 @@ else
         --port 25433 \
         --fixture scripts/fixtures/mailrs-pg-extensions.sql \
         --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
-        --report "scripts/dropin-acceptance-report-v${VERSION}.md"
-    # v7.38.18 — the copy at the repository root is the one a reader
-    # finds first, and it was written by whoever last ran the panel by
-    # hand. It said `goliakk/spg:7.37.15` and `panel cases: 57` while
-    # the panel had been 66 for several releases: a tracked file whose
-    # freshness depends on someone remembering is a file that is stale.
-    # The versioned report under scripts/ is the record; this is the
-    # view, and it is now written from the record every release.
-    cp "scripts/dropin-acceptance-report-v${VERSION}.md" \
-       ./dropin-acceptance-report.md
+        --report "tmp/reports/dropin-acceptance-report-v${VERSION}.md"
+    # v7.39.11 — the reports are internal working material and are not
+    # tracked. The public repository carries what a USER of SPG needs;
+    # a per-release acceptance run is evidence for us and for a customer
+    # we hand it to, not documentation of the product. `tmp/` is
+    # gitignored, so the record accumulates without appearing in the
+    # tree.
+    #
+    # The root copy this used to write is gone with the same reasoning:
+    # a tracked file whose freshness depends on someone remembering is a
+    # file that goes stale, which is what it had done (it said
+    # `goliakk/spg:7.37.15` and `panel cases: 57` while the panel had
+    # been 66 for several releases).
 fi
 
 banner "v${VERSION} published — remaining human steps"
@@ -249,9 +253,8 @@ cat <<EOF
 EOF
 else
 cat <<EOF
-  [ ] commit BOTH dropin reports on develop — the versioned one and
-      ./dropin-acceptance-report.md, which this run rewrote
-      (chore(release): v${VERSION} post-release — check in dropin report)
+  [ ] nothing to commit for the dropin report — it is written to
+      tmp/reports/, which is not tracked
       The versioned reports stop at v7.38.8: this step was skipped for
       several releases running, which is why it now names both files.
   [ ] mailrs ack note — include the manifest digest:

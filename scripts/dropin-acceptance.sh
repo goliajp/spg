@@ -34,7 +34,8 @@
 #   scripts/dropin-acceptance.sh \
 #       [--image IMAGE]     # default goliakk/spg:7.17.0
 #       [--port PORT]       # default 25433
-#       [--report PATH]     # default ./dropin-acceptance-report.md
+#       [--report PATH]     # default tmp/reports/dropin-acceptance-report.md
+#                           (tmp/ is not tracked: internal material)
 #       [--keep-container]  # don't stop on exit (useful for debug)
 #       [--no-pull]         # skip `docker pull` of the image
 
@@ -42,7 +43,7 @@ set -u
 
 IMAGE="goliakk/spg:7.17.0"
 PORT="25433"
-REPORT="./dropin-acceptance-report.md"
+REPORT="tmp/reports/dropin-acceptance-report.md"
 KEEP=0
 NO_PULL=0
 CONTAINER_NAME="spg-dropin-$$"
@@ -557,11 +558,10 @@ TOTAL=$((PASS_COUNT + FAIL_COUNT))
   # vX.Y.Z carries the report for X.Y.(Z-1), and reads as a mistake. It is
   # not; the record is the versioned file, and the header above names the
   # image either way.
-  echo "This report describes the image named above and nothing else. The"
-  echo "root copy is rewritten by each release train AFTER the tag is cut,"
-  echo "so a checkout of tag \`vX.Y.Z\` carries the previous release's copy;"
-  echo "the record for a given release is"
-  echo "\`scripts/dropin-acceptance-report-vX.Y.Z.md\`."
+  echo "This report describes the image named above and nothing else. It"
+  echo "is internal working material and is not tracked: the record for a"
+  echo "given release is \`tmp/reports/dropin-acceptance-report-vX.Y.Z.md\`"
+  echo "on the machine that ran the train."
   echo ""
   if [ "$FAIL_COUNT" -eq 0 ]; then
     echo "**Verdict: PASS — every probed PG dialect feature lands on this SPG image.**"

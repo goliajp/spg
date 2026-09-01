@@ -222,8 +222,7 @@ budgets — `precommit` (≤150 s, wired into the git pre-commit hook),
 (the nightly find-problems tier: permutation matrix over both wire
 protocols, three-master differential oracle, isolation interleavings,
 a generative differ, SQL:2016 coverage, doc-as-corpus, pgbench /
-sysbench scoreboards). `gate.sh`'s categories survive as components;
-see [`docs/TESTING.md`](docs/TESTING.md).
+sysbench scoreboards). `gate.sh`'s categories survive as components.
 
 ```sh
 scripts/suite.sh precommit       # the commit gate (also runs from the hook)

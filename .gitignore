@@ -8,13 +8,14 @@
 /scratch
 /.claude/handoff.md
 .claude/
-# The release skill is part of the shipped engineering system (S5.4),
-# not session-local state — carve it back in.
-!.claude/skills/
-!.claude/skills/release/
-!.claude/skills/release/SKILL.md
 /dist/
 /references/
 
 # PG / 上游 source 树参考(每个开发者本地 clone,不 commit)
 references/
+
+# Internal working material — investigations, designs, correspondence,
+# per-release acceptance reports, development process. The public repo
+# carries only what a user of SPG needs; everything else lives here and
+# is not tracked.
+/tmp/
