@@ -12,6 +12,19 @@ the current build; this file is a release-organized view.
 
 ### Fixed
 
+- **A missing table said what PostgreSQL says, on the MySQL wire.** The
+  errno has been 1146 since v7.39 (round 429), which is what a client
+  branches on; the words were still `relation "t" does not exist`, on
+  every statement. Measured on the published 7.39.6 image against MySQL
+  9.7.2 — `SELECT`, `INSERT`, `ALTER TABLE` and `DROP INDEX` all four —
+  MySQL says `Table 'bench.nosuchtable' doesn't exist`, prefixed with
+  its database, and `DATABASE()` on this wire already answers the same
+  name.
+
+  Found while measuring the `DROP INDEX` fix above: its missing-table
+  edge carried the right number and the wrong sentence, and the sentence
+  turned out not to be about `DROP INDEX` at all.
+
 - **`DROP INDEX i ON t` — how MySQL drops an index — was a syntax
   error.** The two dialects were exactly backwards on the MySQL wire.
   Measured against MySQL 9.7.2 and the published 7.39.6 image, same
@@ -39,7 +52,12 @@ the current build; this file is a release-organized view.
   ANOTHER table is `Can't DROP 'ix'` (1091), the same answer as no such
   index; a missing table is 1146, a different error, so the two are
   kept apart; and `DROP INDEX IF EXISTS ix ON t` is a 1064 there, which
-  the MySQL dialect now refuses too.
+  the MySQL dialect now refuses too. The 1091 is answered with MySQL's
+  own sentence — `Can't DROP 'ix'; check that column/key exists` —
+  matched on the message rather than added to the SQLSTATE table,
+  because PostgreSQL's 42704 also covers missing types, text search
+  configurations and operator classes, none of which MySQL numbers that
+  way.
 
 ## [7.39.6] — 2026-09-01
 
