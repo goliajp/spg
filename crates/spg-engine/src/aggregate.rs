@@ -4922,15 +4922,76 @@ fn sort_synth_by_order_by(
     // Located by forcing this call site to reverse and watching
     // `GROUP BY loc ORDER BY loc` flip. Rounds 682 and 685 wired eleven
     // sites between them without doing that, and none was on the path.
+    //
+    // v7.39.11 — and the DATABASE's collation when the column declares
+    // none, which is what an ordinary `TEXT` column is compared under.
+    //
+    // Reading only the column's own name meant this comparator had no
+    // collation for any column that had not been given one explicitly —
+    // which is nearly all of them — so an aggregate query sorted text by
+    // BYTES while the identical query without an aggregate collated.
+    // Reported by sentori against 7.39.10 and reproduced here, same
+    // rows, same ORDER BY, on a database collating `en_US.utf8`:
+    //
+    // ```text
+    //                                            PG 18    SPG 7.39.10
+    //   GROUP BY t ORDER BY t                    a A b B    a A b B
+    //   GROUP BY t ORDER BY t  + count(*)        a A b B    A B a b
+    //   GROUP BY t HAVING count(*) > 0 ORDER BY t  a A b B  A B a b
+    //   DISTINCT t, count(*) OVER () ORDER BY t  a A b B    A B a b
+    // ```
+    //
+    // No row is wrong and nothing raises; only the order changes, and
+    // only when an aggregate appears somewhere in the statement. It
+    // arrived with the collation switch in v7.38.22 and survived every
+    // release since, including v7.39.5, which was the collation release.
+    //
+    // `C` is byte order and resolves to `None`, so a database that never
+    // asked for a locale takes the path it always did.
+    //
+    // An explicit `COLLATE` on the key outranks both: it is the caller
+    // asking for a specific order, and `ORDER BY t COLLATE "C"` must
+    // still give byte order on a collated database. Reading only
+    // `Expr::Column` treated that spelling as "not a column" and fell
+    // through to the database's collation, which is the opposite of
+    // what it asks for.
+    let db_coll = catalog.map(spg_storage::Catalog::db_collation);
     let key_colls: Vec<Option<alloc::string::String>> = order_rewritten
         .iter()
-        .map(|e| {
+        .zip(order_by.iter())
+        .map(|(e, orig)| {
+            // An explicit `COLLATE` outranks everything below, and it
+            // lives on the ORDER BY item rather than in the expression:
+            // the rewrite has already turned a group key into a
+            // `__grp_K` column reference by the time this runs. Found
+            // by printing both sides rather than reasoning about them —
+            // the first two attempts looked for `Expr::Collate` and
+            // there is none. `ORDER BY t COLLATE "C"` is the caller
+            // asking for byte order and must get it on a collated
+            // database.
+            if let Some(name) = &orig.collation {
+                let name = name.clone();
+                return (!crate::collate::is_byte_wise(&name)
+                    && crate::collate::is_supported(&name))
+                .then_some(name);
+            }
             let spg_sql::ast::Expr::Column(c) = e else {
                 return None;
             };
             let pos = crate::eval::find_column_pos(c, &synth_ctx)?;
-            let name = synth_schema.get(pos)?.collation_name.clone()?;
-            crate::collate::is_supported(&name).then_some(name)
+            let col = synth_schema.get(pos)?;
+            // A MySQL column carries its own folding rule and is not a
+            // candidate for inheriting a PostgreSQL database collation —
+            // the same exclusion `Table::index_collation` makes.
+            if matches!(col.collation, spg_storage::Collation::CaseInsensitive) {
+                return None;
+            }
+            let name = col
+                .collation_name
+                .clone()
+                .or_else(|| db_coll.map(alloc::string::String::from))?;
+            (!crate::collate::is_byte_wise(&name) && crate::collate::is_supported(&name))
+                .then_some(name)
         })
         .collect();
     // v6.4.0 — multi-key ORDER BY on aggregate output. Each key

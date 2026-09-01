@@ -8,6 +8,90 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+Both reported by sentori against the published 7.39.10 image, and both
+reproduced here against PostgreSQL 18.6 before anything was changed.
+
+- **An aggregate anywhere in the statement made `ORDER BY <text>` sort
+  by BYTES.** Same column, same `ORDER BY`, same rows; the only
+  difference is whether an aggregate appears somewhere else:
+
+  ```text
+                                               PG 18    SPG 7.39.10
+    GROUP BY t ORDER BY t                      a A b B    a A b B
+    GROUP BY t ORDER BY t   + count(*)         a A b B    A B a b
+    GROUP BY t HAVING count(*) > 0 ORDER BY t  a A b B    A B a b
+    SELECT t, count(*) OVER () ORDER BY t      a A b B    A B a b
+  ```
+
+  No row is wrong and nothing raises — only the order changes. It is
+  the same class as the restart that changed a sort order in v7.39.5: a
+  report run one way and the same report run another way disagree, with
+  no error on either side. It arrived with the collation switch in
+  v7.38.22 and survived every release since, including v7.39.5, which
+  was the collation release.
+
+  Two paths, one cause each. The grouped comparator resolved a key's
+  collation from the COLUMN's own declared name and nothing else — a
+  plain `TEXT` column declares none, so it was handed nothing and fell
+  back to byte order while the ungrouped path asks the database. The
+  window path builds its order keys itself instead of going through
+  `build_order_keys`, so everything that path resolves has to be
+  resolved again there, and the collation was not; the comment above it
+  records the enum-ordinal defect that had the same cause.
+
+  An explicit `COLLATE` still outranks both, and that took three
+  attempts: it lives on the ORDER BY ITEM, not in the expression, and
+  the first two guesses looked for `Expr::Collate` where the rewrite has
+  already left a `__grp_K` column reference. Printing both sides settled
+  it. `ORDER BY t COLLATE "C"` gives byte order on a collated database,
+  which is what a caller writes when that is what it wants.
+
+  One correction to the report this came from, measured on the published
+  image: it lists `ORDER BY 1` with an aggregate as CORRECT. It is not —
+  it degrades exactly like the named form. The positional and named
+  spellings reach the same sort, and the aggregate alone decides it,
+  which makes the rule simpler than the report's three-way narrowing.
+
+- **`pg_index` said a PRIMARY KEY was not unique** — the PostgreSQL twin
+  of the `SHOW INDEX` defect v7.39.10 fixed for MySQL, and `pg_index` is
+  where every PostgreSQL tool asks the same question.
+
+  ```text
+    DDL                          PG 18                  SPG 7.39.10
+    a int PRIMARY KEY            indisprimary=t u=t     indisprimary=t u=f
+    ALTER … ADD PRIMARY KEY (a)  indisprimary=t u=t     indisprimary=t u=f
+    CREATE UNIQUE INDEX (a,b)    no pg_constraint row   contype='u'
+  ```
+
+  `indisunique = false` on a primary key is a wrong VALUE: anything
+  reading it concludes the key is not unique. It came from the index's
+  own flag — SPG records a primary key's uniqueness on the table's
+  constraint — and `indisprimary` came from testing whether the index
+  NAME ends in `_pkey`, which made the two spellings of one constraint
+  disagree with each other. Both read the constraint now.
+
+  And a bare `CREATE UNIQUE INDEX` no longer grows a `pg_constraint`
+  row. PostgreSQL creates none, so a schema-diff tool comparing the two
+  sides saw a constraint on ours that does not exist on the other; in
+  the reporter's own dump that was an expression index appearing as a
+  constraint. An index that BACKS a constraint still gets its row from
+  the constraint itself.
+
+  The enforcement was never in question — both builds refuse the
+  duplicate and name the same columns. This is a tooling defect and is
+  recorded as one.
+
+  **Not closed, and measured rather than assumed:** an inline composite
+  constraint still produces TWO `pg_index` rows where PostgreSQL has
+  one, and index names differ from PostgreSQL's (`m2_a_pkey` against
+  `m2_pkey`). Those follow from SPG building a different set of indexes
+  for the two spellings of one constraint, which is a storage question
+  rather than a catalog one.
+
 ## [7.39.10] — 2026-09-02
 
 ### Fixed
