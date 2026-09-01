@@ -3204,8 +3204,41 @@ impl Parser {
                     // IF EXISTS makes the drop idempotent.
                     Token::Index => {
                         self.advance();
+                        let if_exists_at = self.pos;
                         let if_exists = self.consume_if_exists();
                         let name = self.expect_ident_like()?;
+                        // v7.39.7 — MySQL's own spelling, which SPG
+                        // refused.
+                        //
+                        // `DROP INDEX i ON t` is how MySQL drops an
+                        // index; its names live inside a table, so the
+                        // statement names the table. Measured against
+                        // MySQL 9.7.2: the form above works, and the
+                        // bare `DROP INDEX i` PostgreSQL uses is a 1064
+                        // there. SPG had it exactly backwards on the
+                        // MySQL wire — the bare form accepted, MySQL's
+                        // own a syntax error — so a migration that drops
+                        // an index failed against the drop-in and not
+                        // against the thing it replaces.
+                        let table = if matches!(self.peek(), Token::On) {
+                            self.advance();
+                            Some(self.expect_ident_like()?)
+                        } else {
+                            None
+                        };
+                        if self.mysql_dialect {
+                            // MySQL has no `IF EXISTS` here either:
+                            // `DROP INDEX IF EXISTS i ON t` is a 1064.
+                            if if_exists {
+                                return Err(self.err_at(
+                                    if_exists_at,
+                                    "MySQL has no IF EXISTS on DROP INDEX".into(),
+                                ));
+                            }
+                            if table.is_none() {
+                                return Err(self.err("expected ON after the index name".into()));
+                            }
+                        }
                         if matches!(
                             self.peek(),
                             Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
@@ -3213,7 +3246,11 @@ impl Parser {
                         ) {
                             self.advance();
                         }
-                        Ok(Statement::DropIndex { name, if_exists })
+                        Ok(Statement::DropIndex {
+                            name,
+                            if_exists,
+                            table,
+                        })
                     }
                     // v7.14.0 — DROP SCHEMA [IF EXISTS] name
                     // [CASCADE|RESTRICT]. SPG is single-database;

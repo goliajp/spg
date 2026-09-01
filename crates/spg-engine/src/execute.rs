@@ -2260,7 +2260,11 @@ impl Engine {
                 })
             }
             Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
-            Statement::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists),
+            Statement::DropIndex {
+                name,
+                if_exists,
+                table,
+            } => self.exec_drop_index(name, if_exists, table),
             Statement::CreateIndex(s) => {
                 // PG bars only the CONCURRENTLY form inside a transaction
                 // block (25001); a plain CREATE INDEX there is fine.
