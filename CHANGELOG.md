@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.39.9] — 2026-09-01
 
 ### Fixed
 
