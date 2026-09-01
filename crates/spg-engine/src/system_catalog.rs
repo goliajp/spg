@@ -3465,7 +3465,38 @@ pub(crate) fn synth_information_schema_table_constraints(
             if already {
                 continue;
             }
-            let is_primary = idx.name.ends_with("_pkey");
+            // v7.39.11 — from the CONSTRAINT, not from the index's name
+            // and not from the index's own uniqueness flag.
+            //
+            // Both were wrong, and sentori reported the pair against
+            // 7.39.10 as the PostgreSQL twin of the `SHOW INDEX` defect
+            // that version fixed for MySQL. Measured against
+            // PostgreSQL 18.6:
+            //
+            // ```text
+            //   a int PRIMARY KEY      PG: indisprimary=t indisunique=t
+            //                         SPG: indisprimary=t indisunique=f
+            // ```
+            //
+            // `indisunique = false` on a primary key is a wrong VALUE:
+            // the reporter's own sentence applies unchanged — anything
+            // reading it concludes the key is not unique. SPG does not
+            // carry a primary key's uniqueness on the index; it lives in
+            // the table's uniqueness constraints, where `is_primary_key`
+            // also says which one is the primary key. Deciding that from
+            // a `_pkey` name suffix made the inline composite spelling
+            // (`m1_a_pkey_0_0`) answer false while the ALTER spelling
+            // answered true.
+            let idx_cols: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            let constraint = t
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .find(|uc| uc.columns == idx_cols);
+            let is_primary = constraint.is_some_and(|uc| uc.is_primary_key);
+            let is_unique = idx.is_unique || constraint.is_some();
             let kind = if is_primary { "PRIMARY KEY" } else { "UNIQUE" };
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
@@ -7718,56 +7749,21 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Null, /* conbin */
             ]));
         }
-        // Single-column unique indices that don't have a UC entry.
-        // v7.39 (read01 ruleutils.c) — a PARTIAL unique index is never a
-        // constraint in PG (constraints cannot carry predicates).
-        for idx in t.indices() {
-            if !idx.is_unique || idx.partial_predicate.is_some() {
-                continue;
-            }
-            let already = t
-                .schema()
-                .uniqueness_constraints
-                .iter()
-                .any(|uc| uc.columns.len() == 1 && uc.columns[0] == idx.column_position);
-            if already {
-                continue;
-            }
-            let is_primary = idx.name.ends_with("_pkey");
-            let kind = if is_primary { "p" } else { "u" };
-            let positions = alloc::vec![idx.column_position];
-            let conkey_display = conkey_vec(&positions);
-            rows.push(Row::new(alloc::vec![
-                Value::BigInt(next_con_oid()),
-                Value::text(idx.name.clone()),
-                Value::BigInt(2200),
-                Value::text::<String>(kind.into()),
-                Value::Bool(false),
-                Value::Bool(false),
-                Value::Bool(true), /* conenforced */
-                Value::Bool(true),
-                Value::BigInt(conrelid),
-                Value::BigInt(0),
-                Value::BigInt(0),
-                Value::BigInt(0),
-                Value::BigInt(0),
-                Value::text(" "),
-                Value::text(" "),
-                Value::text(" "),
-                Value::Bool(true),
-                Value::Int(0),
-                Value::Bool(true),
-                Value::Bool(false), /* conperiod */
-                conkey_display.clone(),
-                Value::Null, /* confkey: non-FK */
-                Value::Null, /* conpfeqop */
-                Value::Null, /* conppeqop */
-                Value::Null, /* conffeqop */
-                Value::Null, /* confdelsetcols */
-                Value::Null, /* conexclop */
-                Value::Null, /* conbin */
-            ]));
-        }
+        // v7.39.11 — a bare `CREATE UNIQUE INDEX` is an INDEX, and
+        // PostgreSQL creates no constraint for it. This loop used to
+        // synthesise one.
+        //
+        // Reported by sentori against 7.39.10: a schema-diff tool
+        // comparing the two sides sees a constraint on ours that does
+        // not exist on PostgreSQL's — in their own dump that was
+        // `users_email_ci_idx`, an expression index, appearing as a
+        // constraint. Measured: `CREATE UNIQUE INDEX m6_ab ON m6 (a,b)`
+        // gives PostgreSQL no `pg_constraint` row and gave us one with
+        // `contype = 'u'`.
+        //
+        // An index that BACKS a constraint still gets its row from the
+        // uniqueness-constraint loop above, which is where the
+        // constraint actually lives.
         // Foreign keys.
         for fk in t.schema().foreign_keys.iter() {
             let conname = fk
@@ -10833,7 +10829,33 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 indcollation.push('0');
                 indoption.push('0');
             }
-            let is_primary = idx.name.ends_with("_pkey");
+            // v7.39.11 — from the CONSTRAINT, not from the index's name
+            // and not from the index's own uniqueness flag.
+            //
+            // Reported by sentori against 7.39.10 as the PostgreSQL twin
+            // of the `SHOW INDEX` defect that version fixed for MySQL.
+            // Measured against PostgreSQL 18.6, `a int PRIMARY KEY`:
+            // PG answers `indisprimary=t indisunique=t`, SPG answered
+            // `indisprimary=t indisunique=f`.
+            //
+            // `indisunique = false` on a primary key is a wrong VALUE —
+            // anything reading it concludes the key is not unique. SPG
+            // does not carry a primary key's uniqueness on the index; it
+            // lives in the table's uniqueness constraints, where
+            // `is_primary_key` also says which one is primary. Deciding
+            // that from a `_pkey` name suffix made the inline composite
+            // spelling (`m1_a_pkey_0_0`) answer false while the ALTER
+            // spelling answered true.
+            let idx_cols: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            let backing = t
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .find(|uc| uc.columns == idx_cols);
+            let is_primary = backing.is_some_and(|uc| uc.is_primary_key);
+            let is_unique = idx.is_unique || backing.is_some();
             let is_partial = idx.partial_predicate.is_some();
             let is_expression = idx.expression.is_some();
             let _ = (is_partial, is_expression);
@@ -10842,7 +10864,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::BigInt(relid),
                 Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
                 Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
-                Value::Bool(idx.is_unique),
+                Value::Bool(is_unique),
                 // v7.39 (round 473) — the index has carried this since
                 // round 52 and enforces it; only the catalog was still
                 // answering `f`, so a migration tool reading pg_index saw

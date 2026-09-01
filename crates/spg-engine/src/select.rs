@@ -787,7 +787,25 @@ impl Engine {
         // ORDER BY + LIMIT/OFFSET on the projected rows.
         if !stmt.order_by.is_empty() {
             let descs: Vec<bool> = stmt.order_by.iter().map(|o| o.desc).collect();
-            sort_by_keys(&mut tagged, &descs);
+            // v7.39.11 — and the collation, which this path was sorting
+            // without.
+            //
+            // Reported by sentori against 7.39.10: `SELECT t, count(*)
+            // OVER () FROM t ORDER BY t` answered `A B a b` on a
+            // database collating `en_US.utf8` where the same query
+            // without the window function answers `a A b B`. No row is
+            // wrong and nothing raises; only the order changes.
+            //
+            // Same cause as the enum-ordinal defect the comment above
+            // records: this branch builds its order keys itself instead
+            // of going through `build_order_keys`, so anything that
+            // path resolves has to be resolved again here, and the
+            // collation was not. `order_by_collations` is the one place
+            // that answers it — explicit `COLLATE` first, then the
+            // column's declaration, then the database's — so calling it
+            // here cannot disagree with the ungrouped path.
+            let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx)?;
+            crate::orderby::sort_by_keys_in(&mut tagged, &descs, &colls);
         }
         let mut out_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         // v7.37 D.41 — `SELECT DISTINCT` over a window projection: the window
