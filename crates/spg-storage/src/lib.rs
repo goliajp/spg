@@ -7765,6 +7765,22 @@ impl Catalog {
         false
     }
 
+    /// v7.39.7 — the same drop, scoped to ONE table.
+    ///
+    /// MySQL keys an index name inside its table, and `DROP INDEX i ON t`
+    /// says which. `None` means the table itself is missing, which is a
+    /// different error from the index being missing — MySQL answers 1146
+    /// for the first and 1091 for the second.
+    pub fn drop_named_index_on(&mut self, table: &str, name: &str) -> Option<bool> {
+        let t = self
+            .tables
+            .iter_mut()
+            .find(|t| t.schema.name.eq_ignore_ascii_case(table))?;
+        let before = t.indices.len();
+        t.indices.retain(|i| i.name != name);
+        Some(t.indices.len() != before)
+    }
+
     /// Borrow-free copy of every table's name in catalog order
     /// (= insertion order, matching the on-disk encoding).
     pub fn table_names(&self) -> Vec<String> {

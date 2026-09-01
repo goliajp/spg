@@ -273,6 +273,7 @@ mod e2e_domain_type;
 mod e2e_double_quote_dialect_v739;
 mod e2e_drop_column_drops_checks_v7382;
 mod e2e_drop_expression_if_exists_round187;
+mod e2e_drop_index_on_v7397;
 mod e2e_drop_wider_pg_dump_compat;
 mod e2e_dump_roundtrip_r1054;
 mod e2e_duplicate_column_v7392;

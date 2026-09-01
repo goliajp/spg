@@ -8,6 +8,39 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`DROP INDEX i ON t` — how MySQL drops an index — was a syntax
+  error.** The two dialects were exactly backwards on the MySQL wire.
+  Measured against MySQL 9.7.2 and the published 7.39.6 image, same
+  statements, same client:
+
+  ```text
+                                    MySQL 9.7.2       spg 7.39.6
+    DROP INDEX ix ON ci                works       syntax error 1064
+    ALTER TABLE ci DROP INDEX ix       works            works
+    DROP INDEX ix                   syntax error       accepted
+  ```
+
+  So a migration that drops an index failed against the drop-in and not
+  against the thing it replaces — and a script written against SPG
+  would fail on the MySQL it claims to be.
+
+  MySQL keys an index name inside its table, which is why its statement
+  names one; PostgreSQL keys it in the schema and has no `ON` clause at
+  all. Each dialect now accepts its own form and refuses the other's.
+  The `ALTER TABLE t DROP INDEX i` spelling, which both accept, scopes
+  to the table `ALTER` named — it did not before, so it could drop an
+  index of the same name belonging to another table.
+
+  MySQL's edges, measured rather than assumed: the index existing on
+  ANOTHER table is `Can't DROP 'ix'` (1091), the same answer as no such
+  index; a missing table is 1146, a different error, so the two are
+  kept apart; and `DROP INDEX IF EXISTS ix ON t` is a 1064 there, which
+  the MySQL dialect now refuses too.
+
 ## [7.39.6] — 2026-09-01
 
 ### Fixed

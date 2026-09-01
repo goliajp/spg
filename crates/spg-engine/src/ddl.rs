@@ -198,7 +198,12 @@ impl Engine {
             // v7.39 (round 431) — `ALTER TABLE t DROP {INDEX|KEY} name`
             // shares the standalone DROP INDEX path, so the two spellings
             // cannot diverge on the not-found / IF EXISTS behaviour.
-            T::DropIndex { name, if_exists } => self.exec_drop_index(name, if_exists).map(|_| ()),
+            // v7.39.7 — and the table is the one ALTER named, so this
+            // spelling scopes the same way MySQL's own `DROP INDEX i ON
+            // t` does.
+            T::DropIndex { name, if_exists } => self
+                .exec_drop_index(name, if_exists, Some(tbl.to_string()))
+                .map(|_| ()),
             T::AddColumn {
                 column,
                 if_not_exists,
@@ -3065,8 +3070,26 @@ impl Engine {
         &mut self,
         name: String,
         if_exists: bool,
+        table: Option<String>,
     ) -> Result<QueryResult, EngineError> {
-        let dropped = self.active_catalog_mut().drop_named_index(&name);
+        // v7.39.7 — `DROP INDEX i ON t` scopes the drop to `t`, because
+        // MySQL keys an index name inside its table. Measured on MySQL
+        // 9.7.2: the index existing on ANOTHER table is `Can't DROP
+        // 'ix'` (1091), the same answer as no such index, and a missing
+        // TABLE is 1146 — a different error, so the two are kept apart
+        // here.
+        let dropped = if let Some(t) = &table {
+            match self.active_catalog_mut().drop_named_index_on(t, &name) {
+                Some(d) => d,
+                None => {
+                    return Err(EngineError::Storage(StorageError::TableNotFound {
+                        name: t.clone(),
+                    }));
+                }
+            }
+        } else {
+            self.active_catalog_mut().drop_named_index(&name)
+        };
         if !dropped {
             if !if_exists {
                 return Err(EngineError::Storage(StorageError::IndexNotFound { name }));

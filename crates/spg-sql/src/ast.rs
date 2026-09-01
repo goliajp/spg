@@ -322,6 +322,14 @@ pub enum Statement {
     DropIndex {
         name: String,
         if_exists: bool,
+        /// v7.39.7 — the table named by MySQL's `DROP INDEX i ON t`.
+        ///
+        /// MySQL keys an index name inside its table and its statement
+        /// says so; PostgreSQL keys it in the schema and has no `ON`
+        /// clause at all. `None` is the PostgreSQL form, which searches
+        /// every table for the name, and is what the MySQL dialect
+        /// refuses — as MySQL does.
+        table: Option<String>,
     },
     /// v7.14.0 — empty / comment-only statement. The lexer strips
     /// `--` line comments and `/* … */` block comments (including
@@ -5943,12 +5951,20 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::DropIndex { name, if_exists } => {
+            Self::DropIndex {
+                name,
+                if_exists,
+                table,
+            } => {
                 f.write_str("DROP INDEX ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
                 }
-                write!(f, "{}", quote_ident(name))
+                write!(f, "{}", quote_ident(name))?;
+                if let Some(t) = table {
+                    write!(f, " ON {}", quote_ident(t))?;
+                }
+                Ok(())
             }
             Self::Select(s) => s.fmt(f),
             Self::CreateTable(s) => s.fmt(f),
