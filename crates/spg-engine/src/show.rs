@@ -211,11 +211,36 @@ impl Engine {
         Ok(QueryResult::Rows { columns, rows })
     }
 
-    /// v7.17.0 Phase 3.P0-60 — `SHOW INDEXES FROM <t>`. MySQL
-    /// surface returns one row per (index × column) with 14
-    /// columns; v7.17 ships the columns admin probes actually
-    /// filter on: Table, Non_unique, Key_name, Seq_in_index,
-    /// Column_name, Null, Index_type.
+    /// v7.17.0 Phase 3.P0-60 — `SHOW INDEXES FROM <t>`.
+    ///
+    /// v7.39.10 — the whole row, and the primary key told apart.
+    ///
+    /// Three things were wrong, measured against MySQL 9.7.2 on the
+    /// published 7.39.9 image, same table, same client:
+    ///
+    /// ```text
+    ///                              MySQL 9.7.2      spg 7.39.9
+    ///   Key_name of the PK           PRIMARY          f1_pkey
+    ///   Non_unique of the PK           0                1
+    ///   columns returned              15                7
+    /// ```
+    ///
+    /// `Non_unique = 1` on a PRIMARY KEY is a wrong VALUE, not a
+    /// spelling: a tool reading it concludes the key is not unique.
+    /// It came from `!idx.is_unique`, and SPG does not carry the
+    /// primary key's uniqueness on the index — it lives in the table's
+    /// uniqueness constraints, where `is_primary_key` says so.
+    ///
+    /// MySQL names every primary key `PRIMARY`, so a migration tool
+    /// looking for that name found nothing; and `SHOW INDEX` has a
+    /// fixed fifteen-column shape that clients read BY POSITION, so
+    /// seven columns is not a subset, it is a different result.
+    ///
+    /// The values SPG has no answer for are MySQL's own for a table it
+    /// has not analysed: `Cardinality = 0`, `Sub_part` and `Packed`
+    /// NULL, empty `Comment` / `Index_comment`, `Visible = YES`,
+    /// `Expression` NULL — all copied from a 9.7.2 run rather than
+    /// invented.
     pub(crate) fn exec_show_indexes(&self, name: &str) -> Result<QueryResult, EngineError> {
         let t = self.active_catalog().get(name).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: name.into() })
@@ -226,34 +251,87 @@ impl Engine {
             ColumnSchema::new("Key_name", DataType::Text, false),
             ColumnSchema::new("Seq_in_index", DataType::Int, false),
             ColumnSchema::new("Column_name", DataType::Text, false),
+            ColumnSchema::new("Collation", DataType::Text, true),
+            ColumnSchema::new("Cardinality", DataType::BigInt, true),
+            ColumnSchema::new("Sub_part", DataType::Int, true),
+            ColumnSchema::new("Packed", DataType::Text, true),
             ColumnSchema::new("Null", DataType::Text, false),
             ColumnSchema::new("Index_type", DataType::Text, false),
+            ColumnSchema::new("Comment", DataType::Text, false),
+            ColumnSchema::new("Index_comment", DataType::Text, false),
+            ColumnSchema::new("Visible", DataType::Text, false),
+            ColumnSchema::new("Expression", DataType::Text, true),
         ];
+        // The column positions the PRIMARY KEY constraint covers, which
+        // is where SPG records that it is unique — the index itself does
+        // not carry the flag.
+        let pk_cols: Option<&[usize]> = t
+            .schema()
+            .uniqueness_constraints
+            .iter()
+            .find(|uc| uc.is_primary_key)
+            .map(|uc| uc.columns.as_slice());
         let mut rows: Vec<Row<'static>> = Vec::new();
+        let mut push_index = |idx: &spg_storage::Index, rows: &mut Vec<Row<'static>>| {
+            // Every column of the index, in order: MySQL emits one row
+            // per (index × column) and numbers them from 1.
+            let positions: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            let is_pk = pk_cols.is_some_and(|c| c == positions.as_slice());
+            let key_name = if is_pk {
+                // MySQL names every primary key PRIMARY.
+                String::from("PRIMARY")
+            } else {
+                idx.name.clone()
+            };
+            let unique = is_pk || idx.is_unique;
+            for (seq, pos) in positions.iter().enumerate() {
+                let col = t
+                    .schema()
+                    .columns
+                    .get(*pos)
+                    .map_or("?".into(), |c| c.name.clone());
+                let nullable = t.schema().columns.get(*pos).is_none_or(|c| c.nullable);
+                rows.push(Row::new(alloc::vec![
+                    Value::text::<String>(name.into()),
+                    Value::Int(i32::from(!unique)),
+                    Value::text(key_name.clone()),
+                    Value::Int(i32::try_from(seq + 1).unwrap_or(1)),
+                    Value::text(col),
+                    Value::text("A"),
+                    Value::BigInt(0),
+                    Value::Null,
+                    Value::Null,
+                    Value::text(if nullable {
+                        "YES".into()
+                    } else {
+                        String::new()
+                    }),
+                    Value::text("BTREE"),
+                    Value::text(String::new()),
+                    Value::text(String::new()),
+                    Value::text("YES"),
+                    Value::Null,
+                ]));
+            }
+        };
+        // PRIMARY first, as MySQL lists it.
         for idx in t.indices() {
-            let col = t
-                .schema()
-                .columns
-                .get(idx.column_position)
-                .map_or("?".into(), |c| c.name.clone());
-            let nullable = t
-                .schema()
-                .columns
-                .get(idx.column_position)
-                .map_or(true, |c| c.nullable);
-            rows.push(Row::new(alloc::vec![
-                Value::text::<String>(name.into()),
-                Value::Int(i32::from(!idx.is_unique)),
-                Value::text(idx.name.clone()),
-                Value::Int(1),
-                Value::text(col),
-                Value::text(if nullable {
-                    "YES".into()
-                } else {
-                    String::new()
-                }),
-                Value::text("BTREE"),
-            ]));
+            let positions: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            if pk_cols.is_some_and(|c| c == positions.as_slice()) {
+                push_index(idx, &mut rows);
+            }
+        }
+        for idx in t.indices() {
+            let positions: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            if pk_cols.is_none_or(|c| c != positions.as_slice()) {
+                push_index(idx, &mut rows);
+            }
         }
         Ok(QueryResult::Rows { columns, rows })
     }

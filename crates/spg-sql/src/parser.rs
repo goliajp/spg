@@ -11031,8 +11031,24 @@ impl Parser {
                 if matches!(self.peek(), Token::Eq) {
                     self.advance();
                 }
+                // v7.39.10 — as WRITTEN, the way `CREATE TABLE`'s ENGINE
+                // clause has kept it since v7.39.3. The lexer folds a
+                // bare identifier, and MySQL names the engine back
+                // exactly: measured, `ALTER TABLE f1 ENGINE=NoSuchEng`
+                // answers `Unknown storage engine 'NoSuchEng'` there and
+                // answered `'nosucheng'` here — the one thing that
+                // message is for is telling the operator which word in
+                // their migration was wrong.
+                let at = self.pos;
                 let name = self.expect_ident_like()?;
-                Ok(alloc::vec![crate::ast::AlterTableTarget::SetEngine(name)])
+                let written = self
+                    .source_span(at, at)
+                    .map(|raw| raw.trim().trim_matches('`').trim_matches('\''))
+                    .filter(|raw| raw.eq_ignore_ascii_case(&name))
+                    .map(alloc::string::String::from);
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetEngine(
+                    written.unwrap_or(name)
+                )])
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("convert") => {
                 self.advance();
