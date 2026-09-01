@@ -2550,6 +2550,22 @@ impl Engine {
             )),
             // v6.2.0 — ANALYZE recomputes per-column histograms.
             Statement::Analyze(target) => self.exec_analyze(target.as_deref()),
+            // v7.39.9 — MySQL's `RENAME TABLE a TO b [, c TO d]`, which
+            // is the spelling a MySQL migration writes. Each pair goes
+            // through the same rename PostgreSQL's `ALTER TABLE …
+            // RENAME TO` uses, so the two cannot come to disagree.
+            Statement::RenameTables(pairs) => {
+                for (from, to) in pairs {
+                    self.exec_alter_table_subaction(
+                        &from,
+                        spg_sql::ast::AlterTableTarget::RenameTable { new: to },
+                    )?;
+                }
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: self.catalog_change_is_committed(),
+                })
+            }
             // v7.39 (round 535) — REINDEX / CLUSTER. SPG has neither index
             // bloat to rebuild nor a clustering order to impose, so the
             // work is a no-op — but PG VALIDATES the target, and both
