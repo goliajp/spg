@@ -8,6 +8,69 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **A dropped DEFAULT came back when the dump was restored.** The
+  source text the catalog views and `dump_sql` read was written once at
+  CREATE TABLE and never again, so `ALTER TABLE t ALTER COLUMN b DROP
+  DEFAULT` — PostgreSQL's own spelling — left it behind:
+
+  ```text
+    CREATE TABLE m1 (id INT PRIMARY KEY, b INT NOT NULL DEFAULT 5);
+    ALTER TABLE m1 ALTER COLUMN b DROP DEFAULT;
+
+    the catalog              default = None
+    information_schema       column_default = '5'
+    pg_attrdef               '5'
+    dump_sql()               b integer NOT NULL DEFAULT 5,
+  ```
+
+  Restore that dump and the default is back: the schema you get is not
+  the schema you dumped. `SET DEFAULT` had the mirror problem,
+  reporting and dumping the value it replaced. Every published version
+  carrying `default_text` behaved this way — it arrived in v7.38 for
+  catalog introspection and nothing taught it about ALTER.
+
+  Found while measuring something else: a MySQL-spelling sweep compared
+  `information_schema` before and after each statement, and the numbers
+  disagreed with the catalog in a way that had nothing to do with the
+  statement under test.
+
+- **Seven MySQL spellings a migration emits were syntax errors.** Each
+  measured one at a time against MySQL 9.7.2 beside the published
+  7.39.8 image; thirty-seven shapes swept, eleven diverged, and these
+  are the ALTER TABLE family among them:
+
+  ```text
+    ALTER TABLE t MODIFY COLUMN b BIGINT
+    ALTER TABLE t CHANGE COLUMN b bb BIGINT
+    ALTER TABLE t ADD COLUMN d INT AFTER a
+    ALTER TABLE t ADD COLUMN e INT FIRST
+    ALTER TABLE t AUTO_INCREMENT = 100
+    ALTER TABLE t ENGINE = InnoDB
+    ALTER TABLE t CONVERT TO CHARACTER SET utf8mb4
+  ```
+
+  `MODIFY` and `CHANGE` REPLACE the definition rather than amend it,
+  which is the part no PostgreSQL spelling expresses: measured, a
+  column declared `INT NOT NULL DEFAULT 5` is `bigint`, nullable, with
+  no default after `MODIFY COLUMN b BIGINT`. Restating them keeps them.
+  A version that only changed the type would silently keep a NOT NULL
+  the migration asked to lift.
+
+  `AFTER` and `FIRST` really move the column, values and all. The row
+  encoding is positional and `SELECT *` reads it in order, so appending
+  instead would be a wrong answer rather than a missing feature —
+  measured on MySQL, `AFTER a` lands the column at ordinal 3 and pushes
+  the old third column to 4, and it does here now.
+
+  `ENGINE` and `CONVERT TO CHARACTER SET` accept what SPG can honour
+  and refuse what it cannot with MySQL's own sentence, the same
+  reasoning `CREATE TABLE`'s ENGINE check already used: a typo in a
+  migration must not quietly become SPG's storage or SPG's encoding.
+
 ## [7.39.8] — 2026-09-01
 
 ### Testing

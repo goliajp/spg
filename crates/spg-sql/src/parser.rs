@@ -10919,10 +10919,109 @@ impl Parser {
     /// Parse one ALTER TABLE subaction. Returns a Vec because
     /// inline `REFERENCES` on `ADD COLUMN` produces both an
     /// AddColumn and an AddForeignKey entry (mailrs round-6 S3).
+    /// v7.39.9 — MySQL's `FIRST` / `AFTER <col>` trailer on ADD /
+    /// MODIFY / CHANGE COLUMN. Absent is the PostgreSQL form, which
+    /// appends.
+    fn parse_column_position(&mut self) -> Option<crate::ast::ColumnPosition> {
+        match self.peek() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("first") => {
+                self.advance();
+                Some(crate::ast::ColumnPosition::First)
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("after") => {
+                self.advance();
+                let name = self.expect_ident_like().ok()?;
+                Some(crate::ast::ColumnPosition::After(name))
+            }
+            _ => None,
+        }
+    }
+
     fn parse_alter_table_subaction(
         &mut self,
     ) -> Result<Vec<crate::ast::AlterTableTarget>, ParseError> {
         match self.peek() {
+            // v7.39.9 — MySQL's own ALTER TABLE vocabulary. Each one is
+            // a statement a real migration emits and SPG answered 1064
+            // for; measured against MySQL 9.7.2, one at a time, beside
+            // the published image.
+            Token::Ident(s)
+                if s.eq_ignore_ascii_case("modify") || s.eq_ignore_ascii_case("change") =>
+            {
+                let changing = s.eq_ignore_ascii_case("change");
+                self.advance();
+                if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("column")) {
+                    self.advance();
+                }
+                // `parse_column_def_with_fk` reads the NAME itself, so
+                // `MODIFY` hands it the column and `CHANGE` eats the old
+                // name first and lets it read the new one.
+                let old_name = if changing {
+                    Some(self.expect_ident_like()?)
+                } else {
+                    None
+                };
+                let (definition, _fk) = self.parse_column_def_with_fk()?;
+                let column = old_name.clone().unwrap_or_else(|| definition.name.clone());
+                let rename_to = if changing {
+                    Some(definition.name.clone())
+                } else {
+                    None
+                };
+                let position = self.parse_column_position();
+                Ok(alloc::vec![crate::ast::AlterTableTarget::ModifyColumn {
+                    column,
+                    rename_to,
+                    definition,
+                    position,
+                }])
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("auto_increment") => {
+                self.advance();
+                if matches!(self.peek(), Token::Eq) {
+                    self.advance();
+                }
+                let n = self.expect_u64_literal()?;
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::SetTableAutoIncrement(
+                        i64::try_from(n).unwrap_or(i64::MAX)
+                    )
+                ])
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("engine") => {
+                self.advance();
+                if matches!(self.peek(), Token::Eq) {
+                    self.advance();
+                }
+                let name = self.expect_ident_like()?;
+                Ok(alloc::vec![crate::ast::AlterTableTarget::SetEngine(name)])
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("convert") => {
+                self.advance();
+                // CONVERT TO CHARACTER SET <cs> [COLLATE <c>]
+                if matches!(self.peek(), Token::To) {
+                    self.advance();
+                }
+                let kw = self.expect_ident_like()?;
+                if !kw.eq_ignore_ascii_case("character") {
+                    return Err(self.err("expected CHARACTER after CONVERT TO".into()));
+                }
+                let set_kw = self.expect_ident_like()?;
+                if !set_kw.eq_ignore_ascii_case("set") {
+                    return Err(self.err("expected SET after CHARACTER".into()));
+                }
+                let charset = self.expect_ident_like()?;
+                let collate =
+                    if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("collate")) {
+                        self.advance();
+                        Some(self.expect_ident_like()?)
+                    } else {
+                        None
+                    };
+                Ok(alloc::vec![
+                    crate::ast::AlterTableTarget::ConvertToCharacterSet { charset, collate }
+                ])
+            }
             Token::Ident(s) if s.eq_ignore_ascii_case("set") => {
                 self.advance();
                 // v7.37.18 (18.7-18.15) — SET ( option = value, … )
@@ -11395,9 +11494,12 @@ impl Parser {
                 // returns ColumnDef + an optional inline FK.
                 let (column, col_level_fk) = self.parse_column_def_with_fk()?;
                 let col_name = column.name.clone();
+                // v7.39.9 — MySQL says where the column goes.
+                let position = self.parse_column_position();
                 let mut out = alloc::vec![crate::ast::AlterTableTarget::AddColumn {
                     column,
                     if_not_exists,
+                    position,
                 }];
                 if let Some(mut fk) = col_level_fk {
                     if fk.columns.is_empty() {
@@ -11731,6 +11833,27 @@ impl Parser {
                     return Ok(alloc::vec![
                         crate::ast::AlterTableTarget::RenameConstraint { old, new }
                     ]);
+                }
+                // v7.39.9 — MySQL's `RENAME {INDEX|KEY} old TO new`.
+                // PostgreSQL renames an index with its own top-level
+                // `ALTER INDEX`, so this spelling had nowhere to go and
+                // answered 1064; MySQL 9.7.2 parses it and answers 1176
+                // when the key is not there.
+                if matches!(self.peek(), Token::Index)
+                    || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("key"))
+                {
+                    self.advance();
+                    let old = self.expect_ident_like()?;
+                    if matches!(self.peek(), Token::To) {
+                        self.advance();
+                    } else {
+                        self.expect_keyword_ident("to")?;
+                    }
+                    let new = self.expect_ident_like()?;
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::RenameIndex {
+                        old,
+                        new,
+                    }]);
                 }
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("column")) {
                     self.advance();

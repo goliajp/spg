@@ -1347,6 +1347,28 @@ pub struct AlterTableStatement {
     /// Single-subaction shape stays a 1-element vec.
     pub targets: Vec<AlterTableTarget>,
 }
+/// v7.39.9 — the `FIRST` / `AFTER c` trailer, written back the way it
+/// was read.
+fn write_column_position(
+    f: &mut core::fmt::Formatter<'_>,
+    pos: Option<&ColumnPosition>,
+) -> core::fmt::Result {
+    match pos {
+        Some(ColumnPosition::First) => f.write_str(" FIRST"),
+        Some(ColumnPosition::After(c)) => write!(f, " AFTER {}", quote_ident(c)),
+        None => Ok(()),
+    }
+}
+
+/// v7.39.9 — where MySQL's `ADD` / `MODIFY` / `CHANGE` puts a column.
+///
+/// The row encoding is positional and `SELECT *` reads it in order, so
+/// this is an answer, not a formatting preference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnPosition {
+    First,
+    After(String),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(clippy::large_enum_variant)]
@@ -1383,6 +1405,47 @@ pub enum AlterTableTarget {
     AddColumn {
         column: ColumnDef,
         if_not_exists: bool,
+        /// v7.39.9 — MySQL's `FIRST` / `AFTER <col>`, which say where
+        /// the column goes. `None` is the PostgreSQL form and appends.
+        position: Option<ColumnPosition>,
+    },
+    /// v7.39.9 — MySQL's `MODIFY COLUMN c <definition>` and
+    /// `CHANGE COLUMN old new <definition>`.
+    ///
+    /// Both REPLACE the column's definition rather than amending it,
+    /// which is the part that cannot be expressed by the PostgreSQL
+    /// spellings SPG already had. Measured on MySQL 9.7.2: a column
+    /// declared `INT NOT NULL DEFAULT 5`, after `MODIFY COLUMN b
+    /// BIGINT`, is `bigint` NULLABLE with NO default — restating them
+    /// keeps them, omitting them drops them. `CHANGE` is the same and
+    /// also renames.
+    ModifyColumn {
+        /// The column as it is named now.
+        column: String,
+        /// `CHANGE`'s new name; `None` for `MODIFY`, which keeps it.
+        rename_to: Option<String>,
+        /// The whole new definition, exactly as written.
+        definition: ColumnDef,
+        position: Option<ColumnPosition>,
+    },
+    /// v7.39.9 — MySQL's `RENAME {INDEX|KEY} old TO new`.
+    RenameIndex { old: String, new: String },
+    /// v7.39.9 — MySQL's `ALTER TABLE t AUTO_INCREMENT = n`, which sets
+    /// the value the NEXT insert takes. Measured on 9.7.2: after
+    /// `= 100`, the next row's id is 100.
+    SetTableAutoIncrement(i64),
+    /// v7.39.9 — MySQL's `ENGINE = <name>`. SPG has one storage engine
+    /// and substitutes for every name MySQL knows, exactly as
+    /// `CREATE TABLE` already does; a name MySQL does not know is
+    /// refused with its 1286, because a typo in a migration must not
+    /// quietly become SPG's storage.
+    SetEngine(String),
+    /// v7.39.9 — MySQL's `CONVERT TO CHARACTER SET <cs> [COLLATE <c>]`.
+    /// SPG stores UTF-8 throughout, so a charset it can represent is
+    /// accepted and one it cannot is refused with MySQL's 1115.
+    ConvertToCharacterSet {
+        charset: String,
+        collate: Option<String>,
     },
     /// v7.13.0 — `ALTER TABLE t ALTER COLUMN <col> TYPE <ty>
     /// [USING <expr>]` (mailrs round-5 G8). Engine rewrites every
@@ -7119,9 +7182,49 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             }
             write!(f, "{}", quote_ident(name))
         }
+        AlterTableTarget::ModifyColumn {
+            column,
+            rename_to,
+            definition,
+            position,
+        } => {
+            if let Some(new) = rename_to {
+                write!(
+                    f,
+                    "CHANGE COLUMN {} {} {}",
+                    quote_ident(column),
+                    quote_ident(new),
+                    definition.ty
+                )?;
+            } else {
+                write!(f, "MODIFY COLUMN {} {}", quote_ident(column), definition.ty)?;
+            }
+            if !definition.nullable {
+                f.write_str(" NOT NULL")?;
+            }
+            write_column_position(f, position.as_ref())
+        }
+        AlterTableTarget::RenameIndex { old, new } => {
+            write!(
+                f,
+                "RENAME INDEX {} TO {}",
+                quote_ident(old),
+                quote_ident(new)
+            )
+        }
+        AlterTableTarget::SetTableAutoIncrement(n) => write!(f, "AUTO_INCREMENT = {n}"),
+        AlterTableTarget::SetEngine(name) => write!(f, "ENGINE = {name}"),
+        AlterTableTarget::ConvertToCharacterSet { charset, collate } => {
+            write!(f, "CONVERT TO CHARACTER SET {charset}")?;
+            if let Some(c) = collate {
+                write!(f, " COLLATE {c}")?;
+            }
+            Ok(())
+        }
         AlterTableTarget::AddColumn {
             column,
             if_not_exists,
+            position,
         } => {
             f.write_str("ADD COLUMN ")?;
             if *if_not_exists {
