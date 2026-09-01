@@ -8,6 +8,46 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **`SHOW INDEX` said a PRIMARY KEY was not unique.** Measured against
+  MySQL 9.7.2 on the published 7.39.9 image, same table, same client:
+
+  ```text
+                               MySQL 9.7.2      spg 7.39.9
+    Key_name of the PK           PRIMARY          f1_pkey
+    Non_unique of the PK           0                1
+    columns returned              15                7
+  ```
+
+  `Non_unique = 1` on a primary key is a wrong VALUE, not a spelling: a
+  tool reading it concludes the key is not unique. It came from
+  `!idx.is_unique`, and SPG does not carry the primary key's uniqueness
+  on the index — it lives in the table's uniqueness constraints, where
+  `is_primary_key` says so.
+
+  MySQL names every primary key `PRIMARY`, so a migration tool looking
+  for that name found nothing. And `SHOW INDEX` has a fixed
+  fifteen-column shape that clients read BY POSITION, so seven columns
+  is not a subset — it is a different result. The eight that were
+  missing are answered with MySQL's own values for an unanalysed table,
+  copied from a 9.7.2 run rather than invented: `Collation` A,
+  `Cardinality` 0, `Sub_part` and `Packed` NULL, empty comments,
+  `Visible` YES, `Expression` NULL.
+
+  A composite index also gets one row per column now, numbered from 1,
+  where it had named only the leading column and always said
+  `Seq_in_index = 1`. And `PRIMARY` is listed first, as MySQL lists it.
+
+- **`ALTER TABLE t ENGINE=NoSuchEng` quoted a word the migration did
+  not contain.** MySQL names the engine back exactly so the operator
+  can find the typo; the lexer folds a bare identifier, so the message
+  said `'nosucheng'`. `CREATE TABLE`'s ENGINE clause has kept the
+  written spelling since v7.39.3 — this is the same guard on the
+  statement added in v7.39.9.
+
 ## [7.39.9] — 2026-09-01
 
 ### Fixed
