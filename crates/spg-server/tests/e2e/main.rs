@@ -482,6 +482,7 @@ mod e2e_show_isolation_round118;
     unused_variables
 )]
 mod e2e_slow_query_log;
+mod e2e_spawn_control_v7398;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
