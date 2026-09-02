@@ -571,7 +571,15 @@ fn main() {
                 }
             }
             let total = t_total.elapsed();
-            println!("total {total:?} — report {}", report.display());
+            // v7.39.12 — and what else the machine was doing, because a
+            // duration read without it invites the reader to attribute
+            // the difference to the code. See `Ledger::load_start`.
+            println!(
+                "total {total:?} — report {} — load {:.2} -> {:.2}",
+                report.display(),
+                ledger.load_start,
+                ledger.load_end.unwrap_or(-1.0)
+            );
             // v7.38.17 — name what did NOT run.
             //
             // `full` holds seven steps that nothing schedules: CI has a

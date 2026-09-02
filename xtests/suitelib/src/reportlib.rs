@@ -39,8 +39,41 @@ pub struct Ledger {
     /// and 1,989,963 ms in this repository, and the difference is how many
     /// crates the commit touched.
     pub band: u64,
+    /// v7.39.12 — how busy the machine was, at the start of the run and
+    /// at the end.
+    ///
+    /// A step's duration is not a property of the step alone, and a
+    /// report that does not say what else the machine was doing invites
+    /// the reader to attribute the difference to the code. It did: this
+    /// tier was read at 10,777 s and taken apart on the assumption that
+    /// the time was its own work, when another workload on the same box
+    /// had `syspolicyd` pinned at 90% CPU and a probe binary that
+    /// launches in under a second was taking 99 s to start.
+    ///
+    /// One-minute load average, which is the cheapest thing that would
+    /// have told that story. It is recorded, never judged — the numbers
+    /// a busy machine produces are not wrong, they are about something
+    /// else, and the reader is the one who has to know which.
+    pub load_start: f64,
+    pub load_end: Option<f64>,
     started: Instant,
     steps: Vec<StepRecord>,
+}
+
+/// The one-minute load average, or `-1.0` where the platform will not
+/// say. Deliberately not an `Option` in the JSON: a missing field reads
+/// as "nobody looked", and this is "the machine would not answer".
+#[must_use]
+pub fn load_avg_1m() -> f64 {
+    let mut avg = [0f64; 3];
+    // SAFETY: `getloadavg` writes at most `nelem` doubles into the
+    // buffer and the buffer holds three.
+    let n = unsafe { getloadavg(avg.as_mut_ptr(), 3) };
+    if n >= 1 { avg[0] } else { -1.0 }
+}
+
+unsafe extern "C" {
+    fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
 }
 
 /// `<UTCyyyymmddHHMMSS>-<gitsha7>` (D3). The caller supplies both —
@@ -58,6 +91,8 @@ impl Ledger {
             tier: tier.to_string(),
             runid: runid.to_string(),
             band: 1,
+            load_start: load_avg_1m(),
+            load_end: None,
             started: Instant::now(),
             steps: Vec::new(),
         }
@@ -137,6 +172,8 @@ impl Ledger {
         let _ = writeln!(out, "  \"tier\": \"{}\",", self.tier);
         let _ = writeln!(out, "  \"runid\": \"{}\",", self.runid);
         let _ = writeln!(out, "  \"band\": {},", self.band);
+        let _ = writeln!(out, "  \"load_start\": {:.2},", self.load_start);
+        let _ = writeln!(out, "  \"load_end\": {:.2},", self.load_end.unwrap_or(-1.0));
         let _ = writeln!(
             out,
             "  \"total_ms\": {},",
@@ -175,7 +212,8 @@ impl Ledger {
     ///
     /// # Errors
     /// Filesystem only.
-    pub fn write(&self, target_dir: &std::path::Path) -> Result<PathBuf, String> {
+    pub fn write(&mut self, target_dir: &std::path::Path) -> Result<PathBuf, String> {
+        self.load_end = Some(load_avg_1m());
         let dir = target_dir.join("suite");
         std::fs::create_dir_all(&dir).map_err(|e| format!("reportlib: mkdir: {e}"))?;
         let json = self.to_json();

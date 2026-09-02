@@ -495,3 +495,102 @@ mod test_scratch_root {
         );
     }
 }
+
+/// v7.39.12 — the unit tier does not spawn a harness that carries no
+/// tests.
+///
+/// `cargo test --workspace --lib --bins` selected 83 harnesses across
+/// this workspace and **64 of them carried zero tests**. Sixty-two of
+/// those were binary targets, and 56 of the 62 belonged to
+/// `spg-bench-competitor` — the side-by-side benchmark harness whose
+/// `main`s time SPG against PostgreSQL and MySQL, and whose manifest
+/// already declares `test = false` for them.
+///
+/// It declares it and the flag overrode it: an explicit target
+/// selector wins over the manifest. Measured on `heavy`, which the
+/// manifest marks `test = false` — `--tests` selects it 0 times and
+/// `--lib --bins` selects it once; over nine benchmark bins, 1 against
+/// 9. Excluding the crate says the same thing in the place that is
+/// honoured: 84 harnesses became 27, and the test count did not move
+/// (1,206 before, 1,206 after).
+///
+/// This row asserts the SHAPE, in counts rather than seconds, so it
+/// reads the same on any machine: the tier's own `unit` command must
+/// exclude the benchmark crate, and no other step may reintroduce
+/// `--bins` over the whole workspace.
+///
+/// Why it is worth a row: each harness is a process spawn, and a spawn
+/// is only free on an idle machine. The tier measured 10,777 s on the
+/// testbed while another workload on the same box held `syspolicyd` at
+/// 90% CPU; a probe binary that took 99 s to launch under that load
+/// runs in under a second when the queue is empty. None of that was
+/// the tier's work — but the spawns are the part this repository can
+/// decide not to make.
+#[cfg(test)]
+mod unit_tier_spawns {
+    use std::path::{Path, PathBuf};
+
+    fn gate_sh() -> String {
+        let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        std::fs::read_to_string(root.join("scripts/gate.sh")).expect("scripts/gate.sh")
+    }
+
+    #[test]
+    fn every_workspace_wide_selection_excludes_the_benchmark_crate() {
+        // Only WORKSPACE-wide selections: a `-p spg-server --tests`
+        // leg names one crate and never reaches the benchmark crate,
+        // and cargo rejects `--exclude` without `--workspace` anyway.
+        // This row found that distinction itself, on the
+        // shipped-collation leg.
+        let sh = gate_sh();
+        let lines: Vec<&str> = sh
+            .lines()
+            .map(str::trim)
+            .filter(|l| {
+                !l.starts_with('#')
+                    && l.contains("cargo test")
+                    && l.contains("--workspace")
+                    && (l.contains("--bins") || l.contains("--tests"))
+            })
+            .collect();
+        assert!(
+            !lines.is_empty(),
+            "no workspace-wide `cargo test … --bins/--tests` left in gate.sh — \
+             if the tier stopped selecting them, delete this row and say why"
+        );
+        for l in &lines {
+            assert!(
+                l.contains("--exclude spg-bench-competitor"),
+                "this line selects the benchmark crate's targets, which spawns \
+                 harnesses carrying no tests (56 for --bins, 40 for --tests): {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_binaries_that_do_carry_tests_are_named_here() {
+        // Six binary targets carry tests and must keep running:
+        // spg-server (108), spgctl (23), the oracle (8), perm (3) and
+        // dogfood (2) runners, and sqllogictest (1). None of them is in
+        // the benchmark crate, which is why excluding it costs nothing.
+        // If one of them ever moves INTO that crate, this row is the
+        // place that says the exclude has to be revisited.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let manifest = std::fs::read_to_string(root.join("xbench/competitor/Cargo.toml"))
+            .expect("xbench/competitor/Cargo.toml");
+        for name in ["spg-server", "spgctl", "spg-oracle-runner", "sqllogictest"] {
+            assert!(
+                !manifest.contains(&format!("name = \"{name}\"")),
+                "{name} carries tests and has moved into the crate the unit                  step excludes"
+            );
+        }
+    }
+}

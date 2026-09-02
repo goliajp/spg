@@ -8,6 +8,88 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [7.39.12] — 2026-09-03
+
+### Changed
+
+The release tier, decomposed rather than trimmed. Everything below is a
+COUNT, so it reads the same on any machine — which matters here more
+than usual, because the durations did not.
+
+- **The tier stopped spawning 97 test harnesses that carry no tests.**
+
+  ```text
+                              harnesses   empty   tests
+    unit   --lib --bins           84        64     1,206
+           + exclude bench        27         8     1,206
+    e2e    --tests                102       60     9,086
+           + exclude bench         62       20     9,086
+  ```
+
+  Sixty-two of the 64 empty ones are binary targets, and 56 of those 62
+  belong to `spg-bench-competitor` — the side-by-side benchmark harness
+  whose `main`s time SPG against PostgreSQL and MySQL. Its manifest
+  already says `test = false` for them, and the flag overrode it: an
+  explicit target selector wins over the manifest. Measured on `heavy`,
+  which the manifest marks `test = false` — `--tests` selects it 0 times
+  and `--lib --bins` selects it once; over nine benchmark bins, 1
+  against 9.
+
+  Excluding the crate says the same thing where it is honoured, and the
+  test count does not move in either step. The six binary targets that
+  DO carry tests are in other crates and keep running: spg-server (108),
+  spgctl (23), the oracle (8), perm (3) and dogfood (2) runners,
+  sqllogictest (1).
+
+  Pinned as a rule about the tier's own commands, scoped to
+  workspace-wide selections — which is a distinction the pin found for
+  itself, on a `-p spg-server --tests` leg that names one crate and can
+  never reach the benchmark crate.
+
+- **Every suite report now records what else the machine was doing.**
+  One-minute load average at the start of the run and at the end,
+  written into the report JSON and printed beside the total. It is
+  recorded, never judged.
+
+### Not a finding
+
+**The tier's 10,777 s was not the tier's work, and the first three
+attempts to attribute it were all wrong.** Recorded because the wrong
+turns are the useful part.
+
+The measured shape, from the tier's own report: `unit` 5,601 s and `e2e`
+2,655 s, 77% of the whole. Decomposing `unit` gave compile 240 s against
+run 4,596 s — so not the build. Attributing the run:
+
+1. *Every binary pays ~33 s of startup* — refuted: a test binary's
+   `--list` returns in 0.00 s.
+2. *A few binaries do real work* — refuted: the six that a timestamped
+   run showed at 42-99 s each report `0 passed … finished in 0.00 s`,
+   and the worst of them runs in under a second when asked directly.
+3. *First execution of a freshly linked binary pays validation* —
+   refuted: a binary that had never been launched ran in 9 ms.
+
+The answer was on the machine, not in the repository: another workload
+on the same box had `syspolicyd` at 90% CPU, spawning short-lived
+processes continuously. Every `exec` queued behind it. The same probe
+binary took 99 s to launch under that load and under a second when the
+queue was empty.
+
+So the durations in the 7.39.11 report describe a shared machine, and
+nothing in this version claims to have made the tier faster in seconds.
+What it does is stop making 97 process spawns per run that buy nothing —
+free on an idle machine, and the whole cost on a busy one.
+
+Three of this session's own measuring instruments failed in ways that
+looked exactly like data, which is why the counts above are counts: a
+per-binary timing sweep that ran while another job was live; a
+`while read` loop that silently dropped the last line of every list it
+was given, and so under-counted both sides of a comparison by one
+harness; and a set difference taken over paths whose hashes differ
+between two cargo invocations, which reported that excluding one crate
+had dropped `spg-engine`'s 413 tests. Each was caught by a witness
+unrelated to the thing being measured.
+
 ## [7.39.11] — 2026-09-02
 
 ### Fixed

@@ -87,9 +87,40 @@ run_unit() {
     #
     # So the ignored pass runs in release, where its numbers mean something,
     # and the ordinary pass stays as it was.
-    cargo test --workspace --locked --lib --bins
+    # v7.39.12 — the benchmark crate's binaries are not a unit-test
+    # surface, and `--bins` was running all fifty-six of them.
+    #
+    # Counted, not timed, so the number reads the same on any machine:
+    # `--lib --bins` selects 84 harnesses across this workspace and
+    # **64 of them carry zero tests**. Sixty-two of the 64 are binary
+    # targets, and 56 of the 62 belong to `spg-bench-competitor` — the
+    # side-by-side benchmark harness whose `main`s time SPG against
+    # PostgreSQL and MySQL, and whose manifest already says
+    # `test = false` for them.
+    #
+    # It says so and the flag overrode it: an explicit target selector
+    # wins over the manifest. Measured on `heavy`, which the manifest
+    # marks `test = false` — `--tests` selects it 0 times and
+    # `--lib --bins` selects it once; over nine benchmark bins, 1
+    # against 9. Excluding the crate says the same thing in the place
+    # that is honoured: 84 harnesses become 27 and the test count does
+    # not move, 1,206 before and 1,206 after.
+    #
+    # The six binary targets that DO carry tests are in other crates
+    # and keep running: spg-server (108), spgctl (23), the oracle (8),
+    # perm (3) and dogfood (2) runners, sqllogictest (1).
+    #
+    # Why it is worth the line: each harness is a process spawn, and a
+    # spawn is only free on an idle machine. This tier measured
+    # 10,777 s on the testbed while another workload on the same box
+    # held `syspolicyd` at 90% CPU; a probe binary that took 99 s to
+    # launch under that load runs in under a second when the queue is
+    # empty. None of that was the tier's work — but the spawns are the
+    # part this file can decide not to make.
+    cargo test --workspace --exclude spg-bench-competitor --locked --lib --bins
     if [[ "$FULL" == 1 ]]; then
-        cargo test --release --workspace --locked --lib --bins -- --ignored
+        cargo test --release --workspace --exclude spg-bench-competitor \
+            --locked --lib --bins -- --ignored
     fi
     cargo test --workspace --locked --doc
 }
@@ -104,7 +135,14 @@ run_e2e() {
     # --tests = every test target (the merged e2e binaries, plus
     # in-crate unittests, plus the perf/SLO targets — which compile
     # empty under debug, so this stays a functional sweep).
-    cargo test --workspace --locked --tests -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+    # v7.39.12 — the same exclude the unit step carries, for the same
+    # reason and with the same kind of evidence. `--tests` selected 102
+    # harnesses of which 60 carried zero tests; excluding the benchmark
+    # crate leaves 62 harnesses, 20 of them empty, and 9,086 tests —
+    # the same 9,086. Forty spawns that bought nothing, on top of the
+    # fifty-seven the unit step was making.
+    cargo test --workspace --exclude spg-bench-competitor --locked --tests \
+        -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
 
     # v7.39.5 — and the wire panel a second time, under the collation the
     # published image ships.
