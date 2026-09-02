@@ -51,6 +51,21 @@ than usual, because the durations did not.
   written into the report JSON and printed beside the total. It is
   recorded, never judged.
 
+- **The suite's port probe no longer decides freeness with a
+  stopwatch.** It bound `127.0.0.1:p` and then connected with a 150 ms
+  deadline. The bind alone is not conclusive — BSD lets a specific
+  address bind over a wildcard one when both carry `SO_REUSEADDR`,
+  which Rust's `TcpListener` sets. Verified directly: with `0.0.0.0:p`
+  held, the specific bind SUCCEEDS and only the connect says the port
+  is taken. So the connect is load-bearing, and its deadline turned a
+  busy machine into a wrong answer — the timeout read as "nobody
+  answered" and the probe handed out a port that was being served.
+  `the_second_port_also_skips_a_port_someone_is_serving` failed with
+  left and right both 25464 on a run whose load went 6.99 to 10.92, and
+  passed three of three when the machine was quieter. A loopback
+  connect is prompt either way, refused immediately with no listener
+  and completed immediately with one, so the deadline bought nothing.
+
 ### Not a finding
 
 **The tier's 10,777 s was not the tier's work, and the first three
