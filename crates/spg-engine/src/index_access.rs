@@ -248,10 +248,26 @@ pub(crate) fn try_pk_walk_top_n<'a>(
     // row belongs at the very front and the walk would have to know about
     // it before emitting anything. ASC is recoverable, because NULLs belong
     // last — see the short-walk check after the loop.
+    //
+    // v7.39.11 — on the null PLACEMENT, which is not the same question
+    // as the direction.
+    //
+    // r1020 wrote `order.desc` because DESC defaults to NULLS FIRST and
+    // ASC to NULLS LAST, and that is true of the DEFAULT. An explicit
+    // clause overrides it, and `ORDER BY a NULLS FIRST LIMIT 3` on an
+    // indexed nullable column took the walk and dropped every NULL row
+    // — the r1020 defect itself, still reachable through the one
+    // spelling the guard did not cover. Measured against PG 18.6 on
+    // `(1,2,3,4,5,NULL,6)`: PG answers `NULL 1 2`, every published SPG
+    // through 7.39.10 answered `1 2 3`. Without the index both answer
+    // `NULL 1 2`, which is why it took an index to see it.
+    //
+    // The same correction hands `DESC NULLS LAST` back to the walk: its
+    // NULLs belong at the end, which is the recoverable side.
     let key_nullable = schema_cols
         .get(col_pos)
         .is_none_or(|c: &ColumnSchema| c.nullable);
-    if key_nullable && order.desc {
+    if key_nullable && order.nulls_first.unwrap_or(order.desc) {
         return None;
     }
     let where_expr = stmt.where_.as_ref();
@@ -3013,7 +3029,7 @@ fn probe_key(
 
 /// v7.38.18 (S0) — this column's collation when its index keys under
 /// one, i.e. when it is text and the collation is not byte order.
-fn collated_column(col: &ColumnSchema, db_coll: &str) -> Option<alloc::string::String> {
+pub(crate) fn collated_column(col: &ColumnSchema, db_coll: &str) -> Option<alloc::string::String> {
     if !matches!(
         col.ty,
         spg_storage::DataType::Text

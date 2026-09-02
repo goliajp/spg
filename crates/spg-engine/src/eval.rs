@@ -2499,10 +2499,18 @@ fn apply_one_subscript(
             });
         }
     };
-    if i < 1 {
+    // v7.39.11 — PG's catalog vectors subscript from 0, where every
+    // array type subscripts from 1. `indkey[0]` is the first key
+    // column there, and returning NULL for it would be a wrong answer
+    // rather than an error.
+    let lower = i64::from(!matches!(
+        target_v,
+        Value::Int2Vector(_) | Value::OidVector(_)
+    ));
+    if i < lower {
         return Ok(Value::Null);
     }
-    let pos = (i - 1) as usize;
+    let pos = (i - lower) as usize;
     match array_element_at(&target_v, pos) {
         Some(v) => Ok(v),
         None if array_len(&target_v).is_some() => Ok(Value::Null),

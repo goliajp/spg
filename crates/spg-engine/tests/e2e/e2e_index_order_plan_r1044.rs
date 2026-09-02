@@ -81,8 +81,6 @@ fn r1044_shapes_outside_the_gate_still_sort() {
     for sql in [
         // No index on the column at all.
         "EXPLAIN SELECT id FROM io ORDER BY m",
-        // LIMIT has its own top-N path.
-        "EXPLAIN SELECT id FROM io ORDER BY id LIMIT 10",
         // r1047 — DISTINCT walks only when the projection IS the order
         // column; a different column makes it about the whole tuple.
         "EXPLAIN SELECT DISTINCT id FROM io ORDER BY j",
@@ -95,6 +93,33 @@ fn r1044_shapes_outside_the_gate_still_sort() {
             "expected a Sort for a shape outside the gate: {sql}\n{p:?}"
         );
     }
+}
+
+/// v7.39.11 — and a LIMIT is INSIDE the gate now.
+///
+/// This line used to sit in the list above, under "LIMIT has its own
+/// top-N path". It does, on the materialising side; the streaming path
+/// declined the statement outright and fell back to materialising it,
+/// which is a whole answer built to return ten rows. `iter_desc`'s own
+/// doc calls this "the ORDER BY <indexed col> DESC + LIMIT N executor
+/// path" — the shape the walk was written for, and the one shape the
+/// gate refused.
+#[test]
+fn a_limit_takes_the_walk() {
+    let mut e = engine();
+    let p = plan(&mut e, "EXPLAIN SELECT id FROM io ORDER BY id LIMIT 10");
+    assert!(
+        p[0].trim_start().starts_with("Limit"),
+        "the LIMIT should still be named: {p:?}"
+    );
+    assert!(
+        p.iter().any(|l| l.contains("Index Scan using io_pkey")),
+        "the walk was not named: {p:?}"
+    );
+    assert!(
+        !p.iter().any(|l| l.trim_start().starts_with("Sort")),
+        "a walked order still claimed a Sort: {p:?}"
+    );
 }
 
 /// r1047 — `SELECT DISTINCT <col> ORDER BY <col>` is the walk plus a

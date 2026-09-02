@@ -62,7 +62,13 @@ if [[ "${1:-}" == "--on-mini" ]]; then
     # source file: a blanket touch forces a full workspace rebuild on
     # every run, which is a real cost paid to fix a rare-looking bug. The
     # transferred list is what cargo needs and nothing more.
-    rsync -az --delete --filter='P /target/' --filter=':- .gitignore' \
+    # v7.39.11 — carry the recorded-delta register, which is internal
+    # and therefore gitignored, and which the suite's own
+    # `recorded_delta_register` row reads. Without it that row skips on
+    # the testbed, so the gate would run everywhere except where it is
+    # meant to run.
+    rsync -az --delete --filter='P /target/' --filter='+ /tmp/docs/***' \
+        --filter=':- .gitignore' \
         --out-format='%n' ./ "$HOST:$RDIR/" | grep -E '\.(rs|toml)$' > /tmp/spg-synced.txt || true
     if [ -s /tmp/spg-synced.txt ]; then
         # shellcheck disable=SC2016

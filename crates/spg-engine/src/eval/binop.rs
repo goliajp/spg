@@ -977,7 +977,9 @@ pub(crate) fn apply_binary(
         BinOp::Concat if matches!(l, Value::Json(_)) || matches!(r, Value::Json(_)) => {
             crate::json::concat(&l, &r)
         }
-        BinOp::Concat => Ok(text_concat(&l, &r)),
+        BinOp::Concat => {
+            char1_concat_is_ambiguous(&l, &r).map_or_else(|| Ok(text_concat(&l, &r)), Err)
+        }
         // PG `jsonb #- text[]` deletes the value at a nested path.
         BinOp::JsonDeletePath => crate::json::delete_path(&[l, r]),
         BinOp::BitOr | BinOp::BitAnd
@@ -2570,7 +2572,9 @@ fn apply_binary_numeric(
                 let ord = float_pg_cmp(af, bf);
                 Ok(Value::Bool(cmp_to_bool(op, ord)))
             }
-            BinOp::Concat => Ok(text_concat(&l, &r)),
+            BinOp::Concat => {
+                char1_concat_is_ambiguous(&l, &r).map_or_else(|| Ok(text_concat(&l, &r)), Err)
+            }
             other => Err(EvalError::TypeMismatch {
                 detail: format!("operator {other:?} not defined for NUMERIC and Float"),
             }),
@@ -2583,6 +2587,9 @@ fn apply_binary_numeric(
     // because the numeric fast-path claimed the expression but couldn't widen
     // the text side. (The float path already special-cases Concat this way.)
     if matches!(op, BinOp::Concat) {
+        if let Some(e) = char1_concat_is_ambiguous(&l, &r) {
+            return Err(e);
+        }
         return Ok(text_concat(&l, &r));
     }
     // v7.38 (read01, T6.P3) — comparison involving a NUMERIC special uses the
@@ -2695,7 +2702,9 @@ fn apply_binary_numeric(
             })?;
             Ok(Value::Bool(cmp_to_bool(op, lhs.cmp(&rhs))))
         }
-        BinOp::Concat => Ok(text_concat(&l, &r)),
+        BinOp::Concat => {
+            char1_concat_is_ambiguous(&l, &r).map_or_else(|| Ok(text_concat(&l, &r)), Err)
+        }
         other => Err(EvalError::TypeMismatch {
             detail: format!("operator {other:?} not defined for NUMERIC"),
         }),
@@ -2815,6 +2824,43 @@ fn bit_concat(an: u32, ab: &[u8], bn: u32, bb: &[u8]) -> (u32, alloc::vec::Vec<u
         }
     }
     (total, out)
+}
+
+/// v7.39.11 — PostgreSQL refuses `||` when either side is `"char"`.
+///
+/// Reported by sentori against 7.39.10, where it cost them a comparison
+/// query: the PostgreSQL side raised and ours answered, so the diff was
+/// between an error and a result. Measured on 18.6 — the operator is
+/// genuinely ambiguous there, and the message says so:
+///
+/// ```text
+///   SELECT 'x' || 'r'::"char"          ERROR: operator is not unique: unknown || "char"
+///   SELECT 'r'::"char" || 'x'          ERROR: operator is not unique: "char" || unknown
+///   SELECT 'x'::text || 'r'::"char"    ERROR: operator is not unique: text || "char"
+///   SELECT 'x' || 'r'::char(1)         xr        <- CHAR(n) is a different type
+///   SELECT ('r'::"char")::text || 'x'  rx        <- an explicit cast resolves it
+/// ```
+///
+/// An answer more permissive than PostgreSQL's is one a caller cannot
+/// act on: a script written against SPG then fails on the thing SPG
+/// claims to be. `CHAR(n)` / `BPCHAR` is a different type and keeps
+/// concatenating, as it does there.
+fn char1_concat_is_ambiguous(l: &Value<'static>, r: &Value<'static>) -> Option<EvalError> {
+    if !matches!(l, Value::Char1(_)) && !matches!(r, Value::Char1(_)) {
+        return None;
+    }
+    // PostgreSQL names both operand types, and an untyped literal is
+    // `unknown` there.
+    let name = |v: &Value<'static>| -> &'static str {
+        match v {
+            Value::Char1(_) => "\"char\"",
+            Value::Text(_) => "text",
+            _ => "unknown",
+        }
+    };
+    Some(EvalError::TypeMismatch {
+        detail: alloc::format!("operator is not unique: {} || {}", name(l), name(r)),
+    })
 }
 
 fn text_concat<'a>(l: &'a Value<'static>, r: &'a Value<'static>) -> Value<'static> {

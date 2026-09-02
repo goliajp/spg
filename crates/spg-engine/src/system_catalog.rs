@@ -282,6 +282,11 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         | DataType::CharArray
         | DataType::MoneyArray => "ARRAY",
         DataType::Vector { .. } => "USER-DEFINED",
+        // v7.39.11 — PG's catalog vectors have names, and an error that
+        // does not use them ("got USER-DEFINED") tells the reader
+        // nothing about what they had.
+        DataType::Int2Vector => "int2vector",
+        DataType::OidVector => "oidvector",
         // Non-exhaustive — fall back to "USER-DEFINED" the way
         // PG labels any pg_type it doesn't recognise.
         _ => "USER-DEFINED",
@@ -3450,67 +3455,16 @@ pub(crate) fn synth_information_schema_table_constraints(
                 Value::text("YES"),
             ]));
         }
-        // Single-column unique indices without a UC entry.
-        // v7.39 (read01 ruleutils.c) — partial unique indexes are not
-        // constraints (PG).
-        for idx in t.indices() {
-            if !idx.is_unique || idx.partial_predicate.is_some() {
-                continue;
-            }
-            let already = t
-                .schema()
-                .uniqueness_constraints
-                .iter()
-                .any(|uc| uc.columns.len() == 1 && uc.columns[0] == idx.column_position);
-            if already {
-                continue;
-            }
-            // v7.39.11 — from the CONSTRAINT, not from the index's name
-            // and not from the index's own uniqueness flag.
-            //
-            // Both were wrong, and sentori reported the pair against
-            // 7.39.10 as the PostgreSQL twin of the `SHOW INDEX` defect
-            // that version fixed for MySQL. Measured against
-            // PostgreSQL 18.6:
-            //
-            // ```text
-            //   a int PRIMARY KEY      PG: indisprimary=t indisunique=t
-            //                         SPG: indisprimary=t indisunique=f
-            // ```
-            //
-            // `indisunique = false` on a primary key is a wrong VALUE:
-            // the reporter's own sentence applies unchanged — anything
-            // reading it concludes the key is not unique. SPG does not
-            // carry a primary key's uniqueness on the index; it lives in
-            // the table's uniqueness constraints, where `is_primary_key`
-            // also says which one is the primary key. Deciding that from
-            // a `_pkey` name suffix made the inline composite spelling
-            // (`m1_a_pkey_0_0`) answer false while the ALTER spelling
-            // answered true.
-            let idx_cols: Vec<usize> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
-                .collect();
-            let constraint = t
-                .schema()
-                .uniqueness_constraints
-                .iter()
-                .find(|uc| uc.columns == idx_cols);
-            let is_primary = constraint.is_some_and(|uc| uc.is_primary_key);
-            let is_unique = idx.is_unique || constraint.is_some();
-            let kind = if is_primary { "PRIMARY KEY" } else { "UNIQUE" };
-            rows.push(Row::new(alloc::vec![
-                Value::text("spg"),
-                Value::text("public"),
-                Value::text(idx.name.clone()),
-                Value::text("spg"),
-                Value::text("public"),
-                Value::text(tname.clone()),
-                Value::text(kind),
-                Value::text("NO"),
-                Value::text("NO"),
-                Value::text("YES"),
-            ]));
-        }
+        // v7.39.11 — a bare `CREATE UNIQUE INDEX` is an INDEX, and
+        // PostgreSQL lists no constraint for it. This loop used to list
+        // one, the same way the `pg_constraint` synthesiser did until
+        // this version; sentori found the pair against 7.39.10, where a
+        // schema-diff tool comparing the two sides saw a constraint on
+        // ours that does not exist on PostgreSQL's.
+        //
+        // An index that BACKS a constraint still gets its row from the
+        // uniqueness-constraint loop above, which is where the
+        // constraint lives.
         // Foreign keys.
         for fk in t.schema().foreign_keys.iter() {
             let conname = fk
@@ -4426,7 +4380,7 @@ fn push_system_attributes(rows: &mut Vec<Row<'static>>, attrelid: i64) {
             Value::Int(0),
             Value::SmallInt(*attlen),
             Value::SmallInt(*attnum),
-            Value::Int(0),
+            Value::SmallInt(0), // attndims — smallint, as PG declares it
             Value::Int(-1),
             Value::Bool(*byval),
             Value::text("p"),
@@ -4460,7 +4414,8 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("attstattarget", DataType::Int, false),
         ColumnSchema::new("attlen", DataType::SmallInt, false),
         ColumnSchema::new("attnum", DataType::SmallInt, false),
-        ColumnSchema::new("attndims", DataType::Int, false),
+        // v7.39.11 — PG declares this `smallint`.
+        ColumnSchema::new("attndims", DataType::SmallInt, false),
         ColumnSchema::new("atttypmod", DataType::Int, false),
         ColumnSchema::new("attbyval", DataType::Bool, false),
         ColumnSchema::new("attstorage", DataType::Text, false),
@@ -4504,7 +4459,12 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             let typlen: i16 = pg_type_len(col.ty);
             // attndims — number of array dimensions. Most array
             // types are 1-D in SPG; jagged / 2-D arrays report 2.
-            let attndims: i32 = match col.ty {
+            //
+            // v7.39.11 — `smallint`, which is what PostgreSQL declares
+            // it. Reported by sentori against 7.39.10, where it was
+            // `integer`: a client that binds the column by its declared
+            // width reads two bytes and gets the wrong number.
+            let attndims: i16 = match col.ty {
                 DataType::TextArray
                 | DataType::IntArray
                 | DataType::BigIntArray
@@ -4544,7 +4504,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(-1), // attstattarget — -1 = use system default
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
-                Value::Int(attndims),
+                Value::SmallInt(attndims),
                 Value::Int(pg_atttypmod(col.ty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(attstorage),
@@ -4606,7 +4566,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(-1),
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
-                Value::Int(0),
+                Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(-1),
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(if typlen > 0 { "p" } else { "x" }),
@@ -4670,7 +4630,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(-1),
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
-                Value::Int(0),
+                Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(pg_atttypmod(*fty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(if typlen > 0 { "p" } else { "x" }),
@@ -4722,7 +4682,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(-1),
                 Value::SmallInt(typlen),
                 Value::SmallInt(attnum),
-                Value::Int(0),
+                Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(pg_atttypmod(col.ty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
                 Value::text(if typlen > 0 { "p" } else { "x" }),
@@ -4825,6 +4785,9 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         // read 0 for an `xid` column and `format_type` answered `???`.
         DataType::Xid => 28,
         DataType::Xid8 => 5069,
+        // v7.39.11 — PG's own OIDs for the catalog vectors.
+        DataType::Int2Vector => 22,
+        DataType::OidVector => 30,
         DataType::SmallInt => 21,
         DataType::Int => 23,
         DataType::BigInt => 20,
@@ -5399,6 +5362,15 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         (28, "xid", 4, "b", "U", 0, 0),
         (29, "cid", 4, "b", "U", 0, 0),
         (5069, "xid8", 8, "b", "U", 0, 0),
+        // v7.39.11 — PG's catalog vectors. `pg_index.indkey` and kin are
+        // typed as these now, and a column whose `atttypid` names a type
+        // `pg_type` does not carry is exactly the defect round 640
+        // closed for `xid`: `format_type` answers `???` and every
+        // `pg_attribute JOIN pg_type` loses the row. Measured off PG18;
+        // typarray is 0 rather than PG's 1006 / 1013, as the note in
+        // `build_row` explains for the rows above.
+        (22, "int2vector", -1, "b", "A", 21, 0),
+        (30, "oidvector", -1, "b", "A", 26, 0),
         (114, "json", -1, "b", "U", 0, 199),
         (142, "xml", -1, "b", "U", 0, 143),
         (700, "float4", 4, "b", "N", 0, 1021),
@@ -5806,7 +5778,8 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         ColumnSchema::new("pronargs", DataType::SmallInt, false),
         ColumnSchema::new("pronargdefaults", DataType::SmallInt, false),
         ColumnSchema::new("prorettype", DataType::BigInt, false),
-        ColumnSchema::new("proargtypes", DataType::Text, false),
+        // v7.39.11 — PG's own type; see the row builder below.
+        ColumnSchema::new("proargtypes", DataType::OidVector, false),
         ColumnSchema::new("proallargtypes", DataType::Text, true),
         ColumnSchema::new("proargmodes", DataType::Text, true),
         // The one of these five SPG really has: CREATE FUNCTION names
@@ -5856,18 +5829,15 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             "a" | "w" => 1000.0,
             _ => 0.0,
         };
-        // proargtypes — PG int2vector encoding; we don't have the
-        // per-arg type list in the table, so synthesise N placeholder
-        // zeros. ORMs that need the real list will fall back to the
+        // proargtypes — PG's `oidvector`; we don't have the per-arg
+        // type list in the table, so synthesise N placeholder zeros.
+        // ORMs that need the real list will fall back to the
         // pg_proc.dat columns of pg_proc-loaded extensions.
+        //
+        // v7.39.11 — a real `oidvector`, so `unnest(proargtypes)` and
+        // `= ANY (proargtypes)` reach it; see `pg_index`'s vectors.
         let arg_count = if nargs < 0 { 0 } else { nargs };
-        let mut argtypes = alloc::string::String::new();
-        for i in 0..arg_count {
-            if i > 0 {
-                argtypes.push(' ');
-            }
-            argtypes.push('0');
-        }
+        let argtypes: Vec<u32> = alloc::vec![0; usize::try_from(arg_count).unwrap_or(0)];
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
@@ -5894,7 +5864,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
             Value::SmallInt(0), // pronargdefaults
             Value::BigInt(rettype),
-            Value::text(argtypes),
+            Value::OidVector(argtypes),
             Value::Null,                        // proallargtypes
             Value::Null,                        // proargmodes
             Value::Null,                        // proargnames — a builtin's are not catalogued
@@ -5950,7 +5920,11 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::SmallInt(i16::try_from(nargs).unwrap_or(i16::MAX)),
             Value::SmallInt(0),
             Value::BigInt(0),
-            Value::text(alloc::string::String::new()),
+            // v7.39.11 — proargtypes is an `oidvector` now, and a
+            // user-defined function's row has to carry one too or the
+            // column holds two shapes. Placeholder zeros, one per
+            // declared argument, as the built-in rows carry.
+            Value::OidVector(alloc::vec![0; nargs]),
             Value::Null, // proallargtypes
             Value::Null, // proargmodes
             // v7.39 (round 543) — the declared parameter NAMES, which
@@ -7345,19 +7319,48 @@ pub(crate) fn synth_info_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
     (schema, rows)
 }
 
-pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// v7.39.11 — the column list this view serves, which is the session's
+/// dialect's own.
+///
+/// Reported by sentori against 7.39.10, the mirror of the defect
+/// 7.39.2 closed for `SHOW CREATE TABLE`: through that version every
+/// session got MySQL's shape, so a PostgreSQL session had no
+/// `table_schema` and `WHERE table_schema = 'public'` — the way every
+/// tool scopes this view — raised `column "table_schema" does not
+/// exist`, while `referenced_table_name` and `referenced_column_name`,
+/// which PostgreSQL does not have, were there instead.
+///
+/// Measured on PostgreSQL 18.6 and MySQL 9.7.2: the two lists agree on
+/// the first nine, in that order, and MySQL adds three. So the rows are
+/// built once, in MySQL's order, and a PostgreSQL session is served the
+/// first nine.
+const KCU_PG_COLUMNS: usize = 9;
+
+pub(crate) fn synth_info_key_column_usage(
+    cat: &Catalog,
+    mysql: bool,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let mut schema = alloc::vec![
+        ColumnSchema::new("constraint_catalog", DataType::Text, false),
+        ColumnSchema::new("constraint_schema", DataType::Text, false),
         ColumnSchema::new("constraint_name", DataType::Text, false),
+        ColumnSchema::new("table_catalog", DataType::Text, false),
+        ColumnSchema::new("table_schema", DataType::Text, false),
         ColumnSchema::new("table_name", DataType::Text, false),
         ColumnSchema::new("column_name", DataType::Text, false),
         ColumnSchema::new("ordinal_position", DataType::Int, false),
-        ColumnSchema::new("referenced_table_name", DataType::Text, false),
-        ColumnSchema::new("referenced_column_name", DataType::Text, false),
         // v7.39 (round 266) — where this column sits in the parent key
         // the FK points at. NULL on PK/UNIQUE rows, which is how a
         // reflection tool tells an FK row apart from a key row.
         ColumnSchema::new("position_in_unique_constraint", DataType::Int, true),
+        // MySQL's three, and only MySQL's.
+        ColumnSchema::new("referenced_table_schema", DataType::Text, true),
+        ColumnSchema::new("referenced_table_name", DataType::Text, true),
+        ColumnSchema::new("referenced_column_name", DataType::Text, true),
     ];
+    if !mysql {
+        schema.truncate(KCU_PG_COLUMNS);
+    }
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
@@ -7403,15 +7406,24 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
                     .unwrap_or(i);
                 #[allow(clippy::cast_possible_wrap)]
                 let in_unique = (in_unique + 1) as i32;
-                rows.push(Row::new(alloc::vec![
+                let mut vals = alloc::vec![
+                    Value::text("spg"),
+                    Value::text("public"),
                     Value::text(conname.clone()),
+                    Value::text("spg"),
+                    Value::text("public"),
                     Value::text(tname.clone()),
                     Value::text(col_name_at(local)),
                     Value::Int(ordinal),
+                    Value::Int(in_unique),
+                    Value::text("public"),
                     Value::text(fk.parent_table.clone()),
                     Value::text(parent_name),
-                    Value::Int(in_unique),
-                ]));
+                ];
+                if !mysql {
+                    vals.truncate(KCU_PG_COLUMNS);
+                }
+                rows.push(Row::new(vals));
             }
         }
         // PK / composite UC entries.
@@ -7420,15 +7432,26 @@ pub(crate) fn synth_info_key_column_usage(cat: &Catalog) -> (Vec<ColumnSchema>, 
             for (i, &local) in uc.columns.iter().enumerate() {
                 #[allow(clippy::cast_possible_wrap)]
                 let ordinal = (i + 1) as i32;
-                rows.push(Row::new(alloc::vec![
+                let mut vals = alloc::vec![
+                    Value::text("spg"),
+                    Value::text("public"),
                     Value::text(conname.clone()),
+                    Value::text("spg"),
+                    Value::text("public"),
                     Value::text(tname.clone()),
                     Value::text(col_name_at(local)),
                     Value::Int(ordinal),
-                    Value::text(String::new()),
-                    Value::text(String::new()),
+                    // A key row is not a foreign key, and PG leaves
+                    // this NULL rather than 0.
                     Value::Null,
-                ]));
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                ];
+                if !mysql {
+                    vals.truncate(KCU_PG_COLUMNS);
+                }
+                rows.push(Row::new(vals));
             }
         }
     }
@@ -10593,25 +10616,59 @@ pub(crate) fn render_indexdef(
         .map_or_else(alloc::string::String::new, |c| {
             alloc::format!(" COLLATE \"{c}\"")
         });
-    let order_suffix = {
+    // v7.39.11 — one renderer for every key column, not just the
+    // leading one.
+    //
+    // The clause was decorated onto the first column and every extra
+    // printed bare, so `CREATE INDEX i ON t (a, b DESC)` read back as
+    // `(a, b)`: a dump lost the clause and a schema diff saw drift on
+    // every run. Reported by sentori against 7.39.10 alongside the
+    // partial-index `WHERE` and the expression key, both of which
+    // already survived.
+    //
+    // PG omits the word when it matches the default for the direction:
+    // ascending defaults to NULLS LAST and descending to NULLS FIRST.
+    let order_suffix = |descending: bool, nulls_first: Option<bool>| {
         let mut sfx = alloc::string::String::new();
-        if idx.descending {
+        if descending {
             sfx.push_str(" DESC");
         }
-        if let Some(nf) = idx.nulls_first
-            && nf != idx.descending
+        if let Some(nf) = nulls_first
+            && nf != descending
         {
             sfx.push_str(if nf { " NULLS FIRST" } else { " NULLS LAST" });
         }
         sfx
     };
-    let cols = core::iter::once(alloc::format!(
-        "{}{collate_prefix}{order_suffix}",
-        col_at(idx.column_position)
-    ))
-    .chain(idx.extra_column_positions.iter().map(|&p| col_at(p)))
-    .collect::<Vec<_>>()
-    .join(", ");
+    // v7.39.11 — the key list is built once, from whatever the leading
+    // key renders as.
+    //
+    // It used to be built twice: a `cols` join for a plain column key,
+    // and a separate `format!` for an expression key that appended no
+    // extras at all. A bare column with an ordering clause is STORED as
+    // an expression, so `CREATE INDEX i ON t (a DESC, b)` took the
+    // second branch and read back as `(a DESC)` — the second column
+    // gone from the definition entirely, which is worse than the
+    // dropped clause it sits beside.
+    let key_list = |leading: alloc::string::String| -> alloc::string::String {
+        core::iter::once(leading)
+            .chain(
+                idx.extra_column_positions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &p)| {
+                        let o = idx.extra_orders.get(i).copied().unwrap_or_default();
+                        alloc::format!("{}{}", col_at(p), order_suffix(o.descending, o.nulls_first))
+                    }),
+            )
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let cols = key_list(alloc::format!(
+        "{}{collate_prefix}{}",
+        col_at(idx.column_position),
+        order_suffix(idx.descending, idx.nulls_first)
+    ));
     // v7.39 (read01 round 83) — an index prints UNIQUE only when it is the one
     // that ENFORCES a uniqueness constraint, not merely when its columns happen
     // to match one. PG: `CREATE INDEX idx ON t(a)` over a table that also has
@@ -10657,12 +10714,16 @@ pub(crate) fn render_indexdef(
     // pair (`(a + b)`), so add the outer pair exactly when the stored form opens
     // with `(` — which a function call never does.
     let key = match &idx.expression {
-        Some(expr) if expr.starts_with('(') => {
-            alloc::format!("({expr}){collate_prefix}{order_suffix}")
-        }
+        Some(expr) if expr.starts_with('(') => key_list(alloc::format!(
+            "({expr}){collate_prefix}{}",
+            order_suffix(idx.descending, idx.nulls_first)
+        )),
         // A bare column is stored here as an expression too, so this is
         // the branch a plain `CREATE INDEX i ON t (a DESC)` takes.
-        Some(expr) => alloc::format!("{expr}{collate_prefix}{order_suffix}"),
+        Some(expr) => key_list(alloc::format!(
+            "{expr}{collate_prefix}{}",
+            order_suffix(idx.descending, idx.nulls_first)
+        )),
         None => cols,
     };
     // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and
@@ -10771,10 +10832,12 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("indisready", DataType::Bool, false),
         ColumnSchema::new("indislive", DataType::Bool, false),
         ColumnSchema::new("indisreplident", DataType::Bool, false),
-        ColumnSchema::new("indkey", DataType::Text, false),
-        ColumnSchema::new("indcollation", DataType::Text, false),
-        ColumnSchema::new("indclass", DataType::Text, false),
-        ColumnSchema::new("indoption", DataType::Text, false),
+        // v7.39.11 — PG's own types for these four; see the row
+        // builder below.
+        ColumnSchema::new("indkey", DataType::Int2Vector, false),
+        ColumnSchema::new("indcollation", DataType::OidVector, false),
+        ColumnSchema::new("indclass", DataType::OidVector, false),
+        ColumnSchema::new("indoption", DataType::Int2Vector, false),
         // v7.39 (round 543) — PG's last two, and the two a tool tests to
         // tell an expression index from a plain one and a partial index
         // from a whole one. Measured: both NULL for a plain index,
@@ -10803,32 +10866,30 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         for idx in t.indices() {
             idx_oid += 1;
             let n_attrs_total = 1 + idx.extra_column_positions.len();
-            // Build PG's `indkey` int2vector — space-separated
-            // column positions, 1-based. SPG stores positions
-            // 0-based; add 1 to align with PG's attnum.
-            let mut indkey = alloc::string::String::new();
-            indkey.push_str(&alloc::format!("{}", idx.column_position + 1));
-            for extra in &idx.extra_column_positions {
-                indkey.push(' ');
-                indkey.push_str(&alloc::format!("{}", extra + 1));
-            }
-            // indclass: array of opclass OIDs, one per column.
-            // SPG uses default opclass for every column; PG would
-            // emit `1978 1978` for two int4 columns. We populate
-            // with placeholder 0s so the shape stays valid.
-            let mut indclass = alloc::string::String::new();
-            let mut indcollation = alloc::string::String::new();
-            let mut indoption = alloc::string::String::new();
-            for i in 0..n_attrs_total {
-                if i > 0 {
-                    indclass.push(' ');
-                    indcollation.push(' ');
-                    indoption.push(' ');
-                }
-                indclass.push('0');
-                indcollation.push('0');
-                indoption.push('0');
-            }
+            // PG's `indkey` int2vector — column positions, 1-based.
+            // SPG stores positions 0-based; add 1 to align with PG's
+            // attnum.
+            //
+            // v7.39.11 — a real `int2vector`, not the text that prints
+            // the same. Reported by sentori against 7.39.10: through
+            // that version these four were `text`, so `a.attnum = ANY
+            // (i.indkey)` — how Django's introspection, Rails' schema
+            // dumper, sqlalchemy and every hand-written schema-diff
+            // query ask which columns an index covers — raised
+            // "ANY/ALL right-hand side must be an array, got text",
+            // and so did `unnest`, `array_position` and subscripting.
+            // The printed form is unchanged; only the type is.
+            let indkey: Vec<i16> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .map(|p| i16::try_from(p + 1).unwrap_or(0))
+                .collect();
+            // indclass: opclass OIDs, one per column. SPG uses the
+            // default opclass for every column; PG would emit
+            // `1978 1978` for two int4 columns. We populate with
+            // placeholder 0s so the shape stays valid.
+            let indclass: Vec<u32> = alloc::vec![0; n_attrs_total];
+            let indcollation: Vec<u32> = alloc::vec![0; n_attrs_total];
+            let indoption: Vec<i16> = alloc::vec![0; n_attrs_total];
             // v7.39.11 — from the CONSTRAINT, not from the index's name
             // and not from the index's own uniqueness flag.
             //
@@ -10879,10 +10940,10 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(true),  // indisready
                 Value::Bool(true),  // indislive
                 Value::Bool(false), // indisreplident
-                Value::text(indkey),
-                Value::text(indcollation),
-                Value::text(indclass),
-                Value::text(indoption),
+                Value::Int2Vector(indkey),
+                Value::OidVector(indcollation),
+                Value::OidVector(indclass),
+                Value::Int2Vector(indoption),
                 idx.expression.clone().map_or(Value::Null, Value::text), // indexprs
                 idx.partial_predicate
                     .clone()

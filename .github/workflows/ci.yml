@@ -2,11 +2,19 @@ name: CI
 
 # git-flow trigger map — push-only, no PRs. All merges happen locally
 # via `git flow {feature,bugfix,release,hotfix} finish`; what reaches
-# origin is already-merged history. Heavy gates (prod_ready, slo_smoke,
-# perf_gate, release-build) gate by branch via `if:` so feature/bugfix
-# pushes get fast feedback while release/hotfix + integration lines
-# (develop, master) run the full battery. See .claude/git-flow.md for
-# the mapping table.
+# origin is already-merged history.
+#
+# v7.39.11 — every push runs `check` plus the three supply-chain jobs.
+# The release-profile battery runs on `develop` alone, because that is
+# where every finish lands: a change passes it exactly once there, and
+# the release branch and the master merge carry the identical tree,
+# already certified by `scripts/suite.sh prerelease` locally before the
+# release is cut. Running it again on those pushes measures the same
+# commit a third time and is most of what made a release slow.
+#
+# Twelve jobs became five, and nineteen runners on a develop push
+# became five, by paying each build once instead of once per question
+# asked of it. See .claude/git-flow.md for the branch map.
 on:
   push:
     branches:
@@ -22,246 +30,97 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
-  fmt:
-    name: rustfmt
+  # v7.39.11 — one runner, one cache, one debug build.
+  #
+  # `fmt`, `clippy` and `test` were three jobs on three runners, and
+  # clippy and test compile the same workspace in the same profile —
+  # so the debug build was paid twice on two machines to answer two
+  # questions about one tree. rustfmt and clippy also ship with the
+  # runner image; `rustup component add` was installing what was
+  # already there.
+  check:
+    name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Install rustfmt
-        run: rustup component add rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install clippy
-        run: rustup component add clippy
-      - uses: Swatinem/rust-cache@v2
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build --workspace
-        run: cargo build --workspace --locked
       - name: cargo test --workspace
         # Replication and backup e2e tests spawn `spg-server` child
         # processes; serial runner keeps port-grabbing tests honest.
         run: cargo test --workspace --locked -- --test-threads=1
 
-  prod_ready:
-    name: prod_ready gate
+  # v7.39.11 — the release-profile battery, on one runner, after ONE
+  # release build.
+  #
+  # This was eleven jobs: `prod_ready`, `slo_smoke`, `sqllogictest`,
+  # `release-build`, `dropin_acceptance`, and a `perf_gate` matrix of
+  # eight. Every one of them began by compiling the workspace in
+  # release, so the same build ran eleven times on eleven machines to
+  # run gates whose own runtime is seconds. The matrix bought
+  # max-of-8 instead of sum-of-8 on the GATES while paying 8x for the
+  # BUILD they all shared, and each leg restored its own multi-GB
+  # cache to do it.
+  #
+  # Ordered cheapest-first so a red arrives early. `fail-fast` is
+  # gone with the matrix, so the loop keeps going and names every
+  # failing crate in one run, which is what the matrix's
+  # `fail-fast: false` was for.
+  #
+  # Runs on `develop` only. Every git-flow finish lands there, so
+  # every change passes this exactly once; a release branch and a
+  # master merge carry the same tree, already gated here and again by
+  # `scripts/suite.sh prerelease` locally before the release is cut.
+  # Re-running it on those pushes measures the same commit a third
+  # time.
+  release_gates:
+    name: release-profile gates
     runs-on: ubuntu-latest
-    # The prod_ready test asserts every [machine] row in PROD_READY.md
-    # is backed by a row_X_Y_* test in crates/spg-server/tests/prod_ready.rs.
-    # Failure here means PROD_READY.md is over-claiming.
-    #
-    # v7.11.x context — PROD_READY.md / DEPLOYMENT.md / RUNBOOK.md /
-    # PERFORMANCE.md live under `.claude/internal-docs/` (gitignored by
-    # project convention) so they're not present at workspace root on a
-    # fresh CI clone. v7.12.8 promoted the harness to gracefully skip
-    # doc-presence checks when the source file is absent (see
-    # `prod_doc_missing` / `assert_doc_has_sections` in prod_ready.rs);
-    # the gate now actually runs (45 / 45 on master CI as of v7.12.7),
-    # so the v7.11.x `continue-on-error` soft-fail is gone.
-    #
-    # Skipped on plain feature/bugfix pushes — runs on any push to
-    # integration / release lines, i.e. right after a git-flow finish
-    # merge lands.
-    if: |
-      github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
+    if: github.ref == 'refs/heads/develop'
     steps:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
-      - name: cargo test --release --test prod_ready
-        run: cargo test --release -p spg-server --test prod_ready --locked
-
-  slo_smoke:
-    name: SLO smoke
-    runs-on: ubuntu-latest
-    # v4.32 — the fast SLO gate from PERFORMANCE.md §SLO. Runs in < 5 s
-    # on a normal runner. SLO ceilings are intentionally loose
-    # (~2-3× v4.27 baseline) so shared-runner noise doesn't false-alarm.
-    #
-    # Same gate policy as prod_ready: integration/release pushes only.
-    if: |
-      github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test --release --test slo_smoke
-        run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
-
-  perf_gate:
-    name: perf_gate (release / ${{ matrix.crate }})
-    runs-on: ubuntu-latest
-    # Every crate's perf_gate target is wrapped in
-    # `#![cfg(not(debug_assertions))]`, so the workspace-wide debug
-    # `test` job above produces empty perf_gate binaries. This job is
-    # the real gate — release build, one crate at a time so a single
-    # failure points at exactly which gate regressed.
-    #
-    # v7.21 — the standalone perf_* binaries (join_reorder /
-    # plan_cache / stages_knn in spg-engine; 1b_rows / concurrency /
-    # sq8 / parallel_freezer / prefetch / prepared_vs_simple in
-    # spg-server) were folded into per-crate perf_gate targets, so
-    # spg-server joined the loop. Fast tier runs here; the
-    # `#[ignore]`d full tier is `scripts/gate.sh gates --full`.
-    #
-    # v7.37.27 (27.8 — pipeline governance batch 2) — fan the 8-crate
-    # serial loop out across one runner per crate via matrix. Same
-    # gate semantics (any matrix leg failing reds the gate), but
-    # wall-clock drops from sum-of-8 to max-of-8. `fail-fast: false`
-    # so we see every failing gate in the first run instead of
-    # bailing after the first one.
-    #
-    # Same gate policy as prod_ready / slo_smoke: integration / release
-    # lines. Skipped on plain feature/bugfix pushes.
-    if: |
-      github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - spg-audit
-          - spg-crypto
-          - spg-engine
-          - spg-sql
-          - spg-storage
-          - spg-wire
-          - spgctl
-          - spg-server
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo test --release perf_gate -p ${{ matrix.crate }}
-        run: |
-          set -euo pipefail
-          cargo test --release -p "${{ matrix.crate }}" --test perf_gate --locked -- --test-threads=1 --nocapture
-
-  sqllogictest:
-    name: biz (sqllogictest)
-    runs-on: ubuntu-latest
-    # v7.37.27 (27.1) — biz-tier sqllogictest conformance corpus
-    # rounds out the five-category CI matrix (lint / unit / e2e /
-    # gates / biz). dump_compat + data_compat sub-tasks need a
-    # PostgreSQL service container; they ride in their own job
-    # below when wired. sqllogictest is pure SPG so it lives here.
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo run -p sqllogictest --release
-        run: cargo run -p sqllogictest --release --locked
-
-  audit:
-    name: cargo-audit
-    runs-on: ubuntu-latest
-    # rustsec/audit-check compiled cargo-audit from source on every
-    # run (~190 s of the ~4 min CI wall clock). install-action drops
-    # in the prebuilt binary instead; same advisory DB, same failure
-    # semantics via `cargo audit`'s exit code.
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install cargo-audit (prebuilt)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-audit
-      - name: cargo audit
-        run: cargo audit
-
-  deny:
-    name: cargo-deny
-    runs-on: ubuntu-latest
-    # v4.31: license allowlist + duplicate-version check via cargo-deny.
-    # Config in deny.toml.
-    steps:
-      - uses: actions/checkout@v6
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  secret_scan:
-    name: secret scan (trufflehog)
-    runs-on: ubuntu-latest
-    # v4.32 originally used gitleaks/gitleaks-action@v2 for secret
-    # scanning. gitleaks v2 added an org-license gate in 2026 that
-    # would have us paying per-month; v7.12.8 swaps to trufflehog
-    # which stays free for OSS / org use. v7.12.9 hotfix narrows
-    # the trigger config — passing `base: default_branch + head:
-    # HEAD` on a push-to-master event tells trufflehog the diff is
-    # master..master (empty) and the action errors out with "BASE
-    # and HEAD commits are the same".
-    #
-    # Fix: drop the explicit base/head, omit `path` (so the action
-    # picks its event-aware default). The action then:
-    #   - on push, scans the commits introduced by the push range
-    #   - on pull_request, scans the PR's diff vs the base ref
-    #   - on workflow_dispatch / schedule, scans the whole tree
-    #
-    # `--results=verified,unknown` keeps the signal high — only
-    # credentials the action could actually probe against an
-    # issuing service (verified) plus genuinely-novel matches
-    # the action's analyzers don't recognise (unknown).
-    steps:
-      - uses: actions/checkout@v6
-        with: { fetch-depth: 0 }
-      - name: trufflehog scan
-        # Pinned to the latest release tag, not @main — latest *stable*
-        # principle; a moving branch ref is the opposite of stable.
-        uses: trufflesecurity/trufflehog@v3.95.5
-        with:
-          extra_args: --results=verified,unknown
-
-  dropin_acceptance:
-    name: drop-in acceptance (candidate image)
-    runs-on: ubuntu-latest
-    # v7.18 — scripts/dropin-acceptance.sh probe (PG dialect panel +
-    # mailrs init-schema.sql / pg-extensions.sql as first real
-    # customer fixture). Any regression in PG drop-in compatibility
-    # — a stock PG schema that worked yesterday but parser-fails
-    # today — flips this gate red. HARD GATE since v7.29; any case
-    # that flips ✅→❌ is a release blocker. The per-release
-    # reference reports live at scripts/dropin-acceptance-report-v*.md.
-    #
-    # 2026-06-13 pipeline governance — the panel used to run against
-    # the previously *published* image (`--image goliakk/spg:7.X.Y`,
-    # bumped by hand after each release). That tested a constant: it
-    # could never catch a regression in the commit under test, and
-    # the manual bump drifted (stuck at 7.30.0 while 7.30.2 was
-    # live). Now the job assembles a candidate image from this
-    # checkout's release binaries (Dockerfile.ci) and gates the
-    # actual commit. The published image is still watched by the
-    # nightly sentinel workflow (dropin-published.yml).
-    if: |
-      github.ref == 'refs/heads/master' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: Build candidate binaries
+      - name: Build the release binaries once
         run: cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
+      - name: prod_ready gate
+        # Asserts every [machine] row in PROD_READY.md is backed by a
+        # row_X_Y_* test. Failure means PROD_READY.md is over-claiming.
+        run: cargo test --release -p spg-server --test prod_ready --locked
+      - name: SLO smoke
+        # Ceilings are deliberately loose (~2-3x baseline) so
+        # shared-runner noise does not false-alarm.
+        run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
+      - name: perf_gate (every crate)
+        # Each crate's perf_gate is `#![cfg(not(debug_assertions))]`,
+        # so the debug `test` job above builds it empty; this is the
+        # real gate. One crate at a time so a failure names which.
+        run: |
+          set -uo pipefail
+          rc=0
+          for c in spg-audit spg-crypto spg-engine spg-sql spg-storage spg-wire spgctl spg-server; do
+            echo "::group::perf_gate $c"
+            cargo test --release -p "$c" --test perf_gate --locked -- --test-threads=1 --nocapture || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+      - name: biz (sqllogictest)
+        run: cargo run -p sqllogictest --release --locked
       - name: Assemble candidate image
+        # The panel used to run against the previously PUBLISHED
+        # image, which tested a constant: it could never catch a
+        # regression in the commit under test, and the hand-bumped tag
+        # drifted. The published image is watched by the nightly
+        # sentinel workflow (dropin-published.yml) instead.
         run: |
           mkdir -p target/ci-image
           cp target/release/spg-server target/release/spg target/release/pg_isready target/ci-image/
           docker build -f Dockerfile.ci -t spg-candidate:ci target/ci-image
-      - name: drop-in acceptance harness
+      - name: drop-in acceptance
+        # HARD GATE since v7.29: any case that flips OK to FAIL is a
+        # release blocker.
         run: |
           scripts/dropin-acceptance.sh \
             --image spg-candidate:ci \
@@ -276,29 +135,55 @@ jobs:
         with:
           name: dropin-acceptance-report
           path: ./dropin-acceptance-report.md
-
-  release-build:
-    name: release build (sanity)
-    runs-on: ubuntu-latest
-    # Catches optimization-only bugs and confirms the production binary
-    # still links cleanly. Runs on anything that will land on master:
-    # master push, release/** + hotfix/** push. Skipped on
-    # feature/develop to keep their CI quick.
-    if: |
-      github.ref == 'refs/heads/master' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
-    steps:
-      - uses: actions/checkout@v6
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo build --release -p spg-server
-        run: cargo build --release -p spg-server --locked
       - name: Upload spg-server binary
-        # Only upload on master pushes — release/hotfix branches
-        # produce the same binary but it's the master tag that we keep.
-        if: github.ref == 'refs/heads/master'
         uses: actions/upload-artifact@v7
         with:
           name: spg-server-linux-amd64
           path: target/release/spg-server
           retention-days: 14
+
+  # The three below compile no Rust of ours and answer questions no
+  # local run does, so they stay their own runners on every push.
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install cargo-audit (prebuilt)
+        # rustsec/audit-check compiled it from source on every run
+        # (~190 s); install-action drops in the prebuilt binary. Same
+        # advisory DB, same failure semantics via the exit code.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit
+        run: cargo audit
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    # License allowlist + duplicate-version check. Config in deny.toml.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  secret_scan:
+    name: secret scan (trufflehog)
+    runs-on: ubuntu-latest
+    # gitleaks v2 added an org-license gate in 2026; trufflehog stays
+    # free for OSS / org use. No explicit base/head: on a push to
+    # master those are the same commit and the action errors out, so
+    # the event-aware default picks the push range itself.
+    #
+    # `--results=verified,unknown` keeps the signal high — only
+    # credentials the action could probe against an issuing service,
+    # plus genuinely-novel matches its analyzers do not recognise.
+    steps:
+      - uses: actions/checkout@v6
+        with: { fetch-depth: 0 }
+      - name: trufflehog scan
+        # Pinned to a release tag, not @main — a moving branch ref is
+        # the opposite of stable.
+        uses: trufflesecurity/trufflehog@v3.95.5
+        with:
+          extra_args: --results=verified,unknown

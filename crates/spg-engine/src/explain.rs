@@ -1524,9 +1524,16 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         let mut n = PlanNode::new(alloc::format!(
             "Index Scan using {idx_name} on {name}{alias_sfx}"
         ));
-        let desc = if stmt.order_by[0].desc { " DESC" } else { "" };
-        n.attrs
-            .push(alloc::format!("Order By: {}{desc}", stmt.order_by[0].expr));
+        // v7.39.11 — every key the walk follows, not only the first.
+        // The gate takes a multi-column ordering now, and a plan that
+        // names one key for a two-key walk understates what it did.
+        let keys = stmt
+            .order_by
+            .iter()
+            .map(|o| alloc::format!("{}{}", o.expr, if o.desc { " DESC" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(", ");
+        n.attrs.push(alloc::format!("Order By: {keys}"));
         // The walk IS the scan — one node, the way PG renders it — so it
         // carries the scan's own rows and width, not a child's. Reading
         // `child_cost` here instead gave `cost=0.15..0.00 rows=1` on a

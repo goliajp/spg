@@ -260,6 +260,22 @@ pub enum DataType {
     /// `pg_typeof('{1,2}'::oid[])` with `bigint[]`, which is the defect
     /// round 667 closed for the scalar.
     OidArray,
+    /// v7.39.11 — PG's `int2vector`: the type its catalogs use for
+    /// `pg_index.indkey` and `pg_index.indoption`. It IS an array of
+    /// `smallint` — `a.attnum = ANY (i.indkey)` is how Django, Rails,
+    /// sqlalchemy and every hand-written schema-diff query ask which
+    /// columns an index covers — but its output function prints the
+    /// elements space-separated with no braces, and its subscripts
+    /// start at 0 rather than 1. Carrying it as `text` (which SPG did
+    /// through 7.39.10) got the printing right and made every array
+    /// operation raise; carrying it as `smallint[]` would trade one
+    /// of those for the other. It is its own type here for the same
+    /// reason it is one there.
+    Int2Vector,
+    /// v7.39.11 — PG's `oidvector`: `pg_index.indclass`,
+    /// `pg_index.indcollation`, `pg_proc.proargtypes`. `int2vector`
+    /// with `oid` elements; see [`DataType::Int2Vector`].
+    OidVector,
     /// v7.37.5 β-P4 — `INTERVAL[]` — single-dimension array of
     /// `IntervalSpan { months, days, micros }`. PG wire OID 1187
     /// (`_interval`). Catalog tag 35 + per-cell body
@@ -513,6 +529,8 @@ impl fmt::Display for DataType {
             Self::Xid8 => f.write_str("XID8"),
             Self::Oid => f.write_str("OID"),
             Self::OidArray => f.write_str("OID[]"),
+            Self::Int2Vector => f.write_str("INT2VECTOR"),
+            Self::OidVector => f.write_str("OIDVECTOR"),
             Self::Float => f.write_str("FLOAT"),
             Self::Real => f.write_str("REAL"),
             Self::Text => f.write_str("TEXT"),
@@ -855,6 +873,13 @@ pub enum Value<'arena> {
     /// [per elem: u8 null + (non-null) scalar body]`.
     BoolArray(Vec<Option<bool>>),
     SmallIntArray(Vec<Option<i16>>),
+    /// v7.39.11 — PG `int2vector`. An array of `smallint` that prints
+    /// space-separated and subscripts from 0; see
+    /// [`DataType::Int2Vector`]. PG's own vectors never hold NULLs, so
+    /// the elements are plain.
+    Int2Vector(Vec<i16>),
+    /// v7.39.11 — PG `oidvector`; see [`Value::Int2Vector`].
+    OidVector(Vec<u32>),
     FloatArray(Vec<Option<f64>>),
     /// PG `NUMERIC[]` — `(scaled: i128, scale: u16)` per element.
     NumericArray(Vec<Option<(i128, u16)>>),
@@ -1182,6 +1207,8 @@ impl<'arena> Value<'arena> {
             Self::IntervalArray(_) => Some(DataType::IntervalArray),
             Self::BoolArray(_) => Some(DataType::BoolArray),
             Self::SmallIntArray(_) => Some(DataType::SmallIntArray),
+            Self::Int2Vector(_) => Some(DataType::Int2Vector),
+            Self::OidVector(_) => Some(DataType::OidVector),
             Self::FloatArray(_) => Some(DataType::FloatArray),
             Self::NumericArray(_) => Some(DataType::NumericArray),
             Self::DateArray(_) => Some(DataType::DateArray),
@@ -1306,6 +1333,8 @@ impl<'arena> Value<'arena> {
             Value::IntervalArray(v) => Value::IntervalArray(v),
             Value::BoolArray(v) => Value::BoolArray(v),
             Value::SmallIntArray(v) => Value::SmallIntArray(v),
+            Value::Int2Vector(v) => Value::Int2Vector(v),
+            Value::OidVector(v) => Value::OidVector(v),
             Value::FloatArray(v) => Value::FloatArray(v),
             Value::NumericArray(v) => Value::NumericArray(v),
             Value::DateArray(v) => Value::DateArray(v),
@@ -3042,6 +3071,8 @@ impl IndexKey {
             // GIN, and SPG's GIN axis lands in v7.37.8.
             Value::BoolArray(_)
             | Value::SmallIntArray(_)
+            | Value::Int2Vector(_)
+            | Value::OidVector(_)
             | Value::FloatArray(_)
             | Value::NumericArray(_)
             | Value::DateArray(_)
@@ -3177,6 +3208,28 @@ pub struct Index {
     /// recurrence_id)` are enforced correctly. Catalog
     /// FILE_VERSION 16+; older snapshots deserialise empty.
     pub extra_column_positions: Vec<usize>,
+    /// v7.39.11 — each extra key column's `DESC` / `NULLS FIRST`,
+    /// positionally aligned with `extra_column_positions`. An empty
+    /// vec, and any position past its end, means the PG default:
+    /// ascending, nulls last.
+    ///
+    /// SPG's index does not scan in a per-column direction, so this
+    /// changes no lookup — the same reason `descending` exists for the
+    /// LEADING column. `pg_get_indexdef` is a reproduction of the DDL,
+    /// and without this `CREATE INDEX i ON t (a, b DESC)` read back as
+    /// `(a, b)`: a dump lost the clause and a schema diff saw drift
+    /// every run. Reported by sentori against 7.39.10; round 537 fixed
+    /// the identical thing for the leading column.
+    pub extra_orders: Vec<KeyOrder>,
+}
+
+/// v7.39.11 — one index key column's ordering clause, as written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyOrder {
+    pub descending: bool,
+    /// `None` when the statement did not say, in which case PG's
+    /// default applies and neither word is rendered.
+    pub nulls_first: Option<bool>,
 }
 
 /// Default neighbor degree (M) for the NSW graph. Picked at construction
@@ -3651,6 +3704,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3687,6 +3741,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3710,6 +3765,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3731,6 +3787,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3752,6 +3809,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3774,6 +3832,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -3797,6 +3856,7 @@ impl Index {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         }
     }
 
@@ -9436,7 +9496,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 94;
+const FILE_VERSION: u8 = 95;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -9775,6 +9835,23 @@ impl Catalog {
                         write_str(&mut out, c);
                     }
                     None => out.push(0),
+                }
+                // v7.39.11 — the EXTRA key columns' ordering clauses
+                // (FILE_VERSION 95+). Appended after the collation so a
+                // v94 reader stops before it and defaults every extra
+                // to ascending / nulls last, which is what those
+                // snapshots recorded.
+                write_u16(
+                    &mut out,
+                    u16::try_from(idx.extra_orders.len()).expect("\u{2264} 65k extra cols / index"),
+                );
+                for o in &idx.extra_orders {
+                    out.push(u8::from(o.descending));
+                    out.push(match o.nulls_first {
+                        None => 0,
+                        Some(true) => 1,
+                        Some(false) => 2,
+                    });
                 }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.

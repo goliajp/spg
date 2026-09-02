@@ -1978,6 +1978,7 @@ impl Table {
             nulls_first: None,
             collation: None,
             extra_column_positions: Vec::new(),
+            extra_orders: Vec::new(),
         });
         Ok(())
     }
@@ -4404,6 +4405,7 @@ impl Table {
                 nulls_first: None,
                 collation: None,
                 extra_column_positions: Vec::new(),
+                extra_orders: Vec::new(),
             });
             return Ok(());
         }

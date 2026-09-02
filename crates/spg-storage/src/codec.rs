@@ -1070,6 +1070,34 @@ fn deserialize_indices(
                         last.collation = coll;
                     }
                 }
+                // v7.39.11 — the EXTRA key columns' ordering clauses
+                // (FILE_VERSION 95+). v94-and-below leave the vec empty,
+                // which reads as ascending / nulls last for every extra
+                // — what those snapshots recorded.
+                if version >= 95 {
+                    let n = cur.read_u16()? as usize;
+                    let mut orders = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let descending = cur.read_u8()? != 0;
+                        let nulls_first = match cur.read_u8()? {
+                            0 => None,
+                            1 => Some(true),
+                            2 => Some(false),
+                            other => {
+                                return Err(StorageError::Corrupt(format!(
+                                    "index extra nulls-order tag: unknown byte {other}"
+                                )));
+                            }
+                        };
+                        orders.push(crate::KeyOrder {
+                            descending,
+                            nulls_first,
+                        });
+                    }
+                    if let Some(last) = t.indices.last_mut() {
+                        last.extra_orders = orders;
+                    }
+                }
             }
         }
     }
@@ -1206,6 +1234,11 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // byte for byte; only the declared type differs, which is the whole
         // point of the variant.
         DataType::OidArray => out.push(76),
+        // v7.39.11 — PG's catalog vectors. Catalog-only today, but the
+        // codec is exhaustive and a persisted column of either type
+        // must round-trip rather than corrupt.
+        DataType::Int2Vector => out.push(77),
+        DataType::OidVector => out.push(78),
         DataType::Bool => out.push(5),
         DataType::Vector { dim, encoding } => match encoding {
             // Tag 6: pre-v6 F32 vector. Layout unchanged; pre-v6
@@ -1395,6 +1428,8 @@ impl Cursor<'_> {
             74 => Ok(DataType::Xid8),
             75 => Ok(DataType::Oid),
             76 => Ok(DataType::OidArray),
+            77 => Ok(DataType::Int2Vector),
+            78 => Ok(DataType::OidVector),
             5 => Ok(DataType::Bool),
             6 => Ok(DataType::Vector {
                 dim: self.read_u32()?,
@@ -1653,6 +1688,9 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
                 .map(|x| if x.is_some() { 3 } else { 1 })
                 .sum::<usize>()
         }
+        // v7.39.11 — PG's vectors never hold NULLs, so no null flags.
+        Value::Int2Vector(items) => 2 + items.len() * 2,
+        Value::OidVector(items) => 2 + items.len() * 4,
         Value::FloatArray(items) => {
             2 + items
                 .iter()
@@ -2272,6 +2310,20 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
                         out.push(u8::from(*b));
                     }
                 }
+            }
+        }
+        (Value::Int2Vector(items), DataType::Int2Vector) => {
+            let count = u16::try_from(items.len()).expect("int2vector \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                out.extend_from_slice(&item.to_le_bytes());
+            }
+        }
+        (Value::OidVector(items), DataType::OidVector) => {
+            let count = u16::try_from(items.len()).expect("oidvector \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                out.extend_from_slice(&item.to_le_bytes());
             }
         }
         (Value::SmallIntArray(items), DataType::SmallIntArray) => {
@@ -2907,6 +2959,8 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // silently-invalid tag.
         Value::BoolArray(_)
         | Value::SmallIntArray(_)
+        | Value::Int2Vector(_)
+        | Value::OidVector(_)
         | Value::FloatArray(_)
         | Value::NumericArray(_)
         | Value::DateArray(_)
@@ -4022,6 +4076,23 @@ impl<'a> Cursor<'a> {
                     }
                 }
                 Ok(Value::SmallIntArray(items))
+            }
+            DataType::Int2Vector => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<i16> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let b = self.take(2)?;
+                    items.push(i16::from_le_bytes([b[0], b[1]]));
+                }
+                Ok(Value::Int2Vector(items))
+            }
+            DataType::OidVector => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<u32> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    items.push(self.read_u32()?);
+                }
+                Ok(Value::OidVector(items))
             }
             DataType::FloatArray => {
                 let count = self.read_u16()? as usize;

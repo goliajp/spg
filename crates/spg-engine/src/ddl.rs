@@ -2983,6 +2983,16 @@ impl Engine {
             }
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.extra_column_positions = extra_positions;
+                // v7.39.11 — and each extra's ordering clause, which the
+                // parser used to drop. See `Index::extra_orders`.
+                idx.extra_orders = stmt
+                    .extra_orders
+                    .iter()
+                    .map(|o| spg_storage::KeyOrder {
+                        descending: o.descending,
+                        nulls_first: o.nulls_first,
+                    })
+                    .collect();
             }
             // v7.38.1 (L12) — a multi-column CREATE INDEX becomes a REAL
             // composite B-tree: the key is the whole column tuple, so an
@@ -4044,6 +4054,7 @@ impl Engine {
                         partial_predicate: None,
                         expression: None,
                         extra_columns: Vec::new(),
+                        extra_orders: Vec::new(),
                         is_unique: idx.is_unique,
                         opclass: None,
                         method_name: None,

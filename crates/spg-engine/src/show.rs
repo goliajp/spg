@@ -944,6 +944,8 @@ fn render_data_type(ty: DataType) -> String {
         DataType::Xid8 => "XID8".into(),
         DataType::Oid => "OID".into(),
         DataType::OidArray => "OID[]".into(),
+        DataType::Int2Vector => "INT2VECTOR".into(),
+        DataType::OidVector => "OIDVECTOR".into(),
         DataType::Varchar(n) => alloc::format!("VARCHAR({n})"),
         DataType::Char(n) => alloc::format!("CHAR({n})"),
         DataType::Bool => "BOOL".into(),

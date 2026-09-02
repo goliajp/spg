@@ -116,6 +116,23 @@ preflight gate: precommit tier PASS (--fast)
   the reason for the hurry is over. If it goes red, cut the next
   version — the tag and the crates are already unrecallable.
 FASTNOTE
+elif PRERELEASE_REPORT=$(scripts/prerelease-verdict.sh 2>/dev/null); then
+    # v7.39.11 — a green `suite.sh prerelease` on THIS commit is the
+    # battery, and running it again here learns nothing.
+    #
+    # The release used to run the categories three times on one tree:
+    # `suite.sh prerelease` (the operator's step, ~74 minutes of
+    # budget), then `gate.sh dogfood`, then `gate.sh all` — which is
+    # lint / unit / e2e / gates / biz / dogfood / perf, the same list
+    # again. The tree does not change between them.
+    #
+    # The report is only accepted when its runid names HEAD's short
+    # SHA, so evidence from the commit before this one does not let a
+    # release through, and a report with any step `fail` or `skipped`
+    # is refused.
+    echo "preflight gate: prerelease PASS on HEAD — ${PRERELEASE_REPORT}"
+    echo "preflight gate: dogfood-replay + gate.sh all SKIPPED (that report covers them)"
+    SKIP_FULL=1
 elif [[ "${SKIP_DOGFOOD:-0}" == 0 ]]; then
     banner "preflight gate: dogfood-replay (fast tier)"
     if ! scripts/gate.sh dogfood; then
@@ -160,7 +177,11 @@ promise is intact." >&2
     fi
     echo "preflight gate: gate.sh all PASS"
 else
-    echo "preflight gate: gate.sh all SKIPPED (SKIP_FULL=1 set)"
+    if [[ -n "${PRERELEASE_REPORT:-}" ]]; then
+        echo "preflight gate: gate.sh all SKIPPED (covered by ${PRERELEASE_REPORT})"
+    else
+        echo "preflight gate: gate.sh all SKIPPED (SKIP_FULL=1 set)"
+    fi
 fi
 
 if [[ "$SKIP_CRATES" == 0 ]]; then

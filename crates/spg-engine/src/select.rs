@@ -1421,7 +1421,10 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_info_key_column_usage" => {
-                    let (schema, rows) = synth_info_key_column_usage(self.active_catalog());
+                    // v7.39.11 — the session's dialect decides the
+                    // column list; see the synthesiser.
+                    let mysql = self.in_mysql_dialect();
+                    let (schema, rows) = synth_info_key_column_usage(self.active_catalog(), mysql);
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.17.0 Phase 3.P0-64 — information_schema.REFERENTIAL_CONSTRAINTS.
@@ -3762,6 +3765,27 @@ impl Engine {
                             rows,
                         ));
                         (DataType::Text, alloc::vec::Vec::new())
+                    }
+                    // v7.39.11 — every remaining array-family value,
+                    // through the one element menu, so a type does not
+                    // have to be written out here a second time to be
+                    // unnestable. `unnest(ARRAY[1,2]::smallint[])`
+                    // raised "expects an array argument, got
+                    // smallint[]" until this arm — the arms above name
+                    // int / bigint / text / json and stop — and so did
+                    // every catalog vector. Found while closing
+                    // sentori's §4 against 7.39.10.
+                    ref v if crate::eval::values::array_len(v).is_some() => {
+                        let elems = crate::eval::values::array_elements(v).unwrap_or_default();
+                        let dt = elems
+                            .iter()
+                            .find_map(spg_storage::Value::data_type)
+                            .unwrap_or(DataType::Text);
+                        let rows = elems
+                            .into_iter()
+                            .map(|e| Row::new(alloc::vec![e]))
+                            .collect();
+                        (dt, rows)
                     }
                     other => {
                         // v7.39 (round 622, S05a) — see table_access.rs:
@@ -8253,11 +8277,32 @@ impl Engine {
         stmt: &SelectStatement,
         from: &FromClause,
     ) -> Option<(String, usize)> {
-        if stmt.order_by.len() != 1
+        // v7.39.11 — LIMIT / OFFSET join the walk instead of refusing it.
+        //
+        // Reported by sentori against 7.39.10 and measured on their own
+        // busiest read: "the most recent N events for this project",
+        // backed by an index on exactly that ordering. PostgreSQL 18
+        // answered it with `Limit -> Index Scan`; SPG with
+        // `Limit -> Sort -> Seq Scan`, 4.998 ms against 0.021 — the
+        // whole table sorted to return twenty rows.
+        //
+        // The walk was built for this shape — `iter_desc`'s own doc says
+        // "the ORDER BY <indexed col> DESC + LIMIT N executor path" —
+        // and then the gate refused every statement that had a LIMIT, so
+        // the one query it was written for could never reach it. The
+        // capability was here; the routing was not.
+        //
+        // A non-literal count is refused: `LIMIT $1` is rewritten to a
+        // literal by `resolve_limit_exprs` before dispatch, so anything
+        // still carrying a placeholder here has not been through it.
+        let literal_count = |e: &Option<spg_sql::ast::LimitExpr>| {
+            matches!(e, None | Some(spg_sql::ast::LimitExpr::Literal(_)))
+        };
+        if stmt.order_by.is_empty()
             || !stmt.distinct_on.is_empty()
             || stmt.limit_with_ties
-            || stmt.limit.is_some()
-            || stmt.offset.is_some()
+            || !literal_count(&stmt.limit)
+            || !literal_count(&stmt.offset)
             || stmt.having.is_some()
             || stmt.group_by.is_some()
             || !stmt.unions.is_empty()
@@ -8347,12 +8392,115 @@ impl Engine {
         // 72.0 ms with the column nullable and 20.2 with the same data
         // under NOT NULL. `NOT NULL` is not the default, so that was the
         // common case paying for the uncommon one.
-        let index = table.index_on(order_pos)?;
-        if !matches!(index.kind, spg_storage::IndexKind::BTree(_))
-            || index.expression.is_some()
-            || index.partial_predicate.is_some()
+        // v7.39.11 — the walk comes out in the tree's order, so it may
+        // only take an ORDER BY whose order that IS.
+        //
+        // The B-tree walks in BYTE order unless the column's keys are
+        // ICU sort keys. `try_pk_walk_top_n` has asked this since
+        // v7.38.18; this gate never did, and the answer changed when an
+        // index appeared. Measured on `alpha / Beta / GAMMA / delta`
+        // over a MySQL-dialect session, `SELECT t FROM s ORDER BY t`:
+        //
+        //   no index   alpha Beta delta GAMMA   (MySQL's own order)
+        //   indexed    Beta GAMMA alpha delta   (bytes)
+        //
+        // No row is wrong and nothing raises; only the order changes,
+        // and it changes because an index exists. Ordering is the one
+        // thing a walk contributes, so when it is the wrong ordering
+        // there is nothing left to keep.
+        let order_col = cols.get(order_pos)?;
+        if crate::index_access::collated_column(order_col, table.db_collation()).is_none()
+            && !crate::collate::column_key_is_bytewise(order_col, self.speaks_mysql)
         {
             return None;
+        }
+        // v7.39.11 — a composite B-tree LEADING on the ORDER BY column
+        // walks it too, which is what `try_pk_walk_top_n` has always
+        // done and what this gate did not know.
+        //
+        // Keys sort by the whole tuple, so the leading component comes
+        // out in order — `Index::iter_asc` says so, and the materialising
+        // top-N walk has relied on it since v7.38.1. The consequence of
+        // the two gates disagreeing was the thing r1044 exists to
+        // prevent: measured on a table indexed `(a, b)`, `SELECT a FROM
+        // m ORDER BY a LIMIT 2` planned as `Limit -> Sort -> Seq Scan`
+        // while the executor plainly walked the index — a projection
+        // that divides by zero on the last row in key order returned two
+        // rows instead of raising. EXPLAIN is the first thing any
+        // performance question opens, and an instrument that misnames
+        // the access path is worse than one that says nothing.
+        let index = table
+            .index_on(order_pos)
+            .filter(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+            .or_else(|| {
+                table.indices().iter().find(|i| {
+                    matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
+                        && i.column_position == order_pos
+                })
+            })?;
+        if index.expression.is_some() || index.partial_predicate.is_some() {
+            return None;
+        }
+        // v7.39.11 — more than one ORDER BY term walks when the index
+        // holds exactly that ordering.
+        //
+        // Keys sort by the whole tuple, so `iter_asc` over a composite
+        // B-tree IS `ORDER BY a, b` — the walk needs no new machinery,
+        // only permission. Reported by sentori against 7.39.10:
+        // `ORDER BY a, b LIMIT 10` planned as `Seq Scan -> Sort` here
+        // against an `Incremental Sort` over an index scan on
+        // PostgreSQL 18, on a table indexed for it.
+        //
+        // Three things have to hold, and each of them is the tree's
+        // limitation rather than a conservative choice:
+        //
+        //   * the terms are the index's key columns, in its order, from
+        //     the leading one — a suffix or a permutation is a different
+        //     ordering;
+        //   * every term runs the same direction, because the tree is
+        //     walked one way for all of them. `(a, b DESC)` is what
+        //     PostgreSQL serves from an index whose SECOND key is
+        //     descending, and SPG's tree does not scan per column;
+        //   * every key column is NOT NULL. A NULL key is not in the
+        //     tree at all, and the separate pass that emits those rows
+        //     (r1046) knows how to place them for ONE column, not for a
+        //     tuple.
+        if stmt.order_by.len() > 1 {
+            let keys: Vec<usize> = core::iter::once(index.column_position)
+                .chain(index.extra_column_positions.iter().copied())
+                .collect();
+            if stmt.order_by.len() > keys.len() {
+                return None;
+            }
+            let desc = stmt.order_by[0].desc;
+            for (term, &key_pos) in stmt.order_by.iter().zip(keys.iter()) {
+                if term.desc != desc {
+                    return None;
+                }
+                let Expr::Column(c) = &term.expr else {
+                    return None;
+                };
+                if let Some(q) = &c.qualifier
+                    && !q.eq_ignore_ascii_case(alias)
+                {
+                    return None;
+                }
+                let pos = cols
+                    .iter()
+                    .position(|s| s.name.eq_ignore_ascii_case(&c.name))?;
+                if pos != key_pos {
+                    return None;
+                }
+                let col = cols.get(pos)?;
+                if col.nullable {
+                    return None;
+                }
+                if crate::index_access::collated_column(col, table.db_collation()).is_none()
+                    && !crate::collate::column_key_is_bytewise(col, self.speaks_mysql)
+                {
+                    return None;
+                }
+            }
         }
         Some((index.name.clone(), order_pos))
     }
@@ -8387,7 +8535,18 @@ impl Engine {
             .unwrap_or(from.primary.name.as_str());
         let cols = table.schema().columns.clone();
         let order = &stmt.order_by[0];
-        let Some(index) = table.index_on(order_pos) else {
+        // v7.39.11 — the same lookup the gate made; see
+        // `index_order_walk_target`.
+        let Some(index) = table
+            .index_on(order_pos)
+            .filter(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+            .or_else(|| {
+                table.indices().iter().find(|i| {
+                    matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
+                        && i.column_position == order_pos
+                })
+            })
+        else {
             return Ok(None);
         };
 
@@ -8453,10 +8612,21 @@ impl Engine {
         let distinct = stmt.distinct;
         let mut count = 0usize;
         let mut visited = 0usize;
+        // v7.39.11 — OFFSET and LIMIT, applied as the walk goes.
+        //
+        // Both count PASSING rows, so a skipped row still has to run the
+        // predicate and the projection — `stream_filter_project` is
+        // `stream_project_row` without the emit, which is exactly that.
+        // Stopping at `remaining == 0` is the whole point: twenty rows
+        // off the end of an index instead of a sorted table.
+        let mut to_skip = stmt.offset_literal().unwrap_or(0) as usize;
+        let mut remaining: Option<usize> = stmt.limit_literal().map(|l| l as usize);
         let mut emit_null_rows = |emitted_rows: &mut alloc::vec::Vec<bool>,
                                   eval_stack: &mut Vec<Value<'static>>,
                                   values: &mut Vec<Value<'static>>,
                                   visited: &mut usize,
+                                  to_skip: &mut usize,
+                                  remaining: &mut Option<usize>,
                                   emit: &mut F|
          -> Result<usize, EngineError> {
             if !cols[order_pos].nullable {
@@ -8478,18 +8648,45 @@ impl Engine {
                     cancel.check()?;
                 }
                 emitted_rows[ri] = true;
-                if Self::stream_project_row(
-                    row,
-                    stmt.where_.as_ref(),
-                    compiled_where.as_ref(),
-                    eval_stack,
-                    &projection,
-                    &bound_pos,
-                    &ctx,
-                    values,
-                    emit,
-                )? {
+                if *remaining == Some(0) {
+                    break;
+                }
+                let passed = if *to_skip > 0 {
+                    let p = Self::stream_filter_project(
+                        row,
+                        stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        eval_stack,
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        values,
+                    )?;
+                    if p {
+                        *to_skip -= 1;
+                    }
+                    false
+                } else {
+                    Self::stream_project_row(
+                        row,
+                        stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        eval_stack,
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        values,
+                        emit,
+                    )?
+                };
+                if passed {
                     n += 1;
+                    if let Some(r) = remaining.as_mut() {
+                        *r -= 1;
+                        if *r == 0 {
+                            break;
+                        }
+                    }
                     if distinct {
                         break;
                     }
@@ -8504,6 +8701,8 @@ impl Engine {
                 &mut eval_stack,
                 &mut values,
                 &mut visited,
+                &mut to_skip,
+                &mut remaining,
                 emit,
             )?;
         }
@@ -8515,7 +8714,10 @@ impl Engine {
         } else {
             alloc::boxed::Box::new(index.iter_asc())
         };
-        for (_key, locators) in walker {
+        'walk: for (_key, locators) in walker {
+            if remaining == Some(0) {
+                break;
+            }
             for loc in locators {
                 let spg_storage::RowLocator::Hot(ri) = *loc else {
                     continue;
@@ -8534,18 +8736,45 @@ impl Engine {
                     cancel.check()?;
                 }
                 emitted_rows[ri] = true;
-                if Self::stream_project_row(
-                    row,
-                    stmt.where_.as_ref(),
-                    compiled_where.as_ref(),
-                    &mut eval_stack,
-                    &projection,
-                    &bound_pos,
-                    &ctx,
-                    &mut values,
-                    emit,
-                )? {
+                // v7.39.11 — a skipped row still runs the predicate and
+                // the projection, because OFFSET counts rows that PASS;
+                // it just does not reach the client.
+                let passed = if to_skip > 0 {
+                    let p = Self::stream_filter_project(
+                        row,
+                        stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        &mut eval_stack,
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        &mut values,
+                    )?;
+                    if p {
+                        to_skip -= 1;
+                    }
+                    false
+                } else {
+                    Self::stream_project_row(
+                        row,
+                        stmt.where_.as_ref(),
+                        compiled_where.as_ref(),
+                        &mut eval_stack,
+                        &projection,
+                        &bound_pos,
+                        &ctx,
+                        &mut values,
+                        emit,
+                    )?
+                };
+                if passed {
                     count += 1;
+                    if let Some(r) = remaining.as_mut() {
+                        *r -= 1;
+                        if *r == 0 {
+                            break 'walk;
+                        }
+                    }
                     // One row per key group: the rest are the same value.
                     if distinct {
                         break;
@@ -8560,6 +8789,8 @@ impl Engine {
                 &mut eval_stack,
                 &mut values,
                 &mut visited,
+                &mut to_skip,
+                &mut remaining,
                 emit,
             )?;
         }
@@ -12847,6 +13078,17 @@ pub(crate) fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, 
     // through to the type-mismatch arm below.
     if let Some(flat) = crate::eval::values::flatten_2d(v) {
         return array_value_to_elements(&flat);
+    }
+    // v7.39.11 — every array-family value, through the one element
+    // menu. The arms below name int / bigint / text / json and stop, so
+    // `SELECT unnest(ARRAY[1,2]::smallint[])` raised "expects an array
+    // argument, got smallint[]" — the type it had just been given —
+    // and so did every catalog vector. Found while closing sentori's
+    // §4 against 7.39.10; the FROM-clause unnest has the same arm.
+    if crate::eval::values::array_len(v).is_some() {
+        if let Some(elems) = crate::eval::values::array_elements(v) {
+            return Ok(elems);
+        }
     }
     match v {
         Value::Null => Ok(Vec::new()),

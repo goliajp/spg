@@ -14,6 +14,12 @@ fn rows(r: QueryResult) -> Vec<Vec<Value<'static>>> {
 #[test]
 fn key_column_usage_lists_fk_columns() {
     let mut e = Engine::new();
+    // v7.39.11 — `referenced_table_name` and `referenced_column_name`
+    // are MySQL's columns, and this file is named for MySQL's views.
+    // Until this version every session got MySQL's shape, so the pin
+    // passed on a PostgreSQL engine while a PostgreSQL session had no
+    // `table_schema` at all — the defect, asserted as the contract.
+    e.set_mysql_dialect(true);
     e.execute("CREATE TABLE parents (id INT NOT NULL, PRIMARY KEY (id))")
         .unwrap();
     e.execute(

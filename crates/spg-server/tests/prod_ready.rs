@@ -847,23 +847,34 @@ fn row_8_2_native_wire_opcode_stable() {
     }
 }
 
-/// 9.8 CI workflow exists — .github/workflows/ci.yml is present
-/// and has the five jobs we documented.
+/// 9.8 CI workflow exists — .github/workflows/ci.yml is present and
+/// runs the work we documented.
+///
+/// v7.39.11 — on the STEPS, not on the job names. This asserted five
+/// job names, and three of them (`rustfmt`, `clippy`, `test`) were one
+/// job per question about a single tree: three machines, three caches,
+/// and the same workspace compiled twice in the same profile. Folding
+/// them into one job did not stop any of that work happening, but it
+/// failed this row, which had pinned the packaging rather than the
+/// work. A row that cannot tell "we stopped linting" from "we stopped
+/// spending a runner on linting" is not measuring the claim it names.
 #[test]
 fn row_9_8_ci_workflow_present() {
     let path = workspace_root().join(".github/workflows/ci.yml");
     let yml = std::fs::read_to_string(&path)
         .unwrap_or_else(|_| panic!(".github/workflows/ci.yml must exist at {}", path.display()));
-    for job in [
-        "rustfmt",
-        "clippy",
-        "test",
-        "cargo-audit",
+    for step in [
+        "cargo fmt --check",
+        "cargo clippy --workspace --all-targets",
+        "cargo test --workspace",
+        "cargo audit",
         "prod_ready gate",
+        "perf_gate (every crate)",
+        "drop-in acceptance",
     ] {
         assert!(
-            yml.contains(&format!("name: {job}")),
-            "CI missing required job {job:?}"
+            yml.contains(&format!("name: {step}")),
+            "CI no longer runs {step:?}"
         );
     }
 }

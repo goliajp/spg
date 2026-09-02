@@ -8,12 +8,33 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [7.39.11] — 2026-09-02
 
 ### Fixed
 
-Both reported by sentori against the published 7.39.10 image, and both
-reproduced here against PostgreSQL 18.6 before anything was changed.
+Reported by sentori against the published 7.39.10 image unless noted,
+and every one reproduced here against PostgreSQL 18.6 — or MySQL 9.7.2
+where the surface is MySQL's — before anything was changed.
+
+- **`ORDER BY <indexed nullable column> NULLS FIRST` with a `LIMIT`
+  dropped every NULL row.** Found here, not reported. On
+  `(1,2,3,4,5,NULL,6)`:
+
+  ```text
+    ORDER BY a NULLS FIRST LIMIT 3     PG 18.6: NULL 1 2
+    every published SPG to 7.39.10:             1 2 3
+  ```
+
+  Without an index on the column both answer `NULL 1 2` — the sort sees
+  every row — so it takes an index to see it, and no error is raised on
+  either side. It is r1020's defect, still reachable through the one
+  spelling that fix's guard did not cover: it refused the index walk
+  when the key was nullable and the order was DESC, because DESC
+  defaults to NULLS FIRST and the NULL rows are not in the tree. An
+  explicit `NULLS FIRST` on an ASCENDING order puts them in exactly the
+  same place and was not refused. The guard asks about the null
+  PLACEMENT now, which is the question it was always trying to ask, and
+  the same correction hands `DESC NULLS LAST` back to the fast path.
 
 - **An aggregate anywhere in the statement made `ORDER BY <text>` sort
   by BYTES.** Same column, same `ORDER BY`, same rows; the only
@@ -91,6 +112,235 @@ reproduced here against PostgreSQL 18.6 before anything was changed.
   `m2_pkey`). Those follow from SPG building a different set of indexes
   for the two spellings of one constraint, which is a storage question
   rather than a catalog one.
+
+- **The catalog's vector columns were `text`, so the ordinary index
+  query raised.** Long-standing — 7.38.21 behaves the same.
+
+  ```text
+                          PostgreSQL 18.6   SPG 7.39.10
+    pg_index.indkey         int2vector        text
+    pg_index.indclass       oidvector         text
+    pg_index.indoption      int2vector        text
+    pg_index.indcollation   oidvector         text
+    pg_proc.proargtypes     oidvector         text
+    pg_constraint.conkey    smallint[]        smallint[]   <- fine
+  ```
+
+  So every array operation over them raised: `a.attnum = ANY (i.indkey)`
+  with "ANY/ALL right-hand side must be an array, got text", and the
+  same for `unnest`, `array_position` and subscripting. That spelling is
+  not exotic — it is what Django's introspection, Rails' schema dumper,
+  sqlalchemy and every hand-written schema-diff query use to ask which
+  columns an index covers.
+
+  `int2vector` and `oidvector` are their own types here, as they are
+  there. Carrying them as `text` printed them correctly and made every
+  operation raise; carrying them as `smallint[]` would have traded one
+  of those for the other, because the array types print `{2,3}` where a
+  vector prints `2 3`. Both hold now, along with the detail that makes
+  them a type rather than an array: their subscripts start at 0, so
+  `indkey[0]` is the first key column and `array_position(indkey,
+  2::smallint)` answers 0 — both measured on 18.6.
+
+  Two things surfaced while closing it. `unnest()` raised on most of the
+  array family — `SELECT unnest(ARRAY[1,2]::smallint[])` answered
+  "expects an array argument, got smallint[]", naming the type it had
+  just been handed, because the arms listed int / bigint / text / json
+  and stopped. And `pg_attribute.attndims` was declared `integer` where
+  PostgreSQL declares `smallint`.
+
+- **`information_schema.key_column_usage` served MySQL's column list to
+  a PostgreSQL session** — the mirror of the defect v7.39.2 closed for
+  `SHOW CREATE TABLE`.
+
+  ```text
+    PG 18.6    constraint_catalog, constraint_schema, constraint_name,
+               table_catalog, table_schema, table_name, column_name,
+               ordinal_position, position_in_unique_constraint
+    MySQL 9.7  … the same nine, then referenced_table_schema,
+               referenced_table_name, referenced_column_name
+    SPG 7.39.10  MySQL's, minus the four catalog/schema columns
+  ```
+
+  So `WHERE table_schema = 'public'` — the way every tool scopes this
+  view — raised `column "table_schema" does not exist`, while two
+  columns PostgreSQL does not have were there instead. The session's
+  dialect decides the list now. The two engines agree on the first
+  nine, in that order, which is why one row builder serves both.
+
+- **`pg_get_indexdef` dropped every non-leading key column's ordering
+  clause, and dropped the columns themselves when the LEADING one had a
+  clause.**
+
+  ```text
+    DDL                                    PG 18.6 and SPG 7.39.11
+    (a, b DESC)                            (a, b DESC)
+    (a DESC, b)                            (a DESC, b)
+    (a DESC NULLS LAST, b ASC NULLS FIRST, c)
+                                           (a DESC NULLS LAST, b NULLS FIRST, c)
+
+                                           SPG 7.39.10
+    (a, b DESC)                            (a, b)
+    (a DESC, b)                            (a DESC)          <- column gone
+  ```
+
+  Two causes. The parser read each extra column's `ASC` / `DESC` /
+  `NULLS …` and threw it away; only the leading column's survived. And a
+  bare column WITH a clause is stored as an expression, and the
+  renderer's expression branch appended no extra columns at all — which
+  is worse than the dropped clause it sits beside, because the second
+  key column vanishes from the definition. A dump lost the clause and a
+  schema diff saw drift on every run.
+
+  Catalog `FILE_VERSION` 95 carries the extra columns' clauses. A v94
+  snapshot reads them as ascending / nulls last, which is what those
+  snapshots recorded. SPG's index does not scan in a per-column
+  direction, so none of this changes a lookup — it changes what a dump
+  says, which is this function's whole job.
+
+- **`text || "char"` answered where PostgreSQL refuses it.** Measured on
+  18.6, where the operator is genuinely ambiguous and the message says
+  so:
+
+  ```text
+    SELECT 'x' || 'r'::"char"          ERROR: operator is not unique: unknown || "char"
+    SELECT 'x'::text || 'r'::"char"    ERROR: operator is not unique: text || "char"
+    SELECT 'x' || 'r'::char(1)         xr    <- CHAR(n) is a different type
+    SELECT ('r'::"char")::text || 'x'  rx    <- an explicit cast resolves it
+  ```
+
+  An answer more permissive than PostgreSQL's is one a caller cannot act
+  on: a script written against SPG then fails on the thing SPG claims to
+  be. It cost the reporter a comparison query, where one side raised and
+  ours returned a row. One operator, pinned; not a swept class.
+
+- **`information_schema.table_constraints` listed a constraint for a
+  bare `CREATE UNIQUE INDEX`.** The `pg_constraint` half of this shipped
+  in the previous entry; this is its twin, in the loop beside it, and it
+  was still deciding "is this a primary key" from whether the index NAME
+  ends in `_pkey`.
+
+- **An index changed the answer to a text `ORDER BY` on a MySQL
+  session.** Found here, not reported. On `alpha / Beta / GAMMA /
+  delta`:
+
+  ```text
+    SELECT t FROM s ORDER BY t
+      no index   alpha Beta delta GAMMA   (MySQL's own order)
+      indexed    Beta GAMMA alpha delta   (bytes)
+  ```
+
+  No row is wrong and nothing raises; only the order changes, and it
+  changes because an index exists — the same class as the two "an index
+  that was charging you and doing nothing" entries in v7.39.6. A B-tree
+  walks in byte order unless the column's keys are ICU sort keys, and
+  the streaming walk's gate never asked; the materialising top-N walk
+  has asked since v7.38.18. Ordering is the one thing a walk
+  contributes, so when it is the wrong ordering there is nothing left to
+  keep, and the gate declines.
+
+- **`EXPLAIN` misnamed the access path for a composite index.** On a
+  table indexed `(a, b)`, `SELECT a FROM m ORDER BY a LIMIT 2` planned
+  as `Limit -> Sort -> Seq Scan` while the executor plainly walked the
+  index — witnessed by a projection that divides by zero on the last row
+  in key order and did not raise. There are two index-ordered walks and
+  only one of them knew that a composite B-tree LEADING on the ORDER BY
+  column can be walked; `EXPLAIN` asks that one. r1044 exists to keep
+  the plan and the executor answering the same question and says why:
+  EXPLAIN is the first thing any performance question opens, and an
+  instrument that misnames the access path is worse than one that says
+  nothing.
+
+### Changed
+
+The release instrument. Four measurements, all from this repository's
+own records.
+
+- **A pre-commit budget no longer fails a commit on wall-clock alone.**
+  The tier's own reports have the same commit at 35 s and 1,989,963 ms
+  for `unit-affected` on this host, and in the slow run `fmt` — fixed
+  work every time — read 2,554 ms against 2,300 ms in the fast one. The
+  machine was busy; no step had changed. Three attempts to sense that
+  condition directly were refuted by measurement and are recorded in the
+  code. A step is red now only when it is over its budget AND over twice
+  its own recent median at the same band, so a busy machine makes the
+  history slow too and nothing fires, while a step that really regressed
+  stands out against its own past. With no history to compare against,
+  the budget is recorded and does not block. 7.39.9 and 7.39.10 were
+  both committed with `--no-verify`; a hook that gets bypassed is not a
+  gate.
+
+- **Pre-commit builds only what it runs.** It ran three cargo
+  invocations before the first step, and the first of them was `build
+  --workspace --all-targets` — every integration-test binary in the
+  workspace, the e2e suites and the perf_gate targets included, none of
+  which this tier runs. Recorded at band 12: `unit-affected` 3,136.9 s
+  and `clippy-affected` 387.3 s on a run whose every step passed.
+
+- **CI: twelve jobs became five, and nineteen runners on a `develop`
+  push became five.** `fmt`, `clippy` and `test` were three machines
+  compiling the same workspace in the same profile to answer three
+  questions about one tree; they are one job. `prod_ready`, `slo_smoke`,
+  `sqllogictest`, `release-build`, `dropin_acceptance` and a `perf_gate`
+  matrix of eight each began by compiling the workspace in release, so
+  that build ran eleven times to run gates whose own runtime is seconds;
+  they are one job after one release build. The matrix bought max-of-8
+  on the gates while paying 8x for the build they shared. `rustup
+  component add rustfmt` / `clippy` installed what the runner image
+  already ships.
+
+  The release-profile battery runs on `develop` alone. Every git-flow
+  finish lands there, so a change passes it exactly once; the release
+  branch and the master merge carry the identical tree, already gated
+  there and again by `scripts/suite.sh prerelease` locally before the
+  release is cut.
+
+- **`release.sh` accepts a green `prerelease` report for HEAD instead of
+  running the battery again.** The release ran the same categories three
+  times on one tree: `suite.sh prerelease` (about 74 minutes of budget),
+  then `gate.sh dogfood`, then `gate.sh all` — lint / unit / e2e / gates
+  / biz / dogfood / perf, the same list. The tree does not change
+  between them. The report is accepted only when its runid names HEAD's
+  short SHA, so evidence from the commit before does not let a release
+  through, and any step recorded `fail` or `skipped` refuses it.
+
+### Not closed
+
+- **An index still cannot serve a mixed-direction ordering, or an
+  ordering on a composite index's non-leading column.** Reported by
+  sentori with the first performance measurement either of us has taken
+  on their shape: their busiest read, `ORDER BY received_at DESC LIMIT
+  20` behind an index on `(project_id, received_at DESC)`, plans as
+  `Limit -> Index Scan` on PostgreSQL 18 and `Limit -> Sort -> Seq Scan`
+  here, 0.021 ms against 4.998 on their box.
+
+  Their second line is closed. **A multi-column `ORDER BY` walks the
+  index that holds exactly that ordering** — keys sort by the whole
+  tuple, so `iter_asc` over a composite B-tree IS `ORDER BY a, b`, and
+  the walk needed permission rather than machinery. Three things have to
+  hold, and each is the tree's limitation rather than a conservative
+  choice: the terms are the index's key columns in its order from the
+  leading one; every term runs the same direction, because the tree is
+  walked one way for all of them; and every key column is NOT NULL,
+  because a NULL key is not in the tree and the pass that emits those
+  rows places them for one column, not for a tuple. Each has its own
+  negative control, and ablating the check fails all three.
+
+  The streaming walk also takes LIMIT and OFFSET now and stops when the
+  count is met; its gate refused every statement carrying one, so a wire
+  client asking for the newest twenty rows fell back to materialising.
+  The honest measurement of THAT on its own: ablating it changes no row
+  and no early stop, because the materialising fallback walks the index
+  too. What it bought was the two gates agreeing, which is what
+  surfaced the misnamed plan above.
+
+  **What is left is their first line and their production shape.**
+  `ORDER BY a, b DESC` needs the index to scan per column, which it does
+  not — the clauses are recorded now, which is the prerequisite and not
+  the feature. And `WHERE a = ? ORDER BY b LIMIT n` behind an index on
+  `(a, b)` needs the walk to seek to a key prefix and iterate inside it,
+  which it cannot yet do at all. That is the shape their busiest read
+  has, so their measurement stands.
 
 ## [7.39.10] — 2026-09-02
 
