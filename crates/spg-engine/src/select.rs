@@ -684,12 +684,27 @@ impl Engine {
 
         // 4) Build extended schema: original columns + synthetic.
         let mut ext_cols = schema_cols.clone();
-        for i in 0..window_nodes.len() {
-            ext_cols.push(ColumnSchema::new(
-                alloc::format!("__win_{i}"),
-                DataType::Text, // type doesn't matter for projection eval
-                true,
-            ));
+        for (i, wnode) in window_nodes.iter().enumerate() {
+            // v7.39.12 — the synthetic column carries the window call's
+            // TYPE.
+            //
+            // The comment here said "type doesn't matter for projection
+            // eval", and for the eval it does not — the values are
+            // already computed. It is the type that travels in the
+            // RowDescription, and psql aligns a column by that: on
+            // `SELECT count(*) AS plaincnt, count(*) OVER () AS wincnt`
+            // PostgreSQL right-aligns both and SPG left-aligned the
+            // second, because the first was bigint and the second was
+            // this `Text`. `\gdesc` — which asks the extended
+            // protocol's Describe — reported the right type for both,
+            // so the two descriptions of one column disagreed.
+            //
+            // Reported by sentori against 7.39.11, found by the
+            // alignment. Text stays as the fallback for a call whose
+            // type this build cannot name, which is what it was.
+            let ty =
+                crate::describe::describe_expr_type(wnode, schema_cols).unwrap_or(DataType::Text);
+            ext_cols.push(ColumnSchema::new(alloc::format!("__win_{i}"), ty, true));
         }
         // 6) Rewrite the projection: WindowFunction nodes → Column(__win_N).
         let mut rewritten_items: Vec<SelectItem> = Vec::with_capacity(stmt.items.len());
@@ -3370,7 +3385,16 @@ impl Engine {
             let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
             let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
-                let keys = build_order_keys(&resolved_order, &r, &synth_ctx)?;
+                // v7.39.12 — a correlated subquery in ORDER BY is resolved
+                // for this row before the key is built; see
+                // `Engine::order_by_resolved_for_row`.
+                let per_row =
+                    self.order_by_resolved_for_row(&resolved_order, &r, &synth_ctx, cancel)?;
+                let keys = build_order_keys(
+                    per_row.as_deref().unwrap_or(&resolved_order),
+                    &r,
+                    &synth_ctx,
+                )?;
                 tagged.push((keys, r));
             }
             sort_by_keys(&mut tagged, &descs);
@@ -6194,7 +6218,17 @@ impl Engine {
                 let descs: Vec<bool> = resolved.iter().map(|o| o.desc).collect();
                 let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
                 for r in rows {
-                    let keys = build_order_keys(&resolved, &r, &synth_ctx)?;
+                    // v7.39.12 — a correlated subquery in ORDER BY is resolved
+                    // for this row before the key is built; see
+                    // `Engine::order_by_resolved_for_row`.
+                    let per_row = self.order_by_resolved_for_row(
+                        &resolved,
+                        &r,
+                        &synth_ctx,
+                        CancelToken::none(),
+                    )?;
+                    let keys =
+                        build_order_keys(per_row.as_deref().unwrap_or(&resolved), &r, &synth_ctx)?;
                     tagged.push((keys, r));
                 }
                 sort_by_keys(&mut tagged, &descs);
@@ -7188,6 +7222,45 @@ impl Engine {
         // once per row. See `order_by_bound_positions`.
         let order_bound =
             crate::orderby::order_by_bound_positions(&order_by, schema_cols, Some(alias));
+        // v7.39.12 — a correlated scalar subquery in ORDER BY is
+        // resolved for the row before its key is built.
+        //
+        // Uncorrelated subqueries are replaced by a literal before
+        // execution; a correlated one cannot be, so it reached the
+        // per-row evaluator — the one place that cannot run a subquery
+        // — and the statement raised "subquery reached row eval".
+        // Reported by sentori against 7.39.11; see
+        // `Engine::order_by_resolved_for_row`.
+        //
+        // The `any` runs once, here, so an ordinary ORDER BY pays one
+        // bool per row and nothing else.
+        let order_has_subquery = order_by
+            .iter()
+            .any(|o| crate::subquery::expr_has_subquery(&o.expr));
+        let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
+        let order_keys_for =
+            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
+                if order_has_subquery {
+                    // A substituted literal is no longer a bound column.
+                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                    return crate::orderby::build_order_keys_bound(
+                        per_row.as_deref().unwrap_or(&order_by),
+                        &unbound,
+                        &order_colls,
+                        row,
+                        &ctx,
+                        buf,
+                    );
+                }
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    buf,
+                )
+            };
         // v7.39 (round 581) — and it stops asking when the answer is
         // always "keep".
         //
@@ -7298,14 +7371,7 @@ impl Engine {
                     return Ok(());
                 }
                 let mut buf = key_pool.pop().unwrap_or_default();
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    &order_colls,
-                    row,
-                    &ctx,
-                    &mut buf,
-                )?;
+                order_keys_for(row, &mut buf)?;
                 // v7.39 (round 581) — reject before projecting.
                 //
                 // `ORDER BY g DESC, id DESC LIMIT 10` over 500k rows with
@@ -7472,14 +7538,7 @@ impl Engine {
                     // this branch never did, so `SELECT DISTINCT k .. ORDER
                     // BY k` resolved "k" by string for every surviving row.
                     let mut buf = key_pool.pop().unwrap_or_default();
-                    crate::orderby::build_order_keys_bound(
-                        &order_by,
-                        &order_bound,
-                        &order_colls,
-                        row,
-                        &ctx,
-                        &mut buf,
-                    )?;
+                    order_keys_for(row, &mut buf)?;
                     buf
                 } else {
                     order_keys
@@ -8070,6 +8129,45 @@ impl Engine {
         // path the planner took, and this is the path a plain single-table
         // SELECT takes.
         let order_colls = crate::orderby::order_by_collations(&order_by, &ctx)?;
+        // v7.39.12 — a correlated scalar subquery in ORDER BY is
+        // resolved for the row before its key is built.
+        //
+        // Uncorrelated subqueries are replaced by a literal before
+        // execution; a correlated one cannot be, so it reached the
+        // per-row evaluator — the one place that cannot run a subquery
+        // — and the statement raised "subquery reached row eval".
+        // Reported by sentori against 7.39.11; see
+        // `Engine::order_by_resolved_for_row`.
+        //
+        // The `any` runs once, here, so an ordinary ORDER BY pays one
+        // bool per row and nothing else.
+        let order_has_subquery = order_by
+            .iter()
+            .any(|o| crate::subquery::expr_has_subquery(&o.expr));
+        let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
+        let order_keys_for =
+            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
+                if order_has_subquery {
+                    // A substituted literal is no longer a bound column.
+                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                    return crate::orderby::build_order_keys_bound(
+                        per_row.as_deref().unwrap_or(&order_by),
+                        &unbound,
+                        &order_colls,
+                        row,
+                        &ctx,
+                        buf,
+                    );
+                }
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    buf,
+                )
+            };
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
@@ -8127,14 +8225,7 @@ impl Engine {
             // re-derivation below is handed the same ones. `finish`'s
             // contract is that a key comes back the way it was pushed;
             // a collation is part of the way it was pushed.
-            crate::orderby::build_order_keys_bound(
-                &order_by,
-                &order_bound,
-                &order_colls,
-                row,
-                &ctx,
-                &mut keys,
-            )?;
+            order_keys_for(row, &mut keys)?;
             sorter.push(&mut keys, row)?;
         }
 
@@ -9266,6 +9357,45 @@ impl Engine {
         // path the planner took, and this is the path a plain single-table
         // SELECT takes.
         let order_colls = crate::orderby::order_by_collations(&order_by, &ctx)?;
+        // v7.39.12 — a correlated scalar subquery in ORDER BY is
+        // resolved for the row before its key is built.
+        //
+        // Uncorrelated subqueries are replaced by a literal before
+        // execution; a correlated one cannot be, so it reached the
+        // per-row evaluator — the one place that cannot run a subquery
+        // — and the statement raised "subquery reached row eval".
+        // Reported by sentori against 7.39.11; see
+        // `Engine::order_by_resolved_for_row`.
+        //
+        // The `any` runs once, here, so an ordinary ORDER BY pays one
+        // bool per row and nothing else.
+        let order_has_subquery = order_by
+            .iter()
+            .any(|o| crate::subquery::expr_has_subquery(&o.expr));
+        let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
+        let order_keys_for =
+            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
+                if order_has_subquery {
+                    // A substituted literal is no longer a bound column.
+                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                    return crate::orderby::build_order_keys_bound(
+                        per_row.as_deref().unwrap_or(&order_by),
+                        &unbound,
+                        &order_colls,
+                        row,
+                        &ctx,
+                        buf,
+                    );
+                }
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    buf,
+                )
+            };
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
@@ -9323,14 +9453,7 @@ impl Engine {
             // re-derivation below is handed the same ones. `finish`'s
             // contract is that a key comes back the way it was pushed;
             // a collation is part of the way it was pushed.
-            crate::orderby::build_order_keys_bound(
-                &order_by,
-                &order_bound,
-                &order_colls,
-                row,
-                &ctx,
-                &mut keys,
-            )?;
+            order_keys_for(row, &mut keys)?;
             sorter.push(&mut keys, row)?;
         }
 

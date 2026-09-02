@@ -8454,6 +8454,13 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
         Expr::Array(_) => strong("array".to_string()),
         // `(expr).field` is named for the field, as a column would be.
         Expr::FieldAccess { field, .. } => strong(field.clone()),
+        // v7.39.12 — PostgreSQL names a subscript after its operand, so
+        // `arr[1]` is `arr`. There was no arm, so it fell through to
+        // `?column?`. Reported by sentori against 7.39.11 — the same
+        // naming defect v7.38.20 closed, reached through a different
+        // expression. Weak, like the field access above it: an outer
+        // cast or function still names the column.
+        Expr::ArraySubscript { target, .. } => (figure_name_inner(target).0, NameStrength::Weak),
         // A cast prefers its argument's name and settles for the type:
         // `upper(s)::text` is `upper`, `(a+b)::text` is `text`.
         Expr::Cast {

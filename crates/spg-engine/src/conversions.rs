@@ -3711,6 +3711,16 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         28 => "xid",
         29 => "cid",
         5069 => "xid8",
+        // v7.39.12 — PG's catalog vectors. v7.39.11 gave them their own
+        // types and `pg_type` rows; this map is the third place a type
+        // has to be known, and without it `format_type` answered `???`
+        // for exactly the five columns that version had just retyped —
+        // which is what `information_schema.columns.data_type` and `\d`
+        // are built on. Reported by sentori against 7.39.11, who
+        // checked that the `pg_type` rows were there and that
+        // `format_type` said `???` anyway.
+        22 => "int2vector",
+        30 => "oidvector",
         114 => "json",
         142 => "xml",
         650 => "cidr",

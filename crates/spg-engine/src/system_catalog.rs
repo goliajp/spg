@@ -10910,11 +10910,50 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             let idx_cols: Vec<usize> = core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
                 .collect();
+            // v7.39.12 — the constraint's columns START WITH the
+            // index's, rather than equalling them.
+            //
+            // Reported by sentori against 7.39.11, and it is a
+            // regression this project shipped: on their own dump,
+            // tables with a findable primary key went from 27 of 27 to
+            // 20 of 27, and the seven that vanished are the ones whose
+            // primary key is composite.
+            //
+            //   ALTER TABLE t ADD PRIMARY KEY (a, b)
+            //                     7.39.10        7.39.11       PG 18
+            //     indisprimary       t              f            t
+            //     indisunique        f              f            t
+            //
+            // SPG builds a SINGLE-column index for a composite
+            // constraint added by `ALTER TABLE` — the form `pg_dump`
+            // emits, so the form every restored database uses — while
+            // the constraint records every column. Equality could never
+            // match, so both flags came back false and nothing marked
+            // the key primary at all. The name-guessing v7.39.11
+            // removed happened to get `indisprimary` right for exactly
+            // this case.
+            //
+            // Longest prefix wins, so an inline composite (whose index
+            // IS composite) still matches on all of its columns rather
+            // than on its first. What stays ambiguous: a user's own
+            // `CREATE INDEX ix ON t (a)` over a table with `PRIMARY KEY
+            // (a, b)` prefix-matches the same constraint, and SPG
+            // records nothing that says which index a constraint
+            // created. It is reported for the constraint's index
+            // because that one is built first and wins the tie on
+            // declaration order; a second index on the same prefix
+            // would be mislabelled. That is a narrower wrong answer
+            // than seven tables with no primary key.
             let backing = t
                 .schema()
                 .uniqueness_constraints
                 .iter()
-                .find(|uc| uc.columns == idx_cols);
+                .filter(|uc| uc.columns.starts_with(&idx_cols))
+                // The tightest prefix: an index on (a) backs `UNIQUE
+                // (a)` rather than `PRIMARY KEY (a, b)` when a table
+                // carries both, because the shorter constraint is the
+                // one it covers exactly.
+                .min_by_key(|uc| uc.columns.len());
             let is_primary = backing.is_some_and(|uc| uc.is_primary_key);
             let is_unique = idx.is_unique || backing.is_some();
             let is_partial = idx.partial_predicate.is_some();

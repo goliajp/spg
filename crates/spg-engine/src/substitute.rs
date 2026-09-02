@@ -24,6 +24,80 @@ use crate::{EngineError, value_to_literal};
 /// would lose precision through Literal and aren't supported in
 /// uncorrelated-subquery results; they error with a clear hint.
 pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
+    value_to_literal_expr_typed(v, None)
+}
+
+/// v7.39.12 — the same conversion, told what the subquery DECLARED.
+///
+/// A scalar subquery materialises through a literal expression, and the
+/// arms below add an explicit cast wherever a `Value` cannot carry its
+/// own identity — this file already records three of those: BIGINT
+/// narrowing to integer, `CHAR(8)` truncating to one character, and
+/// `BIT(n)` failing outright.
+///
+/// Four more, reported by sentori against 7.39.11, and the first is not
+/// an introspection complaint:
+///
+/// ```text
+///                                   PG 18                   SPG 7.39.11
+///   pg_typeof over timestamptz   timestamp with time zone   WITHOUT
+///   pg_typeof over jsonb         jsonb                      unknown
+///   pg_typeof over text          text                       unknown
+///   pg_typeof over bigint[]      bigint[]                   integer[]
+/// ```
+///
+/// `SET TimeZone = 'Asia/Tokyo'; UPDATE iss SET first_seen = (SELECT
+/// min(occurred_at) …)` then stores an instant nine hours from the one
+/// PostgreSQL stores — the session's offset — because the assignment
+/// coerces a `timestamp` rather than moving a `timestamptz`. Under UTC
+/// both agree, which is why nothing had caught it: the published image
+/// defaults to UTC and so do the official ones.
+///
+/// SPG carries no scalar `Value::Timestamptz` — the zone lives in the
+/// column's declared type, not in the value — so the value alone cannot
+/// preserve it. The declared type is what this parameter is for, and it
+/// is used only where the value is genuinely ambiguous.
+pub(crate) fn value_to_literal_expr_typed(
+    v: Value,
+    declared: Option<spg_storage::DataType>,
+) -> Result<Expr, EngineError> {
+    use spg_storage::DataType as D;
+    let cast_to = |v: &Value, name: &str| -> Expr {
+        Expr::Cast {
+            expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(
+                crate::eval::value_to_text(v),
+            ))),
+            target: spg_sql::ast::CastTarget::Named(alloc::string::String::from(name)),
+        }
+    };
+    match (&v, declared) {
+        // The zone. `Value::Timestamp` is what both types hold.
+        (Value::Timestamp(_), Some(D::Timestamptz)) => {
+            return Ok(cast_to(&v, "timestamptz"));
+        }
+        // `Value::Json` holds both spellings; `Value::Text` reaching a
+        // JSON column is the same ambiguity from the other side.
+        (Value::Json(_) | Value::Text(_), Some(D::Jsonb)) => return Ok(cast_to(&v, "jsonb")),
+        (Value::Json(_) | Value::Text(_), Some(D::Json)) => return Ok(cast_to(&v, "json")),
+        // A bare string literal is `unknown` until something types it.
+        (Value::Text(_), Some(D::Text)) => return Ok(cast_to(&v, "text")),
+        // An array of small integers rebuilds as `integer[]` unless the
+        // declaration says otherwise.
+        (
+            Value::IntArray(_) | Value::SmallIntArray(_) | Value::BigIntArray(_),
+            Some(D::BigIntArray),
+        ) => {
+            // `CastTarget::BigIntArray`, not a name: `int8[]` parses in
+            // a written cast but is not a name the target lookup knows.
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(
+                    crate::eval::value_to_text(&v),
+                ))),
+                target: spg_sql::ast::CastTarget::BigIntArray,
+            });
+        }
+        _ => {}
+    }
     let lit = match v {
         Value::Null => Literal::Null,
         // v7.39 (round 189) — a bare Literal::Integer re-types to INT

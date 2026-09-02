@@ -117,12 +117,27 @@ run_unit() {
     # launch under that load runs in under a second when the queue is
     # empty. None of that was the tier's work — but the spawns are the
     # part this file can decide not to make.
-    cargo test --workspace --exclude spg-bench-competitor --locked --lib --bins
+    # v7.39.12 — and `--bins` is gone, because `e2e` runs every one of
+    # them minutes later.
+    #
+    # `cargo test --tests` selects the library and binary targets too,
+    # not only `tests/`. Compared by harness NAME, the set this step
+    # selected was a **subset of e2e's with nothing left over** — zero
+    # names on the difference. So this invocation ran 27 harnesses and
+    # 1,206 tests that the next step ran again.
+    #
+    # `--lib` stays: it is the tier's fast-fail signal, sixteen
+    # harnesses of the crates' own unit tests, and a broken one should
+    # not wait out an hour of e2e to say so. `--bins` was eleven more
+    # harnesses — including spg-server's 108-test binary — for no
+    # coverage `--tests` does not already give.
+    cargo test --workspace --exclude spg-bench-competitor --locked --lib
     if [[ "$FULL" == 1 ]]; then
         cargo test --release --workspace --exclude spg-bench-competitor \
-            --locked --lib --bins -- --ignored
+            --locked --lib -- --ignored
     fi
-    cargo test --workspace --locked --doc
+    # Doc tests are the one thing `--tests` does not reach.
+    cargo test --workspace --exclude spg-bench-competitor --locked --doc
 }
 
 run_e2e() {
