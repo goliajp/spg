@@ -76,8 +76,28 @@ fn port_is_free(p: u16) -> bool {
     if std::net::TcpListener::bind(("127.0.0.1", p)).is_err() {
         return false;
     }
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], p));
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(150)).is_err()
+    // v7.39.12 — the connect has no deadline any more.
+    //
+    // The bind above is not conclusive on its own: BSD lets a specific
+    // address bind over a wildcard one when both carry SO_REUSEADDR,
+    // which Rust's `TcpListener` sets, so a server listening on
+    // `0.0.0.0:p` does not stop `127.0.0.1:p` from binding. The connect
+    // is what catches that case — someone answers, so the port is
+    // taken.
+    //
+    // It carried a 150 ms deadline, and a deadline turns a busy machine
+    // into a wrong ANSWER: connect times out, the timeout reads as "no
+    // one answered", and the probe hands out a port that is being
+    // served. That is what happened — `the_second_port_also_skips_a_port
+    // _someone_is_serving` failed with left and right both 25464 on a
+    // run whose load average went 6.99 to 10.92, and passed three times
+    // out of three when the machine was quieter.
+    //
+    // Nothing needs the deadline. A loopback connect to a port with no
+    // listener is refused by the kernel immediately; a port WITH one
+    // completes immediately. Both answers are prompt, and neither of
+    // them is a stopwatch.
+    std::net::TcpStream::connect(("127.0.0.1", p)).is_err()
 }
 
 impl Roster {
