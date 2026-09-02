@@ -8632,6 +8632,24 @@ impl Engine {
             if !cols[order_pos].nullable {
                 return Ok(0);
             }
+            // v7.39.11 — nothing to emit once the LIMIT is met, and
+            // finding that out must not cost a scan.
+            //
+            // This pass looks for NULL-keyed rows by walking the whole
+            // heap, because they are not in the tree. That is the price
+            // r1046 measured and accepted for an UNBOUNDED order. With
+            // a LIMIT the walk above has usually already produced every
+            // row the caller asked for, and scanning 400,000 rows to
+            // add none of them is the whole cost of the query: the
+            // release sweep's `SELECT pad FROM t ORDER BY n LIMIT 10`
+            // over a nullable indexed NUMERIC went 0.237 ms at 50,000
+            // rows and 2.251 at 400,000 — linear, against PostgreSQL's
+            // 0.155 and 0.182 — the moment this gate started accepting
+            // LIMIT. The `remaining` check below sits after the
+            // per-row filters, so it could never be reached.
+            if *remaining == Some(0) {
+                return Ok(0);
+            }
             let mut n = 0usize;
             for (ri, row) in table.rows().iter().enumerate() {
                 if !matches!(row.values.get(order_pos), Some(Value::Null)) {

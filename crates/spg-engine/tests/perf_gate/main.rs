@@ -89,6 +89,7 @@ mod count_unseen;
 mod join_reorder;
 mod mailrs_prod_cascade_100k;
 mod never_die;
+mod nullable_top_n_scaling;
 mod ordered_agg;
 mod plan_cache;
 mod proj_borrow;
