@@ -795,6 +795,10 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         // types (`ARRAY[1, 2.5]` → numeric[], `ARRAY[1, 2.5::float8]` →
         // double precision[]); report them instead of falling to "unknown".
         Value::SmallIntArray(_) => "smallint[]",
+        // v7.39.11 — their own type names, as `\d` and every schema
+        // tool reads them.
+        Value::Int2Vector(_) => "int2vector",
+        Value::OidVector(_) => "oidvector",
         Value::NumericArray(_) => "numeric[]",
         Value::FloatArray(_) => "double precision[]",
         // v7.39 (read01 round 73) — the 2-D forms. Every 1-D element type already

@@ -124,6 +124,10 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // v7.39 (round 694) — OID[] the same way; OID 1028 via
         // `pg_type_oid`.
         | DataType::OidArray
+        // v7.39.11 — the catalog vectors print space-separated with no
+        // braces, which is their own output function, not the array one.
+        | DataType::Int2Vector
+        | DataType::OidVector
         // v7.37.5 β-P4 — INTERVAL[] collapses to Text on the wire
         // as PG external array form: `{"1 day","24:00:00",NULL}`.
         // RowDescription advertises OID 1187 via `pg_type_oid`.

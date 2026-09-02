@@ -441,6 +441,19 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         // ζ-A/γ/δ/ε first-class types.
         Value::BoolArray(items) => crate::eval::format_bool_array(items),
         Value::SmallIntArray(items) => crate::eval::format_smallint_array(items),
+        // v7.39.11 — PG's vector output function: elements separated by
+        // one space, no braces, no quoting. `1 2` where the array types
+        // print `{1,2}`.
+        Value::Int2Vector(items) => items
+            .iter()
+            .map(alloc::string::ToString::to_string)
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" "),
+        Value::OidVector(items) => items
+            .iter()
+            .map(alloc::string::ToString::to_string)
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" "),
         Value::FloatArray(items) => crate::eval::format_float_array_styled(items, style),
         Value::NumericArray(items) => crate::eval::format_numeric_array(items),
         Value::DateArray(items) => crate::eval::format_date_array_styled(items, style),
@@ -507,6 +520,10 @@ pub(crate) fn array_len(v: &Value) -> Option<usize> {
         Value::IntArray(items) => Some(items.len()),
         Value::BigIntArray(items) => Some(items.len()),
         Value::SmallIntArray(items) => Some(items.len()),
+        // v7.39.11 — the catalog vectors ARE arrays; only their I/O
+        // differs. Without these two arms `= ANY (i.indkey)` raised.
+        Value::Int2Vector(items) => Some(items.len()),
+        Value::OidVector(items) => Some(items.len()),
         Value::BoolArray(items) => Some(items.len()),
         Value::FloatArray(items) => Some(items.len()),
         Value::NumericArray(items) => Some(items.len()),
@@ -590,6 +607,9 @@ pub(crate) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         Value::IntArray(items) => nth!(items, |n| Value::Int(*n)),
         Value::BigIntArray(items) => nth!(items, |n| Value::BigInt(*n)),
         Value::SmallIntArray(items) => nth!(items, |n| Value::SmallInt(*n)),
+        // v7.39.11 — no null flags to unwrap; PG's vectors hold none.
+        Value::Int2Vector(items) => items.get(pos).map(|n| Value::SmallInt(*n)),
+        Value::OidVector(items) => items.get(pos).map(|n| Value::BigInt(i64::from(*n))),
         Value::BoolArray(items) => nth!(items, |b| Value::Bool(*b)),
         Value::FloatArray(items) => nth!(items, |f| Value::Float(*f)),
         Value::NumericArray(items) => {

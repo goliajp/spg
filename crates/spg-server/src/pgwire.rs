@@ -8191,6 +8191,18 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
         Value::SmallIntArray(items) => put(&binary_array(items, 21, |v, b| {
             b.extend_from_slice(&v.to_be_bytes());
         })),
+        // v7.39.11 — PG's catalog vectors ARE arrays on the wire; the
+        // only difference is that their subscripts start at 0, which
+        // the array header carries as the lower bound. Without these
+        // two arms a binary-format client reading `pg_index.indkey`
+        // got "binary result format not implemented" where it used to
+        // read the column as text.
+        Value::Int2Vector(items) => put(&binary_vector(items, 21, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
+        Value::OidVector(items) => put(&binary_vector(items, 26, |v, b| {
+            b.extend_from_slice(&v.to_be_bytes());
+        })),
         Value::FloatArray(items) => put(&binary_array(items, 701, |v, b| {
             b.extend_from_slice(&v.to_be_bytes());
         })),
@@ -8252,6 +8264,25 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
 
 /// v7.39 — encode a 1-D array in PG's binary array format. `enc`
 /// writes one element's payload; NULL elements get len -1.
+/// v7.39.11 — `binary_array` for PG's catalog vectors: no NULL
+/// elements (they hold none) and a lower bound of 0, which is what
+/// makes `indkey[0]` the first key column.
+fn binary_vector<T>(items: &[T], elem_oid: u32, enc: impl Fn(&T, &mut Vec<u8>)) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + items.len() * 8);
+    buf.extend_from_slice(&1i32.to_be_bytes()); // ndim
+    buf.extend_from_slice(&0i32.to_be_bytes()); // no NULL bitmap
+    buf.extend_from_slice(&elem_oid.to_be_bytes());
+    buf.extend_from_slice(&(items.len() as i32).to_be_bytes());
+    buf.extend_from_slice(&0i32.to_be_bytes()); // lower bound
+    for v in items {
+        let mut payload = Vec::new();
+        enc(v, &mut payload);
+        buf.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        buf.extend_from_slice(&payload);
+    }
+    buf
+}
+
 fn binary_array<T>(items: &[Option<T>], elem_oid: u32, enc: impl Fn(&T, &mut Vec<u8>)) -> Vec<u8> {
     let has_null = items.iter().any(Option::is_none);
     let mut buf = Vec::with_capacity(20 + items.len() * 8);
@@ -8785,6 +8816,9 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::BigIntArray => 1016, // PG `_int8` (BIGINT[]) — v7.11.12 Epic 3
         // v7.39 (round 694) — PG `_oid`.
         DataType::OidArray => 1028,
+        // v7.39.11 — PG's own OIDs for the catalog vectors.
+        DataType::Int2Vector => 22,
+        DataType::OidVector => 30,
         DataType::TsVector => 3614, // PG `tsvector` — v7.12.0 G-CRIT-3
         DataType::TsQuery => 3615,  // PG `tsquery` — v7.12.0 G-CRIT-3
         DataType::Uuid => 2950,     // PG `uuid` — v7.17.0 Phase 3 P0-25

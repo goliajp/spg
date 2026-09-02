@@ -257,9 +257,21 @@ mod recorded_delta_register {
         out
     }
 
-    fn ids_in_register(root: &Path) -> BTreeSet<String> {
-        let text = std::fs::read_to_string(root.join("docs/RECORDED_DELTAS.md"))
-            .expect("docs/RECORDED_DELTAS.md must exist");
+    /// v7.39.11 — the register lives under `tmp/`, which is internal
+    /// and not in the published tree.
+    ///
+    /// It moved there when the repository stopped carrying development
+    /// and process material, and this reader was not moved with it, so
+    /// the row has been red on every full run since — which is to say
+    /// on none of them, because the two releases in between skipped the
+    /// gate. `prod_ready` had this exact problem with the internal docs
+    /// and answered it the same way: a check whose SOURCE is absent
+    /// skips rather than fails, because a clone that never had the file
+    /// is not a tree that lost its register.
+    const REGISTER: &str = "tmp/docs/RECORDED_DELTAS.md";
+
+    fn ids_in_register(root: &Path) -> Option<BTreeSet<String>> {
+        let text = std::fs::read_to_string(root.join(REGISTER)).ok()?;
         let mut out = BTreeSet::new();
         let mut rest = text.as_str();
         while let Some(i) = rest.find("| RD-") {
@@ -269,20 +281,25 @@ mod recorded_delta_register {
                 out.insert(format!("RD-{n}"));
             }
         }
-        out
+        Some(out)
     }
 
     #[test]
     fn every_marker_has_a_row_and_every_row_has_a_marker() {
         let root = root();
         let src = ids_in_source(&root);
-        let reg = ids_in_register(&root);
         assert!(!src.is_empty(), "no RD- markers found — the scan is broken");
+        let Some(reg) = ids_in_register(&root) else {
+            // Say so rather than passing quietly: a skip nobody can see
+            // is the same as no gate.
+            println!("{REGISTER} is not in this tree — register check skipped");
+            return;
+        };
 
         let unlisted: Vec<&String> = src.difference(&reg).collect();
         assert!(
             unlisted.is_empty(),
-            "a source comment records these deltas and docs/RECORDED_DELTAS.md \
+            "a source comment records these deltas and {REGISTER} \
              does not list them: {unlisted:?}. Measure both engines and add a row."
         );
 
@@ -301,7 +318,7 @@ mod recorded_delta_register {
             .collect();
         assert!(
             orphaned.is_empty(),
-            "docs/RECORDED_DELTAS.md lists these deltas and no source comment \
+            "{REGISTER} lists these deltas and no source comment \
              records them: {orphaned:?}. If they were closed, delete the rows."
         );
     }

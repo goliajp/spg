@@ -16563,20 +16563,24 @@ impl Parser {
         };
         // v7.9.14 — accept extra comma-separated columns inside
         // the index key parens (`CREATE INDEX … (a, b, c)`).
-        // mailrs F2. Each extra column may carry an optional
-        // `ASC` / `DESC` / `NULLS FIRST` / `NULLS LAST` clause
-        // — parsed and discarded; SPG doesn't honour direction
-        // on a BTree index today (column ordering is intrinsic
-        // to the storage). v7.10 will widen to genuine composite
-        // index keys.
+        // mailrs F2.
+        //
+        // v7.39.11 — each extra column's `ASC` / `DESC` / `NULLS FIRST`
+        // / `NULLS LAST` is KEPT. It used to be parsed and dropped on
+        // the floor, so `CREATE INDEX i ON t (a, b DESC)` read back from
+        // `pg_get_indexdef` as `(a, b)`: a dump lost the clause and a
+        // schema diff saw drift on every run. Reported by sentori
+        // against 7.39.10, and the same defect round 537 fixed for the
+        // LEADING column, in the loop right beside it.
         let mut extra_columns: Vec<String> = Vec::new();
+        let mut extra_orders: Vec<crate::ast::IndexColumnOrder> = Vec::new();
         // The leading column may also have ASC/DESC after it — and that
         // one is the column SPG indexes, so its clause is kept.
         let key_order = self.consume_optional_index_column_qualifiers();
         while matches!(self.peek(), Token::Comma) {
             self.advance();
             let extra = self.expect_ident_like()?;
-            let _ = self.consume_optional_index_column_qualifiers();
+            extra_orders.push(self.consume_optional_index_column_qualifiers());
             extra_columns.push(extra);
         }
         if !matches!(self.peek(), Token::RParen) {
@@ -16705,6 +16709,7 @@ impl Parser {
             included_columns,
             partial_predicate,
             extra_columns: extra_columns.clone(),
+            extra_orders: extra_orders.clone(),
             expression,
             is_unique,
             opclass,

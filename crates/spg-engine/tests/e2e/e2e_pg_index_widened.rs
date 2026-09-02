@@ -83,10 +83,19 @@ fn pg_index_indkey_carries_one_based_column_position() {
     e.execute("CREATE INDEX ix_t_c ON t(c)").unwrap();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_index");
     let ix = rs.first().expect("one index row");
+    // v7.39.11 — `indkey` is a real `int2vector` now, not the text
+    // that happened to print the same. The claim this pin makes is
+    // unchanged: the position is PG's 1-based attnum, where SPG stores
+    // it 0-based.
     match &ix[15] {
-        Value::Text(s) => assert_eq!(s.as_ref(), "3", "indkey should be `3`"),
+        Value::Int2Vector(v) => assert_eq!(v.as_slice(), [3], "indkey should be `3`"),
         other => panic!("indkey wrong type: {other:?}"),
     }
+    assert_eq!(
+        spg_engine::eval::value_to_text(&ix[15]),
+        "3",
+        "and it still PRINTS the way PG prints an int2vector"
+    );
 }
 
 #[test]

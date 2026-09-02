@@ -2397,6 +2397,12 @@ pub struct CreateIndexStatement {
     /// that only the leading column is currently honoured.
     /// Composite BTree index keys land in v7.10.
     pub extra_columns: Vec<String>,
+    /// v7.39.11 — each extra column's `ASC` / `DESC` / `NULLS FIRST`
+    /// / `NULLS LAST`, positionally aligned with `extra_columns`. The
+    /// parser used to discard these, so a composite index's direction
+    /// survived only on the leading column and `pg_get_indexdef`
+    /// rendered `(a, b DESC)` back as `(a, b)`.
+    pub extra_orders: Vec<IndexColumnOrder>,
     /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
     /// enforces uniqueness on the indexed key (combined with the
     /// `partial_predicate` filter — only rows where the predicate

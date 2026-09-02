@@ -1698,7 +1698,22 @@ fn cast_catalog_scalar_lower(
                     return Err(bad(elem_ty, part));
                 }
             }
-            Value::text(t.to_string())
+            // v7.39.11 — a real vector, not the text that happens to
+            // print the same. Through 7.39.10 this was `Value::text`,
+            // and every array operation over a catalog vector raised.
+            if elem_ty == "oid" {
+                Value::OidVector(
+                    t.split_whitespace()
+                        .map(|p| p.parse::<u32>().unwrap_or_default())
+                        .collect(),
+                )
+            } else {
+                Value::Int2Vector(
+                    t.split_whitespace()
+                        .map(|p| p.parse::<i16>().unwrap_or_default())
+                        .collect(),
+                )
+            }
         }
         // `grantee=privileges/grantor`, and PG checks the key word first:
         // anything before the `=` that is not a role name, `group` or

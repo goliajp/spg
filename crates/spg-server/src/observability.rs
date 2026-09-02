@@ -617,6 +617,9 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // (~4 elements × element size).
                 DataType::IntArray => 16,
                 DataType::BigIntArray | DataType::OidArray => 32,
+                // v7.39.11 — index key vectors; a handful of elements.
+                DataType::Int2Vector => 16,
+                DataType::OidVector => 32,
                 // v7.12.0 — tsvector averages ~80 lexemes × ~8B
                 // each per the v7.12 design risk register R2.
                 DataType::TsVector => 640,

@@ -147,6 +147,15 @@ fn numeric_gcd_lcm(x: &Value<'_>, y: &Value<'_>, want_lcm: bool) -> Option<Value
 /// WHERE, trailing semicolon). `pretty` drops the redundant top-level
 /// WHERE parentheses, as PG's pretty mode does. Shapes beyond a plain
 /// single-table SELECT fall back to the stored single-line body.
+/// v7.39.11 — the lower bound of an array's subscripts. 1 for every
+/// array type; 0 for PG's catalog vectors, whose subscripts and
+/// `array_position` results both start there. Measured on PG 18.6 with
+/// `(b, c)` indexed: `array_position(indkey, 2::smallint)` answers 0,
+/// not 1.
+fn array_lower_bound(v: &Value) -> i32 {
+    i32::from(!matches!(v, Value::Int2Vector(_) | Value::OidVector(_)))
+}
+
 pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
     let Ok(spg_sql::ast::Statement::Select(stmt)) = spg_sql::parser::parse_statement(body) else {
         return body.to_string();
@@ -5299,7 +5308,9 @@ fn apply_function_dispatch(
             for i in start_at..len {
                 let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
                 if array_search_match(&elem, &args[1])? {
-                    return Ok(Value::Int(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                    return Ok(Value::Int(
+                        i32::try_from(i).unwrap_or(i32::MAX) + array_lower_bound(&args[0]),
+                    ));
                 }
             }
             Ok(Value::Null)
@@ -5654,7 +5665,9 @@ fn apply_function_dispatch(
             for i in 0..len {
                 let elem = array_element_at(&args[0], i).unwrap_or(Value::Null);
                 if array_search_match(&elem, &args[1])? {
-                    hits.push(Some(i32::try_from(i + 1).unwrap_or(i32::MAX)));
+                    hits.push(Some(
+                        i32::try_from(i).unwrap_or(i32::MAX) + array_lower_bound(&args[0]),
+                    ));
                 }
             }
             Ok(Value::IntArray(hits))
