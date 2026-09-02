@@ -67,7 +67,8 @@ if [[ "${1:-}" == "--on-mini" ]]; then
     # `recorded_delta_register` row reads. Without it that row skips on
     # the testbed, so the gate would run everywhere except where it is
     # meant to run.
-    rsync -az --delete --filter='P /target/' --filter='+ /tmp/docs/***' \
+    rsync -az --delete --filter='P /target/' \
+        --filter='+ /tmp/' --filter='+ /tmp/docs/***' --filter='- /tmp/*' \
         --filter=':- .gitignore' \
         --out-format='%n' ./ "$HOST:$RDIR/" | grep -E '\.(rs|toml)$' > /tmp/spg-synced.txt || true
     if [ -s /tmp/spg-synced.txt ]; then
