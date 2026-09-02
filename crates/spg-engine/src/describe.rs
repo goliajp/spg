@@ -893,6 +893,56 @@ pub(crate) fn describe_expr_in(
                     nullable: true,
                 });
             }
+            // v7.39.12 — an AGGREGATE used as a window function.
+            //
+            // `count(*) OVER ()` fell through this arm's
+            // `function_return_shape`, which does not carry the
+            // aggregates, and the whole arm returned None — so the row
+            // stream declared it TEXT while the bare `count(*)` beside
+            // it declared bigint. psql aligns by the row stream's type,
+            // so the window column was the one left-aligned in a row of
+            // right-aligned numbers; sentori found it that way.
+            //
+            // The bounded set PostgreSQL fixes regardless of argument:
+            // count is bigint, and the booleans are boolean. The rest
+            // (sum, avg, min, max, …) report their argument's type,
+            // which is what the fallthrough below already does when
+            // `function_return_shape` knows the call.
+            if let Some(ty) = match lower.as_str() {
+                // `count(*)` is held as `count_star` so the star arity
+                // survives the AST; both spellings are one aggregate.
+                "count" | "count_star" => Some(DataType::BigInt),
+                "bool_and" | "bool_or" | "every" => Some(DataType::Bool),
+                "string_agg" => Some(DataType::Text),
+                _ => None,
+            } {
+                return Some(ExprShape {
+                    name: lower,
+                    ty,
+                    nullable: true,
+                });
+            }
+            if matches!(lower.as_str(), "sum" | "avg" | "min" | "max")
+                && let Some(a) = args.first()
+                && let Some(inner) = describe_expr_in(a, schema_cols, cat)
+            {
+                // PG widens sum/avg; min/max keep the argument's type.
+                let ty = match (lower.as_str(), inner.ty) {
+                    ("sum", DataType::Int | DataType::SmallInt) => DataType::BigInt,
+                    ("avg", DataType::Int | DataType::SmallInt | DataType::BigInt) => {
+                        DataType::Numeric {
+                            precision: 0,
+                            scale: 0,
+                        }
+                    }
+                    (_, t) => t,
+                };
+                return Some(ExprShape {
+                    name: lower,
+                    ty,
+                    nullable: true,
+                });
+            }
             let inner = function_return_shape(name, args, schema_cols)?;
             Some(ExprShape {
                 name: lower,
@@ -981,14 +1031,14 @@ pub(crate) fn describe_expr_in(
         // (array_agg(…))[1] — element type of the array.
         Expr::ArraySubscript { target, .. } => {
             let inner = describe_expr_in(target, schema_cols, cat)?;
-            let elem = match inner.ty {
-                DataType::IntArray => DataType::Int,
-                DataType::BigIntArray => DataType::BigInt,
-                DataType::TextArray => DataType::Text,
-                other => other,
-            };
+            let elem = array_element_type(inner.ty).unwrap_or(inner.ty);
             Some(ExprShape {
-                name: "?column?".to_string(),
+                // v7.39.12 — PostgreSQL names a subscript after its
+                // operand, so `arr[1]` is `arr` and not `?column?`.
+                // This is the naming defect v7.38.20 closed, reached
+                // through a different expression; sentori found it
+                // beside the type.
+                name: inner.name,
                 ty: elem,
                 nullable: true,
             })
@@ -1037,6 +1087,49 @@ pub(crate) fn describe_expr_in(
 /// runtime values in a way the planner can't statically resolve
 /// (e.g. `coalesce(arg1, arg2)` where arg1 is NULL literal — the
 /// caller's type-inference cascade handles those).
+/// v7.39.12 — one array-element map, because there were two and the
+/// short one was wrong.
+///
+/// The `unnest` arm below carries the full family; the array-subscript
+/// arm carried Int / `BigInt` / Text and returned the ARRAY type for
+/// everything else. So `arr[1]` over a `smallint[]` described itself as
+/// `smallint[]`, and psql — which aligns a column by the type the ROW
+/// STREAM declares — left-aligned a number.
+///
+/// Reported by sentori against 7.39.11: `\gdesc` gave the right type
+/// for every one of these and the row stream did not, and the tell was
+/// the alignment.
+fn array_element_type(ty: DataType) -> Option<DataType> {
+    Some(match ty {
+        DataType::IntArray => DataType::Int,
+        DataType::SmallIntArray => DataType::SmallInt,
+        DataType::BigIntArray => DataType::BigInt,
+        DataType::OidArray => DataType::Oid,
+        DataType::BoolArray => DataType::Bool,
+        DataType::UuidArray => DataType::Uuid,
+        DataType::FloatArray => DataType::Float,
+        DataType::NumericArray => DataType::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+        DataType::DateArray => DataType::Date,
+        DataType::TimestampArray => DataType::Timestamp,
+        DataType::TimestamptzArray => DataType::Timestamptz,
+        DataType::JsonArray => DataType::Json,
+        DataType::JsonbArray => DataType::Jsonb,
+        DataType::BytesArray => DataType::Bytes,
+        DataType::IntervalArray => DataType::Interval,
+        DataType::TextArray => DataType::Text,
+        DataType::VarcharArray => DataType::Varchar(0),
+        DataType::CharArray => DataType::Char(0),
+        DataType::MoneyArray => DataType::Money,
+        // v7.39.11's catalog vectors are arrays too.
+        DataType::Int2Vector => DataType::SmallInt,
+        DataType::OidVector => DataType::Oid,
+        _ => return None,
+    })
+}
+
 fn function_return_shape(
     name: &str,
     args: &[Expr],
@@ -1113,7 +1206,18 @@ fn function_return_shape(
         "decode" | "hex" => (DataType::Bytes, true),
         // Integer-returning length / position helpers.
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
-        | "position" | "strpos" | "ascii" | "masklen" => (DataType::Int, true),
+        | "position" | "strpos" | "ascii" | "masklen"
+        // v7.39.12 — the array position / dimension helpers, which
+        // PostgreSQL returns as integer and this map did not carry, so
+        // the row stream declared them TEXT and psql left-aligned a
+        // number. Reported by sentori against 7.39.11 over a plain
+        // `smallint[]` — not only over the vector types v7.39.11 added.
+        | "array_position"
+        | "array_length"
+        | "array_lower"
+        | "array_upper"
+        | "array_ndims"
+        | "cardinality" => (DataType::Int, true),
         // BigInt-returning.
         "count" | "count_star" | "nextval" | "currval" | "lastval" | "unix_timestamp" => {
             (DataType::BigInt, true)

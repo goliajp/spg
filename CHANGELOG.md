@@ -10,6 +10,107 @@ the current build; this file is a release-organized view.
 
 ## [7.39.12] — 2026-09-03
 
+### Fixed
+
+sentori's 7.39.11 report, every item, measured against PostgreSQL 18.6
+before anything was changed. The first is a regression this project
+shipped last version.
+
+- **A composite PRIMARY KEY added by `ALTER TABLE` stopped being
+  findable in `pg_index`.** On their own dump, tables with a findable
+  primary key went from 27 of 27 to 20 of 27, and the seven that
+  vanished are the ones whose primary key is composite:
+
+  ```text
+    ALTER TABLE t ADD PRIMARY KEY (a, b)
+                      7.39.10        7.39.11       PG 18.6
+      indisprimary       t              f             t
+      indisunique        f              f             t
+  ```
+
+  v7.39.11 closed the single-column case by reading the flags off the
+  CONSTRAINT instead of guessing from the index's name, and matched the
+  constraint's columns to the index's by equality. SPG builds a
+  single-column index for a composite constraint added by `ALTER TABLE`
+  — the form `pg_dump` emits, so the form every restored database uses
+  — so equality could never match and both flags came back false. The
+  name-guessing that was removed happened to get `indisprimary` right
+  for exactly this case. The constraint's columns must now START WITH
+  the index's, longest prefix first.
+
+- **A scalar subquery over `timestamptz` moved the instant it stored.**
+
+  ```text
+    SET TimeZone = 'Asia/Tokyo';
+    UPDATE iss SET first_seen = (SELECT min(occurred_at) FROM ev);
+    extract(epoch FROM first_seen)
+
+      PG 18.6      1767225600
+      SPG 7.39.11  1767193200      <- nine hours, the session's offset
+  ```
+
+  Under UTC both agree, which is why nothing had caught it: the
+  published image defaults to UTC and so do the official ones. A scalar
+  subquery materialises through a literal expression, and SPG carries no
+  scalar `Value::Timestamptz` — the zone lives in the column's declared
+  type — so the value alone could not preserve it and the assignment
+  coerced a `timestamp`. The declared type is passed into that
+  conversion now, which also closes the introspection arm: `pg_typeof`
+  over a scalar subquery answered `unknown` for `text`, and narrowed
+  `bigint[]` to `integer[]`.
+
+  `jsonb` improves rather than closes: it answered `unknown` and now
+  answers `json`. SPG carries JSON and JSONB in one `Value` variant, so
+  the two are not distinguishable at the point the literal is rebuilt.
+
+- **A correlated scalar subquery in `ORDER BY` raised.**
+
+  ```text
+    SELECT i.id FROM issues i
+     ORDER BY (SELECT max(e.occurred_at) FROM events e
+                WHERE e.issue_id = i.id) DESC NULLS LAST
+    ERROR:  subquery reached row eval — engine resolver bug
+  ```
+
+  The message names itself. An uncorrelated subquery in `ORDER BY` is
+  replaced by a literal before execution; a correlated one cannot be,
+  so it reached the per-row evaluator, which is the one place that
+  cannot run a subquery. It is the ordering a shipped subcommand of
+  theirs uses, and it raised rather than mis-sorting. Resolved per row
+  now, in the three sort paths that build keys from a bound position
+  list; the check that decides whether to is one `any` per statement.
+
+- **The row stream and Describe disagreed for three kinds of
+  expression.** psql aligns a column by the type the row stream's
+  `RowDescription` carries; `\gdesc` asks Describe. They disagreed, and
+  the tell was that psql left-aligned columns PostgreSQL right-aligns.
+
+  ```text
+                                        PG 18.6      SPG 7.39.11
+    count(*) OVER ()                    bigint       text
+    array_position(arr, 8::smallint)    integer      text
+    arr[1]                              smallint     smallint[]
+    arr[1] — the column's NAME          arr          ?column?
+  ```
+
+  Three causes. The window rewrite gave its synthetic `__win_N` column
+  `DataType::Text` under a comment saying the type does not matter for
+  projection eval — true of the eval, and that type is what travels in
+  the RowDescription. The array-position family was missing from the
+  function return map. And the array-subscript arm carried its own
+  three-entry element map where the workspace already had a full one,
+  so a `smallint[]` subscript described itself as `smallint[]`. The
+  naming is the defect v7.38.20 closed, reached through an expression
+  that had no arm.
+
+- **`format_type` answered `???` for the catalog vectors.** v7.39.11
+  gave `indkey` / `indclass` / `indoption` / `indcollation` /
+  `proargtypes` their own types and `pg_type` rows; the regtype name map
+  is a third place a type has to be known, and without it `format_type`
+  — which `information_schema.columns.data_type` and `\d` are built on
+  — answered `???` for exactly the five columns that had just been
+  retyped.
+
 ### Changed
 
 The release tier, decomposed rather than trimmed. Everything below is a

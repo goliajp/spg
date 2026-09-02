@@ -186,6 +186,60 @@ impl Engine {
     /// the inner SELECT, and replaces the node with the literal
     /// result. Only the WHERE-filter call sites use this path so
     /// the uncorrelated fast path is preserved everywhere else.
+    /// v7.39.12 — an `ORDER BY` whose key is a correlated scalar
+    /// subquery, resolved for one row.
+    ///
+    /// Reported by sentori against 7.39.11, and it predates it:
+    ///
+    /// ```text
+    ///   SELECT i.id FROM issues i
+    ///    ORDER BY (SELECT max(e.occurred_at) FROM events e
+    ///               WHERE e.issue_id = i.id) DESC NULLS LAST
+    ///   ERROR:  subquery reached row eval — engine resolver bug
+    /// ```
+    ///
+    /// The message names itself. Uncorrelated subqueries in `ORDER BY`
+    /// are replaced by a literal before execution, and correlated ones
+    /// cannot be — they have a different value per row — so they
+    /// reached the per-row evaluator, which is the one place that
+    /// cannot run a subquery. Everything adjacent answers: the same
+    /// correlated subquery in the SELECT list, in `WHERE`, an
+    /// uncorrelated one in `ORDER BY`, and both rewrites (`LATERAL`,
+    /// and the `GROUP BY` join) — so it is the correlation AND the
+    /// `ORDER BY` position together.
+    ///
+    /// It is what `backfill_split` does, a shipped subcommand of
+    /// theirs, and the statement raised rather than mis-sorting.
+    ///
+    /// Returns the order list unchanged when no key holds a subquery,
+    /// which is every ordinary statement and costs one tree walk.
+    pub(crate) fn order_by_resolved_for_row(
+        &self,
+        order_by: &[spg_sql::ast::OrderBy],
+        row: &Row<'static>,
+        ctx: &EvalContext<'_>,
+        cancel: CancelToken<'_>,
+    ) -> Result<Option<alloc::vec::Vec<spg_sql::ast::OrderBy>>, EngineError> {
+        if !order_by.iter().any(|o| expr_has_subquery(&o.expr)) {
+            return Ok(None);
+        }
+        let mut out = alloc::vec::Vec::with_capacity(order_by.len());
+        for o in order_by {
+            if !expr_has_subquery(&o.expr) {
+                out.push(o.clone());
+                continue;
+            }
+            let v = self.eval_expr_with_correlated(&o.expr, row, ctx, cancel, None)?;
+            let mut o2 = o.clone();
+            // The same materialisation a resolved subquery takes, so a
+            // key keeps the type its inner SELECT declared — see
+            // `value_to_literal_expr_typed`.
+            o2.expr = crate::substitute::value_to_literal_expr(v)?;
+            out.push(o2);
+        }
+        Ok(Some(out))
+    }
+
     pub(crate) fn eval_expr_with_correlated(
         &self,
         expr: &Expr,
@@ -1117,7 +1171,12 @@ impl Engine {
                 return Err(EngineError::CardinalityViolation);
             }
         };
-        Ok(Some(value_to_literal_expr(value)?))
+        // v7.39.12 — hand the conversion what the subquery DECLARED,
+        // because some types are not recoverable from the value.
+        Ok(Some(crate::substitute::value_to_literal_expr_typed(
+            value,
+            columns.first().map(|c| c.ty),
+        )?))
     }
 
     pub(crate) fn subquery_replacement(
