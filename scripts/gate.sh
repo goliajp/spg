@@ -131,13 +131,55 @@ run_unit() {
     # not wait out an hour of e2e to say so. `--bins` was eleven more
     # harnesses — including spg-server's 108-test binary — for no
     # coverage `--tests` does not already give.
-    cargo test --workspace --exclude spg-bench-competitor --locked --lib
-    if [[ "$FULL" == 1 ]]; then
-        cargo test --release --workspace --exclude spg-bench-competitor \
-            --locked --lib -- --ignored
-    fi
-    # Doc tests are the one thing `--tests` does not reach.
+    # v7.39.12 — doc tests, and nothing else.
+    #
+    # Every distinct `cargo test` target selection costs a full
+    # rebuild, because cargo resolves features over the selected
+    # members and a different member set is a different feature set.
+    # Measured on this workspace, the same command, the same tree:
+    #
+    #   after a DIFFERENT selection ran   358 s
+    #   after the SAME selection ran       11 s
+    #   the fifteen harnesses, by hand     11 s
+    #
+    # The 347 s is cargo re-resolving and rebuilding. This tier made a
+    # dozen differently shaped calls and paid it at every transition —
+    # `e2e` alone read 4,156 s of a 7,314 s tier, and the tests inside
+    # it report 127 s.
+    #
+    # So each profile gets ONE selection. `--lib` is gone from here:
+    # compared by harness name its set was a subset of e2e's `--tests`
+    # with nothing left over, so it ran 1,206 tests that e2e ran again
+    # AND made every later step rebuild. Doc tests are the one thing
+    # `--tests` cannot reach, and they need their own rustdoc pass
+    # whatever else happens.
     cargo test --workspace --exclude spg-bench-competitor --locked --doc
+}
+
+
+# v7.39.12 — one release build for every step that needs release
+# artefacts, because each distinct cargo selection is a rebuild.
+#
+# The release side made eleven differently shaped calls — `-p
+# spg-server --test prod_ready`, `-p spg-server --test slo_smoke`,
+# `-p <crate> --test perf_gate` eight times, `-p sqllogictest`, `-p
+# spg-dogfood-replay`, `-p spg-perm-runner` — and cargo re-resolved
+# features and rebuilt at every transition. Measured on the debug
+# side, same command and same tree: 358 s after a different selection,
+# 11 s after the same one.
+#
+# Two selections now cover all of it: the workspace's binaries, and the
+# workspace's release test harnesses. Everything downstream runs what
+# they produced. `--features perf-counters` stays its own build; a
+# different feature set is a different artefact and cannot be shared.
+_release_built=0
+ensure_release_build() {
+    [[ "$_release_built" == 1 ]] && return 0
+    banner "release build (once, shared by gates / biz / dogfood / perm)"
+    cargo build --release --locked --workspace --exclude spg-bench-competitor
+    cargo test --release --locked --workspace --exclude spg-bench-competitor \
+        --tests --no-run
+    _release_built=1
 }
 
 run_e2e() {
@@ -156,8 +198,15 @@ run_e2e() {
     # crate leaves 62 harnesses, 20 of them empty, and 9,086 tests —
     # the same 9,086. Forty spawns that bought nothing, on top of the
     # fifty-seven the unit step was making.
-    cargo test --workspace --exclude spg-bench-competitor --locked --tests \
-        -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+    # v7.39.12 — build the selection once, then run what it produced.
+    #
+    # `run-test-binaries.sh` executes each harness directly, with the
+    # package root as its working directory, which is what cargo does.
+    # It exists so this step and the collation leg below share ONE
+    # build instead of being two selections with a rebuild between
+    # them. See the note in `run_unit` for the measurement.
+    scripts/run-test-binaries.sh e2e \
+        --workspace --exclude spg-bench-competitor --tests
 
     # v7.39.5 — and the wire panel a second time, under the collation the
     # published image ships.
@@ -175,9 +224,18 @@ run_e2e() {
     # which fixture notices. Measured when it was added: 734 tests, green
     # both ways, which is why `e2e_panel_collation_v7395` exists — a
     # second panel that no fixture can distinguish is theatre.
+    #
+    # v7.39.12 — from the SAME build as the leg above, not a second
+    # cargo selection. `cargo test -p spg-server --tests` names one
+    # member, which is a different feature resolution and therefore a
+    # full rebuild of the dependency graph — the trap this repository
+    # documented for `unit-affected` and then repeated here. The
+    # harnesses are already built; this runs the spg-server ones again
+    # with the collation set.
     banner "e2e: shipped collation"
-    SPG_E2E_DB_COLLATION=en_US.utf8 \
-        cargo test --locked -p spg-server --tests -- "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
+    RUN_FILTER=spg-server RUN_ENV="SPG_E2E_DB_COLLATION=en_US.utf8" \
+        scripts/run-test-binaries.sh "e2e: shipped collation" \
+        --workspace --exclude spg-bench-competitor --tests
 
     # v7.38 element B — permutation matrix runner. Fast tier walks
     # 3 core permutations (embedded / server_simple / topk_off) over
@@ -185,23 +243,27 @@ run_e2e() {
     # walks every non-full-only permutation over the include_globs.
     # See xtests/perm-runner/README.md for the matrix definition.
     banner "e2e: perm-runner"
+    ensure_release_build
     if [[ "$FULL" == 1 ]]; then
-        cargo run --release --locked -p spg-perm-runner -- all --full
+        target/release/spg-perm-runner all --full
     else
-        cargo run --release --locked -p spg-perm-runner -- all --fast
+        target/release/spg-perm-runner all --fast
     fi
 }
 
 run_gates() {
     banner gates
-    cargo test --release --locked -p spg-server --test prod_ready
-    cargo test --release --locked -p spg-server --test slo_smoke -- \
-        --nocapture "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
-    for crate in "${PERF_GATE_CRATES[@]}"; do
-        banner "gates: perf_gate ${crate}"
-        cargo test --release --locked -p "$crate" --test perf_gate -- \
-            --test-threads=1 --nocapture "${TIER_ARGS[@]+"${TIER_ARGS[@]}"}"
-    done
+    # v7.39.12 — eleven cargo selections became one shared build plus
+    # three filtered runs over what it produced. See
+    # `ensure_release_build`; the per-crate `perf_gate` loop is now a
+    # filter over already-built harnesses rather than eight rebuilds.
+    ensure_release_build
+    RUN_FILTER=prod_ready scripts/run-test-binaries.sh "gates: prod_ready" \
+        --release --workspace --exclude spg-bench-competitor --tests
+    RUN_FILTER=slo_smoke scripts/run-test-binaries.sh "gates: slo_smoke" \
+        --release --workspace --exclude spg-bench-competitor --tests
+    RUN_FILTER=perf_gate scripts/run-test-binaries.sh "gates: perf_gate" \
+        --release --workspace --exclude spg-bench-competitor --tests
     # r1018 — the two counter pins, each its own cargo invocation.
     #
     # They read process-global `UNIQ_PROBE_*` counters, which only exist
@@ -239,8 +301,14 @@ run_gates() {
     local sqlx_srv=$!
     sleep 1
     local sqlx_rc=0
-    SPG_PG_URL='postgres://bench:bench@127.0.0.1:25460/bench' \
-        cargo test --release --locked -p spg-sqlx-pgwire -- --ignored \
+    # v7.39.12 — from the shared release build, filtered, rather than a
+    # single-package selection that rebuilds the graph. `--ignored` is
+    # passed through to the harness.
+    RUN_FILTER=spg-sqlx-pgwire \
+    RUN_ENV="SPG_PG_URL=postgres://bench:bench@127.0.0.1:25460/bench" \
+    RUN_ARGS="--ignored" \
+        scripts/run-test-binaries.sh "biz: sqlx-pgwire" \
+        --release --workspace --exclude spg-bench-competitor --tests \
         || sqlx_rc=$?
     kill "$sqlx_srv" 2>/dev/null || true
     return "$sqlx_rc"
@@ -248,7 +316,8 @@ run_gates() {
 
 run_biz() {
     banner biz
-    cargo run --release --locked -p sqllogictest
+    ensure_release_build
+    target/release/sqllogictest
     # v7.39.4 — the same corpus under the collation the PRODUCT SHIPS.
     #
     # The image carries `LANG=en_US.utf8` and says so on the way up
@@ -265,7 +334,7 @@ run_biz() {
     #
     # Records that assert byte order say `skipif spg-collated` and are
     # skipped here — nowhere else.
-    SPG_SLT_DB_COLLATION=en_US.utf8 cargo run --release --locked -p sqllogictest
+    SPG_SLT_DB_COLLATION=en_US.utf8 target/release/sqllogictest
     xtests/dump_compat/run.sh local-build
     xtests/data_compat/run.sh local-build
     # v7.39 (round 666) — the differential corpus joins the protocol.
@@ -279,6 +348,7 @@ run_biz() {
 
 run_dogfood() {
     banner dogfood
+    ensure_release_build
     # v7.37.5 — dogfood-replay testbed. Fast tier skips fixtures
     # whose snapshot is >100 MB (i.e. not present in CI) and still
     # exercises every synthetic recovery scenario. `--full` runs
@@ -288,11 +358,9 @@ run_dogfood() {
     # cascade reproducer). Without it cargo errors with
     # "could not determine which binary to run".
     if [[ "$FULL" == 1 ]]; then
-        cargo run --release --locked -p spg-dogfood-replay \
-            --bin spg-dogfood-replay -- all
+        target/release/spg-dogfood-replay all
     else
-        cargo run --release --locked -p spg-dogfood-replay \
-            --bin spg-dogfood-replay -- all --fast
+        target/release/spg-dogfood-replay all --fast
     fi
 }
 
