@@ -67,7 +67,25 @@ if [[ "${1:-}" == "--on-mini" ]]; then
     # `recorded_delta_register` row reads. Without it that row skips on
     # the testbed, so the gate would run everywhere except where it is
     # meant to run.
-    rsync -az --delete --filter='P /target/' \
+    # v7.39.12 — `-c`, so "changed" means the CONTENT changed.
+    #
+    # rsync's default is size-and-mtime, and a local `git stash`, a
+    # `git checkout`, or a `cargo fmt` pass rewrites mtimes on files
+    # whose bytes are identical. Those files transfer, the `touch`
+    # below then tells cargo they are new, and cargo rebuilds them —
+    # so the tier paid a COLD build of the whole workspace three times
+    # over (clippy-driver, debug, release) on a commit that changed one
+    # file.
+    #
+    # Measured on this working tree, same filters, dry run:
+    #
+    #   by size and mtime   1,618 source files
+    #   by content              1 source file
+    #
+    # That is where the tier's time went. Hashing 1,600 small files on
+    # both sides costs seconds; rebuilding the workspace three times
+    # costs most of an hour.
+    rsync -azc --delete --filter='P /target/' \
         --filter='+ /tmp/' --filter='+ /tmp/docs/***' --filter='- /tmp/*' \
         --filter=':- .gitignore' \
         --out-format='%n' ./ "$HOST:$RDIR/" | grep -E '\.(rs|toml)$' > /tmp/spg-synced.txt || true

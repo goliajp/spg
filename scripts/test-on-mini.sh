@@ -91,7 +91,11 @@ ssh "$HOST" "mkdir -p '$RDIR'"
 # 1200-1500 s gate runs and two-minute single-crate builds came from.
 # `P` is a protect rule, which is the receiver-side half the exclude was
 # assumed to carry.
-rsync -az --delete --filter='P /target/' --filter=':- .gitignore' \
+# v7.39.12 — `-c`: "changed" means the content changed. rsync's default
+# is size-and-mtime, and a `git stash` / `git checkout` / `cargo fmt`
+# rewrites mtimes on byte-identical files, which makes cargo rebuild
+# them on the far side. Measured: 1,618 files by mtime, 1 by content.
+rsync -azc --delete --filter='P /target/' --filter=':- .gitignore' \
     ./ "$HOST:$RDIR/"
 
 # Stage what just arrived, because the selectors here are diffs.
