@@ -41,13 +41,13 @@ budget_s = 5
 
 [[step]]
 tier = "precommit"
-name = "clippy-affected"
+name = "clippy-changed"
 impl = "internal"
 budget_s = 45
 
 [[step]]
 tier = "precommit"
-name = "unit-affected"
+name = "unit-changed"
 impl = "internal"
 budget_s = 35
 
@@ -61,15 +61,15 @@ budget_s = 10
 tier = "precommit"
 name = "slt-smoke"
 impl = "external"
-# v7.39.12 — one workspace build, then the binary directly.
+# v7.39.12 — the binary this tier already built, run directly.
 #
-# `cargo run -p sqllogictest` names one member, which is a different
-# feature resolution and so a full rebuild of the dependency graph —
-# after `unit-affected` had just built the workspace, and before
-# `ironrule-smoke` changes the selection again. Measured on this
-# workspace: 358 s after a different selection ran, 11 s after the same
-# one.
-cmd = "cargo build -q --workspace --exclude spg-bench-competitor --locked --bin sqllogictest && target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+# `cargo run -p sqllogictest` names one member, and `cargo build
+# --workspace` names all of them; either is a different member set from
+# the one `unit-changed` and `pins-current` use, and cargo resolves
+# features over the selected members — so this step rebuilt the graph
+# between them. `sqllogictest` is IN that shared selection now (see
+# `precommit_selection`), so its binary exists by the time this runs.
+cmd = "target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list"
 # v7.38.18 — 45, and the number is two things, not one.
 #
 # The corpus itself is 1.5-2.0 s: 413 cases, measured twice on a warm
