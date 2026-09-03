@@ -163,6 +163,66 @@ use tokio::task::JoinError;
 /// partition attach, etc.) reuse the same primitive.
 static INFLIGHT_OPENS: RaceGuard<PathBuf, Result<AsyncDatabase, EngineError>> = RaceGuard::new();
 
+/// v7.39.12 — the handles that are still alive, by canonical path.
+///
+/// `INFLIGHT_OPENS` dedups callers that arrive WHILE an open is
+/// running. It removes its entry the moment the result is published,
+/// so a caller arriving one instant later starts its own open — and
+/// that open fails, because the handle the first batch received is
+/// still holding the lock:
+///
+/// ```text
+///   let a = AsyncDatabase::open_path(&p).await?;   // ok
+///   let b = AsyncDatabase::open_path(&p).await;    // ERROR: "locked
+///                                                  // by an in-flight
+///                                                  // task"
+/// ```
+///
+/// Nothing is in flight there; the first open finished. A pool that
+/// opens its connections one at a time — the ordinary case — hits it
+/// on the second one, and `concurrent_open_path_dedup` was flaky for
+/// the same reason: it passed only when all sixteen callers arrived
+/// inside the leader's window.
+///
+/// A `Weak` per path fixes both. While a handle lives, a later
+/// `open_path` for that path gets a clone of it — which is exactly
+/// what the followers of an in-flight open already receive, so this
+/// serves one more caller from the same object rather than inventing
+/// a second kind of answer. When the last clone drops, the `Weak`
+/// stops upgrading and the next open does the real work.
+static LIVE_HANDLES: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::RwLock<Database>>>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn live_handles() -> &'static std::sync::Mutex<
+    std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::RwLock<Database>>>,
+> {
+    LIVE_HANDLES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// A live handle for `path`, if one is still held anywhere in this
+/// process. Dead entries are dropped as they are found, so the map
+/// does not grow with paths nobody holds.
+fn live_handle(path: &Path) -> Option<AsyncDatabase> {
+    let mut map = live_handles().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(path).and_then(std::sync::Weak::upgrade) {
+        Some(inner) => Some(AsyncDatabase { inner }),
+        None => {
+            map.remove(path);
+            None
+        }
+    }
+}
+
+fn remember_handle(path: &Path, db: &AsyncDatabase) {
+    live_handles()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), std::sync::Arc::downgrade(&db.inner));
+}
+
 /// v7.37.12 — observability counters for the dedup path. Forwarded
 /// from the underlying `RaceGuard` counters so existing callers
 /// (`spgctl`, test harnesses) read the same atomic addresses they
@@ -327,6 +387,17 @@ impl AsyncDatabase {
         // caller seeds the shared entry; subsequent callers attach
         // before the result is published. On result publication, all
         // waiters wake; map entry is removed.
+        // v7.39.12 — a handle that is still alive answers directly.
+        // See `LIVE_HANDLES`.
+        if let Some(db) = live_handle(&canonical) {
+            if log_enabled {
+                eprintln!(
+                    "[spg open_path] path={} role=live-handle",
+                    canonical.display()
+                );
+            }
+            return Ok(db);
+        }
         let lookup = INFLIGHT_OPENS.lookup(&canonical);
         let (is_first, shared) = match lookup {
             RaceLookup::First(s) => (true, s),
@@ -371,6 +442,9 @@ impl AsyncDatabase {
             // AsyncDatabase clone drops.
             if let Ok(ref db) = result {
                 spawn_self_wake_checkpoint_task(std::sync::Arc::downgrade(&db.inner));
+                // v7.39.12 — and record it, so the next caller for this
+                // path is served rather than refused.
+                remember_handle(&canonical, db);
             }
             return result;
         }
@@ -837,6 +911,75 @@ mod dedup_tests {
                 result.err()
             );
         }
+    }
+
+    /// v7.39.12 — a second open while the first handle lives.
+    ///
+    /// `INFLIGHT_OPENS` dedups callers that arrive WHILE an open is
+    /// running, and removes its entry the instant the result is
+    /// published. A caller arriving one moment later started its own
+    /// open, and that open failed against the lock the first handle
+    /// still holds:
+    ///
+    /// ```text
+    ///   let a = AsyncDatabase::open_path(&p).await?;   ok
+    ///   let b = AsyncDatabase::open_path(&p).await;    ERROR: database
+    ///                                                  is locked by an
+    ///                                                  in-flight task
+    /// ```
+    ///
+    /// Nothing was in flight — the first open had finished. A pool that
+    /// opens its connections one at a time, which is the ordinary case,
+    /// met this on the second one.
+    ///
+    /// It is also why `concurrent_open_path_dedup` was flaky: it passed
+    /// only when all sixteen callers arrived inside the leader's
+    /// window, and it took 20-54 s to fail because the losers were
+    /// contending for the lock. It runs in 0.08 s now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_open_while_the_first_handle_lives_is_served() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("live.spg");
+        let mut first = AsyncDatabase::open_path(&path).await.expect("first open");
+        first
+            .execute("CREATE TABLE t(id BIGINT)")
+            .await
+            .expect("ddl");
+
+        let mut second = AsyncDatabase::open_path(&path)
+            .await
+            .expect("a second open while the first handle lives must be served");
+        // The same database, not a second one: what one writes, the
+        // other reads.
+        second
+            .execute("INSERT INTO t VALUES (7)")
+            .await
+            .expect("insert through the second handle");
+        let r = first
+            .query("SELECT id FROM t")
+            .await
+            .expect("read through the first");
+        assert_eq!(r.len(), 1, "one handle's write is the other's row");
+    }
+
+    /// And the entry does not outlive the handles: once every clone is
+    /// dropped, the next open does the real work rather than serving a
+    /// handle to a database nobody holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_live_entry_dies_with_its_last_clone() {
+        let tmp = tempfile::tempdir().expect("tmp dir");
+        let path = tmp.path().join("gone.spg");
+        {
+            let mut db = AsyncDatabase::open_path(&path).await.expect("open");
+            db.execute("CREATE TABLE t(id BIGINT)").await.expect("ddl");
+        }
+        // Nothing holds it now. This must be a fresh open, and it must
+        // see what the first one committed.
+        let mut again = AsyncDatabase::open_path(&path).await.expect("reopen");
+        again
+            .execute("INSERT INTO t VALUES (1)")
+            .await
+            .expect("the table survived the reopen");
     }
 
     /// v7.37.11 — the spg-sqlx cancel-then-retry pattern: a caller

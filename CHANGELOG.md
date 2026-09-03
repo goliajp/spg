@@ -449,6 +449,33 @@ where the surface is MySQL's — before anything was changed.
   instrument that misnames the access path is worse than one that says
   nothing.
 
+- **A second `AsyncDatabase::open_path` on a live path was refused.**
+
+  ```text
+    let a = AsyncDatabase::open_path(&p).await?;   ok
+    let b = AsyncDatabase::open_path(&p).await;    ERROR: database is
+                                                   locked by an
+                                                   in-flight task
+  ```
+
+  Nothing was in flight — the first open had finished, and its handle
+  holds the lock. The process-wide dedup added in v7.37.11 covers
+  callers that arrive WHILE an open is running and removes its entry
+  the instant the result is published, so a caller one moment later
+  starts its own open and meets the first handle's lock. A pool that
+  opens its connections one at a time, which is the ordinary case, met
+  it on the second one.
+
+  A live handle answers now — the same clone the followers of an
+  in-flight open already receive, so this serves one more caller from
+  the same object rather than inventing a second kind of answer. When
+  the last clone drops, the next open does the real work.
+
+  Found because `concurrent_open_path_dedup` is flaky, and it was flaky
+  for this reason: it passed only when all sixteen callers arrived
+  inside the leader's window, and it took 20-54 s to fail because the
+  losers were contending for the lock. It runs in 0.08 s.
+
 ### Changed
 
 The release instrument. Four measurements, all from this repository's

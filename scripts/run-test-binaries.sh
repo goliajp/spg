@@ -63,10 +63,16 @@ n=$(grep -c . "$list" || true)
 pass=0; fail=0; tests=0; failed_names=""
 while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
     [ -x "$exe" ] || continue
-    case "${RUN_FILTER:-}" in
-        "") ;;
-        *) case "$name" in *"$RUN_FILTER"*) ;; *) continue ;; esac ;;
-    esac
+    # RUN_FILTER is a comma-separated list of substrings; a harness runs
+    # when its <package>::<target> label contains any of them.
+    if [ -n "${RUN_FILTER:-}" ]; then
+        keep=0
+        IFS=, read -r -a _wanted <<< "$RUN_FILTER"
+        for w in "${_wanted[@]}"; do
+            case "$name" in *"$w"*) keep=1; break ;; esac
+        done
+        [ "$keep" = 1 ] || continue
+    fi
     # cargo runs a test binary with the package root as its working
     # directory, and fixtures are opened relative to it.
     out=$(cd "$pkg" && env ${RUN_ENV:-} "$exe" --quiet ${RUN_ARGS:-} 2>&1)

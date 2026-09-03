@@ -61,7 +61,15 @@ budget_s = 10
 tier = "precommit"
 name = "slt-smoke"
 impl = "external"
-cmd = "cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 cargo run -q -p sqllogictest -- --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+# v7.39.12 — one workspace build, then the binary directly.
+#
+# `cargo run -p sqllogictest` names one member, which is a different
+# feature resolution and so a full rebuild of the dependency graph —
+# after `unit-affected` had just built the workspace, and before
+# `ironrule-smoke` changes the selection again. Measured on this
+# workspace: 358 s after a different selection ran, 11 s after the same
+# one.
+cmd = "cargo build -q --workspace --exclude spg-bench-competitor --locked --bin sqllogictest && target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list"
 # v7.38.18 — 45, and the number is two things, not one.
 #
 # The corpus itself is 1.5-2.0 s: 413 cases, measured twice on a warm

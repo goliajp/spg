@@ -57,7 +57,24 @@ pub fn clippy_affected(root: &Path, graph: &CrateGraph) -> Result<String, String
         return Ok("no crate changes — skipped".into());
     }
     let affected = graph.affected(&changed);
-    let flags: String = affected.iter().map(|c| format!(" -p {c}")).collect();
+    // v7.39.12 — workspace-wide, not the affected subset.
+    //
+    // Cargo resolves features over the SELECTED members, so each
+    // distinct member set is a distinct set of artefacts. The affected
+    // set changes from commit to commit, which means this step was
+    // rebuilding the dependency graph with clippy-driver on almost
+    // every commit — the "narrow" selection was the expensive one.
+    //
+    // Measured on this workspace, the same command and tree: 358 s
+    // after a different selection ran, 11 s after the same one. One
+    // stable workspace-wide selection stays warm across commits AND
+    // shares its artefacts with `gate.sh lint`, which uses exactly this
+    // line.
+    //
+    // The benchmark crate is excluded for the reason `gate.sh` gives:
+    // its binaries are not a test surface, and it is `test = false` in
+    // its own manifest.
+    let _ = &affected;
     // v7.38.23 — `--all-targets`, because without it this step does not
     // lint TEST code and `gate.sh lint` does.
     //
@@ -69,9 +86,13 @@ pub fn clippy_affected(root: &Path, graph: &CrateGraph) -> Result<String, String
     // precommit had reported "clippy clean over 13 crates".
     sh(
         root,
-        &format!("cargo clippy -q --all-targets{flags} -- -D warnings"),
+        "cargo clippy -q --workspace --exclude spg-bench-competitor \
+         --all-targets --locked -- -D warnings",
     )?;
-    Ok(format!("clippy clean over {} crates", affected.len()))
+    Ok(format!(
+        "clippy clean (workspace; {} crate(s) changed)",
+        affected.len()
+    ))
 }
 
 /// `unit-affected` — `--lib --bins` tests over the affected closure.
@@ -112,42 +133,42 @@ pub fn affected_selection(
 }
 
 pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> {
-    let Some((affected, flags)) = affected_selection(root, graph)? else {
+    let Some((affected, _)) = affected_selection(root, graph)? else {
         return Ok("no crate changes — skipped".into());
     };
-    // v7.38.2 — cargo errors on `--lib` when a SINGLE selected package
-    // has no lib target (bins-only spg-server / spgctl), but silently
-    // tolerates the same flags across MULTIPLE packages — so this step
-    // only ever failed when exactly one bins-only crate changed. Retry
-    // without `--lib` on that precise error.
+    // v7.39.12 — one workspace-wide build, then run the affected
+    // packages' harnesses out of it.
     //
-    // v7.38.22 — `2>&1`, so the step can see whether it SPENT its budget
-    // or waited for it.
+    // This step selected `-p A -p B …` over the affected closure, and
+    // that set changes from commit to commit. Cargo resolves features
+    // over the SELECTED members, so every new set was a new set of
+    // artefacts: the "narrow" selection rebuilt the dependency graph on
+    // almost every commit, and then `pins-current` and `slt-smoke`
+    // changed the selection again and rebuilt after it.
     //
-    // This step has recorded 2289.9 s, 167.8 s, 1585.8 s, 8.9 s and
-    // 505.2 s at the same band against a hard 480 s budget. Timed
-    // directly, twice: 1017 s wall for 20.4 s user and 10.9 s sys, then
-    // 725 s wall for 11.8 s and 1.3 s. Ninety-seven per cent of the
-    // budget went on waiting, and what it waited for was another cargo
-    // holding the build-directory lock — a full workspace clippy, in the
-    // run that produced the 2289 s.
+    // Measured on this workspace, the same command and tree: 358 s
+    // after a different selection ran, 11 s after the same one, and 11 s
+    // for the fifteen harnesses run by hand. The 347 s was cargo, not
+    // the tests.
     //
-    // Cargo says so on stderr, in as many words. Reading it turns a
-    // number nobody could account for into a named cause.
-    let blocked = "Blocking waiting for file lock";
-    let waited = match sh(root, &format!("cargo test -q{flags} --lib --bins 2>&1")) {
-        Ok(out) => out.contains(blocked),
-        Err(e) if e.contains("no library targets") => {
-            sh(root, &format!("cargo test -q{flags} --bins 2>&1"))?.contains(blocked)
-        }
-        Err(e) => return Err(e),
-    };
-    let note = if waited {
-        " — and WAITED on the build-directory lock, so this duration is another cargo's"
-    } else {
-        ""
-    };
-    Ok(format!("unit green over {} crates{note}", affected.len()))
+    // Measured on the hook itself, one comment added to spg-engine:
+    // this step ran 32 minutes, with `-p spg-bench-competitor` in the
+    // selection — the benchmark crate, 56 harnesses carrying no tests.
+    //
+    // So: build the workspace once (the same selection `clippy-affected`
+    // and `gate.sh` use, so it stays warm), then execute only the
+    // affected packages' harnesses. The coverage is what it was; what
+    // is gone is the rebuild and the benchmark crate.
+    let filter = affected.join(",");
+    let out = sh(
+        root,
+        &format!(
+            "RUN_FILTER='{filter}' scripts/run-test-binaries.sh unit-affected \
+             --workspace --exclude spg-bench-competitor --lib --bins"
+        ),
+    )?;
+    let summary = out.lines().last().unwrap_or("").trim().to_string();
+    Ok(format!("{summary} ({} crate(s) affected)", affected.len()))
 }
 
 /// `pins-current` — the e2e pins THIS commit adds or touches.
@@ -248,9 +269,17 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
         }
 
         let filters = mods.join(" ");
+        // v7.39.12 — from the workspace build, not a single-package
+        // selection. `-p <pkg> --test e2e` is a different member set
+        // and so a full rebuild before this step could run anything;
+        // see the note in `unit_affected`.
         let out = sh(
             root,
-            &format!("cargo test -q -p {pkg} --test e2e -- {filters}"),
+            &format!(
+                "RUN_FILTER='{pkg}::e2e' RUN_ARGS='{filters}' \
+                 scripts/run-test-binaries.sh pins-current \
+                 --workspace --exclude spg-bench-competitor --tests"
+            ),
         )?;
         let ran: usize = out
             .lines()
@@ -296,7 +325,14 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
 pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
-        sh(root, "cargo build --release -q -p spg-server")?;
+        // v7.39.12 — the workspace selection, so this shares artefacts with
+        // `gate.sh`'s release build instead of resolving features over one
+        // member and rebuilding the graph.
+        sh(
+            root,
+            "cargo build --release -q --workspace --exclude spg-bench-competitor \
+             --locked --bin spg-server",
+        )?;
     }
     let home = std::env::var("HOME").map_err(|_| "no $HOME")?;
     let wrapper = Path::new(&home).join("spgbench/bin/psql");
@@ -1023,7 +1059,9 @@ pub fn ironrule_smoke(root: &Path, runid: &str) -> Result<String, String> {
 pub fn perm_matrix(root: &Path) -> Result<String, String> {
     sh(
         root,
-        "cargo build -q --release -p spg-server -p spg-perm-runner",
+        // v7.39.12 — the workspace selection; see the note in
+        // `unit_affected`. Naming members rebuilds the graph.
+        "cargo build -q --release --workspace --exclude spg-bench-competitor --locked",
     )?;
     sh(root, "cargo run -q --release -p spg-perm-runner -- all").map(|out| tail_lines(&out, 10))
 }
@@ -1081,7 +1119,9 @@ fn tail_lines(out: &str, n: usize) -> String {
 pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
     sh(
         root,
-        "cargo build -q --release -p spg-server -p spg-gendiff",
+        // v7.39.12 — the workspace selection; see the note in
+        // `unit_affected`. Naming members rebuilds the graph.
+        "cargo build -q --release --workspace --exclude spg-bench-competitor --locked",
     )?;
     let seed = runid
         .bytes()
@@ -1177,7 +1217,14 @@ pub fn sql2016(root: &Path) -> Result<String, String> {
 pub fn pgbench(root: &Path, runid: &str) -> Result<String, String> {
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
-        sh(root, "cargo build --release -q -p spg-server")?;
+        // v7.39.12 — the workspace selection, so this shares artefacts with
+        // `gate.sh`'s release build instead of resolving features over one
+        // member and rebuilding the graph.
+        sh(
+            root,
+            "cargo build --release -q --workspace --exclude spg-bench-competitor \
+             --locked --bin spg-server",
+        )?;
     }
     let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-pgb"));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1259,7 +1306,14 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
         .ok_or("sysbench not installed on this runner (brew install sysbench)")?;
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
-        sh(root, "cargo build --release -q -p spg-server")?;
+        // v7.39.12 — the workspace selection, so this shares artefacts with
+        // `gate.sh`'s release build instead of resolving features over one
+        // member and rebuilding the graph.
+        sh(
+            root,
+            "cargo build --release -q --workspace --exclude spg-bench-competitor \
+             --locked --bin spg-server",
+        )?;
     }
     let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sb"));
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1414,7 +1468,14 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
 pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
-        sh(root, "cargo build --release -q -p spg-server")?;
+        // v7.39.12 — the workspace selection, so this shares artefacts with
+        // `gate.sh`'s release build instead of resolving features over one
+        // member and rebuilding the graph.
+        sh(
+            root,
+            "cargo build --release -q --workspace --exclude spg-bench-competitor \
+             --locked --bin spg-server",
+        )?;
     }
     let home = std::env::var("HOME").unwrap_or_default();
     let wrapper = Path::new(&home).join("spgbench/bin/psql");
