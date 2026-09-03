@@ -311,7 +311,26 @@ fn main() {
                     .map(|flags| {
                         let mut v = vec!["test".to_string(), "-q".to_string()];
                         v.extend(flags.split_whitespace().map(str::to_string));
-                        v.extend(["--lib", "--bins", "--locked", "--no-run"].map(str::to_string));
+                        // v7.39.12 — `--tests` too, so the release's e2e
+                        // finds them built.
+                        //
+                        // Same members is not enough: the release builds
+                        // the integration test targets and this tier did
+                        // not, so they were cold at release time, every
+                        // time. Measured back to back on the testbed —
+                        // `gate.sh e2e` right after a precommit, then
+                        // again with nothing changed between:
+                        //
+                        //     1,937 s   then   230 s
+                        //
+                        // A commit pays that once and the release pays
+                        // nothing for it, which is the trade this tier
+                        // is for: the commit loop is where waiting is
+                        // cheap.
+                        v.extend(
+                            ["--lib", "--bins", "--tests", "--locked", "--no-run"]
+                                .map(str::to_string),
+                        );
                         v
                     })
                     .unwrap_or_default();
@@ -346,7 +365,7 @@ fn main() {
                 if !subset_ref.is_empty() {
                     prep.push((
                         subset_ref.as_slice(),
-                        "cargo test <changed + sqllogictest> --no-run --lib --bins",
+                        "cargo test <shared members> --no-run --lib --bins --tests",
                     ));
                 }
                 for (args, label) in prep {
