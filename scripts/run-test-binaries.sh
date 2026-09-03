@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# v7.39.12 — build one cargo selection, then run its harnesses directly.
+#
+# Every distinct `cargo test` target selection costs a full rebuild,
+# because cargo resolves features over the selected members and a
+# different member set is a different feature set. Measured on this
+# workspace, same command, same tree:
+#
+#   after a DIFFERENT selection ran   358 s
+#   after the SAME selection ran       11 s
+#   the fifteen harnesses, by hand     11 s
+#
+# So the 347 s is cargo re-resolving and rebuilding, not the tests —
+# they take ten seconds — and a tier that makes a dozen differently
+# shaped cargo calls pays that over and over. This runs ONE selection
+# and then executes what it produced.
+#
+# Usage: run-test-binaries.sh <label> [cargo test selection args...]
+#   env: RUN_FILTER=<substring>   only harnesses whose name contains it
+#        RUN_ENV="K=V K2=V2"      extra environment for each harness
+#        RUN_ARGS="--ignored"     extra arguments for each harness
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+label="${1:?usage: run-test-binaries.sh <label> [cargo args...]}"
+shift
+
+list=$(mktemp -t spg-testbins)
+trap 'rm -f "$list"' EXIT
+
+# `--no-run` builds; the JSON stream names what it built and where the
+# package lives, which is the working directory cargo would have used.
+if ! cargo test -q --locked "$@" --no-run --message-format=json 2>/dev/null \
+    | python3 -c '
+import sys, json, os
+seen = set()
+for line in sys.stdin:
+    if not line.startswith("{"):
+        continue
+    d = json.loads(line)
+    exe = d.get("executable")
+    if not exe or exe in seen:
+        continue
+    # Only harnesses. `--tests` also BUILDS the plain binaries an
+    # integration test depends on — spg-server, spgctl, pg_isready —
+    # and those carry an `executable` too. Running one of those with
+    # `--quiet` runs its real `main`: "spg: unknown command: --quiet".
+    if not d.get("profile", {}).get("test"):
+        continue
+    seen.add(exe)
+    pkg_dir = os.path.dirname(d.get("manifest_path", ""))
+    name = d["target"]["name"]
+    pkg = d["package_id"].split("#")[0].rstrip("/").split("/")[-1]
+    print(exe + "\t" + pkg_dir + "\t" + pkg + "::" + name)
+' > "$list"; then
+    echo "$label: the build failed" >&2
+    exit 1
+fi
+
+n=$(grep -c . "$list" || true)
+[ "$n" -gt 0 ] || { echo "$label: the selection produced no test binaries" >&2; exit 1; }
+
+pass=0; fail=0; tests=0; failed_names=""
+while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
+    [ -x "$exe" ] || continue
+    case "${RUN_FILTER:-}" in
+        "") ;;
+        *) case "$name" in *"$RUN_FILTER"*) ;; *) continue ;; esac ;;
+    esac
+    # cargo runs a test binary with the package root as its working
+    # directory, and fixtures are opened relative to it.
+    out=$(cd "$pkg" && env ${RUN_ENV:-} "$exe" --quiet ${RUN_ARGS:-} 2>&1)
+    rc=$?
+    t=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
+    tests=$(( tests + ${t:-0} ))
+    if [ "$rc" = 0 ]; then
+        pass=$(( pass + 1 ))
+    else
+        fail=$(( fail + 1 ))
+        failed_names="$failed_names $name"
+        printf '%s\n' "$out" | tail -40 >&2
+    fi
+done < "$list"
+
+echo "$label: $pass/$((pass+fail)) harnesses green, $tests tests"
+[ "$fail" = 0 ] || { echo "$label: FAILED —$failed_names" >&2; exit 1; }

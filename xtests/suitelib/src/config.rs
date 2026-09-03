@@ -541,34 +541,69 @@ mod unit_tier_spawns {
 
     #[test]
     fn every_workspace_wide_selection_excludes_the_benchmark_crate() {
-        // Only WORKSPACE-wide selections: a `-p spg-server --tests`
-        // leg names one crate and never reaches the benchmark crate,
-        // and cargo rejects `--exclude` without `--workspace` anyway.
-        // This row found that distinction itself, on the
-        // shipped-collation leg.
         let sh = gate_sh();
         let lines: Vec<&str> = sh
             .lines()
             .map(str::trim)
             .filter(|l| {
                 !l.starts_with('#')
-                    && l.contains("cargo test")
+                    && (l.contains("cargo test") || l.contains("run-test-binaries.sh"))
                     && l.contains("--workspace")
-                    && (l.contains("--bins") || l.contains("--tests"))
             })
             .collect();
         assert!(
             !lines.is_empty(),
-            "no workspace-wide `cargo test … --bins/--tests` left in gate.sh — \
-             if the tier stopped selecting them, delete this row and say why"
+            "no workspace-wide test selection left in gate.sh — if the tier \
+             stopped making one, delete this row and say why"
         );
         for l in &lines {
             assert!(
                 l.contains("--exclude spg-bench-competitor"),
-                "this line selects the benchmark crate's targets, which spawns \
-                 harnesses carrying no tests (56 for --bins, 40 for --tests): {l}"
+                "this line selects the benchmark crate's targets, which builds \
+                 and runs harnesses carrying no tests: {l}"
             );
         }
+    }
+
+    /// v7.39.12 — and no step names a single package to run tests.
+    ///
+    /// Cargo resolves features over the SELECTED members, so a
+    /// different member set is a different feature set and a full
+    /// rebuild of the dependency graph. Measured on this workspace, the
+    /// same command and the same tree:
+    ///
+    /// ```text
+    ///   after a DIFFERENT selection ran   358 s
+    ///   after the SAME selection ran       11 s
+    ///   the fifteen harnesses, by hand     11 s
+    /// ```
+    ///
+    /// The tier made a dozen differently shaped calls and paid that at
+    /// every transition: `e2e` read 4,156 s of a 7,314 s tier while the
+    /// tests inside it report 127 s. `scripts/run-test-binaries.sh`
+    /// builds one selection and runs what it produced, filtered by
+    /// package, so a step that wants only spg-server's harnesses does
+    /// not force a rebuild to get them.
+    ///
+    /// The two exceptions carry their reason on the line: a build with
+    /// a different FEATURE set is a different artefact and cannot be
+    /// shared, however it is invoked.
+    #[test]
+    fn no_step_rebuilds_the_world_to_test_one_package() {
+        let sh = gate_sh();
+        let offenders: Vec<&str> = sh
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .filter(|l| l.contains("cargo test") && l.contains(" -p "))
+            .filter(|l| !l.contains("--features"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "each of these names one package and so rebuilds the dependency \
+             graph before it can run anything; use run-test-binaries.sh with \
+             RUN_FILTER instead: {offenders:?}"
+        );
     }
 
     #[test]
