@@ -7238,29 +7238,6 @@ impl Engine {
             .iter()
             .any(|o| crate::subquery::expr_has_subquery(&o.expr));
         let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
-        let order_keys_for =
-            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
-                if order_has_subquery {
-                    // A substituted literal is no longer a bound column.
-                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
-                    return crate::orderby::build_order_keys_bound(
-                        per_row.as_deref().unwrap_or(&order_by),
-                        &unbound,
-                        &order_colls,
-                        row,
-                        &ctx,
-                        buf,
-                    );
-                }
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    &order_colls,
-                    row,
-                    &ctx,
-                    buf,
-                )
-            };
         // v7.39 (round 581) — and it stops asking when the answer is
         // always "keep".
         //
@@ -7371,7 +7348,27 @@ impl Engine {
                     return Ok(());
                 }
                 let mut buf = key_pool.pop().unwrap_or_default();
-                order_keys_for(row, &mut buf)?;
+                if order_has_subquery {
+                    // A substituted literal is no longer a bound column.
+                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                    crate::orderby::build_order_keys_bound(
+                        per_row.as_deref().unwrap_or(&order_by),
+                        &unbound,
+                        &order_colls,
+                        row,
+                        &ctx,
+                        &mut buf,
+                    )?;
+                } else {
+                    crate::orderby::build_order_keys_bound(
+                        &order_by,
+                        &order_bound,
+                        &order_colls,
+                        row,
+                        &ctx,
+                        &mut buf,
+                    )?;
+                }
                 // v7.39 (round 581) — reject before projecting.
                 //
                 // `ORDER BY g DESC, id DESC LIMIT 10` over 500k rows with
@@ -7538,7 +7535,28 @@ impl Engine {
                     // this branch never did, so `SELECT DISTINCT k .. ORDER
                     // BY k` resolved "k" by string for every surviving row.
                     let mut buf = key_pool.pop().unwrap_or_default();
-                    order_keys_for(row, &mut buf)?;
+                    if order_has_subquery {
+                        // A substituted literal is no longer a bound column.
+                        let per_row =
+                            self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                        crate::orderby::build_order_keys_bound(
+                            per_row.as_deref().unwrap_or(&order_by),
+                            &unbound,
+                            &order_colls,
+                            row,
+                            &ctx,
+                            &mut buf,
+                        )?;
+                    } else {
+                        crate::orderby::build_order_keys_bound(
+                            &order_by,
+                            &order_bound,
+                            &order_colls,
+                            row,
+                            &ctx,
+                            &mut buf,
+                        )?;
+                    }
                     buf
                 } else {
                     order_keys
@@ -8145,29 +8163,6 @@ impl Engine {
             .iter()
             .any(|o| crate::subquery::expr_has_subquery(&o.expr));
         let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
-        let order_keys_for =
-            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
-                if order_has_subquery {
-                    // A substituted literal is no longer a bound column.
-                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
-                    return crate::orderby::build_order_keys_bound(
-                        per_row.as_deref().unwrap_or(&order_by),
-                        &unbound,
-                        &order_colls,
-                        row,
-                        &ctx,
-                        buf,
-                    );
-                }
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    &order_colls,
-                    row,
-                    &ctx,
-                    buf,
-                )
-            };
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
@@ -8225,7 +8220,27 @@ impl Engine {
             // re-derivation below is handed the same ones. `finish`'s
             // contract is that a key comes back the way it was pushed;
             // a collation is part of the way it was pushed.
-            order_keys_for(row, &mut keys)?;
+            if order_has_subquery {
+                // A substituted literal is no longer a bound column.
+                let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                crate::orderby::build_order_keys_bound(
+                    per_row.as_deref().unwrap_or(&order_by),
+                    &unbound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    &mut keys,
+                )?;
+            } else {
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    &mut keys,
+                )?;
+            }
             sorter.push(&mut keys, row)?;
         }
 
@@ -9373,29 +9388,6 @@ impl Engine {
             .iter()
             .any(|o| crate::subquery::expr_has_subquery(&o.expr));
         let unbound: Vec<Option<usize>> = alloc::vec![None; order_by.len()];
-        let order_keys_for =
-            |row: &spg_storage::Row<'static>, buf: &mut Vec<OrderKey>| -> Result<(), EngineError> {
-                if order_has_subquery {
-                    // A substituted literal is no longer a bound column.
-                    let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
-                    return crate::orderby::build_order_keys_bound(
-                        per_row.as_deref().unwrap_or(&order_by),
-                        &unbound,
-                        &order_colls,
-                        row,
-                        &ctx,
-                        buf,
-                    );
-                }
-                crate::orderby::build_order_keys_bound(
-                    &order_by,
-                    &order_bound,
-                    &order_colls,
-                    row,
-                    &ctx,
-                    buf,
-                )
-            };
         let mut sorter = crate::extsort::ExternalSorter::new(
             self.temp_run_factory,
             self.session_work_mem_bytes(),
@@ -9453,7 +9445,27 @@ impl Engine {
             // re-derivation below is handed the same ones. `finish`'s
             // contract is that a key comes back the way it was pushed;
             // a collation is part of the way it was pushed.
-            order_keys_for(row, &mut keys)?;
+            if order_has_subquery {
+                // A substituted literal is no longer a bound column.
+                let per_row = self.order_by_resolved_for_row(&order_by, row, &ctx, cancel)?;
+                crate::orderby::build_order_keys_bound(
+                    per_row.as_deref().unwrap_or(&order_by),
+                    &unbound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    &mut keys,
+                )?;
+            } else {
+                crate::orderby::build_order_keys_bound(
+                    &order_by,
+                    &order_bound,
+                    &order_colls,
+                    row,
+                    &ctx,
+                    &mut keys,
+                )?;
+            }
             sorter.push(&mut keys, row)?;
         }
 

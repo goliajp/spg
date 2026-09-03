@@ -69,7 +69,15 @@ CRATES=(
     spg-engine spg-embedded spg-embedded-tokio spg-sqlx spg-server spgctl
 )
 
-banner() { printf '\n══ release.sh %s ══\n' "$*"; }
+# v7.39.12 — every banner carries the seconds since the last one, so
+# the next release says where its time went instead of being guessed at.
+_last_banner_at=$(date +%s)
+banner() {
+    local now
+    now=$(date +%s)
+    printf '\n══ release.sh %s ══  [+%ss]\n' "$*" "$(( now - _last_banner_at ))"
+    _last_banner_at=$now
+}
 
 banner "preflight v${VERSION}"
 branch=$(git rev-parse --abbrev-ref HEAD)
@@ -196,12 +204,30 @@ if [[ "$SKIP_CRATES" == 0 ]]; then
             >/dev/null 2>&1; then
             echo "  ${crate} ${VERSION} already on crates.io — skip"
         else
+            _pub_t0=$(date +%s)
             echo "  publishing ${crate} ${VERSION}"
             # If a prior retry left this version in the index but the UA
             # check above somehow still missed it, the cargo publish call
             # below will fail with "already exists on crates.io index";
             # treat that case as success so the loop continues.
-            if ! cargo publish -p "$crate" --locked 2> /tmp/release-publish-err.txt; then
+            # v7.39.12 — one target directory for all thirteen
+            # verifications.
+            #
+            # `cargo publish` packages the crate, extracts the tarball
+            # under `target/package/<crate>-<ver>/`, and BUILDS it there
+            # to prove the published artefact compiles. That check is
+            # worth keeping — it is the one thing that catches a file
+            # the manifest forgot to include — but each extracted crate
+            # is its own workspace with its own target dir, so the
+            # dependency graph was compiled from scratch thirteen times
+            # in a row, having just been compiled by the gate.
+            #
+            # A shared `CARGO_TARGET_DIR` leaves the verification doing
+            # exactly what it did and lets crate two onwards reuse what
+            # crate one built. Kept out of `target/` proper so a release
+            # never races the gate's own artefacts.
+            if ! CARGO_TARGET_DIR="${PWD}/target/publish-verify" \
+                cargo publish -p "$crate" --locked 2> /tmp/release-publish-err.txt; then
                 if grep -q "already exists on crates.io index" /tmp/release-publish-err.txt; then
                     echo "  ${crate} ${VERSION} already on crates.io — skip (post-publish)"
                 else
@@ -209,6 +235,7 @@ if [[ "$SKIP_CRATES" == 0 ]]; then
                     exit 1
                 fi
             fi
+            echo "  ${crate} took $(( $(date +%s) - _pub_t0 ))s"
         fi
     done
 else
