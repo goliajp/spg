@@ -606,6 +606,122 @@ mod unit_tier_spawns {
         );
     }
 
+    /// v7.39.12 — the two clippy invocations select the same members.
+    ///
+    /// Clippy artefacts are per-selection like any others. Narrowing
+    /// `clippy-changed` to the changed crates made that step 0.3 s and
+    /// made the next release pay 765 s for `gate.sh lint`, which had
+    /// been 3.1 s on an unchanged tree: the narrow run replaced the
+    /// workspace-wide artefacts and the wide one rebuilt them.
+    ///
+    /// Across one commit-then-release cycle the narrow version is far
+    /// worse. This row is here because the mistake is invisible in
+    /// either tier alone — each looks faster or slower on its own — and
+    /// only the pair shows it.
+    #[test]
+    fn both_tiers_run_clippy_over_the_same_members() {
+        let sh = gate_sh();
+        let steps =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/steps.rs"))
+                .expect("src/steps.rs");
+        // Only the flags that decide WHICH MEMBERS cargo builds. `-q`,
+        // `--locked` and everything after the bare `--` do not.
+        let members = |line: &str| -> String {
+            let mut out: Vec<String> = Vec::new();
+            let mut it = line.split_whitespace().peekable();
+            while let Some(w) = it.next() {
+                match w {
+                    "--" => break,
+                    "--workspace" | "--all-targets" | "--lib" | "--bins" | "--tests" => {
+                        out.push(w.to_string());
+                    }
+                    "--exclude" | "-p" => {
+                        if let Some(v) = it.next() {
+                            out.push(format!("{w} {}", v.trim_matches('"')));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.sort();
+            out.join(" ")
+        };
+        let from = |text: &str| -> Vec<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|l| !l.starts_with("//") && !l.starts_with('#'))
+                .filter(|l| l.contains("cargo clippy") && l.contains("--workspace"))
+                .map(members)
+                .collect()
+        };
+        let mut all = from(&sh);
+        all.extend(from(&steps));
+        assert!(
+            all.len() >= 2,
+            "expected a workspace clippy in gate.sh AND in steps.rs, found {}: {all:?}",
+            all.len()
+        );
+        let first = &all[0];
+        for m in &all[1..] {
+            assert_eq!(
+                m, first,
+                "the two tiers select different members for clippy, so each \
+                 rebuilds the other's artefacts: {all:?}"
+            );
+        }
+    }
+
+    /// v7.39.12 — and the two tiers BUILD the same members for tests.
+    ///
+    /// This is the clippy row's twin, and the defect it pins is the one
+    /// that made `gate.sh e2e` read 576 s in the tier against 74-137 s
+    /// by hand for years: `precommit` built a narrow member set and
+    /// `prerelease` built the workspace, so each evicted the other's
+    /// test artefacts and whichever ran second paid a full rebuild.
+    ///
+    /// Six hypotheses about that gap were refuted one at a time —
+    /// the tests, process spawn, compilation, page-cache eviction, the
+    /// runner's PATH, the runner's `sh -c` — because every one of them
+    /// looked inside the step, and the cause was in the run before it.
+    #[test]
+    fn both_tiers_build_the_same_members_for_tests() {
+        let steps =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/steps.rs"))
+                .expect("src/steps.rs");
+        assert!(
+            steps.contains(
+                r#"pub const SHARED_MEMBERS: &str = " --workspace --exclude spg-bench-competitor";"#
+            ),
+            "the shared member set is named once, in steps.rs, and both tiers \
+             use that name — a literal here is how the two drifted apart"
+        );
+        // Every rustc-building call in the precommit steps goes through
+        // it; none names members of its own. Scanned by STATEMENT, not
+        // by line: these are multi-line format strings, and the line
+        // that says `run-test-binaries.sh` is not the line that says
+        // which members — the first version of this row was fooled by
+        // exactly that.
+        let joined: String = steps
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace('\\', " ");
+        let offenders: Vec<String> = joined
+            .split(';')
+            .map(str::trim)
+            .filter(|st| st.contains("run-test-binaries.sh") || st.contains("cargo test -q"))
+            .filter(|st| !st.contains("SHARED_MEMBERS"))
+            .map(|st| st.chars().take(90).collect())
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these name their own members instead of the shared set, so they \
+             evict the other tier's artefacts: {offenders:?}"
+        );
+    }
+
     #[test]
     fn the_binaries_that_do_carry_tests_are_named_here() {
         // Six binary targets carry tests and must keep running:

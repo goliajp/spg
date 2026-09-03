@@ -51,31 +51,43 @@ pub fn changed_crates(root: &Path, graph: &CrateGraph) -> Result<Vec<String>, St
 ///
 /// # Errors
 /// Clippy findings (the output is the reason).
-/// v7.39.12 — the ONE member set every rustc step in `precommit` uses.
+/// v7.39.12, corrected the same day — the ONE member set every rustc
+/// step in BOTH tiers uses.
 ///
 /// Cargo resolves features over the SELECTED members, so two different
 /// member sets are two sets of artefacts and a rebuild between them.
 /// Different TARGET flags over the same members are not: adding
-/// `--tests` to a set already built with `--lib --bins` builds the extra
-/// targets and nothing else. So the members are fixed here and the
-/// steps vary only their targets.
+/// `--tests` to a set already built with `--lib --bins` builds the
+/// extra targets and nothing else.
 ///
-/// `sqllogictest` joins the changed crates because `slt-smoke` needs
-/// its binary, and asking for it under a different selection is what
-/// made that step rebuild the graph.
+/// The first version of this named the changed crates plus
+/// `sqllogictest`, which made `unit-changed` 38 s and made the next
+/// release rebuild the world: `gate.sh e2e` selects
+/// `--workspace --exclude spg-bench-competitor`, so the narrow run had
+/// replaced exactly the artefacts it needed. That is the whole of the
+/// e2e step's long-standing 4x — 576 s in the tier against 74-137 s by
+/// hand — and it explains why six hypotheses about it were each
+/// refuted: the cause was in the PREVIOUS run, not in the step. Run by
+/// hand the same selection twice in a row and it is warm; run it after
+/// a precommit and it is cold.
+///
+/// So both tiers name the same members and only their targets differ.
+/// A commit pays the workspace build once; the release then pays
+/// nothing for it. Across one commit-then-release cycle that is far
+/// cheaper than each tier evicting the other's work, and it is the same
+/// correction `clippy-changed` needed on the same day.
+pub const SHARED_MEMBERS: &str = " --workspace --exclude spg-bench-competitor";
+
+/// Whether this commit changed any crate at all. `None` means the
+/// rustc steps have nothing to do.
 ///
 /// # Errors
 /// Whatever `changed_crates` reports.
 pub fn precommit_selection(root: &Path, graph: &CrateGraph) -> Result<Option<String>, String> {
-    let changed = changed_crates(root, graph)?;
-    if changed.is_empty() {
+    if changed_crates(root, graph)?.is_empty() {
         return Ok(None);
     }
-    let mut members: Vec<String> = changed;
-    if !members.iter().any(|m| m == "sqllogictest") {
-        members.push("sqllogictest".to_string());
-    }
-    Ok(Some(members.iter().map(|c| format!(" -p {c}")).collect()))
+    Ok(Some(SHARED_MEMBERS.to_string()))
 }
 
 /// v7.39.12 — did the diff touch a `tests/` directory?
@@ -127,19 +139,32 @@ pub fn clippy_changed(root: &Path, graph: &CrateGraph) -> Result<String, String>
     // `#[cfg(test)]` modules are covered by `--lib`; the integration
     // targets need `--tests`, and that is asked for exactly when the
     // diff touches a `tests/` directory.
-    let flags: String = changed.iter().map(|c| format!(" -p {c}")).collect();
-    let targets = if diff_touches_tests(root)? {
-        "--lib --bins --tests"
-    } else {
-        "--lib --bins"
-    };
+    // v7.39.12, corrected the same day — the WORKSPACE selection, which
+    // is the one `gate.sh lint` uses, character for character.
+    //
+    // Narrowing this to the changed crates made the step 0.3 s and made
+    // the release pay for it: clippy artefacts are per-selection like
+    // any others, so a narrow run replaces the workspace-wide ones and
+    // `gate.sh lint` — 3.1 s on an unchanged tree — rebuilt them from
+    // scratch at 765 s on the very next release. Across one
+    // commit-then-release cycle the narrow version is far worse, and
+    // that is a cost moved rather than removed.
+    //
+    // One string, in two places, so the two tiers share. Whichever runs
+    // first pays; the second is free. `diff_touches_tests` stays for
+    // `unit_changed`'s use of it.
     sh(
         root,
-        &format!("cargo clippy -q{flags} {targets} --locked -- -D warnings"),
+        // Character for character `gate.sh lint`'s line, including the
+        // absence of an exclude: the benchmark crate's code is linted
+        // like any other, and CI's `check` job lints it too. The
+        // exclude elsewhere in this file is about which harnesses RUN,
+        // which is a different question.
+        "cargo clippy -q --workspace --all-targets --locked -- -D warnings",
     )?;
     let _ = graph;
     Ok(format!(
-        "clippy clean over {} changed crate(s) ({targets})",
+        "clippy clean (workspace; {} crate(s) changed)",
         changed.len()
     ))
 }
@@ -196,20 +221,19 @@ pub fn unit_changed(root: &Path, graph: &CrateGraph) -> Result<String, String> {
     // depends on spg-engine so that their harnesses can exist, and
     // nothing in this step then runs most of them.
     //
-    // v7.38.2 — `--lib` is an error, not a no-op, when a selected
-    // package has no lib target (bins-only spg-server / spgctl), so the
-    // retry drops it on that exact message.
-    let flags = precommit_selection(root, graph)?.unwrap_or_default();
-    let out = match sh(
+    // The shared member set BUILDS; `RUN_FILTER` decides which of its
+    // harnesses run, and that is where "the crates you changed" lives
+    // now. Building narrowly is what evicted the release's artefacts —
+    // see `SHARED_MEMBERS`.
+    let _ = precommit_selection(root, graph)?;
+    let filter = changed.join(",");
+    let out = sh(
         root,
-        &format!("cargo test -q{flags} --lib --bins --locked 2>&1"),
-    ) {
-        Ok(out) => out,
-        Err(e) if e.contains("no library targets") => {
-            sh(root, &format!("cargo test -q{flags} --bins --locked 2>&1"))?
-        }
-        Err(e) => return Err(e),
-    };
+        &format!(
+            "RUN_FILTER='{filter}' scripts/run-test-binaries.sh \
+             unit-changed{SHARED_MEMBERS} --lib --bins"
+        ),
+    )?;
     // v7.38.22 — say whether the step SPENT its time or waited for it.
     // What it waits for is another cargo holding the build-directory
     // lock, and cargo says so on stderr in as many words.
@@ -328,11 +352,15 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
         // workspace selection here would build the world; a bare
         // `-p <pkg>` one would be a third member set and rebuild
         // between the steps. See `precommit_selection`.
-        let sel = precommit_selection(root, &crate::crategraph::CrateGraph::generate(root)?)?
-            .unwrap_or_else(|| format!(" -p {pkg}"));
+        // The shared member set with `--tests` added: same members, so
+        // the extra targets build and nothing rebuilds. See
+        // `SHARED_MEMBERS`.
         let out = sh(
             root,
-            &format!("cargo test -q{sel} --lib --bins --tests --locked -- {filters}"),
+            &format!(
+                "RUN_FILTER='{pkg}::e2e' RUN_ARGS='{filters}' \
+                 scripts/run-test-binaries.sh pins-current{SHARED_MEMBERS} --tests"
+            ),
         )?;
         let ran: usize = out
             .lines()

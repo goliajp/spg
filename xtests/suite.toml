@@ -69,7 +69,7 @@ impl = "external"
 # features over the selected members — so this step rebuilt the graph
 # between them. `sqllogictest` is IN that shared selection now (see
 # `precommit_selection`), so its binary exists by the time this runs.
-cmd = "target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list"
+cmd = "cargo build -q --workspace --exclude spg-bench-competitor --locked --bin sqllogictest && target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list && SPG_SLT_DB_COLLATION=en_US.utf8 target/debug/sqllogictest --list xtests/sqllogictest/corpus/PRECOMMIT.list"
 # v7.38.18 — 45, and the number is two things, not one.
 #
 # The corpus itself is 1.5-2.0 s: 413 cases, measured twice on a warm
