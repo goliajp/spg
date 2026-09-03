@@ -98,12 +98,25 @@ cmd = "scripts/gate.sh lint"
 budget_s = 330
 
 [[step]]
-tier = "prerelease"
+# v7.39.12 — doc tests moved off the release path.
+#
+# The step is rustdoc alone now: `--lib --bins` left it because that
+# set was a subset of e2e's with nothing left over. What remains costs
+# 441 s on an UNCHANGED tree — every run, whatever changed — against a
+# 2,485 s tier, so it is 18% of the release path spent proving that doc
+# examples still compile.
+#
+# That is worth knowing and it is not worth knowing before every
+# release, so it runs nightly with the rest of `full`. A doc example
+# that stops compiling is a documentation defect; it cannot reach a
+# user through the published binary.
+tier = "full"
 name = "unit"
 impl = "external"
 cmd = "scripts/gate.sh unit"
-# observed 290 / 329 / 340 warm (n=6; one 660s cold rebuild excluded)
-budget_s = 510
+# observed 441 s on an unchanged tree (rustdoc compiles every example
+# whether or not anything changed).
+budget_s = 660
 
 [[step]]
 tier = "prerelease"

@@ -64,7 +64,20 @@ PERF_GATE_CRATES=(
     spgctl spg-server
 )
 
-banner() { printf '\n══ gate.sh %s ══\n' "$*"; }
+# v7.39.12 — every banner carries the seconds since the last one.
+#
+# The tier reports one number per STEP, and `e2e` reads 1,256 s on an
+# unchanged tree while the same five pieces measured by hand sum to
+# 361 s. Rather than guess at the difference a fourth time — the first
+# three guesses were each refuted — the sub-steps say their own cost
+# from inside the run.
+_banner_at=$(date +%s)
+banner() {
+    local now
+    now=$(date +%s)
+    printf '\n══ gate.sh %s ══  [+%ss]\n' "$*" "$(( now - _banner_at ))"
+    _banner_at=$now
+}
 
 run_lint() {
     banner lint
@@ -74,88 +87,29 @@ run_lint() {
 
 run_unit() {
     banner unit
-    # The everyday tier runs the unit tests unoptimised, which is the right
-    # trade for a loop that runs constantly.
-    #
-    # `--full` adds `--include-ignored`, and some of those ignored tests are
-    # ignored precisely BECAUSE they measure something — they carry budgets
-    # in nanoseconds and say in their own comments to run them with
-    # `--release`. Handing them a debug build fails them by construction: the
-    # first `--full` run this branch ever did died on a 200 ns budget
-    # measured at 1913 ns, which is 48 ns when built the way the test asks
-    # for. That is the profile, not a regression.
-    #
-    # So the ignored pass runs in release, where its numbers mean something,
-    # and the ordinary pass stays as it was.
-    # v7.39.12 — the benchmark crate's binaries are not a unit-test
-    # surface, and `--bins` was running all fifty-six of them.
-    #
-    # Counted, not timed, so the number reads the same on any machine:
-    # `--lib --bins` selects 84 harnesses across this workspace and
-    # **64 of them carry zero tests**. Sixty-two of the 64 are binary
-    # targets, and 56 of the 62 belong to `spg-bench-competitor` — the
-    # side-by-side benchmark harness whose `main`s time SPG against
-    # PostgreSQL and MySQL, and whose manifest already says
-    # `test = false` for them.
-    #
-    # It says so and the flag overrode it: an explicit target selector
-    # wins over the manifest. Measured on `heavy`, which the manifest
-    # marks `test = false` — `--tests` selects it 0 times and
-    # `--lib --bins` selects it once; over nine benchmark bins, 1
-    # against 9. Excluding the crate says the same thing in the place
-    # that is honoured: 84 harnesses become 27 and the test count does
-    # not move, 1,206 before and 1,206 after.
-    #
-    # The six binary targets that DO carry tests are in other crates
-    # and keep running: spg-server (108), spgctl (23), the oracle (8),
-    # perm (3) and dogfood (2) runners, sqllogictest (1).
-    #
-    # Why it is worth the line: each harness is a process spawn, and a
-    # spawn is only free on an idle machine. This tier measured
-    # 10,777 s on the testbed while another workload on the same box
-    # held `syspolicyd` at 90% CPU; a probe binary that took 99 s to
-    # launch under that load runs in under a second when the queue is
-    # empty. None of that was the tier's work — but the spawns are the
-    # part this file can decide not to make.
-    # v7.39.12 — and `--bins` is gone, because `e2e` runs every one of
-    # them minutes later.
-    #
-    # `cargo test --tests` selects the library and binary targets too,
-    # not only `tests/`. Compared by harness NAME, the set this step
-    # selected was a **subset of e2e's with nothing left over** — zero
-    # names on the difference. So this invocation ran 27 harnesses and
-    # 1,206 tests that the next step ran again.
-    #
-    # `--lib` stays: it is the tier's fast-fail signal, sixteen
-    # harnesses of the crates' own unit tests, and a broken one should
-    # not wait out an hour of e2e to say so. `--bins` was eleven more
-    # harnesses — including spg-server's 108-test binary — for no
-    # coverage `--tests` does not already give.
     # v7.39.12 — doc tests, and nothing else.
     #
-    # Every distinct `cargo test` target selection costs a full
-    # rebuild, because cargo resolves features over the selected
-    # members and a different member set is a different feature set.
-    # Measured on this workspace, the same command, the same tree:
+    # Every distinct `cargo test` target selection costs a full rebuild:
+    # cargo resolves features over the SELECTED members, so a different
+    # member set is a different feature set. Measured on this workspace,
+    # the same command and the same tree:
     #
     #   after a DIFFERENT selection ran   358 s
     #   after the SAME selection ran       11 s
     #   the fifteen harnesses, by hand     11 s
     #
-    # The 347 s is cargo re-resolving and rebuilding. This tier made a
-    # dozen differently shaped calls and paid it at every transition —
-    # `e2e` alone read 4,156 s of a 7,314 s tier, and the tests inside
-    # it report 127 s.
+    # This step used to run `--lib --bins`, and that cost twice over.
+    # Compared by harness NAME its set was a subset of `e2e`'s `--tests`
+    # with nothing left over — 1,206 tests that e2e ran again minutes
+    # later — AND the selection change made e2e rebuild before it could
+    # start. Both are gone.
     #
-    # So each profile gets ONE selection. `--lib` is gone from here:
-    # compared by harness name its set was a subset of e2e's `--tests`
-    # with nothing left over, so it ran 1,206 tests that e2e ran again
-    # AND made every later step rebuild. Doc tests are the one thing
-    # `--tests` cannot reach, and they need their own rustdoc pass
-    # whatever else happens.
+    # Doc tests are the one thing `--tests` cannot reach, and rustdoc
+    # needs its own pass whatever else happens. They cost 441 s on an
+    # unchanged tree, every run, which is why the step moved to the
+    # `full` tier — see the note beside it in xtests/suite.toml.
     cargo test --workspace --exclude spg-bench-competitor --locked --doc
 }
-
 
 # v7.39.12 — one release build for every step that needs release
 # artefacts, because each distinct cargo selection is a rebuild.
