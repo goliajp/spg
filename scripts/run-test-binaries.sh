@@ -26,7 +26,8 @@ label="${1:?usage: run-test-binaries.sh <label> [cargo args...]}"
 shift
 
 list=$(mktemp -t spg-testbins)
-trap 'rm -f "$list"' EXIT
+times=$(mktemp -t spg-testtimes)
+trap 'rm -f "$list" "$times"' EXIT
 
 # `--no-run` builds; the JSON stream names what it built and where the
 # package lives, which is the working directory cargo would have used.
@@ -75,8 +76,18 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
     fi
     # cargo runs a test binary with the package root as its working
     # directory, and fixtures are opened relative to it.
+    started=$(date +%s)
     out=$(cd "$pkg" && env ${RUN_ENV:-} "$exe" --quiet ${RUN_ARGS:-} 2>&1)
     rc=$?
+    # v7.39.12 — every harness records its own wall clock.
+    #
+    # The step-level number and the same work measured by hand have
+    # disagreed by 4x, and six hypotheses about the difference were
+    # each refuted by measurement. A per-harness row says whether the
+    # gap is spread across all of them (the machine) or concentrated in
+    # a few (those harnesses), which is the question the step-level
+    # number cannot answer.
+    printf '%6ss  %s\n' "$(( $(date +%s) - started ))" "$name" >> "$times"
     t=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
     tests=$(( tests + ${t:-0} ))
     if [ "$rc" = 0 ]; then
@@ -89,4 +100,7 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
 done < "$list"
 
 echo "$label: $pass/$((pass+fail)) harnesses green, $tests tests"
+# The five slowest, so a step's cost is attributable from its own log.
+slow=$(sort -rn "$times" | head -5 | tr '\n' ';' | sed 's/;$//')
+echo "$label: slowest —$slow"
 [ "$fail" = 0 ] || { echo "$label: FAILED —$failed_names" >&2; exit 1; }
