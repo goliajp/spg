@@ -22,8 +22,8 @@ fn main() {
             let graph = suitelib::crategraph::CrateGraph::generate(root).expect("graph");
             let runid = "step-debug".to_string();
             let out = match name.as_str() {
-                "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
-                "unit-affected" => suitelib::steps::unit_affected(root, &graph),
+                "clippy-changed" => suitelib::steps::clippy_changed(root, &graph),
+                "unit-changed" => suitelib::steps::unit_changed(root, &graph),
                 "pins-current" => suitelib::steps::pins_current(root),
                 "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                 "ironrules" => suitelib::steps::ironrules_full(root, &runid),
@@ -284,7 +284,7 @@ fn main() {
                 // runs, which is workspace-wide.
                 //
                 // It built `-p A -p B … --lib --bins` over the affected
-                // closure while `unit_affected` (also v7.39.12) moved to
+                // closure while `unit_changed` (also v7.39.12) moved to
                 // one workspace-wide build. Two selections, so cargo
                 // resolved features twice and rebuilt between them: the
                 // ledger's own total read 871 s where the steps summed
@@ -294,28 +294,27 @@ fn main() {
                 // One selection, named in one place. `affected_selection`
                 // still decides WHICH harnesses run; it no longer
                 // decides what gets built.
-                let anything_changed = suitelib::steps::affected_selection(root, &graph)
+                // v7.39.12 — the member set the steps use, not a
+                // second one. See `steps::precommit_selection`: cargo
+                // resolves features over the selected members, so a
+                // prepare that names a different set builds artefacts
+                // the step cannot use and rebuilds on the way in.
+                //
+                // The ledger caught the last instance of that without
+                // being asked: its own total read 871 s on a run whose
+                // six steps summed to 593 s, and the ledger starts
+                // before the prepare while the step timer starts after
+                // it.
+                let subset_args: Vec<String> = suitelib::steps::precommit_selection(root, &graph)
                     .ok()
                     .flatten()
-                    .is_some();
-                let subset_args: Vec<String> = if anything_changed {
-                    [
-                        "test",
-                        "-q",
-                        "--workspace",
-                        "--exclude",
-                        "spg-bench-competitor",
-                        "--locked",
-                        "--no-run",
-                        "--lib",
-                        "--bins",
-                    ]
-                    .iter()
-                    .map(|s| (*s).to_string())
-                    .collect()
-                } else {
-                    Vec::new()
-                };
+                    .map(|flags| {
+                        let mut v = vec!["test".to_string(), "-q".to_string()];
+                        v.extend(flags.split_whitespace().map(str::to_string));
+                        v.extend(["--lib", "--bins", "--locked", "--no-run"].map(str::to_string));
+                        v
+                    })
+                    .unwrap_or_default();
                 let subset_ref: Vec<&str> = subset_args.iter().map(String::as_str).collect();
                 // v7.39.11 — prepare builds the one thing the tier
                 // actually runs, and nothing else.
@@ -347,7 +346,7 @@ fn main() {
                 if !subset_ref.is_empty() {
                     prep.push((
                         subset_ref.as_slice(),
-                        "cargo test --workspace --no-run --lib --bins",
+                        "cargo test <changed + sqllogictest> --no-run --lib --bins",
                     ));
                 }
                 for (args, label) in prep {
@@ -355,7 +354,7 @@ fn main() {
                     // v7.38.25 — `--lib` is an error, not a no-op, when no
                     // selected package has a lib target, and the affected
                     // closure is often one bins-only crate.
-                    // `steps::unit_affected` has retried without it since
+                    // `steps::unit_changed` has retried without it since
                     // v7.38.2; this prepare, which runs first and exits the
                     // tier on any failure, did not -- so a commit touching
                     // only `spg-dogfood-replay` could not reach the step
@@ -500,7 +499,7 @@ fn main() {
                     if band > 1
                         && matches!(
                             s.name.as_str(),
-                            "unit-affected" | "clippy-affected" | "pins-current" | "slt-smoke"
+                            "unit-changed" | "clippy-changed" | "pins-current" | "slt-smoke"
                         )
                     {
                         (b * band * 12 / 10).min(BUDGET_CAP_S)
@@ -525,8 +524,8 @@ fn main() {
                         }
                     }
                     _ => match s.name.as_str() {
-                        "clippy-affected" => suitelib::steps::clippy_affected(root, &graph),
-                        "unit-affected" => suitelib::steps::unit_affected(root, &graph),
+                        "clippy-changed" => suitelib::steps::clippy_changed(root, &graph),
+                        "unit-changed" => suitelib::steps::unit_changed(root, &graph),
                         "pins-current" => suitelib::steps::pins_current(root),
                         "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                         // S1.3 — smoke plus the previous release's data

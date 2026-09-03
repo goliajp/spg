@@ -47,58 +47,103 @@ pub fn changed_crates(root: &Path, graph: &CrateGraph) -> Result<Vec<String>, St
     Ok(hits)
 }
 
-/// `clippy-affected` — clippy over the affected closure, debug profile.
+/// `clippy-changed` — clippy over the crates this commit changed.
 ///
 /// # Errors
 /// Clippy findings (the output is the reason).
-pub fn clippy_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> {
+/// v7.39.12 — the ONE member set every rustc step in `precommit` uses.
+///
+/// Cargo resolves features over the SELECTED members, so two different
+/// member sets are two sets of artefacts and a rebuild between them.
+/// Different TARGET flags over the same members are not: adding
+/// `--tests` to a set already built with `--lib --bins` builds the extra
+/// targets and nothing else. So the members are fixed here and the
+/// steps vary only their targets.
+///
+/// `sqllogictest` joins the changed crates because `slt-smoke` needs
+/// its binary, and asking for it under a different selection is what
+/// made that step rebuild the graph.
+///
+/// # Errors
+/// Whatever `changed_crates` reports.
+pub fn precommit_selection(root: &Path, graph: &CrateGraph) -> Result<Option<String>, String> {
+    let changed = changed_crates(root, graph)?;
+    if changed.is_empty() {
+        return Ok(None);
+    }
+    let mut members: Vec<String> = changed;
+    if !members.iter().any(|m| m == "sqllogictest") {
+        members.push("sqllogictest".to_string());
+    }
+    Ok(Some(members.iter().map(|c| format!(" -p {c}")).collect()))
+}
+
+/// v7.39.12 — did the diff touch a `tests/` directory?
+///
+/// Which clippy targets a changed crate needs. `--lib --bins` covers
+/// `src/`, including its `#[cfg(test)]` modules; `--tests` adds the
+/// integration targets, and on this workspace those are the expensive
+/// ones — `clippy -p spg-engine --all-targets` is 135 s against 52 s
+/// for `--lib` alone, because spg-engine's e2e target carries 6,898
+/// tests.
+///
+/// So the target set follows what the commit actually touched. A
+/// commit that edits `src/` lints `src/`; one that edits `tests/`
+/// lints those too. Either way `gate.sh lint` and CI's `check` job run
+/// `--workspace --all-targets` before anything ships.
+///
+/// # Errors
+/// git failures only.
+pub fn diff_touches_tests(root: &Path) -> Result<bool, String> {
+    let diff = sh(root, "git diff --name-only HEAD")?;
+    Ok(diff.lines().any(|f| f.contains("/tests/")))
+}
+
+pub fn clippy_changed(root: &Path, graph: &CrateGraph) -> Result<String, String> {
     let changed = changed_crates(root, graph)?;
     if changed.is_empty() {
         return Ok("no crate changes — skipped".into());
     }
-    let affected = graph.affected(&changed);
-    // v7.39.12 — workspace-wide, not the affected subset.
+    // v7.39.12 — the crates the commit CHANGED, not their dependents.
     //
-    // Cargo resolves features over the SELECTED members, so each
-    // distinct member set is a distinct set of artefacts. The affected
-    // set changes from commit to commit, which means this step was
-    // rebuilding the dependency graph with clippy-driver on almost
-    // every commit — the "narrow" selection was the expensive one.
+    // This step selected the affected closure — a change to spg-engine
+    // pulls in every crate that depends on it — and cargo resolves
+    // features over the selected members, so each new closure was a new
+    // set of artefacts and the "narrow" selection rebuilt on almost
+    // every commit. Measured after one line changed in spg-engine:
     //
-    // Measured on this workspace, the same command and tree: 358 s
-    // after a different selection ran, 11 s after the same one. One
-    // stable workspace-wide selection stays warm across commits AND
-    // shares its artefacts with `gate.sh lint`, which uses exactly this
-    // line.
+    //   clippy --workspace --all-targets      161 s
+    //   clippy -p spg-engine --all-targets    135 s
+    //   clippy -p spg-engine --lib             52 s
     //
-    // The benchmark crate is excluded for the reason `gate.sh` gives:
-    // its binaries are not a test surface, and it is `test = false` in
-    // its own manifest.
-    let _ = &affected;
-    // v7.38.23 — `--all-targets`, because without it this step does not
-    // lint TEST code and `gate.sh lint` does.
+    // The dependents are linted by `gate.sh lint` and by CI's `check`
+    // job, both of which run `--workspace --all-targets` on every push
+    // — before anything ships. What this step owes the committer is a
+    // verdict on the code they just wrote, quickly.
     //
-    // The release gate runs `cargo clippy --workspace --all-targets
-    // --locked -- -D warnings`; this one ran the default targets, so a
-    // lint in a test passed precommit every time and could only fail at
-    // the release. It did: v7.38.23's train stopped at `gate.sh lint`
-    // over a `repeat().take()` in a test added the same day, after
-    // precommit had reported "clippy clean over 13 crates".
+    // v7.38.23 — `--all-targets` was added because without it this step
+    // did not lint TEST code, and a `repeat().take()` in a test added
+    // the same day passed precommit and stopped the release. `src/`'s
+    // `#[cfg(test)]` modules are covered by `--lib`; the integration
+    // targets need `--tests`, and that is asked for exactly when the
+    // diff touches a `tests/` directory.
+    let flags: String = changed.iter().map(|c| format!(" -p {c}")).collect();
+    let targets = if diff_touches_tests(root)? {
+        "--lib --bins --tests"
+    } else {
+        "--lib --bins"
+    };
     sh(
         root,
-        "cargo clippy -q --workspace --exclude spg-bench-competitor \
-         --all-targets --locked -- -D warnings",
+        &format!("cargo clippy -q{flags} {targets} --locked -- -D warnings"),
     )?;
+    let _ = graph;
     Ok(format!(
-        "clippy clean (workspace; {} crate(s) changed)",
-        affected.len()
+        "clippy clean over {} changed crate(s) ({targets})",
+        changed.len()
     ))
 }
 
-/// `unit-affected` — `--lib --bins` tests over the affected closure.
-///
-/// # Errors
-/// Test failures (the output is the reason).
 /// v7.38.22 — the crate selection `unit-affected` will run, and the
 /// `-p` flags that name it.
 ///
@@ -132,43 +177,52 @@ pub fn affected_selection(
     Ok(Some((affected, flags)))
 }
 
-pub fn unit_affected(root: &Path, graph: &CrateGraph) -> Result<String, String> {
-    let Some((affected, _)) = affected_selection(root, graph)? else {
+pub fn unit_changed(root: &Path, graph: &CrateGraph) -> Result<String, String> {
+    let changed = changed_crates(root, graph)?;
+    if changed.is_empty() {
         return Ok("no crate changes — skipped".into());
-    };
-    // v7.39.12 — one workspace-wide build, then run the affected
-    // packages' harnesses out of it.
+    }
+    // v7.39.12 — the crates the commit CHANGED run their own unit
+    // tests. Their dependents are covered by CI's workspace test job on
+    // every push, and by `gate.sh e2e` before anything ships.
     //
-    // This step selected `-p A -p B …` over the affected closure, and
-    // that set changes from commit to commit. Cargo resolves features
-    // over the SELECTED members, so every new set was a new set of
-    // artefacts: the "narrow" selection rebuilt the dependency graph on
-    // almost every commit, and then `pins-current` and `slt-smoke`
-    // changed the selection again and rebuilt after it.
+    // Measured after one line changed in spg-engine:
     //
-    // Measured on this workspace, the same command and tree: 358 s
-    // after a different selection ran, 11 s after the same one, and 11 s
-    // for the fifteen harnesses run by hand. The 347 s was cargo, not
-    // the tests.
+    //   the affected closure, workspace build + filtered run   537 s
+    //   cargo test -p spg-engine --lib (build and run)           38 s
     //
-    // Measured on the hook itself, one comment added to spg-engine:
-    // this step ran 32 minutes, with `-p spg-bench-competitor` in the
-    // selection — the benchmark crate, 56 harnesses carrying no tests.
+    // The 537 s is not the tests — spg-engine's lib carries 405 of them
+    // and they run in seconds. It is rustc compiling every crate that
+    // depends on spg-engine so that their harnesses can exist, and
+    // nothing in this step then runs most of them.
     //
-    // So: build the workspace once (the same selection `clippy-affected`
-    // and `gate.sh` use, so it stays warm), then execute only the
-    // affected packages' harnesses. The coverage is what it was; what
-    // is gone is the rebuild and the benchmark crate.
-    let filter = affected.join(",");
-    let out = sh(
+    // v7.38.2 — `--lib` is an error, not a no-op, when a selected
+    // package has no lib target (bins-only spg-server / spgctl), so the
+    // retry drops it on that exact message.
+    let flags = precommit_selection(root, graph)?.unwrap_or_default();
+    let out = match sh(
         root,
-        &format!(
-            "RUN_FILTER='{filter}' scripts/run-test-binaries.sh unit-affected \
-             --workspace --exclude spg-bench-competitor --lib --bins"
-        ),
-    )?;
-    let summary = out.lines().last().unwrap_or("").trim().to_string();
-    Ok(format!("{summary} ({} crate(s) affected)", affected.len()))
+        &format!("cargo test -q{flags} --lib --bins --locked 2>&1"),
+    ) {
+        Ok(out) => out,
+        Err(e) if e.contains("no library targets") => {
+            sh(root, &format!("cargo test -q{flags} --bins --locked 2>&1"))?
+        }
+        Err(e) => return Err(e),
+    };
+    // v7.38.22 — say whether the step SPENT its time or waited for it.
+    // What it waits for is another cargo holding the build-directory
+    // lock, and cargo says so on stderr in as many words.
+    let waited = out.contains("Blocking waiting for file lock");
+    let note = if waited {
+        " — and WAITED on the build-directory lock, so this duration is another cargo's"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "unit green over {} changed crate(s){note}",
+        changed.len()
+    ))
 }
 
 /// `pins-current` — the e2e pins THIS commit adds or touches.
@@ -269,17 +323,16 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
         }
 
         let filters = mods.join(" ");
-        // v7.39.12 — from the workspace build, not a single-package
-        // selection. `-p <pkg> --test e2e` is a different member set
-        // and so a full rebuild before this step could run anything;
-        // see the note in `unit_affected`.
+        // v7.39.12 — the same member set every rustc step in this tier
+        // uses, with `--tests` added for the pin's own target. A
+        // workspace selection here would build the world; a bare
+        // `-p <pkg>` one would be a third member set and rebuild
+        // between the steps. See `precommit_selection`.
+        let sel = precommit_selection(root, &crate::crategraph::CrateGraph::generate(root)?)?
+            .unwrap_or_else(|| format!(" -p {pkg}"));
         let out = sh(
             root,
-            &format!(
-                "RUN_FILTER='{pkg}::e2e' RUN_ARGS='{filters}' \
-                 scripts/run-test-binaries.sh pins-current \
-                 --workspace --exclude spg-bench-competitor --tests"
-            ),
+            &format!("cargo test -q{sel} --lib --bins --tests --locked -- {filters}"),
         )?;
         let ran: usize = out
             .lines()
