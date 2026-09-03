@@ -27,11 +27,15 @@ shift
 
 list=$(mktemp -t spg-testbins)
 times=$(mktemp -t spg-testtimes)
-trap 'rm -f "$list" "$times"' EXIT
 
 # `--no-run` builds; the JSON stream names what it built and where the
 # package lives, which is the working directory cargo would have used.
-if ! cargo test -q --locked "$@" --no-run --message-format=json 2>/dev/null \
+# v7.39.12 — the build's stderr is kept, because "the build failed" with
+# the reason discarded is a message nobody can act on. It cost one
+# release-gate run to read as an unexplained failure.
+build_err=$(mktemp -t spg-testbuild)
+trap 'rm -f "$list" "$times" "$build_err"' EXIT
+if ! cargo test -q --locked "$@" --no-run --message-format=json 2>"$build_err" \
     | python3 -c '
 import sys, json, os
 seen = set()
@@ -55,6 +59,7 @@ for line in sys.stdin:
     print(exe + "\t" + pkg_dir + "\t" + pkg + "::" + name)
 ' > "$list"; then
     echo "$label: the build failed" >&2
+    cat "$build_err" >&2
     exit 1
 fi
 
