@@ -280,19 +280,42 @@ fn main() {
                 // 2289.9 s, 167.8 s, 1585.8 s, 8.9 s, 505.2 s. That is a
                 // 257x spread, and the short readings are the ones where
                 // a previous run happened to leave the subset warm.
-                let subset = suitelib::steps::affected_selection(root, &graph)
+                // v7.39.12 — prepare builds the SAME selection the step
+                // runs, which is workspace-wide.
+                //
+                // It built `-p A -p B … --lib --bins` over the affected
+                // closure while `unit_affected` (also v7.39.12) moved to
+                // one workspace-wide build. Two selections, so cargo
+                // resolved features twice and rebuilt between them: the
+                // ledger's own total read 871 s where the steps summed
+                // to 593 s, and those 278 s were this prepare building
+                // artefacts the step then could not use.
+                //
+                // One selection, named in one place. `affected_selection`
+                // still decides WHICH harnesses run; it no longer
+                // decides what gets built.
+                let anything_changed = suitelib::steps::affected_selection(root, &graph)
                     .ok()
                     .flatten()
-                    .map(|(_, flags)| flags);
-                let subset_args: Vec<String> = subset
-                    .as_deref()
-                    .map(|f| {
-                        let mut v = vec!["test".to_string(), "-q".to_string()];
-                        v.extend(f.split_whitespace().map(str::to_string));
-                        v.extend(["--no-run", "--lib", "--bins"].map(str::to_string));
-                        v
-                    })
-                    .unwrap_or_default();
+                    .is_some();
+                let subset_args: Vec<String> = if anything_changed {
+                    [
+                        "test",
+                        "-q",
+                        "--workspace",
+                        "--exclude",
+                        "spg-bench-competitor",
+                        "--locked",
+                        "--no-run",
+                        "--lib",
+                        "--bins",
+                    ]
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+                } else {
+                    Vec::new()
+                };
                 let subset_ref: Vec<&str> = subset_args.iter().map(String::as_str).collect();
                 // v7.39.11 — prepare builds the one thing the tier
                 // actually runs, and nothing else.
@@ -324,7 +347,7 @@ fn main() {
                 if !subset_ref.is_empty() {
                     prep.push((
                         subset_ref.as_slice(),
-                        "cargo test <affected> --no-run --lib --bins",
+                        "cargo test --workspace --no-run --lib --bins",
                     ));
                 }
                 for (args, label) in prep {
