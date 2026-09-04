@@ -812,6 +812,7 @@ impl Engine {
         Some(crate::eval::SessionCoercion {
             zone,
             localize: self.tz_localize_fn,
+            offset: self.tz_offset_fn,
             order,
         })
     }

@@ -62,25 +62,38 @@ pub(crate) fn value_to_literal_expr_typed(
     declared: Option<spg_storage::DataType>,
 ) -> Result<Expr, EngineError> {
     use spg_storage::DataType as D;
-    let cast_to = |v: &Value, name: &str| -> Expr {
+    // v7.39.13 — render through the COLUMN-AWARE renderer.
+    //
+    // `value_to_text` sees the value alone, and `Value::Timestamp` is
+    // what both `timestamp` and `timestamptz` hold — so it wrote
+    // `2026-01-01 00:00:00` with no offset. The re-parse on the other
+    // side then read that as a wall clock in the session's zone and
+    // subtracted the offset: under `Asia/Tokyo`, an instant assigned
+    // through a scalar subquery moved nine hours. The cast this arm
+    // adds was supposed to prevent exactly that and could not, because
+    // `expr_names_an_instant` asks whether the TEXT carries an offset
+    // and this text did not.
+    let cast_to = |v: &Value, name: &str, dt: Option<spg_storage::DataType>| -> Expr {
+        let text = match dt {
+            Some(d) => crate::eval::values::value_to_text_typed(v, &d),
+            None => crate::eval::value_to_text(v),
+        };
         Expr::Cast {
-            expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(
-                crate::eval::value_to_text(v),
-            ))),
+            expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(text))),
             target: spg_sql::ast::CastTarget::Named(alloc::string::String::from(name)),
         }
     };
     match (&v, declared) {
         // The zone. `Value::Timestamp` is what both types hold.
         (Value::Timestamp(_), Some(D::Timestamptz)) => {
-            return Ok(cast_to(&v, "timestamptz"));
+            return Ok(cast_to(&v, "timestamptz", Some(D::Timestamptz)));
         }
         // `Value::Json` holds both spellings; `Value::Text` reaching a
         // JSON column is the same ambiguity from the other side.
-        (Value::Json(_) | Value::Text(_), Some(D::Jsonb)) => return Ok(cast_to(&v, "jsonb")),
-        (Value::Json(_) | Value::Text(_), Some(D::Json)) => return Ok(cast_to(&v, "json")),
+        (Value::Json(_) | Value::Text(_), Some(D::Jsonb)) => return Ok(cast_to(&v, "jsonb", None)),
+        (Value::Json(_) | Value::Text(_), Some(D::Json)) => return Ok(cast_to(&v, "json", None)),
         // A bare string literal is `unknown` until something types it.
-        (Value::Text(_), Some(D::Text)) => return Ok(cast_to(&v, "text")),
+        (Value::Text(_), Some(D::Text)) => return Ok(cast_to(&v, "text", None)),
         // An array of small integers rebuilds as `integer[]` unless the
         // declaration says otherwise.
         (
@@ -335,6 +348,29 @@ fn array_elements(v: &Value) -> Option<alloc::vec::Vec<Expr>> {
 /// that need lossy textual round-trip (BYTEA, arrays, ts*)
 /// surface as an Unsupported error so the caller can add a cast
 /// in the inner SELECT.
+/// v7.39.13 — as [`value_to_literal_expr_permissive`], told the type the
+/// value came OUT of.
+///
+/// `Value::Timestamp` is what a `timestamp` and a `timestamptz` both
+/// hold, so a literal built from the value alone is a wall clock with
+/// no offset. `INSERT … SELECT` materialises its source rows through
+/// here, and the assignment on the other side then read that wall
+/// clock in the session's zone: under `Asia/Tokyo` an instant copied
+/// between two timestamptz columns moved nine hours, every time, with
+/// no cast and no subquery anywhere in the statement.
+///
+/// The source column's type is right there in the same `QueryResult`
+/// the rows came from — it was being discarded by a `..` pattern.
+pub(crate) fn value_to_literal_expr_permissive_typed(
+    v: Value,
+    src: Option<spg_storage::DataType>,
+) -> Result<Expr, EngineError> {
+    if let (Some(spg_storage::DataType::Timestamptz), Value::Timestamp(_)) = (src, &v) {
+        return value_to_literal_expr_typed(v, Some(spg_storage::DataType::Timestamptz));
+    }
+    value_to_literal_expr_permissive(v)
+}
+
 pub(crate) fn value_to_literal_expr_permissive(v: Value) -> Result<Expr, EngineError> {
     // v7.39 (round 621) — an ARRAY goes back through its own text form, cast
     // to its own type: the road Tid, UUID and BYTEA already take.

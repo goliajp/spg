@@ -135,11 +135,13 @@ cmd = "scripts/gate.sh release-build"
 # harness, which `gates`, `biz`, `dogfood` and the perm-runner all need.
 #
 # It was inside `e2e` from 2026-09-03, judged by a budget derived on
-# 2026-08-17 from an `e2e` that built nothing. No budget here yet: the
-# only honest source for one is a run that measures this step, and none
-# has happened. The first prerelease after this lands sets it, and until
-# then this step cannot go red — which is the price of not inventing a
-# number, paid once and in the open.
+# 2026-08-17 from an `e2e` that built nothing.
+#
+# 165.7 s, measured once on the testbed 2026-09-04 — the first run that
+# could see this step at all. 250 is 1.5x that, the rule c81f818b
+# states, applied here to a single observation because there is only
+# one; it widens when there is a spread to apply it to.
+budget_s = 250
 
 [[step]]
 tier = "prerelease"

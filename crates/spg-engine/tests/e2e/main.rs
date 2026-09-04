@@ -1354,6 +1354,7 @@ mod e2e_trigger;
 mod e2e_trim;
 mod e2e_trim_position_syntax;
 mod e2e_trunc;
+mod e2e_tstz_assignment_v73913;
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1366,6 +1367,7 @@ mod e2e_unique_collation;
 mod e2e_unique_index;
 mod e2e_unique_nulls_not_distinct;
 mod e2e_unnest_multi;
+mod e2e_unnest_zip_element_types_v73913;
 mod e2e_unsigned;
 mod e2e_update_correlated;
 mod e2e_update_from_delete_using;
