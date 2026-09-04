@@ -1859,7 +1859,28 @@ impl Engine {
                     if !already_idx {
                         let suffix = if is_pk { "pkey" } else { "key" };
                         let idx_name = alloc::format!("{}_{leading}_{suffix}", tbl);
-                        let _ = table.add_index(idx_name, leading);
+                        let _ = table.add_index(idx_name.clone(), leading);
+                        // v7.39.13 — which of the two this index is.
+                        //
+                        // A SINGLE-column constraint's index covers the
+                        // whole key, so it IS the constraint's index. For a
+                        // COMPOSITE one this covers the leading column
+                        // only: a probe SPG builds because a composite
+                        // B-tree cannot answer a lookup that does not start
+                        // at its front, and one PostgreSQL has no
+                        // equivalent of. Recorded, because the catalog
+                        // otherwise has to guess from columns or a name —
+                        // and guessing renamed a user's own index and
+                        // called an expression index the primary key.
+                        if let Some(ix) =
+                            table.indices_mut().iter_mut().find(|i| i.name == idx_name)
+                        {
+                            if columns.len() >= 2 {
+                                ix.constraint_internal = true;
+                            } else {
+                                ix.constraint_backing = true;
+                            }
+                        }
                     }
                 }
             }
@@ -4503,7 +4524,18 @@ impl Engine {
                 return Err(EngineError::Storage(e));
             }
             if i == 0 {
+                if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                    ix.constraint_backing = true;
+                }
                 inline_lead_added = Some(idx_name);
+            } else if inline_pk_columns.len() >= 2 {
+                // v7.39.13 — a probe index for a non-leading key column.
+                // The lead one becomes the composite below and IS the
+                // constraint's index; these exist so a probe that does
+                // not start at the key's front still has a B-tree.
+                if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                    ix.constraint_internal = true;
+                }
             }
         }
         // v7.38.1 (L12) — a multi-column PRIMARY KEY's leading index
@@ -4611,7 +4643,17 @@ impl Engine {
                     return Err(EngineError::Storage(e));
                 }
                 if k == 0 {
+                    if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                        ix.constraint_backing = true;
+                    }
                     lead_added = Some(idx_name);
+                } else if names.len() >= 2 {
+                    // v7.39.13 — see the inline-PK loop above: a probe
+                    // index for a non-leading key column, not the
+                    // constraint's own.
+                    if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                        ix.constraint_internal = true;
+                    }
                 }
             }
             // v7.38.1 (L12) — same upgrade as the inline-PK path: the

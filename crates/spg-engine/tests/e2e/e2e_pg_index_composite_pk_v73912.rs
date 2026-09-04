@@ -103,34 +103,39 @@ fn the_single_column_case_v7_39_11_closed_stays_closed() {
     assert_eq!(one[0][2], "true");
 }
 
+/// v7.39.13 — this said "SPG builds two indexes for the inline
+/// spelling — which sentori and this project both still have open",
+/// and asserted the pair. It is closed: storage records which index a
+/// constraint built, so the probe index over a non-leading column is no
+/// longer a catalog object and the constraint's own index carries
+/// PostgreSQL's name for it. PG 18.6 shows exactly `inl_pkey`.
 #[test]
-fn an_inline_composite_marks_the_composite_index_and_not_the_other() {
-    // SPG builds two indexes for the inline spelling — which sentori
-    // and this project both still have open. What must hold is that
-    // the one covering the whole key is the primary one and the one
-    // covering a single non-leading column is not.
+fn an_inline_composite_reports_one_index_named_as_postgresql_names_it() {
     let mut e = seeded();
     let r = rows(&mut e, FLAGS);
     let inl: Vec<&Vec<String>> = r.iter().filter(|x| x[0].starts_with("inl")).collect();
-    assert_eq!(inl.len(), 2, "the known-open double row: {r:?}");
-    let primary: Vec<&&Vec<String>> = inl.iter().filter(|x| x[1] == "true").collect();
-    assert_eq!(primary.len(), 1, "exactly one of the pair is primary");
-    assert!(
-        primary[0][0].contains("_a_"),
-        "the composite index is the one that covers the key: {inl:?}"
-    );
+    assert_eq!(inl.len(), 1, "one index per constraint, as PG has: {r:?}");
+    assert_eq!(inl[0][0], "inl_pkey");
+    assert_eq!(inl[0][1], "true", "indisprimary");
+    assert_eq!(inl[0][2], "true", "indisunique");
 }
 
+/// v7.39.13 — the same intent, on an index that still exists.
+///
+/// This used to reach for `inl_b_pkey_0_1`, SPG's own probe index over
+/// a non-leading key column, which the catalog no longer shows. A USER
+/// index over a constrained column is the case that matters, and it
+/// must stay plain: it accepts duplicates, and 7.39.12 reported it
+/// unique.
 #[test]
-fn a_plain_index_over_a_constrained_column_is_not_unique() {
-    // The negative control for the prefix rule: an index on a column
-    // that no constraint covers must stay plain. `inl_b_pkey_0_1`
-    // covers column b alone, and `PRIMARY KEY (a, b)` does not START
-    // with (b), so the prefix does not match it.
+fn a_user_index_over_a_constrained_column_is_not_unique() {
     let mut e = seeded();
+    e.execute("CREATE INDEX two_b_plain ON two (b)").unwrap();
+    // It really does accept two rows sharing b — the key is (a, b).
+    e.execute("INSERT INTO two VALUES (1, 9), (2, 9)").unwrap();
     let r = rows(&mut e, FLAGS);
-    let b_only: Vec<&Vec<String>> = r.iter().filter(|x| x[0].contains("_b_")).collect();
-    assert_eq!(b_only.len(), 1);
-    assert_eq!(b_only[0][1], "false", "indisprimary");
-    assert_eq!(b_only[0][2], "false", "indisunique");
+    let plain: Vec<&Vec<String>> = r.iter().filter(|x| x[0] == "two_b_plain").collect();
+    assert_eq!(plain.len(), 1, "{r:?}");
+    assert_eq!(plain[0][1], "false", "indisprimary");
+    assert_eq!(plain[0][2], "false", "indisunique");
 }

@@ -2360,6 +2360,42 @@ fn greatest_least_collation(args: &[Expr], ctx: &EvalContext<'_>) -> Option<allo
 /// 35.6 %-of-self-time note on `compare` is untouched.
 #[cold]
 #[inline(never)]
+/// v7.39.13 — rename the operands of an ambiguous `||` refusal the way
+/// PostgreSQL names them.
+///
+/// `char1_concat_is_ambiguous` builds the message from the VALUES, and
+/// `Value::Text` is what an untyped literal and a real `text` both
+/// arrive as. PostgreSQL calls the first `unknown`:
+///
+/// ```text
+///   'x' || 'r'::"char"          unknown || "char"
+///   'x'::text || 'r'::"char"    text    || "char"
+/// ```
+///
+/// Only the expression knows which was written, so the substitution
+/// happens here, where it is in hand.
+fn name_untyped_concat_operands(e: EvalError, lhs: &Expr, rhs: &Expr) -> EvalError {
+    const PREFIX: &str = "operator is not unique: ";
+    let EvalError::TypeMismatch { detail } = &e else {
+        return e;
+    };
+    let Some(rest) = detail.strip_prefix(PREFIX) else {
+        return e;
+    };
+    let Some((l_name, r_name)) = rest.split_once(" || ") else {
+        return e;
+    };
+    let fix = |written: &str, side: &Expr| -> alloc::string::String {
+        if written == "text" && is_unknown_string_literal(side) {
+            return alloc::string::String::from("unknown");
+        }
+        alloc::string::String::from(written)
+    };
+    EvalError::TypeMismatch {
+        detail: alloc::format!("{PREFIX}{} || {}", fix(l_name, lhs), fix(r_name, rhs)),
+    }
+}
+
 fn unknown_literal_cmp_error(
     err: EvalError,
     lhs: &Expr,
@@ -3986,6 +4022,14 @@ fn eval_function_call_positional(
                 spg_storage::DataType::Xid
                     | spg_storage::DataType::Xid8
                     | spg_storage::DataType::Oid
+                    // v7.39.13 — `jsonb` for the same reason and no
+                    // other: SPG carries JSON and JSONB in one
+                    // `Value::Json`, so the value-driven namer can only
+                    // ever say `json`. Reported by sentori against
+                    // 7.39.12 — `pg_typeof` over a `jsonb` scalar
+                    // subquery answered `json`, and an ORM branching on
+                    // the type reads that.
+                    | spg_storage::DataType::Jsonb
             )
             && let Some(n) = pg_typeof_name_for_datatype(shape.ty)
         {
@@ -5268,7 +5312,25 @@ pub fn eval_expr(
             if ctx.mysql_dialect {
                 apply_binary_mysql_unsigned(*op, lhs, rhs, l, r, ctx)
             } else {
-                binop::apply_binary(*op, l, r)
+                // v7.39.13 — `||` against a `"char"` refuses, and PG names
+                // an untyped literal `unknown` in the refusal. SPG holds
+                // both `'x'` and `'x'::text` as `Value::Text`, so only the
+                // EXPRESSION can tell them apart — the same knowledge
+                // `unknown_literal_cmp_error` already uses one arm above,
+                // for comparisons. Reported by sentori: the refusal is
+                // right, the left-hand type named in it was not.
+                //
+                // On the error path only; a successful concat pays one
+                // branch on the op.
+                let untyped = matches!(op, spg_sql::ast::BinOp::Concat)
+                    && (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs));
+                binop::apply_binary(*op, l, r).map_err(|e| {
+                    if untyped {
+                        name_untyped_concat_operands(e, lhs, rhs)
+                    } else {
+                        e
+                    }
+                })
             }
         }
         Expr::Cast { expr, target } => eval_cast_arm(expr, target, row, ctx),

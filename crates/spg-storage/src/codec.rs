@@ -1098,6 +1098,18 @@ fn deserialize_indices(
                         last.extra_orders = orders;
                     }
                 }
+                // v7.39.13 — whether SPG built this index for a
+                // constraint's non-leading columns (FILE_VERSION 96+).
+                // A v95 snapshot has no byte here and every index in it
+                // reads as user-created, which is what it recorded.
+                if version >= 96 {
+                    let internal = cur.read_u8()? != 0;
+                    let backing = cur.read_u8()? != 0;
+                    if let Some(last) = t.indices.last_mut() {
+                        last.constraint_internal = internal;
+                        last.constraint_backing = backing;
+                    }
+                }
             }
         }
     }
