@@ -62,6 +62,27 @@ of a freshly linked binary, and it is a property of the host:
 and 0.00 s there. So a tier that builds and then immediately runs pays
 this on every harness, and the same command run later pays none of it.
 
+The daemon's log names the subsystem: `com.apple.syspolicy.exec`
+provenance tracking — `Found provenance data on process`, `Tracking
+process with attributes`, and `Unable to initialize qtn_proc: 3`
+repeated 2,376 times. The stalled process samples 2,670 of 2,670 in
+`_dyld_start`, before `main`. The testbed logs none of that path.
+
+It is not the file: it is who runs it. On ONE machine, one crate, one
+cold build, the same binary content —
+
+```text
+  built and run from the terminal's process tree   first  30.55 s
+  built and run through sshd on the same host      first   0.33 s
+```
+
+— and both carry `com.apple.provenance`. The terminal application
+holds `com.apple.quarantine`, so everything it spawns is inside the
+provenance sandbox, and the testbed is fast because its work arrives
+over ssh. Nothing in this repository can change that, and the
+attribute itself cannot be removed (`xattr -d` is refused even under
+sudo).
+
 Ruled out, each with its own control: the tests; the server spawns
 (the fixture uses `127.0.0.1:0`, not the suite's port probe); binary
 size (the worst offender is 1 MB); the runner's shell plumbing (0.01 s
