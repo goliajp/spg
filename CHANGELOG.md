@@ -36,6 +36,35 @@ release is allowed to happen.
   visible to the other. `the_probe_is_still_right_past_the_backlog`
   walks 200 probes; against the old one it fails on the 129th.
 
+### Corrected — what last version's release note said
+
+7.39.12 shipped a note calling the tier's cost "cross-tier artifact
+eviction", and repeated it in code comments and in a pin's rationale.
+Measured properly, that mechanism does not exist. Cargo keeps a set of
+artefacts per member selection and the sets coexist:
+
+```text
+  two selections, both built, alternated, tree unchanged
+    0 s   0 s   1 s   0 s
+```
+
+What is real is that each selection rebuilds the same change on its
+own. One `touch` of `crates/spg-sql/src/lib.rs`:
+
+```text
+  first selection        93 s
+  second, same change    94 s
+```
+
+So holding both tiers to one member set is worth doing — it makes a
+commit compile once instead of twice — but not for the reason given.
+The pair of readings the claim was built on, 358 s "after a different
+selection" against 11 s "after the same one", is the difference between
+a selection never built on that host and one already built.
+
+The same note also credited this with "the whole of the e2e step's 4x".
+It is not, and what is remains open.
+
 ### Changed — the gate itself
 
 - **The release build is a step, not a side effect.** It had moved

@@ -597,8 +597,8 @@ mod unit_tier_spawns {
     /// same command and the same tree:
     ///
     /// ```text
-    ///   after a DIFFERENT selection ran   358 s
-    ///   after the SAME selection ran       11 s
+    ///   a selection never built here      358 s
+    ///   the same one, already built        11 s
     ///   the fifteen harnesses, by hand     11 s
     /// ```
     ///
@@ -635,13 +635,24 @@ mod unit_tier_spawns {
     /// Clippy artefacts are per-selection like any others. Narrowing
     /// `clippy-changed` to the changed crates made that step 0.3 s and
     /// made the next release pay 765 s for `gate.sh lint`, which had
-    /// been 3.1 s on an unchanged tree: the narrow run replaced the
-    /// workspace-wide artefacts and the wide one rebuilt them.
+    /// been 3.1 s on an unchanged tree.
     ///
-    /// Across one commit-then-release cycle the narrow version is far
-    /// worse. This row is here because the mistake is invisible in
-    /// either tier alone — each looks faster or slower on its own — and
-    /// only the pair shows it.
+    /// v7.39.13 — and the reason is NOT that one replaces the other.
+    /// Measured, both selections materialised, alternated with no
+    /// change to the tree: 0 s, 0 s, 1 s, 0 s. Cargo keeps a set of
+    /// artefacts per selection and they coexist. What costs is that
+    /// each set rebuilds the same change SEPARATELY — one `touch` of
+    /// `crates/spg-sql/src/lib.rs`, then:
+    ///
+    /// ```text
+    ///   first selection            93 s
+    ///   second, same change        94 s
+    /// ```
+    ///
+    /// So a second member set does not evict anything; it doubles what
+    /// every commit costs, forever. This row is here because that is
+    /// invisible in either tier alone — each looks faster or slower on
+    /// its own — and only the pair shows it.
     #[test]
     fn both_tiers_run_clippy_over_the_same_members() {
         let sh = gate_sh();
@@ -697,16 +708,19 @@ mod unit_tier_spawns {
 
     /// v7.39.12 — and the two tiers BUILD the same members for tests.
     ///
-    /// This is the clippy row's twin, and the defect it pins is the one
-    /// that made `gate.sh e2e` read 576 s in the tier against 74-137 s
-    /// by hand for years: `precommit` built a narrow member set and
-    /// `prerelease` built the workspace, so each evicted the other's
-    /// test artefacts and whichever ran second paid a full rebuild.
+    /// This is the clippy row's twin: `precommit` built a narrow member
+    /// set and `prerelease` built the workspace, so every commit
+    /// compiled the same change twice.
     ///
-    /// Six hypotheses about that gap were refuted one at a time —
-    /// the tests, process spawn, compilation, page-cache eviction, the
-    /// runner's PATH, the runner's `sh -c` — because every one of them
-    /// looked inside the step, and the cause was in the run before it.
+    /// v7.39.13 — an earlier version of this comment said the two sets
+    /// EVICTED each other and whichever ran second paid a full rebuild.
+    /// That is not what happens, and the measurement is on the clippy
+    /// row above: alternating two materialised selections over an
+    /// unchanged tree costs 0 s. The pair of readings this was built on
+    /// — 358 s "after a different selection" against 11 s "after the
+    /// same one" — is the difference between a selection that had never
+    /// been built here and one that had, not between evicted and
+    /// warm.
     #[test]
     fn both_tiers_build_the_same_members_for_tests() {
         let steps =
@@ -741,8 +755,8 @@ mod unit_tier_spawns {
             .collect();
         assert!(
             offenders.is_empty(),
-            "these name their own members instead of the shared set, so they \
-             evict the other tier's artefacts: {offenders:?}"
+            "these name their own members instead of the shared set, so every \
+             commit compiles the same change once per set: {offenders:?}"
         );
     }
 
