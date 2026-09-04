@@ -36,6 +36,45 @@ release is allowed to happen.
   visible to the other. `the_probe_is_still_right_past_the_backlog`
   walks 200 probes; against the old one it fails on the 129th.
 
+### Measured — where the e2e step's hour actually went
+
+The step read 3,911 s in a release tier against 201 s for the same
+command by hand, and six hypotheses about that gap were each refuted
+because every one looked inside the step. Recording libtest's own time
+beside the wall clock answered it on the first run:
+
+```text
+                     wall     in-test
+  this host        1,356 s      83.2 s      93.9% is not tests
+  the testbed         71 s      70.1 s       1.4% is not tests
+```
+
+9,083 tests take a minute and a half. The cost is the first execution
+of a freshly linked binary, and it is a property of the host:
+
+```text
+  touch one crate, relink, run the same harness eight times
+    this host    exec 1  268.50 s   then 0.06 s each
+    the testbed  exec 1    0.05 s   then 0.05 s each
+```
+
+`syspolicyd` accumulated 2m27s of CPU during that one execution here
+and 0.00 s there. So a tier that builds and then immediately runs pays
+this on every harness, and the same command run later pays none of it.
+
+Ruled out, each with its own control: the tests; the server spawns
+(the fixture uses `127.0.0.1:0`, not the suite's port probe); binary
+size (the worst offender is 1 MB); the runner's shell plumbing (0.01 s
+per harness, fork/exec 2 ms); the 775,610-entry deps directory (0.03 s
+in place once assessed); a fresh copy at a new path (0.35 s, so it is
+the linker's output specifically); the target directory's location
+(`$HOME` 15.5 s vs `/tmp` 24.6 s, both 0.01 s after); and Gatekeeper
+assessment as such — this host has `spctl` assessments DISABLED and
+the testbed has them ENABLED, and it is this host that pays.
+
+Nine harnesses were removed from the sweep because they hold no tests
+under a debug build; the rest of this is not a defect in the tree.
+
 ### Corrected — what last version's release note said
 
 7.39.12 shipped a note calling the tier's cost "cross-tier artifact
