@@ -66,7 +66,9 @@ pub struct Ledger {
     pub load_start: f64,
     pub load_end: Option<f64>,
     started: Instant,
-    steps: Vec<StepRecord>,
+    /// v7.39.13 — readable, because the verdict needs the reference
+    /// step's own reading to know how slow the host was.
+    pub steps: Vec<StepRecord>,
 }
 
 /// The one-minute load average, or `-1.0` where the platform will not
