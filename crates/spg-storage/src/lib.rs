@@ -3164,6 +3164,34 @@ pub struct Index {
     /// Persisted as `[u8 has_pred][u16 LE len][bytes]` on the
     /// catalog snapshot (FILE_VERSION 12, appended after
     /// `included_columns`).
+    /// v7.39.13 — `true` when SPG built this index to serve probes on a
+    /// constraint's non-leading columns, rather than because anyone
+    /// asked for it.
+    ///
+    /// A multi-column `PRIMARY KEY (a, b)` becomes one composite B-tree
+    /// over the whole key PLUS one single-column B-tree per remaining
+    /// column, because a composite cannot answer a probe that does not
+    /// start at its front. PostgreSQL has one index per constraint and
+    /// no others, so those extras appeared in `pg_index` as indexes a
+    /// schema reader never created and PostgreSQL would never show —
+    /// and for an INLINE composite key the catalog listed two of them
+    /// and no primary key at all.
+    ///
+    /// Recorded rather than guessed. Deciding it from the name is what
+    /// v7.39.11 removed and v7.39.12 reintroduced as a prefix match, in
+    /// both cases because nothing in storage said so.
+    pub constraint_internal: bool,
+    /// v7.39.13 — `true` when this IS a constraint's own index: the one
+    /// PostgreSQL creates for a `PRIMARY KEY` / `UNIQUE`, and the only
+    /// one it shows.
+    ///
+    /// Recorded, because the alternative is matching an index's columns
+    /// against a constraint's and calling a hit the constraint's index.
+    /// v7.39.12 did that by prefix and mislabelled a user's own index;
+    /// doing it by EXACT columns still renames `CREATE INDEX idx_d_a ON
+    /// d (a)` to the name of the `UNIQUE (a)` beside it, and still
+    /// claims an expression index on `(a + 1)` is the key.
+    pub constraint_backing: bool,
     pub partial_predicate: Option<String>,
     /// v6.8.2 — expression-index key, stored as the expression's
     /// canonical Display form. `None` = bare column-reference
@@ -3696,6 +3724,8 @@ impl Index {
             column_position,
             kind: IndexKind::BTree(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3733,6 +3763,8 @@ impl Index {
             column_position,
             kind: IndexKind::Nsw(NswGraph::new(m)),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3757,6 +3789,8 @@ impl Index {
                 summaries: alloc::vec::Vec::new(),
             },
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3779,6 +3813,8 @@ impl Index {
             column_position,
             kind: IndexKind::Gin(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3801,6 +3837,8 @@ impl Index {
             column_position,
             kind: IndexKind::GinTrgm(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3824,6 +3862,8 @@ impl Index {
             column_position,
             kind: IndexKind::GinFulltext(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -3848,6 +3888,8 @@ impl Index {
             column_position,
             kind: IndexKind::GinJsonb(PersistentBTreeMap::new()),
             included_columns: Vec::new(),
+            constraint_internal: false,
+            constraint_backing: false,
             partial_predicate: None,
             expression: None,
             is_unique: false,
@@ -9496,7 +9538,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 95;
+const FILE_VERSION: u8 = 96;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -9853,6 +9895,13 @@ impl Catalog {
                         Some(false) => 2,
                     });
                 }
+                // v7.39.13 — whether SPG built this index for a
+                // constraint's non-leading columns (FILE_VERSION 96+).
+                // A v95 reader stops before this byte and reads every
+                // index as user-created, which is what those snapshots
+                // recorded and what the catalog said about them.
+                out.push(u8::from(idx.constraint_internal));
+                out.push(u8::from(idx.constraint_backing));
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].

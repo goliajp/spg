@@ -3605,6 +3605,11 @@ fn constraint_index_name(
     uc: &spg_storage::UniquenessConstraint,
     cols: &[String],
 ) -> alloc::string::String {
+    // PostgreSQL names a constraint's index after the constraint when
+    // one was named, and generates the rest.
+    if let Some(n) = &uc.name {
+        return n.clone();
+    }
     if uc.is_primary_key {
         return alloc::format!("{table}_pkey");
     }
@@ -3627,21 +3632,57 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
             t.schema().columns.iter().map(|c| c.name.clone()).collect();
         let mut claimed: Vec<bool> = alloc::vec![false; ucs.len()];
         for idx in t.indices() {
+            // v7.39.13 — SPG's own probe index for a constraint's
+            // non-leading columns is not an index anyone declared, and
+            // PostgreSQL has no equivalent to show. Skipped because
+            // storage RECORDS that SPG built it — the fact the two
+            // versions before this one tried to infer from a name and
+            // then from a column prefix.
+            if idx.constraint_internal {
+                continue;
+            }
             oid += 1;
             let columns: Vec<usize> = core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
                 .collect();
-            // EXACT, not a prefix. A constraint whose columns merely
-            // START WITH this index's is a different object.
-            let exact = ucs.iter().position(|uc| uc.columns == columns);
+            // v7.39.13 — the index says whether it is a constraint's,
+            // and only then are the columns matched to find WHICH.
+            //
+            // Matching on columns alone — by prefix in 7.39.12, by
+            // equality in the first cut of this — renamed
+            // `CREATE INDEX idx_d_a ON d (a)` to the name of the
+            // `UNIQUE (a)` beside it, and reported an expression index
+            // on `(a + 1)` as the primary key, because its stored
+            // column position is the key's.
+            let exact = if idx.constraint_backing {
+                ucs.iter().position(|uc| uc.columns == columns)
+            } else {
+                None
+            };
             if let Some(i) = exact {
                 claimed[i] = true;
             }
             let uc = exact.map(|i| &ucs[i]);
+            // A constraint's index carries PostgreSQL's name for it.
+            // SPG generates `t_a_pkey_0_0` for an inline composite key;
+            // PostgreSQL calls that index `t_pkey`, and a schema reader
+            // matching names against `pg_constraint` finds nothing under
+            // the other spelling.
+            let name = uc.map_or_else(
+                || idx.name.clone(),
+                |u| {
+                    let cols: Vec<alloc::string::String> = u
+                        .columns
+                        .iter()
+                        .filter_map(|p| col_names.get(*p).cloned())
+                        .collect();
+                    constraint_index_name(&tname, u, &cols)
+                },
+            );
             out.push(CatalogIndex {
                 oid,
                 table: tname.clone(),
-                name: idx.name.clone(),
+                name,
                 columns,
                 included: idx.included_columns.clone(),
                 is_unique: idx.is_unique || uc.is_some(),
