@@ -12587,32 +12587,31 @@ pub(crate) fn unnest_zip_rows(
         alloc::vec::Vec::with_capacity(args.len());
     for a in args {
         let v = eval::eval_expr(a, &dummy_row, &ctx).map_err(EngineError::Eval)?;
-        let (dt, items): (DataType, alloc::vec::Vec<Value<'static>>) = match v {
-            Value::Null => (DataType::Text, alloc::vec::Vec::new()),
-            Value::TextArray(xs) => (
-                DataType::Text,
-                xs.into_iter()
-                    .map(|x| x.map(Value::text).unwrap_or(Value::Null))
-                    .collect(),
-            ),
-            Value::IntArray(xs) => (
-                DataType::Int,
-                xs.into_iter()
-                    .map(|x| x.map(Value::Int).unwrap_or(Value::Null))
-                    .collect(),
-            ),
-            Value::BigIntArray(xs) => (
-                DataType::BigInt,
-                xs.into_iter()
-                    .map(|x| x.map(Value::BigInt).unwrap_or(Value::Null))
-                    .collect(),
-            ),
-            other => {
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "unnest() expects array arguments, got {}",
-                    crate::conversions::pg_type_name_for_error_opt(other.data_type())
-                )));
-            }
+        // v7.39.13 — the element menu the rest of the workspace already
+        // has, not a third copy of a shortened one.
+        //
+        // This arm listed Text, Int and BigInt and refused everything
+        // else, so `unnest(uuid[], text[])` raised while
+        // `unnest(uuid[])` — a different path — did not. A shipped
+        // endpoint of a customer's returned 500 on every call because
+        // of it. `array_elements` and `array_element_type` are the two
+        // halves of the menu that `array_element_at`'s own comment
+        // describes: "previously only matched Text/Int/BigInt arrays
+        // and errored on every other element type". Same sentence,
+        // third arm.
+        let (dt, items): (DataType, alloc::vec::Vec<Value<'static>>) = if matches!(v, Value::Null) {
+            (DataType::Text, alloc::vec::Vec::new())
+        } else if let Some(items) = crate::eval::values::array_elements(&v) {
+            let dt = v
+                .data_type()
+                .and_then(crate::describe::array_element_type)
+                .unwrap_or(DataType::Text);
+            (dt, items)
+        } else {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "unnest() expects array arguments, got {}",
+                crate::conversions::pg_type_name_for_error_opt(v.data_type())
+            )));
         };
         dtypes.push(dt);
         columns.push(items);

@@ -599,6 +599,10 @@ pub(crate) struct SessionCoercion {
     /// where it was.
     pub zone: Option<alloc::string::String>,
     pub localize: Option<crate::TzLocalizeFn>,
+    /// v7.39.13 — the other direction. `wall_to_utc` alone could only
+    /// serve assignments INTO a timestamptz column; PG also converts
+    /// the other way, and SPG did not.
+    pub offset: Option<crate::TzOffsetFn>,
     /// The session's date order. A written date is ambiguous
     /// (`01/02/2020`), and this is what resolves it.
     pub order: DateOrder,
@@ -611,6 +615,21 @@ impl SessionCoercion {
     pub(crate) fn wall_to_utc(&self, wall: i64) -> Option<i64> {
         let zone = self.zone.as_ref()?;
         zone_local_to_utc_with(zone, wall, self.localize)
+    }
+
+    /// v7.39.13 — the wall-clock reading an instant shows in the
+    /// session zone, or `None` when the session is on UTC.
+    ///
+    /// The mirror of `wall_to_utc`, and it was missing: assigning a
+    /// `timestamptz` into a plain `timestamp` column stored the UTC
+    /// instant unchanged, where PG 18.6 renders it in the session's
+    /// zone first. Measured under `Asia/Tokyo`, one instant copied
+    /// into a `timestamp` column: SPG 1767225600, PG 1767258000.
+    #[must_use]
+    pub(crate) fn utc_to_wall(&self, utc: i64) -> Option<i64> {
+        let zone = self.zone.as_ref()?;
+        let off = self.offset.and_then(|f| f(zone, utc))?;
+        utc.checked_add(off)
     }
 
     /// v7.39 (round 524) — the session facts an ASSIGNMENT is read
@@ -630,6 +649,7 @@ impl SessionCoercion {
         Some(Self {
             zone,
             localize: ctx.tz_localize_fn,
+            offset: ctx.tz_offset_fn,
             order,
         })
     }

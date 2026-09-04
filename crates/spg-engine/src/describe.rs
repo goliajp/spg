@@ -1099,7 +1099,7 @@ pub(crate) fn describe_expr_in(
 /// Reported by sentori against 7.39.11: `\gdesc` gave the right type
 /// for every one of these and the row stream did not, and the tell was
 /// the alignment.
-fn array_element_type(ty: DataType) -> Option<DataType> {
+pub(crate) fn array_element_type(ty: DataType) -> Option<DataType> {
     Some(match ty {
         DataType::IntArray => DataType::Int,
         DataType::SmallIntArray => DataType::SmallInt,

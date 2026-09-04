@@ -751,7 +751,7 @@ use crate::{
     enforce_uniqueness_inserts, eval, eval_runtime_default_free, expr_has_subquery,
     literal_expr_to_value, literal_expr_to_value_in, lookup_row_position_by_keys,
     plan_fk_parent_deletions, plan_fk_parent_updates, resolve_column_default_free, triggers,
-    try_index_seek_positions, try_pk_predicate, value_to_literal_expr_permissive,
+    try_index_seek_positions, try_pk_predicate,
 };
 
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
@@ -1774,15 +1774,14 @@ impl Engine {
                 let col = &schema_cols[*pos];
                 let v = crate::eval::session_read_temporal_text(v, col.ty, sc.as_ref());
                 let coerced = coerce_value(v, col.ty, &col.name, *pos)?;
-                let coerced = localize_assignment_to_tstz(
-                    coerced,
-                    col,
-                    expr_names_an_instant(
-                        expr,
-                        sc.as_ref().map_or(crate::eval::DateOrder::Mdy, |c| c.order),
-                    ),
-                    sc.as_ref(),
+                let src_instant = source_names_an_instant(
+                    expr,
+                    ctx.columns,
+                    Some(&cat_for_ctx),
+                    sc.as_ref().map_or(crate::eval::DateOrder::Mdy, |c| c.order),
                 );
+                let coerced = localize_assignment_to_tstz(coerced, col, src_instant, sc.as_ref());
+                let coerced = naive_assignment_from_tstz(coerced, col, src_instant, sc.as_ref());
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
                 let coerced = crate::conversions::round_to_column_float_md(coerced, col)?;
                 check_unsigned_range(&coerced, col, *pos)?;
@@ -4847,8 +4846,8 @@ impl Engine {
         // materialised rows.
         if let Some(select) = stmt.select_source.clone() {
             let select_result = self.exec_select_cancel(&select, CancelToken::none())?;
-            let rows = match select_result {
-                QueryResult::Rows { rows, .. } => rows,
+            let (rows, src_cols) = match select_result {
+                QueryResult::Rows { rows, columns } => (rows, columns),
                 other => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "INSERT … SELECT: inner statement produced {other:?} instead of a row set"
@@ -4858,8 +4857,15 @@ impl Engine {
             let mut materialised: Vec<Vec<Expr>> = Vec::with_capacity(rows.len());
             for row in rows {
                 let mut tuple: Vec<Expr> = Vec::with_capacity(row.values.len());
-                for v in row.values {
-                    tuple.push(value_to_literal_expr_permissive(v)?);
+                for (vi, v) in row.values.into_iter().enumerate() {
+                    // v7.39.13 — with the type the value came out of. See
+                    // `value_to_literal_expr_permissive_typed`: without it
+                    // an instant copied between two timestamptz columns
+                    // lost its zone on the way through the literal.
+                    tuple.push(crate::substitute::value_to_literal_expr_permissive_typed(
+                        v,
+                        src_cols.get(vi).map(|c| c.ty),
+                    )?);
                 }
                 materialised.push(tuple);
             }
@@ -6958,6 +6964,72 @@ mod spg_engine_no_alias {
 /// `TIMESTAMP '…'` is a wall-clock reading whatever it carries — PG
 /// drops the offset for that type — so only the string's own offset,
 /// read where the type does not already answer, decides.
+/// v7.39.13 — whether the SOURCE of an assignment is already an
+/// instant, asked of its TYPE rather than of its syntax.
+///
+/// `expr_names_an_instant` below recognises exactly two shapes: a
+/// string literal carrying an offset, and a `::timestamptz` cast.
+/// Everything else answered "not an instant", and
+/// `localize_assignment_to_tstz` then subtracted the session offset
+/// from values that were already instants. Measured against PG 18.6
+/// under `SET TimeZone='Asia/Tokyo'`, one instant copied four ways:
+///
+/// ```text
+///                                      SPG 7.39.12   PG 18.6
+///   INSERT INTO d SELECT ts FROM src    1767193200   1767225600
+///   UPDATE d SET v = (SELECT ts …)      1767193200   1767225600
+///   UPDATE d SET v = s.ts FROM src s    1767193200   1767225600
+///   CREATE TABLE d AS SELECT ts …       1767225600   1767225600
+/// ```
+///
+/// Nine hours, silently, on every write of a query result into a
+/// `timestamptz` column — reported by sentori against three writes in
+/// their own tree. The third row has no subquery in it at all, which
+/// is what rules out "a value that round-trips through a literal" as
+/// the boundary: it is every assignment whose source is a query
+/// expression.
+///
+/// The type is the thing that knows. A column reference resolves
+/// against the schema the expression is being evaluated in — for
+/// `UPDATE … FROM` that is the combined row — and a scalar subquery
+/// is described the same way `pg_typeof` describes it, which SPG
+/// already answers correctly for the same expression.
+fn source_names_an_instant(
+    e: &Expr,
+    cols: &[ColumnSchema],
+    catalog: Option<&spg_storage::Catalog>,
+    order: crate::eval::DateOrder,
+) -> bool {
+    if expr_names_an_instant(e, order) {
+        return true;
+    }
+    matches!(
+        source_temporal_type(e, cols, catalog),
+        Some(DataType::Timestamptz)
+    )
+}
+
+/// The declared type of an assignment's source, for the shapes that can
+/// carry a zone. `None` when nothing here can say, which leaves the
+/// syntactic answer standing.
+fn source_temporal_type(
+    e: &Expr,
+    cols: &[ColumnSchema],
+    catalog: Option<&spg_storage::Catalog>,
+) -> Option<DataType> {
+    match e {
+        Expr::ScalarSubquery(inner) => {
+            let cat = catalog?;
+            let described = crate::describe::describe_select_columns(inner, cat, &[], 0);
+            match described.as_slice() {
+                [only] => Some(only.ty),
+                _ => None,
+            }
+        }
+        _ => crate::describe::describe_expr_type(e, cols),
+    }
+}
+
 fn expr_names_an_instant(e: &Expr, order: crate::eval::DateOrder) -> bool {
     let text_carries_offset = |s: &str| {
         crate::eval::parse_timestamp_literal_tz_ordered_pub(s, order)
@@ -6972,6 +7044,25 @@ fn expr_names_an_instant(e: &Expr, order: crate::eval::DateOrder) -> bool {
                 Expr::Literal(spg_sql::ast::Literal::String(s)) => text_carries_offset(s),
                 _ => true,
             },
+            // v7.39.13 — and the same cast spelled as a NAME.
+            //
+            // `value_to_literal_expr_typed` builds `CastTarget::Named
+            // ("timestamptz")`, not the dedicated variant, so every
+            // literal it produced for a timestamptz source fell into the
+            // `_` below and was read back as a wall clock. That is one
+            // half of why `INSERT … SELECT` moved an instant by the
+            // session offset: the type was carried all the way here and
+            // then not recognised at the last step. A probe that made
+            // this arm raise fired on exactly that statement.
+            spg_sql::ast::CastTarget::Named(n)
+                if n.eq_ignore_ascii_case("timestamptz")
+                    || n.eq_ignore_ascii_case("timestamp with time zone") =>
+            {
+                match &**expr {
+                    Expr::Literal(spg_sql::ast::Literal::String(s)) => text_carries_offset(s),
+                    _ => true,
+                }
+            }
             _ => false,
         },
         _ => false,
@@ -6982,6 +7073,38 @@ fn expr_names_an_instant(e: &Expr, order: crate::eval::DateOrder) -> bool {
 ///
 /// A no-op unless the session is on a non-UTC zone, the column is
 /// timestamptz, and the source was a wall-clock reading.
+/// v7.39.13 — the other direction, which was missing.
+///
+/// PG converts a `timestamptz` assigned into a plain `timestamp`
+/// column by rendering it in the session's zone first — the value
+/// stored is the wall clock a reader in that zone would see. SPG
+/// stored the UTC instant unchanged, so the same copy that moved an
+/// instant nine hours going one way failed to move it at all going
+/// the other. Measured under `Asia/Tokyo`, one instant copied into a
+/// `timestamp` column:
+///
+/// ```text
+///   SPG 7.39.12   1767225600
+///   PG 18.6       1767258000
+/// ```
+///
+/// A no-op unless the session is on a non-UTC zone, the column is
+/// naive, and the source was an instant.
+fn naive_assignment_from_tstz(
+    v: Value<'static>,
+    col: &ColumnSchema,
+    src_names_an_instant: bool,
+    zone: Option<&crate::eval::SessionCoercion>,
+) -> Value<'static> {
+    if !src_names_an_instant || col.ty != DataType::Timestamp {
+        return v;
+    }
+    let (Some(z), Value::Timestamp(utc)) = (zone, &v) else {
+        return v;
+    };
+    z.utc_to_wall(*utc).map_or(v, Value::Timestamp)
+}
+
 fn localize_assignment_to_tstz(
     v: Value<'static>,
     col: &ColumnSchema,
@@ -7375,12 +7498,9 @@ fn parse_insert_rows(
                 };
                 let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
-                let coerced = localize_assignment_to_tstz(
-                    coerced,
-                    col,
-                    map[i].is_some_and(|j| slot_is_tstz[j]),
-                    session_zone,
-                );
+                let src_instant = map[i].is_some_and(|j| slot_is_tstz[j]);
+                let coerced = localize_assignment_to_tstz(coerced, col, src_instant, session_zone);
+                let coerced = naive_assignment_from_tstz(coerced, col, src_instant, session_zone);
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
@@ -7490,6 +7610,7 @@ fn parse_insert_rows(
                 let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
                 let coerced = coerce_value(raw, col.ty, &col.name, i)?;
                 let coerced = localize_assignment_to_tstz(coerced, col, src_is_tstz, session_zone);
+                let coerced = naive_assignment_from_tstz(coerced, col, src_is_tstz, session_zone);
                 enforce_enum_label(enum_label_lookup, i, &col.name, &coerced)?;
                 let coerced = canonicalize_set_value(set_variant_lookup, i, &col.name, coerced)?;
                 let coerced = crate::conversions::truncate_to_column_fsp(coerced, col);
