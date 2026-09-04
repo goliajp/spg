@@ -706,6 +706,70 @@ mod unit_tier_spawns {
         }
     }
 
+    /// v7.39.13 — every harness the e2e leg SKIPS is empty by
+    /// construction under that profile.
+    ///
+    /// `run_e2e` passes `RUN_SKIP=perf_gate,slo_smoke` because those
+    /// targets are `#![cfg(not(debug_assertions))]` and hold no tests
+    /// in a debug build, while `run_gates` runs them in release where
+    /// they do. Measured: nine such harnesses cost 222 s of the e2e
+    /// step's 1,356 s and reported 0.00 s of tests between them, since
+    /// the first execution of a freshly linked binary is assessed by
+    /// the system whatever is inside it.
+    ///
+    /// A skip is a claim that nothing is lost. Delete the `cfg` line
+    /// from one of those files and the claim silently stops being true,
+    /// so this row checks the tree instead of trusting the name.
+    #[test]
+    fn what_the_e2e_leg_skips_is_empty_in_this_profile() {
+        let sh = gate_sh();
+        let line = sh
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("RUN_SKIP=") && l.contains("run-test-binaries.sh e2e"))
+            .expect("run_e2e must pass RUN_SKIP; if the skip is gone, delete this row");
+        let list = line
+            .split_whitespace()
+            .next()
+            .and_then(|w| w.strip_prefix("RUN_SKIP="))
+            .expect("RUN_SKIP=<list>");
+        let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        for pattern in list.split(',') {
+            let mut found = 0;
+            for dir in ["crates"] {
+                let Ok(crates) = std::fs::read_dir(root.join(dir)) else {
+                    continue;
+                };
+                for c in crates.flatten() {
+                    for candidate in [
+                        c.path().join("tests").join(format!("{pattern}.rs")),
+                        c.path().join("tests").join(pattern).join("main.rs"),
+                    ] {
+                        let Ok(text) = std::fs::read_to_string(&candidate) else {
+                            continue;
+                        };
+                        found += 1;
+                        assert!(
+                            text.contains("#![cfg(not(debug_assertions))]"),
+                            "{} is skipped by the e2e leg but is NOT gated out of debug \
+                             builds, so those tests now run nowhere in that tier",
+                            candidate.display()
+                        );
+                    }
+                }
+            }
+            assert!(
+                found > 0,
+                "RUN_SKIP names `{pattern}` and no target by that name exists — \
+                 the skip matches nothing, or the targets were renamed"
+            );
+        }
+    }
+
     /// v7.39.12 — and the two tiers BUILD the same members for tests.
     ///
     /// This is the clippy row's twin: `precommit` built a narrow member
