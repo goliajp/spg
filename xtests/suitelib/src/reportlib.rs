@@ -27,6 +27,15 @@ pub struct StepRecord {
     pub status: StepStatus,
     pub duration: Duration,
     pub budget: Option<Duration>,
+    /// v7.39.13 — how busy the machine was when this step finished.
+    ///
+    /// The run-level pair could not see the middle. A 103-minute
+    /// prerelease reported 1.23 at the start and 3.67 at the end while
+    /// one step inside it read 3,911 s against 201 s for the same
+    /// command by hand — and nothing in the report could say whether
+    /// the machine was quiet for that hour, because the only two
+    /// samples sat either side of it.
+    pub load_end: f64,
 }
 
 pub struct Ledger {
@@ -120,6 +129,7 @@ impl Ledger {
             },
             duration: t0.elapsed(),
             budget,
+            load_end: load_avg_1m(),
         });
         out
     }
@@ -144,6 +154,7 @@ impl Ledger {
             },
             duration,
             budget,
+            load_end: load_avg_1m(),
         });
     }
 
@@ -153,6 +164,7 @@ impl Ledger {
             status: StepStatus::Skipped,
             duration: Duration::ZERO,
             budget: None,
+            load_end: load_avg_1m(),
         });
     }
 
@@ -196,6 +208,7 @@ impl Ledger {
             if let Some(b) = s.budget {
                 let _ = write!(out, ", \"budget_ms\": {}", b.as_millis());
             }
+            let _ = write!(out, ", \"load_end\": {:.2}", s.load_end);
             out.push('}');
             out.push_str(if i + 1 < self.steps.len() {
                 ",\n"

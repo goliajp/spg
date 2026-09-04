@@ -35,7 +35,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-    echo "usage: $0 <lint|unit|e2e|gates|biz|dogfood|perf|all> [--full]" >&2
+    echo "usage: $0 <lint|unit|release-build|e2e|gates|biz|dogfood|perf|all> [--full]" >&2
     exit 2
 }
 
@@ -389,12 +389,24 @@ START=$SECONDS
 case "$CATEGORY" in
     lint)    run_lint ;;
     unit)    run_unit ;;
+    # v7.39.13 — the release build is a step, not a side effect.
+    #
+    # `ensure_release_build` moved into `run_e2e` on 2026-09-03 so the
+    # four steps that need release binaries would share one build. They
+    # do — but `e2e` then carried a fat-LTO build of the workspace plus
+    # every release test harness inside a budget derived on 2026-08-17
+    # from an `e2e` that built nothing (94 / 205 / 360 s observed). A
+    # cost hidden inside another step's number is a cost nobody can
+    # judge, and the tier's runaway verdict would now stop a release
+    # while naming the wrong step.
+    release-build) ensure_release_build ;;
     e2e)     run_e2e ;;
     gates)   run_gates ;;
     biz)     run_biz ;;
     dogfood) run_dogfood ;;
     perf)    run_perf ;;
-    all)     run_lint; run_unit; run_e2e; run_gates; run_biz; run_dogfood; run_perf ;;
+    all)     run_lint; run_unit; ensure_release_build; run_e2e; run_gates
+             run_biz; run_dogfood; run_perf ;;
     *) usage ;;
 esac
 printf '\n══ gate.sh %s%s: PASS (%ss) ══\n' \

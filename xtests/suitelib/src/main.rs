@@ -653,73 +653,61 @@ fn main() {
             if failed.is_some() {
                 rc = 1;
             }
-            // v7.39.11 — a wall-clock budget is red only when this
-            // host's own history says the STEP got slower.
-            //
-            // The fixed budget alone could not tell those apart, and
-            // the tier's own record proves it: the SAME commit produced
-            // 35 s and 1,989,963 ms for `unit-affected` on this host,
-            // and in the slow run `fmt` — fixed work every time — read
-            // 2,554 ms against 2,300 ms in the fast one. So the machine
-            // was busy and no step had changed. Three attempts to sense
-            // that condition directly were refuted by measurement: a
-            // process-spawn probe moved 1.2x under twelve spinners, a
-            // parallel-CPU probe 1.1-1.4x.
-            //
-            // The comment this replaces said "the history does the
-            // arguing" and then exited 1 anyway, so the history was
-            // printed for a human who had already been refused. It
-            // decides now: red needs BOTH over the fixed budget AND
-            // over 2x this step's recent median at the same band. A
-            // busy machine makes the history slow too, so it stays
-            // green; a step that really regressed stands out against
-            // its own past, which is the only baseline that holds the
-            // machine constant.
-            //
-            // With no history to compare against, the budget is
-            // recorded and does not block: a first run on a new host
-            // has nothing to argue with.
-            const SLOWDOWN_FACTOR: u128 = 2;
+            // The rule is `verdict::judge`, with its evidence on the
+            // two factors it uses. It lived inline here through two
+            // versions and was wrong in two ways for all of it —
+            // nothing in the tree could reach it to say so.
+            use suitelib::verdict::{RUNAWAY_FACTOR, SLOWDOWN_FACTOR, Verdict, judge};
             for rec in ledger.over_budget() {
                 let name = rec.name.as_str();
                 let ms = rec.duration.as_millis();
+                let budget = rec.budget.unwrap_or_default();
                 let past =
                     suitelib::reportlib::recent_step_ms(&root.join("target"), tier, name, band, 6);
-                let budget = rec.budget.unwrap_or_default();
-                if past.is_empty() {
-                    eprintln!(
-                        "  over budget  {name} ({:?} > {budget:?}) — \
-                         no earlier run at band {band} to compare with, recorded only",
-                        rec.duration
-                    );
-                    continue;
-                }
                 let mut sorted = past.clone();
                 sorted.sort_unstable();
-                let median = u128::from(sorted[sorted.len() / 2]);
+                let median = sorted.get(sorted.len() / 2).map(|m| u128::from(*m));
                 let secs: Vec<String> = past
                     .iter()
                     .map(|m| format!("{:.1}s", *m as f64 / 1000.0))
                     .collect();
-                if ms > median * SLOWDOWN_FACTOR {
-                    eprintln!(
+                let verdict = judge(ms, budget.as_millis(), median);
+                match verdict {
+                    Verdict::Runaway => {
+                        eprintln!(
+                            "  RUNAWAY      {name} ({:?} > {RUNAWAY_FACTOR}x its {budget:?} \
+                             budget) — no history argues this down. Same step at band {band}, \
+                             most recent first: {}",
+                            rec.duration,
+                            if secs.is_empty() {
+                                "none".to_string()
+                            } else {
+                                secs.join(", ")
+                            }
+                        );
+                    }
+                    Verdict::Slower => eprintln!(
                         "  SLOWER       {name} ({:?} > {budget:?}, and > {SLOWDOWN_FACTOR}x its \
                          own median {:.1}s) — same step at band {band}, most recent first: {}",
                         rec.duration,
-                        median as f64 / 1000.0,
+                        median.unwrap_or_default() as f64 / 1000.0,
                         secs.join(", ")
-                    );
-                    if tier == "precommit" {
-                        rc = 1;
-                    }
-                } else {
-                    eprintln!(
+                    ),
+                    Verdict::NoHistory => eprintln!(
+                        "  over budget  {name} ({:?} > {budget:?}) — \
+                         no earlier run at band {band} to compare with, recorded only",
+                        rec.duration
+                    ),
+                    Verdict::HostIsSlow => eprintln!(
                         "  over budget  {name} ({:?} > {budget:?}) — in line with its own \
                          median {:.1}s at band {band}, so this host is slow, not the step: {}",
                         rec.duration,
-                        median as f64 / 1000.0,
+                        median.unwrap_or_default() as f64 / 1000.0,
                         secs.join(", ")
-                    );
+                    ),
+                }
+                if verdict.is_red() {
+                    rc = 1;
                 }
             }
             std::process::exit(rc);

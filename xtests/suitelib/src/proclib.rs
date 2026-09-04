@@ -73,31 +73,43 @@ pub struct Roster {
 ///
 /// A connect settles it. If anything answers, someone is serving.
 fn port_is_free(p: u16) -> bool {
-    if std::net::TcpListener::bind(("127.0.0.1", p)).is_err() {
-        return false;
-    }
-    // v7.39.12 — the connect has no deadline any more.
+    // v7.39.13 — two binds, and no connect.
     //
-    // The bind above is not conclusive on its own: BSD lets a specific
-    // address bind over a wildcard one when both carry SO_REUSEADDR,
-    // which Rust's `TcpListener` sets, so a server listening on
-    // `0.0.0.0:p` does not stop `127.0.0.1:p` from binding. The connect
-    // is what catches that case — someone answers, so the port is
-    // taken.
+    // Neither address alone answers the question, because SO_REUSEADDR
+    // — which Rust's `TcpListener` always sets — lets a specific
+    // address and a wildcard one coexist. Measured on this host:
     //
-    // It carried a 150 ms deadline, and a deadline turns a busy machine
-    // into a wrong ANSWER: connect times out, the timeout reads as "no
-    // one answered", and the probe hands out a port that is being
-    // served. That is what happened — `the_second_port_also_skips_a_port
-    // _someone_is_serving` failed with left and right both 25464 on a
-    // run whose load average went 6.99 to 10.92, and passed three times
-    // out of three when the machine was quieter.
+    // ```text
+    //   holder 0.0.0.0    bind 127.0.0.1 SUCCEEDS   bind 0.0.0.0 EADDRINUSE
+    //   holder 127.0.0.1  bind 127.0.0.1 EADDRINUSE bind 0.0.0.0 SUCCEEDS
+    // ```
     //
-    // Nothing needs the deadline. A loopback connect to a port with no
-    // listener is refused by the kernel immediately; a port WITH one
-    // completes immediately. Both answers are prompt, and neither of
-    // them is a stopwatch.
-    std::net::TcpStream::connect(("127.0.0.1", p)).is_err()
+    // So each holder is invisible to one of the two binds and caught by
+    // the other, and requiring BOTH sees either.
+    //
+    // What this replaces was a bind plus a connect: someone answers, so
+    // the port is taken. That probe filled the queue it was probing.
+    // Every call against an occupied port left one connection the
+    // holder never accepts, and a listener's backlog is finite — 128,
+    // which is what Rust's std asks for. Measured, holder never
+    // accepting:
+    //
+    // ```text
+    //   connects 1..128   succeed        -> port correctly read as TAKEN
+    //   connect  129      no answer      -> port read as FREE
+    // ```
+    //
+    // A probe that degrades by being used, and hands out an occupied
+    // port once it has, is worse than a slow one. It failed
+    // `the_second_port_also_skips_a_port_someone_is_serving` once in
+    // three full-suite runs with left and right both 25474, and a
+    // deadline was removed from the connect one version earlier for a
+    // symptom of this same defect.
+    //
+    // Binds cost nothing on a busy machine and give the same answer
+    // every time, which is the property the earlier probe never had.
+    std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        && std::net::TcpListener::bind(("0.0.0.0", p)).is_ok()
 }
 
 impl Roster {
@@ -1045,6 +1057,41 @@ mod second_port_tests {
         for _ in 0..8 {
             let second = r.free_port_excluding(Some(9)).expect("a free port");
             assert_ne!(second, first, "handed out a port someone is serving");
+        }
+        drop(held);
+    }
+
+    /// v7.39.13 — and it is still right on the two-hundredth probe.
+    ///
+    /// The eight-iteration rows above cannot see the defect that
+    /// actually shipped: the probe used to ask "does anyone answer?"
+    /// with a connect, and every such connect against an occupied port
+    /// left the holder a connection it never accepts. A listener's
+    /// backlog is 128, so probe 129 got no answer and the probe called
+    /// a served port free — it degraded by being used, and eight
+    /// probes never reached the cliff.
+    ///
+    /// 200 is chosen to be past 128 with room. Against the old probe
+    /// this fails on the 129th iteration; against two binds it does
+    /// not fail at all.
+    #[test]
+    fn the_probe_is_still_right_past_the_backlog() {
+        let r = Roster::new();
+        let (taken, held) = (0..64)
+            .find_map(|_| {
+                let p = r.free_port().ok()?;
+                std::net::TcpListener::bind(("0.0.0.0", p))
+                    .ok()
+                    .map(|l| (p, l))
+            })
+            .expect("a port this test can hold");
+        for i in 0..200 {
+            let p = r.free_port().expect("a free port");
+            assert_ne!(
+                p, taken,
+                "probe {i} handed out a port someone is serving — the probe \
+                 got worse the more it was used"
+            );
         }
         drop(held);
     }
