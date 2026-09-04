@@ -56,19 +56,71 @@ impl Verdict {
     }
 }
 
-/// Judge one over-budget reading. `median_ms` is `None` when this band
-/// holds no earlier run of the same step.
+/// How much slower this whole RUN was than usual, measured inside it.
+///
+/// v7.39.13 — a tier's first step is fixed work (`fmt` parses every
+/// source file and formats nothing), so how long it took says how slow
+/// the host was while this run happened, in the run's own units. The
+/// alternative is a constant, and a constant is a guess.
+///
+/// Measured here: `fmt` takes 2.6-3.7 s at a load average around 3 and
+/// took 6.9 s at 54.7. Its own median holds the work constant, so the
+/// ratio is the host and nothing else.
+///
+/// Kept as a fraction, not a float — a gate that rounds is a gate that
+/// argues. A run no slower than usual gives 1/1 and changes nothing;
+/// the factor never tightens a threshold, only loosens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Host {
+    num: u128,
+    den: u128,
+}
+
+impl Default for Host {
+    fn default() -> Self {
+        Self { num: 1, den: 1 }
+    }
+}
+
+impl Host {
+    /// From the reference step's reading and its own median at this
+    /// band. A reference that ran FASTER than its median gives 1/1:
+    /// a quiet machine is not a reason to fail a step sooner.
+    #[must_use]
+    pub fn from_reference(ms: u128, median_ms: u128) -> Self {
+        if median_ms == 0 || ms <= median_ms {
+            return Self::default();
+        }
+        Self {
+            num: ms,
+            den: median_ms,
+        }
+    }
+
+    /// The factor, for printing only.
+    #[must_use]
+    pub fn as_ratio(self) -> f64 {
+        self.num as f64 / self.den as f64
+    }
+}
+
+/// Judge one over-budget reading.
+///
+/// `median_ms` is `None` when this band holds no earlier run of the
+/// same step. `host` scales both thresholds by how slow the whole run
+/// was, so a busy machine does not turn into a wrong verdict.
 ///
 /// `Runaway` outranks `Slower`: when the history is in the same runaway
 /// range it is contaminated, and deferring to it is the defect this
 /// function exists to prevent.
-pub fn judge(ms: u128, budget_ms: u128, median_ms: Option<u128>) -> Verdict {
-    if budget_ms > 0 && ms > budget_ms * RUNAWAY_FACTOR {
+#[must_use]
+pub fn judge(ms: u128, budget_ms: u128, median_ms: Option<u128>, host: Host) -> Verdict {
+    if budget_ms > 0 && ms * host.den > budget_ms * RUNAWAY_FACTOR * host.num {
         return Verdict::Runaway;
     }
     match median_ms {
         None => Verdict::NoHistory,
-        Some(median) if ms > median * SLOWDOWN_FACTOR => Verdict::Slower,
+        Some(median) if ms * host.den > median * SLOWDOWN_FACTOR * host.num => Verdict::Slower,
         Some(_) => Verdict::HostIsSlow,
     }
 }
@@ -83,8 +135,11 @@ mod tests {
     /// median of 2,655,000 ms recorded while the same defect was live.
     #[test]
     fn a_contaminated_median_cannot_excuse_a_runaway_step() {
-        assert_eq!(judge(3_910_900, 480_000, Some(2_655_000)), Verdict::Runaway);
-        assert!(judge(3_910_900, 480_000, Some(2_655_000)).is_red());
+        assert_eq!(
+            judge(3_910_900, 480_000, Some(2_655_000), Host::default()),
+            Verdict::Runaway
+        );
+        assert!(judge(3_910_900, 480_000, Some(2_655_000), Host::default()).is_red());
     }
 
     /// The same reading under the verdict this replaces: within 2x its
@@ -104,7 +159,10 @@ mod tests {
     /// recorded it and moved on, so a fresh host had no gate.
     #[test]
     fn a_runaway_needs_no_history() {
-        assert_eq!(judge(3_910_900, 480_000, None), Verdict::Runaway);
+        assert_eq!(
+            judge(3_910_900, 480_000, None, Host::default()),
+            Verdict::Runaway
+        );
     }
 
     /// The general machine slowdown in that same run must NOT be red.
@@ -113,8 +171,11 @@ mod tests {
     /// the same range because the host was busy for both.
     #[test]
     fn a_busy_host_is_not_a_regression() {
-        assert_eq!(judge(717_615, 330_000, Some(583_000)), Verdict::HostIsSlow);
-        assert!(!judge(717_615, 330_000, Some(583_000)).is_red());
+        assert_eq!(
+            judge(717_615, 330_000, Some(583_000), Host::default()),
+            Verdict::HostIsSlow
+        );
+        assert!(!judge(717_615, 330_000, Some(583_000), Host::default()).is_red());
     }
 
     /// A step that doubled against its own history is red even well
@@ -127,7 +188,7 @@ mod tests {
     /// ablation green, which is how it survived two versions.
     #[test]
     fn a_step_that_doubled_against_its_own_past_is_red() {
-        let v = judge(300_000, 200_000, Some(100_000));
+        let v = judge(300_000, 200_000, Some(100_000), Host::default());
         assert_eq!(v, Verdict::Slower);
         assert!(
             v.is_red(),
@@ -143,10 +204,51 @@ mod tests {
         assert!(!Verdict::NoHistory.is_red());
     }
 
+    /// The host factor comes from fixed work in the same run, and it
+    /// only ever loosens. Measured on 2026-09-04: `fmt` — which parses
+    /// every source file and formats nothing — read 6,931 ms against
+    /// its own median of 3,500 ms while the load average was 54.7.
+    #[test]
+    fn a_reference_that_ran_slow_loosens_every_other_step() {
+        let host = Host::from_reference(6_931, 3_500);
+        assert!((host.as_ratio() - 1.98).abs() < 0.01, "{}", host.as_ratio());
+        // A step 3x its budget on that host is the host, not the step.
+        assert_eq!(
+            judge(90_000, 30_000, Some(40_000), host),
+            Verdict::HostIsSlow
+        );
+        // On a quiet host the same reading is over 2x its own median.
+        assert_eq!(
+            judge(90_000, 30_000, Some(40_000), Host::default()),
+            Verdict::Slower
+        );
+    }
+
+    /// And a run no slower than usual changes nothing — a quiet machine
+    /// is not a reason to fail a step sooner.
+    #[test]
+    fn a_reference_that_ran_fast_does_not_tighten_anything() {
+        assert_eq!(Host::from_reference(1_000, 3_500), Host::default());
+        assert_eq!(Host::from_reference(3_500, 3_500), Host::default());
+        assert_eq!(Host::from_reference(3_500, 0), Host::default());
+    }
+
+    /// The real slt-smoke reading stays red even on that 1.98x host:
+    /// 210,907 ms against a 15,000 ms budget is 14x, and 4 x 1.98 is
+    /// 7.9. A host factor excuses a busy machine, not a rebuild.
+    #[test]
+    fn the_host_factor_does_not_excuse_a_fourteen_times_step() {
+        let host = Host::from_reference(6_931, 3_500);
+        assert_eq!(judge(210_907, 15_000, Some(44_250), host), Verdict::Runaway);
+    }
+
     /// Under budget never reaches this function, but a zero budget
     /// (a step that declares none) must not divide the run by nothing.
     #[test]
     fn a_step_without_a_budget_defers_to_its_history() {
-        assert_eq!(judge(9_999_999, 0, None), Verdict::NoHistory);
+        assert_eq!(
+            judge(9_999_999, 0, None, Host::default()),
+            Verdict::NoHistory
+        );
     }
 }

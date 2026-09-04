@@ -8,6 +8,50 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed — the gate itself
+
+Two defects found while asking why a prerelease run read 102.6 minutes.
+Neither is visible to a user of the database; both decide whether a
+release is allowed to happen.
+
+- **The tier's budget verdict could not fail a release.** It was
+  history-relative with no floor, and a `SLOWER` reading failed
+  `precommit` only. So `e2e` read 3,911 s against a 480 s budget — 8.1x
+  — and the report said `pass`: the 2,655 s median it was compared
+  against had itself been recorded while the same defect was live, and
+  the release tier printed the words and published anyway. The rule
+  moved to `verdict::judge`, where a test can reach it; it had stood
+  inline through two versions, wrong in two ways, with nothing in the
+  tree able to say so. `RUNAWAY` is now over 4x the budget whatever the
+  history says, and both verdicts are red on every tier.
+
+- **The suite's port probe degraded by being used.** It asked "does
+  anyone answer?" with a connect, and every connect against an occupied
+  port left the holder a connection it never accepts. The backlog is
+  128, so probe 129 got no answer and the probe called a served port
+  free. It is two binds now — `127.0.0.1` and `0.0.0.0` — because
+  `SO_REUSEADDR` makes each kind of holder invisible to one of them and
+  visible to the other. `the_probe_is_still_right_past_the_backlog`
+  walks 200 probes; against the old one it fails on the 129th.
+
+### Changed — the gate itself
+
+- **The release build is a step, not a side effect.** It had moved
+  inside `e2e` so four steps could share one build — they do, but `e2e`
+  then carried a fat-LTO build of the workspace plus every release test
+  harness inside a budget derived from an `e2e` that built nothing.
+- **A tier run keeps its output.** `run-test-binaries.sh` prints each
+  harness as it finishes rather than only in the summary, and
+  `suite.sh` writes `target/suite/log-<tier>-<stamp>.txt`. A 3,911 s
+  step printed one banner, then nothing for an hour, and left no record
+  of what it had been doing. Every step also records the machine's load
+  when it ended, so a duration can be read against what else was
+  running.
+
+---
+
 ## [7.39.12] — 2026-09-04
 
 ### Fixed

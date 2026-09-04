@@ -657,8 +657,50 @@ fn main() {
             // two factors it uses. It lived inline here through two
             // versions and was wrong in two ways for all of it —
             // nothing in the tree could reach it to say so.
-            use suitelib::verdict::{RUNAWAY_FACTOR, SLOWDOWN_FACTOR, Verdict, judge};
+            use suitelib::verdict::{Host, RUNAWAY_FACTOR, SLOWDOWN_FACTOR, Verdict, judge};
+            // v7.39.13 — how slow the HOST was, measured in this run.
+            //
+            // `fmt` parses every source file and formats nothing, so
+            // its duration is the machine and not the tree. Against its
+            // own median at this band that is a factor every other
+            // step's threshold scales by — which is what a fixed budget
+            // could never do and a constant would only guess at. It
+            // read 6.9 s at a load average of 54.7 against 2.6-3.7 s at
+            // around 3, and on that run it failed `fmt` for being the
+            // machine it was measuring.
+            //
+            // The reference itself is skipped, not excused: a ruler
+            // compared against itself always reads 1.
+            const REFERENCE_STEP: &str = "fmt";
+            let host = ledger
+                .steps
+                .iter()
+                .find(|s| s.name == REFERENCE_STEP)
+                .map(|s| {
+                    let past = suitelib::reportlib::recent_step_ms(
+                        &root.join("target"),
+                        tier,
+                        REFERENCE_STEP,
+                        band,
+                        6,
+                    );
+                    let mut sorted = past.clone();
+                    sorted.sort_unstable();
+                    let median = sorted.get(sorted.len() / 2).map_or(0, |m| u128::from(*m));
+                    Host::from_reference(s.duration.as_millis(), median)
+                })
+                .unwrap_or_default();
+            if host != Host::default() {
+                eprintln!(
+                    "  host         this run is {:.2}x slower than usual, measured on \
+                     `{REFERENCE_STEP}` — every threshold below is scaled by it",
+                    host.as_ratio()
+                );
+            }
             for rec in ledger.over_budget() {
+                if rec.name == REFERENCE_STEP {
+                    continue;
+                }
                 let name = rec.name.as_str();
                 let ms = rec.duration.as_millis();
                 let budget = rec.budget.unwrap_or_default();
@@ -671,7 +713,7 @@ fn main() {
                     .iter()
                     .map(|m| format!("{:.1}s", *m as f64 / 1000.0))
                     .collect();
-                let verdict = judge(ms, budget.as_millis(), median);
+                let verdict = judge(ms, budget.as_millis(), median, host);
                 match verdict {
                     Verdict::Runaway => {
                         eprintln!(
