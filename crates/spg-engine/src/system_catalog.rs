@@ -2786,29 +2786,36 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("idx_tup_fetch", DataType::BigInt, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
+    // v7.39.13 — through the one enumeration, so `indexrelid` still
+    // means the same object `pg_class.oid` and `pg_index.indexrelid` do.
     let mut relid: i64 = 16384;
-    let mut indexrelid: i64 = 100_000;
+    let mut relid_of: alloc::collections::BTreeMap<alloc::string::String, i64> =
+        alloc::collections::BTreeMap::new();
     for tname in cat.visible_table_names() {
         if crate::is_internal_table_name(&tname) {
             continue;
         }
-        let Some(t) = cat.get(&tname) else {
+        relid_of.insert(tname.clone(), relid);
+        relid = relid.saturating_add(1);
+    }
+    for ci in catalog_indexes(cat) {
+        let Some(relid) = relid_of.get(&ci.table).copied() else {
             continue;
         };
-        for idx in t.indices() {
-            indexrelid = indexrelid.saturating_add(1);
+        {
+            let indexrelid = ci.oid;
+            let tname = &ci.table;
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(relid),
                 Value::BigInt(indexrelid),
                 Value::text("public"),
                 Value::Text(alloc::borrow::Cow::Owned(tname.clone())),
-                Value::Text(alloc::borrow::Cow::Owned(idx.name.clone())),
+                Value::Text(alloc::borrow::Cow::Owned(ci.name.clone())),
                 Value::BigInt(0), // idx_scan
                 Value::BigInt(0), // idx_tup_read
                 Value::BigInt(0), // idx_tup_fetch
             ]));
         }
-        relid = relid.saturating_add(1);
     }
     (schema, rows)
 }
@@ -3537,6 +3544,148 @@ pub(crate) fn synth_information_schema_table_constraints(
 pub(crate) const OID_TABLE_BASE: i64 = 16384;
 pub(crate) const OID_VIEW_BASE: i64 = 32768;
 pub(crate) const OID_INDEX_BASE: i64 = 100_000;
+
+/// v7.39.13 — every object that gets an index OID, enumerated ONCE.
+///
+/// Five places walked `t.indices()` from `OID_INDEX_BASE` and had to
+/// agree on the order, and one of them says so in a comment: "Index
+/// oids follow the SAME sequence synth_pg_index_raw uses". They agreed
+/// on what they enumerated and were all wrong about the same thing.
+///
+/// SPG builds a SINGLE-column index for a composite constraint added
+/// by `ALTER TABLE` — the form `pg_dump` emits — while the constraint
+/// records every column. `pg_index` therefore guessed which constraint
+/// an index backed by PREFIX-matching its columns, and reported the
+/// guess. Measured against PG 18.6, reported by sentori:
+///
+/// ```text
+///                                 PG 18.6                 SPG 7.39.12
+///   PK(a,b), then INDEX ix(a)   ix f/f/1, pkey t/t/2   BOTH t/t/1
+///   INDEX ix(a), then PK(a,b)   ix f/f/1, pkey t/t/2   ix only
+///   is ix actually unique?      no                     says yes
+/// ```
+///
+/// The third line is the dangerous one: an index that is not unique,
+/// reporting that it is. A migration guard that asserts uniqueness
+/// before relying on it gets a yes and is wrong — the opposite
+/// direction from the defect 7.39.11 fixed, which was a real key
+/// reporting NOT unique and merely raised a false alarm.
+///
+/// So nothing prefix-matches any more. A storage index reports its own
+/// columns and its own uniqueness, and each uniqueness constraint gets
+/// the row PostgreSQL gives it: its own columns, unique, primary when
+/// it says so. A storage index whose columns EXACTLY equal a
+/// constraint's is that constraint's index and carries its flags,
+/// which is how an inline `PRIMARY KEY (a, b)` stays one row.
+pub(crate) struct CatalogIndex {
+    pub oid: i64,
+    pub table: alloc::string::String,
+    pub name: alloc::string::String,
+    /// 0-based column positions on the parent table.
+    pub columns: Vec<usize>,
+    pub included: Vec<usize>,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    /// The access method's OID, already resolved — `IndexKind` carries
+    /// the index's data, and a synthesised row has none to carry.
+    pub am_oid: i64,
+    pub partial_predicate: Option<alloc::string::String>,
+    pub expression: Option<alloc::string::String>,
+    pub nulls_not_distinct: bool,
+    /// `false` for the row a constraint gets when no storage index has
+    /// exactly its columns — it exists in PostgreSQL and not in SPG's
+    /// storage, and the difference matters to anything that asks the
+    /// index for statistics.
+    pub is_storage: bool,
+}
+
+/// PostgreSQL's own name for a constraint's index.
+fn constraint_index_name(
+    table: &str,
+    uc: &spg_storage::UniquenessConstraint,
+    cols: &[String],
+) -> alloc::string::String {
+    if uc.is_primary_key {
+        return alloc::format!("{table}_pkey");
+    }
+    let mut n = alloc::string::String::from(table);
+    for c in cols {
+        n.push('_');
+        n.push_str(c);
+    }
+    n.push_str("_key");
+    n
+}
+
+pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
+    let mut out: Vec<CatalogIndex> = Vec::new();
+    let mut oid = OID_INDEX_BASE;
+    for tname in cat.visible_table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        let ucs = &t.schema().uniqueness_constraints;
+        let col_names: Vec<alloc::string::String> =
+            t.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let mut claimed: Vec<bool> = alloc::vec![false; ucs.len()];
+        for idx in t.indices() {
+            oid += 1;
+            let columns: Vec<usize> = core::iter::once(idx.column_position)
+                .chain(idx.extra_column_positions.iter().copied())
+                .collect();
+            // EXACT, not a prefix. A constraint whose columns merely
+            // START WITH this index's is a different object.
+            let exact = ucs.iter().position(|uc| uc.columns == columns);
+            if let Some(i) = exact {
+                claimed[i] = true;
+            }
+            let uc = exact.map(|i| &ucs[i]);
+            out.push(CatalogIndex {
+                oid,
+                table: tname.clone(),
+                name: idx.name.clone(),
+                columns,
+                included: idx.included_columns.clone(),
+                is_unique: idx.is_unique || uc.is_some(),
+                is_primary: uc.is_some_and(|u| u.is_primary_key),
+                am_oid: am_oid_of(&idx.kind),
+                partial_predicate: idx.partial_predicate.clone(),
+                expression: idx.expression.clone(),
+                nulls_not_distinct: idx.nulls_not_distinct,
+                is_storage: true,
+            });
+        }
+        // The constraints no storage index covers exactly. PostgreSQL
+        // has an index for every one of them; SPG enforces them without
+        // one, and a catalog that omits them tells a schema reader the
+        // table has no primary key.
+        for (i, uc) in ucs.iter().enumerate() {
+            if claimed[i] {
+                continue;
+            }
+            oid += 1;
+            let cols: Vec<alloc::string::String> = uc
+                .columns
+                .iter()
+                .filter_map(|p| col_names.get(*p).cloned())
+                .collect();
+            out.push(CatalogIndex {
+                oid,
+                table: tname.clone(),
+                name: constraint_index_name(&tname, uc, &cols),
+                columns: uc.columns.clone(),
+                included: Vec::new(),
+                is_unique: true,
+                is_primary: uc.is_primary_key,
+                am_oid: 403, // btree — what PostgreSQL builds for a key
+                partial_predicate: None,
+                expression: None,
+                nulls_not_distinct: uc.nulls_not_distinct,
+                is_storage: false,
+            });
+        }
+    }
+    out
+}
+
 /// v7.39 (round 635) — pg_cast rows need an oid of their own. Above the
 /// index range so it cannot collide with a relation's.
 // 7.38.1 S5.1 — pg_cast rows are BUILTIN casts, and pg_dump decides
@@ -3638,14 +3787,9 @@ pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
             return Some(alloc::string::String::from(vname));
         }
     }
-    let mut idx_oid = OID_INDEX_BASE;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
-            idx_oid += 1;
-            if idx_oid == oid {
-                return Some(idx.name.clone());
-            }
+    for ci in catalog_indexes(cat) {
+        if ci.oid == oid {
+            return Some(ci.name);
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
@@ -3681,14 +3825,9 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
             return Some(OID_VIEW_BASE + pos as i64);
         }
     }
-    let mut idx_oid = OID_INDEX_BASE;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
-            idx_oid += 1;
-            if idx.name == bare {
-                return Some(idx_oid);
-            }
+    for ci in catalog_indexes(cat) {
+        if ci.name == bare {
+            return Some(ci.oid);
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
@@ -4059,20 +4198,18 @@ pub(crate) fn synth_pg_class(
     // Index oids follow the SAME sequence synth_pg_index_raw uses (from
     // 100_000, tables in table_names() order, indices in catalog order), so
     // indexrelid and pg_class.oid agree.
-    let mut idx_oid: i64 = OID_INDEX_BASE;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
-            idx_oid += 1;
-            let relnatts = i16::try_from(1 + idx.extra_column_positions.len()).unwrap_or(i16::MAX);
+    for ci in catalog_indexes(cat) {
+        {
+            let idx_oid = ci.oid;
+            let relnatts = i16::try_from(ci.columns.len()).unwrap_or(i16::MAX);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
-                Value::text(idx.name.clone()),
-                Value::BigInt(namespace_oid_for_relname(&idx.name)),
-                Value::BigInt(0),                    // reltype (indexes have none)
-                Value::BigInt(0),                    // reloftype
-                Value::BigInt(10),                   // relowner
-                Value::BigInt(am_oid_of(&idx.kind)), // relam — the real AM
+                Value::text(ci.name.clone()),
+                Value::BigInt(namespace_oid_for_relname(&ci.name)),
+                Value::BigInt(0),         // reltype (indexes have none)
+                Value::BigInt(0),         // reloftype
+                Value::BigInt(10),        // relowner
+                Value::BigInt(ci.am_oid), // relam — the real AM
                 Value::BigInt(idx_oid),
                 Value::BigInt(0),
                 Value::Int(0),
@@ -10582,6 +10719,27 @@ pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
 /// as `name`), ignored the constraint-backing check (so a primary key's index
 /// printed `CREATE INDEX` instead of `CREATE UNIQUE INDEX`), and only ever
 /// listed column names. One renderer now feeds both.
+/// v7.39.13 — the `CREATE INDEX` PostgreSQL prints for a constraint's
+/// own index, which SPG synthesises because its storage has none.
+fn render_constraint_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> alloc::string::String {
+    let cols: alloc::vec::Vec<alloc::string::String> = ci
+        .columns
+        .iter()
+        .map(|p| {
+            t.schema()
+                .columns
+                .get(*p)
+                .map_or_else(|| "?".into(), |c| c.name.clone())
+        })
+        .collect();
+    alloc::format!(
+        "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+        ci.name,
+        ci.table,
+        cols.join(", ")
+    )
+}
+
 pub(crate) fn render_indexdef(
     t: &spg_storage::Table,
     idx: &spg_storage::Index,
@@ -10784,14 +10942,28 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("indexdef", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
-            let indexdef = render_indexdef(t, idx, &tname);
+    // v7.39.13 — through the one enumeration, so this view and
+    // `pg_index` list the same objects. Listing only the storage
+    // indexes here while `pg_index` also carries each constraint's own
+    // row would be two catalogs disagreeing about one schema.
+    for ci in catalog_indexes(cat) {
+        let Some(t) = cat.get(&ci.table) else {
+            continue;
+        };
+        {
+            let tname = ci.table.clone();
+            let indexdef = if ci.is_storage {
+                t.indices().iter().find(|i| i.name == ci.name).map_or_else(
+                    || render_constraint_indexdef(t, &ci),
+                    |i| render_indexdef(t, i, &tname),
+                )
+            } else {
+                render_constraint_indexdef(t, &ci)
+            };
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
                 Value::text(tname.clone()),
-                Value::text(idx.name.clone()),
+                Value::text(ci.name.clone()),
                 Value::Null, // tablespace — the default one
                 Value::text(indexdef),
             ]));
@@ -10860,12 +11032,17 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         by_table.insert(tname.clone(), table_oid);
         table_oid = table_oid.saturating_add(1);
     }
-    for tname in &names {
-        let Some(t) = cat.get(tname) else { continue };
-        let relid = *by_table.get(tname).unwrap_or(&0);
-        for idx in t.indices() {
-            idx_oid += 1;
-            let n_attrs_total = 1 + idx.extra_column_positions.len();
+    // v7.39.13 — one enumeration, and nothing guesses which constraint
+    // an index backs. See `catalog_indexes`: a storage index reports its
+    // own columns and its own uniqueness, and each uniqueness constraint
+    // gets the row PostgreSQL gives it. The prefix match this replaces
+    // reported two primary keys for one table and told a reader that an
+    // index accepting duplicates was unique.
+    for ci in catalog_indexes(cat) {
+        {
+            let relid = *by_table.get(&ci.table).unwrap_or(&0);
+            let idx_oid = ci.oid;
+            let n_attrs_total = ci.columns.len();
             // PG's `indkey` int2vector — column positions, 1-based.
             // SPG stores positions 0-based; add 1 to align with PG's
             // attnum.
@@ -10876,88 +11053,19 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             // (i.indkey)` — how Django's introspection, Rails' schema
             // dumper, sqlalchemy and every hand-written schema-diff
             // query ask which columns an index covers — raised
-            // "ANY/ALL right-hand side must be an array, got text",
-            // and so did `unnest`, `array_position` and subscripting.
-            // The printed form is unchanged; only the type is.
-            let indkey: Vec<i16> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
+            // "ANY/ALL right-hand side must be an array, got text".
+            let indkey: Vec<i16> = ci
+                .columns
+                .iter()
                 .map(|p| i16::try_from(p + 1).unwrap_or(0))
                 .collect();
-            // indclass: opclass OIDs, one per column. SPG uses the
-            // default opclass for every column; PG would emit
-            // `1978 1978` for two int4 columns. We populate with
-            // placeholder 0s so the shape stays valid.
             let indclass: Vec<u32> = alloc::vec![0; n_attrs_total];
             let indcollation: Vec<u32> = alloc::vec![0; n_attrs_total];
             let indoption: Vec<i16> = alloc::vec![0; n_attrs_total];
-            // v7.39.11 — from the CONSTRAINT, not from the index's name
-            // and not from the index's own uniqueness flag.
-            //
-            // Reported by sentori against 7.39.10 as the PostgreSQL twin
-            // of the `SHOW INDEX` defect that version fixed for MySQL.
-            // Measured against PostgreSQL 18.6, `a int PRIMARY KEY`:
-            // PG answers `indisprimary=t indisunique=t`, SPG answered
-            // `indisprimary=t indisunique=f`.
-            //
-            // `indisunique = false` on a primary key is a wrong VALUE —
-            // anything reading it concludes the key is not unique. SPG
-            // does not carry a primary key's uniqueness on the index; it
-            // lives in the table's uniqueness constraints, where
-            // `is_primary_key` also says which one is primary. Deciding
-            // that from a `_pkey` name suffix made the inline composite
-            // spelling (`m1_a_pkey_0_0`) answer false while the ALTER
-            // spelling answered true.
-            let idx_cols: Vec<usize> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
-                .collect();
-            // v7.39.12 — the constraint's columns START WITH the
-            // index's, rather than equalling them.
-            //
-            // Reported by sentori against 7.39.11, and it is a
-            // regression this project shipped: on their own dump,
-            // tables with a findable primary key went from 27 of 27 to
-            // 20 of 27, and the seven that vanished are the ones whose
-            // primary key is composite.
-            //
-            //   ALTER TABLE t ADD PRIMARY KEY (a, b)
-            //                     7.39.10        7.39.11       PG 18
-            //     indisprimary       t              f            t
-            //     indisunique        f              f            t
-            //
-            // SPG builds a SINGLE-column index for a composite
-            // constraint added by `ALTER TABLE` — the form `pg_dump`
-            // emits, so the form every restored database uses — while
-            // the constraint records every column. Equality could never
-            // match, so both flags came back false and nothing marked
-            // the key primary at all. The name-guessing v7.39.11
-            // removed happened to get `indisprimary` right for exactly
-            // this case.
-            //
-            // Longest prefix wins, so an inline composite (whose index
-            // IS composite) still matches on all of its columns rather
-            // than on its first. What stays ambiguous: a user's own
-            // `CREATE INDEX ix ON t (a)` over a table with `PRIMARY KEY
-            // (a, b)` prefix-matches the same constraint, and SPG
-            // records nothing that says which index a constraint
-            // created. It is reported for the constraint's index
-            // because that one is built first and wins the tie on
-            // declaration order; a second index on the same prefix
-            // would be mislabelled. That is a narrower wrong answer
-            // than seven tables with no primary key.
-            let backing = t
-                .schema()
-                .uniqueness_constraints
-                .iter()
-                .filter(|uc| uc.columns.starts_with(&idx_cols))
-                // The tightest prefix: an index on (a) backs `UNIQUE
-                // (a)` rather than `PRIMARY KEY (a, b)` when a table
-                // carries both, because the shorter constraint is the
-                // one it covers exactly.
-                .min_by_key(|uc| uc.columns.len());
-            let is_primary = backing.is_some_and(|uc| uc.is_primary_key);
-            let is_unique = idx.is_unique || backing.is_some();
-            let is_partial = idx.partial_predicate.is_some();
-            let is_expression = idx.expression.is_some();
+            let is_primary = ci.is_primary;
+            let is_unique = ci.is_unique;
+            let is_partial = ci.partial_predicate.is_some();
+            let is_expression = ci.expression.is_some();
             let _ = (is_partial, is_expression);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
@@ -10969,7 +11077,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 // round 52 and enforces it; only the catalog was still
                 // answering `f`, so a migration tool reading pg_index saw
                 // a plain unique index and would have tried to "fix" it.
-                Value::Bool(idx.nulls_not_distinct),
+                Value::Bool(ci.nulls_not_distinct),
                 Value::Bool(is_primary),
                 Value::Bool(false), // indisexclusion — EXCLUDE constraint
                 Value::Bool(true),  // indimmediate
@@ -10983,8 +11091,8 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::OidVector(indcollation),
                 Value::OidVector(indclass),
                 Value::Int2Vector(indoption),
-                idx.expression.clone().map_or(Value::Null, Value::text), // indexprs
-                idx.partial_predicate
+                ci.expression.clone().map_or(Value::Null, Value::text), // indexprs
+                ci.partial_predicate
                     .clone()
                     .map_or(Value::Null, Value::text), // indpred
             ]));

@@ -65,14 +65,33 @@ fn every_table_has_exactly_one_index_marked_primary() {
     assert_eq!(r[0][0], "3");
 }
 
+/// v7.39.13 — this row asserted "one index backs the constraint" and
+/// that it carried both flags, which was the PREFIX GUESS this version
+/// removed: the single-column index SPG builds for `ALTER TABLE ADD
+/// PRIMARY KEY (a, b)` is not the key, and saying it was is how an
+/// index that accepts duplicates came to report `indisunique`.
+///
+/// The constraint has its own row now, `two_pkey` over both columns,
+/// and SPG's own probe index reports itself. What still has to hold —
+/// and is what their dump measures — is that exactly ONE row per table
+/// claims the primary key.
 #[test]
 fn a_composite_key_added_by_alter_table_is_primary_and_unique() {
     let mut e = seeded();
     let r = rows(&mut e, FLAGS);
     let two: Vec<&Vec<String>> = r.iter().filter(|x| x[0].starts_with("two")).collect();
-    assert_eq!(two.len(), 1, "one index backs the constraint: {r:?}");
-    assert_eq!(two[0][1], "true", "indisprimary");
-    assert_eq!(two[0][2], "true", "indisunique");
+    let primary: Vec<&&Vec<String>> = two.iter().filter(|x| x[1] == "true").collect();
+    assert_eq!(primary.len(), 1, "exactly one primary among {two:?}");
+    assert_eq!(primary[0][0], "two_pkey", "PostgreSQL's name for it");
+    assert_eq!(primary[0][2], "true", "indisunique");
+    for row in &two {
+        if row[0] != "two_pkey" {
+            assert_eq!(
+                row[2], "false",
+                "a probe index over a prefix of the key accepts duplicates: {row:?}"
+            );
+        }
+    }
 }
 
 #[test]
