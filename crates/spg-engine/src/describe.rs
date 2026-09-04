@@ -866,7 +866,11 @@ pub(crate) fn describe_expr_in(
         // it delegates. Without this arm a view with any window column
         // resolved to nothing at all, and reported no columns.
         Expr::WindowFunction { name, args, .. } => {
-            let lower = name.to_ascii_lowercase();
+            // v7.39.13 — the name the projection reports, from the same
+            // map. `count(*)` is held as `count_star`; this arm was
+            // handing the internal spelling to Describe while the row
+            // stream mapped it back, so one call had two names.
+            let lower = spg_sql::ast::canonical_function_name(name);
             let fixed = match lower.as_str() {
                 "row_number" | "rank" | "dense_rank" => Some(DataType::BigInt),
                 "ntile" => Some(DataType::Int),

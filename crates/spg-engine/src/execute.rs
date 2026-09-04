@@ -2273,7 +2273,42 @@ impl Engine {
                 }
                 self.exec_create_index(s)
             }
-            Statement::Insert(s) => {
+            Statement::Insert(mut s) => {
+                // v7.39.13 — resolve scalar subqueries before the row
+                // walk, which UPDATE has done since embed round-12 and
+                // DELETE since round 157. INSERT never did, so
+                // `INSERT INTO d (n) VALUES ((SELECT max(n) FROM s))`
+                // reached row eval with the subquery still in the tree
+                // and raised "subquery reached row eval — engine
+                // resolver bug", for every type. PG 18.6 accepts all of
+                // them. Reported by sentori against 7.39.12; it is not a
+                // regression, it is a path the ORDER BY fix of that
+                // version did not reach.
+                //
+                // Not with a WITH clause, for the reason the UPDATE arm
+                // gives: the CTE temps are not installed yet, so a
+                // subquery reading one would miss it or — worse — read a
+                // same-named real table instead.
+                if s.ctes.is_empty() {
+                    for row in &mut s.rows {
+                        for e in row.iter_mut() {
+                            self.resolve_expr_subqueries(e, cancel)?;
+                        }
+                    }
+                    if let Some(clause) = &mut s.on_conflict
+                        && let spg_sql::ast::OnConflictAction::Update {
+                            assignments,
+                            where_,
+                        } = &mut clause.action
+                    {
+                        for (_, e) in assignments.iter_mut() {
+                            self.resolve_expr_subqueries(e, cancel)?;
+                        }
+                        if let Some(w) = where_ {
+                            self.resolve_expr_subqueries(w, cancel)?;
+                        }
+                    }
+                }
                 // v7.39 (pg_stat knife A) — per-table n_tup_ins. Charged
                 // to the statement's target (a partition-routed insert
                 // charges the parent; ON CONFLICT updates count here

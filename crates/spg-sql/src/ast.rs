@@ -8399,7 +8399,17 @@ pub fn figure_column_name(expr: &Expr) -> Option<String> {
 /// under: `count(*)` is held as `count_star` so the star arity survives the
 /// AST, and that internal spelling must not reach a client. PG18 reports
 /// `count`.
-fn canonical_function_name(name: &str) -> String {
+/// v7.39.13 — public, because Describe was naming the same call from a
+/// second map that did not have this entry.
+///
+/// `count(*)` is held as `count_star` so the star arity survives the
+/// AST. The projection mapped it back and the extended protocol's
+/// Describe did not, so `SELECT count(*) OVER ()` answered `count` in
+/// the row stream and `count_star` to `\gdesc` — an ORM-visible column
+/// name, and two answers to one question. Reported by sentori against
+/// 7.39.12.
+#[must_use]
+pub fn canonical_function_name(name: &str) -> String {
     match name {
         "count_star" => "count".to_string(),
         other => other.to_ascii_lowercase(),
