@@ -72,16 +72,21 @@ It is not the file: it is who runs it. On ONE machine, one crate, one
 cold build, the same binary content —
 
 ```text
-  under iTerm.app       first  30.55 s     xattrs: macl, provenance, quarantine
-  under sshd            first   0.33 s
-  under Terminal.app    first   0.02 s     xattrs: none
+  under the terminal app   first  30.55 s     app xattrs: provenance
+  under sshd               first   0.33 s
+  under Terminal.app       first   0.02 s     app xattrs: none
 ```
 
 — and the built file carries `com.apple.provenance` in all three. So
-it is not the file's attribute: it is whose descendant runs it.
-Everything an application with `com.apple.quarantine` spawns sits
-inside the provenance sandbox, and the testbed is fast for the same
-reason the third row is — its work does not arrive that way.
+it is not the file's attribute: it is whose descendant runs it. An
+application bundle that carries `com.apple.provenance` — which any
+user-installed app has — puts everything it spawns in the provenance
+sandbox; `Terminal.app` is a system bundle with no extended
+attributes at all and does not. The testbed is fast for the same
+reason the third row is: its work does not arrive that way.
+
+The bundle's attribute cannot be removed either, not on a copy and
+not under sudo, so there is no stripping it off.
 
 Nothing in this repository can change that, and the attribute on the
 file cannot be removed (`xattr -d` is refused even under sudo). Which
