@@ -159,7 +159,13 @@ run_e2e() {
     # It exists so this step and the collation leg below share ONE
     # build instead of being two selections with a rebuild between
     # them. See the note in `run_unit` for the measurement.
-    scripts/run-test-binaries.sh e2e \
+    #
+    # v7.39.13 — minus the release-only harnesses. `perf_gate` and
+    # `slo_smoke` are `#![cfg(not(debug_assertions))]`, so under this
+    # profile they hold zero tests, and `run_gates` runs them in release
+    # where they do. Measured: nine such harnesses, 222 s of this step's
+    # 1,356 s, 0.00 s of tests between them.
+    RUN_SKIP=perf_gate,slo_smoke scripts/run-test-binaries.sh e2e \
         --workspace --exclude spg-bench-competitor --tests
 
     # v7.39.5 — and the wire panel a second time, under the collation the

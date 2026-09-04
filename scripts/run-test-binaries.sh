@@ -17,6 +17,8 @@
 #
 # Usage: run-test-binaries.sh <label> [cargo test selection args...]
 #   env: RUN_FILTER=<substring>   only harnesses whose name contains it
+#        RUN_SKIP=<substring,...>  harnesses whose name contains one of these
+#                                  are not executed
 #        RUN_ENV="K=V K2=V2"      extra environment for each harness
 #        RUN_ARGS="--ignored"     extra arguments for each harness
 set -uo pipefail
@@ -78,6 +80,22 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
             case "$name" in *"$w"*) keep=1; break ;; esac
         done
         [ "$keep" = 1 ] || continue
+    fi
+    # v7.39.13 — and RUN_SKIP is the other direction, for harnesses this
+    # profile cannot run. `perf_gate` and `slo_smoke` are
+    # `#![cfg(not(debug_assertions))]`: under debug they compile to zero
+    # tests, and `gate.sh gates` runs them in release, which is where
+    # they mean anything. Executing them here cost 222 s of the e2e
+    # step's 1,356 s -- `spg-server::slo_smoke` alone spent 56 s running
+    # nothing, because the first execution of a freshly linked binary is
+    # assessed by the system whatever is inside it.
+    if [ -n "${RUN_SKIP:-}" ]; then
+        drop=0
+        IFS=, read -r -a _unwanted <<< "$RUN_SKIP"
+        for w in "${_unwanted[@]}"; do
+            case "$name" in *"$w"*) drop=1; break ;; esac
+        done
+        [ "$drop" = 0 ] || continue
     fi
     # cargo runs a test binary with the package root as its working
     # directory, and fixtures are opened relative to it.
