@@ -62,20 +62,21 @@ pub fn changed_crates(root: &Path, graph: &CrateGraph) -> Result<Vec<String>, St
 ///
 /// The first version of this named the changed crates plus
 /// `sqllogictest`, which made `unit-changed` 38 s and made the next
-/// release rebuild the world: `gate.sh e2e` selects
-/// `--workspace --exclude spg-bench-competitor`, so the narrow run had
-/// replaced exactly the artefacts it needed. That is the whole of the
-/// e2e step's long-standing 4x — 576 s in the tier against 74-137 s by
-/// hand — and it explains why six hypotheses about it were each
-/// refuted: the cause was in the PREVIOUS run, not in the step. Run by
-/// hand the same selection twice in a row and it is warm; run it after
-/// a precommit and it is cold.
+/// release compile the same commit a second time.
 ///
-/// So both tiers name the same members and only their targets differ.
-/// A commit pays the workspace build once; the release then pays
-/// nothing for it. Across one commit-then-release cycle that is far
-/// cheaper than each tier evicting the other's work, and it is the same
-/// correction `clippy-changed` needed on the same day.
+/// v7.39.13 — the mechanism, measured, because an earlier version of
+/// this comment got it wrong and said one selection EVICTED the other.
+/// It does not. Cargo keeps a set of artefacts per selection and they
+/// coexist: alternate two materialised selections over an unchanged
+/// tree and it costs 0 s, 0 s, 1 s, 0 s. What costs is that each set
+/// rebuilds the same change on its own — one `touch` of
+/// `crates/spg-sql/src/lib.rs`, then 93 s for the first selection and
+/// 94 s for the second.
+///
+/// So both tiers name the same members and only their targets differ,
+/// and a commit compiles once instead of twice. The comment this
+/// replaces also claimed this was "the whole of the e2e step's 4x";
+/// it is not, and what is remains open — see the release notes.
 pub const SHARED_MEMBERS: &str = " --workspace --exclude spg-bench-competitor";
 
 /// Whether this commit changed any crate at all. `None` means the
@@ -223,8 +224,8 @@ pub fn unit_changed(root: &Path, graph: &CrateGraph) -> Result<String, String> {
     //
     // The shared member set BUILDS; `RUN_FILTER` decides which of its
     // harnesses run, and that is where "the crates you changed" lives
-    // now. Building narrowly is what evicted the release's artefacts —
-    // see `SHARED_MEMBERS`.
+    // now. Building narrowly is what made the release compile the same
+    // commit a second time — see `SHARED_MEMBERS`.
     let _ = precommit_selection(root, graph)?;
     let filter = changed.join(",");
     let out = sh(
