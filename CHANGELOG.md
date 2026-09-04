@@ -72,16 +72,21 @@ It is not the file: it is who runs it. On ONE machine, one crate, one
 cold build, the same binary content —
 
 ```text
-  built and run from the terminal's process tree   first  30.55 s
-  built and run through sshd on the same host      first   0.33 s
+  under iTerm.app       first  30.55 s     xattrs: macl, provenance, quarantine
+  under sshd            first   0.33 s
+  under Terminal.app    first   0.02 s     xattrs: none
 ```
 
-— and both carry `com.apple.provenance`. The terminal application
-holds `com.apple.quarantine`, so everything it spawns is inside the
-provenance sandbox, and the testbed is fast because its work arrives
-over ssh. Nothing in this repository can change that, and the
-attribute itself cannot be removed (`xattr -d` is refused even under
-sudo).
+— and the built file carries `com.apple.provenance` in all three. So
+it is not the file's attribute: it is whose descendant runs it.
+Everything an application with `com.apple.quarantine` spawns sits
+inside the provenance sandbox, and the testbed is fast for the same
+reason the third row is — its work does not arrive that way.
+
+Nothing in this repository can change that, and the attribute on the
+file cannot be removed (`xattr -d` is refused even under sudo). Which
+terminal the work is driven from is not a property of the tree, so it
+is recorded here and nowhere else.
 
 Ruled out, each with its own control: the tests; the server spawns
 (the fixture uses `127.0.0.1:0`, not the suite's port probe); binary
