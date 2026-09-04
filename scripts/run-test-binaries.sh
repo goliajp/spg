@@ -98,8 +98,15 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
     # 3,911 s printed one banner and then nothing for over an hour:
     # there was no way to see where it was without waiting for it to
     # end, and no record afterwards of when each harness started.
-    printf '%6ss  %s\n' "$(( $(date +%s) - started ))" "$name" \
-        | tee -a "$times"
+    #
+    # v7.39.13 — and libtest's own figure beside the wall clock. The
+    # two answer different questions: `finished in` is the tests, the
+    # wall clock is the tests plus building the process, loading it,
+    # and whatever it spawns. A step whose sum of test time is minutes
+    # and whose wall clock is an hour is not a slow test suite.
+    inner=$(printf '%s' "$out" | grep -oE 'finished in [0-9.]+s' | tail -1 | cut -d' ' -f3)
+    printf '%6ss wall  %8s in-test  %s\n' \
+        "$(( $(date +%s) - started ))" "${inner:-?}" "$name" | tee -a "$times"
     t=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
     tests=$(( tests + ${t:-0} ))
     if [ "$rc" = 0 ]; then
