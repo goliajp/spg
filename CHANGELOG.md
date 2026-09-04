@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [7.39.12] — 2026-09-03
+## [7.39.12] — 2026-09-04
 
 ### Fixed
 
@@ -166,6 +166,47 @@ than usual, because the durations did not.
   passed three of three when the machine was quieter. A loopback
   connect is prompt either way, refused immediately with no listener
   and completed immediately with one, so the deadline bought nothing.
+
+- **Both tiers build the same cargo members, and the same targets.**
+  This is the release gate's long-standing 4x, and it was never inside
+  the step it showed up in.
+
+  Cargo resolves features over the SELECTED members, so two different
+  member sets are two sets of artefacts. `precommit` named a narrow set
+  and `prerelease` names the workspace, so each evicted the other's work
+  and whichever ran second paid a full rebuild. Measured back to back on
+  the testbed — `gate.sh e2e` right after a precommit, then again with
+  nothing changed between:
+
+  ```text
+    1,937 s   then   230 s
+  ```
+
+  Six hypotheses about that gap were refuted one at a time: the tests
+  (9,068 of them report 127 s), process spawn (wall equals the
+  harness's own reported time to the millisecond when run directly),
+  compilation (that run compiled nothing), page-cache eviction by
+  clippy (running e2e straight after a full clippy was the fastest
+  reading yet, 114 s), the runner's PATH (77 s against 81 s), and the
+  runner's `sh -c` (111 s, same as direct). Every one of them looked
+  inside the step. The cause was in the run before it — which is also
+  why it never reproduced by hand, where the same selection ran twice
+  in a row and was warm.
+
+  The same mistake was made and caught within one day on the clippy
+  side: narrowing `clippy-changed` to the changed crates made that step
+  0.3 s and made the next release's `lint` — 3.1 s on an unchanged tree
+  — take 765 s. A cost moved, not removed.
+
+  The member set is named once now, as `steps::SHARED_MEMBERS`, and the
+  precommit prepare builds `--tests` as well so the release finds them
+  warm. Two tests fail if the tiers drift apart, one per driver,
+  scanned by statement rather than by line — the first version of the
+  test-side one was fooled by a multi-line format string.
+
+  `precommit` is 16 s on an unchanged tree and 272 s on a change to
+  spg-engine, against a run earlier in this version that was killed at
+  47 minutes.
 
 ### Not a finding
 
