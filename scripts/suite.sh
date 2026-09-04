@@ -127,4 +127,17 @@ if [[ "$TIER" != "precommit" ]]; then
     }
 fi
 
-exec cargo run -q -p suitelib --bin suite-run -- "$TIER" "$@"
+# v7.39.13 — keep the run's output.
+#
+# `run-test-binaries.sh` ends every step with its five slowest
+# harnesses, precisely so a step's cost is attributable from its own
+# log. A prerelease `e2e` step ran 3,911 s, printed that line, and sent
+# it to a terminal and nowhere else — so the only way left to ask what
+# it had spent the hour on was to run the hour again. The report JSON
+# holds durations; it holds nothing about what happened inside one.
+#
+# `set -euo pipefail` is on, so cargo's exit status still decides.
+mkdir -p target/suite
+SUITE_LOG="target/suite/log-${TIER}-$(date -u +%Y%m%d%H%M%S).txt"
+echo "suite: $TIER — output also kept in $SUITE_LOG"
+cargo run -q -p suitelib --bin suite-run -- "$TIER" "$@" 2>&1 | tee "$SUITE_LOG"

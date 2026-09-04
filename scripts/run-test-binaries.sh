@@ -92,7 +92,14 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
     # gap is spread across all of them (the machine) or concentrated in
     # a few (those harnesses), which is the question the step-level
     # number cannot answer.
-    printf '%6ss  %s\n' "$(( $(date +%s) - started ))" "$name" >> "$times"
+    #
+    # v7.39.13 — and prints it as it goes. This file wrote the rows to a
+    # temp file and showed them only in the summary, so a step that ran
+    # 3,911 s printed one banner and then nothing for over an hour:
+    # there was no way to see where it was without waiting for it to
+    # end, and no record afterwards of when each harness started.
+    printf '%6ss  %s\n' "$(( $(date +%s) - started ))" "$name" \
+        | tee -a "$times"
     t=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
     tests=$(( tests + ${t:-0} ))
     if [ "$rc" = 0 ]; then

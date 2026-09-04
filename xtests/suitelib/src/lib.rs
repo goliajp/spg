@@ -23,6 +23,7 @@ pub mod crategraph;
 pub mod proclib;
 pub mod reportlib;
 pub mod steps;
+pub mod verdict;
 pub mod wireclient;
 
 pub mod isolib;

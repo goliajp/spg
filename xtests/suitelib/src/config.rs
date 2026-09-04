@@ -539,8 +539,32 @@ mod unit_tier_spawns {
         std::fs::read_to_string(root.join("scripts/gate.sh")).expect("scripts/gate.sh")
     }
 
+    /// v7.39.13 — the name says TEST because the code inspects test
+    /// selections. It read `every_workspace_wide_selection` for one
+    /// version while filtering for `cargo test`, and the clippy line
+    /// it therefore never looked at selects different members from
+    /// every other step in the tier. A name is a claim.
+    ///
+    /// That gap looked like the cause of the release tier's `e2e`
+    /// step reading 3,911 s, and it is not — a row asserting the two
+    /// families agree was written, went red on exactly that pair, and
+    /// was then deleted, because the measurement refuted its premise:
+    ///
+    /// ```text
+    ///   test selection, twice in a row       CONTROL     0 s
+    ///   clippy --workspace (benchmark IN)              106 s
+    ///   test selection again, right after                1 s
+    /// ```
+    ///
+    /// Clippy runs workspace members under a wrapper, so its units
+    /// are fingerprinted apart and its dependency work lands in check
+    /// artefacts that a later `--tests` build does not need. A member
+    /// set costs a rebuild when the SAME subcommand changes it — that
+    /// is the 358 s / 11 s pair below — not when clippy and test
+    /// disagree. Keeping the two aligned anyway would be a guard with
+    /// no measured cost behind it.
     #[test]
-    fn every_workspace_wide_selection_excludes_the_benchmark_crate() {
+    fn every_workspace_wide_test_selection_excludes_the_benchmark_crate() {
         let sh = gate_sh();
         let lines: Vec<&str> = sh
             .lines()
