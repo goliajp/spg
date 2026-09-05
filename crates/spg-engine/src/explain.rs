@@ -1408,14 +1408,28 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
             // wrapped in a Hash node, like PG); anything else ->
             // Nested Loop with a Join Filter.
             for (jidx, j) in from.joins.iter().enumerate() {
-                let right = scan_node(
-                    engine,
-                    &j.table.name,
-                    j.table.alias.as_deref(),
-                    None,
-                    &cte_names,
-                    false,
-                );
+                // v7.40.6 — the joined side is a sub-plan too when it is
+                // a derived table. v7.40.5 fixed the FROM position and
+                // left this one, on the reasoning that a join folds into
+                // the left-deep chain below; it does, and the chain takes
+                // whatever node it is handed. Measured against PG 18.6,
+                // before:
+                //
+                //     ->  Hash  (rows=0)
+                //           ->  Seq Scan on z  (rows=0)
+                //
+                // for a sub-SELECT that produced twenty thousand rows.
+                let right = match j.table.lateral_subquery.as_deref() {
+                    Some(inner) => build_plan_tree(inner, engine),
+                    None => scan_node(
+                        engine,
+                        &j.table.name,
+                        j.table.alias.as_deref(),
+                        None,
+                        &cte_names,
+                        false,
+                    ),
+                };
                 let (verb, hashable) = match j.kind {
                     spg_sql::ast::JoinKind::Inner => ("", true),
                     spg_sql::ast::JoinKind::Left => (" Left", true),

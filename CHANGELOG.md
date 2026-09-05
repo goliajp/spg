@@ -10,6 +10,28 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the same missing sub-plan, on the join side
+
+v7.40.5 made a derived table render as a sub-plan and said joins were
+excluded on purpose. They were the same defect. Measured against
+PostgreSQL 18.6 on the same data:
+
+```text
+  SPG    ->  Hash  (rows=0)
+               ->  Seq Scan on z  (cost=0.00..1.00 rows=0 width=8)
+
+  PG18   ->  Hash
+               ->  Sort
+                     ->  Seq Scan on a
+```
+
+`z` is a sub-SELECT there too, and the plan claimed a scan of it
+reporting zero rows for twenty thousand. The reasoning for excluding it —
+that a join folds into the left-deep chain — was true and beside the
+point: the chain takes whatever node it is handed, so handing it the
+sub-plan is the whole change.
+
+
 
 ## [7.40.5] — 2026-09-06
 
