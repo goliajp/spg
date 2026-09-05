@@ -884,38 +884,55 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
 /// peak and SPG does not meter one, and a number that was not measured
 /// is worse than none.
 ///
-/// v7.37 (round 884) — a KNOWN DIVERGENCE (RD-5), recorded here because round
-/// 882 created it. A single-table `ORDER BY` served over the wire now
-/// goes through the bounded sorter and can spill (26 runs and 86 MB on a
-/// 400k-row sort at `work_mem = 4MB`, counted in
-/// `pg_stat_database.temp_files`). EXPLAIN ANALYZE does not see that: it
-/// re-runs the statement through `exec_select_cancel`, the materialising
-/// executor, where the spilling walk is not hooked — so the sort it
-/// measures really is a quicksort, and this line is accurate about the
-/// run it describes while understating what the same SQL does in
-/// production.
+/// v7.37 (round 884) recorded a KNOWN DIVERGENCE here (RD-5): a
+/// single-table `ORDER BY` over the wire goes through the bounded sorter
+/// and can spill, ANALYZE re-ran the statement through the materialising
+/// executor where the spilling walk is not hooked, and so this line said
+/// `quicksort` for a sort that had gone to disk. That note ended by
+/// saying the honest fix was to make ANALYZE execute the path the query
+/// actually takes, and that it must not be smuggled in under a
+/// `Sort Method` change.
 ///
-/// Reporting `external merge` here would mean predicting a spill rather
-/// than measuring one, which is what the paragraph above refuses to do.
-/// Closing it properly means making ANALYZE execute the path the query
-/// actually takes; that is a change to what EXPLAIN ANALYZE runs, not to
-/// what it prints, and it is not smuggled in under a `Sort Method` fix.
-fn annotate_sort_method(node: &mut PlanNode, has_limit: bool) {
+/// v7.40.5 — round 903 made ANALYZE run
+/// `execute_readonly_select_streaming_prepared`, which IS the path a
+/// client's SELECT takes, and the obstacle went with it. The sorter on
+/// that path reports every run it writes into the engine's `spill_stats`,
+/// so the caller reads those counters either side of the run and hands
+/// the delta here. This reports a spill that HAPPENED; it still predicts
+/// nothing.
+///
+/// The wording is PG 18.6's, differenced on this testbed over 200,000
+/// rows of 64-byte text at `work_mem = '4MB'`:
+///
+/// ```text
+///   PG18.6   Sort Method: external merge  Disk: 13504kB
+///   SPG      Sort Method: quicksort            <- before this change
+/// ```
+///
+/// One caveat, stated rather than hidden: the counters are per ENGINE and
+/// the delta is per STATEMENT, so a plan with two Sort nodes attributes
+/// the same spill to both. PG attributes per node. A plan that sorts
+/// twice is the shape to fix that on, and it is not this one.
+fn annotate_sort_method(node: &mut PlanNode, has_limit: bool, spilled_bytes: Option<u64>) {
     if node.head == "Sort"
         && !node.attrs.iter().any(|a| a.starts_with("Sort Method:"))
         && let Some(pos) = node.attrs.iter().position(|a| a.starts_with("Sort Key:"))
     {
-        node.attrs.insert(
-            pos + 1,
-            alloc::string::String::from(if has_limit {
-                "Sort Method: top-N heapsort"
-            } else {
-                "Sort Method: quicksort"
-            }),
-        );
+        // PG's wording, from PG 18.6 on this testbed: `Sort Method:
+        // external merge  Disk: 13504kB` — two spaces before `Disk`, and
+        // the volume in whole kB.
+        let line = match spilled_bytes {
+            Some(bytes) => alloc::format!(
+                "Sort Method: external merge  Disk: {}kB",
+                bytes.div_ceil(1024)
+            ),
+            None if has_limit => alloc::string::String::from("Sort Method: top-N heapsort"),
+            None => alloc::string::String::from("Sort Method: quicksort"),
+        };
+        node.attrs.insert(pos + 1, line);
     }
     for c in &mut node.children {
-        annotate_sort_method(c, has_limit);
+        annotate_sort_method(c, has_limit, spilled_bytes);
     }
 }
 
@@ -1892,6 +1909,23 @@ impl Engine {
             // real per-table scan counters around the execution so leaf
             // scans report rows the executor genuinely touched.
             let before = scan_counter_snapshot(self);
+            // v7.40.5 — the spill counters, read either side of the run.
+            //
+            // The note above `annotate_sort_method` said reporting
+            // `external merge` would mean predicting a spill rather than
+            // measuring one. That was true while ANALYZE re-ran the
+            // statement through the materialising executor; round 903
+            // made it run the streaming path a client takes, and the
+            // sorter on that path reports every run it writes into
+            // `spill_stats`. So it can be measured, and this reads it.
+            let spill_before = (
+                self.spill_stats
+                    .files
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                self.spill_stats
+                    .bytes
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
             let started = self.clock.map(|f| f());
             // v7.37 (round 903) — ANALYZE runs the path the QUERY runs.
             //
@@ -1941,8 +1975,22 @@ impl Engine {
                 None
             };
             if let Some(tree) = &mut plan_tree {
+                let spilled_bytes = self
+                    .spill_stats
+                    .bytes
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(spill_before.1);
+                let spilled_files = self
+                    .spill_stats
+                    .files
+                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .saturating_sub(spill_before.0);
                 fill_actuals(tree, true, self, row_count as u64, elapsed_ms, &deltas);
-                annotate_sort_method(tree, sel.limit.is_some());
+                annotate_sort_method(
+                    tree,
+                    sel.limit.is_some(),
+                    (spilled_files > 0).then_some(spilled_bytes),
+                );
                 lines.clear();
                 render_costed(tree, !e.costs_off, &mut lines);
             }

@@ -144,6 +144,7 @@ mod e2e_error_position_round95;
 mod e2e_exclude_wire_round217;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_explain;
+mod e2e_explain_sort_spilled_wire_v7405;
 mod e2e_file_access_sqlstate_round191;
 #[allow(
     clippy::doc_markdown,

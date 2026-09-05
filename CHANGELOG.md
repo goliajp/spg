@@ -10,6 +10,44 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — EXPLAIN said `quicksort` for a sort that wrote 13 MB to disk
+
+`Sort Method` was hard-coded: `top-N heapsort` under a LIMIT and
+`quicksort` otherwise, never asking whether the sort had gone to disk.
+Differenced against PostgreSQL 18.6 on the same 200,000 rows of 64-byte
+text at `work_mem = '4MB'`:
+
+```text
+  PG18.6   Sort Method: external merge  Disk: 13504kB
+  SPG      Sort Method: quicksort
+```
+
+A DBA could not tell a sort that fit from one that spilled, which is the
+question `work_mem` exists to answer.
+
+The note above that code explained why it was honest at the time —
+ANALYZE re-ran the statement through the materialising executor, where
+the spilling walk is not hooked, so the sort it measured really was a
+quicksort, and saying `external merge` would have meant predicting a
+spill rather than measuring one. **Round 903 removed that obstacle and
+nobody came back for this.** ANALYZE now runs the streaming path a
+client's SELECT takes, and the sorter on that path already reports every
+run it writes into the engine's spill counters. Those are read either
+side of the run now, so the line reports a spill that HAPPENED. It still
+predicts nothing.
+
+Stated rather than hidden: the counters are per engine and the delta is
+per statement, so a plan with two Sort nodes would attribute the same
+spill to both. PostgreSQL attributes per node. A plan that sorts twice is
+the shape to fix that on.
+
+The pin is in the SERVER suite, and its first draft was not — an
+in-process `Engine` has no temp-run factory, so it cannot spill at all,
+and an engine-level pin would have gone green against a fix that did
+nothing. That is the second time this release that the difference
+mattered.
+
+
 
 ## [7.40.4] — 2026-09-06
 
