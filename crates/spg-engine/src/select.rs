@@ -7790,18 +7790,19 @@ impl Engine {
                 } else {
                     sort_keys_of(&tagged, terms[0].0)
                 };
-                let low_card = !keep_sorted
-                    && terms.len() == 1
-                    && all_keys
-                        .as_ref()
-                        .is_some_and(|(keys, exact)| !*exact && !key_discriminates(keys));
-                let keyed =
-                    all_keys.filter(|(keys, exact)| *exact || key_discriminates(keys) || low_card);
+                let (worth_it, key_exact) = match all_keys.as_ref() {
+                    Some(PrefixKeys::Narrow(k, e)) => (*e || key_discriminates(k), *e),
+                    Some(PrefixKeys::Wide(k, e)) => (*e || key_discriminates(k), *e),
+                    None => (false, false),
+                };
+                let low_card = !keep_sorted && terms.len() == 1 && !key_exact && !worth_it;
+                let keyed = all_keys.filter(|_| worth_it || low_card);
                 if keep_sorted {
                     // The collated permutation above already placed every
                     // row. A draft let the byte-order fallback run after
                     // it and undo the whole thing.
-                } else if let Some((mut order, exact)) = keyed {
+                } else if let Some(keys) = keyed {
+                    let exact = key_exact;
                     let (first_col, first_desc, _) = terms[0];
                     let row_cmp = |ia: u32, ib: u32| -> core::cmp::Ordering {
                         let (a, b) = (&tagged[ia as usize], &tagged[ib as usize]);
@@ -7825,59 +7826,29 @@ impl Engine {
                         }
                         core::cmp::Ordering::Equal
                     };
-                    let _ = first_col;
-                    if low_card {
-                        // Integer sort first, then one pass per run.
-                        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
-                            let c = pa.cmp(&pb);
-                            let c = if first_desc { c.reverse() } else { c };
-                            c.then_with(|| ia.cmp(&ib))
-                        });
-                        let mut lo = 0;
-                        while lo < order.len() {
-                            let mut hi = lo + 1;
-                            while hi < order.len() && order[hi].0 == order[lo].0 {
-                                hi += 1;
-                            }
-                            if hi - lo > 1 {
-                                let head = tagged[order[lo].1 as usize].1.values.get(first_col);
-                                let uniform = order[lo + 1..hi].iter().all(|&(_, i)| {
-                                    tagged[i as usize].1.values.get(first_col) == head
-                                });
-                                if !uniform {
-                                    order[lo..hi].sort_by(|&(_, ia), &(_, ib)| {
-                                        row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
-                                    });
-                                }
-                                // A uniform run is already in index
-                                // order, which IS the stable answer.
-                            }
-                            lo = hi;
+                    let same_value = |ia: u32, ib: u32| -> bool {
+                        tagged[ia as usize].1.values.get(first_col)
+                            == tagged[ib as usize].1.values.get(first_col)
+                    };
+                    let how = PrefixSort {
+                        first_desc,
+                        low_card,
+                        exact,
+                        single_term: terms.len() == 1,
+                    };
+                    let order: Vec<u32> = match keys {
+                        PrefixKeys::Narrow(v, _) => {
+                            sort_prefix_permutation(v, &how, &row_cmp, &same_value)
                         }
-                    } else {
-                        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
-                            let c = pa.cmp(&pb);
-                            let c = if first_desc { c.reverse() } else { c };
-                            if c != core::cmp::Ordering::Equal {
-                                return c;
-                            }
-                            // An EXACT key that ties means the values are
-                            // equal, so only the remaining terms can speak.
-                            // A prefix that ties has decided nothing yet and
-                            // the first term must be asked again, which
-                            // `row_cmp` does by walking every term from the
-                            // start.
-                            if exact && terms.len() == 1 {
-                                return ia.cmp(&ib);
-                            }
-                            row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
-                        });
-                    }
+                        PrefixKeys::Wide(v, _) => {
+                            sort_prefix_permutation(v, &how, &row_cmp, &same_value)
+                        }
+                    };
                     let mut slots: Vec<Option<(Vec<crate::orderby::OrderKey>, Row<'static>)>> =
                         core::mem::take(&mut tagged).into_iter().map(Some).collect();
                     tagged = order
                         .iter()
-                        .map(|&(_, i)| {
+                        .map(|&i| {
                             slots[i as usize]
                                 .take()
                                 .expect("the permutation names each row once")
@@ -15428,34 +15399,170 @@ fn byte_order_answers_the_collation(
 /// The `None` is the safety of it: a NULL or any other type has no
 /// faithful eight-byte key, so such a column takes the ordinary path
 /// rather than being given a made-up one.
+/// The prefix keys for a sort, at the width the DATA asks for.
+///
+/// v7.40.1 — the width used to be eight bytes for every text column, and
+/// the panel's two text cells priced both halves of that choice against
+/// PostgreSQL 18.6, in memory on both legs, 400,000 rows:
+///
+/// ```text
+///   short text (9 bytes, shared prefix)    SPG 96.6   PG 71.0   1.36x behind
+///   long text (192 bytes, byte 0 decides)  SPG 70.9   PG 72.4   parity
+/// ```
+///
+/// `'k' || lpad(n, 8, '0')` is nine bytes, so an eight-byte prefix drops
+/// the last digit: ten rows share every key, forty thousand tie-runs
+/// each fall back to the full comparator, and each of those reads at
+/// random into a 400,000-element array. The md5 column decides on byte
+/// zero and never ties, which is why only one of the two cells lost.
+///
+/// Widened to sixteen bytes and measured -- same window, two binaries
+/// named by md5, order digests identical:
+///
+/// ```text
+///   short text   104.9 -> 56.9 ms   1.84x faster (and 0.80x of PG)
+///   long text     74.9 -> 90.7 ms   1.21x SLOWER
+/// ```
+///
+/// So a fixed width is the wrong shape either way: `(u128, u32)` is 32
+/// bytes against `(u64, u32)`'s 16, and a column that already decided on
+/// byte zero pays double the sort's memory traffic for eight bytes it
+/// never reads. That is the tax a shared hot path levies on the workload
+/// it does not help.
+///
+/// The width comes from the longest value instead, which is exact and
+/// free -- it is one pass the loop below already makes. Every value at
+/// sixteen bytes or under makes the wide key the WHOLE key, so `exact`
+/// is true and the tie fallback with its random reads disappears
+/// altogether; anything longer keeps the narrow key and pays nothing.
+enum PrefixKeys {
+    Narrow(Vec<(u64, u32)>, bool),
+    Wide(Vec<(u128, u32)>, bool),
+}
+
 fn sort_keys_of(
     tagged: &[(Vec<crate::orderby::OrderKey>, Row<'static>)],
     col: usize,
-) -> Option<(Vec<(u64, u32)>, bool)> {
+) -> Option<PrefixKeys> {
     let n = u32::try_from(tagged.len()).ok()?;
-    let mut out: Vec<(u64, u32)> = Vec::with_capacity(tagged.len());
-    let exact = match tagged.first()?.1.values.get(col)? {
-        Value::Text(_) => false,
-        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => true,
+    let is_text = match tagged.first()?.1.values.get(col)? {
+        Value::Text(_) => true,
+        Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) => false,
         _ => return None,
     };
-    for (i, row) in (0..n).zip(tagged.iter()) {
-        let key = match row.1.values.get(col) {
-            Some(Value::Text(t)) if !exact => {
-                let mut k = [0u8; 8];
-                let bytes = t.as_bytes();
-                let take = bytes.len().min(8);
-                k[..take].copy_from_slice(&bytes[..take]);
-                u64::from_be_bytes(k)
-            }
-            Some(Value::SmallInt(v)) if exact => (i64::from(*v) as u64) ^ (1 << 63),
-            Some(Value::Int(v)) if exact => (i64::from(*v) as u64) ^ (1 << 63),
-            Some(Value::BigInt(v)) if exact => (*v as u64) ^ (1 << 63),
-            _ => return None,
-        };
-        out.push((key, i));
+    if !is_text {
+        let mut out: Vec<(u64, u32)> = Vec::with_capacity(tagged.len());
+        for (i, row) in (0..n).zip(tagged.iter()) {
+            let key = match row.1.values.get(col) {
+                Some(Value::SmallInt(v)) => (i64::from(*v) as u64) ^ (1 << 63),
+                Some(Value::Int(v)) => (i64::from(*v) as u64) ^ (1 << 63),
+                Some(Value::BigInt(v)) => (*v as u64) ^ (1 << 63),
+                _ => return None,
+            };
+            out.push((key, i));
+        }
+        return Some(PrefixKeys::Narrow(out, true));
     }
-    Some((out, exact))
+    // One pass, and it answers both questions: the bytes of every key,
+    // and whether the longest of them fits the wide one.
+    let mut wide: Vec<(u128, u32)> = Vec::with_capacity(tagged.len());
+    let mut longest = 0usize;
+    for (i, row) in (0..n).zip(tagged.iter()) {
+        let Some(Value::Text(t)) = row.1.values.get(col) else {
+            return None;
+        };
+        let bytes = t.as_bytes();
+        longest = longest.max(bytes.len());
+        let mut k = [0u8; 16];
+        let take = bytes.len().min(16);
+        k[..take].copy_from_slice(&bytes[..take]);
+        wide.push((u128::from_be_bytes(k), i));
+    }
+    if longest <= 16 {
+        return Some(PrefixKeys::Wide(wide, true));
+    }
+    // Longer than the wide key: the narrow one costs half the memory
+    // traffic and decides exactly as much, since neither is the whole
+    // value. Built from the wide keys rather than reading the rows again.
+    let narrow = wide
+        .into_iter()
+        .map(|(k, i)| ((k >> 64) as u64, i))
+        .collect();
+    Some(PrefixKeys::Narrow(narrow, false))
+}
+
+/// Sort a prefix-key permutation, whatever the key's width.
+///
+/// v7.40.1 -- extracted so the two widths share one body. `low_card`
+/// keeps the run-at-a-time shortcut and `exact` keeps the "a tie means
+/// the values are equal" one; both are the caller's to decide.
+struct PrefixSort {
+    /// The first ORDER BY term is descending.
+    first_desc: bool,
+    /// The key does not discriminate, so sort it and settle each run of
+    /// equal keys in one pass instead of n log n comparisons.
+    low_card: bool,
+    /// The key IS the value, so a tie means the values are equal.
+    exact: bool,
+    /// One ORDER BY term, so nothing else can speak after a tie.
+    single_term: bool,
+}
+
+fn sort_prefix_permutation<K: Copy + Ord>(
+    mut order: Vec<(K, u32)>,
+    how: &PrefixSort,
+    row_cmp: &dyn Fn(u32, u32) -> core::cmp::Ordering,
+    same_value: &dyn Fn(u32, u32) -> bool,
+) -> Vec<u32> {
+    let PrefixSort {
+        first_desc,
+        low_card,
+        exact,
+        single_term,
+    } = *how;
+    if low_card {
+        // Integer sort first, then one pass per run.
+        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
+            let c = pa.cmp(&pb);
+            let c = if first_desc { c.reverse() } else { c };
+            c.then_with(|| ia.cmp(&ib))
+        });
+        let mut lo = 0;
+        while lo < order.len() {
+            let mut hi = lo + 1;
+            while hi < order.len() && order[hi].0 == order[lo].0 {
+                hi += 1;
+            }
+            if hi - lo > 1 {
+                let head = order[lo].1;
+                let uniform = order[lo + 1..hi].iter().all(|&(_, i)| same_value(head, i));
+                if !uniform {
+                    order[lo..hi]
+                        .sort_by(|&(_, ia), &(_, ib)| row_cmp(ia, ib).then_with(|| ia.cmp(&ib)));
+                }
+                // A uniform run is already in index order, which IS the
+                // stable answer.
+            }
+            lo = hi;
+        }
+    } else {
+        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
+            let c = pa.cmp(&pb);
+            let c = if first_desc { c.reverse() } else { c };
+            if c != core::cmp::Ordering::Equal {
+                return c;
+            }
+            // An EXACT key that ties means the values are equal, so only
+            // the remaining terms can speak. A prefix that ties has
+            // decided nothing yet and the first term must be asked again,
+            // which `row_cmp` does by walking every term from the start.
+            if exact && single_term {
+                return ia.cmp(&ib);
+            }
+            row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
+        });
+    }
+    order.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Whether a PREFIX key is worth sorting a permutation on.
@@ -15472,10 +15579,10 @@ fn sort_keys_of(
 /// So the permutation is taken when the key DECIDES, and a sample says
 /// whether it does. An exact key always decides; a prefix has to earn
 /// it.
-fn key_discriminates(keys: &[(u64, u32)]) -> bool {
+fn key_discriminates<K: Copy + Ord>(keys: &[(K, u32)]) -> bool {
     const SAMPLE: usize = 1024;
     let step = (keys.len() / SAMPLE).max(1);
-    let mut seen: Vec<u64> = keys
+    let mut seen: Vec<K> = keys
         .iter()
         .step_by(step)
         .take(SAMPLE)

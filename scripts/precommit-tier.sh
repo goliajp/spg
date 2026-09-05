@@ -41,8 +41,13 @@ path="${SPG_TESTBED_PATH:-workspace/goliajp/spg-ci}"
 
 run_local() { exec scripts/suite.sh precommit; }
 
+# `ssh -n` everywhere. A hook must not consume the caller's stdin, and
+# ssh reads it by default: `git commit -F -` takes its message from
+# stdin, so the first version of this file ate the message and the
+# commit vanished with no output at all. Nothing here needs stdin.
+
 [[ -z "${SPG_NO_OFFLOAD:-}" ]] || run_local
-ssh -o BatchMode=yes -o ConnectTimeout=4 "$host" true 2>/dev/null || {
+ssh -n -o BatchMode=yes -o ConnectTimeout=4 "$host" true 2>/dev/null || {
     echo "precommit: ${host} not reachable — running here"
     run_local
 }
@@ -76,7 +81,7 @@ rsync -a --delete --exclude target --exclude .git ./ "${host}:${path}/" || {
 # `;` and `2>&1 >/dev/null` and left one file behind —
 # `xtests/appsql/differ/Cargo.lock` — which is the same
 # swallowed-partial-failure shape as everything else this release fixed.
-remote_tree=$(ssh "$host" "cd ${path} && git read-tree --empty && git add -A && git write-tree") || {
+remote_tree=$(ssh -n "$host" "cd ${path} && git read-tree --empty && git add -A && git write-tree") || {
     echo "precommit: could not read ${host}'s tree — running here"
     run_local
 }
@@ -88,4 +93,4 @@ if [[ "$local_tree" != "$remote_tree" ]]; then
 fi
 
 echo "precommit: on ${host}, tree ${local_tree} — the same bytes this commit carries"
-ssh "$host" "cd ${path} && export PATH=\$HOME/.orbstack/bin:\$PATH && bash scripts/suite.sh precommit"
+ssh -n "$host" "cd ${path} && export PATH=\$HOME/.orbstack/bin:\$PATH && bash scripts/suite.sh precommit"
