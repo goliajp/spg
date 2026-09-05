@@ -614,7 +614,7 @@ done
 # clearly there, and these four cells are extra work on top of the
 # sixty-four above.
 echo
-echo "sort panel — the sort alone, ratio against PG18, ceiling ${SORT_CEILING}x:"
+echo "sort panel — the sort alone, wall-clock ratio against PG18, ceiling ${SORT_CEILING}x (server-reported ratio beside it, reported not judged):"
 SORT_WORST=0
 SORT_OVER=0
 BIG="sweep_$(set -- ${SIZES}; for x in "$@"; do :; done; echo "$x")"
@@ -636,12 +636,72 @@ for entry in "${SORT_SHAPES[@]}"; do
   done
   smin="$(lo "${s[@]}")"; gmin="$(lo "${g[@]}")"
   smax="$(hi "${s[@]}")"; gmax="$(hi "${g[@]}")"
-  ratio="$(awk -v a="${smin}" -v b="${gmin}" 'BEGIN{ if (b <= 0) print "0"; else printf "%.2f", a/b }')"
+  wall="$(awk -v a="${smin}" -v b="${gmin}" 'BEGIN{ if (b <= 0) print "0"; else printf "%.2f", a/b }')"
+  # v7.40.2 — the CEILING is judged on server-reported time, and the
+  # wall clock is reported beside it.
+  #
+  # This panel's ratio was the client's wall clock, and the client does
+  # not reach the two engines the same way. On this testbed it is
+  # `docker exec` into the PostgreSQL container, so PostgreSQL answers
+  # over that container's loopback while SPG is reached back out through
+  # `host.docker.internal`. Moving the client to the host reverses the
+  # penalty rather than removing it: SPG becomes host loopback and
+  # PostgreSQL gains a published-port hop. Measured on one tree, one
+  # size, the same binaries:
+  #
+  #   sort only, text (26 values)      wrapper 1.30x   host psql 0.67x
+  #   sort only, long text distinct    wrapper 1.32x   host psql 0.68x
+  #
+  # r1022's rule that both legs name one host is satisfied by both and
+  # says nothing about path LENGTH.
+  #
+  # Server-reported time has no client and no socket in it, so it is the
+  # same question asked without the route. Asked that way, at 400,000
+  # rows:
+  #
+  #   shape                          wall    server
+  #   int                            0.80x   0.28x
+  #   text (26 values)               1.30x   1.13x
+  #   short text distinct            0.76x   0.66x
+  #   long text distinct             1.32x   0.80x   <- a WIN, called a loss
+  #   long text, key not projected   1.31x   1.16x
+  #   long text top-N                1.30x   0.45x   <- a WIN, called a loss
+  #
+  # Two of the six cells this ceiling exists to watch were reporting the
+  # transport. So both numbers are printed: a reader who sees only one
+  # of them cannot tell which kind of gap they are looking at.
+  #
+  # The ceiling still reads the WALL CLOCK, and the first version of
+  # this change moved it to the server column and was wrong. Two
+  # measurements, made after the move, say why:
+  #
+  #   * On the shapes that RETURN their rows the two server numbers are
+  #     not comparable. `text key desc, rows returned` reads 3.00x by
+  #     server against 2.00x by wall, and `text key, rows returned`
+  #     2.21x against 1.23x. `EXPLAIN ANALYZE` discards the result rows,
+  #     and the two engines evidently do not discard the same amount of
+  #     work. Judging those cells by server time swaps a route bias for
+  #     a bias in the instrument, and it put `sort_worst` on the ceiling.
+  #   * The server number is not yet stable enough to gate on.
+  #     `long text distinct` read 0.80x standalone and 1.27x in this
+  #     panel half an hour apart. Some of that is the fixture -- the
+  #     standalone table carries a fourth column -- and the rest is not
+  #     accounted for.
+  #
+  # So the column is evidence and not yet a verdict. What it already
+  # buys is the ability to say which kind of gap a cell has, which is
+  # the question that sent a whole release's perf work at the wrong
+  # target.
+  ssrv="$(server_one "${SPG_URI}" "${sql}" "${SPG_WM}" 1)"
+  gsrv="$(server_one "${PG_URI}"  "${sql}" "${PG_WM}"  0)"
+  srvr="$(awk -v a="${ssrv}" -v b="${gsrv}" 'BEGIN{ if (b <= 0) print "0"; else printf "%.2f", a/b }')"
+  ratio="${wall}"
   over="$(awk -v r="${ratio}" -v c="${SORT_CEILING}" 'BEGIN{ print (r > c) ? 1 : 0 }')"
   (( over )) && SORT_OVER=$((SORT_OVER + 1))
   SORT_WORST="$(awk -v a="${ratio}" -v b="${SORT_WORST}" 'BEGIN{ print (a > b) ? a : b }')"
-  printf '  %-26s %8s-%-8s %8s-%-8s  %sx%s\n' "${name}" "${smin}" "${smax}" \
-    "${gmin}" "${gmax}" "${ratio}" \
+  printf '  %-26s %8s-%-8s %8s-%-8s  %sx  (server %7s/%-7s %sx)%s\n' \
+    "${name}" "${smin}" "${smax}" "${gmin}" "${gmax}" "${wall}" \
+    "${ssrv}" "${gsrv}" "${srvr}" \
     "$( (( over )) && echo '  <- OVER CEILING' )"
 done
 
