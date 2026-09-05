@@ -10,6 +10,32 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — every release since 7.22.0 has left a wrongly-named tag behind
+
+`git flow release finish` names the tag after the BRANCH, so
+`release/7.40.0` produces `7.40.0`, while this repository's convention
+— and `scripts/release.sh`'s own preflight, which refuses to publish
+without it — is `v7.40.0`. `gitflow.prefix.versiontag` is set to `v` in
+the repository config, but that is a git-flow-avh key and the installed
+tool is git-flow-next 2.0.0, whose schema has no version-tag prefix at
+all. The setting is read by nobody.
+
+Twenty-one bare tags have accumulated since 7.22.0, several of them
+pushed. Every release in between depended on someone noticing between
+`finish` and the publish, and the failure is silent because a bare tag
+is a perfectly valid tag.
+
+`scripts/release-finish.sh` passes `--tagname` and then checks — a flag
+that is accepted is not a flag that was honoured — renaming a bare tag
+if one appears anyway, and asserting at the end that `vX.Y.Z` exists,
+points at master, and has no bare twin. `release.sh`'s preflight now
+refuses to publish while a bare twin exists, which is the check that
+would have caught all twenty-one.
+
+The existing bare tags are left alone: several are published, and
+deleting a published tag is the owner's call, not the toolchain's.
+
+
 ## [7.40.0] — 2026-09-05
 
 ### Added — six array types PostgreSQL 18.6 accepts and SPG refused

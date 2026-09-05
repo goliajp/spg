@@ -93,6 +93,23 @@ tag_commit=$(git rev-parse "v${VERSION}^{commit}" 2>/dev/null) \
 manifest_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 [[ "$manifest_version" == "$VERSION" ]] \
     || { echo "preflight: Cargo.toml workspace version is ${manifest_version}, expected ${VERSION}" >&2; exit 1; }
+# v7.40.0 — and no BARE tag beside it.
+#
+# `git flow release finish` names the tag after the branch, so
+# `release/X.Y.Z` produces `X.Y.Z` and this repository's convention is
+# `vX.Y.Z`. Twenty-one bare tags have accumulated since 7.22.0, several
+# of them pushed, and every release has depended on someone noticing
+# between `finish` and here. The check above only proves the `v` tag
+# exists — it says nothing about a bare twin, which is a valid tag that
+# nothing will complain about again.
+#
+# `scripts/release-finish.sh` is the way to not create one.
+if git rev-parse -q --verify "refs/tags/${VERSION}" >/dev/null; then
+    echo "preflight: a bare tag '${VERSION}' exists beside v${VERSION} — \
+git-flow named it after the branch. Delete it (git tag -d ${VERSION}), and \
+use scripts/release-finish.sh next time." >&2
+    exit 1
+fi
 echo "preflight OK: master @ $(git rev-parse --short HEAD), tag v${VERSION}"
 
 # v7.37.8 followup (mailrs lock-hang 4th-recurrence ack P2 — prod-shape
