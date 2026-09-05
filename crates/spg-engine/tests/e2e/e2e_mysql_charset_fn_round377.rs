@@ -49,10 +49,7 @@ fn text(e: &mut Engine, sql: &str) -> String {
 fn text_reports_utf8mb4() {
     let mut e = mysql();
     assert_eq!(text(&mut e, "SELECT CHARSET('x')"), "utf8mb4");
-    assert_eq!(
-        text(&mut e, "SELECT COLLATION('x')"),
-        "utf8mb4_0900_ai_ci"
-    );
+    assert_eq!(text(&mut e, "SELECT COLLATION('x')"), "utf8mb4_0900_ai_ci");
     assert_eq!(text(&mut e, "SELECT CHARSET(CONCAT('a', 'b'))"), "utf8mb4");
 }
 

@@ -189,9 +189,7 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
         // "operator does not exist: - numeric", naming the type it had
         // just refused to negate. Found by the MySQL corpus, but the
         // defect is on both faces.
-        (UnOp::Neg, Value::NumericBig(b)) => {
-            Ok(Value::NumericBig(alloc::boxed::Box::new(b.neg())))
-        }
+        (UnOp::Neg, Value::NumericBig(b)) => Ok(Value::NumericBig(alloc::boxed::Box::new(b.neg()))),
         // NOTE: PG has no `- money` operator (unary minus on money is an
         // error there), so money is intentionally NOT handled here.
         (

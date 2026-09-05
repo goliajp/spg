@@ -146,9 +146,13 @@ fn a_real_beside_an_integer_stays_a_real_array() {
 fn array_agg_over_the_new_element_types() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE s (x time)").unwrap();
-    e.execute("INSERT INTO s VALUES ('12:00'),('13:00')").unwrap();
+    e.execute("INSERT INTO s VALUES ('12:00'),('13:00')")
+        .unwrap();
     assert_eq!(
-        rows(&mut e, "SELECT array_agg(x), pg_typeof(array_agg(x)) FROM s"),
+        rows(
+            &mut e,
+            "SELECT array_agg(x), pg_typeof(array_agg(x)) FROM s"
+        ),
         ["{12:00:00,13:00:00}|time without time zone[]"]
     );
 }

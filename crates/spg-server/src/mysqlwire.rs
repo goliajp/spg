@@ -1054,11 +1054,7 @@ fn mysql_duplicate_entry_text(pg: &str) -> String {
     let values = pg
         .split_once(")=(")
         .and_then(|(_, rest)| rest.split_once(')'))
-        .map(|(vals, _)| {
-            vals.split(", ")
-                .collect::<Vec<_>>()
-                .join("-")
-        })
+        .map(|(vals, _)| vals.split(", ").collect::<Vec<_>>().join("-"))
         .unwrap_or_default();
     format!("Duplicate entry '{values}' for key '{table}.{key}'")
 }

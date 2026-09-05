@@ -2039,9 +2039,7 @@ fn lex_number(s: &str, mysql: bool) -> Result<(Token, usize), LexErrorKind> {
                 }
                 let mut hex = alloc::string::String::with_capacity(bits.len() / 4);
                 for nibble in bits.as_bytes().chunks(4) {
-                    let v = nibble
-                        .iter()
-                        .fold(0u8, |acc, c| acc * 2 + (*c - b'0'));
+                    let v = nibble.iter().fold(0u8, |acc, c| acc * 2 + (*c - b'0'));
                     hex.push(char::from_digit(u32::from(v), 16).unwrap_or('0'));
                 }
                 if hex.len() % 2 == 1 {

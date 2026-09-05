@@ -6477,7 +6477,11 @@ fn the_five_new_arrays_survive_a_catalog_round_trip() {
     let row = alloc::vec![
         Value::RealArray(alloc::vec![Some(1.5f32), None, Some(-0.25)]),
         Value::TimeArray(alloc::vec![Some(45_296_000_000), None]),
-        Value::TimeTzArray(alloc::vec![Some((45_296_000_000, 7200)), None, Some((0, -19_800))]),
+        Value::TimeTzArray(alloc::vec![
+            Some((45_296_000_000, 7200)),
+            None,
+            Some((0, -19_800))
+        ]),
         Value::InetArray(alloc::vec![
             Some((2u8, 32u8, [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
             None,

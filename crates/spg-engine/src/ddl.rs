@@ -3698,11 +3698,7 @@ impl Engine {
         // already reads.
         if let Some(n) = stmt.auto_increment
             && let Some(t) = self.active_catalog_mut().get_mut(&table_name)
-            && let Some(col) = t
-                .schema_mut()
-                .columns
-                .iter_mut()
-                .find(|c| c.auto_increment)
+            && let Some(col) = t.schema_mut().columns.iter_mut().find(|c| c.auto_increment)
         {
             col.auto_restart = Some(n);
         }
@@ -4774,9 +4770,9 @@ impl Engine {
                 }
                 // v7.40.0 — the declared MySQL prefix, per key column.
                 let declared_prefix = match tc {
-                    spg_sql::ast::TableConstraint::Index {
-                        prefix_lengths, ..
-                    } => prefix_lengths.get(k).copied().flatten(),
+                    spg_sql::ast::TableConstraint::Index { prefix_lengths, .. } => {
+                        prefix_lengths.get(k).copied().flatten()
+                    }
                     _ => None,
                 };
                 if declared_prefix.is_some()
