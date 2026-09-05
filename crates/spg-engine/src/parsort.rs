@@ -418,6 +418,66 @@ mod tests {
         assert_eq!(parts_for(70_000, 64), 4, "no chunk under MIN_CHUNK");
     }
 
+    /// Does the split beat the whole, in isolation?
+    ///
+    /// It prints; it does not judge. It exists because the end-to-end
+    /// panel could not answer it and I read the panel wrong for three
+    /// rounds. The sort is 28-57% of the cells it appears in by one
+    /// ablation, adding threads moved those cells 3-15%, and I concluded
+    /// this module was giving back what it saved. It is not. Measured
+    /// here on 400,000 `(i128, u32)` keys, best of five, nothing else
+    /// running:
+    ///
+    /// ```text
+    ///   workers=0  parts=1   10.16 ms
+    ///   workers=1  parts=2    5.32 ms   1.91x
+    ///   workers=2  parts=3    4.15 ms   2.45x
+    ///   workers=3  parts=4    3.26 ms   3.12x
+    ///   workers=7  parts=8    2.32 ms   4.39x
+    /// ```
+    ///
+    /// The whole key sort is 10 ms of a 78 ms cell. Amdahl on 13% caps
+    /// the end-to-end gain at ~11%, which is what the panel showed. The
+    /// flat curve was correct behaviour and the redesign it seemed to
+    /// call for was retired before it was written.
+    ///
+    /// `cargo test --profile release-counters -p spg-engine --lib \
+    ///  does_the_split -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints a measurement; run with --ignored --nocapture"]
+    fn does_the_split_beat_the_whole() {
+        use alloc::vec::Vec;
+        extern crate std;
+        let n = 400_000u32;
+        let v: Vec<(i128, u32)> = (0..n)
+            .map(|i| ((i128::from(i) * 7919) % 400_000, i))
+            .collect();
+        let cmp = |a: &(i128, u32), b: &(i128, u32)| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1));
+        for workers in [0usize, 1, 2, 3, 7] {
+            let mut best = core::time::Duration::MAX;
+            for _ in 0..5 {
+                let w = v.clone();
+                let t = std::time::Instant::now();
+                let out = sort_total(
+                    w,
+                    Workers {
+                        per_sort: workers,
+                        per_process: 64,
+                    },
+                    &cmp,
+                );
+                let took = t.elapsed();
+                assert_eq!(out.len(), v.len());
+                best = best.min(took);
+            }
+            std::println!(
+                "workers={workers} parts={} best={:?}",
+                parts_for(v.len(), workers),
+                best
+            );
+        }
+    }
+
     /// The process-wide cap, which is the difference between a server
     /// that fans out and a server that thrashes.
     #[test]
