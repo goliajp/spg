@@ -8378,6 +8378,208 @@ impl Engine {
     ///
     /// The gate is here once. Two copies of it is how the plan and the
     /// executor come to disagree again.
+    /// v7.39.13 — the shape refusals both ordered-walk gates make.
+    ///
+    /// One list, because two of them would be two answers to "can this
+    /// statement walk an index", and a walk that runs where EXPLAIN says
+    /// it does not is the defect r1044 exists to prevent.
+    /// v7.39.13 — `WHERE lead = <literal> ORDER BY next [DESC] LIMIT n`
+    /// behind an index on `(lead, next, …)`: one seek to the key prefix,
+    /// then n steps inside it.
+    ///
+    /// Sentori's busiest read, and the one shape they have reported
+    /// unchanged for three versions: `WHERE project_id = ? ORDER BY
+    /// received_at DESC LIMIT 20`. PostgreSQL 18 answers it with
+    /// `Limit -> Index Scan`; SPG planned `Sort -> Seq Scan` and sorted
+    /// the table to return twenty rows, roughly 250x behind.
+    ///
+    /// The ordered walk that existed could only start at an index's
+    /// LEADING column, so an index on `(project_id, received_at)` could
+    /// serve `ORDER BY project_id` and nothing else. What was missing is
+    /// below it: a tree walk bounded by a key prefix, which
+    /// `Index::iter_prefix_desc` now provides.
+    ///
+    /// The equality conjunct only NARROWS the walk — the statement's own
+    /// `WHERE` still runs per row — so picking the wrong conjunct can
+    /// cost time and cannot change an answer.
+    pub(crate) fn index_prefix_walk_target(
+        &self,
+        stmt: &SelectStatement,
+        from: &FromClause,
+    ) -> Option<(String, usize, alloc::vec::Vec<spg_storage::IndexKey>)> {
+        if self.walk_shape_refused(stmt, from) {
+            return None;
+        }
+        // One ORDER BY term for now: a second one would have to be the
+        // next key column again, and the tree walks one direction.
+        if stmt.order_by.len() != 1 || stmt.distinct {
+            return None;
+        }
+        let table = self.active_catalog().get(&from.primary.name)?;
+        let alias = from
+            .primary
+            .alias
+            .as_deref()
+            .unwrap_or(from.primary.name.as_str());
+        let cols = &table.schema().columns;
+        let order = &stmt.order_by[0];
+        let Expr::Column(oc) = &order.expr else {
+            return None;
+        };
+        if let Some(q) = &oc.qualifier
+            && !q.eq_ignore_ascii_case(alias)
+        {
+            return None;
+        }
+        let order_pos = cols
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&oc.name))?;
+        // The walk comes out in the tree's order, so it may only take an
+        // ORDER BY whose order that IS — the same question the leading-
+        // column gate asks, for the same reason.
+        let order_col = cols.get(order_pos)?;
+        if crate::index_access::collated_column(order_col, table.db_collation()).is_none()
+            && !crate::collate::column_key_is_bytewise(order_col, self.speaks_mysql)
+        {
+            return None;
+        }
+        // A NULL key is not in the tree, and this walk has no separate
+        // pass for those rows the way the leading-column one does.
+        if order_col.nullable {
+            return None;
+        }
+        let where_ = stmt.where_.as_ref()?;
+        for index in table.indices() {
+            if !matches!(index.kind, spg_storage::IndexKind::BTreeMulti(_))
+                || index.expression.is_some()
+                || index.partial_predicate.is_some()
+            {
+                continue;
+            }
+            // The ORDER BY column must be the key component that follows
+            // the equality-bound prefix.
+            if index.extra_column_positions.first() != Some(&order_pos) {
+                continue;
+            }
+            let lead_pos = index.column_position;
+            let lead_col = cols.get(lead_pos)?;
+            // The prefix is compared with the tree's own ordering, so the
+            // leading column has to be one the tree orders bytewise too.
+            if crate::index_access::collated_column(lead_col, table.db_collation()).is_none()
+                && !crate::collate::column_key_is_bytewise(lead_col, self.speaks_mysql)
+            {
+                continue;
+            }
+            let Some(key) = self.eq_literal_key_for(where_, lead_pos, cols, alias) else {
+                continue;
+            };
+            return Some((index.name.clone(), order_pos, alloc::vec![key]));
+        }
+        None
+    }
+
+    /// The index key a top-level `AND` conjunct binds `col_pos` to, when
+    /// one of them is `col = <literal>` (either way round).
+    ///
+    /// Only literals: a column reference or a function would have to be
+    /// evaluated per row, and this runs once for the whole statement.
+    fn eq_literal_key_for(
+        &self,
+        where_: &Expr,
+        col_pos: usize,
+        cols: &[ColumnSchema],
+        alias: &str,
+    ) -> Option<spg_storage::IndexKey> {
+        let col = cols.get(col_pos)?;
+        let mut found: Option<spg_storage::IndexKey> = None;
+        let mut stack: alloc::vec::Vec<&Expr> = alloc::vec![where_];
+        while let Some(e) = stack.pop() {
+            match e {
+                Expr::Binary {
+                    lhs,
+                    op: spg_sql::ast::BinOp::And,
+                    rhs,
+                } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Expr::Binary {
+                    lhs,
+                    op: spg_sql::ast::BinOp::Eq,
+                    rhs,
+                } => {
+                    let names_col = |x: &Expr| match x {
+                        Expr::Column(c) => {
+                            c.name.eq_ignore_ascii_case(&col.name)
+                                && c.qualifier
+                                    .as_ref()
+                                    .is_none_or(|q| q.eq_ignore_ascii_case(alias))
+                        }
+                        _ => false,
+                    };
+                    let lit = if names_col(lhs) {
+                        Some(&**rhs)
+                    } else if names_col(rhs) {
+                        Some(&**lhs)
+                    } else {
+                        None
+                    };
+                    if let Some(lit) = lit
+                        && let Ok(v) = crate::conversions::literal_expr_to_value(lit.clone())
+                        && !v.is_null()
+                        && let Some(k) = spg_storage::IndexKey::from_value_for_column(&v, col.ty)
+                    {
+                        found = Some(k);
+                    }
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    fn walk_shape_refused(&self, stmt: &SelectStatement, from: &FromClause) -> bool {
+        // A non-literal count is refused: `LIMIT $1` is rewritten to a
+        // literal by `resolve_limit_exprs` before dispatch, so anything
+        // still carrying a placeholder here has not been through it.
+        let literal_count = |e: &Option<spg_sql::ast::LimitExpr>| {
+            matches!(e, None | Some(spg_sql::ast::LimitExpr::Literal(_)))
+        };
+        if stmt.order_by.is_empty()
+            || !stmt.distinct_on.is_empty()
+            || stmt.limit_with_ties
+            || !literal_count(&stmt.limit)
+            || !literal_count(&stmt.offset)
+            || stmt.having.is_some()
+            || stmt.group_by.is_some()
+            || !stmt.unions.is_empty()
+            || !from.joins.is_empty()
+            || from.primary.lateral_subquery.is_some()
+            || from.primary.unnest_expr.is_some()
+            || from.primary.as_of_segment.is_some()
+            || from.primary.generate_series_args.is_some()
+            || select_has_window(stmt)
+            || aggregate::uses_aggregate(stmt)
+        {
+            return true;
+        }
+        if stmt
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
+        {
+            return true;
+        }
+        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+            return true;
+        };
+        if table.has_cold_rows_fast() {
+            return true;
+        }
+        !from.primary.only
+            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
+    }
+
     pub(crate) fn index_order_walk_target(
         &self,
         stmt: &SelectStatement,
@@ -8404,40 +8606,10 @@ impl Engine {
         let literal_count = |e: &Option<spg_sql::ast::LimitExpr>| {
             matches!(e, None | Some(spg_sql::ast::LimitExpr::Literal(_)))
         };
-        if stmt.order_by.is_empty()
-            || !stmt.distinct_on.is_empty()
-            || stmt.limit_with_ties
-            || !literal_count(&stmt.limit)
-            || !literal_count(&stmt.offset)
-            || stmt.having.is_some()
-            || stmt.group_by.is_some()
-            || !stmt.unions.is_empty()
-            || !from.joins.is_empty()
-            || from.primary.lateral_subquery.is_some()
-            || from.primary.unnest_expr.is_some()
-            || from.primary.as_of_segment.is_some()
-            || from.primary.generate_series_args.is_some()
-            || select_has_window(stmt)
-            || aggregate::uses_aggregate(stmt)
-        {
-            return None;
-        }
-        if stmt
-            .items
-            .iter()
-            .any(|i| matches!(i, SelectItem::Expr { expr, .. } if is_top_level_unnest(expr)))
-        {
+        if self.walk_shape_refused(stmt, from) {
             return None;
         }
         let table = self.active_catalog().get(&from.primary.name)?;
-        if table.has_cold_rows_fast() {
-            return None;
-        }
-        if !from.primary.only
-            && crate::partition::has_children(self.active_catalog(), &from.primary.name)
-        {
-            return None;
-        }
         let alias = from
             .primary
             .alias
@@ -8628,8 +8800,15 @@ impl Engine {
         crate::orderby::check_order_by_legality(stmt)?;
         crate::orderby::check_order_by_positions(stmt)?;
         crate::window::reject_window_in_row_clauses(stmt)?;
-        let Some((_, order_pos)) = self.index_order_walk_target(stmt, from) else {
-            return Ok(None);
+        // v7.39.13 — the prefix walk first: it serves a shape the
+        // leading-column walk cannot, and refuses everything that one
+        // takes.
+        let (order_pos, prefix) = match self.index_prefix_walk_target(stmt, from) {
+            Some((_, pos, keys)) => (pos, Some(keys)),
+            None => match self.index_order_walk_target(stmt, from) {
+                Some((_, pos)) => (pos, None),
+                None => return Ok(None),
+            },
         };
         let Some(table) = self.active_catalog().get(&from.primary.name) else {
             return Ok(None);
@@ -8643,16 +8822,27 @@ impl Engine {
         let order = &stmt.order_by[0];
         // v7.39.11 — the same lookup the gate made; see
         // `index_order_walk_target`.
-        let Some(index) = table
-            .index_on(order_pos)
-            .filter(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
-            .or_else(|| {
-                table.indices().iter().find(|i| {
-                    matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
-                        && i.column_position == order_pos
-                })
+        let Some(index) = (if prefix.is_some() {
+            // The prefix planner named an index whose FIRST extra key
+            // column is the order column; the lookup below looks for one
+            // whose LEADING column is, and would find the wrong tree.
+            table.indices().iter().find(|i| {
+                matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
+                    && i.extra_column_positions.first() == Some(&order_pos)
+                    && i.expression.is_none()
+                    && i.partial_predicate.is_none()
             })
-        else {
+        } else {
+            table
+                .index_on(order_pos)
+                .filter(|i| matches!(i.kind, spg_storage::IndexKind::BTree(_)))
+                .or_else(|| {
+                    table.indices().iter().find(|i| {
+                        matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
+                            && i.column_position == order_pos
+                    })
+                })
+        }) else {
             return Ok(None);
         };
 
@@ -8831,14 +9021,30 @@ impl Engine {
             )?;
         }
 
-        let walker: alloc::boxed::Box<
-            dyn Iterator<Item = (&spg_storage::IndexKey, &spg_storage::PostingList)>,
-        > = if order.desc {
-            alloc::boxed::Box::new(index.iter_desc())
-        } else {
-            alloc::boxed::Box::new(index.iter_asc())
-        };
-        'walk: for (_key, locators) in walker {
+        // v7.39.13 — a prefix walk when the statement binds the index's
+        // leading column, the whole tree otherwise. The key is not read
+        // by the loop, so the two shapes meet as posting lists.
+        let walker: alloc::boxed::Box<dyn Iterator<Item = &spg_storage::PostingList>> =
+            match prefix.as_ref().and_then(|p| {
+                if order.desc {
+                    index.iter_prefix_desc(p).map(
+                        |it| -> alloc::boxed::Box<dyn Iterator<Item = &spg_storage::PostingList>> {
+                            alloc::boxed::Box::new(it.map(|(_, l)| l))
+                        },
+                    )
+                } else {
+                    index.iter_prefix_asc(p).map(
+                        |it| -> alloc::boxed::Box<dyn Iterator<Item = &spg_storage::PostingList>> {
+                            alloc::boxed::Box::new(it.map(|(_, l)| l))
+                        },
+                    )
+                }
+            }) {
+                Some(it) => it,
+                None if order.desc => alloc::boxed::Box::new(index.iter_desc().map(|(_, l)| l)),
+                None => alloc::boxed::Box::new(index.iter_asc().map(|(_, l)| l)),
+            };
+        'walk: for locators in walker {
             if remaining == Some(0) {
                 break;
             }

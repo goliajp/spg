@@ -366,6 +366,62 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
         IterRev { stack }
     }
 
+    /// v7.39.13 — the DESCENDING mirror of [`range`], over a group named
+    /// by two predicates rather than by two keys.
+    ///
+    /// `above(k)` is true when `k` sorts past the group's top; `below(k)`
+    /// is true when it sorts before its bottom. The descent picks, at
+    /// every node, the rightmost position that is not `above`, so it
+    /// reaches the group's last key in `O(log₈ N)` and then walks left,
+    /// stopping at the first `below`. `O(log N + k)` for `k` hits — the
+    /// same shape `range` has, in the other direction.
+    ///
+    /// Predicates, not `Bound<&K>`, because the group this exists for is
+    /// a key PREFIX: every tuple beginning with `(project_id)`. A tuple
+    /// `[p]` sorts BELOW every longer tuple that starts with `p`, so
+    /// `Excluded([p])` names the wrong edge and there is no `[p, +inf]`
+    /// to write down. `WHERE project_id = ? ORDER BY received_at DESC
+    /// LIMIT 20` is that group read from its top.
+    pub fn range_rev_by<'a, A, B>(&'a self, above: A, below: B) -> RangeIterRev<'a, K, V, B>
+    where
+        A: Fn(&K) -> bool,
+        B: Fn(&K) -> bool,
+    {
+        let mut stack: Vec<(&'a Arc<BNode<K, V>>, usize)> = Vec::with_capacity(8);
+        let mut node = &self.root;
+        loop {
+            match &**node {
+                BNode::Leaf { entries } => {
+                    // Emit right-to-left from the last entry that is not
+                    // above the group. `IterRev`'s leaf encoding emits
+                    // `entries[E - pos]`, so starting at index `j - 1`
+                    // means `pos = E - j + 1`.
+                    let j = upper_index_by(entries, &above);
+                    stack.push((node, entries.len() - j + 1));
+                    break;
+                }
+                BNode::Internal { entries, children } => {
+                    // Descend into `children[j]`, then RESUME by emitting
+                    // `entries[j-1]` and walking left. The pushed position
+                    // is the resume step, not the current one — `range`
+                    // does the same for the forward walk, and getting it
+                    // wrong here re-descended the subtree it had just
+                    // finished, so the walk wandered between groups
+                    // instead of ending. `IterRev` emits `entries[E -
+                    // pos/2]` at even `pos`, so `pos = 2*(E - j) + 2`.
+                    let j = upper_index_by(entries, &above);
+                    stack.push((node, 2 * (entries.len() - j) + 2));
+                    node = &children[j];
+                }
+            }
+        }
+        RangeIterRev {
+            inner: IterRev { stack },
+            below,
+            done: false,
+        }
+    }
+
     /// v7.38 (perf, index range scan) — in-order iterator over the entries
     /// whose keys fall in `(lo, hi)` (each end honoured per `core::ops::Bound`).
     /// Descends to `lo` in `O(log₈ N)` (skipping the subtrees entirely below
@@ -413,6 +469,19 @@ impl<K: Ord, V> PersistentBTreeMap<K, V> {
 
 /// First entry index whose key is ≥ (Included) / > (Excluded) `lo`; 0 for
 /// Unbounded. Linear — a node holds ≤ `MAX_ENTRIES` = 7 entries.
+/// v7.39.13 — how many of `entries` are at or below a group's top,
+/// where `above` answers "this key sorts past the group".
+///
+/// The mirror of [`lower_index`] for the descending descent. Kept as a
+/// predicate rather than a `Bound<&K>` because the group this serves is
+/// a KEY PREFIX — every tuple beginning with `(project_id)` — and there
+/// is no single key that names its upper edge: a tuple `[p]` sorts
+/// BELOW every longer tuple starting with `p`, so `Excluded([p])` would
+/// exclude the whole group and there is no `[p, +infinity]` to write.
+fn upper_index_by<K, V>(entries: &[(K, V)], above: &impl Fn(&K) -> bool) -> usize {
+    entries.partition_point(|e| !above(&e.0))
+}
+
 fn lower_index<K: Ord, V>(entries: &[(K, V)], lo: Bound<&K>) -> usize {
     match lo {
         Bound::Unbounded => 0,
@@ -1126,6 +1195,30 @@ pub struct IterRev<'a, K, V> {
     stack: Vec<(&'a Arc<BNode<K, V>>, usize)>,
 }
 
+/// v7.39.13 — [`PersistentBTreeMap::range_rev_by`]'s iterator: an
+/// `IterRev` that stops at the group's lower edge.
+#[derive(Debug)]
+pub struct RangeIterRev<'a, K, V, B> {
+    inner: IterRev<'a, K, V>,
+    below: B,
+    done: bool,
+}
+
+impl<'a, K, V, B: Fn(&K) -> bool> Iterator for RangeIterRev<'a, K, V, B> {
+    type Item = (&'a K, &'a V);
+    fn next(&mut self) -> Option<(&'a K, &'a V)> {
+        if self.done {
+            return None;
+        }
+        let (k, v) = self.inner.next()?;
+        if (self.below)(k) {
+            self.done = true;
+            return None;
+        }
+        Some((k, v))
+    }
+}
+
 impl<'a, K, V> Iterator for IterRev<'a, K, V> {
     type Item = (&'a K, &'a V);
     fn next(&mut self) -> Option<(&'a K, &'a V)> {
@@ -1773,5 +1866,76 @@ mod tests {
         assert_eq!(a, b);
         let (a, _) = a.insert(9, 90);
         assert_ne!(a, b);
+    }
+
+    /// v7.39.13 — the descending bounded walk reaches the group's top in
+    /// one descent and comes out complete and in order.
+    ///
+    /// The shape it exists for: keys are `(group, seq)` pairs and the
+    /// query wants the LAST n of one group. A forward `range` cannot do
+    /// it — `RangeIter` is one-directional — and `iter_rev` starts at the
+    /// tree's own end, so it would walk every later group first.
+    ///
+    /// Sized past the node fan-out on purpose: with 8 groups x 40 keys
+    /// the tree is several levels deep, so a descent that picked the
+    /// wrong child or the wrong resume position shows up as a short or
+    /// out-of-order answer rather than passing on a single leaf.
+    #[test]
+    fn range_rev_by_walks_one_group_from_its_top() {
+        let mut m: PersistentBTreeMap<(u32, u32), u32> = PersistentBTreeMap::new();
+        for g in 0..8u32 {
+            for i in 0..40u32 {
+                m = m.insert((g, i), g * 1000 + i).0;
+            }
+        }
+        for g in 0..8u32 {
+            let got: Vec<(u32, u32)> = m
+                .range_rev_by(|k: &(u32, u32)| k.0 > g, |k: &(u32, u32)| k.0 < g)
+                .map(|(k, _)| *k)
+                .collect();
+            let want: Vec<(u32, u32)> = (0..40u32).rev().map(|i| (g, i)).collect();
+            assert_eq!(got, want, "group {g}");
+        }
+    }
+
+    /// And it stops early, which is the whole point of walking rather
+    /// than collecting: `LIMIT 20` must not visit the other 20.
+    #[test]
+    fn range_rev_by_is_lazy() {
+        let mut m: PersistentBTreeMap<(u32, u32), u32> = PersistentBTreeMap::new();
+        for g in 0..4u32 {
+            for i in 0..100u32 {
+                m = m.insert((g, i), i).0;
+            }
+        }
+        let got: Vec<(u32, u32)> = m
+            .range_rev_by(|k: &(u32, u32)| k.0 > 2, |k: &(u32, u32)| k.0 < 2)
+            .take(3)
+            .map(|(k, _)| *k)
+            .collect();
+        assert_eq!(got, alloc::vec![(2, 99), (2, 98), (2, 97)]);
+    }
+
+    /// An empty group answers nothing rather than sliding into its
+    /// neighbour — the failure a descent that lands one position off
+    /// would produce.
+    #[test]
+    fn range_rev_by_over_an_absent_group_is_empty() {
+        let mut m: PersistentBTreeMap<(u32, u32), u32> = PersistentBTreeMap::new();
+        for g in [0u32, 2, 4] {
+            for i in 0..10u32 {
+                m = m.insert((g, i), i).0;
+            }
+        }
+        for missing in [1u32, 3, 5] {
+            let got: Vec<(u32, u32)> = m
+                .range_rev_by(
+                    |k: &(u32, u32)| k.0 > missing,
+                    |k: &(u32, u32)| k.0 < missing,
+                )
+                .map(|(k, _)| *k)
+                .collect();
+            assert!(got.is_empty(), "group {missing} answered {got:?}");
+        }
     }
 }

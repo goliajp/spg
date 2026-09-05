@@ -3665,6 +3665,21 @@ pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
             | DataType::Uuid
             | DataType::Date
             | DataType::Timestamp
+            // v7.39.13 — `timestamptz` keys exactly as `timestamp` does:
+            // both hold the same i64 of UTC microseconds, and the zone
+            // lives in the column's type rather than in the value. Its
+            // absence here meant `CREATE INDEX … (project_id,
+            // received_at)` never became a composite tree at all — the
+            // index stayed a single-column B-tree on the leading column
+            // with the extra positions recorded and unused.
+            //
+            // Two reported defects were the same hole. The ordered walk
+            // could not serve `WHERE project_id = ? ORDER BY received_at
+            // DESC LIMIT 20` because there was no composite tree to walk,
+            // and `pg_index` answered `indnatts = 2` for an index that
+            // held one column — the catalog claiming what the storage
+            // does not do, which sentori reported as its own item.
+            | DataType::Timestamptz
     )
 }
 
@@ -4077,6 +4092,68 @@ impl Index {
     /// leaving the prefix. Same cap/keep contract as
     /// [`Index::lookup_range_capped_by`]: `None` = not selective
     /// enough (or not a multi index), fall back.
+    /// v7.39.13 — the keys under a composite index's PREFIX, in the
+    /// tree's order, lazily.
+    ///
+    /// `WHERE project_id = ? ORDER BY received_at DESC LIMIT 20` behind
+    /// an index on `(project_id, received_at)` is one seek and twenty
+    /// steps. SPG had no way to express it: `lookup_prefix_capped_by`
+    /// materialises the whole group and caps, and `iter_desc` starts at
+    /// the tree's own end, so the walk would cross every later project
+    /// first. Sentori measured that shape as `Seq Scan -> Sort` against
+    /// PostgreSQL's `Limit -> Index Scan`.
+    ///
+    /// The bound is a prefix, not a key: a tuple `[p]` sorts BELOW every
+    /// longer tuple starting with `p`, so no single key names the
+    /// group's top. `range_rev_by` takes the two predicates instead.
+    ///
+    /// `None` for anything that is not a composite B-tree, or a prefix
+    /// longer than the key.
+    pub fn iter_prefix_desc<'a>(
+        &'a self,
+        prefix: &'a [IndexKey],
+    ) -> Option<impl Iterator<Item = (&'a [IndexKey], &'a crate::posting::PostingList)> + 'a> {
+        let IndexKind::BTreeMulti(m) = &self.kind else {
+            return None;
+        };
+        if prefix.is_empty() || prefix.len() > 1 + self.extra_column_positions.len() {
+            return None;
+        }
+        let p = prefix.len();
+        Some(
+            m.range_rev_by(
+                move |k: &alloc::boxed::Box<[IndexKey]>| k[..core::cmp::min(k.len(), p)] > *prefix,
+                move |k: &alloc::boxed::Box<[IndexKey]>| k[..core::cmp::min(k.len(), p)] < *prefix,
+            )
+            .map(|(k, v)| (&k[..], v)),
+        )
+    }
+
+    /// The ascending mirror of [`Self::iter_prefix_desc`]. Forward
+    /// `range` can express this one with a key bound — every tuple in
+    /// the group sorts at or after the prefix tuple itself — so it
+    /// takes that road and stops on the same predicate.
+    pub fn iter_prefix_asc<'a>(
+        &'a self,
+        prefix: &'a [IndexKey],
+    ) -> Option<impl Iterator<Item = (&'a [IndexKey], &'a crate::posting::PostingList)> + 'a> {
+        let IndexKind::BTreeMulti(m) = &self.kind else {
+            return None;
+        };
+        if prefix.is_empty() || prefix.len() > 1 + self.extra_column_positions.len() {
+            return None;
+        }
+        let p = prefix.len();
+        let lo: alloc::boxed::Box<[IndexKey]> = prefix.to_vec().into_boxed_slice();
+        Some(
+            m.range(core::ops::Bound::Included(&lo), core::ops::Bound::Unbounded)
+                .take_while(move |(k, _)| k.len() >= p && k[..p] == *prefix)
+                .map(|(k, v)| (&k[..], v))
+                .collect::<Vec<_>>()
+                .into_iter(),
+        )
+    }
+
     pub fn lookup_prefix_capped_by(
         &self,
         prefix: &[IndexKey],
