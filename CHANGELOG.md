@@ -10,6 +10,36 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the counter pins paid for a fat link they never read
+
+```text
+  the same three pins, cold for each profile
+    release          (fat LTO, 1 CGU)    228 s   3/3 green
+    release-counters (thin LTO, 16 CGU)   92 s   3/3 green
+```
+
+`gates` runs three pins under `--features perf-counters`, and that
+feature must stay out of the workspace graph — round 718 measured what
+happens when it leaks: `target/release/spg-server` 7-13x slower. A
+separate feature set is a separate build, and under `release` that
+build is fat LTO with one codegen unit. Priced from the tier's own
+reports, `gates` is 404-440 s on runs where the engine changed and 68 s
+on runs where it did not.
+
+What those pins read is `UNIQ_PROBE_*`, explicit increments in the
+engine's own code. Whole-program inlining does not change how many
+times an explicit `+= 1` runs, so the fat link buys them nothing.
+
+Two things the gate caught while this landed, both correctly. The crate
+graph follows a `Cargo.toml` change and a new profile is one. And
+`no_step_rebuilds_the_world_to_test_one_package` exempts a line
+carrying `--features` — it tested one LINE at a time, so rewrapping the
+invocation put `-p spg-engine` on one line and `--features
+perf-counters` on the next, and the rule read the first half as an
+offender. The unit of that rule is the COMMAND: trailing backslashes
+are joined before the scan now, and the ablation is the wrap itself.
+
+
 ## [7.40.2] — 2026-09-05
 
 ### Fixed — a low-cardinality text sort paid for four random reads per comparison
