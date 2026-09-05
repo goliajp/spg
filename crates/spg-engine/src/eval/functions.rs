@@ -2788,11 +2788,20 @@ fn apply_function_dispatch(
                     let parsed = crate::json::parse(s).map_err(|e| EvalError::TypeMismatch {
                         detail: format!("jsonb_pretty(): JSON parse failed: {e}"),
                     })?;
-                    fn pretty(v: &crate::json::JsonValue, indent: usize) -> alloc::string::String {
+                    // v7.40.0 — the two spellings indent differently, and
+                    // the width is part of the output a test compares.
+                    // Measured: PostgreSQL 18.6's `jsonb_pretty` uses
+                    // four spaces, MySQL 9.7.2's `JSON_PRETTY` uses two.
+                    // SPG used four for both.
+                    let unit = if name == "json_pretty" { "  " } else { "    " };
+                    fn pretty(
+                        v: &crate::json::JsonValue,
+                        indent: usize,
+                        unit: &str,
+                    ) -> alloc::string::String {
                         use alloc::string::String;
-                        // v7.38 (read01) — PG jsonb_pretty indents with 4 spaces.
-                        let pad = "    ".repeat(indent);
-                        let pad_next = "    ".repeat(indent + 1);
+                        let pad = unit.repeat(indent);
+                        let pad_next = unit.repeat(indent + 1);
                         match v {
                             crate::json::JsonValue::Null => "null".into(),
                             crate::json::JsonValue::Bool(b) => {
@@ -2811,7 +2820,7 @@ fn apply_function_dispatch(
                                 let mut out = String::from("[\n");
                                 for (i, item) in items.iter().enumerate() {
                                     out.push_str(&pad_next);
-                                    out.push_str(&pretty(item, indent + 1));
+                                    out.push_str(&pretty(item, indent + 1, unit));
                                     if i + 1 < items.len() {
                                         out.push(',');
                                     }
@@ -2831,7 +2840,7 @@ fn apply_function_dispatch(
                                         k.replace('\\', "\\\\").replace('"', "\\\"");
                                     out.push_str(&pad_next);
                                     out.push_str(&alloc::format!("\"{key_escaped}\": "));
-                                    out.push_str(&pretty(v, indent + 1));
+                                    out.push_str(&pretty(v, indent + 1, unit));
                                     if i + 1 < members.len() {
                                         out.push(',');
                                     }
@@ -2843,7 +2852,7 @@ fn apply_function_dispatch(
                             }
                         }
                     }
-                    Ok(Value::text(pretty(&parsed, 0)))
+                    Ok(Value::text(pretty(&parsed, 0, unit)))
                 }
                 other => Err(EvalError::TypeMismatch {
                     detail: format!(
@@ -6814,7 +6823,14 @@ fn apply_function_dispatch(
             let out = if name == "charset" {
                 if is_text { "utf8mb4" } else { "binary" }
             } else if is_text {
-                "utf8mb4_uca1400_ai_ci"
+                // v7.40.0 — the SESSION's collation, which is MySQL
+                // 9.7.2's `utf8mb4_0900_ai_ci`. This was hard-coded to
+                // `utf8mb4_uca1400_ai_ci`, which is MARIADB's default:
+                // SPG reports itself as MySQL and answered a name MySQL
+                // does not have. Measured against 9.7.2, which answers
+                // its own default here and in `@@collation_connection`
+                // — one value, from one place.
+                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
             } else {
                 "binary"
             };
@@ -12099,6 +12115,37 @@ fn apply_function_dispatch(
                 }
             }
             Ok(Value::Null)
+        }
+        // v7.40.0 — MySQL's `ANY_VALUE(x)` outside an aggregating query.
+        //
+        // It is not an aggregate there (MySQL documents it as a function
+        // that suppresses the ONLY_FULL_GROUP_BY rejection), so a
+        // statement whose only aggregate call is this one runs row by
+        // row and reaches here. Measured on 9.7.2: `SELECT ANY_VALUE(x)
+        // FROM t` over two rows answers two rows. On PostgreSQL 18.6 it
+        // is a true aggregate and answers one, which is the path this
+        // arm is never reached on.
+        "any_value" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArity {
+                    name: alloc::string::String::from("any_value"),
+                    types: arg_type_list(args),
+                });
+            }
+            Ok(args[0].clone().into_owned())
+        }
+        // v7.40.0 — MySQL `ISNULL(expr)`: 1 when the argument is NULL,
+        // 0 otherwise. It is not `IS NULL` spelled as a call — it takes
+        // one argument and returns an integer, which is what a query
+        // written against MySQL expects to compare and to SUM.
+        "isnull" => {
+            if args.len() != 1 {
+                return Err(EvalError::WrongArity {
+                    name: alloc::string::String::from("isnull"),
+                    types: arg_type_list(args),
+                });
+            }
+            Ok(Value::Int(i32::from(matches!(args[0], Value::Null))))
         }
         // MySQL `if(cond, then, else)` — alias for CASE WHEN.
         // NULL condition → else branch (MySQL semantic).

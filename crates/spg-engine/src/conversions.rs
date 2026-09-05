@@ -2321,6 +2321,22 @@ pub(crate) fn parse_time_str(s: &str) -> Option<i64> {
     if s.eq_ignore_ascii_case("allballs") {
         return Some(0);
     }
+    // v7.40.0 — a TIMESTAMP literal gives its time of day. Measured,
+    // BOTH engines do this: `'2020-01-02 03:04:05'::time` is `03:04:05`
+    // on PostgreSQL 18.6 and `TIME('2020-01-02 03:04:05')` is the same
+    // on MySQL 9.7.2. SPG refused it as invalid input syntax.
+    //
+    // The date half is only dropped when what precedes the space really
+    // is a date: `10:30 x` stays a refusal.
+    if let Some((head, tail)) = s.split_once(' ') {
+        let date_shaped = head.split('-').count() == 3
+            && head
+                .split('-')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        if date_shaped {
+            return parse_time_str(tail);
+        }
+    }
     let (hms, frac) = match s.split_once('.') {
         Some((h, f)) => (h, Some(f)),
         None => (s, None),
@@ -2565,9 +2581,10 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "smallint_array" | "int2_array" => DataType::SmallIntArray,
         "int_array" | "integer_array" | "int4_array" => DataType::IntArray,
         "bigint_array" | "int8_array" => DataType::BigIntArray,
-        "float_array" | "double_array" | "real_array" | "float8_array" | "float4_array" => {
-            DataType::FloatArray
-        }
+        "float_array" | "double_array" | "float8_array" => DataType::FloatArray,
+        // v7.40.0 — `real[]` used to land on `double precision[]` here;
+        // PG 18.6 answers `real[]` for `'{1.5}'::_float4` (measured).
+        "real_array" | "float4_array" => DataType::RealArray,
         // Width-suffixed float spellings — SPG has one float
         // representation.
         "float4" | "real" => DataType::Real,
@@ -2617,6 +2634,10 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "bytea_array" => DataType::BytesArray,
         "interval_array" => DataType::IntervalArray,
         "money_array" => DataType::MoneyArray,
+        "time_array" => DataType::TimeArray,
+        "timetz_array" => DataType::TimeTzArray,
+        "inet_array" => DataType::InetArray,
+        "xml_array" => DataType::XmlArray,
         // v7.38 (read01) — primitive scalar spellings. These reach here only
         // via CastTarget::Named (e.g. the function-style typecast `int4('5')` /
         // `text(42)` / `date('2024-01-15')`); the `expr::type` parser path maps
@@ -2680,6 +2701,7 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::TextArray => DataType::TextArray,
         ColumnTypeName::IntArray => DataType::IntArray,
         ColumnTypeName::BigIntArray => DataType::BigIntArray,
+        ColumnTypeName::OidArray => DataType::OidArray,
         ColumnTypeName::TsVector => DataType::TsVector,
         ColumnTypeName::TsQuery => DataType::TsQuery,
         ColumnTypeName::Uuid => DataType::Uuid,
@@ -2715,6 +2737,11 @@ pub(crate) const fn column_type_to_data_type(t: ColumnTypeName) -> DataType {
         ColumnTypeName::BytesArray => DataType::BytesArray,
         ColumnTypeName::VarcharArray => DataType::VarcharArray,
         ColumnTypeName::CharArray => DataType::CharArray,
+        ColumnTypeName::RealArray => DataType::RealArray,
+        ColumnTypeName::TimeArray => DataType::TimeArray,
+        ColumnTypeName::TimeTzArray => DataType::TimeTzArray,
+        ColumnTypeName::InetArray => DataType::InetArray,
+        ColumnTypeName::XmlArray => DataType::XmlArray,
         ColumnTypeName::Multirange(k) => DataType::Multirange(match k {
             spg_sql::ast::RangeKindAst::Int4 => spg_storage::RangeKind::Int4,
             spg_sql::ast::RangeKindAst::Int8 => spg_storage::RangeKind::Int8,
@@ -3530,6 +3557,13 @@ fn coerce_text_array_to(
         // v7.39 (round 326, V43) — INTERVAL[] joined the covered set;
         // `'{1 day}'::interval[]` used to fail as a plain type mismatch.
         DataType::IntervalArray => DataType::Interval,
+        // v7.40.0 — five arrays whose elements already had a full
+        // scalar coerce path; only the array step was missing.
+        DataType::RealArray => DataType::Real,
+        DataType::TimeArray => DataType::Time,
+        DataType::TimeTzArray => DataType::TimeTz,
+        DataType::InetArray => DataType::Inet,
+        DataType::XmlArray => DataType::Xml,
         _ => return Ok(None),
     };
     let mut scal: alloc::vec::Vec<Option<Value<'static>>> =
@@ -3611,6 +3645,56 @@ fn coerce_text_array_to(
                             micros,
                             kind,
                         }),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::RealArray => Value::RealArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::Real(x) => Some(x),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::TimeArray => Value::TimeArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::Time(us) => Some(us),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::TimeTzArray => Value::TimeTzArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::TimeTz { us, offset_secs } => Some((us, offset_secs)),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::InetArray => Value::InetArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::Inet { family, bits, addr } => Some((family, bits, addr)),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        ),
+        DataType::XmlArray => Value::XmlArray(
+            scal.into_iter()
+                .map(|o| {
+                    o.and_then(|v| match v {
+                        Value::Xml(x) => Some(x.into_owned()),
                         _ => None,
                     })
                 })
@@ -5814,6 +5898,38 @@ pub(crate) fn coerce_value(
                 })
                 .collect(),
         )),
+        // v7.40.0 — the same widening ladder for `real[]`, which used to
+        // resolve to `float8[]` and so borrowed those arms. PG 18.6
+        // accepts `ARRAY[1,2]::float4[]` and `ARRAY[1.5]::real[]`.
+        (Value::RealArray(items), DataType::RealArray) => Some(Value::RealArray(items)),
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::FloatArray(items), DataType::RealArray) => Some(Value::RealArray(
+            items.into_iter().map(|o| o.map(|x| x as f32)).collect(),
+        )),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::IntArray(items), DataType::RealArray) => Some(Value::RealArray(
+            items.into_iter().map(|o| o.map(|n| n as f32)).collect(),
+        )),
+        #[allow(clippy::cast_precision_loss)]
+        (Value::BigIntArray(items), DataType::RealArray) => Some(Value::RealArray(
+            items.into_iter().map(|o| o.map(|n| n as f32)).collect(),
+        )),
+        (Value::NumericArray(items), DataType::RealArray) => Some(Value::RealArray(
+            items
+                .into_iter()
+                .map(|o| {
+                    o.map(|(scaled, scale)| {
+                        crate::eval::format_numeric(scaled, scale)
+                            .parse()
+                            .unwrap_or(f32::NAN)
+                    })
+                })
+                .collect(),
+        )),
+        #[allow(clippy::cast_possible_truncation)]
+        (Value::RealArray(items), DataType::FloatArray) => Some(Value::FloatArray(
+            items.into_iter().map(|o| o.map(f64::from)).collect(),
+        )),
         // v7.38 (read01) — the rest of the numeric-array coercion matrix PG
         // accepts on INSERT / cast. Widening int→bigint / int·bigint→numeric /
         // float→numeric never fails; narrowing bigint→int fails the whole
@@ -5980,6 +6096,21 @@ pub(crate) fn coerce_value(
         (Value::TextArray(items), DataType::UuidArray) if items.is_empty() => {
             Some(Value::UuidArray(alloc::vec::Vec::new()))
         }
+        (Value::TextArray(items), DataType::RealArray) if items.is_empty() => {
+            Some(Value::RealArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::TimeArray) if items.is_empty() => {
+            Some(Value::TimeArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::TimeTzArray) if items.is_empty() => {
+            Some(Value::TimeTzArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::InetArray) if items.is_empty() => {
+            Some(Value::InetArray(alloc::vec::Vec::new()))
+        }
+        (Value::TextArray(items), DataType::XmlArray) if items.is_empty() => {
+            Some(Value::XmlArray(alloc::vec::Vec::new()))
+        }
         (Value::TextArray(items), DataType::JsonArray) if items.is_empty() => {
             Some(Value::JsonArray(alloc::vec::Vec::new()))
         }
@@ -6003,6 +6134,11 @@ pub(crate) fn coerce_value(
             | DataType::TimestampArray
             | DataType::TimestamptzArray
             | DataType::IntervalArray
+            | DataType::RealArray
+            | DataType::TimeArray
+            | DataType::TimeTzArray
+            | DataType::InetArray
+            | DataType::XmlArray
             | DataType::UuidArray),
         ) => coerce_text_array_to(items, dt, col_name)?,
         // v7.39 (round 326, V43) — the same targets from a STRING LITERAL.
@@ -6012,7 +6148,14 @@ pub(crate) fn coerce_value(
         // literal form that simply did not exist for the temporal arrays.
         (
             Value::Text(s),
-            dt @ (DataType::TimestampArray | DataType::TimestamptzArray | DataType::IntervalArray),
+            dt @ (DataType::TimestampArray
+            | DataType::TimestamptzArray
+            | DataType::IntervalArray
+            | DataType::RealArray
+            | DataType::TimeArray
+            | DataType::TimeTzArray
+            | DataType::InetArray
+            | DataType::XmlArray),
         ) => {
             let items = decode_text_array_literal(&s).map_err(|_| {
                 EngineError::Eval(EvalError::TypeMismatch {
@@ -6509,6 +6652,45 @@ pub(crate) fn pg_type_name_for_error_opt(t: Option<DataType>) -> alloc::string::
     }
 }
 
+/// v7.40.0 — the element type of a one-dimensional array type, or
+/// `None` when `t` is not one. This table existed inline in
+/// `pg_type_name_for_error` and nowhere else, so `pg_attribute.attndims`
+/// kept its own shorter copy and answered 0 for `varchar[]`, `char[]`,
+/// `money[]`, `interval[]`, `jsonb[]` and `oid[]` — PG 18.6 answers 1
+/// for every one of them (measured).
+pub(crate) fn array_element_type(t: DataType) -> Option<DataType> {
+    use spg_storage::DataType as D;
+    Some(match t {
+        D::TextArray => D::Text,
+        D::IntArray => D::Int,
+        D::BigIntArray => D::BigInt,
+        D::OidArray => D::Oid,
+        D::SmallIntArray => D::SmallInt,
+        D::FloatArray => D::Float,
+        D::NumericArray => D::Numeric {
+            precision: 0,
+            scale: 0,
+        },
+        D::BoolArray => D::Bool,
+        D::DateArray => D::Date,
+        D::TimestampArray => D::Timestamp,
+        D::TimestamptzArray => D::Timestamptz,
+        D::IntervalArray => D::Interval,
+        D::UuidArray => D::Uuid,
+        D::JsonArray | D::JsonbArray => D::Jsonb,
+        D::BytesArray => D::Bytes,
+        D::MoneyArray => D::Money,
+        D::VarcharArray => D::Varchar(0),
+        D::CharArray => D::Char(0),
+        D::RealArray => D::Real,
+        D::TimeArray => D::Time,
+        D::TimeTzArray => D::TimeTz,
+        D::InetArray => D::Inet,
+        D::XmlArray => D::Xml,
+        _ => return None,
+    })
+}
+
 pub(crate) fn pg_type_name_for_error(t: DataType) -> alloc::string::String {
     use spg_storage::DataType as D;
     let elem = match t {
@@ -6530,6 +6712,11 @@ pub(crate) fn pg_type_name_for_error(t: DataType) -> alloc::string::String {
         D::JsonArray | D::JsonbArray => Some(D::Jsonb),
         D::BytesArray => Some(D::Bytes),
         D::MoneyArray => Some(D::Money),
+        D::RealArray => Some(D::Real),
+        D::TimeArray => Some(D::Time),
+        D::TimeTzArray => Some(D::TimeTz),
+        D::InetArray => Some(D::Inet),
+        D::XmlArray => Some(D::Xml),
         _ => None,
     };
     match elem {

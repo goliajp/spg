@@ -558,7 +558,12 @@ pub fn cast_value_ref_in(
         }
         CastTarget::Float => cast_numeric_to_float(v),
         CastTarget::Bool => cast_to_bool(v),
-        CastTarget::Date => cast_to_date(v),
+        // v7.40.0 — MySQL's CAST to a temporal type answers NULL, with a
+        // warning, for a value that is not a date. Measured on 9.7.2:
+        // `SELECT CAST('2020-99-99' AS DATE)` is NULL. The same value in
+        // an INSERT is `ERROR 1292` under STRICT_TRANS_TABLES, and that
+        // is a different path. PostgreSQL raises for both.
+        CastTarget::Date => mysql_null_on_bad_temporal(cast_to_date(v), mysql),
         // TIMESTAMP and TIMESTAMPTZ share a runtime representation
         // (i64 microseconds UTC) but NOT an input rule, and conflating
         // the two silently stored the wrong instant. `::timestamp`
@@ -576,14 +581,14 @@ pub fn cast_value_ref_in(
         // applied here too: MariaDB drops the fraction, PG keeps every
         // microsecond.
         CastTarget::Timestamp => {
-            let out = cast_to_timestamp(v)?;
-            Ok(if mysql {
+            let out = mysql_null_on_bad_temporal(cast_to_timestamp(v), mysql)?;
+            Ok(if mysql && !matches!(out, Value::Null) {
                 round_temporal_to_precision(out, 0, true)
             } else {
                 out
             })
         }
-        CastTarget::Timestamptz => cast_to_timestamptz(v),
+        CastTarget::Timestamptz => mysql_null_on_bad_temporal(cast_to_timestamptz(v), mysql),
         // v7.9.25 — `expr::INTERVAL`. Currently only TEXT → Interval
         // is supported (the mailrs idiom: `$1::INTERVAL` where the
         // bound param is a string like `'7 days'`).
@@ -1316,6 +1321,20 @@ pub fn cast_value_ref_in(
 /// path below reaches exactly this code rather than a copy of it.
 /// v7.39 (round 722) — the compiled `Step::CastPlain` entry: same tail,
 /// name pre-resolved at compile time.
+/// v7.40.0 — MySQL turns a failed temporal cast into NULL; PostgreSQL
+/// raises. Applied only where the failure IS the value not being a date
+/// — an error from anywhere else passes through.
+fn mysql_null_on_bad_temporal(
+    r: Result<Value<'static>, EvalError>,
+    mysql: bool,
+) -> Result<Value<'static>, EvalError> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(_) if mysql => Ok(Value::Null),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn finish_named_cast_plain(
     v: Value<'static>,
     dt: spg_storage::DataType,
@@ -1373,6 +1392,30 @@ fn finish_named_cast(
         }
         (_, v) => v,
     };
+    // v7.40.0 — MySQL's CAST to a temporal type answers NULL, with a
+    // warning, where the value is not a date. Measured on 9.7.2:
+    // `SELECT CAST('2020-99-99' AS DATE)` is NULL; the same value in an
+    // INSERT is `ERROR 1292` under STRICT_TRANS_TABLES, and that path
+    // does not come through here.
+    //
+    // PostgreSQL raises for both, and keeps doing so.
+    let temporal_target = matches!(
+        dt,
+        spg_storage::DataType::Date
+            | spg_storage::DataType::Time
+            | spg_storage::DataType::TimeTz
+            | spg_storage::DataType::Timestamp
+            | spg_storage::DataType::Timestamptz
+    );
+    if mysql && temporal_target {
+        let Ok(ok) = crate::conversions::coerce_value(v, dt, resolve_name, 0) else {
+            return Ok(Value::Null);
+        };
+        return Ok(match temporal_prec {
+            Some(prec) => round_temporal_to_precision(ok, prec, mysql),
+            None => ok,
+        });
+    }
     let coerced =
         crate::conversions::coerce_value(v, dt, resolve_name, 0).map_err(|e| match e {
             // v7.39 (read01 round 113) — pass an already-classed engine

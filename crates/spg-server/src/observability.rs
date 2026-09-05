@@ -662,6 +662,11 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 DataType::JsonArray | DataType::JsonbArray => 256,
                 DataType::BytesArray => 256,
                 DataType::VarcharArray | DataType::CharArray => 64,
+                // v7.40.0 — same ~4-element shape as their siblings.
+                DataType::RealArray => 20,
+                DataType::TimeArray | DataType::TimeTzArray => 36,
+                DataType::InetArray => 80,
+                DataType::XmlArray => 256,
                 // v7.37.5 δ — multirange rough heuristic (~3
                 // ranges × 24 B bounds body).
                 DataType::Multirange(_) => 72,

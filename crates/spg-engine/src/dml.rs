@@ -7497,7 +7497,8 @@ fn parse_insert_rows(
                     raw
                 };
                 let raw = crate::eval::session_read_temporal_text(raw, col.ty, session_zone);
-                let coerced = coerce_value(raw, col.ty, &col.name, i)?;
+                let coerced = coerce_value(raw, col.ty, &col.name, i)
+                    .map_err(|e| mysql_datetime_column_error(e, mysql, &col.name, row_no))?;
                 let src_instant = map[i].is_some_and(|j| slot_is_tstz[j]);
                 let coerced = localize_assignment_to_tstz(coerced, col, src_instant, session_zone);
                 let coerced = naive_assignment_from_tstz(coerced, col, src_instant, session_zone);
@@ -8350,4 +8351,40 @@ fn resolve_unqualified_source_leaf(
         // own FROM and is not this walk's business.
         _ => Ok(()),
     }
+}
+
+/// v7.40.0 — MySQL's own sentence for a value that is not a date.
+///
+/// PostgreSQL says `date/time field value out of range: "2020-99-99"`
+/// and, where a different field order could have explained it, adds a
+/// HINT naming its `DateStyle` GUC. MySQL 9.7.2 says
+/// `Incorrect datetime value: '2020-99-99' for column 'made' at row 1`
+/// — and the column and the row are known HERE and nowhere later, which
+/// is why the rewrite is at this call site rather than at the wire.
+fn mysql_datetime_column_error(
+    e: EngineError,
+    mysql: bool,
+    col: &str,
+    row_no: usize,
+) -> EngineError {
+    if !mysql {
+        return e;
+    }
+    let EngineError::Eval(EvalError::TypeMismatch { detail }) = &e else {
+        return e;
+    };
+    let Some(rest) = detail.strip_prefix("date/time field value out of range: ") else {
+        return e;
+    };
+    let value = rest
+        .lines()
+        .next()
+        .unwrap_or(rest)
+        .trim()
+        .trim_matches('"');
+    EngineError::Eval(EvalError::TypeMismatch {
+        detail: alloc::format!(
+            "Incorrect datetime value: '{value}' for column '{col}' at row {row_no}"
+        ),
+    })
 }

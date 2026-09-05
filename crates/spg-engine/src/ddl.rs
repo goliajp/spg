@@ -1923,7 +1923,11 @@ impl Engine {
                         validated: !not_valid,
                     });
             }
-            spg_sql::ast::TableConstraint::Index { name, columns } => {
+            spg_sql::ast::TableConstraint::Index {
+                name,
+                columns,
+                prefix_lengths,
+            } => {
                 // v7.15.0 — ALTER TABLE ADD KEY (cols).
                 // mysqldump occasionally emits this
                 // post-CREATE-TABLE shape; build a BTree
@@ -1958,8 +1962,15 @@ impl Engine {
                     }
                 };
                 table
-                    .add_index(idx_name, leading)
+                    .add_index(idx_name.clone(), leading)
                     .map_err(EngineError::Storage)?;
+                // v7.40.0 — record the declared prefix so the index
+                // reads back as it was written.
+                if let Some(p) = prefix_lengths.first().copied().flatten()
+                    && let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name)
+                {
+                    ix.prefix_len = Some(p);
+                }
             }
             spg_sql::ast::TableConstraint::FulltextIndex { name, columns } => {
                 // v7.17.0 Phase 2.2 — ALTER TABLE ADD
@@ -3675,6 +3686,26 @@ impl Engine {
         }
         self.install_implicit_indexes(&table_name, &inline_pk_columns, &stmt.table_constraints)?;
         self.install_excl_range_indexes(&table_name);
+        // v7.40.0 — `ENGINE=InnoDB AUTO_INCREMENT=100` sets the NEXT
+        // value the table hands out. Measured on MySQL 9.7.2: the first
+        // row inserted into such a table gets 100. SPG consumed the
+        // option and dropped it, so the row got 1 — and
+        // `SHOW CREATE TABLE`, which reproduces the option from the
+        // counter, round-tripped a different number than the dump named.
+        //
+        // Applied as the identity RESTART floor, which is the same thing
+        // `ALTER … RESTART WITH n` sets and which `next_auto_value`
+        // already reads.
+        if let Some(n) = stmt.auto_increment
+            && let Some(t) = self.active_catalog_mut().get_mut(&table_name)
+            && let Some(col) = t
+                .schema_mut()
+                .columns
+                .iter_mut()
+                .find(|c| c.auto_increment)
+        {
+            col.auto_restart = Some(n);
+        }
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: self.catalog_change_is_committed(),
@@ -4057,13 +4088,45 @@ impl Engine {
             // lets the auto-namer resolve collisions, which is what an empty
             // name asks for here.
             if o.indexes {
+                // v7.40.0 — the uniqueness constraints too. Measured on
+                // both engines: `CREATE TABLE b (LIKE a INCLUDING ALL)`
+                // on PostgreSQL 18.6 and `CREATE TABLE b LIKE a` on
+                // MySQL 9.7.2 each give the copy the source's PRIMARY
+                // KEY. SPG copied the plain indexes and left the key
+                // behind, so the copy of a keyed table had no key —
+                // which is the shape that looks right until a duplicate
+                // goes in.
+                for uc in &src_schema.uniqueness_constraints {
+                    let mut copy = uc.clone();
+                    if !spec.keep_index_names {
+                        copy.name = None;
+                    }
+                    schema.uniqueness_constraints.push(copy);
+                }
                 for idx in src.indices() {
+                    // The constraint copy above covers these; a second
+                    // index over the same columns would be a duplicate.
+                    let positions: Vec<usize> = core::iter::once(idx.column_position)
+                        .chain(idx.extra_column_positions.iter().copied())
+                        .collect();
+                    if idx.constraint_internal
+                        || src_schema
+                            .uniqueness_constraints
+                            .iter()
+                            .any(|uc| uc.columns == positions)
+                    {
+                        continue;
+                    }
                     let Some(col) = src_schema.columns.get(idx.column_position) else {
                         continue;
                     };
                     out_indexes.push(CreateIndexStatement {
                         concurrently: false,
-                        name: String::new(),
+                        name: if spec.keep_index_names {
+                            idx.name.clone()
+                        } else {
+                            String::new()
+                        },
                         key_order: spg_sql::ast::IndexColumnOrder::default(),
                         key_collation: None,
                         table: String::new(),
@@ -4352,13 +4415,34 @@ impl Engine {
                     nulls_not_distinct,
                     deferrable,
                     initially_deferred,
-                } => (
-                    false,
-                    columns.clone(),
-                    *nulls_not_distinct,
-                    name.clone(),
-                    (*deferrable, *initially_deferred),
-                ),
+                    prefix_lengths,
+                } => {
+                    // v7.40.0 — a UNIQUE key with a MySQL prefix is a
+                    // DIFFERENT constraint: MySQL rejects two rows that
+                    // share the first n characters, and a full-column
+                    // unique would accept them. It is enforced as a
+                    // unique EXPRESSION index over `left(col, n)`,
+                    // which is exactly that rule, and installed below
+                    // rather than here — so this entry is skipped.
+                    if prefix_lengths.iter().any(Option::is_some) {
+                        if columns.len() != 1 {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "UNIQUE KEY over {} columns with an index prefix is not \
+                                 supported; SPG enforces a prefixed unique key as an \
+                                 expression index, which takes one column",
+                                columns.len()
+                            )));
+                        }
+                        continue;
+                    }
+                    (
+                        false,
+                        columns.clone(),
+                        *nulls_not_distinct,
+                        name.clone(),
+                        (*deferrable, *initially_deferred),
+                    )
+                }
                 spg_sql::ast::TableConstraint::Check { name, expr, .. } => {
                     // v7.13.0 — collect CHECK predicate sources;
                     // they get attached to the schema below.
@@ -4600,8 +4684,36 @@ impl Engine {
                 spg_sql::ast::TableConstraint::PrimaryKey { columns, .. } => {
                     ("pkey", columns, None)
                 }
+                // v7.40.0 — a prefixed UNIQUE is installed as a unique
+                // EXPRESSION index over `left(col, n)`, which is the
+                // rule MySQL enforces. Handled here because the
+                // constraint path above deliberately skipped it.
+                spg_sql::ast::TableConstraint::Unique {
+                    name,
+                    columns,
+                    prefix_lengths,
+                    ..
+                } if prefix_lengths.iter().any(Option::is_some) => {
+                    let col = &columns[0];
+                    let n = prefix_lengths[0].expect("checked by the guard");
+                    let idx_name = name
+                        .clone()
+                        .unwrap_or_else(|| alloc::format!("{table_name}_{col}_key"));
+                    table
+                        .add_index(idx_name.clone(), col)
+                        .map_err(EngineError::Storage)?;
+                    if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                        ix.is_unique = true;
+                        ix.prefix_len = Some(n);
+                        ix.expression = Some(alloc::format!("left({col}, {n})"));
+                    }
+                    // The tree still holds the column's own values until
+                    // the expression is evaluated over the rows.
+                    crate::expr_index::refresh(table)?;
+                    continue;
+                }
                 spg_sql::ast::TableConstraint::Unique { columns, .. } => ("key", columns, None),
-                spg_sql::ast::TableConstraint::Index { name, columns } => {
+                spg_sql::ast::TableConstraint::Index { name, columns, .. } => {
                     ("idx", columns, name.as_ref())
                 }
                 spg_sql::ast::TableConstraint::Check { .. } => continue,
@@ -4625,10 +4737,28 @@ impl Engine {
             // above has always done.
             let mut lead_added: Option<alloc::string::String> = None;
             for (k, col_name) in names.iter().enumerate() {
-                let already = table.indices().iter().any(|idx| {
-                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                        && table.schema().columns[idx.column_position].name == *col_name
-                });
+                // v7.40.0 — a DECLARED index is built even when the
+                // column already carries one.
+                //
+                // This skip is what made `CREATE TABLE t (a INT, b
+                // VARCHAR(32), PRIMARY KEY (a,b), KEY kb (b))` lose
+                // `kb` entirely: the composite key had already put a
+                // probe B-tree on `b`, so the declaration was swallowed
+                // and its NAME never registered — `SHOW INDEX` did not
+                // list it and `DROP INDEX kb ON t` then answered
+                // `ERROR 1091 Can't DROP 'kb'`.
+                //
+                // Round 431 fixed exactly this for `ALTER TABLE ADD KEY`
+                // and wrote down why; the inline form kept the skip.
+                // The skip stays for a SYNTHESISED index — the
+                // constraint's own — where a second B-tree over the same
+                // column is pure cost with no name to lose.
+                let declared = matches!(explicit_name, Some(_)) && k == 0;
+                let already = !declared
+                    && table.indices().iter().any(|idx| {
+                        matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                            && table.schema().columns[idx.column_position].name == *col_name
+                    });
                 if already {
                     continue;
                 }
@@ -4641,6 +4771,18 @@ impl Engine {
                 };
                 if let Err(e) = table.add_index(idx_name.clone(), col_name) {
                     return Err(EngineError::Storage(e));
+                }
+                // v7.40.0 — the declared MySQL prefix, per key column.
+                let declared_prefix = match tc {
+                    spg_sql::ast::TableConstraint::Index {
+                        prefix_lengths, ..
+                    } => prefix_lengths.get(k).copied().flatten(),
+                    _ => None,
+                };
+                if declared_prefix.is_some()
+                    && let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name)
+                {
+                    ix.prefix_len = declared_prefix;
                 }
                 if k == 0 {
                     if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {

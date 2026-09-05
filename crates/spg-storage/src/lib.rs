@@ -300,6 +300,11 @@ pub enum DataType {
     BytesArray,       // PG `_bytea`       OID 1001, tag 46
     VarcharArray,     // PG `_varchar`     OID 1015, tag 47
     CharArray,        // PG `_bpchar`      OID 1014, tag 48
+    RealArray,        // PG `_float4`      OID 1021, tag 79
+    TimeArray,        // PG `_time`        OID 1183, tag 80
+    TimeTzArray,      // PG `_timetz`      OID 1270, tag 81
+    InetArray,        // PG `_inet`        OID 1041, tag 82
+    XmlArray,         // PG `_xml`         OID 143,  tag 83
     /// v7.37.5 δ — PG 14+ multirange types. A multirange is an
     /// ordered collection of non-overlapping ranges of the same
     /// element kind (e.g. `int4multirange(int4range(1,5),
@@ -574,6 +579,11 @@ impl fmt::Display for DataType {
             Self::BytesArray => f.write_str("BYTEA[]"),
             Self::VarcharArray => f.write_str("VARCHAR[]"),
             Self::CharArray => f.write_str("CHAR[]"),
+            Self::RealArray => f.write_str("REAL[]"),
+            Self::TimeArray => f.write_str("TIME[]"),
+            Self::TimeTzArray => f.write_str("TIMETZ[]"),
+            Self::InetArray => f.write_str("INET[]"),
+            Self::XmlArray => f.write_str("XML[]"),
             Self::Multirange(k) => f.write_str(match k {
                 RangeKind::Int4 => "INT4MULTIRANGE",
                 RangeKind::Int8 => "INT8MULTIRANGE",
@@ -892,6 +902,21 @@ pub enum Value<'arena> {
     BytesArray(Vec<Option<Vec<u8>>>),
     VarcharArray(Vec<Option<String>>),
     CharArray(Vec<Option<String>>),
+    /// v7.40.0 — the five array spellings PostgreSQL 18.6 accepts
+    /// that SPG's postfix-`[]` map refused. Measured there first:
+    /// twenty-four spellings accepted, eighteen reachable here,
+    /// `oid[]` needing only routing, and these five needing a type.
+    ///
+    /// PG wire OIDs `_float4` 1021, `_time` 1183, `_timetz` 1270,
+    /// `_inet` 1041, `_xml` 143.
+    RealArray(Vec<Option<f32>>),
+    TimeArray(Vec<Option<i64>>),
+    /// `(us, offset_secs)` per element — the pair [`Value::TimeTz`]
+    /// carries, and the pair `timetz_sort_key` orders by.
+    TimeTzArray(Vec<Option<(i64, i32)>>),
+    /// `(family, bits, addr)` per element — [`Value::Inet`]'s shape.
+    InetArray(Vec<Option<(u8, u8, [u8; 16])>>),
+    XmlArray(Vec<Option<String>>),
     /// v7.37.5 δ — PG 14+ multirange. `ranges` is a Vec of
     /// non-overlapping bounds spans of the shared `kind`. PG's
     /// canonical text form is `{[a,b),[c,d),...}` (comma-separated
@@ -1214,6 +1239,11 @@ impl<'arena> Value<'arena> {
             Self::DateArray(_) => Some(DataType::DateArray),
             Self::TimestampArray(_) => Some(DataType::TimestampArray),
             Self::TimestamptzArray(_) => Some(DataType::TimestamptzArray),
+            Self::RealArray(_) => Some(DataType::RealArray),
+            Self::TimeArray(_) => Some(DataType::TimeArray),
+            Self::TimeTzArray(_) => Some(DataType::TimeTzArray),
+            Self::InetArray(_) => Some(DataType::InetArray),
+            Self::XmlArray(_) => Some(DataType::XmlArray),
             Self::UuidArray(_) => Some(DataType::UuidArray),
             Self::JsonArray(_) => Some(DataType::JsonArray),
             Self::JsonbArray(_) => Some(DataType::JsonbArray),
@@ -1346,6 +1376,11 @@ impl<'arena> Value<'arena> {
             Value::BytesArray(v) => Value::BytesArray(v),
             Value::VarcharArray(v) => Value::VarcharArray(v),
             Value::CharArray(v) => Value::CharArray(v),
+            Value::RealArray(v) => Value::RealArray(v),
+            Value::TimeArray(v) => Value::TimeArray(v),
+            Value::TimeTzArray(v) => Value::TimeTzArray(v),
+            Value::InetArray(v) => Value::InetArray(v),
+            Value::XmlArray(v) => Value::XmlArray(v),
             Value::Multirange { kind, ranges } => Value::Multirange { kind, ranges },
             // v7.38 (read01, T9) — Composite fields are already `Value<'static>`.
             Value::Composite(fields) => Value::Composite(fields),
@@ -3115,6 +3150,13 @@ impl IndexKey {
             | Value::BytesArray(_)
             | Value::VarcharArray(_)
             | Value::CharArray(_)
+            // v7.40.0 — and the five this version adds. Same reason:
+            // an array is not a B-tree key.
+            | Value::RealArray(_)
+            | Value::TimeArray(_)
+            | Value::TimeTzArray(_)
+            | Value::InetArray(_)
+            | Value::XmlArray(_)
             // v7.37.5 δ — multirange not indexable (PG uses GiST/
             // SP-GiST + a custom operator class; SPG plans the same
             // axis under v7.37.8 with ranges).
@@ -3280,6 +3322,20 @@ pub struct Index {
     /// every run. Reported by sentori against 7.39.10; round 537 fixed
     /// the identical thing for the leading column.
     pub extra_orders: Vec<KeyOrder>,
+    /// v7.40.0 — MySQL's index prefix, `KEY kb (b(4))`, as declared.
+    ///
+    /// Recorded for the same reason `descending`, `nulls_first` and
+    /// `collation` are: `SHOW INDEX` reports it as `Sub_part` and
+    /// `SHOW CREATE TABLE` reproduces it, and a declaration that is
+    /// accepted and then unrecorded reads back as a different schema.
+    ///
+    /// The index itself keys the WHOLE column. A full key answers every
+    /// lookup a prefix key answers, and answers it at least as
+    /// precisely — the difference is index size, which is not
+    /// observable in any answer. It IS observable for a UNIQUE prefix
+    /// key, where MySQL rejects two rows sharing the prefix; that form
+    /// is refused at DDL rather than under-enforced (see `ddl.rs`).
+    pub prefix_len: Option<u32>,
 }
 
 /// v7.39.11 — one index key column's ordering clause, as written.
@@ -3811,6 +3867,14 @@ pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
         | DataType::BytesArray
         | DataType::VarcharArray
         | DataType::CharArray
+        // v7.40.0 — the five array spellings this version adds. Same
+        // answer as every other array: PostgreSQL answers containment
+        // over these with GIN, not a B-tree over the whole value.
+        | DataType::RealArray
+        | DataType::TimeArray
+        | DataType::TimeTzArray
+        | DataType::InetArray
+        | DataType::XmlArray
         | DataType::MoneyArray
         | DataType::IntArray2D
         | DataType::BigIntArray2D
@@ -3886,6 +3950,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -3925,6 +3990,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -3951,6 +4017,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -3975,6 +4042,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -3999,6 +4067,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -4024,6 +4093,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -4050,6 +4120,7 @@ impl Index {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         }
     }
 
@@ -9758,7 +9829,17 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// old form — `timetz` had no comparison operator, so no probe was ever
 /// built — but a v96 file's entries are in it, so a v96 catalog has its
 /// timetz indexes rebuilt on load.
-const FILE_VERSION: u8 = 97;
+/// v7.40.0 — v98 adds DataType tags 79..=83 for `real[]`, `time[]`,
+/// `timetz[]`, `inet[]` and `xml[]`. Purely additive: no v97 file can
+/// contain one, because none of those five was a column type. The
+/// version moves so that a v97 binary meeting tag 79 reports a version
+/// it does not know rather than a corrupt catalog — the same story tag
+/// 3 (uuid) had at v36 and tags 4/5 had at v90.
+/// v7.40.0 — v99 appends the MySQL index prefix (`KEY k (b(4))`) to the
+/// per-index block, after the two constraint flags v96 added. A v98
+/// reader stops before it and reads every index as un-prefixed, which
+/// is what a v98 snapshot recorded: the parser dropped the length.
+const FILE_VERSION: u8 = 99;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -9803,9 +9884,27 @@ impl Catalog {
     /// Serialize the whole catalog (schema + every row) into a self-contained
     /// byte buffer. Format is documented above the impl block.
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_at(FILE_VERSION)
+    }
+
+    /// v7.40.0 — the same image as an OLDER writer would have produced.
+    ///
+    /// A test that wants a pre-vN file has until now stamped the version
+    /// byte on a current image and repaired the CRC. That works only
+    /// while the newer versions add nothing to any block: v97 changed
+    /// what an index KEY contains and v98 added DataType tags, so both
+    /// left the byte layout alone — and v99, which appends the MySQL
+    /// index prefix to every index, broke the trick with a one-byte
+    /// desynchronisation reported as `MVCC header appendix row count
+    /// 768 != decoded rows 3`.
+    ///
+    /// So the writer takes the version. Only the fields a version ADDED
+    /// are conditional; everything older is unconditional, which is what
+    /// makes this readable.
+    pub(crate) fn serialize_at(&self, version: u8) -> Vec<u8> {
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(FILE_MAGIC);
-        out.push(FILE_VERSION);
+        out.push(version);
         write_u32(
             &mut out,
             u32::try_from(self.tables.len()).expect("≤ 4G tables"),
@@ -10122,6 +10221,19 @@ impl Catalog {
                 // recorded and what the catalog said about them.
                 out.push(u8::from(idx.constraint_internal));
                 out.push(u8::from(idx.constraint_backing));
+                // v7.40.0 — the MySQL index prefix `KEY k (b(4))`
+                // (FILE_VERSION 99+). A v98 reader stops before these
+                // bytes and reads the index as un-prefixed, which is
+                // what those snapshots recorded.
+                if version >= 99 {
+                    match idx.prefix_len {
+                        None => out.push(0),
+                        Some(n) => {
+                            out.push(1);
+                            out.extend_from_slice(&n.to_le_bytes());
+                        }
+                    }
+                }
             }
             // v6.7.2 — per-table hot_tier_bytes Option<u64>.
             // Layout: [u8 has_value][u64 LE value (if has_value)].

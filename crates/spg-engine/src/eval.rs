@@ -61,6 +61,8 @@ pub use format::{
     format_numeric_array, format_numeric_kind, format_real, format_smallint_array,
     format_text_array, format_time, format_timestamp, format_timestamp_array, format_timestamptz,
     format_timestamptz_at, format_timetz, format_uuid_array, parse_date_literal,
+    // v7.40.0 — the five new array text forms.
+    format_inet_array, format_real_array, format_time_array, format_timetz_array,
     parse_timestamp_literal,
 };
 // v7.39 (GUC knife 3) — session render styles + styled formatters.
@@ -3373,6 +3375,11 @@ fn eval_array_arm(
     }
     let mut has_text = false;
     let mut has_float = false;
+    // v7.40.0 — `Value::Real` used to land in this loop's `_ =>
+    // has_text` arm, so `ARRAY[1.5::real, 2]` came back `text[]` where
+    // PostgreSQL 18.6 answers `real[]` (measured). Only a `float8`
+    // widens the array; `real` beside an int or a numeric stays real.
+    let mut has_real = false;
     let mut has_numeric = false;
     let mut has_bigint = false;
     let mut has_int = false;
@@ -3400,6 +3407,7 @@ fn eval_array_arm(
                 numeric_representable = false;
             }
             Value::Float(_) => has_float = true,
+            Value::Real(_) => has_real = true,
             Value::Text(_) | Value::Json(_) => has_text = true,
             // v7.39 (round 652) — a reg value belongs to the array by
             // its OID half. Falling into the catch-all made
@@ -3411,7 +3419,7 @@ fn eval_array_arm(
             _ => has_text = true,
         }
     }
-    let any_numlike = has_int || has_bigint || has_numeric || has_float;
+    let any_numlike = has_int || has_bigint || has_numeric || has_float || has_real;
     if has_text || !any_numlike || (has_numeric && !numeric_representable) {
         let out: Vec<Option<String>> = materialised
             .into_iter()
@@ -3428,12 +3436,34 @@ fn eval_array_arm(
     // numeric[] (each element keeps its own scale, PG's behaviour);
     // else the integer widths. Matches `pg_typeof(ARRAY[1, 2.5])` =
     // numeric[] and keeps downstream `[i]` arithmetic numeric.
-    if has_float {
+    if has_real && !has_float {
+        #[allow(clippy::cast_possible_truncation)]
+        let out: Vec<Option<f32>> = materialised
+            .into_iter()
+            .map(|v| match v {
+                Value::Null => None,
+                Value::Real(f) => Some(f),
+                #[allow(clippy::cast_precision_loss)]
+                Value::Int(n) => Some(n as f32),
+                Value::SmallInt(n) => Some(f32::from(n)),
+                #[allow(clippy::cast_precision_loss)]
+                Value::BigInt(n) => Some(n as f32),
+                #[allow(clippy::cast_precision_loss)]
+                Value::Numeric { scaled, scale, .. } => {
+                    Some((scaled as f64 / libm::pow(10.0, f64::from(scale))) as f32)
+                }
+                _ => None,
+            })
+            .collect();
+        return Ok(Value::RealArray(out));
+    }
+    if has_float || has_real {
         let out: Vec<Option<f64>> = materialised
             .into_iter()
             .map(|v| match v {
                 Value::Null => None,
                 Value::Float(f) => Some(f),
+                Value::Real(f) => Some(f64::from(f)),
                 Value::Int(n) => Some(f64::from(n)),
                 Value::SmallInt(n) => Some(f64::from(n)),
                 #[allow(clippy::cast_precision_loss)]
@@ -3497,6 +3527,46 @@ fn eval_array_arm(
 /// Out-of-lined `eval_expr` arm — keeps the recursive frame small
 /// (stack-depth guard budget); body unchanged.
 #[inline(never)]
+/// MySQL's collation-derivation rank for an expression. See the call
+/// site in `eval_function_call_arm` for the measured table.
+///
+/// A function over several arguments takes the STRONGEST derivation
+/// among them — the lowest rank — which is what `CONCAT('a', s)`
+/// answering 2 shows. One with no arguments is a system constant only
+/// if it is one of the three named below; every other zero-argument
+/// builtin returns a value, and a value is a literal here.
+fn mysql_coercibility(e: &Expr) -> i32 {
+    match e {
+        Expr::Collate { .. } => 0,
+        Expr::Column(_) => 2,
+        Expr::Literal(spg_sql::ast::Literal::Null) => 6,
+        Expr::Literal(
+            spg_sql::ast::Literal::Integer(_)
+            | spg_sql::ast::Literal::Float(_)
+            | spg_sql::ast::Literal::Numeric { .. },
+        ) => 5,
+        Expr::Literal(_) => 4,
+        Expr::FunctionCall { name, args } => {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "user" | "current_user" | "session_user" | "system_user" | "database"
+                    | "schema" | "version"
+            ) {
+                return 3;
+            }
+            args.iter().map(mysql_coercibility).min().unwrap_or(4)
+        }
+        Expr::Cast { expr, .. } => mysql_coercibility(expr),
+        Expr::Binary { lhs, rhs, .. } => {
+            mysql_coercibility(lhs).min(mysql_coercibility(rhs))
+        }
+        Expr::Unary { expr, .. } => mysql_coercibility(expr),
+        // Anything else carries a value that came from somewhere in the
+        // row, which is a column's derivation.
+        _ => 2,
+    }
+}
+
 fn eval_function_call_arm(
     name: &str,
     args: &[Expr],
@@ -3541,6 +3611,27 @@ fn eval_function_call_arm(
                 unit.to_ascii_lowercase()
             ),
         });
+    }
+    // v7.40.0 — MySQL's `COERCIBILITY(expr)`.
+    //
+    // It reports the collation DERIVATION of the expression, which is a
+    // property of the SYNTAX and not of the value: `COERCIBILITY(s)` and
+    // `COERCIBILITY(s COLLATE utf8mb4_bin)` are 2 and 0 for the same
+    // column, and no evaluated value can tell them apart. So it is
+    // answered here, where the argument is still an expression.
+    //
+    // The ranks are MySQL 9.7.2's own, measured:
+    //
+    // ```text
+    //   COLLATE …            0     a column               2
+    //   USER() DATABASE()    3     a string literal       4
+    //   VERSION()                  a number               5
+    //                              NULL                   6
+    // ```
+    if name.eq_ignore_ascii_case("coercibility")
+        && let [arg] = args
+    {
+        return Ok(Value::Int(mysql_coercibility(arg)));
     }
     // v7.39 (round 258) — `pg_typeof` over an ENUM. An enum value travels
     // as `Value::Text` (its label), so the value-driven namer answered
@@ -5639,6 +5730,11 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::DateArray => "date[]",
         D::TimestampArray => "timestamp without time zone[]",
         D::TimestamptzArray => "timestamp with time zone[]",
+        D::RealArray => "real[]",
+        D::TimeArray => "time without time zone[]",
+        D::TimeTzArray => "time with time zone[]",
+        D::InetArray => "inet[]",
+        D::XmlArray => "xml[]",
         D::UuidArray => "uuid[]",
         D::JsonArray => "json[]",
         D::JsonbArray => "jsonb[]",

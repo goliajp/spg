@@ -1179,7 +1179,23 @@ impl Table {
 
     pub fn next_auto_value(&self, col_pos: usize) -> Option<i64> {
         let ty = self.schema.columns.get(col_pos)?.ty;
-        if !matches!(ty, DataType::SmallInt | DataType::Int | DataType::BigInt) {
+        // v7.40.0 — `BIGINT UNSIGNED` is an integer column, and MySQL
+        // 9.7.2 takes `AUTO_INCREMENT` on it. SPG models it as a
+        // scale-0 NUMERIC because its range does not fit an i64, so
+        // this refused it — with the sentence "AUTO_INCREMENT applies
+        // to integer columns only", about a column that is one.
+        //
+        // A scale-0 numeric only. A DECIMAL with digits after the point
+        // is not an integer column and MySQL refuses AUTO_INCREMENT on
+        // it too.
+        let integral = matches!(
+            ty,
+            DataType::SmallInt
+                | DataType::Int
+                | DataType::BigInt
+                | DataType::Numeric { scale: 0, .. }
+        );
+        if !integral {
             return None;
         }
         if let Some(v) = self.auto_value_from_index(col_pos) {
@@ -1198,6 +1214,18 @@ impl Table {
                 }
                 Some(Value::BigInt(n)) => {
                     max = Some(max.map_or(*n, |m| m.max(*n)));
+                }
+                // A scale-0 numeric holding an unsigned-bigint value.
+                // Past i64::MAX the sequence is out of this API's reach
+                // and the column keeps whatever it already holds.
+                Some(Value::Numeric {
+                    scaled,
+                    scale: 0,
+                    kind: NumericKind::Finite,
+                }) => {
+                    if let Ok(v) = i64::try_from(*scaled) {
+                        max = Some(max.map_or(v, |m| m.max(v)));
+                    }
                 }
                 _ => {}
             }
@@ -1981,6 +2009,7 @@ impl Table {
             collation: None,
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
+            prefix_len: None,
         });
         Ok(())
     }
@@ -4410,6 +4439,7 @@ impl Table {
                 collation: None,
                 extra_column_positions: Vec::new(),
                 extra_orders: Vec::new(),
+                prefix_len: None,
             });
             return Ok(());
         }

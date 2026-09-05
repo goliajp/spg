@@ -67,6 +67,10 @@ fn fixture() -> Engine {
 }
 
 /// The whole statement, as MySQL 9.7.2 renders it.
+/// v7.40.0 — the options tail grew `COLLATE=`. MySQL 9.7.2 ends every
+/// `SHOW CREATE TABLE` with the table's collation (measured); SPG
+/// stopped at the charset, so DDL read back from it declared a
+/// different collation than the table has.
 #[test]
 fn it_renders_mysqls_shape() {
     let mut e = fixture();
@@ -84,7 +88,7 @@ fn it_renders_mysqls_shape() {
          PRIMARY KEY (`id`),\n  \
          UNIQUE KEY `uq_v` (`v`),\n  \
          KEY `idx_n` (`n`)\n\
-         ) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4",
+         ) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci",
     );
 }
 

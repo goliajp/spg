@@ -11,6 +11,10 @@
 //! suppresses the fold; a `_ci` override folds (the dialect default), so
 //! it absorbs as a no-op.
 //!
+//! v7.40.0 — the lowering onto `BINARY` is gone, and the reason is in
+//! `e2e_mysql_face_v7400`: byte-wise is two properties, and the BINARY
+//! cast carries both. `utf8mb4_bin` does not fold AND it PADS.
+//!
 //! Every expectation is copied from a MariaDB 11 run.
 
 use spg_engine::{Engine, QueryResult};

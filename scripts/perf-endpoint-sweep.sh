@@ -197,6 +197,47 @@ time_one() { # $1=uri $2=sql $3=work_mem setting
   "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" -c '\timing on' -c "$2" -c "$2" -c "$2" 2>&1 |
     grep -E '^Time:' | sed 's/Time: //; s/ ms//' | sort -g | head -1
 }
+# v7.40.0 — the same cell, timed by the SERVER instead of by the client.
+#
+# `time_one` above reports psql's wall clock, and on a sub-millisecond
+# cell that is almost entirely TRANSPORT. Measured on this testbed while
+# preparing the 7.39.13 customer note: the same trivial statement is
+# 0.067 ms to SPG (a native listener) and 0.438 ms to PostgreSQL (a
+# container port-forward) — 6.5x, all of it in the route, none of it in
+# either engine. A per-query floor read off the client clock therefore
+# said SPG's floor was about 7x PostgreSQL's, with the sign backwards:
+# the servers' own numbers put SPG at 0.013-0.018 ms against 0.045-0.079.
+#
+# So the panel carries a second, transport-free column. It is REPORTED,
+# not judged: the verdict still comes from the wall-clock legs and their
+# control, because those are what a customer's client actually waits
+# for. This column is here so that a floor claim is never again made
+# from a number that is 99% route.
+#
+# The two engines do not summarise identically, and the difference is
+# documented in SPG's own EXPLAIN: SPG's `Execution Time` INCLUDES
+# planning, PostgreSQL's excludes it. The comparable pair is therefore
+# PostgreSQL's `Planning Time + Execution Time` against SPG's
+# `Execution Time` alone, which is what `server_one` takes — a sum of
+# both lines on SPG would count its planning twice.
+server_one() { # $1=uri $2=sql $3=work_mem setting $4=1 if this leg is SPG
+  "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" 2>/dev/null |
+    awk -v spg="$4" '
+      /^Planning Time: / { p = $3 + 0; next }
+      /^Execution Time: / {
+        e = $3 + 0
+        t = (spg == 1) ? e : p + e
+        if (n++ == 0 || t < best) best = t
+        p = 0
+      }
+      END { if (n) printf "%.3f", best; else printf "n/a" }'
+}
+
 lo() { printf '%s\n' "$@" | sort -g | head -1; }
 hi() { printf '%s\n' "$@" | sort -g | tail -1; }
 
@@ -482,8 +523,10 @@ TYPED_SHAPES=(
 
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0
 
-printf '\n%-8s %-26s %-16s %-16s %s\n' SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' VERDICT
-printf '%-8s %-26s %-16s %-16s %s\n' -------- -------------------------- ---------------- ---------------- -------
+printf '\n%-8s %-26s %-16s %-16s %-9s %-9s %s\n' \
+  SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' 'SRV-SPG' 'SRV-PG' VERDICT
+printf '%-8s %-26s %-16s %-16s %-9s %-9s %s\n' \
+  -------- -------------------------- ---------------- ---------------- --------- --------- -------
 
 for rows in ${SIZES}; do
   T="sweep_${rows}"
@@ -539,6 +582,10 @@ for rows in ${SIZES}; do
           ;;
       esac
     done
+    # The transport-free reading, once per leg, AFTER the alternating
+    # wall-clock rounds so it cannot disturb them.
+    ssrv="$(server_one "${SPG_URI}" "${sql}" "${SPG_WM}" 1)"
+    gsrv="$(server_one "${PG_URI}"  "${sql}" "${PG_WM}"  0)"
     smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
     gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
     cmin="$(lo "${c[@]}")"; cmax="$(hi "${c[@]}")"
@@ -557,8 +604,9 @@ for rows in ${SIZES}; do
     fi
     [[ "${v}" == LOSS ]] && LOSSES=$((LOSSES + 1))
     CELLS=$((CELLS + 1))
-    printf '%-8s %-26s %-16s %-16s %s%s\n' \
-      "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" "${v}" "${note}"
+    printf '%-8s %-26s %-16s %-16s %-9s %-9s %s%s\n' \
+      "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" \
+      "${ssrv}" "${gsrv}" "${v}" "${note}"
   done
 done
 

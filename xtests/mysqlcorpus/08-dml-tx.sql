@@ -1,0 +1,27 @@
+-- DML MySQL spells differently, and its transaction statements.
+DROP TABLE IF EXISTS mc_d;
+CREATE TABLE mc_d (id INT NOT NULL PRIMARY KEY, v INT NOT NULL, u VARCHAR(8) UNIQUE);
+INSERT INTO mc_d VALUES (1,10,'a'),(2,20,'b');
+SELECT 'T01', id, v, u FROM mc_d ORDER BY id;
+INSERT INTO mc_d (id,v,u) VALUES (1,99,'a') ON DUPLICATE KEY UPDATE v = v + 1;
+SELECT 'T02', id, v FROM mc_d ORDER BY id;
+INSERT IGNORE INTO mc_d (id,v,u) VALUES (1,0,'a');
+SELECT 'T03', id, v FROM mc_d ORDER BY id;
+REPLACE INTO mc_d (id,v,u) VALUES (2,42,'b');
+SELECT 'T04', id, v FROM mc_d ORDER BY id;
+UPDATE mc_d SET v = v * 2 WHERE id = 1 ORDER BY id LIMIT 1;
+SELECT 'T05', id, v FROM mc_d ORDER BY id;
+DELETE FROM mc_d WHERE id = 2 ORDER BY id LIMIT 1;
+SELECT 'T06', COUNT(*) FROM mc_d;
+START TRANSACTION;
+INSERT INTO mc_d VALUES (3,30,'c');
+SELECT 'T07', COUNT(*) FROM mc_d;
+ROLLBACK;
+SELECT 'T08', COUNT(*) FROM mc_d;
+START TRANSACTION;
+INSERT INTO mc_d VALUES (4,40,'d');
+COMMIT;
+SELECT 'T09', COUNT(*) FROM mc_d;
+TRUNCATE TABLE mc_d;
+SELECT 'T10', COUNT(*) FROM mc_d;
+DROP TABLE mc_d;

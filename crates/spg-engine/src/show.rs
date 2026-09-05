@@ -104,13 +104,23 @@ impl Engine {
                     )
                 })
                 .collect();
-            let kw = if uc.is_primary_key {
-                "PRIMARY KEY"
-            } else {
-                "UNIQUE KEY"
-            };
+            // v7.40.0 — measured on MySQL 9.7.2, a KEY's column list has
+            // NO space after the comma while a FOREIGN KEY's does:
+            //   UNIQUE KEY `uq` (`x`,`y`),
+            //   CONSTRAINT `c` FOREIGN KEY (`x`, `y`) REFERENCES …
+            // and a UNIQUE KEY carries its name, which SPG omitted.
             body.push_str(",\n  ");
-            body.push_str(&alloc::format!("{kw} ({})", col_names.join(", ")));
+            if uc.is_primary_key {
+                body.push_str(&alloc::format!("PRIMARY KEY ({})", col_names.join(",")));
+            } else {
+                let n = uc.name.clone().unwrap_or_else(|| {
+                    crate::system_catalog::pg_unique_conname(t, uc, name)
+                });
+                body.push_str(&alloc::format!(
+                    "UNIQUE KEY `{n}` ({})",
+                    col_names.join(",")
+                ));
+            }
         }
         // v7.39 (round 358, M16) — the secondary indexes, which were
         // absent entirely. MariaDB's order is PRIMARY KEY, then UNIQUE
@@ -129,21 +139,42 @@ impl Engine {
                 );
                 // An index that merely backs a declared UNIQUE constraint
                 // was already printed by the loop above.
-                let backs_constraint = t
-                    .schema()
-                    .uniqueness_constraints
-                    .iter()
-                    .any(|uc| uc.columns == [idx.column_position]);
+                // v7.40.0 — by the index's WHOLE column list, and against
+                // a constraint's whole list. This compared a
+                // single-element slice, so the two single-column indexes
+                // SPG builds to back a COMPOSITE key matched nothing and
+                // were printed as two extra `KEY` lines — internal names
+                // and all — beside the `PRIMARY KEY (a,b)` they belong to.
+                let positions: Vec<usize> = core::iter::once(idx.column_position)
+                    .chain(idx.extra_column_positions.iter().copied())
+                    .collect();
+                // Exactly `catalog_indexes`'s rule: SPG's own probe index
+                // for a constraint's non-leading columns is nobody's
+                // declared index, and a constraint's backing index has
+                // already been printed above — but only when its columns
+                // ARE the constraint's. `constraint_backing` alone is not
+                // that claim; it only says the lookup is worth doing.
+                let backs_constraint = idx.constraint_internal
+                    || (idx.constraint_backing
+                        && t.schema()
+                            .uniqueness_constraints
+                            .iter()
+                            .any(|uc| uc.columns == positions));
                 if backs_constraint {
                     continue;
                 }
                 let kw = if idx.is_unique { "UNIQUE KEY" } else { "KEY" };
+                // v7.40.0 — and its declared prefix, as MySQL prints it.
+                let col = match idx.prefix_len {
+                    Some(p) => alloc::format!("{col}({p})"),
+                    None => col,
+                };
                 body.push_str(",\n  ");
                 body.push_str(&alloc::format!("{kw} `{}` ({col})", idx.name));
             }
         }
         // Foreign keys.
-        for fk in &t.schema().foreign_keys {
+        for (fk_i, fk) in t.schema().foreign_keys.iter().enumerate() {
             let local: Vec<String> = fk
                 .local_columns
                 .iter()
@@ -171,9 +202,23 @@ impl Engine {
                         .map(|p| alloc::format!("col{p}"))
                         .collect()
                 };
+            // v7.40.0 — MySQL 9.7.2 always NAMES the constraint here,
+            // and generates `<table>_ibfk_<n>` (1-based) when the user
+            // did not (measured). SPG emitted the bare `FOREIGN KEY`,
+            // so a dump read back by a tool that matches constraints by
+            // name found none.
+            //
+            // The column lists keep their spaces: measured, MySQL writes
+            // `FOREIGN KEY (`x`, `y`) REFERENCES `p` (`a`, `b`)` with
+            // them and a KEY's list without — its own inconsistency, and
+            // matching it is the point.
+            let fk_name = fk
+                .name
+                .clone()
+                .unwrap_or_else(|| alloc::format!("{name}_ibfk_{}", fk_i + 1));
             body.push_str(",\n  ");
             body.push_str(&alloc::format!(
-                "FOREIGN KEY ({}) REFERENCES `{}` ({})",
+                "CONSTRAINT `{fk_name}` FOREIGN KEY ({}) REFERENCES `{}` ({})",
                 local.join(", "),
                 fk.parent_table,
                 parent_cols.join(", ")
@@ -195,10 +240,16 @@ impl Engine {
             .filter(|n| *n > 1)
             .map_or_else(String::new, |n| alloc::format!(" AUTO_INCREMENT={n}"));
         let ddl = alloc::format!(
-            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{} DEFAULT CHARSET=utf8mb4",
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB{} DEFAULT CHARSET=utf8mb4 \
+             COLLATE={}",
             name,
             body,
-            auto_opt
+            auto_opt,
+            // v7.40.0 — MySQL 9.7.2 ends the options with the table's
+            // collation, and SPG stopped at the charset. A table created
+            // without an explicit one takes the server's, which is the
+            // same value `SHOW VARIABLES LIKE 'collation_server'` gives.
+            crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
         );
         let columns = alloc::vec![
             ColumnSchema::new("Table", DataType::Text, false),
@@ -262,31 +313,25 @@ impl Engine {
             ColumnSchema::new("Visible", DataType::Text, false),
             ColumnSchema::new("Expression", DataType::Text, true),
         ];
-        // The column positions the PRIMARY KEY constraint covers, which
-        // is where SPG records that it is unique — the index itself does
-        // not carry the flag.
-        let pk_cols: Option<&[usize]> = t
-            .schema()
-            .uniqueness_constraints
-            .iter()
-            .find(|uc| uc.is_primary_key)
-            .map(|uc| uc.columns.as_slice());
-        let mut rows: Vec<Row<'static>> = Vec::new();
-        let mut push_index = |idx: &spg_storage::Index, rows: &mut Vec<Row<'static>>| {
-            // Every column of the index, in order: MySQL emits one row
-            // per (index × column) and numbers them from 1.
-            let positions: Vec<usize> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
-                .collect();
-            let is_pk = pk_cols.is_some_and(|c| c == positions.as_slice());
-            let key_name = if is_pk {
-                // MySQL names every primary key PRIMARY.
-                String::from("PRIMARY")
-            } else {
-                idx.name.clone()
-            };
-            let unique = is_pk || idx.is_unique;
-            for (seq, pos) in positions.iter().enumerate() {
+        // v7.40.0 — the rows come from `catalog_indexes`, the one
+        // table that already knew how to tell a constraint's index
+        // from a declared one, and how to synthesise the row for a
+        // constraint SPG enforces without a single covering index.
+        //
+        // The walk this replaces read `t.indices()` and matched the
+        // primary key by comparing an index's column list to the
+        // constraint's. That works only when ONE storage index covers
+        // the whole key. Measured against MySQL 9.7.2 with
+        // `PRIMARY KEY (a, b)`, SPG had two — `mc_i_a_pkey_0_0` and
+        // `mc_i_b_pkey_0_1` — neither matching, so the key was
+        // reported as two unrelated single-column indexes, both
+        // `Non_unique = 1`, and no row said `PRIMARY` at all. That is
+        // the v7.39.10 defect returning through the composite door.
+        let all = crate::system_catalog::catalog_indexes(self.active_catalog());
+        let mut push_index = |idx: &crate::system_catalog::CatalogIndex,
+                              rows: &mut Vec<Row<'static>>| {
+            let key_name = crate::system_catalog::mysql_index_name(idx);
+            for (seq, pos) in idx.columns.iter().enumerate() {
                 let col = t
                     .schema()
                     .columns
@@ -295,13 +340,20 @@ impl Engine {
                 let nullable = t.schema().columns.get(*pos).is_none_or(|c| c.nullable);
                 rows.push(Row::new(alloc::vec![
                     Value::text::<String>(name.into()),
-                    Value::Int(i32::from(!unique)),
+                    Value::Int(i32::from(!idx.is_unique)),
                     Value::text(key_name.clone()),
                     Value::Int(i32::try_from(seq + 1).unwrap_or(1)),
                     Value::text(col),
                     Value::text("A"),
                     Value::BigInt(0),
-                    Value::Null,
+                    // v7.40.0 — Sub_part: the declared prefix, `KEY kb
+                    // (b(4))`. It was always NULL because the parser
+                    // dropped the length.
+                    prefix_of(&idx.name, self.active_catalog(), name)
+                        .filter(|_| seq == 0)
+                        .map_or(Value::Null, |p| {
+                            Value::Int(i32::try_from(p).unwrap_or(0))
+                        }),
                     Value::Null,
                     Value::text(if nullable {
                         "YES".into()
@@ -316,22 +368,13 @@ impl Engine {
                 ]));
             }
         };
+        let mut rows: Vec<Row<'static>> = Vec::new();
         // PRIMARY first, as MySQL lists it.
-        for idx in t.indices() {
-            let positions: Vec<usize> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
-                .collect();
-            if pk_cols.is_some_and(|c| c == positions.as_slice()) {
-                push_index(idx, &mut rows);
-            }
+        for idx in all.iter().filter(|i| i.table == name && i.is_primary) {
+            push_index(idx, &mut rows);
         }
-        for idx in t.indices() {
-            let positions: Vec<usize> = core::iter::once(idx.column_position)
-                .chain(idx.extra_column_positions.iter().copied())
-                .collect();
-            if pk_cols.is_none_or(|c| c != positions.as_slice()) {
-                push_index(idx, &mut rows);
-            }
+        for idx in all.iter().filter(|i| i.table == name && !i.is_primary) {
+            push_index(idx, &mut rows);
         }
         Ok(QueryResult::Rows { columns, rows })
     }
@@ -916,6 +959,20 @@ pub(crate) fn render_mysql_type(col: &ColumnSchema) -> String {
 /// stored text.
 fn mysql_default_text(d: &str) -> String {
     let t = d.trim();
+    // v7.40.0 — a PostgreSQL cast suffix is not part of a MySQL
+    // default. The catalog stores the default's SOURCE TEXT, and a
+    // `varchar` default arrives as `'z'::character varying`; MySQL
+    // 9.7.2 writes `DEFAULT 'z'` (measured). SPG printed the cast,
+    // so a `SHOW CREATE TABLE` fed back to MySQL would not parse.
+    let t = t
+        .rsplit_once("::")
+        .filter(|(head, _)| {
+            // Only when the head is a complete literal — a `::` inside
+            // one is not a cast.
+            let h = head.trim_end();
+            h.len() >= 2 && h.starts_with('\'') && h.ends_with('\'')
+        })
+        .map_or(t, |(head, _)| head.trim_end());
     // v7.39.2 — MySQL 9.7.2 writes `DEFAULT CURRENT_TIMESTAMP`, upper
     // case and without parentheses; the parenthesised lower-case form
     // this used to emit is MariaDB's, and SPG claims to be MySQL.
@@ -929,6 +986,19 @@ fn mysql_default_text(d: &str) -> String {
         return alloc::string::String::from(t);
     }
     alloc::format!("'{t}'")
+}
+
+/// v7.40.0 — the declared MySQL prefix of a named index on a table.
+///
+/// `catalog_indexes` synthesises rows for constraints that have no
+/// storage index, so it cannot carry one; the length lives on the
+/// storage index and is looked up by name.
+fn prefix_of(idx_name: &str, cat: &spg_storage::Catalog, table: &str) -> Option<u32> {
+    cat.get(table)?
+        .indices()
+        .iter()
+        .find(|i| i.name == idx_name)?
+        .prefix_len
 }
 
 fn render_data_type(ty: DataType) -> String {
@@ -994,6 +1064,11 @@ fn render_data_type(ty: DataType) -> String {
         DataType::BytesArray => "BYTEA[]".into(),
         DataType::VarcharArray => "VARCHAR[]".into(),
         DataType::CharArray => "CHAR[]".into(),
+        DataType::RealArray => "REAL[]".into(),
+        DataType::TimeArray => "TIME[]".into(),
+        DataType::TimeTzArray => "TIMETZ[]".into(),
+        DataType::InetArray => "INET[]".into(),
+        DataType::XmlArray => "XML[]".into(),
         DataType::Point => "POINT".into(),
         DataType::Lseg => "LSEG".into(),
         DataType::Path => "PATH".into(),

@@ -13577,11 +13577,36 @@ impl Parser {
         // SELECT list uses; anything without child expressions is
         // left alone.
         match expr {
-            Expr::FunctionCall { args, .. } => {
+            // v7.40.0 — an AGGREGATE's argument is NOT nullified.
+            //
+            // A grouping column is NULL in the OUTPUT of a set that
+            // drops it, and an aggregate over it still aggregates the
+            // real values. Measured, over 0,1,2,3:
+            //
+            // ```text
+            //   SELECT qty, SUM(qty) … GROUP BY ROLLUP(qty)
+            //     PostgreSQL 18.6   the total row is  NULL | 6
+            //     MySQL 9.7.2       the total row is  NULL | 6
+            //     SPG 7.39.13                         NULL | NULL
+            // ```
+            //
+            // The round that made this walk descend "at any depth" was
+            // right about `COALESCE(g,'TOTAL')` and wrong about
+            // `SUM(g)`: it turned the aggregate's own input into a NULL
+            // literal, so the grand total of a rollup keyed on the
+            // summed column answered nothing. Wrong on BOTH faces.
+            //
+            // `grouping(…)` is settled above, before this, so it keeps
+            // reading the dropped set.
+            Expr::FunctionCall { name, args } => {
+                if is_aggregate_function_name(name) {
+                    return;
+                }
                 for a in args {
                     Self::substitute_grouping_calls(a, dropped);
                 }
             }
+            Expr::AggregateOrdered { .. } => {}
             Expr::Binary { lhs, rhs, .. } => {
                 Self::substitute_grouping_calls(lhs, dropped);
                 Self::substitute_grouping_calls(rhs, dropped);
@@ -14540,6 +14565,59 @@ impl Parser {
                 for ob in &mut order_keys {
                     Self::rewrite_grouping_to_col(&mut ob.expr, &grp_exprs);
                 }
+                // v7.40.0 — and a KEY the order sorts on that the query
+                // did not project.
+                //
+                // A UNION's ORDER BY can only name output columns, so
+                // the rollup order synthesised over `grouping_universe`
+                // named `qty` for `SELECT SUM(qty) … GROUP BY qty WITH
+                // ROLLUP` and the query answered `column "qty" does not
+                // exist`. MySQL 9.7.2 answers 0, 1, 2, 3, 6 — it orders
+                // by the key whether or not it is selected. The key
+                // travels as a hidden column, exactly as the grouping
+                // mask above does, and is stripped from the output by
+                // the same rule.
+                let mut key_exprs: Vec<Expr> = Vec::new();
+                for ob in &order_keys {
+                    let is_key = grouping_universe.iter().any(|u| u == &ob.expr);
+                    let projected = stmt.items.iter().any(|it| {
+                        matches!(it, SelectItem::Expr { expr, .. } if expr == &ob.expr)
+                    });
+                    if is_key && !projected && !key_exprs.iter().any(|k| k == &ob.expr) {
+                        key_exprs.push(ob.expr.clone());
+                    }
+                }
+                for (k, kexpr) in key_exprs.iter().enumerate() {
+                    let colname = alloc::format!("__grp_key_{k}");
+                    let mut he = kexpr.clone();
+                    Self::substitute_grouping_calls(&mut he, &head_dropped);
+                    stmt.items.push(SelectItem::Expr {
+                        expr: he,
+                        alias: Some(colname.clone()),
+                    });
+                    for (i, (_, peer)) in stmt.unions.iter_mut().enumerate() {
+                        let set = &grouping_sets[i + 1];
+                        let dropped: Vec<Expr> = grouping_universe
+                            .iter()
+                            .filter(|u| !set.iter().any(|kk| kk == *u))
+                            .cloned()
+                            .collect();
+                        let mut pe = kexpr.clone();
+                        Self::substitute_grouping_calls(&mut pe, &dropped);
+                        peer.items.push(SelectItem::Expr {
+                            expr: pe,
+                            alias: Some(colname.clone()),
+                        });
+                    }
+                    for ob in &mut order_keys {
+                        if &ob.expr == kexpr {
+                            ob.expr = Expr::Column(crate::ast::ColumnName {
+                                name: colname.clone(),
+                                qualifier: None,
+                            });
+                        }
+                    }
+                }
                 stmt.order_by = order_keys;
             }
         }
@@ -14745,6 +14823,7 @@ impl Parser {
             source,
             at,
             options,
+            keep_index_names: false,
         })
     }
 
@@ -14768,6 +14847,7 @@ impl Parser {
                 temporary: false,
                 name,
                 engine: None,
+                auto_increment: None,
                 columns: Vec::new(),
                 like_specs: Vec::new(),
                 inherits: Vec::new(),
@@ -14802,6 +14882,45 @@ impl Parser {
                     as_plain_table: true,
                 },
             ));
+        }
+        // v7.40.0 — MySQL's `CREATE TABLE b LIKE a`, which is the same
+        // copy PostgreSQL spells `CREATE TABLE b (LIKE a INCLUDING ALL)`
+        // written without the parentheses. It was a syntax error, so a
+        // schema written against MySQL could not be loaded at all.
+        //
+        // Measured on MySQL 9.7.2: the copy takes the columns, their
+        // defaults and the indexes, and takes neither the rows nor the
+        // foreign keys — which is exactly `INCLUDING ALL` here, since
+        // SPG's LIKE has never copied foreign keys.
+        if matches!(self.peek(), Token::Like) {
+            let at = self.pos;
+            let spec = self.parse_create_table_like(at)?;
+            let spec = crate::ast::LikeSpec {
+                options: crate::ast::LikeOptions {
+                    defaults: true,
+                    constraints: true,
+                    identity: true,
+                    generated: true,
+                    indexes: true,
+                    comments: true,
+                },
+                keep_index_names: true,
+                ..spec
+            };
+            return Ok(Statement::CreateTable(CreateTableStatement {
+                temporary: false,
+                name,
+                engine: None,
+                auto_increment: None,
+                columns: Vec::new(),
+                like_specs: alloc::vec![spec],
+                inherits: Vec::new(),
+                if_not_exists,
+                foreign_keys: Vec::new(),
+                table_constraints: Vec::new(),
+                partition_by: None,
+                partition_of: None,
+            }));
         }
         if !matches!(self.peek(), Token::LParen) {
             return Err(self.err(format!(
@@ -14894,6 +15013,7 @@ impl Parser {
                         nulls_not_distinct: col.unique_nulls_not_distinct,
                         deferrable: col.constraint_deferrable,
                         initially_deferred: col.constraint_initially_deferred,
+                        prefix_lengths: Vec::new(),
                     });
                 }
                 if let Some(check_expr) = col.check.clone() {
@@ -14969,7 +15089,7 @@ impl Parser {
         // AUTO_INCREMENT=42 ROW_FORMAT=DYNAMIC COMMENT='blog posts'`.
         // SPG accepts all forms as no-ops (each option is
         // `<ident> [=] <ident-or-string>` separated by whitespace).
-        let engine = self.consume_mysql_table_options();
+        let (engine, auto_increment) = self.consume_mysql_table_options();
         // v7.38 (read01 P6.55) — PG storage parameters `WITH (opt=val, …)`.
         // SPG has no per-table reloptions, so accept and ignore them so a
         // pg_dump `CREATE TABLE … WITH (fillfactor=70, …)` restores cleanly.
@@ -14996,6 +15116,7 @@ impl Parser {
             temporary: false,
             name,
             engine,
+            auto_increment,
             columns,
             like_specs,
             inherits,
@@ -15418,13 +15539,26 @@ impl Parser {
         }
         self.advance();
         let mut cols: Vec<String> = Vec::new();
+        let mut prefix_lengths: Vec<Option<u32>> = Vec::new();
         while let Token::Ident(s) | Token::QuotedIdent(s) = self.peek().clone() {
             self.advance();
             cols.push(s);
-            // Skip optional `(length)` per-column prefix.
+            // v7.40.0 — the per-column `(length)` prefix is KEPT.
+            //
+            // It used to be skipped, so `KEY kb (b(4))` was accepted and
+            // the prefix forgotten: `SHOW INDEX` reported `Sub_part`
+            // NULL and `SHOW CREATE TABLE` printed `(b)` where MySQL
+            // 9.7.2 prints `(b(4))`. A declaration that is accepted and
+            // then unrecorded is the worst of the three answers.
+            let mut prefix: Option<u32> = None;
             if matches!(self.peek(), Token::LParen) {
                 let mut depth = 1usize;
                 self.advance();
+                if let Token::Integer(n) = self.peek()
+                    && let Ok(v) = u32::try_from(*n)
+                {
+                    prefix = Some(v);
+                }
                 while depth > 0 {
                     match self.peek() {
                         Token::LParen => depth += 1,
@@ -15435,6 +15569,7 @@ impl Parser {
                     self.advance();
                 }
             }
+            prefix_lengths.push(prefix);
             // Skip optional ASC / DESC.
             if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("asc") || s.eq_ignore_ascii_case("desc"))
                 || matches!(self.peek(), Token::Asc | Token::Desc)
@@ -15471,6 +15606,7 @@ impl Parser {
                 // MySQL inline UNIQUE KEY has no deferral vocabulary.
                 deferrable: false,
                 initially_deferred: false,
+                prefix_lengths,
             }))
         } else if is_fulltext {
             // v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY` now
@@ -15492,6 +15628,7 @@ impl Parser {
             Ok(Some(crate::ast::TableConstraint::Index {
                 name: idx_name,
                 columns: cols,
+                prefix_lengths,
             }))
         }
     }
@@ -15531,8 +15668,11 @@ impl Parser {
     /// options genuinely have no meaning for SPG's storage; the engine
     /// name does, because MySQL REFUSES one it does not know and a dump
     /// with a typo in it should not quietly become a table.
-    fn consume_mysql_table_options(&mut self) -> Option<alloc::string::String> {
+    fn consume_mysql_table_options(
+        &mut self,
+    ) -> (Option<alloc::string::String>, Option<i64>) {
         let mut engine: Option<alloc::string::String> = None;
+        let mut auto_increment: Option<i64> = None;
         loop {
             // Heuristic: a table option is an ident (or `DEFAULT`
             // reserved keyword) followed by `=` and an
@@ -15602,13 +15742,23 @@ impl Parser {
                     }
                     self.advance();
                 }
-                Token::Integer(_) => {
+                Token::Integer(v) => {
+                    // v7.40.0 — `AUTO_INCREMENT=100` is the next value
+                    // the table hands out, and it was consumed and
+                    // dropped: measured on MySQL 9.7.2, the first row
+                    // inserted into a table declared that way gets 100,
+                    // where SPG gave it 1. `SHOW CREATE TABLE` already
+                    // reproduces the option from the counter, so the
+                    // dump round-tripped through a different number.
+                    if name_lc == "auto_increment" {
+                        auto_increment = Some(v);
+                    }
                     self.advance();
                 }
                 _ => {}
             }
         }
-        engine
+        (engine, auto_increment)
     }
 
     /// v7.9.18 — true when the next tokens are `PRIMARY KEY (…)`.
@@ -15705,6 +15855,7 @@ impl Parser {
             nulls_not_distinct,
             deferrable,
             initially_deferred,
+            prefix_lengths: Vec::new(),
         })
     }
 
@@ -17557,6 +17708,10 @@ impl Parser {
                 ColumnTypeName::Text => ColumnTypeName::TextArray,
                 ColumnTypeName::Int => ColumnTypeName::IntArray,
                 ColumnTypeName::BigInt => ColumnTypeName::BigIntArray,
+                // v7.40.0 — `oid[]`. Everything downstream of the
+                // parser already handled `DataType::OidArray`; this
+                // arm is the whole of what was missing.
+                ColumnTypeName::Oid => ColumnTypeName::OidArray,
                 // v7.37.5 β-P4 — INTERVAL[] via the same postfix
                 // `[]` grammar. Wire OID 1187.
                 ColumnTypeName::Interval => ColumnTypeName::IntervalArray,
@@ -17580,6 +17735,13 @@ impl Parser {
                 // element precision is per-row, not column-wide).
                 ColumnTypeName::Varchar(_) => ColumnTypeName::VarcharArray,
                 ColumnTypeName::Char(_) => ColumnTypeName::CharArray,
+                // v7.40.0 — TIME(p)[] / TIMETZ(p)[] drop the
+                // precision the same way NUMERIC[] does.
+                ColumnTypeName::Real => ColumnTypeName::RealArray,
+                ColumnTypeName::Time => ColumnTypeName::TimeArray,
+                ColumnTypeName::TimeTz => ColumnTypeName::TimeTzArray,
+                ColumnTypeName::Inet => ColumnTypeName::InetArray,
+                ColumnTypeName::Xml => ColumnTypeName::XmlArray,
                 // v7.37.5 ζ-A — MONEY[] (OID 791) ship-triage
                 // follow-up.
                 ColumnTypeName::Money => ColumnTypeName::MoneyArray,
@@ -23370,7 +23532,26 @@ impl Parser {
                 // nothing. An unknown name now falls through to the
                 // node, and the engine refuses it.
                 let real = crate::charset::is_mysql_collation(&lc);
-                if self.mysql_dialect && real && (lc.ends_with("_bin") || lc == "binary") {
+                // v7.40.0 — `binary` lowers; a `_bin` COLLATION does not.
+                //
+                // They are not the same thing, and folding them together
+                // lost a bit. Measured on MySQL 9.7.2 with the connection
+                // on utf8mb4:
+                //
+                // ```text
+                //   'a ' = 'a' COLLATE utf8mb4_bin        1   PAD SPACE
+                //   'a ' = 'a' COLLATE utf8mb4_0900_bin   0   NO PAD
+                //   'AB' = 'ab' COLLATE utf8mb4_bin       0   byte-wise
+                // ```
+                //
+                // The BINARY cast carries "byte-wise" and, with it,
+                // "no pad" — so `utf8mb4_bin`, which pads, answered 0 to
+                // the first line. Keeping the node lets `text_compare_of`
+                // read the NAME and settle the two bits separately: it
+                // does not fold (`folds_case` says so) and it does pad
+                // (`pads_space` says so), while `is_byte_wise` still
+                // keeps the ORDERING off the locale.
+                if self.mysql_dialect && real && lc == "binary" {
                     expr = Expr::Cast {
                         expr: alloc::boxed::Box::new(expr),
                         target: CastTarget::Named("binary".to_string()),
@@ -27870,8 +28051,14 @@ fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
 /// sublink boundaries — a sublink's aggregates belong to the sublink).
 /// Backs the "aggregate functions are not allowed in a recursive query's
 /// recursive term" well-formedness check.
-fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
-    const AGG_NAMES: &[&str] = &[
+/// v7.40.0 — is this the name of an aggregate? The same list
+/// `expr_has_toplevel_aggregate` walks, exposed so the grouping-set
+/// rewrite can leave an aggregate's ARGUMENT alone.
+pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
+    AGG_NAMES.iter().any(|a| name.eq_ignore_ascii_case(a))
+}
+
+const AGG_NAMES: &[&str] = &[
         "count",
         "sum",
         "min",
@@ -27893,6 +28080,7 @@ fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
         "var_pop",
         "var_samp",
         "variance",
+        "std",
         "stddev",
         "stddev_pop",
         "stddev_samp",
@@ -27905,6 +28093,8 @@ fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
         "covar_pop",
         "covar_samp",
     ];
+
+fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
     match e {
         Expr::AggregateOrdered { .. } => true,
         Expr::FunctionCall { name, args } => {

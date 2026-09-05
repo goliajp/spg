@@ -2468,6 +2468,12 @@ pub struct LikeSpec {
     pub source: String,
     pub at: usize,
     pub options: LikeOptions,
+    /// v7.40.0 — MySQL's `CREATE TABLE b LIKE a` keeps the source's
+    /// index names (`PRIMARY`, `ks`); PostgreSQL's
+    /// `CREATE TABLE b (LIKE a INCLUDING ALL)` renames the copies after
+    /// the new table (`lb_pkey`, `lb_s_idx`). Both measured. The
+    /// spelling says which engine's rule applies.
+    pub keep_index_names: bool,
 }
 
 /// Which properties `LIKE` carries over. A bare `LIKE` copies names,
@@ -2497,6 +2503,12 @@ pub struct CreateTableStatement {
     /// answers `ERROR 1286`, and `sql_mode` claimed
     /// `NO_ENGINE_SUBSTITUTION` while doing it.
     pub engine: Option<String>,
+    /// v7.40.0 — the `AUTO_INCREMENT=N` table option: the next value
+    /// the table hands out. It was consumed and dropped, so the first
+    /// row of a table declared `AUTO_INCREMENT=100` got 1 where MySQL
+    /// 9.7.2 gives it 100 — and `SHOW CREATE TABLE`, which reproduces
+    /// the option from the counter, round-tripped a different number.
+    pub auto_increment: Option<i64>,
     pub columns: Vec<ColumnDef>,
     /// v7.39 (round 531) — the `LIKE` clauses in the column list, in
     /// the order written. Empty for a table that has none.
@@ -2624,6 +2636,12 @@ pub enum TableConstraint {
         /// v7.39 (round 711) — see PrimaryKey.
         deferrable: bool,
         initially_deferred: bool,
+        /// v7.40.0 — MySQL's per-column index prefix on a
+        /// `UNIQUE KEY k (b(4))`, aligned with `columns`. Unlike a
+        /// plain KEY's, this one CHANGES what the constraint accepts:
+        /// MySQL rejects two rows sharing the first four characters.
+        /// Empty for every PostgreSQL spelling.
+        prefix_lengths: Vec<Option<u32>>,
     },
     /// v7.13.0 — `CHECK (<expr>)` table-level constraint
     /// (mailrs round-5 G3). Column-level inline CHECKs fold into
@@ -2664,6 +2682,17 @@ pub enum TableConstraint {
     Index {
         name: Option<String>,
         columns: Vec<String>,
+        /// v7.40.0 — MySQL's per-column index prefix, `KEY k (b(4))`,
+        /// positionally aligned with `columns`. `None` for a column
+        /// written without one, which is every PostgreSQL index key.
+        ///
+        /// It was skipped by the parser and dropped, so the declaration
+        /// was accepted and the index built over the whole column with
+        /// nothing recording that a prefix had been asked for —
+        /// `SHOW INDEX` then reported `Sub_part` NULL and
+        /// `SHOW CREATE TABLE` printed `(b)` where MySQL 9.7.2 prints
+        /// `(b(4))`.
+        prefix_lengths: Vec<Option<u32>>,
     },
     /// v7.17.0 Phase 2.2 — MySQL `FULLTEXT KEY/INDEX [name]
     /// (cols)` inline declaration. Pre-v7.17 the parser
@@ -3083,6 +3112,17 @@ pub enum ColumnTypeName {
     /// v7.11.13 `BIGINT[]` — single-dimension i64 array. PG wire
     /// OID 1016.
     BigIntArray,
+    /// v7.40.0 `OID[]` — single-dimension oid array. PG wire OID
+    /// 1028.
+    ///
+    /// `DataType::OidArray` and its value, codec tag, wire encoding
+    /// and every naming surface have existed since v7.39 (round 694);
+    /// what was missing was only the DDL spelling, so
+    /// `CREATE TABLE t (c oid[])` answered `Oid[] not yet supported`
+    /// while PostgreSQL 18.6 accepts it. Capability present, routing
+    /// absent — the same shape as this repository's other hand-kept
+    /// lists.
+    OidArray,
     /// v7.12.0 `tsvector` — PG full-text search lexeme set. PG
     /// wire OID 3614. Literal: `'foo:1 bar:2'::tsvector` (PG
     /// external form). G-CRIT-3.
@@ -3158,6 +3198,14 @@ pub enum ColumnTypeName {
     BytesArray,
     VarcharArray,
     CharArray,
+    /// v7.40.0 — five array spellings PG 18.6 accepts at
+    /// `CREATE TABLE` and SPG refused at the type name. The
+    /// element types were all present; only the `[]` step was.
+    RealArray,
+    TimeArray,
+    TimeTzArray,
+    InetArray,
+    XmlArray,
     /// v7.37.5 δ — PG 14+ multirange types. Same wrapper pattern
     /// as `Range(RangeKindAst)` — one column type variant covers
     /// all six builtin multiranges, kind pins the element type.
@@ -3227,6 +3275,7 @@ impl fmt::Display for ColumnTypeName {
             Self::TextArray => f.write_str("TEXT[]"),
             Self::IntArray => f.write_str("INT[]"),
             Self::BigIntArray => f.write_str("BIGINT[]"),
+            Self::OidArray => f.write_str("oid[]"),
             Self::TsVector => f.write_str("TSVECTOR"),
             Self::TsQuery => f.write_str("TSQUERY"),
             Self::Uuid => f.write_str("UUID"),
@@ -3268,6 +3317,11 @@ impl fmt::Display for ColumnTypeName {
             Self::BytesArray => f.write_str("BYTEA[]"),
             Self::VarcharArray => f.write_str("VARCHAR[]"),
             Self::CharArray => f.write_str("CHAR[]"),
+            Self::RealArray => f.write_str("REAL[]"),
+            Self::TimeArray => f.write_str("TIME[]"),
+            Self::TimeTzArray => f.write_str("TIMETZ[]"),
+            Self::InetArray => f.write_str("INET[]"),
+            Self::XmlArray => f.write_str("XML[]"),
             Self::Multirange(k) => f.write_str(match k {
                 RangeKindAst::Int4 => "INT4MULTIRANGE",
                 RangeKindAst::Int8 => "INT8MULTIRANGE",
@@ -7503,7 +7557,11 @@ impl fmt::Display for TableConstraint {
                 }
                 Ok(())
             }
-            Self::Index { name, columns } => {
+            Self::Index {
+                name,
+                columns,
+                prefix_lengths,
+            } => {
                 f.write_str("KEY ")?;
                 if let Some(n) = name {
                     write!(f, "{} ", quote_ident(n))?;
@@ -7514,6 +7572,10 @@ impl fmt::Display for TableConstraint {
                         f.write_str(", ")?;
                     }
                     f.write_str(&quote_ident(c))?;
+                    // v7.40.0 — the declared prefix rounds back with it.
+                    if let Some(Some(p)) = prefix_lengths.get(i) {
+                        write!(f, "({p})")?;
+                    }
                 }
                 f.write_str(")")
             }
