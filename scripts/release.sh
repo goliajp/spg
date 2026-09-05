@@ -345,3 +345,19 @@ cat <<EOF
       zero-change validation (see docs/TESTING.md "Release battery")
 EOF
 fi
+
+# v7.40.3 — and put the operator back on develop.
+#
+# The train is the last thing done on master, and nothing brought you
+# back afterwards. Three commits after v7.40.2 landed on master that
+# way: ordinary development work, invisible on develop, while
+# `git push origin develop` answered "Everything up-to-date" three
+# times because the commits sat on the branch nobody was pushing. It
+# was found by a mismatch — `origin/develop..develop` empty while the
+# two refs named different commits — and not by anything that checks.
+#
+# The preflight above REFUSES to run anywhere but master, so this
+# cannot strand a later run; it only ends the one that just finished.
+git checkout -q develop 2>/dev/null \
+    && echo "release.sh: back on develop" \
+    || echo "release.sh: still on $(git rev-parse --abbrev-ref HEAD) — switch before committing" >&2
