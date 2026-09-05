@@ -2342,14 +2342,7 @@ pub(crate) fn enforce_unique_updates(
             // v7.40.0 — the UPDATE twin. It has no key DETAIL to give,
             // so MySQL's sentence names the key with an empty value
             // list, which is what the shared helper produces from one.
-            unique_violation(
-                &conname,
-                table_name,
-                &[],
-                &[],
-                uc.is_primary_key,
-                mysql,
-            )
+            unique_violation(&conname, table_name, &[], &[], uc.is_primary_key, mysql)
         };
         // v7.39 (round 166, attack A3) — probe path first.
         // r1018 — same chooser as the insert path: the probe descends on

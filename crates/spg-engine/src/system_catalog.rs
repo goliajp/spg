@@ -7820,7 +7820,9 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
     // copy of the walk. One table now.
     let mut rows: Vec<Row<'static>> = Vec::new();
     for idx in catalog_indexes(cat) {
-        let Some(t) = cat.get(&idx.table) else { continue };
+        let Some(t) = cat.get(&idx.table) else {
+            continue;
+        };
         for (seq, pos) in idx.columns.iter().enumerate() {
             let col = t
                 .schema()

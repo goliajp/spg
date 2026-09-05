@@ -8376,12 +8376,7 @@ fn mysql_datetime_column_error(
     let Some(rest) = detail.strip_prefix("date/time field value out of range: ") else {
         return e;
     };
-    let value = rest
-        .lines()
-        .next()
-        .unwrap_or(rest)
-        .trim()
-        .trim_matches('"');
+    let value = rest.lines().next().unwrap_or(rest).trim().trim_matches('"');
     EngineError::Eval(EvalError::TypeMismatch {
         detail: alloc::format!(
             "Incorrect datetime value: '{value}' for column '{col}' at row {row_no}"

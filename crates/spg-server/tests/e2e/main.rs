@@ -18,6 +18,7 @@ mod e2e_alter_rebuild;
     clippy::uninlined_format_args
 )]
 mod e2e_application_name;
+mod e2e_array_type_oids_v7400;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -258,7 +259,6 @@ mod e2e_mysqlwire_caching_sha2;
 )]
 mod e2e_mysqlwire_deprecate_eof_round504;
 mod e2e_mysqlwire_errno_round429;
-mod e2e_mysqlwire_messages_v7400;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -266,6 +266,7 @@ mod e2e_mysqlwire_messages_v7400;
     clippy::uninlined_format_args
 )]
 mod e2e_mysqlwire_handshake;
+mod e2e_mysqlwire_messages_v7400;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -411,7 +412,6 @@ mod e2e_pgwire_client_compat;
     clippy::uninlined_format_args
 )]
 mod e2e_pgwire_describe;
-mod e2e_array_type_oids_v7400;
 mod e2e_pgwire_group_commit_round178;
 mod e2e_pgwire_open_mode_round548;
 #[allow(

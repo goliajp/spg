@@ -598,9 +598,15 @@ pub(crate) fn numeric_avg_at(
     rscale: u16,
 ) -> (i128, u16) {
     let (num, den) = if rscale >= sum_scale {
-        (sum_scaled.saturating_mul(pow10_sat(rscale - sum_scale)), count)
+        (
+            sum_scaled.saturating_mul(pow10_sat(rscale - sum_scale)),
+            count,
+        )
     } else {
-        (sum_scaled, count.saturating_mul(pow10_sat(sum_scale - rscale)))
+        (
+            sum_scaled,
+            count.saturating_mul(pow10_sat(sum_scale - rscale)),
+        )
     };
     (div_round_half_away(num, den), rscale)
 }

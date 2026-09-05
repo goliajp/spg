@@ -14580,9 +14580,10 @@ impl Parser {
                 let mut key_exprs: Vec<Expr> = Vec::new();
                 for ob in &order_keys {
                     let is_key = grouping_universe.iter().any(|u| u == &ob.expr);
-                    let projected = stmt.items.iter().any(|it| {
-                        matches!(it, SelectItem::Expr { expr, .. } if expr == &ob.expr)
-                    });
+                    let projected = stmt
+                        .items
+                        .iter()
+                        .any(|it| matches!(it, SelectItem::Expr { expr, .. } if expr == &ob.expr));
                     if is_key && !projected && !key_exprs.iter().any(|k| k == &ob.expr) {
                         key_exprs.push(ob.expr.clone());
                     }
@@ -15668,9 +15669,7 @@ impl Parser {
     /// options genuinely have no meaning for SPG's storage; the engine
     /// name does, because MySQL REFUSES one it does not know and a dump
     /// with a typo in it should not quietly become a table.
-    fn consume_mysql_table_options(
-        &mut self,
-    ) -> (Option<alloc::string::String>, Option<i64>) {
+    fn consume_mysql_table_options(&mut self) -> (Option<alloc::string::String>, Option<i64>) {
         let mut engine: Option<alloc::string::String> = None;
         let mut auto_increment: Option<i64> = None;
         loop {
@@ -28059,40 +28058,40 @@ pub(crate) fn is_aggregate_function_name(name: &str) -> bool {
 }
 
 const AGG_NAMES: &[&str] = &[
-        "count",
-        "sum",
-        "min",
-        "max",
-        "avg",
-        "string_agg",
-        "array_agg",
-        "bool_and",
-        "bool_or",
-        "every",
-        "any_value",
-        "json_agg",
-        "jsonb_agg",
-        "json_object_agg",
-        "jsonb_object_agg",
-        "bit_and",
-        "bit_or",
-        "bit_xor",
-        "var_pop",
-        "var_samp",
-        "variance",
-        "std",
-        "stddev",
-        "stddev_pop",
-        "stddev_samp",
-        "range_agg",
-        "range_intersect_agg",
-        "percentile_cont",
-        "percentile_disc",
-        "mode",
-        "corr",
-        "covar_pop",
-        "covar_samp",
-    ];
+    "count",
+    "sum",
+    "min",
+    "max",
+    "avg",
+    "string_agg",
+    "array_agg",
+    "bool_and",
+    "bool_or",
+    "every",
+    "any_value",
+    "json_agg",
+    "jsonb_agg",
+    "json_object_agg",
+    "jsonb_object_agg",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "var_pop",
+    "var_samp",
+    "variance",
+    "std",
+    "stddev",
+    "stddev_pop",
+    "stddev_samp",
+    "range_agg",
+    "range_intersect_agg",
+    "percentile_cont",
+    "percentile_disc",
+    "mode",
+    "corr",
+    "covar_pop",
+    "covar_samp",
+];
 
 fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
     match e {

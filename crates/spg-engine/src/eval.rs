@@ -55,14 +55,39 @@ use datetime::{
 };
 use encoding::{decode_text, encode_text};
 pub use format::{
-    days_from_civil, format_bigint_array, format_bool_array, format_bytea_array, format_bytea_hex,
-    format_date, format_date_array, format_float, format_float_array, format_int_array,
-    format_interval, format_interval_array, format_interval_kinded, format_money, format_numeric,
-    format_numeric_array, format_numeric_kind, format_real, format_smallint_array,
-    format_text_array, format_time, format_timestamp, format_timestamp_array, format_timestamptz,
-    format_timestamptz_at, format_timetz, format_uuid_array, parse_date_literal,
+    days_from_civil,
+    format_bigint_array,
+    format_bool_array,
+    format_bytea_array,
+    format_bytea_hex,
+    format_date,
+    format_date_array,
+    format_float,
+    format_float_array,
     // v7.40.0 — the five new array text forms.
-    format_inet_array, format_real_array, format_time_array, format_timetz_array,
+    format_inet_array,
+    format_int_array,
+    format_interval,
+    format_interval_array,
+    format_interval_kinded,
+    format_money,
+    format_numeric,
+    format_numeric_array,
+    format_numeric_kind,
+    format_real,
+    format_real_array,
+    format_smallint_array,
+    format_text_array,
+    format_time,
+    format_time_array,
+    format_timestamp,
+    format_timestamp_array,
+    format_timestamptz,
+    format_timestamptz_at,
+    format_timetz,
+    format_timetz_array,
+    format_uuid_array,
+    parse_date_literal,
     parse_timestamp_literal,
 };
 // v7.39 (GUC knife 3) — session render styles + styled formatters.
@@ -3549,17 +3574,20 @@ fn mysql_coercibility(e: &Expr) -> i32 {
         Expr::FunctionCall { name, args } => {
             if matches!(
                 name.to_ascii_lowercase().as_str(),
-                "user" | "current_user" | "session_user" | "system_user" | "database"
-                    | "schema" | "version"
+                "user"
+                    | "current_user"
+                    | "session_user"
+                    | "system_user"
+                    | "database"
+                    | "schema"
+                    | "version"
             ) {
                 return 3;
             }
             args.iter().map(mysql_coercibility).min().unwrap_or(4)
         }
         Expr::Cast { expr, .. } => mysql_coercibility(expr),
-        Expr::Binary { lhs, rhs, .. } => {
-            mysql_coercibility(lhs).min(mysql_coercibility(rhs))
-        }
+        Expr::Binary { lhs, rhs, .. } => mysql_coercibility(lhs).min(mysql_coercibility(rhs)),
         Expr::Unary { expr, .. } => mysql_coercibility(expr),
         // Anything else carries a value that came from somewhere in the
         // row, which is a column's derivation.

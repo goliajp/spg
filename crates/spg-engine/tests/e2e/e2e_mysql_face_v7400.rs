@@ -37,7 +37,10 @@ fn auto_increment_works_on_an_unsigned_bigint() {
         .unwrap();
     e.execute("INSERT INTO ai (s) VALUES ('x')").unwrap();
     e.execute("INSERT INTO ai (s) VALUES ('y')").unwrap();
-    assert_eq!(rows(&mut e, "SELECT id, s FROM ai ORDER BY id"), ["1|x", "2|y"]);
+    assert_eq!(
+        rows(&mut e, "SELECT id, s FROM ai ORDER BY id"),
+        ["1|x", "2|y"]
+    );
 }
 
 /// MySQL's `CREATE TABLE b LIKE a` is the copy PostgreSQL spells
@@ -60,7 +63,10 @@ fn create_table_like_copies_the_shape_and_not_the_rows() {
     // writes `DEFAULT 'z'`, and SPG carried the catalog's stored source
     // text — `'z'::character varying` — into DDL MySQL cannot parse.
     assert!(ddl.contains("DEFAULT 'z'"), "{ddl}");
-    assert!(!ddl.contains("::"), "a PostgreSQL cast reached the DDL: {ddl}");
+    assert!(
+        !ddl.contains("::"),
+        "a PostgreSQL cast reached the DDL: {ddl}"
+    );
 }
 
 /// PostgreSQL 18.6 renames a `LIKE` copy's indexes after the new table;
@@ -76,7 +82,11 @@ fn the_postgres_spelling_of_like_still_renames_its_copies() {
         &mut e,
         "SELECT indexname FROM pg_indexes WHERE tablename = 'b' ORDER BY 1",
     );
-    assert_eq!(names, ["b_pkey", "b_s_idx"], "PostgreSQL renames the copies");
+    assert_eq!(
+        names,
+        ["b_pkey", "b_s_idx"],
+        "PostgreSQL renames the copies"
+    );
 }
 
 /// The composite key on the MySQL surface — the defect v7.39.10 and
@@ -103,7 +113,10 @@ fn a_composite_primary_key_is_one_index_named_primary() {
     // builds to back the key.
     let ddl = rows(&mut e, "SHOW CREATE TABLE mc").join("\n");
     assert!(ddl.contains("PRIMARY KEY (`a`,`b`)"), "{ddl}");
-    assert!(!ddl.contains("pkey_0_"), "an internal index reached the DDL: {ddl}");
+    assert!(
+        !ddl.contains("pkey_0_"),
+        "an internal index reached the DDL: {ddl}"
+    );
 }
 
 /// Measured on MySQL 9.7.2, the whole options tail and the two column
@@ -194,7 +207,10 @@ fn any_value_aggregates_on_one_engine_and_not_the_other() {
         // aggregate.
         assert_eq!(rows(&mut e, "SELECT ANY_VALUE(v), COUNT(*) FROM t"), both);
         assert_eq!(
-            rows(&mut e, "SELECT g, ANY_VALUE(v) FROM t GROUP BY g ORDER BY g"),
+            rows(
+                &mut e,
+                "SELECT g, ANY_VALUE(v) FROM t GROUP BY g ORDER BY g"
+            ),
             ["1|10", "2|30"]
         );
     }
@@ -259,7 +275,11 @@ fn table_constraints_answers_the_engine_you_are_speaking_to() {
     pg.execute(ddl).unwrap();
     assert_eq!(
         rows(&mut pg, q),
-        ["mc_a_not_null|CHECK", "mc_b_not_null|CHECK", "mc_pkey|PRIMARY KEY"]
+        [
+            "mc_a_not_null|CHECK",
+            "mc_b_not_null|CHECK",
+            "mc_pkey|PRIMARY KEY"
+        ]
     );
 
     let mut my = mysql();
@@ -276,7 +296,10 @@ fn the_scalar_answers_the_corpus_found() {
     // — on BOTH faces. PostgreSQL 18.6 answers it.
     assert_eq!(rows(&mut e, "SELECT (-1e308 * 10) IS NULL"), ["false"]);
     // A timestamp literal gives its time of day. Both engines.
-    assert_eq!(rows(&mut e, "SELECT TIME('2020-01-02 03:04:05')"), ["03:04:05"]);
+    assert_eq!(
+        rows(&mut e, "SELECT TIME('2020-01-02 03:04:05')"),
+        ["03:04:05"]
+    );
     // MySQL's CAST to a temporal type answers NULL for a value that is
     // not a date; the same value in an INSERT still raises.
     assert_eq!(rows(&mut e, "SELECT CAST('2020-99-99' AS DATE)"), ["NULL"]);

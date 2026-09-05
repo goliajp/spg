@@ -113,9 +113,10 @@ impl Engine {
             if uc.is_primary_key {
                 body.push_str(&alloc::format!("PRIMARY KEY ({})", col_names.join(",")));
             } else {
-                let n = uc.name.clone().unwrap_or_else(|| {
-                    crate::system_catalog::pg_unique_conname(t, uc, name)
-                });
+                let n = uc
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| crate::system_catalog::pg_unique_conname(t, uc, name));
                 body.push_str(&alloc::format!(
                     "UNIQUE KEY `{n}` ({})",
                     col_names.join(",")

@@ -8871,11 +8871,11 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::VarcharArray => 1015,     // _varchar
         DataType::CharArray => 1014,        // _bpchar
         // v7.40.0 — OIDs read off PG 18.6's own pg_type.
-        DataType::RealArray => 1021,        // _float4
-        DataType::TimeArray => 1183,        // _time
-        DataType::TimeTzArray => 1270,      // _timetz
-        DataType::InetArray => 1041,        // _inet
-        DataType::XmlArray => 143,          // _xml
+        DataType::RealArray => 1021,   // _float4
+        DataType::TimeArray => 1183,   // _time
+        DataType::TimeTzArray => 1270, // _timetz
+        DataType::InetArray => 1041,   // _inet
+        DataType::XmlArray => 143,     // _xml
         // v7.37.5 ε — PG geometry OIDs (pg_type.dat).
         DataType::Point => 600,
         DataType::Lseg => 601,

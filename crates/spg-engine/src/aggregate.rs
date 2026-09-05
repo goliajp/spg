@@ -6215,11 +6215,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                             sum_scale.saturating_add(4),
                         )
                     } else {
-                        crate::numeric::numeric_avg(
-                            sum_scaled,
-                            sum_scale,
-                            i128::from(st.num.count),
-                        )
+                        crate::numeric::numeric_avg(sum_scaled, sum_scale, i128::from(st.num.count))
                     };
                     Value::Numeric {
                         scaled,
