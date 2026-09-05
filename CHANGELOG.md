@@ -10,6 +10,30 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the panel that judges nothing took five samples to do it
+
+```text
+  prerelease, timed by the tier's own report
+    perf-sweep    752.9 s   of a 2,390 s tier
+      main panel     ~300 s   76 cells, four sizes, judged
+      locale panel   ~180 s   19 cells, judged on cost class
+      shipped panel  ~300 s   19 cells, REPORTED, NOT JUDGED
+```
+
+The three panels cost about the same, and one of them renders no
+verdict — deliberately: the bar for it has not been chosen from a
+distribution yet, so `losses` there is read by nobody.
+
+N is the sample count behind each cell's RANGE, and a range is how the
+other panels refuse to call an unresolved difference. A panel that
+decides nothing does not need five samples to decide it. It runs at
+three, which is the floor `BENCH_PROTOCOL.md` rule 4 asks of a panel
+that DOES judge; the saving is the two it never needed.
+
+And the counter-profile change from 7.40.3, measured in situ rather
+than in isolation: `gates` 404-440 s -> 304.0 s.
+
+
 ## [7.40.3] — 2026-09-05
 
 ### Fixed — the counter pins paid for a fat link they never read
