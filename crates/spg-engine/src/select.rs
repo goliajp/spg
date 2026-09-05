@@ -820,7 +820,12 @@ impl Engine {
             // column's declaration, then the database's — so calling it
             // here cannot disagree with the ungrouped path.
             let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx)?;
-            crate::orderby::sort_by_keys_in(&mut tagged, &descs, &colls);
+            crate::orderby::sort_by_keys_in(
+                &mut tagged,
+                &descs,
+                &colls,
+                self.session_parallel_workers(),
+            );
         }
         let mut out_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         // v7.37 D.41 — `SELECT DISTINCT` over a window projection: the window
@@ -3398,7 +3403,7 @@ impl Engine {
                 )?;
                 tagged.push((keys, r));
             }
-            sort_by_keys(&mut tagged, &descs);
+            sort_by_keys(&mut tagged, &descs, self.session_parallel_workers());
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
@@ -6232,7 +6237,7 @@ impl Engine {
                         build_order_keys(per_row.as_deref().unwrap_or(&resolved), &r, &synth_ctx)?;
                     tagged.push((keys, r));
                 }
-                sort_by_keys(&mut tagged, &descs);
+                sort_by_keys(&mut tagged, &descs, self.session_parallel_workers());
                 rows = tagged.into_iter().map(|(_, r)| r).collect();
             }
             apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
@@ -7742,15 +7747,27 @@ impl Engine {
                         };
                         order.push((k, u32::try_from(i).unwrap_or(u32::MAX)));
                     }
-                    order.sort_by(|(ka, ia), (kb, ib)| {
-                        let c = ka.cmp(kb);
-                        let c = if first_desc { c.reverse() } else { c };
-                        if c != core::cmp::Ordering::Equal {
-                            return c;
-                        }
-                        row_cmp_by_index(&tagged, &terms, &order_colls, mysql, *ia, *ib)
-                            .then_with(|| ia.cmp(ib))
-                    });
+                    // v7.40.4 — collated sort keys across threads. This
+                    // comparator ends on the row index like every other
+                    // one here, so it is a strict total order and the
+                    // split cannot reach a different answer; see
+                    // `crate::parsort`. It is also the path a customer on
+                    // a locale collation actually runs, which is why the
+                    // module moves its elements rather than copying them:
+                    // an ICU sort key is a `Vec<u8>`.
+                    let order = crate::parsort::sort_total(
+                        order,
+                        self.session_parallel_workers(),
+                        &|(ka, ia): &(Vec<u8>, u32), (kb, ib): &(Vec<u8>, u32)| {
+                            let c = ka.cmp(kb);
+                            let c = if first_desc { c.reverse() } else { c };
+                            if c != core::cmp::Ordering::Equal {
+                                return c;
+                            }
+                            row_cmp_by_index(&tagged, &terms, &order_colls, mysql, *ia, *ib)
+                                .then_with(|| ia.cmp(ib))
+                        },
+                    );
                     let mut slots: Vec<Option<(Vec<crate::orderby::OrderKey>, Row<'static>)>> =
                         core::mem::take(&mut tagged).into_iter().map(Some).collect();
                     tagged = order
@@ -7891,6 +7908,7 @@ impl Engine {
                         low_card,
                         exact,
                         single_term: terms.len() == 1,
+                        workers: self.session_parallel_workers(),
                     };
                     let order: Vec<u32> = match keys {
                         PrefixKeys::Narrow(v, _) => {
@@ -7945,7 +7963,13 @@ impl Engine {
                     });
                 }
             } else {
-                crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &order_colls);
+                crate::orderby::partial_sort_tagged_in(
+                    &mut tagged,
+                    keep,
+                    &descs,
+                    &order_colls,
+                    self.session_parallel_workers(),
+                );
             }
         }
 
@@ -8199,6 +8223,7 @@ impl Engine {
             &order_colls,
         )
         .with_stats(&self.spill_stats)
+        .with_workers(self.session_parallel_workers())
         .with_pruned(&needed);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
@@ -9654,6 +9679,7 @@ impl Engine {
             &order_colls,
         )
         .with_stats(&self.spill_stats)
+        .with_workers(self.session_parallel_workers())
         .with_pruned(&needed);
         let snapshot = self.current_snapshot();
         // One key buffer for the whole scan: `push` drains it and leaves
@@ -10691,7 +10717,13 @@ impl Engine {
             // single-table scan's — which is why every other shape sorted by
             // bytes no matter what the schemas carried.
             let colls = crate::orderby::order_by_collations(&stmt.order_by, &ctx)?;
-            crate::orderby::partial_sort_tagged_in(&mut tagged, keep, &descs, &colls);
+            crate::orderby::partial_sort_tagged_in(
+                &mut tagged,
+                keep,
+                &descs,
+                &colls,
+                self.session_parallel_workers(),
+            );
         }
         let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         apply_offset_and_limit(
@@ -15562,12 +15594,14 @@ struct PrefixSort {
     exact: bool,
     /// One ORDER BY term, so nothing else can speak after a tie.
     single_term: bool,
+    /// v7.40.4 — what the two parallelism GUCs say. See `crate::parsort`.
+    workers: crate::parsort::Workers,
 }
 
-fn sort_prefix_permutation<K: Copy + Ord>(
+fn sort_prefix_permutation<K: Copy + Ord + Send + Sync>(
     mut order: Vec<(K, u32)>,
     how: &PrefixSort,
-    row_cmp: &dyn Fn(u32, u32) -> core::cmp::Ordering,
+    row_cmp: &(dyn Fn(u32, u32) -> core::cmp::Ordering + Sync),
     same_value: &dyn Fn(u32, u32) -> bool,
 ) -> Vec<u32> {
     let PrefixSort {
@@ -15575,14 +15609,19 @@ fn sort_prefix_permutation<K: Copy + Ord>(
         low_card,
         exact,
         single_term,
+        workers,
     } = *how;
     if low_card {
         // Integer sort first, then one pass per run.
-        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
-            let c = pa.cmp(&pb);
-            let c = if first_desc { c.reverse() } else { c };
-            c.then_with(|| ia.cmp(&ib))
-        });
+        order = crate::parsort::sort_total(
+            order,
+            workers,
+            &|&(pa, ia): &(K, u32), &(pb, ib): &(K, u32)| {
+                let c = pa.cmp(&pb);
+                let c = if first_desc { c.reverse() } else { c };
+                c.then_with(|| ia.cmp(&ib))
+            },
+        );
         let mut lo = 0;
         while lo < order.len() {
             let mut hi = lo + 1;
@@ -15602,21 +15641,25 @@ fn sort_prefix_permutation<K: Copy + Ord>(
             lo = hi;
         }
     } else {
-        order.sort_unstable_by(|&(pa, ia), &(pb, ib)| {
-            let c = pa.cmp(&pb);
-            let c = if first_desc { c.reverse() } else { c };
-            if c != core::cmp::Ordering::Equal {
-                return c;
-            }
-            // An EXACT key that ties means the values are equal, so only
-            // the remaining terms can speak. A prefix that ties has
-            // decided nothing yet and the first term must be asked again,
-            // which `row_cmp` does by walking every term from the start.
-            if exact && single_term {
-                return ia.cmp(&ib);
-            }
-            row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
-        });
+        order = crate::parsort::sort_total(
+            order,
+            workers,
+            &|&(pa, ia): &(K, u32), &(pb, ib): &(K, u32)| {
+                let c = pa.cmp(&pb);
+                let c = if first_desc { c.reverse() } else { c };
+                if c != core::cmp::Ordering::Equal {
+                    return c;
+                }
+                // An EXACT key that ties means the values are equal, so only
+                // the remaining terms can speak. A prefix that ties has
+                // decided nothing yet and the first term must be asked again,
+                // which `row_cmp` does by walking every term from the start.
+                if exact && single_term {
+                    return ia.cmp(&ib);
+                }
+                row_cmp(ia, ib).then_with(|| ia.cmp(&ib))
+            },
+        );
     }
     order.into_iter().map(|(_, i)| i).collect()
 }

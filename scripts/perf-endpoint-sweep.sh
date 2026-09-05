@@ -238,6 +238,26 @@ server_one() { # $1=uri $2=sql $3=work_mem setting $4=1 if this leg is SPG
       END { if (n) printf "%.3f", best; else printf "n/a" }'
 }
 
+# v7.40.4 — how many PROCESSES the other engine used on this cell.
+#
+# The panel reported a ratio and said nothing about whether the two legs
+# had the same number of CPUs, and for the sort cells they did not.
+# Measured on this testbed at 400,000 rows, seven cells: every cell SPG
+# lost or tied was a cell where PostgreSQL launched parallel workers,
+# and every cell it ran on one process SPG won by 0.67x-0.79x. Three
+# releases of sort work were aimed at a comparator that had already won.
+#
+# The count comes from PostgreSQL's own EXPLAIN, which prints
+# `Workers Launched` under a Gather; absent, the answer is one. It is
+# NOT symmetric — SPG has no Gather node to print — so the column is
+# labelled as the other engine's, and it is evidence about what the
+# ratio beside it means rather than a verdict of its own.
+pg_cores_one() { # $1=uri $2=sql $3=work_mem setting
+  "${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "$3" \
+      -c "EXPLAIN (ANALYZE, TIMING OFF) $2" 2>/dev/null |
+    awk '/Workers Launched: /{ w = $3 + 0 } END { print w + 1 }'
+}
+
 lo() { printf '%s\n' "$@" | sort -g | head -1; }
 hi() { printf '%s\n' "$@" | sort -g | tail -1; }
 
@@ -523,10 +543,10 @@ TYPED_SHAPES=(
 
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0
 
-printf '\n%-8s %-26s %-16s %-16s %-9s %-9s %s\n' \
-  SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' 'SRV-SPG' 'SRV-PG' VERDICT
-printf '%-8s %-26s %-16s %-16s %-9s %-9s %s\n' \
-  -------- -------------------------- ---------------- ---------------- --------- --------- -------
+printf '\n%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s\n' \
+  SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' 'SRV-SPG' 'SRV-PG' PGCPU VERDICT
+printf '%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s\n' \
+  -------- -------------------------- ---------------- ---------------- --------- --------- ------ -------
 
 for rows in ${SIZES}; do
   T="sweep_${rows}"
@@ -604,9 +624,13 @@ for rows in ${SIZES}; do
     fi
     [[ "${v}" == LOSS ]] && LOSSES=$((LOSSES + 1))
     CELLS=$((CELLS + 1))
-    printf '%-8s %-26s %-16s %-16s %-9s %-9s %s%s\n' \
+    # v7.40.4 — how many processes the other engine used. A verdict of
+    # LOSS against three PostgreSQL processes is a different fact from
+    # the same verdict against one, and the panel printed neither.
+    pgcpu="$(pg_cores_one "${PG_URI}" "${sql}" "${PG_WM}")"
+    printf '%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s%s\n' \
       "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" \
-      "${ssrv}" "${gsrv}" "${v}" "${note}"
+      "${ssrv}" "${gsrv}" "${pgcpu}" "${v}" "${note}"
   done
 done
 
@@ -714,9 +738,10 @@ for entry in "${SORT_SHAPES[@]}"; do
   over="$(awk -v r="${ratio}" -v c="${SORT_CEILING}" 'BEGIN{ print (r > c) ? 1 : 0 }')"
   (( over )) && SORT_OVER=$((SORT_OVER + 1))
   SORT_WORST="$(awk -v a="${ratio}" -v b="${SORT_WORST}" 'BEGIN{ print (a > b) ? a : b }')"
-  printf '  %-26s %8s-%-8s %8s-%-8s  %sx  (server %7s/%-7s %sx)%s\n' \
+  pgcpu="$(pg_cores_one "${PG_URI}" "${sql}" "${PG_WM}")"
+  printf '  %-26s %8s-%-8s %8s-%-8s  %sx  (server %7s/%-7s %sx, pg on %s cpu)%s\n' \
     "${name}" "${smin}" "${smax}" "${gmin}" "${gmax}" "${wall}" \
-    "${ssrv}" "${gsrv}" "${srvr}" \
+    "${ssrv}" "${gsrv}" "${srvr}" "${pgcpu}" \
     "$( (( over )) && echo '  <- OVER CEILING' )"
 done
 

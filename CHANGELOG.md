@@ -10,6 +10,101 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [7.40.4] — 2026-09-06
+
+### Added — the sort uses more than one core, and two dead GUCs now mean something
+
+The release panel's remaining sort losses are not a comparator defect.
+Measured against PostgreSQL 18.6 on the panel's own fixtures, 400,000
+rows, both engines' own reported time, best of five per leg:
+
+```text
+  cell                            SPG   PG par  PG serial  vs par  vs ser  PG cpus
+  int                            39.7     59.3       59.1   0.67x   0.67x        1
+  two keys                       54.3     68.8       68.6   0.79x   0.79x        1
+  text (26 values)               78.3     82.0      111.3   0.95x   0.70x        3
+  short text distinct            55.1     78.3       76.5   0.70x   0.72x        1
+  long text distinct             80.0     63.7      122.1   1.26x   0.66x        3
+  long text, key not projected  110.7    102.4      177.3   1.08x   0.62x        3
+  long text top-N                 9.7      9.9       18.2   0.98x   0.53x        3
+```
+
+Seven cells out of seven: every cell SPG lost or tied is a cell where
+PostgreSQL launched parallel workers, and every cell PostgreSQL ran on
+one process SPG won by 0.67x-0.79x. Against a serial PostgreSQL SPG wins
+all seven. Per core it was already ahead everywhere; what was left on the
+scoreboard was two CPUs.
+
+SPG had no parallel execution of any kind, and
+`max_parallel_workers_per_gather` and `max_parallel_workers` both sat in
+the GUC catalogue where a customer could set them, `SHOW` them back, and
+get one thread. Both are read now. A large sort splits, sorts the pieces
+on threads and merges the pairs on threads; the per-gather GUC decides
+the fan-out (PG's default of 2 means three pieces, the shape PG uses) and
+the cluster-wide one is a lease shared by every sort in the process, so
+twenty connections sorting at once cannot take twenty times the threads.
+Zero means the serial path, exactly as before.
+
+The split cannot change an answer. Most of these comparators end on the
+row index, so no two distinct elements compare equal and a strict total
+order has exactly one sorted arrangement. Where a comparator does not —
+`cmp_multi_key_in` has no tie-break on position — the parallel sort is
+the stable one: stable pieces, and a merge that prefers the earlier run
+on a tie.
+
+**What it is worth, measured.** Same binary, the GUC as the ablation,
+samples rotated between the settings, 400,000 rows, server-reported,
+both collations:
+
+```text
+                                collation C        locale collation
+  cell                          off     on         off     on
+  int                             -       -       49.1   40.3
+  two keys                     59.1    53.5       61.7   60.0
+  text (26 values)             81.9    78.8       98.6   94.5
+  short text distinct          55.6    50.3       65.6   61.3
+  long text distinct           89.6    84.2       96.7   95.6
+  long text, key not projected 117.6   114.3      118.0  114.3
+  long text top-N               11.6    11.6       10.7   10.8
+```
+
+3-10% on most cells, 18% on one, and nothing on `top-N` — that cell takes
+a `select_nth`, not a sort, and nothing here touches it. The order
+digests are identical off and on in all fourteen. This is a smaller win
+than three processes suggests, and it does not by itself close the gap
+above; it is one core's worth of the two that are missing.
+
+### Fixed — six sorts of the same rows, and the first fix reached four of them
+
+The pins for the change above were green while the feature was not on the
+customer's path, and finding that out is the more useful half of this
+release.
+
+An autocommit `SELECT … ORDER BY` over the wire does not take the
+executor the engine's own tests take. It goes
+`execute_readonly_select_streaming` -> `try_exec_joined_streaming` ->
+`try_spill_sorted_stream` -> `extsort.rs`, and none of the four sorts the
+first version wired are on it. A server built with all four replaced by
+"return the input untouched" answered `SELECT k FROM sw ORDER BY k` over
+400,000 rows correctly sorted, and did the same at three rows.
+`readonly.rs` says so in its own comment — "THIS is the route every
+autocommit SELECT takes over the wire" — five releases before anyone read
+it.
+
+All six are wired now, and each is proved reached by ablation rather than
+by reading. The new pin
+(`e2e_sort_parallel_wire_v7404`) talks to a real `spg-server` over
+pgwire, because a pin on an `Engine` is not a pin on the server and the
+release panel measures the server.
+
+### Fixed — the panel reported a ratio and not how many CPUs produced it
+
+A cell reading 1.26x against three PostgreSQL processes is a different
+fact from the same cell against one, and all three panels printed the
+same thing for both. Every row now carries the other engine's launched
+worker count, taken from its own `EXPLAIN`.
+
 ### Fixed — the panel that judges nothing took five samples to do it
 
 ```text

@@ -83,6 +83,7 @@ mod notify;
 mod numeric;
 mod opclass;
 mod orderby;
+mod parsort;
 mod partition;
 pub(crate) mod partition_walks;
 pub mod plan_cache;
