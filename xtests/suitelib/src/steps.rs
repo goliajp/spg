@@ -608,6 +608,33 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         .map(|(n, kb)| format!("{n}={} MB", kb / 1024))
         .collect();
     let _ = std::fs::remove_dir_all(&tmp);
+    // v7.40.0 — the three panels' own TABLES are kept, not just their
+    // verdict lines.
+    //
+    // `sh` captures the script's stdout, the step returns one summary
+    // line, and the report JSON keeps name, status and timing. So every
+    // number the sweep prints — nineteen cells times four sizes, the
+    // sort panel, and the two server-reported columns added in this
+    // version — existed only inside a String that was dropped. The
+    // transport-free columns were added precisely because the client
+    // wall clock at this size is mostly wire; a column no reader can
+    // reach answers nothing.
+    //
+    // Written before the first early return, so a failing run keeps its
+    // tables too — that is when they are wanted most.
+    let main_text = match &out {
+        Ok(t) | Err(t) => t.clone(),
+    };
+    let both = match &locale_out {
+        Ok(t) => t.clone(),
+        Err(e) => e.clone(),
+    };
+    let panels = crate::proclib::run_tmp_dir(&format!("{runid}-sweep-panels.txt"));
+    let _ = std::fs::write(
+        &panels,
+        format!("===PG18===\n{main_text}\n===LOCALE-AND-SHIPPED===\n{both}\n"),
+    );
+    let panels = panels.display().to_string();
     let text = out?;
     let verdict = text
         .lines()
@@ -616,7 +643,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         .unwrap_or("(no verdict line)")
         .to_string();
     if !verdict.contains("losses=0") {
-        return Err(format!("sweep verdict: {verdict}"));
+        return Err(format!("sweep verdict: {verdict}; panels: {panels}"));
     }
     // v7.38.19 — the panel's verdict LINE, whether the script exited 0
     // or not.
@@ -633,10 +660,6 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     // gate run went green on exactly that. The line is extracted from
     // either outcome now, and its ABSENCE is the failure: a script that
     // printed no summary never got far enough to have one.
-    let both = match &locale_out {
-        Ok(t) => t.clone(),
-        Err(e) => e.clone(),
-    };
     // v7.38.22 — two panels arrive in one string, so grade them apart.
     //
     // `verdict_line` reads BACKWARDS for the last `cells=` line. With the
@@ -650,7 +673,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     let Some(locale_verdict) = verdict_line(&locale_text) else {
         return Err(format!(
             "locale-collation panel: no verdict line — it never got far enough \
-             to have one: {}",
+             to have one: {}; panels: {panels}",
             locale_text.lines().take(6).collect::<Vec<_>>().join(" / ")
         ));
     };
@@ -709,7 +732,7 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         return Err(format!(
             "locale-collation panel: {locale_verdict} — a declared collation \
              changed the cost class against the same binary under `C`; \
-             shipped-default panel said: {}",
+             shipped-default panel said: {}; panels: {panels}",
             verdict_or_first_line(shipped_text.as_deref())
         ));
     }
@@ -737,7 +760,8 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
     let shipped_note = verdict_or_first_line(shipped_text.as_deref());
     Ok(format!(
         "{verdict}; locale panel {locale_verdict}; shipped-default panel \
-         (SPG en_US vs PG18 en_US, reported not judged) {shipped_note}; peak rss: {}",
+         (SPG en_US vs PG18 en_US, reported not judged) {shipped_note}; peak rss: {}; \
+         panels: {panels}",
         peak_note.join(", ")
     ))
 }

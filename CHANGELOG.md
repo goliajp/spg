@@ -285,6 +285,34 @@ One value, from one place.
 argument and returns an integer, which is what a query written against
 MySQL compares and sums.
 
+### Added — the perf panel reports server-reported time next to the client wall clock
+
+The correction below says the panel could not see the question it was
+being asked. Two columns answer it now. `SRV-SPG` and `SRV-PG` are the
+median of five `EXPLAIN (ANALYZE, TIMING OFF)` runs of the same
+statement on the same leg — PostgreSQL's planning plus execution, SPG's
+execution — so the client, the socket and the container's forwarded
+port are all outside the number.
+
+```text
+  SIZE  SHAPE                    SPGS(min-max)  PG18(min-max)  SRV-SPG  SRV-PG
+  1000  wide, non-indexed key    0.608-0.718    0.600-0.743    0.170    0.138
+  1000  prefix walk, all rows    0.104-0.176    0.207-0.273    0.004    0.016
+```
+
+Reported, not judged: the verdict still comes from the wall clock and
+its control leg, because that is the distribution the ceilings were
+chosen from. What the two columns add is the ability to tell a cell
+where the engines differ from a cell where the transports do — 0.104 ms
+of wall clock against 0.004 ms of engine, on the row above, is 96 % wire.
+
+And the panels are kept. `sh` captured the script's output, the step
+returned one summary line, and the report JSON holds name, status and
+timing — so every table the sweep printed lived in a String that was
+dropped. The three panels are written to
+`/tmp/spg-tests/spg-suite-<runid>-sweep-panels.txt` before the first
+early return, and every outcome names the path.
+
 ### Corrected — what 7.39.13's release note said about its own perf panel
 
 That note quotes the panel's `prefix walk` cells as wins over
