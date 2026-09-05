@@ -614,10 +614,39 @@ mod unit_tier_spawns {
     /// shared, however it is invoked.
     #[test]
     fn no_step_rebuilds_the_world_to_test_one_package() {
-        let sh = gate_sh();
-        let offenders: Vec<&str> = sh
-            .lines()
-            .map(str::trim)
+        // v7.40.3 — continuations are JOINED before the scan.
+        //
+        // The exemption is "a different feature set is a different
+        // artefact", and it was tested one line at a time. A shell
+        // command that wraps puts `-p spg-engine` on one line and
+        // `--features perf-counters` on the next, and the rule then
+        // reads the first half as an offender and the second half as
+        // nothing at all. That is what happened the first time the
+        // counter pins moved to their own profile: the invocation was
+        // unchanged in substance and the pin went red on the line
+        // break.
+        //
+        // The unit of the rule is the COMMAND. Joining trailing
+        // backslashes makes the text match it.
+        let raw = gate_sh();
+        let mut joined: Vec<String> = Vec::new();
+        let mut acc = String::new();
+        for line in raw.lines() {
+            let t = line.trim();
+            if let Some(head) = t.strip_suffix('\\') {
+                acc.push_str(head.trim_end());
+                acc.push(' ');
+            } else {
+                acc.push_str(t);
+                joined.push(core::mem::take(&mut acc));
+            }
+        }
+        if !acc.is_empty() {
+            joined.push(acc);
+        }
+        let offenders: Vec<&str> = joined
+            .iter()
+            .map(String::as_str)
             .filter(|l| !l.starts_with('#'))
             .filter(|l| l.contains("cargo test") && l.contains(" -p "))
             .filter(|l| !l.contains("--features"))

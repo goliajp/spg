@@ -240,8 +240,8 @@ run_gates() {
     # outside the gate that runs is a pin that does not exist.
     for target in uniq_prune_counters uniq_composite_probe pred_int_lane_counters; do
         banner "gates: ${target} (perf-counters, own process)"
-        cargo test --release --locked -p spg-engine --features perf-counters \
-            --test "$target"
+        cargo test --profile release-counters --locked \
+            -p spg-engine --features perf-counters --test "$target"
     done
     # r1049 — the sqlx suite, against a server this gate starts itself.
     #

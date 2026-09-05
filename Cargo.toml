@@ -222,6 +222,28 @@ inherits = "release"
 debug    = "line-tables-only"
 strip    = "none"
 
+# v7.40.3 — the counter pins, which assert COUNTS and never a duration.
+#
+# `gates` runs three of them under `--features perf-counters`, and that
+# feature must stay out of the workspace graph (round 718: it leaked
+# through a shared build and made target/release/spg-server 7-13x
+# slower). A separate feature set is a separate build, and under
+# `release` that build is fat LTO with one codegen unit.
+#
+# Priced from the tier's own reports: `gates` is 404-440 s on the runs
+# where the engine changed and 68 s on the runs where it did not, so
+# roughly 340 s of the step is this one rebuild — about 15% of the whole
+# prerelease tier.
+#
+# What those pins read is `UNIQ_PROBE_*`, explicit increments in the
+# engine's own code. Whole-program inlining does not change how many
+# times an explicit `+= 1` runs, so the fat link buys them nothing.
+# Thin LTO with sixteen codegen units builds the same counts.
+[profile.release-counters]
+inherits      = "release"
+lto           = "thin"
+codegen-units = 16
+
 [profile.dev]
 # debug=1 (line tables) instead of the default 2 (full DWARF). Backtraces keep
 # file and line; what is lost is variable inspection in a debugger, which this
