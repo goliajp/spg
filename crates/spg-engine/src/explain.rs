@@ -1370,18 +1370,40 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
                 .filter_map(|i| promoted_key_for(from, i, &where_eq))
                 .collect();
             let scan_where = without_conjuncts(stmt.where_.as_ref(), &promoted_all);
-            let mut left = scan_node(
-                engine,
-                &from.primary.name,
-                from.primary.alias.as_deref(),
-                scan_where.as_ref().or(if promoted_all.is_empty() {
-                    stmt.where_.as_ref()
-                } else {
-                    None
-                }),
-                &cte_names,
-                engine.stmt_takes_index_only_scan(stmt),
-            );
+            // v7.40.5 — a derived table is a SUB-PLAN, not a relation.
+            //
+            // `FROM (SELECT … ORDER BY …) z` reached `scan_node` with `z`
+            // as a table name and produced `Seq Scan on z rows=0`: a scan
+            // of a relation that does not exist, reporting zero rows for
+            // something that produced forty thousand, with the sort inside
+            // it nowhere in the plan. Differenced against PG 18.6, which
+            // renders the sub-plan under the outer node:
+            //
+            //     Aggregate
+            //       ->  Sort
+            //             Sort Key: sf.s
+            //             Sort Method: external merge  Disk: 13504kB
+            //             ->  Seq Scan on sf
+            //
+            // `build_plan_tree` is already recursive — the UNION arm above
+            // calls it per branch — so the sub-plan is the same call, and
+            // everything this function stacks above `left` stacks the same
+            // way on it.
+            let mut left = match from.primary.lateral_subquery.as_deref() {
+                Some(inner) => build_plan_tree(inner, engine),
+                None => scan_node(
+                    engine,
+                    &from.primary.name,
+                    from.primary.alias.as_deref(),
+                    scan_where.as_ref().or(if promoted_all.is_empty() {
+                        stmt.where_.as_ref()
+                    } else {
+                        None
+                    }),
+                    &cte_names,
+                    engine.stmt_takes_index_only_scan(stmt),
+                ),
+            };
             // Fold joins left-deep: equality ON -> Hash Join (right side
             // wrapped in a Hash node, like PG); anything else ->
             // Nested Loop with a Join Filter.
