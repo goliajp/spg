@@ -110,6 +110,42 @@ fn run(prog: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// Paths a run dirtied that it found clean.
+///
+/// Parsed from `git status --porcelain` either side of the run. A tree
+/// that was ALREADY dirty going in is the operator's business — this
+/// answers only "did the run change something it should have put back".
+///
+/// v7.40.7 — because the list of files to put back was written twice
+/// and the two copies disagreed, so every prerelease left
+/// `xtests/dump_compat/report.md` modified while the code that did it
+/// carried a comment about how a dirty tree once broke a release
+/// preflight. A list that has to be right is worse than a check that
+/// says when it is not.
+#[must_use]
+pub fn newly_dirty(before: &str, after: &str) -> Vec<String> {
+    let paths = |s: &str| -> std::collections::BTreeSet<String> {
+        s.lines()
+            .filter(|l| l.len() > 3)
+            .map(|l| {
+                let rest = &l[3..];
+                // A rename prints `R  old -> new`; the new name is the
+                // one that is now on disk.
+                rest.rsplit(" -> ")
+                    .next()
+                    .unwrap_or(rest)
+                    .trim()
+                    .to_string()
+            })
+            .collect()
+    };
+    let b = paths(before);
+    paths(after)
+        .into_iter()
+        .filter(|p| !b.contains(p))
+        .collect()
+}
+
 /// Exclusive right to run a tier in this working copy.
 ///
 /// Held as a directory, because `mkdir` is the atomic create: two
@@ -217,7 +253,7 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunLock, owner_pid, pid_alive, sweeper_blocking};
+    use super::{RunLock, newly_dirty, owner_pid, pid_alive, sweeper_blocking};
 
     const REPO: &str = "/Users/doracawl/workspace/goliajp/spg-ci";
 
@@ -278,6 +314,41 @@ mod tests {
             sweeper_blocking("zsh\n", &on_us, REPO),
             None,
             "the log is a record, not a running process"
+        );
+    }
+
+    #[test]
+    fn a_run_that_dirties_nothing_reports_nothing() {
+        assert!(newly_dirty("", "").is_empty());
+        assert!(newly_dirty(" M a.rs\n", " M a.rs\n").is_empty());
+    }
+
+    #[test]
+    fn a_file_the_run_modified_is_named() {
+        assert_eq!(
+            newly_dirty("", " M xtests/dump_compat/report.md\n"),
+            vec!["xtests/dump_compat/report.md".to_string()],
+            "this is the one that made --resume carry nothing"
+        );
+    }
+
+    #[test]
+    fn a_tree_that_was_already_dirty_is_the_operators_business() {
+        assert!(
+            newly_dirty(" M a.rs\n?? b.rs\n", " M a.rs\n?? b.rs\n").is_empty(),
+            "running a tier on a working tree is normal; changing it is not"
+        );
+        assert_eq!(
+            newly_dirty(" M a.rs\n", " M a.rs\n M c.rs\n"),
+            vec!["c.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_rename_is_named_by_where_the_file_now_is() {
+        assert_eq!(
+            newly_dirty("", "R  old.rs -> new.rs\n"),
+            vec!["new.rs".to_string()]
         );
     }
 

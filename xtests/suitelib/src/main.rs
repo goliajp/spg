@@ -489,6 +489,25 @@ fn main() {
                     }
                 }
             }
+            // v7.40.7 — what the working tree looked like going in.
+            //
+            // A run must put back everything it regenerates. The list
+            // that does that was written twice and the copies
+            // disagreed, so every prerelease left one report file
+            // modified; nothing in the tree could say so. `--resume`
+            // found it by accident, because a digest of the tree is a
+            // good detector of things that change when nothing should
+            // have. This makes it a verdict rather than an accident.
+            //
+            // The release flow keeps those reports on purpose
+            // (`SUITE_KEEP_REPORTS=1`) so it can commit them as its
+            // chore; there the check would be asserting the opposite of
+            // what is wanted.
+            let dirty_before = if std::env::var("SUITE_KEEP_REPORTS").is_err() {
+                Some(run_cmd("git status --porcelain"))
+            } else {
+                None
+            };
             let mut failed: Option<String> = None;
             let t_total = std::time::Instant::now();
             let tier_steps = m.tier(tier);
@@ -612,15 +631,7 @@ fn main() {
                         if results.iter().any(|(n, ..)| n == "biz")
                             && std::env::var("SUITE_KEEP_REPORTS").is_err()
                         {
-                            let _ = std::process::Command::new("git")
-                                .args([
-                                    "checkout",
-                                    "--",
-                                    "xtests/sqllogictest/report.json",
-                                    "xtests/sqllogictest/report.md",
-                                    "xtests/data_compat/report.md",
-                                ])
-                                .status();
+                            restore_generated_reports();
                         }
                         idx += batch.len();
                         continue;
@@ -694,16 +705,7 @@ fn main() {
                 // dirty tree after prerelease is what broke a release
                 // preflight once.
                 if name == "biz" && std::env::var("SUITE_KEEP_REPORTS").is_err() {
-                    let _ = std::process::Command::new("git")
-                        .args([
-                            "checkout",
-                            "--",
-                            "xtests/sqllogictest/report.json",
-                            "xtests/sqllogictest/report.md",
-                            "xtests/data_compat/report.md",
-                            "xtests/dump_compat/report.md",
-                        ])
-                        .status();
+                    restore_generated_reports();
                 }
                 match outcome {
                     Ok(note) => println!("  ok    {:<16} {note}", name),
@@ -718,6 +720,19 @@ fn main() {
             let report = ledger
                 .write(&root.join("target"))
                 .expect("write suite report");
+            if let Some(before) = &dirty_before {
+                let after = run_cmd("git status --porcelain");
+                let dirtied = suitelib::preflightlib::newly_dirty(before, &after);
+                if !dirtied.is_empty() {
+                    println!(
+                        "  FAIL  tree-dirtied    the run left these changed: {}",
+                        dirtied.join(", ")
+                    );
+                    if failed.is_none() {
+                        failed = Some(format!("tree-dirtied: {dirtied:?}"));
+                    }
+                }
+            }
             if tier == "full" && failed.is_none() {
                 let leaked: Vec<String> =
                     tmp_spg_entries().difference(&tmp_before).cloned().collect();
@@ -930,6 +945,33 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+/// The tracked reports the `biz` step regenerates, put back after it.
+///
+/// v7.40.7 — one list, because there were two and they disagreed. The
+/// parallel-group path named three files and the single-step path named
+/// four, and `biz` runs in the `corpus` group — so every prerelease run
+/// left `xtests/dump_compat/report.md` modified in the working tree.
+///
+/// The comment at the call site has said since v7.38 that "a dirty tree
+/// after prerelease is what broke a release preflight once". It has been
+/// leaving one all along, on the path it actually takes.
+///
+/// Found by `--resume`, which digests the working tree: the first run
+/// dirtied this file, so the second run's digest could not match and it
+/// carried nothing. A cache key is a good detector of things that
+/// change when nothing should have.
+fn restore_generated_reports() {
+    const GENERATED: [&str; 4] = [
+        "xtests/sqllogictest/report.json",
+        "xtests/sqllogictest/report.md",
+        "xtests/data_compat/report.md",
+        "xtests/dump_compat/report.md",
+    ];
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["checkout", "--"]).args(GENERATED);
+    let _ = cmd.status();
 }
 
 fn run_cmd(cmd: &str) -> String {
