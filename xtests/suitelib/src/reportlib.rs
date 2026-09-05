@@ -19,6 +19,14 @@ pub enum StepStatus {
     Pass,
     Fail,
     Skipped,
+    /// v7.40.7 — proved by an earlier run over this same tree, and not
+    /// executed here (`--resume`).
+    ///
+    /// Its own status rather than `Pass` on purpose: a report that
+    /// prints `pass` for work this run did not do is the same lie as a
+    /// green that never ran. The verdict counts it as not-failing; the
+    /// reader can always see which of the two it was.
+    Carried,
 }
 
 #[derive(Debug)]
@@ -36,6 +44,9 @@ pub struct StepRecord {
     /// the machine was quiet for that hour, because the only two
     /// samples sat either side of it.
     pub load_end: f64,
+    /// v7.40.7 — for a [`StepStatus::Carried`] step, the run that
+    /// actually executed it. `None` for everything this run ran itself.
+    pub carried_from: Option<String>,
 }
 
 pub struct Ledger {
@@ -65,6 +76,11 @@ pub struct Ledger {
     /// else, and the reader is the one who has to know which.
     pub load_start: f64,
     pub load_end: Option<f64>,
+    /// v7.40.7 — the working tree this run judged, as a digest
+    /// (`resumelib::tree_digest`). It is what makes `--resume` sound:
+    /// a later run carries a step forward only when its own digest is
+    /// this one, byte for byte.
+    pub tree: Option<String>,
     started: Instant,
     /// v7.39.13 — readable, because the verdict needs the reference
     /// step's own reading to know how slow the host was.
@@ -104,6 +120,7 @@ impl Ledger {
             band: 1,
             load_start: load_avg_1m(),
             load_end: None,
+            tree: None,
             started: Instant::now(),
             steps: Vec::new(),
         }
@@ -132,6 +149,7 @@ impl Ledger {
             duration: t0.elapsed(),
             budget,
             load_end: load_avg_1m(),
+            carried_from: None,
         });
         out
     }
@@ -157,6 +175,24 @@ impl Ledger {
             duration,
             budget,
             load_end: load_avg_1m(),
+            carried_from: None,
+        });
+    }
+
+    /// v7.40.7 — record a step this run did NOT execute because an
+    /// earlier run proved it over the same tree (`--resume`).
+    ///
+    /// The duration is the one the work took THERE. Reusing it keeps
+    /// the report's per-step history comparable; the `carried` status
+    /// is what tells a reader the run did not spend it.
+    pub fn record_carried(&mut self, name: &str, duration: Duration, from_runid: &str) {
+        self.steps.push(StepRecord {
+            name: name.to_string(),
+            status: StepStatus::Carried,
+            duration,
+            budget: None,
+            load_end: load_avg_1m(),
+            carried_from: Some(from_runid.to_string()),
         });
     }
 
@@ -167,6 +203,7 @@ impl Ledger {
             duration: Duration::ZERO,
             budget: None,
             load_end: load_avg_1m(),
+            carried_from: None,
         });
     }
 
@@ -186,6 +223,9 @@ impl Ledger {
         let _ = writeln!(out, "  \"tier\": \"{}\",", self.tier);
         let _ = writeln!(out, "  \"runid\": \"{}\",", self.runid);
         let _ = writeln!(out, "  \"band\": {},", self.band);
+        if let Some(t) = &self.tree {
+            let _ = writeln!(out, "  \"tree\": \"{t}\",");
+        }
         let _ = writeln!(out, "  \"load_start\": {:.2},", self.load_start);
         let _ = writeln!(out, "  \"load_end\": {:.2},", self.load_end.unwrap_or(-1.0));
         let _ = writeln!(
@@ -199,6 +239,7 @@ impl Ledger {
                 StepStatus::Pass => "pass",
                 StepStatus::Fail => "fail",
                 StepStatus::Skipped => "skipped",
+                StepStatus::Carried => "carried",
             };
             let _ = write!(
                 out,
@@ -211,6 +252,9 @@ impl Ledger {
                 let _ = write!(out, ", \"budget_ms\": {}", b.as_millis());
             }
             let _ = write!(out, ", \"load_end\": {:.2}", s.load_end);
+            if let Some(from) = &s.carried_from {
+                let _ = write!(out, ", \"carried_from\": \"{from}\"");
+            }
             out.push('}');
             out.push_str(if i + 1 < self.steps.len() {
                 ",\n"
