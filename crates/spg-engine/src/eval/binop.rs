@@ -6258,6 +6258,54 @@ pub(super) fn compare(
         // (microseconds since midnight / integer cents). PG defines a
         // full btree ordering for both.
         (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        // v7.39.13 — MySQL's `YEAR` against itself and against an
+        // integer. `WHERE k = 2007` selects on MySQL 9.7.2 and raised
+        // here; a year IS a number there, and `>`, `ORDER BY` and
+        // `MAX` all answer on it.
+        // Written as explicit pairs rather than a guard: a guarded arm
+        // here would call `data_type()` for every OTHER pair that
+        // reaches this far down the match, and none of them is a year.
+        (Value::Year(a), Value::Year(b)) => a.cmp(b),
+        (Value::Year(y), Value::SmallInt(n)) => i64::from(*y).cmp(&i64::from(*n)),
+        (Value::Year(y), Value::Int(n)) => i64::from(*y).cmp(&i64::from(*n)),
+        (Value::Year(y), Value::BigInt(n)) => i64::from(*y).cmp(n),
+        (Value::SmallInt(n), Value::Year(y)) => i64::from(*n).cmp(&i64::from(*y)),
+        (Value::Int(n), Value::Year(y)) => i64::from(*n).cmp(&i64::from(*y)),
+        (Value::BigInt(n), Value::Year(y)) => n.cmp(&i64::from(*y)),
+        // v7.39.13 — TIMETZ had NO arm here, so `timetz = timetz`,
+        // `<`, `BETWEEN` and every other comparison raised `operator
+        // does not exist: time with time zone = time with time zone`
+        // — a type SPG stores, renders and accepts in DDL, with no
+        // operator to ask a question about it.
+        //
+        // The order is `spg_storage::timetz_sort_key`, the one
+        // definition all three surfaces read — measured on PostgreSQL
+        // 18.6 rather than assumed: the UTC-equivalent instant first,
+        // then the OFFSET DESCENDING. Values sharing an instant are
+        // DISTINCT, and which zone they were written in decides their
+        // order:
+        //
+        // ```text
+        //   ORDER BY k     07:00:00+01   (06:00 UTC)
+        //                  06:59:59+00
+        //                  09:00:00+02   -+
+        //                  07:00:00+00    |  all 07:00 UTC,
+        //                  02:00:00-05    |  offset descending
+        //                  01:00:00-06   -+
+        // ```
+        //
+        // `'07:00:00+00' = '02:00:00-05'` is FALSE on PostgreSQL, which
+        // is why the instant alone cannot be the whole key.
+        (
+            Value::TimeTz {
+                us: ua,
+                offset_secs: oa,
+            },
+            Value::TimeTz {
+                us: ub,
+                offset_secs: ob,
+            },
+        ) => spg_storage::timetz_sort_key(*ua, *oa).cmp(&spg_storage::timetz_sort_key(*ub, *ob)),
         (Value::Money(a), Value::Money(b)) => a.cmp(b),
         // v7.37.17 — BYTEA bytewise unsigned comparison (PG `byteacmp`).
         (Value::Bytes(a), Value::Bytes(b)) => a.as_ref().cmp(b.as_ref()),

@@ -8524,8 +8524,32 @@ impl Engine {
                     } else {
                         None
                     };
-                    if let Some(lit) = lit
-                        && let Ok(v) = crate::conversions::literal_expr_to_value(lit.clone())
+                    // v7.39.13 — a BARE literal means whatever the
+                    // COLUMN says it means, and
+                    // `literal_as_column_value` is the one place that
+                    // decision is made. Asking
+                    // `literal_expr_to_value` instead made this the
+                    // fifth copy of it, and it read every string
+                    // literal as text: `WHERE k = '\x07'` on a `bytea`
+                    // column built no key at all, so the walk declined
+                    // and the plan went back to sorting the table —
+                    // while the EQUALITY seek beside it, which does ask
+                    // the one funnel, used the very same index.
+                    //
+                    // Anything that is not a bare literal — a cast, a
+                    // negation — already carries its own type, and
+                    // `from_value_for_column` decides whether that type
+                    // keys for this column.
+                    let v = match lit {
+                        Some(Expr::Literal(l)) => {
+                            crate::index_access::literal_as_column_value(l, col, col_pos)
+                        }
+                        Some(other) => {
+                            crate::conversions::literal_expr_to_value(other.clone()).ok()
+                        }
+                        None => None,
+                    };
+                    if let Some(v) = v
                         && !v.is_null()
                         && let Some(k) = spg_storage::IndexKey::from_value_for_column(&v, col.ty)
                     {
@@ -11823,10 +11847,34 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         Value::Timestamp(t) => return Ok(OrderKey::Int(i128::from(*t))),
         Value::Time(us) => return Ok(OrderKey::Int(i128::from(*us))),
         Value::Year(y) => return Ok(OrderKey::Int(i128::from(*y))),
+        // v7.39.13 — the UTC instant is only HALF the key.
+        //
+        // This ordered by the instant alone, so the values that share
+        // one were called equal and a stable sort then returned them in
+        // insertion order — an answer, not a tie-break. Measured on
+        // PostgreSQL 18.6 against this engine, six rows, one column:
+        //
+        // ```text
+        //   PG 18.6        SPG 7.39.12
+        //   07:00:00+01    07:00:00+01
+        //   06:59:59+00    06:59:59+00
+        //   09:00:00+02    07:00:00+00   <- the four that share
+        //   07:00:00+00    02:00:00-05      07:00 UTC, in the
+        //   02:00:00-05    09:00:00+02      order they were written
+        //   01:00:00-06    01:00:00-06
+        // ```
+        //
+        // PostgreSQL breaks the tie by OFFSET DESCENDING, and
+        // `'07:00:00+00' = '02:00:00-05'` is FALSE there. Shifting the
+        // instant left by 32 bits leaves room for the offset underneath
+        // it — `i128` holds both exactly, where `i64` could not — and
+        // `compare` in `eval::binop` orders the same pair the same way,
+        // from the same measurement.
         Value::TimeTz { us, offset_secs } => {
-            return Ok(OrderKey::Int(
-                i128::from(*us) - i128::from(*offset_secs) * 1_000_000,
-            ));
+            return Ok(OrderKey::Int(i128::from(spg_storage::timetz_sort_key(
+                *us,
+                *offset_secs,
+            ))));
         }
         Value::Money(c) => return Ok(OrderKey::Int(i128::from(*c))),
         _ => {}

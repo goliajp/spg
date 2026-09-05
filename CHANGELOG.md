@@ -10,6 +10,144 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — nine hours, silently, on every write of a query result into a `timestamptz` column
+
+One instant, epoch 1767225600, copied six ways under `SET
+TimeZone='Asia/Tokyo'`:
+
+```text
+                                   before       after     PG 18.6
+  INSERT INTO d SELECT ts        1767193200  1767225600  1767225600
+  UPDATE d SET v = (SELECT ts …) 1767193200  1767225600  1767225600
+  UPDATE d SET v = s.ts FROM s   1767193200  1767225600  1767225600
+  CREATE TABLE d AS SELECT ts    1767225600  1767225600  1767225600
+  INSERT … VALUES ('…+00')       1767225600  1767225600  1767225600
+  INSERT INTO naive SELECT ts    1767225600  1767258000  1767258000
+```
+
+The third row has no subquery in it, which rules out "a value that
+round-trips through a literal" as the boundary: it is every assignment
+whose source is a query expression. The last row was not reported and
+is the same defect from the other side — PostgreSQL renders an instant
+in the session zone on its way into a NAIVE column and SPG stored the
+UTC unchanged. The localisation was applied in exactly the two places
+it did not belong and neither of the two where it did.
+
+Three causes. `expr_names_an_instant` asked the SYNTAX and knew two
+shapes, so a column reference and a scalar subquery both answered "not
+an instant"; it asks the TYPE first now and keeps the syntactic answer
+as the fallback. It did not recognise the cast written as
+`CastTarget::Named("timestamptz")`, which is the form
+`value_to_literal_expr_typed` produces — the type was carried the whole
+way and dropped at the last step. And `INSERT … SELECT` materialised
+its rows through a literal builder never told the source column's type,
+though the type sat in the same `QueryResult` behind a `..`.
+
+### Fixed — a live 500 on `unnest` of two arrays
+
+`unnest(uuid[], text[])` raised `unnest() expects array arguments, got
+uuid[]` — a sentence that names an array type as its reason for saying
+the argument is not an array. `unnest_zip_rows` carried its own
+three-entry element map, Text/Int/BigInt, while the single-argument
+path used the workspace's full one. That is the third arm of a sentence
+`array_element_at` already carries. It shares `array_elements` and
+`array_element_type` now, so there is no list left to fall behind.
+
+### Fixed — `pg_index` reported a guess, and one direction of it was dangerous
+
+SPG builds a SINGLE-column index for a composite constraint added by
+`ALTER TABLE` — the form `pg_dump` emits — while the constraint records
+every column, so the catalog matched them by PREFIX:
+
+```text
+                              PG 18.6                SPG 7.39.12
+  PK(a,b) then INDEX ix(a)  ix f/f/1, pkey t/t/2   BOTH t/t/1
+  INDEX ix(a) then PK(a,b)  ix f/f/1, pkey t/t/2   ix only
+  is ix actually unique?    no                     says yes
+  PK(a,b,c) name / natts    ck_pkey / 3            ck_a_pkey / 1
+```
+
+The third row is the dangerous one, and it points the opposite way from
+the defect 7.39.11 fixed. That was a real key reporting NOT unique — a
+false alarm. This is an index that accepts duplicates reporting that it
+IS unique: a migration guard that asserts uniqueness before relying on
+it gets a yes and is wrong.
+
+Nothing prefix-matches now. `catalog_indexes` is the one enumeration of
+everything that gets an index OID, and all five catalog surfaces walk
+it — they already had to agree on the order, and one of them said so in
+a comment, which is how they came to agree on the same wrong answer.
+
+SPG also builds one single-column B-tree per remaining key column,
+because a composite cannot answer a probe that does not start at its
+front. Those probes are an implementation detail, and they were catalog
+objects:
+
+```text
+                          PG 18.6      before          after
+  ALTER … PK (a,b,c)      pk3_pkey     pk3_a_pkey      pk3_pkey
+                                       + pk3_pkey
+  inline PRIMARY KEY(a,b) pk4_pkey     pk4_a_pkey_0_0  pk4_pkey
+                                       + pk4_b_pkey_0_1
+                                       (no pkey row at all)
+```
+
+`Index` carries `constraint_internal` and `constraint_backing` now, and
+the catalog reads them instead of matching columns. FILE_VERSION 96; a
+v95 snapshot has no byte there and every index in it reads as
+user-created, which is what it recorded.
+
+Recording it rather than inferring it is the point. v7.39.11 decided
+from a name suffix, v7.39.12 from a column prefix, and the first cut of
+THIS decided from exact columns — which renamed a user's own `CREATE
+INDEX idx_d_a ON d (a)` to the name of the `UNIQUE (a)` beside it, and
+reported an expression index on `(a + 1)` as the primary key. Both were
+caught by pins this repository already had.
+
+### Fixed — a scalar subquery in an `INSERT … VALUES` list
+
+Every type raised the same internal message, and PostgreSQL 18.6
+accepts all of them:
+
+```text
+  INSERT INTO d1 (n)  VALUES ((SELECT max(n)  FROM s))   7
+  INSERT INTO d2 (t)  VALUES ((SELECT max(t)  FROM s))   x
+  INSERT INTO d3 (ts) VALUES ((SELECT max(ts) FROM s))   1767225600
+
+  SPG 7.39.12: ERROR: subquery reached row eval — engine resolver bug
+```
+
+The message named itself an engine bug because it was one: the row walk
+is not allowed to meet a subquery. `UPDATE` has resolved its
+assignments up front since embed round-12 and `DELETE` its `WHERE`
+since round 157; `INSERT` never did, so the subquery was still in the
+tree when evaluation reached it.
+
+### Fixed — three names
+
+- **`count(*) OVER ()` had two names, one per route.** It is held as
+  `count_star` so the star arity survives the AST; the projection
+  mapped it back and the extended protocol's Describe did not, so
+  `\gdesc` read `count_star` where the row stream read `count`. An ORM
+  reads the Describe name. This is the twin of the type defect 7.39.12
+  closed in the same synthetic column — the type was fixed there and
+  the name was left, because the two travel by different routes and
+  only one of them was measured. `canonical_function_name` is public
+  now and both routes call it.
+
+- **`pg_typeof` over a `jsonb` scalar subquery answered `json`.** SPG
+  carries JSON and JSONB in one `Value::Json`, so the value-driven
+  namer can only ever say `json`; `jsonb` joins `xid` / `xid8` / `oid`
+  on the list of types whose identity the value does not carry and the
+  expression does.
+
+- **`'x' || 'r'::"char"` named the wrong left-hand type.** PostgreSQL
+  calls an untyped literal `unknown` and SPG said `text`, because at
+  the point the refusal is built there are values, and `Value::Text` is
+  what both an untyped literal and a real `text` arrive as. The
+  expression knows, and `is_unknown_string_literal` was already there
+  for comparisons — the rename happens on the error path only.
+
 ### Fixed — the access path sentori has reported for three versions
 
 `WHERE project_id = ? ORDER BY received_at DESC LIMIT 20`, behind an
@@ -53,6 +191,143 @@ EXPLAIN asks the new planner first, exactly as the executor does. A
 walk that runs while the plan says `Seq Scan` is the r1044 defect, and
 wiring only the executor would have recreated it.
 
+
+### Fixed — which column types may key a composite index, asked of all of them
+
+The `timestamptz` hole above was one miss out of a list, and the list
+was the defect. `multi_component_type_ok` was a `matches!` over eleven
+names, so each of the other sixty-three `DataType`s answered "no" by
+falling off the end, and nothing in the tree could say which of them
+meant it. The miss is silent: an index over a type that falls off is
+still CREATED — it stays a single-column B-tree on the leading column
+with the extra positions recorded and unused — so every answer is
+right and the query sorts the whole table.
+
+This version's own perf gate found the second one hours after the
+first, with an index over `(n numeric, id)`:
+
+```text
+  rows     WHERE n = 1.23 ORDER BY id DESC LIMIT 20
+  10,000   SPG 0.497-0.520 ms   PG 18.6 0.183-0.234 ms
+  50,000   SPG 0.975-0.991 ms   PG 18.6 0.195-0.439 ms
+```
+
+Twenty rows behind a seek do not cost twice as much on five times the
+table. `numeric`, `bytea`, `time`, `timetz`, `money` and `year` are on
+the list now — each measured leading a composite and walking in order —
+and the list is an EXHAUSTIVE match: a new `DataType` does not compile
+until someone answers for it. `double precision` is the type that can
+never join them — `f64` is `PartialOrd`, and a B-tree cannot hold a key
+whose comparison may decline to answer.
+
+A second funnel was in the way of `bytea`. The walk asked
+`literal_expr_to_value` what a literal means, which reads every string
+literal as text, so `WHERE k = '\x07'` built no key for a `bytea`
+column and the walk declined — while the equality seek beside it, which
+asks `literal_as_column_value`, used the very same index. That function
+is documented as the one place the decision is made and had four copies
+before; this was the fifth.
+
+Also measured and NOT changed: composite components key from the VALUE
+while every probe keys from the COLUMN, and the two agree because
+`insert_keyed` refuses a value whose type is not the column's. Keying
+by column here was written and reverted — it re-checked a contract
+insert already enforces, on the write path, and the test written to
+make it bite could not construct the divergent row at all. The reason
+is recorded where the code is, so the next reader does not re-derive
+it.
+
+### Fixed — `timetz` could not be compared, and sorted in the wrong order
+
+Found by this version's own composite-component sweep, not reported.
+Two defects in a type SPG stores, renders and accepts in DDL:
+
+```text
+                 PG 18.6   SPG 7.39.12
+  k = k          true      ERROR: operator does not exist:
+                                  time with time zone =
+                                  time with time zone
+  k > '…'        rows      the same error
+  ORDER BY k     below     wrong among values sharing an instant
+  max(k)         01:00-06  02:00:00-05
+```
+
+The order is a PAIR and only the first half was implemented: the
+UTC-equivalent instant, then the OFFSET DESCENDING. Values that name
+one instant in different zones are DISTINCT — `'07:00:00+00' =
+'02:00:00-05'` is FALSE on PostgreSQL 18.6 — so ordering by the instant
+alone called four of these equal, and a stable sort then returned them
+in the order they were written:
+
+```text
+  PG 18.6        SPG 7.39.12
+  07:00:00+01    07:00:00+01
+  06:59:59+00    06:59:59+00
+  09:00:00+02    07:00:00+00
+  07:00:00+00    02:00:00-05
+  02:00:00-05    09:00:00+02
+  01:00:00-06    01:00:00-06
+```
+
+THREE surfaces answer this question and all three were wrong, in three
+different ways: `eval::binop::compare` had no arm and raised;
+`orderby::value_cmp` — which min, max, `DISTINCT` and `GROUP BY` read —
+fell through to comparing DEBUG RENDERINGS; and only
+`select::value_to_order_key` had the instant right, without the zone.
+They read `orderby::timetz_sort_key` now, one definition, so an
+operator, a sort and an aggregate cannot disagree again.
+
+And giving `timetz` an operator made a third defect reachable that had
+been unreachable: the B-tree key was the instant alone too, so an index
+CHANGED AN ANSWER —
+
+```text
+  WHERE k > '07:00:00+00'
+    no index    2, 6      (PG 18.6: 2, 6)
+    with index  <nothing>
+```
+
+— because the two rows above that bound share its instant and sort
+below it once the zone is dropped. A superset and a re-check cannot
+save a seek that returns too FEW. The index key carries the pair now
+(`spg_storage::timetz_sort_key`, the same definition the other three
+read), which changes what is written to disk: FILE_VERSION 97, and a
+v96 catalog has its `timetz` indexes rebuilt from its rows on load.
+Nothing before this version could observe the old form — there was no
+operator to build a probe with — so the rebuild is the only place it
+has ever mattered.
+
+### Fixed — a `YEAR` column had no type, and one of `timetz`'s three names was wrong
+
+Found while asking which column types may lead a composite index —
+`year` could not be spelled into the question at all.
+
+```text
+                                  MySQL 9.7.2   SPG 7.39.12
+  WHERE k = 2007                  1,3           ERROR: operator does not
+                                                exist: unknown = integer
+  WHERE k > 2007                  2             the same error
+  pg_typeof(k)                    —             unknown
+  information_schema … data_type  year          user-defined
+```
+
+The column's type had landed: the parser maps `year` and the values
+store as years. Every surface that NAMES a type was missing it, so the
+comparability gate read `unknown` on the left and refused the
+predicate, and `types_unify` put it in no family at all. It is in the
+numeric family now, which is where `=`, `>`, `ORDER BY` and `MAX` put
+it on MySQL 9.7.2, and `compare` gained the arms that answer it.
+
+`timetz` is the same shape one step along. `pg_typeof` and
+`format_type` both answered `time with time zone` for a column whose
+`information_schema.columns.data_type` said `USER-DEFINED` — three
+surfaces, one column, two answers. PostgreSQL 18.6 says `time with time
+zone` on all three, and so does this.
+
+**Also found and NOT fixed here:** `CREATE TABLE t (c oid[])` is
+refused — `Oid[] not yet supported` — where PostgreSQL 18.6 accepts it.
+That is a missing column type rather than a naming defect, and it is
+named here rather than left in a probe's output.
 
 ### Fixed — the gate itself
 

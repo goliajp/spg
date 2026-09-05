@@ -2938,6 +2938,37 @@ impl PartialOrd for NumericKey {
     }
 }
 
+/// v7.39.13 — the ONE definition of how two `timetz` values order.
+///
+/// PostgreSQL 18.6 orders them by a PAIR: the UTC-equivalent instant,
+/// then the OFFSET DESCENDING. Values naming one instant in different
+/// zones are DISTINCT there — `'07:00:00+00' = '02:00:00-05'` is FALSE
+/// — and the offset half was missing from every surface that had an
+/// answer at all.
+///
+/// A B-tree over the instant alone does not merely sort badly: it
+/// CHANGES ANSWERS. Measured on this engine with the six-row fixture in
+/// `e2e_timetz_order_v73913`, `WHERE k > '07:00:00+00'`:
+///
+/// ```text
+///   no index   2, 6      (PostgreSQL 18.6: 2, 6)
+///   index      <nothing>
+/// ```
+///
+/// The range starts above one instant, and the two rows that share that
+/// instant while sorting ABOVE the bound live below it in a key space
+/// that has dropped the zone. A superset and a re-check cannot save a
+/// seek that returns too FEW.
+///
+/// The instant shifts left by 17 bits and the offset sits underneath —
+/// an offset is at most ±57,600 seconds and an instant at most about
+/// 1.44e11 microseconds, so the two never meet and the whole key stays
+/// inside `i64`.
+pub fn timetz_sort_key(us: i64, offset_secs: i32) -> i64 {
+    let utc = us - i64::from(offset_secs) * 1_000_000;
+    (utc << 17) - i64::from(offset_secs)
+}
+
 impl IndexKey {
     /// v7.37.43 (INSUBQ B-4) — inline-friendly BigInt fast path.
     /// `try_count_star_pk_in_subquery_fast` (and any other hot loop
@@ -3031,7 +3062,7 @@ impl IndexKey {
             // physical instant in different zones would sort
             // wrong. Matches PG's TIMETZ index behaviour.
             Value::TimeTz { us, offset_secs } => {
-                Some(Self::Int(us - i64::from(*offset_secs) * 1_000_000))
+                Some(Self::Int(timetz_sort_key(*us, *offset_secs)))
             }
             // v7.17.0 Phase 3.P0-35: MONEY indexable as i64 cents
             // (no scaling needed — natural numeric ordering).
@@ -3630,6 +3661,20 @@ pub fn nsw_assign_level(row_idx: usize) -> u8 {
 /// = some non-null component has no key form; the row is then not
 /// entered, which is why creation gates every component column's type
 /// through [`multi_component_type_ok`].
+///
+/// v7.39.13 — this keys by the VALUE while every probe keys by the
+/// COLUMN ([`IndexKey::from_value_for_column`]), and that is safe
+/// because a third thing makes the two agree: `Table::insert_keyed`
+/// refuses a value whose type is not the column's, so a `NUMERIC`
+/// column cannot hold the `Value::Int(2)` that would key as `Int(2)`
+/// where the probe built `Numeric(2)`.
+///
+/// Written down because the possibility looks live and is not. Keying
+/// by column here was implemented and then reverted: it added a schema
+/// lookup per component per row to the write path to re-check a
+/// contract insert already enforces, and the test written to make it
+/// bite could not construct the divergent row at all —
+/// `TypeMismatch { column: "n", expected: Numeric, actual: Int }`.
 pub(crate) fn compose_multi_key(
     values: &[Value<'_>],
     lead: usize,
@@ -3648,39 +3693,130 @@ pub(crate) fn compose_multi_key(
 }
 
 /// v7.38.1 (L12) — component-type gate for multi-column B-trees: every
-/// NON-NULL value of these types keys through `IndexKey::from_value`,
-/// so a row can only be absent from the index when creation raced a
-/// type this list does not name. Deliberately conservative — a type
-/// outside the list simply keeps its index on the leading-column path.
+/// NON-NULL value of these types keys through
+/// [`IndexKey::from_value_for_column`], so a row can only be absent
+/// from the index when creation raced a type this answer does not
+/// allow. A type answering `false` simply keeps its index on the
+/// leading-column path — a slower plan, never a wrong answer.
+///
+/// v7.39.13 — EXHAUSTIVE, and that is the whole point of rewriting it.
+///
+/// It was a `matches!` over eleven names, so every one of the other
+/// sixty-three `DataType`s answered `false` by falling off the end, and
+/// nothing in the tree could say which of them meant it. Two of the
+/// misses were reported from production as separate defects and were
+/// one hole: `timestamptz` (v7.39.13, sentori's access path) and
+/// `numeric`, which this version's own perf gate caught the same day
+/// with a composite index over `(n numeric, id)` that never became a
+/// composite tree —
+///
+/// ```text
+///   10,000 rows   WHERE n = 1.23 ORDER BY id DESC LIMIT 20
+///     SPG 0.497-0.520 ms   PG 18.6 0.183-0.234 ms
+///   50,000 rows   the same query
+///     SPG 0.975-0.991 ms   PG 18.6 0.195-0.439 ms
+/// ```
+///
+/// Twenty rows behind a seek do not cost twice as much on five times
+/// the table. It was a scan and a sort, exactly as `timestamptz` was.
+///
+/// Written as a match with no wildcard, a new `DataType` does not
+/// compile until someone answers for it. That is the mechanical part;
+/// the arms are grouped by the reason, so the answer is also readable.
 pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
-    matches!(
-        ty,
+    match ty {
+        // Integers, and everything whose storage IS an i64 with the
+        // same order: dates, both timestamps, times, money, year.
         DataType::SmallInt
-            | DataType::Int
-            | DataType::BigInt
-            | DataType::Text
-            | DataType::Varchar(_)
-            | DataType::Char(_)
-            | DataType::Bool
-            | DataType::Uuid
-            | DataType::Date
-            | DataType::Timestamp
-            // v7.39.13 — `timestamptz` keys exactly as `timestamp` does:
-            // both hold the same i64 of UTC microseconds, and the zone
-            // lives in the column's type rather than in the value. Its
-            // absence here meant `CREATE INDEX … (project_id,
-            // received_at)` never became a composite tree at all — the
-            // index stayed a single-column B-tree on the leading column
-            // with the extra positions recorded and unused.
-            //
-            // Two reported defects were the same hole. The ordered walk
-            // could not serve `WHERE project_id = ? ORDER BY received_at
-            // DESC LIMIT 20` because there was no composite tree to walk,
-            // and `pg_index` answered `indnatts = 2` for an index that
-            // held one column — the catalog claiming what the storage
-            // does not do, which sentori reported as its own item.
-            | DataType::Timestamptz
-    )
+        | DataType::Int
+        | DataType::BigInt
+        | DataType::Date
+        | DataType::Timestamp
+        // `timestamptz` keys exactly as `timestamp` does: both hold the
+        // same i64 of UTC microseconds, and the zone lives in the
+        // column's type rather than in the value.
+        | DataType::Timestamptz
+        | DataType::Time
+        | DataType::TimeTz
+        | DataType::Year
+        | DataType::Money => true,
+        // Text, in every declared width. `bpchar` keys blank-trimmed,
+        // which is how it compares.
+        DataType::Text | DataType::Varchar(_) | DataType::Char(_) => true,
+        DataType::Bool | DataType::Uuid => true,
+        // Exact decimal, through the canonical `NumericKey` that makes
+        // `1.5` and `1.50` one key. Safe as a component only since
+        // `compose_multi_key` began keying by COLUMN TYPE.
+        DataType::Numeric { .. } => true,
+        // bytea orders by plain byte comparison, which is `Vec<u8>`'s.
+        DataType::Bytes => true,
+        // `f64` is `PartialOrd` and nothing else: a B-tree cannot hold
+        // a key whose comparison may decline to answer.
+        DataType::Float | DataType::Real => false,
+
+        // Object identifiers and `name` reach storage as values
+        // `IndexKey::from_value` returns `None` for. Not a decision
+        // about the type — a statement about the key form it has.
+        DataType::Name | DataType::Xid | DataType::Xid8 | DataType::Oid => false,
+        // Documents and the semi-structured family: PostgreSQL serves
+        // these with GIN, not with a B-tree over the whole value.
+        DataType::Json | DataType::Jsonb | DataType::Hstore | DataType::Xml => false,
+        // Full-text.
+        DataType::TsVector | DataType::TsQuery => false,
+        // Vectors: ordered by distance to a query, which is not an
+        // order at all until the query exists.
+        DataType::Vector { .. } => false,
+        // Intervals, ranges and multiranges have no total order that
+        // a B-tree probe could use; PostgreSQL uses GiST/SP-GiST.
+        DataType::Interval | DataType::Range(_) | DataType::Multirange(_) => false,
+        // Geometry: GiST/SP-GiST there too.
+        DataType::Point
+        | DataType::Lseg
+        | DataType::Path
+        | DataType::PgBox
+        | DataType::Polygon
+        | DataType::Line
+        | DataType::Circle => false,
+        // Network and bit strings. `inet`/`cidr` COULD be B-tree keyed
+        // — PostgreSQL does — but a family-blind byte compare would
+        // mis-order IPv4 against IPv6, so the key form does not exist
+        // here yet.
+        DataType::Inet
+        | DataType::Cidr
+        | DataType::Macaddr
+        | DataType::Macaddr8
+        | DataType::PgLsn
+        | DataType::Bit(_)
+        | DataType::BitVarying(_)
+        | DataType::Char1 => false,
+        // Arrays, of every element type and both dimensionalities.
+        // PostgreSQL answers containment over these with GIN.
+        DataType::TextArray
+        | DataType::IntArray
+        | DataType::BigIntArray
+        | DataType::OidArray
+        | DataType::Int2Vector
+        | DataType::OidVector
+        | DataType::IntervalArray
+        | DataType::BoolArray
+        | DataType::SmallIntArray
+        | DataType::FloatArray
+        | DataType::NumericArray
+        | DataType::DateArray
+        | DataType::TimestampArray
+        | DataType::TimestamptzArray
+        | DataType::UuidArray
+        | DataType::JsonArray
+        | DataType::JsonbArray
+        | DataType::BytesArray
+        | DataType::VarcharArray
+        | DataType::CharArray
+        | DataType::MoneyArray
+        | DataType::IntArray2D
+        | DataType::BigIntArray2D
+        | DataType::TextArray2D
+        | DataType::BoolArray2D => false,
+    }
 }
 
 impl Index {
@@ -9615,7 +9751,14 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// instead of falling back to a scan. A v89 reader meeting either tag
 /// reports a corrupt catalog rather than mis-reading it, which is the
 /// same forward-compatibility story tag 3 (uuid) had at v36.
-const FILE_VERSION: u8 = 96;
+/// v7.39.13 — v97 changes what a TIMETZ key CONTAINS. It held the UTC
+/// instant alone, which files values PostgreSQL calls distinct under
+/// one key; it now holds the instant and the offset, in the pair order
+/// [`timetz_sort_key`] defines. Nothing before v97 could observe the
+/// old form — `timetz` had no comparison operator, so no probe was ever
+/// built — but a v96 file's entries are in it, so a v96 catalog has its
+/// timetz indexes rebuilt on load.
+const FILE_VERSION: u8 = 97;
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -11091,6 +11234,30 @@ impl Catalog {
         // never collides.
         for (i, t) in cat.tables.iter_mut().enumerate() {
             t.set_rel_id(row_header::RelId((i as u64) + 1));
+        }
+        // v7.39.13 — a pre-v97 catalog's TIMETZ index entries are keyed
+        // by the UTC instant alone (see `timetz_sort_key`), and a v97
+        // probe is keyed by the pair. Reading one with the other finds
+        // nothing, which is the failure this whole layer exists to
+        // prevent, so the entries are rebuilt from the rows.
+        //
+        // Only timetz, and only from below v97: `rebuild_indices_pub`
+        // rebuilds every index on the table, so this asks first.
+        if version < 97 {
+            for t in cat.tables.iter_mut() {
+                let cols = &t.schema().columns;
+                let touched = t.indices().iter().any(|idx| {
+                    core::iter::once(idx.column_position)
+                        .chain(idx.extra_column_positions.iter().copied())
+                        .any(|p| {
+                            cols.get(p)
+                                .is_some_and(|c| matches!(c.ty, DataType::TimeTz))
+                        })
+                });
+                if touched {
+                    t.rebuild_indices_pub();
+                }
+            }
         }
         cat.next_rel_id = cat.tables.len() as u64;
         // v7.12.4 — catalog-wide function + trigger appendix.

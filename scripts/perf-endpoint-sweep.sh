@@ -242,7 +242,8 @@ setup_typed_table() { # $1=uri $2=table $3=rows
     -c "INSERT INTO $2 SELECT g, (((g::bigint*7919)%1000)::numeric)/100, decode(lpad(to_hex(g), 16, '0'), 'hex'), repeat(chr(97+(g%26)),200) FROM generate_series(1,$3) g" >/dev/null 2>&1
   "${PSQL}" --no-psqlrc -X -q "$1" \
     -c "CREATE INDEX ${2}_n ON $2 (n)" \
-    -c "CREATE INDEX ${2}_b ON $2 (b)" >/dev/null 2>&1
+    -c "CREATE INDEX ${2}_b ON $2 (b)" \
+    -c "CREATE INDEX ${2}_n_id ON $2 (n, id)" >/dev/null 2>&1
   local got
   got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
   [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
@@ -431,6 +432,24 @@ TYPED_SHAPES=(
   # spelling folded differently from the ordinary one — the panel is for
   # measuring what users send, not what the harness found easy to quote.
   'bytea equality|SELECT count(*) FROM @N@ WHERE b = decode(lpad(to_hex(7), 16, $q$0$q$), $q$hex$q$)'
+  # v7.39.13 — the customer access path, behind a composite index.
+  #
+  # `WHERE <lead> = ? ORDER BY <next> DESC LIMIT n` is sentori's busiest
+  # read and the shape they reported unchanged for three versions: SPG
+  # planned `Sort -> Seq Scan` and sorted the table to return twenty
+  # rows. No cell in either panel covered it — every ORDER BY cell here
+  # sorts the WHOLE table, and the two equality cells return a count
+  # with no ordering — so the panel could not have seen it, and did not.
+  #
+  # `n` holds a thousand distinct values over the fixture, so `n = 1.23`
+  # names a group rather than a row; `(n, id)` is the composite the walk
+  # needs. Both directions, because they take different code: ascending
+  # is a forward range from the prefix, descending is the reverse
+  # descent `range_rev_by` added.
+  'prefix walk, top-N desc|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id DESC LIMIT 20'
+  'prefix walk, top-N asc|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id ASC LIMIT 20'
+  # And the unbounded form, which carries the send as well as the walk.
+  'prefix walk, all rows|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id DESC'
 )
 
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0

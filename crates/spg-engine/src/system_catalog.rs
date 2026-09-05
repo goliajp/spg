@@ -287,6 +287,15 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         // nothing about what they had.
         DataType::Int2Vector => "int2vector",
         DataType::OidVector => "oidvector",
+        // v7.39.13 — measured on PostgreSQL 18.6, `information_schema
+        // .columns.data_type` for a `timetz` column is `time with time
+        // zone`; this table answered `USER-DEFINED` while `pg_typeof`
+        // and `format_type` over the same column both answered
+        // correctly. Three surfaces, one column, two answers.
+        DataType::TimeTz => "time with time zone",
+        // MySQL's own name for its own type, measured on 9.7.2:
+        // `DATA_TYPE` and `COLUMN_TYPE` are both `year`.
+        DataType::Year => "year",
         // Non-exhaustive — fall back to "USER-DEFINED" the way
         // PG labels any pg_type it doesn't recognise.
         _ => "USER-DEFINED",
