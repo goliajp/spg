@@ -7826,9 +7826,65 @@ impl Engine {
                         }
                         core::cmp::Ordering::Equal
                     };
+                    // v7.40.2 — the uniform check reads a COMPACT column,
+                    // not the rows.
+                    //
+                    // `low_card` sorts the prefix keys and then proves,
+                    // once per run, whether every value in it is equal.
+                    // That proof is n-1 comparisons, and each one used to
+                    // walk `order[i] -> tagged[i] -> values -> Value ->
+                    // &str -> bytes`: four dependent reads, the first of
+                    // them scattered across a 400,000-element array of fat
+                    // rows. This file's own note at `key_discriminates`
+                    // warned about that random read; here is its price.
+                    //
+                    // Measured, 400,000 rows, twenty-six distinct values,
+                    // server-reported, against the same binary with
+                    // `low_card` forced off (md5-witnessed, order digests
+                    // identical):
+                    //
+                    //   8-byte values     54.98 ms on   54.91 ms off
+                    //   200-byte values   89.64 ms on  163.18 ms off
+                    //
+                    // So the path earns 1.82x and is not in question. What
+                    // the 8-byte and 200-byte cells say together is where
+                    // the rest goes: the extra 192 bytes a row cost
+                    // 34.6 ms, which is 80 MB compared at 2.3 GB/s — an
+                    // order of magnitude under this machine's memory
+                    // bandwidth, because the cost is the misses and not
+                    // the compare.
+                    //
+                    // Collecting the column first is one sequential pass
+                    // over `tagged` and leaves the comparison two reads:
+                    // a 16-byte slice header, then its bytes.
+                    // Built ONLY for the branch that uses it. `same_value`
+                    // is called from the `low_card` run walk and nowhere
+                    // else, so an exact key -- every value inside sixteen
+                    // bytes -- never asks the question. The first version
+                    // built the column unconditionally and charged 2.1 ms
+                    // to a shape that never reads it:
+                    //
+                    //   8-byte values     56.45 -> 58.55 ms   (a tax)
+                    //   200-byte values   97.18 -> 84.70 ms   (the point)
+                    let col_strs: Option<Vec<&str>> = if low_card {
+                        tagged
+                            .iter()
+                            .map(|t| match t.1.values.get(first_col) {
+                                Some(Value::Text(x)) => Some(x.as_ref()),
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        None
+                    };
                     let same_value = |ia: u32, ib: u32| -> bool {
-                        tagged[ia as usize].1.values.get(first_col)
-                            == tagged[ib as usize].1.values.get(first_col)
+                        col_strs.as_ref().map_or_else(
+                            || {
+                                tagged[ia as usize].1.values.get(first_col)
+                                    == tagged[ib as usize].1.values.get(first_col)
+                            },
+                            |c| c[ia as usize] == c[ib as usize],
+                        )
                     };
                     let how = PrefixSort {
                         first_desc,
