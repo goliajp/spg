@@ -1,4 +1,11 @@
-
-# appsql differ builds standalone; its lock/target are local
-xtests/appsql/differ/target/
-xtests/appsql/differ/Cargo.lock
+# appsql differ builds standalone; its lock and target are local.
+#
+# v7.40.0 — these patterns were `xtests/appsql/differ/target/` and
+# `xtests/appsql/differ/Cargo.lock`. A pattern in a nested .gitignore is
+# relative to ITS OWN directory, so those named
+# `xtests/appsql/differ/xtests/appsql/differ/target/` — a path that
+# cannot exist. The rule matched nothing from the day it was written,
+# which is why 1,036 artefact files stayed tracked and why `git add -A`
+# put them straight back after `git rm --cached`.
+target/
+Cargo.lock
