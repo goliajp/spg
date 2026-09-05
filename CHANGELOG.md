@@ -11,6 +11,52 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
+## [7.40.7] — 2026-09-06
+
+### Fixed — the release gate threw away work it had already done, and
+### could be started twice
+
+Twenty `prerelease` runs on the testbed carried the 7.40.0-7.40.6
+releases. Eleven of them were red and they cost 10.1 hours of wall
+clock. Four of those reds were not properties of the tree being judged:
+
+```text
+  04:11  FAIL release-build   error: extern location for pem does not exist
+  05:08  FAIL release-build   (same, 348 s in)
+  06:03  FAIL e2e             connect: wire: unexpected - in startup
+  06:03  FAIL e2e             (a second run of ours, started 8 s apart)
+```
+
+The first two are this machine's own weekly cargo sweep deleting
+artefacts the build was holding; the message names a crate nobody
+touched. The last two are two tier runs at once, sharing the target
+directory, the suite port range and the test data directories — while
+the e2e step in the same log was 50/50 green over 9,190 tests.
+
+Three changes, each with the evidence in its own module:
+
+- `suite-run --resume` carries forward the steps this exact working
+  tree has already proved. The digest covers HEAD, the worktree delta
+  and the untracked files; one byte different and every step runs.
+  Measured end to end on `precommit`: 402 s, then 0.28 ms. Carried steps
+  are reported as `carried`, naming the run that ran them — never as
+  `pass`, and never counted as evidence a release did not gather.
+  Three of the eleven reds were `perf-sweep`, step seven of nine, each
+  discarding the ~1,300 s already spent ahead of it.
+
+- A run lock, taken as a directory because `mkdir` is the atomic
+  create. A second run is refused rather than allowed to corrupt the
+  first. `EPERM` from `kill(pid, 0)` counts as alive: reading it as
+  "gone" would clear a live run's lock, which is the collision the lock
+  exists to prevent.
+
+- The tier waits out a cargo sweep of THIS repository and says why,
+  rather than failing ten minutes later in another crate's name. Only
+  this repository: on 2026-09-06 that walk spent another twenty minutes
+  on repositories we do not build, and waiting for it would have been
+  waiting for nothing.
+
+
 ## [7.40.6] — 2026-09-06
 
 ### Fixed — the same missing sub-plan, on the join side
