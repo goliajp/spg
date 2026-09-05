@@ -672,7 +672,7 @@ fn main() {
             // The reference itself is skipped, not excused: a ruler
             // compared against itself always reads 1.
             const REFERENCE_STEP: &str = "fmt";
-            let host = ledger
+            let host_ends = ledger
                 .steps
                 .iter()
                 .find(|s| s.name == REFERENCE_STEP)
@@ -687,14 +687,64 @@ fn main() {
                     let mut sorted = past.clone();
                     sorted.sort_unstable();
                     let median = sorted.get(sorted.len() / 2).map_or(0, |m| u128::from(*m));
-                    Host::from_reference(s.duration.as_millis(), median)
+                    // v7.40.2 — the ruler is read TWICE, and the
+                    // slower reading wins.
+                    //
+                    // `fmt` runs FIRST, so one reading describes the
+                    // machine at t=0 and nothing after it. The v7.40.1
+                    // release train was blocked by exactly that: `fmt`
+                    // read 1.05x at load 17, another workload arrived,
+                    // and `slt-smoke` met load 27 four steps later and
+                    // took 129.3 s against a 15 s budget where its own
+                    // history reads 1.6-1.9 s. RUNAWAY, on a step
+                    // nothing had changed -- and a release blocked by
+                    // the laptop it was built on.
+                    //
+                    // Re-running the reference at the END costs its own
+                    // duration, 1.6-1.9 s here, and gives a second
+                    // point. A tier whose box got busier scales by how
+                    // busy it ENDED, which is the reading that
+                    // describes most of what was judged. Two points do
+                    // not describe a load that spiked in the middle and
+                    // recovered; they describe the two ends, which is
+                    // two more than one.
+                    let first = Host::from_reference(s.duration.as_millis(), median);
+                    let second = tier_steps
+                        .iter()
+                        .find(|t| t.name == REFERENCE_STEP)
+                        .and_then(|t| t.cmd.as_deref())
+                        .and_then(|cmd| {
+                            let t0 = std::time::Instant::now();
+                            std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(cmd)
+                                .current_dir(root)
+                                .status()
+                                .ok()
+                                .map(|_| t0.elapsed().as_millis())
+                        })
+                        .map_or(Host::default(), |ms| Host::from_reference(ms, median));
+                    (first, second)
                 })
-                .unwrap_or_default();
+                .unwrap_or((Host::default(), Host::default()));
+            // Both readings travel, because a mechanism whose failure
+            // looks exactly like its success needs a witness. The first
+            // version of this printed only the maximum, and there was
+            // no way to tell from the output whether the second reading
+            // had happened at all.
+            let host = if host_ends.1.as_ratio() > host_ends.0.as_ratio() {
+                host_ends.1
+            } else {
+                host_ends.0
+            };
             if host != Host::default() {
                 eprintln!(
                     "  host         this run is {:.2}x slower than usual, measured on \
-                     `{REFERENCE_STEP}` — every threshold below is scaled by it",
-                    host.as_ratio()
+                     `{REFERENCE_STEP}` at both ends ({:.2}x / {:.2}x) — every threshold \
+                     below is scaled by the slower of them",
+                    host.as_ratio(),
+                    host_ends.0.as_ratio(),
+                    host_ends.1.as_ratio()
                 );
             }
             for rec in ledger.over_budget() {

@@ -122,8 +122,25 @@ echo "preflight OK: master @ $(git rev-parse --short HEAD), tag v${VERSION}"
 # "no preflight gate" behaviour for the rare case where the operator
 # already ran it externally.
 if [[ "$FAST" == 1 ]]; then
+    # v7.40.2 — through `precommit-tier.sh`, so the gate runs where the
+    # machine is idle and proves it graded THIS tree.
+    #
+    # The v7.40.1 train was blocked by its own gate on a box carrying
+    # somebody else's job: eight CPU-saturating workers, and `slt-smoke`
+    # took 129.3 s against a 15 s budget where its own history reads
+    # 1.6-1.9 s. The tier was right to refuse — a contaminated machine
+    # cannot tell a slow step from a busy box — but the release does not
+    # become unshippable because this laptop is busy.
+    #
+    # The host factor that is supposed to absorb this is measured once,
+    # on `fmt`, which runs FIRST. That run read 1.05x at load 17 and
+    # then met load 27 four steps later. A ruler read at t=0 does not
+    # describe a machine whose load doubled during the run.
+    #
+    # `precommit-tier.sh` falls back to running here when there is no
+    # testbed or the trees differ, so this is the same gate either way.
     banner "preflight gate: precommit tier (--fast)"
-    if ! scripts/suite.sh precommit; then
+    if ! scripts/precommit-tier.sh; then
         echo "preflight: precommit tier FAILED — release blocked. This is \
 the narrow gate already; there is nothing left to fall back to, so the \
 failure is the answer." >&2
