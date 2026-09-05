@@ -304,6 +304,16 @@ run_biz() {
     # list. It needs the live PG18 oracle container, same as the two
     # harnesses above.
     xtests/diffcorpus/run.sh
+    # v7.40.0 — and the MySQL half of the same idea.
+    #
+    # SPG advertises a MySQL face. The only systematic corpus it had for
+    # that face was fifteen statements run against MariaDB — a different
+    # engine, whose answers differ from the one SPG reports itself to be.
+    # This corpus is thirteen files against live MySQL 9.7, on the same
+    # protocol as the PostgreSQL one: both legs prove they answer, the
+    # diff is per file, and only a DEVIATION from the recorded baseline
+    # fails. It needs the `spg-bench-mysql` container.
+    xtests/mysqlcorpus/run.sh
 }
 
 run_dogfood() {

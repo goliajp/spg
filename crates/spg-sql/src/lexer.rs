@@ -2025,6 +2025,30 @@ fn lex_number(s: &str, mysql: bool) -> Result<(Token, usize), LexErrorKind> {
             if mysql && radix == 16 {
                 return Ok((Token::HexBytes(digits), j));
             }
+            // v7.40.0 — and `0b…` is one too. The comment above used to
+            // say "only `0x` diverges"; measured on MySQL 9.7.2,
+            // `HEX(CAST(0b101 AS BINARY))` is `05`, the same byte
+            // `b'101'` gives, and SPG answered the integer 5. The bits
+            // pack big-endian, left-padded to a byte — the same rule
+            // `b'…'` already follows — so they are lowered onto the
+            // same token by way of their hex spelling.
+            if mysql && radix == 2 {
+                let mut bits = digits;
+                while bits.len() % 4 != 0 {
+                    bits.insert(0, '0');
+                }
+                let mut hex = alloc::string::String::with_capacity(bits.len() / 4);
+                for nibble in bits.as_bytes().chunks(4) {
+                    let v = nibble
+                        .iter()
+                        .fold(0u8, |acc, c| acc * 2 + (*c - b'0'));
+                    hex.push(char::from_digit(u32::from(v), 16).unwrap_or('0'));
+                }
+                if hex.len() % 2 == 1 {
+                    hex.insert(0, '0');
+                }
+                return Ok((Token::HexBytes(hex), j));
+            }
             return match i64::from_str_radix(&digits, radix) {
                 Ok(v) => Ok((Token::Integer(v), j)),
                 // Over i64 → keep as decimal NUMERIC text.

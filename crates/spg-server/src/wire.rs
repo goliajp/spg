@@ -149,6 +149,11 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::BytesArray
         | DataType::VarcharArray
         | DataType::CharArray
+        | DataType::RealArray
+        | DataType::TimeArray
+        | DataType::TimeTzArray
+        | DataType::InetArray
+        | DataType::XmlArray
         // v7.37.5 ε — geometry collapses to PG external text
         // forms ((x,y) / [(x1,y1),(x2,y2)] / etc). RowDescription
         // advertises 600/601/602/603/604/628/718.

@@ -10,6 +10,315 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.40.0] — 2026-09-05
+
+### Added — six array types PostgreSQL 18.6 accepts and SPG refused
+
+```text
+  CREATE TABLE t (c real[])        PG 18.6  accepted, format_type: real[]
+                                   SPG      ERROR: Real[] not yet supported
+```
+
+`oid[]`, `real[]`, `time[]`, `timetz[]`, `inet[]` and `xml[]`. Of the
+twenty-four array spellings PostgreSQL 18.6 accepts at `CREATE TABLE`,
+SPG reached eighteen.
+
+`oid[]` had everything but the DDL spelling — its value, codec tag and
+wire encoding shipped in v7.39. The other five had no array at all: no
+`Value` variant, no codec tag, no wire OID, no text form. They go
+through all of it now, and two answers came out of the measurement
+rather than out of the element type:
+
+* `ARRAY[1.5::real, 2]` is `real[]` on PostgreSQL 18.6, and
+  `ARRAY[1.5::real, 2.5::numeric]` too — only an actual `float8`
+  widens the array to `double precision[]`. SPG answered `text[]` for
+  both, because `Value::Real` fell into the ladder's text arm.
+  `'{1.5}'::real[]` answered `double precision[]` for the same reason.
+* `real`, `time`, `timetz` and `inet` elements print bare inside the
+  braces; `xml` is quoted when it holds a comma, because an XML
+  document can contain one.
+
+`pg_attribute.attndims` kept its own shorter copy of the array-type
+list and answered 0 for six spellings PostgreSQL answers 1 for —
+`varchar[]`, `char[]`, `money[]`, `interval[]`, `jsonb[]` and `oid[]`.
+One table serves both now.
+
+Catalog `FILE_VERSION` moves 97 → 98 for the five new codec tags. The
+change is additive: no v97 file can contain one.
+
+### Added — a systematic differential corpus for the MySQL face
+
+SPG advertises a MySQL face: a `mysql-wire` listener, `SELECT
+VERSION()` answering `9.7.2-spg`, MySQL's own error numbers and
+SQLSTATEs. The only systematic check on that face was fifteen
+statements run against **MariaDB** — a different engine, whose answers
+differ from the one SPG reports itself to be. v7.38.16 already paid
+for that once, when SPG's trailing-space rules turned out to have been
+calibrated to MariaDB's `PAD SPACE`.
+
+`xtests/mysqlcorpus/` is thirteen files in MySQL's own spelling against
+live MySQL 9.7.2, on the same protocol as the PostgreSQL corpus: start
+our own server, prove BOTH legs answer before scoring, diff per file,
+and fail only on a deviation from a recorded baseline. It joins
+`scripts/gate.sh biz`.
+
+Its first run scored **85** differing lines. The recorded baseline is
+**2**, and twelve of the thirteen files are identical — those two lines
+are the single difference this version keeps as a decision rather than
+a defect (`->` accepts a literal left operand where MySQL raises a
+syntax error, so SPG is the more permissive). Everything else it found
+is fixed below, and every line is in
+`xtests/mysqlcorpus/FINDINGS.md` with the measurement behind it.
+
+Five "findings" along the way were the harness's own, and each is
+written into `RUNNER.md` rather than left to be rediscovered: without
+`--force` the client stops at the first error, so one missing function
+deleted fifteen lines of answers below it; without naming the
+connection charset on both legs, `CHAR_LENGTH('日本')` was 6 on one and
+2 on the other; two merged streams raced an error against its own
+marker row; two corpus statements ordered by a marker literal, which
+ties every row; and one run graded a stale binary, because `rsync -a`
+preserves mtime and cargo skipped the rebuild. The runner asks the SPG
+leg for `spg_version()` now and refuses to score when it is not the
+tree's.
+
+### Fixed — a composite PRIMARY KEY was two fabricated indexes on the MySQL surface
+
+```text
+                    MySQL 9.7.2          SPG 7.39.13
+  index_name        PRIMARY (both rows)  mc_i_a_pkey_0_0
+                                         mc_i_b_pkey_0_1
+  seq_in_index      1, 2                 1, 1
+  non_unique        0                    1
+```
+
+`information_schema.statistics` and `SHOW INDEX` each walked the
+storage indexes themselves, so a key SPG stores as two single-column
+indexes reached a schema reader as two unrelated indexes, both claiming
+not to be unique, and nothing said `PRIMARY`. That is the v7.39.10
+defect (`SHOW INDEX` said the primary key was not unique) and the
+v7.39.12 one (composite keys missing on 20 of 27 customer tables)
+arriving through the composite door.
+
+Both surfaces read the same table the PostgreSQL side already used.
+
+`SHOW CREATE TABLE` had a third copy of the walk, and printed those two
+internal indexes as declared `KEY` lines. It also had three spellings
+wrong against 9.7.2: a KEY's column list takes no space after the comma
+while a FOREIGN KEY's does, a `UNIQUE KEY` and a `FOREIGN KEY` both
+carry a name (`<table>_ibfk_<n>` when generated), and the table options
+end with the collation.
+
+### Fixed — PostgreSQL sentences on the MySQL wire
+
+```text
+-ERROR 1062 (23000): Duplicate entry '1-x' for key 'dk.PRIMARY'
++ERROR 1062 (23000): duplicate key value violates unique constraint
+                     "dk_pkey" on table "dk" DETAIL: Key (a, b)=(1, x)…
+-ERROR 1050 (42S01): Table 'mc_t' already exists
++ERROR 1050 (42S01): relation "mc_t" already exists
+-ERROR 1292 (22007): Incorrect datetime value: '2020-99-99' …
++ERROR 1064 (42000): date/time field value out of range: "2020-99-99"
++HINT:  Perhaps you need a different "DateStyle" setting.
+```
+
+v7.39 gave each failure MySQL's errno and stopped there; the words
+stayed PostgreSQL's, and the last pair carried a PostgreSQL `HINT:`
+line — naming a PostgreSQL GUC — inside a MySQL error packet. Every
+message on this wire loses that tail now, so a future error that grows
+one cannot leak it either.
+
+`DROP TABLE` on a missing table also had the wrong number: MySQL uses
+1051 for the DROP and 1146 for a read, both at 42S02.
+
+### Fixed — a declared index disappeared when the column already had one
+
+```text
+  CREATE TABLE t (a INT, b VARCHAR(32), PRIMARY KEY (a,b), KEY kb (b(4)))
+    SHOW INDEX FROM t     MySQL 9.7.2  lists kb, Sub_part 4
+                          SPG 7.39.13  does not list it at all
+    DROP INDEX kb ON t    MySQL 9.7.2  succeeds
+                          SPG 7.39.13  ERROR 1091 Can't DROP 'kb'
+```
+
+Two independent losses on one declaration. The composite key had
+already put a probe B-tree on `b`, and the inline-index installer
+skipped any column that already carried one — so `kb` was swallowed and
+its NAME never registered. Round 431 fixed exactly that for `ALTER
+TABLE ADD KEY` and wrote down why; the inline form kept the skip.
+
+And the `(4)` was parsed and thrown away, so nothing recorded that a
+prefix had been asked for. The catalog carries it now
+(`FILE_VERSION` 99), `SHOW INDEX` reports it as `Sub_part` and
+`SHOW CREATE TABLE` reproduces the whole clause, backticks and all.
+
+A prefixed **UNIQUE** key is a different constraint, and the difference
+is observable: MySQL rejects two rows sharing the first four
+characters, where a full-column unique accepts them. It is enforced as
+a unique expression index over `left(b, 4)`, which is that rule —
+measured against 9.7.2, the same insert is refused with the same
+sentence, `Duplicate entry 'abcd' for key 'u.uq'`.
+
+### Fixed — `COLLATE utf8mb4_bin` stopped comparing trailing spaces
+
+```text
+                                        MySQL 9.7.2   SPG 7.39.13
+  'a ' = 'a' COLLATE utf8mb4_bin             1             0
+  'a ' = 'a' COLLATE utf8mb4_0900_bin        0             0
+  'AB' = 'ab' COLLATE utf8mb4_bin            0             0
+```
+
+Byte-wise is two properties and SPG carried one. A `_bin` collation
+does not fold case AND it PADS; the `BINARY` cast the parser lowered it
+onto carries both, so the pad went with the fold. The clause keeps its
+own node now and the two bits are read separately, by name — which is
+also what lets `utf8mb4_0900_bin`, which does NOT pad, answer
+differently from `utf8mb4_bin`, which it could not before.
+
+### Fixed — `ANY_VALUE` is not an aggregate on MySQL
+
+```text
+  SELECT any_value(x) FROM t   PostgreSQL 18.6   1 row
+                               MySQL 9.7.2       one row per input row
+```
+
+MySQL documents it as a function that returns its argument and
+suppresses the `ONLY_FULL_GROUP_BY` rejection; PostgreSQL 16+ has a
+true aggregate of the same name. SPG answered PostgreSQL's shape on
+both wires. With a GROUP BY, or another aggregate beside it, both
+engines aggregate and both answers were already right.
+
+### Fixed — `information_schema.table_constraints` answered PostgreSQL's shape on the MySQL wire
+
+```text
+  PostgreSQL 18.6            MySQL 9.7.2
+  mc_pkey  PRIMARY KEY       PRIMARY  PRIMARY KEY
+  mc_a_not_null  CHECK       (absent)
+  mc_b_not_null  CHECK       (absent)
+```
+
+Both measured, and both right about themselves: PostgreSQL 18 models a
+NOT NULL column as a real CHECK constraint, MySQL has no such object.
+The view answers the engine the session is speaking to.
+
+### Fixed — `CREATE TABLE b LIKE a`, and what a `LIKE` copy carries
+
+MySQL's spelling of the copy PostgreSQL writes as
+`CREATE TABLE b (LIKE a INCLUDING ALL)` was a syntax error, so a schema
+written against MySQL could not be loaded.
+
+Both engines give the copy the source's PRIMARY KEY, and SPG's `LIKE`
+copied the plain indexes and left the key behind — so the copy of a
+keyed table had no key, which is the shape that looks right until a
+duplicate goes in. PostgreSQL renames the copies after the new table
+(`lb_pkey`, `lb_s_idx`) and MySQL keeps the source's names (`PRIMARY`,
+`ks`); both measured, and the spelling decides which rule applies.
+
+`AUTO_INCREMENT` on a `BIGINT UNSIGNED` column was refused with
+"AUTO_INCREMENT applies to integer columns only", about a column that
+is one — SPG models that type as a scale-0 NUMERIC because its range
+does not fit an i64.
+
+### Fixed — a rollup's grand total over the column it groups by
+
+```text
+  SELECT qty, SUM(qty) … GROUP BY ROLLUP(qty)   the total row
+    PostgreSQL 18.6   NULL | 6
+    MySQL 9.7.2       NULL | 6
+    SPG 7.39.13       NULL | NULL
+```
+
+A grouping column is NULL in the OUTPUT of a set that drops it, and an
+aggregate over it still aggregates the real values. The rewrite that
+nullifies a dropped key "at any depth" was right about
+`COALESCE(g,'TOTAL')` and wrong about `SUM(g)` — it replaced the
+aggregate's own input with a NULL literal, so the grand total of a
+rollup keyed on the summed column answered nothing. **Wrong on both
+faces.**
+
+And MySQL orders a `WITH ROLLUP` by its keys whether or not they are
+selected, where a UNION's ORDER BY can only name output columns:
+`SELECT SUM(qty) FROM t GROUP BY qty WITH ROLLUP` answered `column
+"qty" does not exist`. The key travels as a hidden column now, as the
+`grouping()` mask already did.
+
+### Fixed — `AUTO_INCREMENT=100` and `COLLATION()`
+
+The table option was parsed and dropped, so the first row of a table
+declared that way got 1 where MySQL 9.7.2 gives it 100 — and `SHOW
+CREATE TABLE`, which reproduces the option from the counter,
+round-tripped a different number than the dump named.
+
+`COLLATION('x')` answered `utf8mb4_uca1400_ai_ci`, which is **MariaDB's**
+default. SPG reports itself as MySQL, whose default is
+`utf8mb4_0900_ai_ci` — the value `@@collation_connection` already gave.
+One value, from one place.
+
+### Fixed — five scalar answers, each measured against MySQL 9.7.2
+
+* `SELECT -1e308` failed with `operator does not exist: - numeric`,
+  naming the type it had just refused to negate. Unary minus had an arm
+  for `Numeric` and none for `NumericBig`. **This one was wrong on both
+  faces** — PostgreSQL 18.6 answers it.
+* `TIME('2020-01-02 03:04:05')` was an error; both engines answer
+  `03:04:05`. Also both faces.
+* `CAST('2020-99-99' AS DATE)` raised where MySQL answers NULL. The
+  same value in an INSERT still raises, which is what MySQL does under
+  `STRICT_TRANS_TABLES`.
+* `0b101` read as the integer 5; on MySQL it is the binary string the
+  same `b'101'` gives.
+* `COERCIBILITY()` did not exist, and `STD()` was not a function. The
+  collation-derivation ranks and the population/sample split are
+  measured, not inferred.
+* `JSON_PRETTY` indented four spaces where MySQL indents two;
+  PostgreSQL's `jsonb_pretty` indents four, and still does.
+
+### Fixed — `AVG` answered PostgreSQL's scale on the MySQL wire, and `ISNULL()` did not exist
+
+```text
+  AVG over 0,1,2,3        MySQL 9.7.2  1.5000              (scale + 4)
+                          SPG          1.5000000000000000
+  AVG over DECIMAL(10,2)  MySQL 9.7.2  2.003333
+```
+
+`ISNULL(expr)` is not `IS NULL` spelled as a call — it takes one
+argument and returns an integer, which is what a query written against
+MySQL compares and sums.
+
+### Corrected — what 7.39.13's release note said about its own perf panel
+
+That note quotes the panel's `prefix walk` cells as wins over
+PostgreSQL — SPG 0.066-0.078 ms against 0.192-0.461 at ten thousand
+rows. Half of that survives and half does not.
+
+**The before/after is sound.** 0.497-0.520 to 0.066-0.078 is one leg
+against itself: whatever the transport costs, it costs the same on both
+sides and cancels. So is the loss of table-size scaling, which is the
+actual evidence that a seek replaced a scan.
+
+**The cross-engine half was not established at that scale.** Both
+numbers are client wall clocks under a millisecond, and the two legs do
+not share a transport — SPG is a native process, the PostgreSQL leg is
+a container with a forwarded port. Measured since:
+
+```text
+  SELECT 1, client wall clock minus what the server says it spent
+    SPG          0.081 - 0.014 = 0.067 ms of wire
+    PostgreSQL   0.445 - 0.007 = 0.438 ms of wire
+```
+
+0.37 ms apart — larger than the whole difference the cells reported. A
+self-control leg cannot see this: it proves a reading repeats, and a
+systematic per-leg bias repeats perfectly.
+
+The direction was right. Server-reported time puts SPG at 0.026-0.037
+ms against PostgreSQL's 0.290-0.641 on that shape, and its per-query
+floor at 0.013-0.018 against 0.045-0.079 — where the same note's
+"about 7x" residual had SPG behind, sign backwards. But a right answer
+from an instrument that cannot see the question is not evidence, and
+the panel is the thing that gates releases.
+
+
 ## [7.39.13] — 2026-09-05
 
 ### Fixed — nine hours, silently, on every write of a query result into a `timestamptz` column

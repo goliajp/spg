@@ -1055,17 +1055,17 @@ pub(crate) fn enforce_uniqueness_inserts(
                     || probe_key_conflict(table, idx, &leading, &key, &fold_key).is_some()
                 {
                     let conname = crate::system_catalog::pg_unique_conname(table, uc, child_table);
-                    let detail = unique_key_detail(
+                    return Err(unique_violation(
+                        &conname,
+                        child_table,
                         &uc.columns
                             .iter()
                             .map(|&i| table.schema().columns[i].name.clone())
                             .collect::<Vec<_>>(),
                         &key,
-                    );
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "duplicate key value violates unique constraint \"{conname}\" \
-                         on table \"{child_table}\"{detail}"
-                    )));
+                        uc.is_primary_key,
+                        mysql,
+                    ));
                 }
             }
             if probe_ok {
@@ -1103,17 +1103,17 @@ pub(crate) fn enforce_uniqueness_inserts(
                 // ORMs regex the constraint name out of this message and
                 // the wire layer lifts it into the PG_DIAG fields.
                 let conname = crate::system_catalog::pg_unique_conname(table, uc, child_table);
-                let detail = unique_key_detail(
+                return Err(unique_violation(
+                    &conname,
+                    child_table,
                     &uc.columns
                         .iter()
                         .map(|&i| table.schema().columns[i].name.clone())
                         .collect::<Vec<_>>(),
                     &key,
-                );
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "duplicate key value violates unique constraint \"{conname}\" \
-                     on table \"{child_table}\"{detail}"
-                )));
+                    uc.is_primary_key,
+                    mysql,
+                ));
             }
         }
     }
@@ -1577,6 +1577,55 @@ fn exclusion_violation(
 /// ` DETAIL: Key (a, b)=(1, x) already exists.` Appended to the main
 /// message (the engine error is a single string; psql-style separate
 /// DETAIL packets are a wire-layer follow-up).
+
+/// v7.40.0 — each engine's own sentence for a unique violation.
+///
+/// PostgreSQL 18.6 names the CONSTRAINT and lists the key columns beside
+/// their values; MySQL 9.7.2 names the INDEX and joins the values with
+/// `-`, and calls every primary key `PRIMARY` whatever the constraint
+/// was declared as:
+///
+/// ```text
+///   PG   duplicate key value violates unique constraint "dk_pkey"
+///          on table "dk" DETAIL: Key (a, b)=(1, x) already exists.
+///   My   Duplicate entry '1-x' for key 'dk.PRIMARY'
+/// ```
+///
+/// Written here, where `is_primary` is known. The MySQL wire has a
+/// parser for the PostgreSQL sentence as well — it covers the paths
+/// that reach it from elsewhere — but that parser can only recognise a
+/// primary key by SPG's generated `<table>_pkey` spelling, so a key
+/// declared `CONSTRAINT pk_dk PRIMARY KEY (a)` needs this.
+fn unique_violation(
+    conname: &str,
+    table: &str,
+    cols: &[String],
+    key: &[Value<'_>],
+    is_primary: bool,
+    mysql: bool,
+) -> EngineError {
+    if mysql {
+        let vals = key
+            .iter()
+            .map(|v| match v {
+                Value::Text(s) => s.to_string(),
+                Value::Null => alloc::string::String::from("NULL"),
+                other => crate::eval::value_to_text(other),
+            })
+            .collect::<Vec<_>>()
+            .join("-");
+        let key_name = if is_primary { "PRIMARY" } else { conname };
+        return EngineError::Unsupported(alloc::format!(
+            "Duplicate entry '{vals}' for key '{table}.{key_name}'"
+        ));
+    }
+    let detail = unique_key_detail(cols, key);
+    EngineError::Unsupported(alloc::format!(
+        "duplicate key value violates unique constraint \"{conname}\" \
+         on table \"{table}\"{detail}"
+    ))
+}
+
 fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
     let vals = key
         .iter()
@@ -1968,12 +2017,14 @@ pub(crate) fn enforce_unique_index_inserts(
                 if !batch_seen.insert(aggregate::encode_key(core::slice::from_ref(&v)))
                     || probe_expr_key_conflict(table, idx, &ik).is_some()
                 {
-                    let detail = unique_key_detail(&key_col_names, &[v]);
-                    return Err(EngineError::Unsupported(alloc::format!(
-                        "duplicate key value violates unique constraint \"{}\" \
-                         on table \"{table_name}\"{detail}",
-                        idx.name
-                    )));
+                    return Err(unique_violation(
+                        &idx.name,
+                        table_name,
+                        &key_col_names,
+                        &[v],
+                        false,
+                        mysql,
+                    ));
                 }
             }
             if probe_ok {
@@ -2033,12 +2084,14 @@ pub(crate) fn enforce_unique_index_inserts(
                         // v7.39 (round 473) — a unique INDEX is a unique
                         // constraint to a client, and PG gives it the same
                         // DETAIL a table constraint gets. This path had none.
-                        let detail = unique_key_detail(&key_col_names, &key);
-                        return Err(EngineError::Unsupported(alloc::format!(
-                            "duplicate key value violates unique constraint \"{}\" \
-                             on table \"{table_name}\"{detail}",
-                            idx.name
-                        )));
+                        return Err(unique_violation(
+                            &idx.name,
+                            table_name,
+                            &key_col_names,
+                            &key,
+                            false,
+                            mysql,
+                        ));
                     }
                 }
                 if probe_ok {
@@ -2085,12 +2138,14 @@ pub(crate) fn enforce_unique_index_inserts(
             if !seen.insert(aggregate::encode_key(&key)) {
                 // v7.39 (SQLSTATE fidelity) — a unique INDEX is a unique
                 // constraint to clients; same PG 23505 phrasing.
-                let detail = unique_key_detail(&key_col_names, &key);
-                return Err(EngineError::Unsupported(alloc::format!(
-                    "duplicate key value violates unique constraint \"{}\" \
-                     on table \"{table_name}\"{detail}",
-                    idx.name
-                )));
+                return Err(unique_violation(
+                    &idx.name,
+                    table_name,
+                    &key_col_names,
+                    &key,
+                    false,
+                    mysql,
+                ));
             }
         }
     }
@@ -2284,10 +2339,17 @@ pub(crate) fn enforce_unique_updates(
                     .join("_");
                 alloc::format!("{table_name}_{cols}_key")
             };
-            EngineError::Unsupported(alloc::format!(
-                "duplicate key value violates unique constraint \"{conname}\" \
-                 on table \"{table_name}\""
-            ))
+            // v7.40.0 — the UPDATE twin. It has no key DETAIL to give,
+            // so MySQL's sentence names the key with an empty value
+            // list, which is what the shared helper produces from one.
+            unique_violation(
+                &conname,
+                table_name,
+                &[],
+                &[],
+                uc.is_primary_key,
+                mysql,
+            )
         };
         // v7.39 (round 166, attack A3) — probe path first.
         // r1018 — same chooser as the insert path: the probe descends on
@@ -3755,17 +3817,17 @@ pub(crate) fn validate_uniqueness_whole_table(
         let encoded = alloc::format!("{key:?}");
         if !seen.insert(encoded) {
             let conname = crate::system_catalog::pg_unique_conname(table, uc, tname);
-            let detail = unique_key_detail(
+            return Err(unique_violation(
+                &conname,
+                tname,
                 &uc.columns
                     .iter()
                     .map(|&ci| schema.columns[ci].name.clone())
                     .collect::<Vec<_>>(),
                 &key,
-            );
-            return Err(EngineError::Unsupported(alloc::format!(
-                "duplicate key value violates unique constraint \"{conname}\" \
-                 on table \"{tname}\"{detail}"
-            )));
+                uc.is_primary_key,
+                mysql,
+            ));
         }
     }
     Ok(())

@@ -183,6 +183,15 @@ pub(super) fn apply_unary(op: UnOp, v: Value<'static>) -> Result<Value<'static>,
                 NK::NegInf => Ok(Value::numeric_special(NK::PosInf)),
             }
         }
+        // v7.40.0 — a numeric too wide for the i128 fast path. Unary
+        // minus had an arm for `Numeric` and none for `NumericBig`, so
+        // `SELECT -1e308` — which PostgreSQL 18.6 answers — failed with
+        // "operator does not exist: - numeric", naming the type it had
+        // just refused to negate. Found by the MySQL corpus, but the
+        // defect is on both faces.
+        (UnOp::Neg, Value::NumericBig(b)) => {
+            Ok(Value::NumericBig(alloc::boxed::Box::new(b.neg())))
+        }
         // NOTE: PG has no `- money` operator (unary minus on money is an
         // error there), so money is intentionally NOT handled here.
         (

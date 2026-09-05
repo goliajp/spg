@@ -1013,7 +1013,79 @@ fn mysql_syntax_error_text(sql: &str, token_pos: usize) -> String {
     )
 }
 
+/// MySQL's words for a unique-constraint violation, from the sentence
+/// PostgreSQL uses for the same event.
+///
+/// PostgreSQL names the CONSTRAINT and lists the key columns beside
+/// their values; MySQL names the INDEX and joins the values with `-`:
+///
+/// ```text
+///   PG   duplicate key value violates unique constraint "dk_pkey"
+///          on table "dk" DETAIL: Key (a, b)=(1, x) already exists.
+///   My   Duplicate entry '1-x' for key 'dk.PRIMARY'
+/// ```
+///
+/// MySQL calls every primary-key index `PRIMARY`, whatever the
+/// constraint was named. SPG generates `<table>_pkey` for an UNNAMED
+/// primary key, which is what this reads. A primary key declared with
+/// `CONSTRAINT pk_dk PRIMARY KEY (…)` therefore still reports
+/// `dk.pk_dk` where MySQL 9.7.2 reports `dk.PRIMARY` (measured) — the
+/// constraint's own name is all that survives into the sentence, and
+/// telling the two apart needs the catalog, which is not in reach here.
+fn mysql_duplicate_entry_text(pg: &str) -> String {
+    let quoted = |after: &str| -> Option<String> {
+        let at = pg.find(after)? + after.len();
+        let rest = &pg[at..];
+        let open = rest.find('"')? + 1;
+        let close = rest[open..].find('"')? + open;
+        Some(rest[open..close].to_string())
+    };
+    let Some(conname) = quoted("unique constraint ") else {
+        return pg.to_string();
+    };
+    let table = quoted("on table ").unwrap_or_default();
+    let key = if conname == format!("{table}_pkey") {
+        "PRIMARY".to_string()
+    } else {
+        conname
+    };
+    // `DETAIL: Key (a, b)=(1, x) already exists.` — the values are what
+    // MySQL quotes, joined with `-`.
+    let values = pg
+        .split_once(")=(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(vals, _)| {
+            vals.split(", ")
+                .collect::<Vec<_>>()
+                .join("-")
+        })
+        .unwrap_or_default();
+    format!("Duplicate entry '{values}' for key '{table}.{key}'")
+}
+
 fn mysql_error_parts(
+    e: &spg_engine::EngineError,
+    db: &str,
+    sql: &str,
+) -> (u16, &'static str, String) {
+    let (errno, sqlstate, msg) = mysql_error_parts_inner(e, db, sql);
+    // v7.40.0 — MySQL has no HINT. PostgreSQL appends one on its own
+    // line and SPG carried it, verbatim, into a MySQL error packet:
+    //
+    //   ERROR 1064 (42000): date/time field value out of range: "2020-99-99"
+    //   HINT:  Perhaps you need a different "DateStyle" setting.
+    //
+    // A client rendering that shows a second line naming a PostgreSQL
+    // GUC. Every message that reaches this wire loses the tail, so a
+    // future error that grows one cannot leak it either.
+    let msg = msg
+        .split_once("\nHINT:")
+        .map_or(msg.as_str(), |(head, _)| head)
+        .to_string();
+    (errno, sqlstate, msg)
+}
+
+fn mysql_error_parts_inner(
     e: &spg_engine::EngineError,
     db: &str,
     sql: &str,
@@ -1044,6 +1116,89 @@ fn mysql_error_parts(
         // the engine's errors into PG SQLSTATEs and is tested on it, so the
         // MySQL errno is derived from that one answer. The two protocols
         // disagree on spelling, never on which failure it was.
+        // v7.40.0 — the MySQL corpus's first run found PostgreSQL
+        // SENTENCES riding on correct MySQL errnos. The number is what a
+        // driver branches on and it was already right; the words are
+        // what a person reads, and they named another product.
+        //
+        // Measured on MySQL 9.7.2, same statements:
+        //   ERROR 1062 (23000): Duplicate entry '1-x' for key 'dk.PRIMARY'
+        //   ERROR 1062 (23000): Duplicate entry '5' for key 'dk.uq_c'
+        //   ERROR 1050 (42S01): Table 'mc_t' already exists
+        // against SPG 7.39.13's
+        //   duplicate key value violates unique constraint "dk_pkey"
+        //     on table "dk" DETAIL: Key (a, b)=(1, x) already exists.
+        //   relation "mc_t" already exists
+        // v7.40.0 — the engine words this one itself when the session is
+        // MySQL, because only it knows whether the constraint is the
+        // primary key. This arm carries the number and the SQLSTATE.
+        spg_engine::EngineError::Unsupported(m) if m.starts_with("Duplicate entry '") => {
+            (1062, "23000", m.clone())
+        }
+        // The PostgreSQL sentence still reaches here from any path that
+        // raises it without the dialect in hand. Parsing it recovers
+        // everything except a NAMED primary key, which reads as a unique.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("duplicate key value violates unique constraint ") =>
+        {
+            (1062, "23000", mysql_duplicate_entry_text(m))
+        }
+        // Likewise: the engine writes MySQL's datetime sentence at the
+        // INSERT site, where the column and the row are known.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("Incorrect datetime value: ") =>
+        {
+            (1292, "22007", detail.clone())
+        }
+        spg_engine::EngineError::Storage(spg_storage::StorageError::DuplicateTable { name }) => {
+            (1050, "42S01", format!("Table '{name}' already exists"))
+        }
+        // `DROP TABLE` on a table that is not there. MySQL uses a
+        // DIFFERENT number for the DROP than for a read — 1051
+        // `Unknown table` against 1146 `Table … doesn't exist`
+        // (measured on 9.7.2, both at SQLSTATE 42S02) — and SPG
+        // answered 1146 for both, with PostgreSQL's sentence. This is
+        // the only site in the engine that words it this way, so the
+        // prefix cannot collect a read's error by accident.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("table \"") && m.ends_with("\" does not exist") =>
+        {
+            let name = m
+                .trim_start_matches("table \"")
+                .trim_end_matches("\" does not exist");
+            (1051, "42S02", format!("Unknown table '{db}.{name}'"))
+        }
+        // v7.40.0 — a set operation whose arms have different column
+        // counts. MySQL 9.7.2: `ERROR 1222 (21000) The used SELECT
+        // statements have a different number of columns`. SPG answered
+        // 1064 — a PARSE error, which is not what happened — carrying
+        // PostgreSQL's sentence.
+        spg_engine::EngineError::Unsupported(m)
+            if m.ends_with("query must have the same number of columns") =>
+        {
+            (
+                1222,
+                "21000",
+                "The used SELECT statements have a different number of columns".to_string(),
+            )
+        }
+        // A date or time literal outside the calendar. MySQL 9.7.2:
+        // `ERROR 1292 (22007) Incorrect datetime value: '2020-99-99'
+        // for column 'made' at row 1`; SPG answered 1064 — a PARSE
+        // error, which is not what happened — with PostgreSQL's
+        // sentence and its `HINT:` line. The column and row are not in
+        // reach at this layer, so the sentence stops before them.
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::TypeMismatch { detail })
+            if detail.starts_with("date/time field value out of range: ") =>
+        {
+            let v = detail
+                .lines()
+                .next()
+                .unwrap_or(detail)
+                .trim_start_matches("date/time field value out of range: ")
+                .trim_matches('"');
+            (1292, "22007", format!("Incorrect datetime value: '{v}'"))
+        }
         // v7.39 — the one place the rule above cannot apply. A storage
         // engine is a MySQL-only concept and PostgreSQL has no SQLSTATE to
         // sort it into, so there is no single answer to derive this from.

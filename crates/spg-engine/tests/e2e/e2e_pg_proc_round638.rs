@@ -46,15 +46,19 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round638_pg_proc_lists_what_the_engine_has() {
     let mut e = Engine::new();
+    // v7.40.0 — 881 became 882: `isnull`, MySQL's one-argument NULL
+    // test, joined the catalog. The count is checked because the
+    // catalog is hand-kept and a function that exists but is not listed
+    // is invisible to every tool that reads it.
     // v7.39 (round 653) — 373/338 became 716/573. The old numbers were not
     // wrong when written; they were the size of a catalog that listed 338 of
     // the 709 functions the engine answers. The gap was measured by calling
     // every candidate name and reading the engine's own reply, which
     // separates "does not exist" from "takes N args".
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["881"]);
+    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["882"]);
     assert_eq!(
         vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"),
-        vec!["573"]
+        vec!["574"]
     );
     // Signatures byte for byte with PG18's for the same names.
     assert_eq!(
@@ -87,7 +91,7 @@ fn round638_no_row_is_orphaned_by_the_join() {
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype"
         ),
-        vec!["881"],
+        vec!["882"],
         "as many as pg_proc has — nothing points at a type pg_type omits"
     );
 }

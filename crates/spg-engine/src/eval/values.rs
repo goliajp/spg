@@ -464,7 +464,14 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
             crate::eval::format_timestamp_array_styled(items, true, style)
         }
         Value::UuidArray(items) => crate::eval::format_uuid_array(items),
-        Value::JsonArray(items) | Value::JsonbArray(items) => crate::eval::format_text_array(items),
+        Value::JsonArray(items) | Value::JsonbArray(items) | Value::XmlArray(items) => {
+            crate::eval::format_text_array(items)
+        }
+        // v7.40.0 — bare element forms; see `format.rs`.
+        Value::RealArray(items) => crate::eval::format_real_array(items, style),
+        Value::TimeArray(items) => crate::eval::format_time_array(items),
+        Value::TimeTzArray(items) => crate::eval::format_timetz_array(items),
+        Value::InetArray(items) => crate::eval::format_inet_array(items),
         Value::BytesArray(items) => crate::eval::format_bytea_array(items),
         Value::IntervalArray(items) => crate::eval::format_interval_array_styled(items, style),
         Value::MoneyArray(items) => crate::conversions::format_money_array(items),
@@ -533,6 +540,11 @@ pub(crate) fn array_len(v: &Value) -> Option<usize> {
         Value::IntervalArray(items) => Some(items.len()),
         Value::UuidArray(items) => Some(items.len()),
         Value::BytesArray(items) => Some(items.len()),
+        Value::RealArray(items) => Some(items.len()),
+        Value::TimeArray(items) => Some(items.len()),
+        Value::TimeTzArray(items) => Some(items.len()),
+        Value::InetArray(items) => Some(items.len()),
+        Value::XmlArray(items) => Some(items.len()),
         _ => None,
     }
 }
@@ -632,6 +644,18 @@ pub(crate) fn array_element_at(v: &Value, pos: usize) -> Option<Value<'static>> 
         }),
         Value::UuidArray(items) => nth!(items, |u| Value::Uuid(*u)),
         Value::BytesArray(items) => nth!(items, |b| Value::Bytes(Cow::Owned(b.clone()))),
+        Value::RealArray(items) => nth!(items, |x| Value::Real(*x)),
+        Value::TimeArray(items) => nth!(items, |us| Value::Time(*us)),
+        Value::TimeTzArray(items) => nth!(items, |(us, off)| Value::TimeTz {
+            us: *us,
+            offset_secs: *off,
+        }),
+        Value::InetArray(items) => nth!(items, |(family, bits, addr)| Value::Inet {
+            family: *family,
+            bits: *bits,
+            addr: *addr,
+        }),
+        Value::XmlArray(items) => nth!(items, |x| Value::Xml(Cow::Owned(x.clone()))),
         _ => None,
     }
 }
@@ -725,6 +749,26 @@ pub(super) fn array_rebuild(model: &Value<'_>, elems: &[Value<'static>]) -> Opti
             Value::Bytes(b) => Some(b.as_ref().to_vec()),
             _ => None,
         }),
+        Value::RealArray(_) => build!(RealArray, |e: &Value<'_>| match e {
+            Value::Real(x) => Some(*x),
+            _ => None,
+        }),
+        Value::TimeArray(_) => build!(TimeArray, |e: &Value<'_>| match e {
+            Value::Time(us) => Some(*us),
+            _ => None,
+        }),
+        Value::TimeTzArray(_) => build!(TimeTzArray, |e: &Value<'_>| match e {
+            Value::TimeTz { us, offset_secs } => Some((*us, *offset_secs)),
+            _ => None,
+        }),
+        Value::InetArray(_) => build!(InetArray, |e: &Value<'_>| match e {
+            Value::Inet { family, bits, addr } => Some((*family, *bits, *addr)),
+            _ => None,
+        }),
+        Value::XmlArray(_) => build!(XmlArray, |e: &Value<'_>| match e {
+            Value::Xml(x) => Some(x.as_ref().into()),
+            _ => None,
+        }),
         Value::IntervalArray(_) => build!(IntervalArray, |e: &Value<'_>| match e {
             Value::Interval {
                 months,
@@ -762,6 +806,10 @@ pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static>
     }
     let mut has_text = false;
     let mut has_float = false;
+    // v7.40.0 — PG 18.6, measured: `ARRAY[1.5::real, 2]` is `real[]` and
+    // `ARRAY[1.5::real, 2.5::numeric]` is `real[]`; only an actual
+    // `float8` in the list widens the whole array to `double precision[]`.
+    let mut has_real = false;
     let mut has_numeric = false;
     let mut has_bigint = false;
     let mut has_int = false;
@@ -771,7 +819,8 @@ pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static>
             Value::Int(_) | Value::SmallInt(_) => has_int = true,
             Value::BigInt(_) => has_bigint = true,
             Value::Numeric { .. } | Value::NumericBig(_) => has_numeric = true,
-            Value::Float(_) | Value::Real(_) => has_float = true,
+            Value::Float(_) => has_float = true,
+            Value::Real(_) => has_real = true,
             _ => has_text = true,
         }
     }
@@ -784,7 +833,23 @@ pub(crate) fn build_array_from_values(vals: &[Value<'static>]) -> Value<'static>
         }
     };
     if !has_text {
-        if has_float {
+        if has_real && !has_float {
+            #[allow(clippy::cast_possible_truncation)]
+            return Value::RealArray(
+                vals.iter()
+                    .map(|v| match v {
+                        Value::Null => None,
+                        Value::Real(f) => Some(*f),
+                        #[allow(clippy::cast_precision_loss)]
+                        Value::Numeric { scaled, scale, .. } => {
+                            Some((*scaled as f64 / libm::pow(10.0, f64::from(*scale))) as f32)
+                        }
+                        other => as_i64(other).map(|n| n as f32),
+                    })
+                    .collect(),
+            );
+        }
+        if has_float || has_real {
             return Value::FloatArray(
                 vals.iter()
                     .map(|v| match v {
@@ -871,6 +936,28 @@ pub(crate) fn homogeneous_typed_array(vals: &[Value<'static>]) -> Option<Value<'
         Value::Uuid(_) => collect!(UuidArray, Value::Uuid(u) => *u),
         Value::Money(_) => collect!(MoneyArray, Value::Money(m) => *m),
         Value::Bytes(_) => collect!(BytesArray, Value::Bytes(b) => b.as_ref().to_vec()),
+        // v7.40.0 — the five that had no array variant to keep.
+        Value::Real(_) => collect!(RealArray, Value::Real(x) => *x),
+        Value::Time(_) => collect!(TimeArray, Value::Time(us) => *us),
+        Value::TimeTz { .. } => {
+            collect!(TimeTzArray, Value::TimeTz { us, offset_secs } => (*us, *offset_secs))
+        }
+        // PG unifies `inet` and `cidr` to `inet[]` (measured on 18.6),
+        // and the two share a body, so one arm takes both.
+        Value::Inet { .. } | Value::Cidr { .. } => {
+            let mut out = alloc::vec::Vec::with_capacity(vals.len());
+            for v in vals {
+                match v {
+                    Value::Null => out.push(None),
+                    Value::Inet { family, bits, addr } | Value::Cidr { family, bits, addr } => {
+                        out.push(Some((*family, *bits, *addr)));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Value::InetArray(out))
+        }
+        Value::Xml(_) => collect!(XmlArray, Value::Xml(x) => x.as_ref().into()),
         Value::Interval { .. } => {
             let mut out = alloc::vec::Vec::with_capacity(vals.len());
             for v in vals {

@@ -1912,6 +1912,45 @@ pub fn format_uuid_array(items: &[Option<[u8; 16]>]) -> String {
     out
 }
 
+/// v7.40.0 — REAL[] / TIME[] / TIMETZ[] / INET[] in PG external
+/// form. Measured against PG 18.6: none of these element forms can
+/// contain a character `array_out` quotes, so each is emitted bare.
+/// `xml[]` is NOT here — an XML element can hold a comma, so it goes
+/// through `format_text_array` with the rest of the string arrays.
+fn bare_array<T, F: Fn(&T) -> String>(items: &[Option<T>], render: F) -> String {
+    let mut out = String::with_capacity(2 + items.len() * 8);
+    out.push('{');
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match item {
+            None => out.push_str("NULL"),
+            Some(v) => out.push_str(&render(v)),
+        }
+    }
+    out.push('}');
+    out
+}
+
+pub fn format_real_array(items: &[Option<f32>], style: &RenderStyle) -> String {
+    bare_array(items, |x| format_real_styled(*x, style))
+}
+
+pub fn format_time_array(items: &[Option<i64>]) -> String {
+    bare_array(items, |us| format_time(*us))
+}
+
+pub fn format_timetz_array(items: &[Option<(i64, i32)>]) -> String {
+    bare_array(items, |(us, off)| format_timetz(*us, *off))
+}
+
+pub fn format_inet_array(items: &[Option<(u8, u8, [u8; 16])>]) -> String {
+    bare_array(items, |(family, bits, addr)| {
+        crate::conversions::format_inet(*family, *bits, addr)
+    })
+}
+
 /// v7.37.5 γ — render a BYTEA[] in PG external form. Each
 /// non-NULL element is `\\x<hex>` (the PG hex output form) and
 /// is double-quoted because the leading backslash is a PG array

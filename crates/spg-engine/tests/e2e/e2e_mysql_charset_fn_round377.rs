@@ -1,8 +1,11 @@
 //! read01 round 377 (MySQL differential) — CHARSET(x) / COLLATION(x)
 //! introspection functions.
 //!
-//! MariaDB 11: `CHARSET('x')` is 'utf8mb4' and `COLLATION('x')` is
-//! 'utf8mb4_uca1400_ai_ci', while a number or a binary string reports
+//! MySQL 9.7.2: `CHARSET('x')` is 'utf8mb4' and `COLLATION('x')` is
+//! 'utf8mb4_0900_ai_ci' (MariaDB 11 answers its own
+//! 'utf8mb4_uca1400_ai_ci' here, and v7.40.0 corrected SPG to the
+//! engine it reports itself as), while a number or a binary string
+//! reports
 //! 'binary' for both. SPG had neither function, so an ORM or a migration
 //! that introspects a column's charset/collation failed outright. SPG
 //! stores text as UTF-8 with the folding default collation, so a
@@ -37,13 +40,18 @@ fn text(e: &mut Engine, sql: &str) -> String {
 }
 
 /// A text argument reports utf8mb4 / the folding default collation.
+///
+/// v7.40.0 — that collation is `utf8mb4_0900_ai_ci`, MySQL's default.
+/// It read `utf8mb4_uca1400_ai_ci`, which is MARIADB's: SPG reports
+/// itself as MySQL and answered a name MySQL does not have, while
+/// `@@collation_connection` on the same session answered the right one.
 #[test]
 fn text_reports_utf8mb4() {
     let mut e = mysql();
     assert_eq!(text(&mut e, "SELECT CHARSET('x')"), "utf8mb4");
     assert_eq!(
         text(&mut e, "SELECT COLLATION('x')"),
-        "utf8mb4_uca1400_ai_ci"
+        "utf8mb4_0900_ai_ci"
     );
     assert_eq!(text(&mut e, "SELECT CHARSET(CONCAT('a', 'b'))"), "utf8mb4");
 }
@@ -68,7 +76,7 @@ fn column_type_decides() {
     assert_eq!(text(&mut e, "SELECT CHARSET(b) FROM ct"), "binary");
     assert_eq!(
         text(&mut e, "SELECT COLLATION(v) FROM ct"),
-        "utf8mb4_uca1400_ai_ci"
+        "utf8mb4_0900_ai_ci"
     );
     assert_eq!(text(&mut e, "SELECT COLLATION(b) FROM ct"), "binary");
 }

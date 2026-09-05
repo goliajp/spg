@@ -1492,6 +1492,7 @@ impl Engine {
                     let (schema, rows) =
                         crate::system_catalog::synth_information_schema_table_constraints(
                             self.active_catalog(),
+                            self.speaks_mysql,
                         );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
@@ -3912,7 +3913,7 @@ impl Engine {
         // already takes — without it `SELECT COUNT(*) FROM
         // unnest(ARRAY[…])` either errored at projection time or
         // returned the wrong shape.
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             // v7.29 — a per-query memo so correlated scalar
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
@@ -4171,7 +4172,7 @@ impl Engine {
         // a single 100 row instead of erroring at projection
         // time. GROUP BY / HAVING / ORDER BY over the aggregate
         // output all ride through `aggregate::run`.
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             // v7.29 — a per-query memo so correlated scalar
             // subqueries batch-evaluate once (group map) instead of
             // executing per group.
@@ -4642,14 +4643,14 @@ impl Engine {
         // replacement shape of INSUBQ. Runs BEFORE `indexed_rows` so
         // we don't pay the row materialisation cost twice. Returns
         // a bare `Rows{count}` if the shape matches.
-        if aggregate::uses_aggregate(stmt)
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
             && let Some(out) = self.try_count_star_pk_in_list_fast(stmt, table, schema_cols, alias)
         {
             return Ok(Some(out));
         }
         // v7.38 (perf) — `count(*) WHERE <indexed BETWEEN>`: count the in-range
         // locators directly, skipping row materialisation + WHERE re-eval.
-        if aggregate::uses_aggregate(stmt)
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
             && let Some(out) = self.try_count_star_indexed_range_fast(
                 stmt,
                 table,
@@ -4948,7 +4949,7 @@ impl Engine {
 
         // Aggregate path: filter rows first, then hand off to the
         // aggregate executor which does its own projection + ORDER BY.
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             return self.run_single_table_aggregate(
                 stmt,
                 table,
@@ -5706,7 +5707,7 @@ impl Engine {
             rows
         };
         // Aggregate dispatch (e.g. SELECT COUNT(*) FROM jsonb_each_text…).
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
                 self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
@@ -5945,7 +5946,7 @@ impl Engine {
             rows
         };
         // Aggregate dispatch.
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             let agg_memo = core::cell::RefCell::new(memoize::MemoizeCache::default());
             let agg_correlated = |e: &Expr, r: &Row<'static>, c: &EvalContext<'_>| {
                 self.eval_expr_with_correlated(e, r, c, cancel, Some(&mut agg_memo.borrow_mut()))
@@ -6126,7 +6127,7 @@ impl Engine {
         // scalar projection, where the aggregate name looked like an unknown
         // function. The WHERE filters that one row, so `… WHERE false` leaves
         // the aggregate zero input rows (`count(*)` → 0).
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             let dummy = Row::new(Vec::new());
             let passes = match &stmt.where_ {
                 Some(w) => matches!(eval::eval_expr(w, &dummy, &ctx)?, Value::Bool(true)),
@@ -8583,7 +8584,7 @@ impl Engine {
             || from.primary.as_of_segment.is_some()
             || from.primary.generate_series_args.is_some()
             || select_has_window(stmt)
-            || aggregate::uses_aggregate(stmt)
+            || aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
         {
             return true;
         }
@@ -9219,7 +9220,7 @@ impl Engine {
             || from.primary.as_of_segment.is_some()
             || from.primary.generate_series_args.is_some()
             || select_has_window(stmt)
-            || aggregate::uses_aggregate(stmt)
+            || aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
         {
             return Ok(None);
         }
@@ -9515,7 +9516,7 @@ impl Engine {
             || from.primary.as_of_segment.is_some()
             || from.primary.generate_series_args.is_some()
             || select_has_window(stmt)
-            || aggregate::uses_aggregate(stmt)
+            || aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
         {
             return Ok(None);
         }
@@ -10132,7 +10133,7 @@ impl Engine {
         {
             return Ok(None);
         }
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             return Ok(None);
         }
         // No window / SRF on the streaming path.
@@ -10386,7 +10387,7 @@ impl Engine {
             .with_session(&joined_sess);
         // Aggregate path: handle GROUP BY / aggregate calls over the
         // joined+filtered rows.
-        if aggregate::uses_aggregate(stmt) {
+        if aggregate::uses_aggregate_in(stmt, self.speaks_mysql) {
             // v7.32 (P4 borrow channel, increment 2) — borrow each
             // surviving join tuple as a RowRef::Tuple; the aggregate
             // engine reads source cells by reference (bound fast path =
@@ -10705,7 +10706,7 @@ impl Engine {
             || !stmt.order_by.is_empty()
             || stmt.offset.is_some()
             || stmt.distinct
-            || aggregate::uses_aggregate(stmt)
+            || aggregate::uses_aggregate_in(stmt, self.speaks_mysql)
         {
             return Err(EngineError::Unsupported(
                 "AS OF SEGMENT supports SELECT projection + WHERE + LIMIT only \
@@ -12188,6 +12189,17 @@ pub(crate) fn resolve_projection_column<'a>(
     }
 }
 
+/// v7.40.0 — a column the grouping-set rewrite injected purely to sort
+/// on, and which must not reach the client. Two families: `__grp_ord_*`
+/// carries a branch's `grouping()` mask (round 135), `__grp_key_*`
+/// carries a key the rollup orders by that the query did not project —
+/// without it `SELECT SUM(qty) … GROUP BY qty WITH ROLLUP` answered
+/// `column "qty" does not exist`, because a UNION's ORDER BY can only
+/// name output columns.
+fn is_synthetic_group_col(name: &str) -> bool {
+    name.starts_with("__grp_ord_") || name.starts_with("__grp_key_")
+}
+
 /// v7.39 (round 135) — drop the synthetic `__grp_ord_*` columns injected by the
 /// parser to carry per-branch GROUPING() masks into a grouping-set query's
 /// ORDER BY. They must never reach the output. No-op unless such a column is
@@ -12221,13 +12233,13 @@ fn strip_synthetic_order_cols(result: QueryResult) -> QueryResult {
     let QueryResult::Rows { columns, rows } = result else {
         return result;
     };
-    if !columns.iter().any(|c| c.name.starts_with("__grp_ord_")) {
+    if !columns.iter().any(|c| is_synthetic_group_col(&c.name)) {
         return QueryResult::Rows { columns, rows };
     }
     let keep: Vec<usize> = columns
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.name.starts_with("__grp_ord_"))
+        .filter(|(_, c)| !is_synthetic_group_col(&c.name))
         .map(|(i, _)| i)
         .collect();
     let new_cols: Vec<ColumnSchema> = keep.iter().map(|&i| columns[i].clone()).collect();

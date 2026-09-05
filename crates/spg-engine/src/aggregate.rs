@@ -51,7 +51,7 @@ impl crate::Engine {
         {
             return None;
         }
-        if !uses_aggregate(stmt) {
+        if !uses_aggregate_in(stmt, self.speaks_mysql) {
             return None;
         }
         let from = stmt.from.as_ref()?;
@@ -114,10 +114,82 @@ impl crate::Engine {
 
 /// True if this statement should go through the aggregate path.
 pub fn uses_aggregate(stmt: &SelectStatement) -> bool {
+    uses_aggregate_in(stmt, false)
+}
+
+/// v7.40.0 — the same question, asked in a dialect.
+///
+/// MySQL's `ANY_VALUE()` is documented as NOT an aggregate: it returns
+/// its argument and suppresses the `ONLY_FULL_GROUP_BY` rejection of
+/// whatever is inside it. PostgreSQL 16+ has an `any_value` that IS a
+/// true aggregate. Measured, over a two-row table:
+///
+/// ```text
+///   SELECT any_value(x) FROM t     PostgreSQL 18.6   1 row
+///                                  MySQL 9.7.2       2 rows
+/// ```
+///
+/// So a MySQL statement whose only aggregate call is `ANY_VALUE` and
+/// which has no GROUP BY or HAVING does not aggregate at all. It stays
+/// in `is_aggregate_name` either way — that is what exempts its
+/// argument from the grouping rule, which is the whole point of the
+/// function on both engines.
+pub fn uses_aggregate_in(stmt: &SelectStatement, mysql: bool) -> bool {
     if stmt.group_by.is_some() || stmt.having.is_some() {
         return true;
     }
+    if mysql && only_aggregate_is_any_value(stmt) {
+        return false;
+    }
     uses_aggregate_ignoring_group_by(stmt)
+}
+
+/// Every aggregate call in the statement is `any_value`, and there is at
+/// least one.
+fn only_aggregate_is_any_value(stmt: &SelectStatement) -> bool {
+    fn walk(e: &Expr, seen: &mut bool, other: &mut bool) {
+        match e {
+            Expr::FunctionCall { name, args } => {
+                if is_aggregate_name(&name.to_ascii_lowercase()) {
+                    if name.eq_ignore_ascii_case("any_value") {
+                        *seen = true;
+                    } else {
+                        *other = true;
+                    }
+                }
+                for a in args {
+                    walk(a, seen, other);
+                }
+            }
+            Expr::AggregateOrdered { .. } => *other = true,
+            Expr::Collate { expr, .. }
+            | Expr::NamedArg { expr, .. }
+            | Expr::Variadic(expr)
+            | Expr::Unary { expr, .. }
+            | Expr::Cast { expr, .. }
+            | Expr::IsNull { expr, .. }
+            | Expr::BoolTest { expr, .. } => walk(expr, seen, other),
+            Expr::Binary { lhs, rhs, .. } => {
+                walk(lhs, seen, other);
+                walk(rhs, seen, other);
+            }
+            _ => {
+                if contains_aggregate(e) {
+                    *other = true;
+                }
+            }
+        }
+    }
+    let (mut seen, mut other) = (false, false);
+    for item in &stmt.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, &mut seen, &mut other);
+        }
+    }
+    for o in &stmt.order_by {
+        walk(&o.expr, &mut seen, &mut other);
+    }
+    seen && !other
 }
 
 /// v7.38.13 — the same question with the GROUP BY / HAVING short-circuit
@@ -241,7 +313,7 @@ pub fn is_aggregate_name(name: &str) -> bool {
             | "every"
             // v7.32 (round-29) — statistical aggregates (every BI /
             // dashboard emits these in rollups).
-            | "stddev" | "stddev_samp" | "stddev_pop"
+            | "std" | "stddev" | "stddev_samp" | "stddev_pop"
             | "variance" | "var_samp" | "var_pop"
             // v7.32 (round-29) — bitwise aggregates.
             | "bit_and" | "bit_or" | "bit_xor"
@@ -409,7 +481,7 @@ pub(crate) fn classify_agg_name(name: &str) -> AggKind {
         "array_agg" => AggKind::ArrayAgg,
         "bool_and" => AggKind::BoolAnd,
         "bool_or" => AggKind::BoolOr,
-        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+        "std" | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
             AggKind::StddevFamily
         }
         "bit_and" => AggKind::BitAnd,
@@ -5149,7 +5221,7 @@ fn validate_agg_arities(
                 | "bool_and" | "bool_or" | "every"
                 // v7.32 (round-29) — statistical + bitwise aggregates
                 // + single-arg JSON aggregate.
-                | "stddev" | "stddev_samp" | "stddev_pop"
+                | "std" | "stddev" | "stddev_samp" | "stddev_pop"
                 | "variance" | "var_samp" | "var_pop"
                 | "bit_and" | "bit_or" | "bit_xor"
                 | "json_agg" | "jsonb_agg" | "xmlagg"
@@ -6131,11 +6203,24 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                         i128::from(st.num.sum_int),
                         0,
                     );
-                    let (scaled, scale) = crate::numeric::numeric_avg(
-                        sum_scaled,
-                        sum_scale,
-                        i128::from(st.num.count),
-                    );
+                    // v7.40.0 — MySQL's AVG has the argument's scale plus
+                    // four; PostgreSQL picks a display scale. Measured on
+                    // 9.7.2: DECIMAL(10,2) averages to six decimals,
+                    // where SPG answered PostgreSQL's sixteen.
+                    let (scaled, scale) = if mysql {
+                        crate::numeric::numeric_avg_at(
+                            sum_scaled,
+                            sum_scale,
+                            i128::from(st.num.count),
+                            sum_scale.saturating_add(4),
+                        )
+                    } else {
+                        crate::numeric::numeric_avg(
+                            sum_scaled,
+                            sum_scale,
+                            i128::from(st.num.count),
+                        )
+                    };
                     Value::Numeric {
                         scaled,
                         scale,
@@ -6148,11 +6233,22 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                 // v7.38 (read01, T4) — avg over integer input is exact NUMERIC
                 // (PG: avg(int)/avg(bigint) → numeric), at PG's division display
                 // scale. sum(int) is unaffected (it reads sum_int as BigInt).
-                let (scaled, scale) = crate::numeric::numeric_avg(
-                    i128::from(st.num.sum_int),
-                    0,
-                    i128::from(st.num.count),
-                );
+                // v7.40.0 — MySQL gives an integer average four decimals
+                // (`1.5000`), PostgreSQL sixteen.
+                let (scaled, scale) = if mysql {
+                    crate::numeric::numeric_avg_at(
+                        i128::from(st.num.sum_int),
+                        0,
+                        i128::from(st.num.count),
+                        4,
+                    )
+                } else {
+                    crate::numeric::numeric_avg(
+                        i128::from(st.num.sum_int),
+                        0,
+                        i128::from(st.num.count),
+                    )
+                };
                 Value::Numeric {
                     scaled,
                     scale,
@@ -6266,7 +6362,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
         // v7.32 (round-29) — variance / stddev. PG: `variance` ==
         // `var_samp`, `stddev` == `stddev_samp`. samp needs n >= 2
         // (n < 2 → NULL); pop needs n >= 1 (n == 1 → 0).
-        "variance" | "var_samp" | "var_pop" | "stddev" | "stddev_samp" | "stddev_pop" => {
+        "variance" | "var_samp" | "var_pop" | "std" | "stddev" | "stddev_samp" | "stddev_pop" => {
             let n = st.num.count;
             if n == 0 {
                 return Value::Null;
@@ -6276,7 +6372,13 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             // POPULATION statistics (`STDDEV` = `STDDEV_POP`, `VARIANCE` =
             // `VAR_POP` on MariaDB 11), where PG's bare forms are the
             // SAMPLE ones. `_samp` / `_pop` are explicit and unchanged.
-            let pop = name.ends_with("_pop") || (mysql && (name == "stddev" || name == "variance"));
+            // v7.40.0 — MySQL's `STD` is a third spelling of the same
+            // population standard deviation: measured on 9.7.2, over
+            // 0,1,2,3 it answers 1.118033988749895 where `STDDEV_SAMP`
+            // answers 1.2909944487358056. PostgreSQL has no `std`.
+            let pop = name.ends_with("_pop")
+                || name == "std"
+                || (mysql && (name == "stddev" || name == "variance"));
             if !pop && n < 2 {
                 // var_samp / stddev (samp) with n == 1 → NULL.
                 return Value::Null;
@@ -6285,7 +6387,11 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             // variance = (N·Σx² − (Σx)²) / (N² | N·(N−1)) using numeric division's
             // display scale, and stddev is its numeric sqrt. Falls through to the
             // f64 path (a double result, PG's float8 overload) on a float input.
-            if !st.stddev_saw_float {
+            // v7.40.0 — and MySQL answers a DOUBLE where PostgreSQL
+            // answers a NUMERIC. Measured on 9.7.2 over 0,1,2,3:
+            // `VARIANCE(x)` is `1.25`, where the exact path below
+            // renders PostgreSQL's `1.2500000000000000`.
+            if !st.stddev_saw_float && !mysql {
                 // v7.39 (round 615) — fold whatever the i128 accumulator holds
                 // into the exact pair, once, here.
                 if let Some((sum, sum_sq)) = stddev_exact_pair(st) {
@@ -6309,7 +6415,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
                     }
                     let rscale = crate::numeric::division_display_scale_big(&numerator, &divisor);
                     if let Some(var) = numerator.div(&divisor, rscale) {
-                        let out = if name.starts_with("stddev") {
+                        let out = if name.starts_with("stddev") || name == "std" {
                             var.sqrt(crate::numeric::sqrt_display_scale_big(&var))
                         } else {
                             Some(var)
@@ -6330,7 +6436,7 @@ pub(crate) fn finalize(name: &str, st: &AggState, mysql: bool) -> Value<'static>
             let numerator = (nf * st.sum_sq - st.num.sum_float * st.num.sum_float).max(0.0);
             let divisor = if pop { nf * nf } else { nf * (nf - 1.0) };
             let var = numerator / divisor;
-            let result = if name.starts_with("stddev") {
+            let result = if name.starts_with("stddev") || name == "std" {
                 crate::eval::f64_sqrt(var)
             } else {
                 var
@@ -6865,6 +6971,12 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
             Some(DataType::Timestamptz) => DataType::TimestamptzArray,
             Some(DataType::Uuid) => DataType::UuidArray,
             Some(DataType::Float) => DataType::FloatArray,
+            // v7.40.0 — five element types whose array now exists.
+            Some(DataType::Real) => DataType::RealArray,
+            Some(DataType::Time) => DataType::TimeArray,
+            Some(DataType::TimeTz) => DataType::TimeTzArray,
+            Some(DataType::Inet | DataType::Cidr) => DataType::InetArray,
+            Some(DataType::Xml) => DataType::XmlArray,
             Some(DataType::Numeric { .. }) => DataType::NumericArray,
             Some(DataType::Bytes) => DataType::BytesArray,
             _ => DataType::TextArray,
@@ -6876,7 +6988,7 @@ fn infer_agg_type(spec: &AggSpec, schema_cols: &[ColumnSchema]) -> DataType {
         // percentile_cont interpolates to float; the regression family
         // (except regr_count) is floating point.
         // v7.38 (read01, T4.3) — PG stddev / variance return NUMERIC.
-        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+        "std" | "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
             DataType::Numeric {
                 precision: 0,
                 scale: 0,
@@ -8165,6 +8277,7 @@ mod value_cmp_mixed_numeric_tests {
             "bool_and",
             "bool_or",
             "every",
+            "std",
             "stddev",
             "stddev_samp",
             "stddev_pop",

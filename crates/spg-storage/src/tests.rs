@@ -2769,7 +2769,7 @@ fn deserialize_rejects_bad_magic() {
 #[test]
 fn deserialize_rejects_unsupported_version() {
     let mut buf = FILE_MAGIC.to_vec();
-    buf.push(99); // future version
+    buf.push(100); // future version
     buf.extend_from_slice(&0u32.to_le_bytes());
     let err = Catalog::deserialize(&buf).unwrap_err();
     assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("version")));
@@ -6179,13 +6179,10 @@ fn a_pre_v97_catalog_has_its_timetz_index_rebuilt_on_load() {
             alloc::vec![(IndexKey::Int(7 * 3_600_000_000), locs)],
         ));
     }
-    let mut bytes = c.serialize();
-    // Stamp it v96 and repair the trailer, so `deserialize` takes the
-    // pre-v97 branch on bytes that are otherwise this build's own.
-    bytes[8] = 96;
-    let n = bytes.len() - 4;
-    let crc = spg_crypto::crc32c::crc32c(&bytes[..n]);
-    bytes[n..].copy_from_slice(&crc.to_le_bytes());
+    // v7.40.0 — written BY a v96 writer, not stamped onto a current
+    // image. v99 appends a byte to every index, so the stamp desynced
+    // the stream by one and `deserialize` reported a row count of 768.
+    let bytes = c.serialize_at(96);
 
     let c2 = Catalog::deserialize(&bytes).unwrap();
     let idx = c2
@@ -6451,4 +6448,63 @@ fn rederive_loses_nothing() {
         "ColumnSchema::new should synthesise a bare column; if it now copies \
          a source, this test proves nothing"
     );
+}
+
+/// v7.40.0 — the five array types added this version must survive a
+/// catalog serialise/deserialise. They are the first arrays in years
+/// to need a NEW codec tag, a new body encoder and a new decoder, and
+/// nothing else in the suite reaches all three: an in-memory engine
+/// test never encodes a row at all.
+///
+/// `xml[]` deliberately carries a comma and an empty string — it rides
+/// the escaped string-array format, not a fixed-width one — and every
+/// column carries a NULL element beside a present one, because the
+/// null flag and the element body are written by different lines.
+#[test]
+fn the_five_new_arrays_survive_a_catalog_round_trip() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("a", DataType::RealArray, true),
+            ColumnSchema::new("b", DataType::TimeArray, true),
+            ColumnSchema::new("c", DataType::TimeTzArray, true),
+            ColumnSchema::new("d", DataType::InetArray, true),
+            ColumnSchema::new("e", DataType::XmlArray, true),
+        ],
+    ))
+    .unwrap();
+    let row = alloc::vec![
+        Value::RealArray(alloc::vec![Some(1.5f32), None, Some(-0.25)]),
+        Value::TimeArray(alloc::vec![Some(45_296_000_000), None]),
+        Value::TimeTzArray(alloc::vec![Some((45_296_000_000, 7200)), None, Some((0, -19_800))]),
+        Value::InetArray(alloc::vec![
+            Some((2u8, 32u8, [10, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
+            None,
+        ]),
+        Value::XmlArray(alloc::vec![
+            Some("<a/>".to_string()),
+            Some("<b>x,y</b>".to_string()),
+            Some(String::new()),
+            None,
+        ]),
+    ];
+    let empties = alloc::vec![
+        Value::RealArray(alloc::vec![]),
+        Value::TimeArray(alloc::vec![]),
+        Value::TimeTzArray(alloc::vec![]),
+        Value::InetArray(alloc::vec![]),
+        Value::XmlArray(alloc::vec![]),
+    ];
+    {
+        let t = c.get_mut("t").unwrap();
+        t.insert(Row::new(row.clone())).unwrap();
+        t.insert(Row::new(empties.clone())).unwrap();
+    }
+    let bytes = c.serialize();
+    let back = Catalog::deserialize(&bytes).expect("the new arrays must load");
+    let t = back.get("t").unwrap();
+    assert_eq!(t.rows().len(), 2);
+    assert_eq!(t.rows()[0].values, row, "row 0 changed across the codec");
+    assert_eq!(t.rows()[1].values, empties, "empty arrays changed");
 }

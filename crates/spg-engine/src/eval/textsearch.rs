@@ -84,6 +84,7 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
         rest.first(),
         Some(
             Value::FloatArray(_)
+                | Value::RealArray(_)
                 | Value::NumericArray(_)
                 | Value::IntArray(_)
                 | Value::SmallIntArray(_)
@@ -162,6 +163,10 @@ fn parse_rank_args(name: &str, args: &[Value<'_>]) -> Result<RankArgs, EvalError
 fn parse_weight_array(name: &str, v: &Value<'_>) -> Result<crate::fts::RankWeights, EvalError> {
     let vals: Vec<f32> = match v {
         Value::FloatArray(a) => a.iter().map(|o| o.unwrap_or(0.0) as f32).collect(),
+        // v7.40.0 — `'{0.1,…}'::real[]` used to arrive as a FloatArray
+        // because `real[]` resolved to `float8[]`; it is a RealArray now,
+        // and this is the shape ts_rank wanted in the first place.
+        Value::RealArray(a) => a.iter().map(|o| o.unwrap_or(0.0)).collect(),
         Value::IntArray(a) => a.iter().map(|o| o.unwrap_or(0) as f32).collect(),
         Value::SmallIntArray(a) => a.iter().map(|o| f32::from(o.unwrap_or(0))).collect(),
         Value::NumericArray(a) => a

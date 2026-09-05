@@ -577,6 +577,34 @@ pub(crate) fn numeric_add(a: i128, a_scale: u16, b: i128, b_scale: u16) -> (i128
 /// rounds half-away-from-zero, matching PG18's exact avg output text
 /// including trailing digits. `count` must be > 0 (callers gate on
 /// `count == 0 → NULL`).
+/// v7.40.0 — the same average at a CALLER-CHOSEN scale.
+///
+/// PostgreSQL and MySQL disagree about how many digits an average has,
+/// and neither is a rounding of the other. Measured:
+///
+/// ```text
+///   AVG over 0,1,2,3        PG 18.6  1.5000000000000000
+///                           MySQL    1.5000
+///   AVG over DECIMAL(10,2)  MySQL    2.003333   (column scale + 4)
+/// ```
+///
+/// MySQL's rule is the argument's scale plus four, so the scale is
+/// known before the division; PostgreSQL picks a display scale from the
+/// operands, which is what [`numeric_avg`] does.
+pub(crate) fn numeric_avg_at(
+    sum_scaled: i128,
+    sum_scale: u16,
+    count: i128,
+    rscale: u16,
+) -> (i128, u16) {
+    let (num, den) = if rscale >= sum_scale {
+        (sum_scaled.saturating_mul(pow10_sat(rscale - sum_scale)), count)
+    } else {
+        (sum_scaled, count.saturating_mul(pow10_sat(sum_scale - rscale)))
+    };
+    (div_round_half_away(num, den), rscale)
+}
+
 pub(crate) fn numeric_avg(sum_scaled: i128, sum_scale: u16, count: i128) -> (i128, u16) {
     let rscale = division_display_scale(sum_scaled, sum_scale, count, 0);
     let (num, den) = if i32::from(rscale) >= i32::from(sum_scale) {

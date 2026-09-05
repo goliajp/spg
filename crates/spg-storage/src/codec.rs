@@ -1110,6 +1110,19 @@ fn deserialize_indices(
                         last.constraint_backing = backing;
                     }
                 }
+                // v7.40.0 — the MySQL index prefix (FILE_VERSION 99+).
+                // A v98 snapshot has no bytes here and every index in it
+                // reads as un-prefixed, which is what it recorded.
+                if version >= 99 {
+                    let prefix = if cur.read_u8()? == 0 {
+                        None
+                    } else {
+                        Some(cur.read_u32()?)
+                    };
+                    if let Some(last) = t.indices.last_mut() {
+                        last.prefix_len = prefix;
+                    }
+                }
             }
         }
     }
@@ -1370,6 +1383,16 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::Xml => out.push(63),
         DataType::Char1 => out.push(64),
         DataType::MoneyArray => out.push(65),
+        // v7.40.0 — the five array spellings PostgreSQL 18.6 accepts
+        // and SPG's postfix-`[]` map refused. Additive tags; a reader
+        // older than v7.40 meeting one reports a corrupt catalog
+        // rather than mis-reading it, the same forward-compatibility
+        // story tags 4 and 5 had at v90.
+        DataType::RealArray => out.push(79),
+        DataType::TimeArray => out.push(80),
+        DataType::TimeTzArray => out.push(81),
+        DataType::InetArray => out.push(82),
+        DataType::XmlArray => out.push(83),
         // v7.39 (read01 pg_lsn.c): tag 66. FILE_VERSION unchanged (additive).
         DataType::PgLsn => out.push(66),
         DataType::Json => out.push(13),
@@ -1573,6 +1596,11 @@ impl Cursor<'_> {
             63 => Ok(DataType::Xml),
             64 => Ok(DataType::Char1),
             65 => Ok(DataType::MoneyArray),
+            79 => Ok(DataType::RealArray),
+            80 => Ok(DataType::TimeArray),
+            81 => Ok(DataType::TimeTzArray),
+            82 => Ok(DataType::InetArray),
+            83 => Ok(DataType::XmlArray),
             66 => Ok(DataType::PgLsn),
             68 => Ok(DataType::Real),
             other => Err(StorageError::Corrupt(format!(
@@ -1721,6 +1749,33 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
                 .map(|x| if x.is_some() { 5 } else { 1 })
                 .sum::<usize>()
         }
+        // v7.40.0 — flag byte plus the element's fixed width.
+        Value::RealArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 5 } else { 1 })
+                .sum::<usize>()
+        }
+        Value::TimeArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 9 } else { 1 })
+                .sum::<usize>()
+        }
+        // us + offset_secs.
+        Value::TimeTzArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 13 } else { 1 })
+                .sum::<usize>()
+        }
+        // family + bits + sixteen address bytes.
+        Value::InetArray(items) => {
+            2 + items
+                .iter()
+                .map(|x| if x.is_some() { 19 } else { 1 })
+                .sum::<usize>()
+        }
         Value::NumericArray(items) => {
             // i128 scaled (16) + u8 scale (1) + 1 null flag.
             2 + items
@@ -1742,6 +1797,9 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         Value::JsonArray(items)
         | Value::JsonbArray(items)
         | Value::VarcharArray(items)
+        // v7.40.0 — `xml[]` is a string array on the wire and on
+        // disk; its validation is at parse, not in the codec.
+        | Value::XmlArray(items)
         | Value::CharArray(items) => {
             let mut n = 2;
             for it in items {
@@ -2413,6 +2471,63 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
                 }
             }
         }
+        // v7.40.0 — five array types PG has had all along and SPG
+        // refused at the type name. Bodies mirror their scalars.
+        (Value::RealArray(items), DataType::RealArray) => {
+            let count = u16::try_from(items.len()).expect("REAL[] \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(x) => {
+                        out.push(0);
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::TimeArray(items), DataType::TimeArray) => {
+            let count = u16::try_from(items.len()).expect("TIME[] \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some(us) => {
+                        out.push(0);
+                        out.extend_from_slice(&us.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::TimeTzArray(items), DataType::TimeTzArray) => {
+            let count = u16::try_from(items.len()).expect("TIMETZ[] \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some((us, offset_secs)) => {
+                        out.push(0);
+                        out.extend_from_slice(&us.to_le_bytes());
+                        out.extend_from_slice(&offset_secs.to_le_bytes());
+                    }
+                }
+            }
+        }
+        (Value::InetArray(items), DataType::InetArray) => {
+            let count = u16::try_from(items.len()).expect("INET[] \u{2264} 65k elements");
+            out.extend_from_slice(&count.to_le_bytes());
+            for item in items {
+                match item {
+                    None => out.push(1),
+                    Some((family, bits, addr)) => {
+                        out.push(0);
+                        out.push(*family);
+                        out.push(*bits);
+                        out.extend_from_slice(&addr[..]);
+                    }
+                }
+            }
+        }
         (Value::UuidArray(items), DataType::UuidArray) => {
             let count = u16::try_from(items.len()).expect("UUID[] ≤ 65k elements");
             out.extend_from_slice(&count.to_le_bytes());
@@ -2429,6 +2544,7 @@ fn write_value_body(out: &mut Vec<u8>, v: &Value<'_>, ty: DataType) {
         (Value::JsonArray(items), DataType::JsonArray)
         | (Value::JsonbArray(items), DataType::JsonbArray)
         | (Value::VarcharArray(items), DataType::VarcharArray)
+        | (Value::XmlArray(items), DataType::XmlArray)
         | (Value::CharArray(items), DataType::CharArray) => {
             let count = u16::try_from(items.len()).expect("string-array ≤ 65k elements");
             out.extend_from_slice(&count.to_le_bytes());
@@ -2983,6 +3099,11 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         | Value::JsonbArray(_)
         | Value::BytesArray(_)
         | Value::VarcharArray(_)
+        | Value::RealArray(_)
+        | Value::TimeArray(_)
+        | Value::TimeTzArray(_)
+        | Value::InetArray(_)
+        | Value::XmlArray(_)
         | Value::CharArray(_) => unreachable!(
             "v7.37.5 γ array-of-scalar lacks a schema-less codec tag — \
              use schema-aware write_value_body via the column's DataType"
@@ -4198,6 +4319,81 @@ impl<'a> Cursor<'a> {
                 }
                 Ok(Value::TimestamptzArray(items))
             }
+            // v7.40.0 — see the matching write arms.
+            DataType::RealArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<f32>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_f32()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "REAL[] null flag: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::RealArray(items))
+            }
+            DataType::TimeArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<i64>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => items.push(Some(self.read_i64()?)),
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TIME[] null flag: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::TimeArray(items))
+            }
+            DataType::TimeTzArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<(i64, i32)>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let us = self.read_i64()?;
+                            let offset_secs = self.read_i32()?;
+                            items.push(Some((us, offset_secs)));
+                        }
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "TIMETZ[] null flag: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::TimeTzArray(items))
+            }
+            DataType::InetArray => {
+                let count = self.read_u16()? as usize;
+                let mut items: Vec<Option<(u8, u8, [u8; 16])>> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    match self.read_u8()? {
+                        0 => {
+                            let family = self.read_u8()?;
+                            let bits = self.read_u8()?;
+                            let mut addr = [0u8; 16];
+                            addr.copy_from_slice(self.take(16)?);
+                            items.push(Some((family, bits, addr)));
+                        }
+                        1 => items.push(None),
+                        other => {
+                            return Err(StorageError::Corrupt(format!(
+                                "INET[] null flag: {other}"
+                            )));
+                        }
+                    }
+                }
+                Ok(Value::InetArray(items))
+            }
             DataType::UuidArray => {
                 let count = self.read_u16()? as usize;
                 let mut items: Vec<Option<[u8; 16]>> = Vec::with_capacity(count);
@@ -4222,6 +4418,7 @@ impl<'a> Cursor<'a> {
             DataType::JsonArray
             | DataType::JsonbArray
             | DataType::VarcharArray
+            | DataType::XmlArray
             | DataType::CharArray => {
                 let kind = ty;
                 let count = self.read_u16()? as usize;
@@ -4241,6 +4438,7 @@ impl<'a> Cursor<'a> {
                     DataType::JsonArray => Value::JsonArray(items),
                     DataType::JsonbArray => Value::JsonbArray(items),
                     DataType::VarcharArray => Value::VarcharArray(items),
+                    DataType::XmlArray => Value::XmlArray(items),
                     DataType::CharArray => Value::CharArray(items),
                     _ => unreachable!(),
                 })

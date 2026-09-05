@@ -76,6 +76,16 @@ pub(crate) fn column_collation(e: &Expr, ctx: &EvalContext<'_>) -> Option<spg_st
 /// COLLATE is 0. Reading only the session there — which is what the
 /// first version of the fold fix did — turned an explicit request into
 /// a silently ignored one, the same defect in the other direction.
+/// v7.40.0 — the collation NAME a comparison is under, from whichever
+/// side declares one. The same chain `text_compare_of` walks, shared so
+/// the gate and the fold cannot disagree about which name applies.
+fn declared_collation(lhs: &Expr, rhs: &Expr, ctx: &EvalContext<'_>) -> Option<String> {
+    explicit_collation_name(lhs)
+        .or_else(|| explicit_collation_name(rhs))
+        .or_else(|| column_collation_name(lhs, ctx))
+        .or_else(|| column_collation_name(rhs, ctx))
+}
+
 pub(crate) fn explicit_collation_name(e: &Expr) -> Option<String> {
     match e {
         Expr::Collate { collation, .. } => Some(collation.clone()),
@@ -358,8 +368,21 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
     // collation, so a comparison touching one is byte-wise even when the
     // other side is a CI column. Measured on MariaDB 11: `'a' = 'A'` is 1
     // under the default collation and `BINARY 'a' = 'A'` is 0.
+    // v7.40.0 — this gate decides whether the comparison takes the OWNED
+    // path, and that path does TWO things: the case fold and the pad. A
+    // byte-wise collation skips the fold; a PADDING byte-wise collation
+    // — `utf8mb4_bin`, measured — still needs the pad, so answering
+    // "byte-wise, nothing to do" lost it. `BINARY x` and
+    // `CAST(x AS BINARY)` carry no collation name and so do not pad,
+    // which is what MySQL 9.7.2 answers for them.
     if is_binary_coerced(lhs) || is_binary_coerced(rhs) {
-        return false;
+        // Gated on the dialect: padding is a property of a MySQL
+        // collation NAME, and `pads_space` says "pads" for any name that
+        // is not one of MySQL's non-padding families — including a
+        // PostgreSQL locale like `en_US.utf8`, which does not pad. A
+        // `BINARY` cast is MySQL's construct in the first place.
+        return ctx.mysql_dialect
+            && crate::collate::pads_space(declared_collation(lhs, rhs, ctx).as_deref());
     }
     // v7.39 (round 364, M4 P2) — a MySQL session folds every text
     // comparison (see `collation_fold_for_compare`), so it must take the
@@ -371,7 +394,22 @@ pub(super) fn compare_is_case_insensitive(lhs: &Expr, rhs: &Expr, ctx: &EvalCont
     // default column stores `CaseInsensitive`, so only the explicit binary
     // column reaches here as `Binary`.
     if ctx.mysql_dialect {
-        return !operand_is_binary_column(lhs, ctx) && !operand_is_binary_column(rhs, ctx);
+        // v7.40.0 — byte-wise is TWO properties and this asked for one.
+        //
+        // A `_bin` collation does not fold case AND it PADS: measured on
+        // MySQL 9.7.2 with the connection on utf8mb4,
+        // `'a ' = 'a' COLLATE utf8mb4_bin` is 1 while
+        // `'a ' = 'a' COLLATE utf8mb4_0900_bin` is 0. This gate decides
+        // whether the comparison takes the OWNED path, which is where
+        // both the fold and the pad happen — so answering "byte-wise,
+        // therefore nothing to do" sent a padding collation down the raw
+        // byte compare and lost the pad with the fold.
+        //
+        // The cheap first clause still answers the common shape.
+        if !operand_is_binary_column(lhs, ctx) && !operand_is_binary_column(rhs, ctx) {
+            return true;
+        }
+        return crate::collate::pads_space(declared_collation(lhs, rhs, ctx).as_deref());
     }
     matches!(
         column_collation(lhs, ctx),
@@ -450,6 +488,18 @@ fn operand_derives_binary(e: &Expr, ctx: &EvalContext<'_>) -> bool {
 }
 
 pub(crate) fn is_binary_coerced(e: &Expr) -> bool {
+    // v7.40.0 — an explicit byte-wise COLLATION counts here too.
+    //
+    // Until this version the parser lowered `x COLLATE utf8mb4_bin`
+    // onto a `CAST(x AS BINARY)`, which is how every fold site came to
+    // suppress correctly. It stopped doing that because the cast also
+    // carries "no pad" and `utf8mb4_bin` PADS (measured on MySQL
+    // 9.7.2). Everything that asks THIS question wants the fold half,
+    // so it is answered here from the name instead; the pad half is read
+    // separately, by name, in `text_compare_of`.
+    if let Expr::Collate { collation, .. } = e {
+        return crate::collate::is_byte_wise(collation);
+    }
     matches!(
         e,
         Expr::Cast {

@@ -280,7 +280,17 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         | DataType::BytesArray
         | DataType::VarcharArray
         | DataType::CharArray
-        | DataType::MoneyArray => "ARRAY",
+        | DataType::MoneyArray
+        // v7.40.0 — `oid[]` joins them, for the same reason: measured
+        // on PostgreSQL 18.6, every array column reads `ARRAY` here
+        // and its element type only through `format_type`.
+        | DataType::OidArray
+        // v7.40.0 — five more, same reason.
+        | DataType::RealArray
+        | DataType::TimeArray
+        | DataType::TimeTzArray
+        | DataType::InetArray
+        | DataType::XmlArray => "ARRAY",
         DataType::Vector { .. } => "USER-DEFINED",
         // v7.39.11 — PG's catalog vectors have names, and an error that
         // does not use them ("got USER-DEFINED") tells the reader
@@ -872,6 +882,11 @@ fn info_column_row(
         DataType::TextArray => "_text",
         DataType::IntArray => "_int4",
         DataType::BigIntArray => "_int8",
+        // v7.40.0 — `oid[]` became a column type, and a column type
+        // that cannot name itself is the defect 7.39.13 closed for
+        // `year` and `timetz`. `ARRAY_TYPE_OIDS` already carried
+        // (1028, "_oid", 26); these two tables did not.
+        DataType::OidArray => "_oid",
         DataType::SmallIntArray => "_int2",
         DataType::FloatArray => "_float8",
         DataType::NumericArray => "_numeric",
@@ -879,6 +894,11 @@ fn info_column_row(
         DataType::DateArray => "_date",
         DataType::TimestampArray => "_timestamp",
         DataType::TimestamptzArray => "_timestamptz",
+        DataType::RealArray => "_float4",
+        DataType::TimeArray => "_time",
+        DataType::TimeTzArray => "_timetz",
+        DataType::InetArray => "_inet",
+        DataType::XmlArray => "_xml",
         DataType::UuidArray => "_uuid",
         // v7.39 (round 620) — two more element types whose arrays fell
         // into the text catch-all and named themselves `text`.
@@ -3432,8 +3452,28 @@ pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
 /// listing every PRIMARY KEY / UNIQUE / FOREIGN KEY / CHECK
 /// constraint. Migration tools (Liquibase, Alembic) compare
 /// before/after snapshots of this view to detect schema drift.
+/// v7.40.0 — `mysql` picks which engine's answer this view gives.
+///
+/// The two disagree, and both are right about themselves. Measured, same
+/// table, `PRIMARY KEY (a,b)` and two NOT NULL columns:
+///
+/// ```text
+///   PostgreSQL 18.6            MySQL 9.7.2
+///   mc_i_pkey  PRIMARY KEY     PRIMARY  PRIMARY KEY
+///   mc_i_a_not_null  CHECK     (absent)
+///   mc_i_b_not_null  CHECK     (absent)
+/// ```
+///
+/// PostgreSQL 18 models a NOT NULL column as a real CHECK constraint and
+/// lists it; MySQL has no such object. And MySQL calls every primary key
+/// `PRIMARY`, whatever the constraint was declared as. Answering one
+/// engine's shape on the other's wire is a schema reader's problem, not
+/// a cosmetic one — a diff tool reports constraints that are not there.
+/// An unnamed foreign key is `<table>_ibfk_<n>` there, the same name
+/// `SHOW CREATE TABLE` prints.
 pub(crate) fn synth_information_schema_table_constraints(
     cat: &Catalog,
+    mysql: bool,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("constraint_catalog", DataType::Text, false),
@@ -3452,7 +3492,11 @@ pub(crate) fn synth_information_schema_table_constraints(
         let Some(t) = cat.get(&tname) else { continue };
         // Uniqueness constraints — both PK and UNIQUE forms.
         for uc in t.schema().uniqueness_constraints.iter() {
-            let conname = pg_unique_conname(t, uc, &tname);
+            let conname = if mysql && uc.is_primary_key {
+                alloc::string::String::from("PRIMARY")
+            } else {
+                pg_unique_conname(t, uc, &tname)
+            };
             let kind = if uc.is_primary_key {
                 "PRIMARY KEY"
             } else {
@@ -3482,11 +3526,14 @@ pub(crate) fn synth_information_schema_table_constraints(
         // uniqueness-constraint loop above, which is where the
         // constraint lives.
         // Foreign keys.
-        for fk in t.schema().foreign_keys.iter() {
-            let conname = fk
-                .name
-                .clone()
-                .unwrap_or_else(|| pg_fk_conname(t, fk, &tname));
+        for (fk_i, fk) in t.schema().foreign_keys.iter().enumerate() {
+            let conname = fk.name.clone().unwrap_or_else(|| {
+                if mysql {
+                    alloc::format!("{tname}_ibfk_{}", fk_i + 1)
+                } else {
+                    pg_fk_conname(t, fk, &tname)
+                }
+            });
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
                 Value::text("public"),
@@ -3520,7 +3567,8 @@ pub(crate) fn synth_information_schema_table_constraints(
         // constraint named `{table}_{col}_not_null`, so it appears in
         // table_constraints with constraint_type CHECK.
         for col in t.schema().columns.iter() {
-            if col.nullable {
+            // MySQL has no NOT NULL constraint object to list.
+            if col.nullable || mysql {
                 continue;
             }
             rows.push(Row::new(alloc::vec![
@@ -4651,22 +4699,12 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             // it. Reported by sentori against 7.39.10, where it was
             // `integer`: a client that binds the column by its declared
             // width reads two bytes and gets the wrong number.
+            // v7.40.0 — one table, not two. The list here used to be a
+            // shorter copy of `array_element_type`'s and answered 0 for
+            // six array spellings PG 18.6 answers 1 for.
             let attndims: i16 = match col.ty {
-                DataType::TextArray
-                | DataType::IntArray
-                | DataType::BigIntArray
-                | DataType::SmallIntArray
-                | DataType::FloatArray
-                | DataType::BoolArray
-                | DataType::DateArray
-                | DataType::TimestampArray
-                | DataType::TimestamptzArray
-                | DataType::UuidArray
-                | DataType::BytesArray
-                | DataType::NumericArray
-                | DataType::JsonArray => 1,
                 DataType::IntArray2D | DataType::BigIntArray2D | DataType::TextArray2D => 2,
-                _ => 0,
+                other => i16::from(crate::conversions::array_element_type(other).is_some()),
             };
             // attstorage — 'p' plain (fixed-width), 'e' external,
             // 'm' main-or-toast, 'x' extended (default for varlena).
@@ -5009,12 +5047,18 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         DataType::TextArray => 1009,
         DataType::IntArray => 1007,
         DataType::BigIntArray => 1016,
+        DataType::OidArray => 1028,
         DataType::SmallIntArray => 1005,
         DataType::FloatArray => 1022,
         DataType::BoolArray => 1000,
         DataType::DateArray => 1182,
         DataType::TimestampArray => 1115,
         DataType::TimestamptzArray => 1185,
+        DataType::RealArray => 1021,
+        DataType::TimeArray => 1183,
+        DataType::TimeTzArray => 1270,
+        DataType::InetArray => 1041,
+        DataType::XmlArray => 143,
         DataType::UuidArray => 2951,
         DataType::BytesArray => 1001,
         DataType::NumericArray => 1231,
@@ -6149,6 +6193,7 @@ pub(crate) const SPG_ONLY_PROCS: &[&str] = &[
     "from_unixtime",
     "gen_uuid_v7",
     "ifnull",
+    "isnull",
     "json_array",
     "last_insert_id",
     "log2",
@@ -6405,6 +6450,7 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3840, "int4range", "f", 2, 3904),
     (4295, "int8multirange", "f", 0, 4536),
     (3945, "int8range", "f", 2, 3926),
+    (900087, "isnull", "f", 1, 23),
     (900011, "json_array", "f", 0, 114),
     (900012, "last_insert_id", "f", 0, 20),
     (1741, "log", "f", 1, 701),
@@ -7746,28 +7792,70 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
         ColumnSchema::new("column_name", DataType::Text, false),
         ColumnSchema::new("seq_in_index", DataType::Int, false),
         ColumnSchema::new("non_unique", DataType::Int, false),
+        // v7.40.0 — MySQL's index prefix, `KEY k (b(4))`. NULL for a
+        // whole-column key, which is every PostgreSQL one.
+        ColumnSchema::new("sub_part", DataType::Int, true),
         ColumnSchema::new("index_type", DataType::Text, false),
     ];
+    // v7.40.0 — built from [`catalog_indexes`], the same table the
+    // PostgreSQL surface reads.
+    //
+    // It used to walk `t.indices()` directly, and so answered three
+    // different wrong things about the same table at once. Measured
+    // against MySQL 9.7.2, `PRIMARY KEY (a, b)`:
+    //
+    // ```text
+    //                       MySQL 9.7.2          SPG 7.39.13
+    //   index_name          PRIMARY (both rows)  mc_i_a_pkey_0_0
+    //                                            mc_i_b_pkey_0_1
+    //   seq_in_index        1, 2                 1, 1
+    //   non_unique          0                    1
+    // ```
+    //
+    // A composite key reached the reader as two unrelated
+    // single-column indexes, each claiming not to be unique — the
+    // v7.39.10 defect (`SHOW INDEX` said the primary key was not
+    // unique) and the v7.39.12 one (composite keys missing on 20 of 27
+    // tables), both still open here because this surface had its own
+    // copy of the walk. One table now.
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
-        for idx in t.indices() {
+    for idx in catalog_indexes(cat) {
+        let Some(t) = cat.get(&idx.table) else { continue };
+        for (seq, pos) in idx.columns.iter().enumerate() {
             let col = t
                 .schema()
                 .columns
-                .get(idx.column_position)
+                .get(*pos)
                 .map_or("?".into(), |c| c.name.clone());
             rows.push(Row::new(alloc::vec![
-                Value::text(tname.clone()),
-                Value::text(idx.name.clone()),
+                Value::text(idx.table.clone()),
+                Value::text(mysql_index_name(&idx)),
                 Value::text(col),
-                Value::Int(1),
+                Value::Int(i32::try_from(seq + 1).unwrap_or(1)),
                 Value::Int(i32::from(!idx.is_unique)),
+                t.indices()
+                    .iter()
+                    .find(|i| i.name == idx.name)
+                    .and_then(|i| i.prefix_len)
+                    .filter(|_| seq == 0)
+                    .map_or(Value::Null, |p| {
+                        Value::Int(i32::try_from(p).unwrap_or(0))
+                    }),
                 Value::text("BTREE"),
             ]));
         }
     }
     (schema, rows)
+}
+
+/// MySQL names every primary key `PRIMARY`, whatever the constraint was
+/// called. Anything else keeps the name it was declared with.
+pub(crate) fn mysql_index_name(idx: &CatalogIndex) -> alloc::string::String {
+    if idx.is_primary {
+        alloc::string::String::from("PRIMARY")
+    } else {
+        idx.name.clone()
+    }
 }
 
 /// v7.17.0 Phase 3.P0-64 — synthesise `information_schema.ROUTINES`.
