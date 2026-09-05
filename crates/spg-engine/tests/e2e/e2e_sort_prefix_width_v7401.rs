@@ -125,3 +125,76 @@ fn a_batch_that_straddles_the_boundary_sorts_as_one() {
         ]
     );
 }
+
+/// v7.40.2 — the low-cardinality run walk, which reads a compact column
+/// rather than the rows.
+///
+/// When the prefix key does not discriminate, the sort orders the keys
+/// and then proves per run whether every value in it is equal; a run
+/// that is uniform is already in stable order and is left alone. That
+/// proof used to walk `order -> tagged -> values -> Value -> &str ->
+/// bytes` for every row, the first hop scattered across the whole
+/// batch. It reads a `Vec<&str>` collected in one sequential pass now,
+/// built only when the run walk will actually happen.
+///
+/// Measured, 400,000 rows, twenty-six distinct values, server-reported,
+/// three md5-distinct binaries in one window, order digests identical
+/// to PostgreSQL's:
+///
+/// ```text
+///   value length   head    compact   compact (only when low_card)
+///   8 bytes       57.78     58.62         56.85
+///   200 bytes     94.51     81.21         81.16
+/// ```
+///
+/// The middle column is why the build is conditional: an exact key
+/// never calls the uniform check, so collecting the column for it was
+/// 0.8 ms charged to a shape that does not read it.
+///
+/// This pins the ANSWER for the shape that takes the path: few distinct
+/// values, each longer than any prefix, with rows interleaved so input
+/// order is not the answer.
+#[test]
+fn a_low_cardinality_text_sort_orders_its_runs() {
+    let mut e = Engine::new();
+    e.execute("CREATE TABLE lc (id int, v text)").unwrap();
+    let mut sql = String::from("INSERT INTO lc VALUES ");
+    for g in 0..120u32 {
+        if g > 0 {
+            sql.push(',');
+        }
+        // Three distinct values, each 40 characters, round-robin: every
+        // eight-byte prefix inside one letter is identical, so the runs
+        // are what decide.
+        let ch = char::from(b'a' + u8::try_from(g % 3).expect("0..3"));
+        sql.push_str(&format!("({g}, '{}')", ch.to_string().repeat(40)));
+    }
+    e.execute(&sql).unwrap();
+    let got = rows(&mut e, "SELECT v FROM lc ORDER BY v LIMIT 3");
+    assert_eq!(got, ["a".repeat(40), "a".repeat(40), "a".repeat(40)]);
+    let tail = rows(&mut e, "SELECT v FROM lc ORDER BY v DESC LIMIT 2");
+    assert_eq!(tail, ["c".repeat(40), "c".repeat(40)]);
+    // Every row comes back, and the three runs are whole: forty of each
+    // value in order. A compact column indexed wrongly would interleave
+    // them, which counting per value catches and a LIMIT would not.
+    assert_eq!(
+        rows(
+            &mut e,
+            "SELECT count(*) FROM (SELECT v FROM lc ORDER BY v) z"
+        ),
+        ["120"]
+    );
+    let all = rows(&mut e, "SELECT v FROM lc ORDER BY v");
+    assert_eq!(all.len(), 120);
+    for (i, v) in all.iter().enumerate() {
+        let want = char::from(b'a' + u8::try_from(i / 40).expect("0..3"))
+            .to_string()
+            .repeat(40);
+        assert_eq!(*v, want, "row {i}");
+    }
+    // What is deliberately NOT asserted: the order of rows that tie.
+    // A draft pinned the ids inside one run to input order and it read
+    // `60, 6, 9, 12`. Neither this engine nor PostgreSQL promises an
+    // order between equal keys, and a pin that demands one is pinning
+    // the implementation rather than the answer.
+}
