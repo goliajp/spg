@@ -10,6 +10,50 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the access path sentori has reported for three versions
+
+`WHERE project_id = ? ORDER BY received_at DESC LIMIT 20`, behind an
+index on `(project_id, received_at)`, planned `Sort -> Seq Scan`: the
+whole table sorted to return twenty rows. PostgreSQL 18.6 answers it
+with `Limit -> Index Scan Backward … Index Cond: (project_id = 7)`.
+
+Two holes, one under the other.
+
+**`timestamptz` was not on the list of types a composite index may key.**
+`multi_component_type_ok` named `Timestamp` and not `Timestamptz`,
+though both hold the same i64 of UTC microseconds and the zone lives in
+the column's type. So `CREATE INDEX … (project_id, received_at)` never
+became a composite tree at all — it stayed a single-column B-tree on
+the leading column with the extra positions recorded and unused. The
+same hole is sentori's other item: `pg_index` answered `indnatts = 2`
+for an index holding one column, the catalog claiming what the storage
+does not do. Measured across the order-column types, only `timestamptz`
+refused:
+
+```text
+  int  bigint  timestamp  date  text   →  Index Scan
+  timestamptz                          →  Sort -> Index Scan
+```
+
+**And the ordered walk could only start at an index's LEADING column.**
+An index on `(project_id, received_at)` could serve `ORDER BY
+project_id` and nothing else. What was missing is a tree walk bounded
+by a key prefix: `PersistentBTreeMap::range_rev_by` descends to a
+group's top in `O(log₈ N)` and walks left, so the query is one seek and
+twenty steps. Its bound is a pair of predicates rather than a pair of
+keys, because a tuple `[p]` sorts BELOW every longer tuple that starts
+with `p` — no single key names the group's top.
+
+The descent was wrong when first written and the tests said so: the
+pushed frame position must be the RESUME step, not the current one, and
+getting it wrong re-descended the subtree it had just finished, so the
+walk wandered between groups instead of ending.
+
+EXPLAIN asks the new planner first, exactly as the executor does. A
+walk that runs while the plan says `Seq Scan` is the r1044 defect, and
+wiring only the executor would have recreated it.
+
+
 ### Fixed — the gate itself
 
 Two defects found while asking why a prerelease run read 102.6 minutes.

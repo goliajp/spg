@@ -1498,10 +1498,16 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
     // unindexed column, so the walk was plainly running and the plan
     // named the wrong access path. Both now ask
     // `Engine::index_order_walk_target`.
-    let walk = stmt
-        .from
-        .as_ref()
-        .and_then(|from| engine.index_order_walk_target(stmt, from));
+    // v7.39.13 — the prefix walk is asked first, exactly as the executor
+    // asks it. A plan that names `Seq Scan -> Sort` for a statement the
+    // engine answers off an index is the r1044 defect in a new place,
+    // and EXPLAIN is the first thing any performance question opens.
+    let walk = stmt.from.as_ref().and_then(|from| {
+        engine
+            .index_prefix_walk_target(stmt, from)
+            .map(|(n, pos, _)| (n, pos))
+            .or_else(|| engine.index_order_walk_target(stmt, from))
+    });
     if let Some((idx_name, _)) = &walk
         && let Some(from) = stmt.from.as_ref()
     {

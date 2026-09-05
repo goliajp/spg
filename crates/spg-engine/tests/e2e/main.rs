@@ -1275,6 +1275,7 @@ mod e2e_pgdump_compat;
 mod e2e_plan_cache;
 mod e2e_plan_cache_invalidation;
 mod e2e_power;
+mod e2e_prefix_order_walk_v73913;
 mod e2e_projection_bind_once_round957;
 mod e2e_qual_order_v7388;
 mod e2e_query_clause_pg_differential;
