@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.40.1] — 2026-09-05
+
+### Fixed — a nine-byte sort key was one byte too long for the prefix that sorts it
+
+```text
+  sort only, short text distinct, 400,000 rows, against PostgreSQL 18.6
+    7.40.0   101.6-103.3 ms   PG 75.8-78.7    1.34x behind
+    7.40.1    56.2-56.7  ms   PG 73.0-74.9    0.77x — ahead by 23%
+```
+
+The sort builds an integer prefix key per row, sorts the permutation on
+it, and asks the full comparator only where prefixes tie. The prefix was
+eight bytes for every text column.
+
+`'k' || lpad(n, 8, '0')` is nine bytes. Eight of them drop the last
+digit, so ten rows share every key: forty thousand tie-runs, each one
+falling back to the full comparator, and each of those reading at random
+into a 400,000-element array. A column of md5 hex decides on byte zero
+and never ties, which is why only one of the panel's two text cells
+showed it.
+
+The width comes from the longest value now — one pass the key builder
+already makes. At sixteen bytes or under the wide key is the WHOLE key,
+so the tie fallback and its random reads disappear; anything longer
+keeps the narrow key and pays nothing for bytes it would not read. Both
+widths share one sort body.
+
+Measured in one window, three binaries named by md5, with every leg's
+`ORDER BY` output digested and compared against PostgreSQL's:
+
+```text
+                 7.40.0   fixed-16   width-from-data   PG18
+  short text      96.3      53.3          53.4         72.7
+  long text       85.6      84.9          81.4         80.4
+```
+
+**What this does not fix.** The panel's other text cells are unchanged
+and three of them still lose: `long text distinct` 1.47x, `long text
+top-N` 1.37x, `long text, key not projected` 1.22x, and `text
+(26 values)` 1.31x. Their keys are longer than any prefix, so they take
+the narrow path and a different cost governs them. They are open, not
+addressed here.
+
+### Fixed — the gate and the repository, from the release before
+
+Carried from 7.40.0's own train, where they were found:
+
+* `pins-current` counted the tests it ran by reading a line
+  `run-test-binaries.sh` stopped printing in v7.39.12 — zero for every
+  possible input, so the step was red on any commit touching a pin file.
+  `unit-changed` had the same shape one step short.
+* `release-build`'s budget was 250 s derived from one warm-tree
+  observation; both runs since that rebuilt went over. 840 s now.
+* The perf sweep's three panels were dropped at the end of the step.
+  They are written to a file the step names.
+* `git flow release finish` names the tag after the branch, and
+  `gitflow.prefix.versiontag` is a git-flow-avh key the installed
+  git-flow-next does not read — twenty-one bare tags since 7.22.0.
+  `scripts/release-finish.sh` passes `--tagname` and then checks.
+* 262.8 MB of build artefacts had been tracked since `8b3271cb`, because
+  a nested `.gitignore` used repository-root paths, which are relative to
+  their own directory and so matched nothing.
+* The pre-commit tier runs where the machine is idle, and proves it
+  graded THIS commit by comparing `git write-tree` on both sides.
+
+
 ### Fixed — 262.8 MB of build artefacts have been in the repository since the appsql differ landed
 
 `.gitignore`'s first line is `/target`, anchored to the root, so
