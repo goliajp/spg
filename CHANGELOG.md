@@ -10,6 +10,9 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [7.40.6] — 2026-09-06
+
 ### Fixed — the same missing sub-plan, on the join side
 
 v7.40.5 made a derived table render as a sub-plan and said joins were
