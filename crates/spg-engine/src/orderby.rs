@@ -651,6 +651,20 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
                 .cmp(&ykind.rank())
                 .then_with(|| span(*xm, *xd, *xu).cmp(&span(*ym, *yd, *yu)))
         }
+        // v7.39.13 — TIMETZ had no arm, so min/max, DISTINCT and
+        // GROUP BY fell through to the debug rendering below and
+        // `max(k)` answered `02:00:00-05` where PostgreSQL 18.6
+        // answers `01:00:00-06`.
+        (
+            Value::TimeTz {
+                us: ua,
+                offset_secs: oa,
+            },
+            Value::TimeTz {
+                us: ub,
+                offset_secs: ob,
+            },
+        ) => spg_storage::timetz_sort_key(*ua, *oa).cmp(&spg_storage::timetz_sort_key(*ub, *ob)),
         // Cross-type compare: fall back to the debug rendering —
         // same-partition is the goal, exact order is irrelevant.
         _ => alloc::format!("{a:?}").cmp(&alloc::format!("{b:?}")),

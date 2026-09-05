@@ -6465,7 +6465,14 @@ pub(crate) fn types_unify(a: DataType, b: DataType) -> bool {
             | DataType::BigInt
             | DataType::Numeric { .. }
             | DataType::Real
-            | DataType::Float => 1,
+            | DataType::Float
+            // v7.39.13 — MySQL's `YEAR` compares against an integer:
+            // `WHERE k = 2007` selects on 9.7.2 and raised here,
+            // `operator does not exist: unknown = integer`, because
+            // this gate put it in no family at all. It is an integer
+            // type there — `ORDER BY`, `MAX` and `>` all answer on the
+            // number — so it belongs in the numeric one.
+            | DataType::Year => 1,
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) => 2,
             DataType::Date | DataType::Timestamp | DataType::Timestamptz => 3,
             _ => return None,

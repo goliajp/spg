@@ -772,6 +772,9 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         // `pg_typeof(current_time)` had no name even once the keyword
         // produced a real TIMETZ.
         Value::TimeTz { .. } => "time with time zone",
+        // v7.39.13 — MySQL's `YEAR`. It fell to "unknown" below, which
+        // is what a value of no type reads as, and this one has a type.
+        Value::Year(_) => "year",
         Value::Timestamp(_) => "timestamp without time zone",
         Value::Interval { .. } => "interval",
         Value::Json(_) => {

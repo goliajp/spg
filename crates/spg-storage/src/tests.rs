@@ -6121,6 +6121,206 @@ fn composite_btree_tracks_every_mutation_and_survives_a_snapshot() {
     );
 }
 
+/// v7.39.13 — a catalog written before v97 has its `timetz` indexes
+/// rebuilt when it is loaded.
+///
+/// v96 and earlier keyed a `timetz` by its UTC instant alone. v97 keys
+/// it by the pair [`timetz_sort_key`] defines, because the instant
+/// alone made an index CHANGE ANSWERS: `WHERE k > '07:00:00+00'`
+/// returned nothing where the scan returned two rows, since the rows
+/// above that bound share its instant and sort below it once the zone
+/// is dropped.
+///
+/// Reading v96 entries with a v97 probe would find nothing, which is
+/// the same failure wearing the other hat, so `deserialize` rebuilds
+/// them from the rows. This plants the OLD keys, stamps the buffer
+/// v96, and asks the loaded index a v97 question.
+#[test]
+fn a_pre_v97_catalog_has_its_timetz_index_rebuilt_on_load() {
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("id", DataType::BigInt, false),
+            ColumnSchema::new("k", DataType::TimeTz, false),
+        ],
+    ))
+    .unwrap();
+    // Three values naming 07:00 UTC in three zones — distinct to
+    // PostgreSQL, and one single key to the pre-v97 form.
+    let tz = |h: i64, off: i32| Value::TimeTz {
+        us: h * 3_600_000_000,
+        offset_secs: off,
+    };
+    let vals = [tz(7, 0), tz(2, -18_000), tz(9, 7_200)];
+    let t = c.get_mut("t").unwrap();
+    for (i, v) in vals.iter().enumerate() {
+        t.insert(Row::new(alloc::vec![
+            Value::BigInt(i as i64 + 1),
+            v.clone()
+        ]))
+        .unwrap();
+    }
+    t.add_index(alloc::string::String::from("t_k"), "k")
+        .unwrap();
+    // Plant the pre-v97 keys: the instant, no zone. All three collapse
+    // onto one entry, which is exactly what a v96 file holds.
+    {
+        let idx = t
+            .indices_mut()
+            .iter_mut()
+            .find(|i| i.name == "t_k")
+            .unwrap();
+        let mut locs = crate::posting::PostingList::new();
+        for i in 0..3usize {
+            locs.push(RowLocator::Hot(i));
+        }
+        idx.kind = IndexKind::BTree(crate::persistent_btree::PersistentBTreeMap::from_sorted(
+            alloc::vec![(IndexKey::Int(7 * 3_600_000_000), locs)],
+        ));
+    }
+    let mut bytes = c.serialize();
+    // Stamp it v96 and repair the trailer, so `deserialize` takes the
+    // pre-v97 branch on bytes that are otherwise this build's own.
+    bytes[8] = 96;
+    let n = bytes.len() - 4;
+    let crc = spg_crypto::crc32c::crc32c(&bytes[..n]);
+    bytes[n..].copy_from_slice(&crc.to_le_bytes());
+
+    let c2 = Catalog::deserialize(&bytes).unwrap();
+    let idx = c2
+        .get("t")
+        .unwrap()
+        .indices()
+        .iter()
+        .find(|i| i.name == "t_k")
+        .unwrap();
+    for (i, v) in vals.iter().enumerate() {
+        let key = IndexKey::from_value(v).unwrap();
+        let locs: alloc::vec::Vec<_> = idx.lookup_eq(&key).iter().collect();
+        assert_eq!(
+            locs.len(),
+            1,
+            "a v97 probe must find exactly its own row, not the group the old key merged"
+        );
+        assert!(matches!(locs[0], RowLocator::Hot(j) if *j == i));
+    }
+}
+
+/// v7.39.13 — a `numeric` column may lead a composite B-tree.
+///
+/// `multi_component_type_ok` was a `matches!` over eleven names, so
+/// `numeric` answered "no" by falling off the end — silently, because
+/// an index over a type that falls off is still created: it stays a
+/// single-column B-tree on the leading column with the extra positions
+/// recorded and unused. The perf gate caught it as a `prefix walk` cell
+/// that scaled with the table.
+///
+/// Keying by the VALUE is enough here because `insert_keyed` refuses a
+/// value whose type is not the column's — a `NUMERIC` column cannot
+/// hold the `Value::Int` that would key in another space, and it holds
+/// one scale, so `IndexKey::from_value` and the probe's
+/// `from_value_for_column` cannot disagree. The canonical-key question
+/// — that `2`, `2.0` and `2.00` are one group — belongs where the
+/// engine does the coercing, and lives in
+/// `e2e_composite_component_types_v73913`.
+#[test]
+fn a_numeric_column_leads_a_composite() {
+    let numeric = DataType::Numeric {
+        precision: 0,
+        scale: 0,
+    };
+    let mut c = Catalog::new();
+    c.create_table(TableSchema::new(
+        "t",
+        vec![
+            ColumnSchema::new("n", numeric, true),
+            ColumnSchema::new("id", DataType::BigInt, false),
+        ],
+    ))
+    .unwrap();
+    let t = c.get_mut("t").unwrap();
+    let num = |scaled: i128, scale: u16| Value::Numeric {
+        scaled,
+        scale,
+        kind: crate::NumericKind::Finite,
+    };
+    // Three ids under one value.
+    for id in [10i64, 11, 12] {
+        t.insert(Row::new(alloc::vec![num(2, 0), Value::BigInt(id)]))
+            .unwrap();
+    }
+    // One row under a different value, to prove the probe selects.
+    t.insert(Row::new(alloc::vec![num(3, 0), Value::BigInt(99)]))
+        .unwrap();
+    // Storage refuses the spelling that would key in another space, so
+    // the composition never sees one. This is the contract the value
+    // keying rests on; assert it rather than assume it.
+    assert!(
+        t.insert(Row::new(alloc::vec![Value::Int(2), Value::BigInt(13)]))
+            .is_err(),
+        "an integer must not reach a NUMERIC column"
+    );
+    t.add_index(alloc::string::String::from("t_n_id"), "n")
+        .unwrap();
+    {
+        let idx = t
+            .indices_mut()
+            .iter_mut()
+            .find(|i| i.name == "t_n_id")
+            .unwrap();
+        idx.extra_column_positions = alloc::vec![1];
+    }
+    // The conversion IS the gate: it returns false when a component's
+    // type is not allowed, and `numeric` was not.
+    assert!(
+        t.convert_index_to_multi("t_n_id").unwrap(),
+        "a numeric leading component must be allowed to key a composite"
+    );
+    let idx = t.indices().iter().find(|i| i.name == "t_n_id").unwrap();
+    assert!(matches!(idx.kind, IndexKind::BTreeMulti(_)));
+    let probe = IndexKey::from_value_for_column(&Value::Int(2), numeric).unwrap();
+    assert_eq!(
+        idx.lookup_prefix_capped_by(core::slice::from_ref(&probe), 1000, |_| true)
+            .expect("the prefix probe fits under the cap")
+            .len(),
+        3,
+        "the whole group belongs under one prefix"
+    );
+    // And the walk is ORDERED by the second component, which is what
+    // `ORDER BY id` behind `WHERE n = 2` rides on.
+    let ids = |asc: bool, idx: &Index, t: &Table| -> alloc::vec::Vec<i64> {
+        let walk: alloc::boxed::Box<dyn Iterator<Item = _>> = if asc {
+            alloc::boxed::Box::new(idx.iter_prefix_asc(core::slice::from_ref(&probe)).unwrap())
+        } else {
+            alloc::boxed::Box::new(idx.iter_prefix_desc(core::slice::from_ref(&probe)).unwrap())
+        };
+        walk.flat_map(|(_, pl)| pl.iter())
+            .filter_map(|loc| match loc {
+                RowLocator::Hot(i) => t.rows().get(*i).map(|r| match r.values[1] {
+                    Value::BigInt(n) => n,
+                    _ => unreachable!(),
+                }),
+                RowLocator::Cold { .. } => None,
+            })
+            .collect()
+    };
+    assert_eq!(ids(true, idx, t), alloc::vec![10, 11, 12]);
+    assert_eq!(ids(false, idx, t), alloc::vec![12, 11, 10]);
+    // An INSERT after the tree exists takes the incremental path, which
+    // is a second call site of the same composition.
+    let t = c.get_mut("t").unwrap();
+    t.insert(Row::new(alloc::vec![num(2, 0), Value::BigInt(13)]))
+        .unwrap();
+    let idx = t.indices().iter().find(|i| i.name == "t_n_id").unwrap();
+    assert_eq!(
+        idx.lookup_prefix_capped_by(core::slice::from_ref(&probe), 1000, |_| true)
+            .unwrap()
+            .len(),
+        4
+    );
+}
+
 /// 7.38.1 L12 — `convert_index_to_multi` upgrades a leading-column
 /// B-tree carrying extras in place, and `drop_column` both shifts the
 /// surviving extras and drops indexes whose extras name the dropped

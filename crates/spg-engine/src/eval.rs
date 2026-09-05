@@ -5646,6 +5646,12 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::VarcharArray => "character varying[]",
         D::CharArray => "\"char\"[]",
         D::IntervalArray => "interval[]",
+        // v7.39.13 — the two temporal types this table never named.
+        // `timetz` answered correctly through the VALUE path and
+        // `unknown` through this one, so `pg_typeof(NULL::timetz)` and
+        // `pg_typeof(k)` disagreed about one column.
+        D::TimeTz => "time with time zone",
+        D::Year => "year",
         _ => return None,
     })
 }
