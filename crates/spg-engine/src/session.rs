@@ -705,6 +705,35 @@ impl Engine {
         kb.saturating_mul(1024)
     }
 
+    /// v7.40.4 — how many EXTRA threads a large sort may use.
+    ///
+    /// `max_parallel_workers_per_gather` has been in the GUC catalogue
+    /// since the compatibility surface was built and nothing has ever
+    /// read it. A customer could set it, `SHOW` it back, and get one
+    /// thread. PG's default is 2, meaning two workers alongside the
+    /// process that already has the query — three sorting processes —
+    /// which is what the sort panel's PostgreSQL leg was doing while
+    /// SPG's leg used one core.
+    ///
+    /// Clamped by the machine: asking for more threads than there are
+    /// cores makes the merge deeper for nothing.
+    #[must_use]
+    pub(crate) fn session_parallel_workers(&self) -> crate::parsort::Workers {
+        let cores = available_cores();
+        crate::parsort::Workers {
+            per_sort: self.guc_count("max_parallel_workers_per_gather", 2, cores),
+            per_process: self.guc_count("max_parallel_workers", 8, cores),
+        }
+    }
+
+    /// A GUC that counts worker processes: PG's own default when it is
+    /// unset or unreadable, and never more than the machine can run.
+    fn guc_count(&self, name: &str, default: usize, cores: usize) -> usize {
+        self.session_param(name)
+            .map_or(default, |v| v.trim().parse::<usize>().unwrap_or(default))
+            .min(cores.saturating_sub(1))
+    }
+
     /// v7.39 (round 621) — does a message of this severity reach the client?
     ///
     /// `client_min_messages` was validated on the way in and then never read,
@@ -1102,6 +1131,22 @@ fn render_pg_mem_kb(kb: u64) -> String {
     }
 }
 
+/// v7.40.4 — the machine's core count, or 1 where it cannot be asked.
+///
+/// A `no_std` build has no way to ask, and a build that cannot ask must
+/// not guess high: one core is the answer that makes `session_parallel_workers`
+/// return the serial path.
+#[cfg(feature = "std")]
+fn available_cores() -> usize {
+    extern crate std;
+    std::thread::available_parallelism().map_or(1, core::num::NonZeroUsize::get)
+}
+
+#[cfg(not(feature = "std"))]
+fn available_cores() -> usize {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_pg_duration_ms;
@@ -1279,5 +1324,40 @@ mod tests {
         let _ = e.execute("SET work_mem = 'not_a_size'");
         assert_eq!(e.session_work_mem_bytes(), 4 * 1024 * 1024);
         assert!(e.session_work_mem_bytes() > 0);
+    }
+
+    /// v7.40.4 — the GUC that was accepted and never read.
+    #[test]
+    fn parallel_workers_comes_from_the_guc() {
+        let mut e = crate::Engine::new();
+        let cores = super::available_cores();
+        let w = e.session_parallel_workers();
+        assert_eq!(
+            w.per_sort,
+            2usize.min(cores.saturating_sub(1)),
+            "PG's own default is two per gather"
+        );
+        assert_eq!(
+            w.per_process,
+            8usize.min(cores.saturating_sub(1)),
+            "and eight for the cluster"
+        );
+        e.execute("SET max_parallel_workers_per_gather = 0")
+            .unwrap();
+        assert_eq!(
+            e.session_parallel_workers().per_sort,
+            0,
+            "zero must reach the serial path"
+        );
+        e.execute("SET max_parallel_workers_per_gather = 1")
+            .unwrap();
+        assert_eq!(
+            e.session_parallel_workers().per_sort,
+            1usize.min(cores.saturating_sub(1))
+        );
+        // Never more threads than the machine has cores to run them on.
+        e.execute("SET max_parallel_workers_per_gather = 1024")
+            .unwrap();
+        assert!(e.session_parallel_workers().per_sort < cores.max(1));
     }
 }

@@ -418,6 +418,10 @@ pub(crate) struct ExternalSorter<'a> {
     /// bytes followed it. One field, one mask, used by both — the
     /// mismatch cannot be written.
     needed: &'a [bool],
+    /// v7.40.4 — what the parallelism GUCs say, for the in-memory run
+    /// sort below. Serial unless a caller with a session hands it over;
+    /// the tests build sorters directly and get the old behaviour.
+    workers: crate::parsort::Workers,
 }
 
 impl<'a> ExternalSorter<'a> {
@@ -444,7 +448,20 @@ impl<'a> ExternalSorter<'a> {
             runs: Vec::new(),
             stats: None,
             needed: &[],
+            workers: crate::parsort::Workers::serial(),
         }
+    }
+
+    /// v7.40.4 — the threads this sort may use.
+    ///
+    /// This sorter is what an autocommit `ORDER BY` over the wire
+    /// actually runs: `execute_readonly_select_streaming` ->
+    /// `try_exec_joined_streaming` -> `try_spill_sorted_stream` -> here.
+    /// The materialising executor in `select.rs` is a different sort, and
+    /// a release panel that talks to the server measures THIS one.
+    pub(crate) fn with_workers(mut self, workers: crate::parsort::Workers) -> Self {
+        self.workers = workers;
+        self
     }
 
     /// Store only the columns `needed` marks, as round 995 measured the
@@ -595,12 +612,21 @@ impl<'a> ExternalSorter<'a> {
         // Third time this release that a capability existed on one path
         // and not its twin. The rule is `orderby::inline_sort_key`'s,
         // shared, so the two cannot drift.
-        if let Some((mut inline, exact)) = Self::inline_first_keys(keys, stride, collations) {
-            if descs.first().copied().unwrap_or(false) {
-                inline.sort_by_key(|p| core::cmp::Reverse(p.0));
-            } else {
-                inline.sort_by_key(|p| p.0);
-            }
+        let workers = self.workers;
+        if let Some((inline, exact)) = Self::inline_first_keys(keys, stride, collations) {
+            // v7.40.4 — across threads. STABLE, because the key alone
+            // decides the order here and equal keys must keep the order
+            // they arrived in: the run walk below settles them, and it
+            // expects to find them where the scan put them.
+            let desc = descs.first().copied().unwrap_or(false);
+            let mut inline =
+                crate::parsort::sort_total_stable(
+                    inline,
+                    workers,
+                    &|a: &(i128, u32), b: &(i128, u32)| {
+                        if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) }
+                    },
+                );
             // A prefix key decides only where it differs, so every run of
             // equal keys still goes to the full comparator — the same
             // pass a second ORDER BY key already needed. An exact key
@@ -631,7 +657,9 @@ impl<'a> ExternalSorter<'a> {
             }
             return order;
         }
-        order.sort_by(|&a, &b| {
+        // v7.40.4 — and the general path, stable for the same reason:
+        // `cmp_multi_key_in` has no tie-break on position.
+        crate::parsort::sort_total_stable(order, workers, &|&a: &u32, &b: &u32| {
             let (a, b) = (a as usize * stride, b as usize * stride);
             cmp_multi_key_in(
                 &keys[a..a + stride],
@@ -639,8 +667,7 @@ impl<'a> ExternalSorter<'a> {
                 descs,
                 collations,
             )
-        });
-        order
+        })
     }
 
     /// `(first key, row index)` when EVERY row's first key travels as an

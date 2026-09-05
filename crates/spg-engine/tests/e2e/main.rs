@@ -1324,6 +1324,7 @@ mod e2e_show_misc_mysql;
 mod e2e_sign;
 mod e2e_slow_query;
 mod e2e_snapshot;
+mod e2e_sort_parallel_v7404;
 mod e2e_sort_prefix_width_v7401;
 mod e2e_sorted_stream_children_round882;
 mod e2e_spg_stat_query;

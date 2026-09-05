@@ -1549,7 +1549,7 @@ pub(crate) fn partial_sort_tagged(
     keep: Option<usize>,
     descs: &[bool],
 ) {
-    partial_sort_tagged_in(tagged, keep, descs, &[]);
+    partial_sort_tagged_in(tagged, keep, descs, &[], crate::parsort::Workers::serial());
 }
 
 /// The `i128` that orders an integer key against other integer keys, or
@@ -1624,6 +1624,7 @@ pub(crate) fn partial_sort_tagged_in(
     keep: Option<usize>,
     descs: &[bool],
     collations: &[Option<crate::collate::Collated>],
+    workers: crate::parsort::Workers,
 ) {
     let cmp = |a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| {
         cmp_multi_key_in(&a.0, &b.0, descs, collations)
@@ -1636,10 +1637,22 @@ pub(crate) fn partial_sort_tagged_in(
             tagged.truncate(k);
         }
         _ => {
-            if sort_tagged_by_inline_int_key(tagged, descs, collations) {
+            if sort_tagged_by_inline_int_key(tagged, descs, collations, workers) {
                 return;
             }
-            tagged.sort_by(cmp);
+            // v7.40.4 — across threads, and STABLE, because
+            // `cmp_multi_key_in` carries no tie-break on position: two
+            // rows with equal keys compare `Equal` and the answer is
+            // whichever order they arrived in. `sort_by` gave that for
+            // free and the parallel one has to keep giving it, which is
+            // why this is the stable entry point and not the other one.
+            *tagged = crate::parsort::sort_total_stable(
+                core::mem::take(tagged),
+                workers,
+                &|a: &(Vec<OrderKey>, Row), b: &(Vec<OrderKey>, Row)| {
+                    cmp_multi_key_in(&a.0, &b.0, descs, collations)
+                },
+            );
         }
     }
 }
@@ -1667,6 +1680,7 @@ fn sort_tagged_by_inline_int_key(
     tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     descs: &[bool],
     collations: &[Option<crate::collate::Collated>],
+    workers: crate::parsort::Workers,
 ) -> bool {
     if tagged.len() < 2 {
         return true;
@@ -1747,12 +1761,14 @@ fn sort_tagged_by_inline_int_key(
     }
     // Stable, as `sort_by` is: equal keys keep the order they arrived in,
     // which is the order the scan produced and what DISTINCT's
-    // first-occurrence rule already relies on.
-    if descs.first().copied().unwrap_or(false) {
-        order.sort_by_key(|p| (core::cmp::Reverse(p.0), p.1));
-    } else {
-        order.sort_by_key(|p| (p.0, p.1));
-    }
+    // first-occurrence rule already relies on. The position is IN the
+    // key, so this is a strict total order and the split cannot reach a
+    // different answer -- see `crate::parsort`.
+    let desc = descs.first().copied().unwrap_or(false);
+    order = crate::parsort::sort_total(order, workers, &|a: &(i128, u32), b: &(i128, u32)| {
+        let c = if desc { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) };
+        c.then_with(|| a.1.cmp(&b.1))
+    });
     if multi || !exact {
         // Settle each run of equal first keys with the full comparator,
         // which reads every key including this one. A run of one — the
@@ -1796,17 +1812,33 @@ fn sort_tagged_by_inline_int_key(
     true
 }
 
-pub(crate) fn sort_by_keys(tagged: &mut [(Vec<OrderKey>, Row)], descs: &[bool]) {
-    sort_by_keys_in(tagged, descs, &[]);
+pub(crate) fn sort_by_keys(
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
+    descs: &[bool],
+    workers: crate::parsort::Workers,
+) {
+    sort_by_keys_in(tagged, descs, &[], workers);
 }
 
 /// v7.39 (round 683) — `sort_by_keys` honouring one collation per position.
 pub(crate) fn sort_by_keys_in(
-    tagged: &mut [(Vec<OrderKey>, Row)],
+    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     descs: &[bool],
     collations: &[Option<crate::collate::Collated>],
+    workers: crate::parsort::Workers,
 ) {
-    tagged.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, descs, collations));
+    // Stable for the same reason `partial_sort_tagged_in` is: this
+    // comparator has no tie-break on position.
+    *tagged = crate::parsort::sort_total_stable(core::mem::take(tagged), workers, &|a: &(
+        Vec<OrderKey>,
+        Row,
+    ),
+                                                                                    b: &(
+        Vec<OrderKey>,
+        Row,
+    )| {
+        cmp_multi_key_in(&a.0, &b.0, descs, collations)
+    });
 }
 
 /// v7.39 (round 683) — the collation for each ORDER BY position.
@@ -2850,7 +2882,13 @@ mod inline_int_key_sort_tests {
         };
 
         let mut fast = build();
-        partial_sort_tagged_in(&mut fast, None, descs, &[]);
+        partial_sort_tagged_in(
+            &mut fast,
+            None,
+            descs,
+            &[],
+            crate::parsort::Workers::serial(),
+        );
 
         let mut general = build();
         general.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, descs, &[]));
@@ -3032,7 +3070,13 @@ mod inline_int_key_sort_tests {
                 .collect()
         };
         let mut fast = build();
-        partial_sort_tagged_in(&mut fast, None, &[false], &colls);
+        partial_sort_tagged_in(
+            &mut fast,
+            None,
+            &[false],
+            &colls,
+            crate::parsort::Workers::serial(),
+        );
         let mut general = build();
         general.sort_by(|a, b| cmp_multi_key_in(&a.0, &b.0, &[false], &colls));
         let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
@@ -3065,7 +3109,13 @@ mod inline_int_key_sort_tests {
                 .collect()
         };
         let mut fast = build();
-        partial_sort_tagged_in(&mut fast, None, &[false], &colls);
+        partial_sort_tagged_in(
+            &mut fast,
+            None,
+            &[false],
+            &colls,
+            crate::parsort::Workers::serial(),
+        );
         let got: Vec<i32> = fast.iter().map(|(_, r)| tag_of(r)).collect();
         // 1 = apple, 0 = Banana, 2 = Cherry under en_US; byte order would
         // put the two capitals first.
@@ -3139,7 +3189,13 @@ mod inline_int_key_sort_tests {
         let mut tagged: Vec<(Vec<OrderKey>, Row<'static>)> = (0..20i32)
             .map(|i| (vec![OrderKey::Int(i128::from((i * 7) % 20))], row(i)))
             .collect();
-        partial_sort_tagged_in(&mut tagged, Some(3), &[false], &[]);
+        partial_sort_tagged_in(
+            &mut tagged,
+            Some(3),
+            &[false],
+            &[],
+            crate::parsort::Workers::serial(),
+        );
         assert_eq!(tagged.len(), 3);
         let keys: Vec<i128> = tagged
             .iter()
