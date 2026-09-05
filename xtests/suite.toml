@@ -138,10 +138,23 @@ cmd = "scripts/gate.sh release-build"
 # 2026-08-17 from an `e2e` that built nothing.
 #
 # 165.7 s, measured once on the testbed 2026-09-04 — the first run that
-# could see this step at all. 250 is 1.5x that, the rule c81f818b
-# states, applied here to a single observation because there is only
-# one; it widens when there is a spread to apply it to.
-budget_s = 250
+# could see this step at all. 250 was 1.5x that, the rule c81f818b
+# states, applied to a single observation because there was only one;
+# it said it would widen when there was a spread to apply it to.
+#
+# v7.40.0 — there is. Four recorded prerelease runs on the testbed:
+#
+#   165.7   2026-09-04   the observation 250 was derived from
+#   550.8   2026-09-05
+#     0.5   2026-09-05   nothing to rebuild
+#   553.2   2026-09-05
+#
+# Both runs that actually rebuilt went OVER, and both were reported and
+# passed over, which is the failure mode the header of this file names:
+# a tripwire permanently too low teaches the reader to skip the line.
+# 165.7 was a warm tree; a fat-LTO rebuild of the workspace plus every
+# release harness is the ~552 s figure. Observed max 553.2 x 1.5 = 830.
+budget_s = 840
 
 [[step]]
 tier = "prerelease"
@@ -170,7 +183,9 @@ tier = "prerelease"
 name = "biz"
 impl = "external"
 cmd = "scripts/gate.sh biz"
-# observed 343 / 348 / 376 (n=5)
+# observed 343 / 348 / 376 (n=5); 282.0 on 2026-09-05 WITH the MySQL
+# corpus step added — the new step did not move the maximum, so the
+# budget stands.
 budget_s = 540
 # S4.6 — biz (embedded corpus + compat, no suite ports) and dogfood
 # (embedded replay, no ports) overlap safely; ~real CPU overlap.

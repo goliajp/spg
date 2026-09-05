@@ -285,6 +285,42 @@ One value, from one place.
 argument and returns an integer, which is what a query written against
 MySQL compares and sums.
 
+### Fixed — `pins-current` could not go green, and `release-build` could not go red
+
+Two gate steps, opposite failures, both found while looking for a
+budget number.
+
+`pins-current` runs the e2e pins a commit touches and fails when the
+filters select nothing. It counted them by reading `test result: ok. N`
+out of `scripts/run-test-binaries.sh` — a line that script has not
+printed since v7.39.12 rewrote it to capture each harness's output into
+a shell variable and print only a timing row and a summary. The count
+was therefore zero for every possible input, so the step was red on any
+commit touching a pin file and skipped on every other. Its history on
+the testbed says so:
+
+```text
+  2026-09-01 21:41  pass  142,105 ms   the last run that ran tests
+  2026-09-03 17:45  pass       14 ms   "no e2e pins touched — skipped"
+  2026-09-05 08:41  FAIL      261 ms   seventeen pin files touched
+```
+
+The runner's own summary line is the contract now, held by four unit
+tests carrying a verbatim sample of it.
+
+`unit-changed` had the same shape one step short of the same fault: it
+reported "unit green over N changed crate(s)" whatever the runner did,
+and the runner exits 0 when its filter selects no harness at all. The
+message carries the harness and test counts now, and no harness at all
+is a failure rather than a green line.
+
+`release-build`'s budget was 250 s, derived from a single 165.7 s
+observation on a warm tree, with a comment saying it would widen once
+there was a spread. There is: the two prerelease runs since that
+actually rebuilt took 550.8 s and 553.2 s, both over, both reported and
+passed over. 840 s now — observed maximum times 1.5, the rule this
+manifest states — with all four observations written beside it.
+
 ### Added — the perf panel reports server-reported time next to the client wall clock
 
 The correction below says the panel could not see the question it was

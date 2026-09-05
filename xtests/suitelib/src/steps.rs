@@ -244,10 +244,45 @@ pub fn unit_changed(root: &Path, graph: &CrateGraph) -> Result<String, String> {
     } else {
         ""
     };
+    // v7.40.0 — say how much ran, and go red when NOTHING did.
+    //
+    // The message was "unit green over N changed crate(s)" whatever the
+    // runner had done. `run-test-binaries.sh` exits 0 when `RUN_FILTER`
+    // selects no harness at all — the loop simply never runs a body —
+    // so this step could report five crates green having executed
+    // nothing, which is the defect `pins-current` was carrying in its
+    // own shape. A count in the message is what makes that visible, and
+    // zero harnesses is an instrument failure rather than a crate that
+    // happens to have no tests.
+    let harnesses = harnesses_run_in(&out);
+    let tests = tests_run_in(&out);
+    if harnesses == 0 {
+        return Err(format!(
+            "{} crate(s) changed but the filter `{filter}` selected no test \
+             harness — nothing ran",
+            changed.len()
+        ));
+    }
     Ok(format!(
-        "unit green over {} changed crate(s){note}",
+        "unit green over {} changed crate(s): {tests} test(s) in {harnesses} \
+         harness(es){note}",
         changed.len()
     ))
+}
+
+/// How many harnesses the runner says it executed, from its own summary.
+///
+/// v7.40.0 — companion to `tests_run_in`. `run-test-binaries.sh` prints
+/// `<label>: <pass>/<total> harnesses green, <n> tests`; a filter that
+/// matched nothing prints `0/0`, exits 0, and is otherwise
+/// indistinguishable from a clean run.
+fn harnesses_run_in(out: &str) -> usize {
+    out.lines()
+        .filter_map(|l| l.split_once(" harnesses green, "))
+        .filter_map(|(head, _)| head.rsplit(' ').next())
+        .filter_map(|frac| frac.split_once('/'))
+        .filter_map(|(_, total)| total.parse::<usize>().ok())
+        .sum()
 }
 
 /// `pins-current` — the e2e pins THIS commit adds or touches.
@@ -363,12 +398,7 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
                  scripts/run-test-binaries.sh pins-current{SHARED_MEMBERS} --tests"
             ),
         )?;
-        let ran: usize = out
-            .lines()
-            .filter_map(|l| l.strip_prefix("test result: ok. "))
-            .filter_map(|l| l.split(' ').next())
-            .filter_map(|n| n.parse::<usize>().ok())
-            .sum();
+        let ran = tests_run_in(&out);
         // Per harness, not summed: a green engine run must not stand in
         // for a server filter set that selected nothing.
         if ran == 0 {
@@ -389,6 +419,91 @@ pub fn pins_current(root: &Path) -> Result<String, String> {
         "{ran_total} pin(s) over {touched} touched file(s) ({})",
         notes.join(", ")
     ))
+}
+
+/// How many tests the runner says it ran, from ITS OWN summary line.
+///
+/// v7.40.0 — this used to read `test result: ok. N`, which
+/// `run-test-binaries.sh` has not printed since v7.39.12 rewrote it.
+/// That rewrite runs each harness with its output captured into a
+/// shell variable and prints only a timing row and a summary; the
+/// harness's own `test result:` line reaches neither stdout nor stderr
+/// unless the harness FAILED. So the count was zero for every possible
+/// input, and the step's own guard —
+///
+/// ```text
+/// if ran == 0 { return Err("… the filters selected no tests") }
+/// ```
+///
+/// — made `pins-current` red on any commit that touches a pin file,
+/// which is the commit it exists for. It went unnoticed because the
+/// preceding tier steps are what usually change, and a tree with no
+/// touched pin file returns "skipped" before reaching here.
+///
+/// The runner's summary line is the contract now, and the test below
+/// holds a verbatim sample of it.
+fn tests_run_in(out: &str) -> usize {
+    out.lines()
+        .filter_map(|l| l.split_once("harnesses green, "))
+        .filter_map(|(_, rest)| rest.strip_suffix(" tests"))
+        .filter_map(|n| n.trim().parse::<usize>().ok())
+        .sum()
+}
+
+#[cfg(test)]
+mod pins_current_count_tests {
+    use super::tests_run_in;
+
+    /// Verbatim from `scripts/run-test-binaries.sh` — a timing row, the
+    /// summary, and the slowest line. Nothing here says `test result:`,
+    /// which is exactly why the old parse could not work.
+    const RUNNER_OUTPUT: &str = "\
+    11s wall      2.9s in-test  spg-engine::e2e
+pins-current: 1/1 harnesses green, 37 tests
+pins-current: slowest —    11s wall      2.9s in-test  spg-engine::e2e";
+
+    #[test]
+    fn the_count_comes_from_the_runners_summary_line() {
+        assert_eq!(tests_run_in(RUNNER_OUTPUT), 37);
+    }
+
+    /// A harness the filters selected nothing in still prints the
+    /// summary, with a zero in it. That is the case the step's guard is
+    /// for, and it must stay distinguishable from the parse failing.
+    #[test]
+    fn a_filter_that_selected_nothing_reads_as_zero() {
+        assert_eq!(
+            tests_run_in("pins-current: 1/1 harnesses green, 0 tests"),
+            0
+        );
+    }
+
+    /// The line the parse was looking for before, on its own, is not a
+    /// count any more — if the runner ever prints it again, it is the
+    /// summary line that decides.
+    /// The harness count comes off the same line, and `0/0` — a filter
+    /// that matched nothing — is what the guard in `unit-changed` reads.
+    #[test]
+    fn the_harness_count_comes_off_the_same_line() {
+        use super::harnesses_run_in;
+        assert_eq!(harnesses_run_in(RUNNER_OUTPUT), 1);
+        assert_eq!(
+            harnesses_run_in("unit-changed: 0/0 harnesses green, 0 tests"),
+            0
+        );
+        assert_eq!(
+            harnesses_run_in("unit-changed: 6/6 harnesses green, 412 tests"),
+            6
+        );
+    }
+
+    #[test]
+    fn a_bare_libtest_line_is_not_the_source() {
+        assert_eq!(
+            tests_run_in("test result: ok. 37 passed; 0 failed; 0 ignored"),
+            0
+        );
+    }
 }
 
 /// `perf-sweep` (S1.2) — the release-blocking endpoint sweep with its
