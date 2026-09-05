@@ -29,6 +29,16 @@ cd "$(dirname "$0")/.."
 V="${1:?usage: $0 <X.Y.Z>}"
 [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "not a version: $V" >&2; exit 2; }
 
+# A dirty tree stops git-flow at the checkout of master, several steps
+# in and after the release branch already exists — "failed to checkout
+# target branch 'master'", which names neither the file nor the reason.
+# Refuse here, where the message can.
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "release-finish: working tree not clean:" >&2
+    git status --short >&2
+    exit 1
+fi
+
 manifest_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 [[ "$manifest_version" == "$V" ]] \
     || { echo "Cargo.toml workspace version is ${manifest_version}, expected ${V}" >&2; exit 1; }
@@ -36,6 +46,16 @@ manifest_version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
 # git-flow's merges run the repository's hooks, and the release commit
 # has already been through them on the branch.
 export GIT_MERGE_AUTOEDIT=no
+
+# Start the branch when it is not there. The first version of this
+# script only finished, and `git flow release finish` answers "start
+# point branch '7.40.1' does not exist" — which is true and unhelpful,
+# because finishing a release IS the two steps and splitting them across
+# two commands is how one of them gets forgotten.
+if ! git rev-parse -q --verify "refs/heads/release/${V}" >/dev/null; then
+    git flow release start "$V"
+fi
+
 git flow release finish --tagname "v${V}" -m "v${V}" "$V"
 
 # The check, not the hope.
