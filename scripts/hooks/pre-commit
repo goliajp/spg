@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# 7.38 CP1 discipline, mechanized (audit A22): a commit runs the
+# precommit tier and a red refuses. `git commit --no-verify` is the
+# explicit, visible escape hatch.
+#
+# v7.40.0 — tracked, and installed by `scripts/install-hooks.sh`. It
+# used to live only in `.git/hooks`, which is per-clone and untracked:
+# a fresh clone had no gate at all and nothing said so.
+exec scripts/precommit-tier.sh

@@ -10,6 +10,58 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — 262.8 MB of build artefacts have been in the repository since the appsql differ landed
+
+`.gitignore`'s first line is `/target`, anchored to the root, so
+`xtests/appsql/differ/target/` was never covered. 1,036 cargo
+fingerprint and artefact files went in with `8b3271cb`, the commit that
+added the differ, and every clone since has pulled them.
+
+The directory has had its own `.gitignore` since 2026-08-19, and it
+named `xtests/appsql/differ/target/` and
+`xtests/appsql/differ/Cargo.lock`. A pattern in a nested `.gitignore`
+is relative to ITS OWN directory, so those two named
+`xtests/appsql/differ/xtests/appsql/differ/target/` — a path that
+cannot exist. The rule matched nothing from the day it was written.
+
+That is why `git rm --cached` alone did not hold: `git add -A` put all
+1,036 files straight back, because nothing ignored them. The patterns
+are `target/` and `Cargo.lock` now, and `git check-ignore` names the
+line. Both paths are untracked, files left on disk; the objects stay in
+history, which is the owner's call, not a script's.
+
+Found by the pre-commit tier's new tree witness, which is not what it
+was looking for: it compares `git write-tree` on both machines before
+grading a commit on the testbed, and the two disagreed by exactly these
+1,036 paths — present in this clone's index, absent from the testbed's
+because rsync excludes `target`.
+
+### Fixed — the pre-commit gate ran wherever you happened to be typing
+
+`exec scripts/suite.sh precommit`, on a box whose usual load has taken
+that tier over six minutes — one step in it has been measured at
+3,136 s here against 6.8 s on the testbed, where the whole tier is 45 s.
+What a gate that slow produces is `--no-verify`: two commits on
+2026-09-05 alone, each bypassing it and then running the tier by hand
+on the testbed anyway.
+
+`scripts/precommit-tier.sh` runs it on the testbed, and the part that
+matters is the witness rather than the offload. Grading a synced copy
+is the defect class this repository has been bitten by twice — `rsync
+-a` preserved mtimes and cargo graded a stale binary; rsync'd files are
+untracked on the far side so diff-selected steps could not see them. So
+the local INDEX (during a pre-commit hook, exactly the tree about to be
+committed) and the testbed's worktree are both hashed with `git
+write-tree`, and equal object ids are the only thing that permits the
+offload. Unequal — a partial commit, a failed sync — falls back to
+running locally, which is correct rather than convenient.
+
+The hook itself is tracked now, under `scripts/hooks/`, installed by
+`scripts/install-hooks.sh` via `core.hooksPath`. It used to exist only
+in `.git/hooks`, which is per-clone and untracked: a fresh clone had no
+gate at all, and nothing said so.
+
+
 ### Fixed — every release since 7.22.0 has left a wrongly-named tag behind
 
 `git flow release finish` names the tag after the BRANCH, so
