@@ -10,6 +10,38 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a derived table's plan was a scan of a relation that does not exist
+
+`EXPLAIN ANALYZE SELECT count(*) FROM (SELECT t FROM s ORDER BY t) z`
+rendered this:
+
+```text
+  Aggregate  (actual rows=1.00)
+    ->  Seq Scan on z  (cost=0.00..1.00 rows=0 width=8)
+```
+
+`z` is the alias of a sub-SELECT, not a table. The node claims a
+sequential scan of it, reports zero rows for something that produced
+forty thousand, and the sort inside the sub-SELECT — the thing the query
+spends its time on — does not appear at all. A customer asking why the
+query is slow is shown a plan with no sort in it.
+
+PostgreSQL 18.6 renders the sub-plan under the outer node, and so does
+SPG now:
+
+```text
+  Aggregate
+    ->  Sort
+          Sort Key: s.t
+          Sort Method: external merge  Disk: 2624kB
+          ->  Seq Scan on s
+```
+
+`build_plan_tree` was already recursive — the UNION arm calls it per
+branch — so the sub-plan is the same call. Joins are left alone
+deliberately: a derived table joined to something else has to fold into
+the left-deep chain, which is a larger change than the shape this fixes.
+
 ### Fixed — EXPLAIN said `quicksort` for a sort that wrote 13 MB to disk
 
 `Sort Method` was hard-coded: `top-N heapsort` under a LIMIT and

@@ -183,3 +183,48 @@ fn a_plain_explain_still_names_no_method() {
         "a plain EXPLAIN has no Sort Method line in PG: {p:?}"
     );
 }
+
+/// v7.40.5 — the same sort, inside a derived table, must still appear.
+///
+/// Differenced against PG 18.6 on the same rows and the same budget:
+///
+/// ```text
+///   PG18.6
+///     Aggregate  (actual rows=1.00)
+///       ->  Sort  (actual rows=200000.00)
+///             Sort Key: sf.s
+///             Sort Method: external merge  Disk: 13504kB
+///             ->  Seq Scan on sf  (actual rows=200000.00)
+///
+///   SPG
+///     Aggregate  (actual rows=1.00)
+///       ->  Seq Scan on z  (cost=0.00..1.00 rows=0 width=8)
+/// ```
+///
+/// The sort is gone, and what replaces it is a scan of a table that does
+/// not exist reporting zero rows for something that produced two hundred
+/// thousand. A customer asking "why is this slow" is shown a plan with no
+/// sort in it.
+#[test]
+fn a_sort_inside_a_derived_table_still_appears_in_the_plan() {
+    let (raw, mut s) = seeded();
+    let _guard = common::ChildGuard(raw);
+    rows(&mut s, "SET work_mem = 64");
+    let p = rows(
+        &mut s,
+        "EXPLAIN ANALYZE SELECT count(*) FROM (SELECT t FROM s ORDER BY t) z",
+    );
+    assert!(
+        p.iter().any(|l| l.contains("Sort")),
+        "the sort vanished from the plan: {p:?}"
+    );
+    assert!(
+        !p.iter().any(|l| l.contains("Seq Scan on z")),
+        "`z` is a derived table, not a relation to scan: {p:?}"
+    );
+    // And the row count of the sub-plan is the rows it produced, not 0.
+    assert!(
+        !p.iter().any(|l| l.contains("rows=0 ")),
+        "a node that produced 40,000 rows must not report 0: {p:?}"
+    );
+}
