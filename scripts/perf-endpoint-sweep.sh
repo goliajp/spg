@@ -682,11 +682,26 @@ for entry in "${SORT_SHAPES[@]}"; do
   #     and the two engines evidently do not discard the same amount of
   #     work. Judging those cells by server time swaps a route bias for
   #     a bias in the instrument, and it put `sort_worst` on the ceiling.
-  #   * The server number is not yet stable enough to gate on.
-  #     `long text distinct` read 0.80x standalone and 1.27x in this
-  #     panel half an hour apart. Some of that is the fixture -- the
-  #     standalone table carries a fourth column -- and the rest is not
-  #     accounted for.
+  #   * NOT because the server number drifts. It was written here that
+  #     it did -- `long text distinct` reading 0.80x standalone and
+  #     1.27x in this panel -- and that was wrong. Ten repeats of
+  #     `server_one` on this panel's own fixture, legs alternating,
+  #     spread 1.5% on SPG and 0.8% on PostgreSQL. The column is steady.
+  #
+  #     The gap was `work_mem`, which the standalone probe did not set,
+  #     and the direction is worth keeping:
+  #
+  #       9MB (this container's default)  external merge, 78 MB  122.5 ms
+  #       4MB (what this panel sets)      quicksort, 4 MB         64.2 ms
+  #       256MB                           quicksort, 12 MB        69.7 ms
+  #
+  #     LESS memory is twice as fast here, because 4MB puts PostgreSQL
+  #     on a different plan. So this cell's verdict rests on a setting
+  #     the panel chooses: at 4MB it reads 1.34x against SPG, and at
+  #     the container's own default it reads 0.65x. 4MB is
+  #     PostgreSQL's stock default and the container's 9MB is the
+  #     outlier, so the panel is on the right side of it -- but the
+  #     number moves by a factor of two and nothing here said so.
   #
   # So the column is evidence and not yet a verdict. What it already
   # buys is the ability to say which kind of gap a cell has, which is
