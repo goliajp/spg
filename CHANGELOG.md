@@ -57,6 +57,22 @@ Three changes, each with the evidence in its own module:
   waiting for nothing.
 
 
+### Fixed — every prerelease left a report file modified, on the path it
+### takes
+
+`biz` regenerates four tracked reports and the run puts them back. The
+list that does that was written twice — three files on the parallel
+group path, four on the single-step path — and `biz` runs in the
+`corpus` group, so the group copy is the one that runs. Every
+prerelease since has left `xtests/dump_compat/report.md` modified,
+under a comment that has said since v7.38 that "a dirty tree after
+prerelease is what broke a release preflight once".
+
+Found by `--resume`, whose digest could not match across two runs of
+the same tree. One list now, plus a verdict rather than a list that has
+to be right: `git status --porcelain` either side of the run, and
+anything the run dirtied that it found clean is a red.
+
 ## [7.40.6] — 2026-09-06
 
 ### Fixed — the same missing sub-plan, on the join side
