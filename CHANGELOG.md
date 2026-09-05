@@ -10,6 +10,8 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.39.13] — 2026-09-05
+
 ### Fixed — nine hours, silently, on every write of a query result into a `timestamptz` column
 
 One instant, epoch 1767225600, copied six ways under `SET
@@ -208,12 +210,17 @@ first, with an index over `(n numeric, id)`:
 
 ```text
   rows     WHERE n = 1.23 ORDER BY id DESC LIMIT 20
-  10,000   SPG 0.497-0.520 ms   PG 18.6 0.183-0.234 ms
-  50,000   SPG 0.975-0.991 ms   PG 18.6 0.195-0.439 ms
+           before      after       PG 18.6
+  10,000   0.497-0.520 0.066-0.078 0.192-0.461 ms
+  50,000   0.975-0.991 0.067-0.071 0.233-0.448 ms
 ```
 
 Twenty rows behind a seek do not cost twice as much on five times the
-table. `numeric`, `bytea`, `time`, `timetz`, `money` and `year` are on
+table, and afterwards they do not: 0.066 ms at ten thousand rows and
+0.067 at fifty thousand is the shape of a seek. The unbounded form of
+the same query — the whole matching group, `ORDER BY id DESC` with no
+`LIMIT` — went 2.588-2.626 ms to 0.074-0.080 at fifty thousand rows.
+The panel reads `cells=38 losses=0 control_false_differences=0`. `numeric`, `bytea`, `time`, `timetz`, `money` and `year` are on
 the list now — each measured leading a composite and walking in order —
 and the list is an EXHAUSTIVE match: a new `DataType` does not compile
 until someone answers for it. `double precision` is the type that can
