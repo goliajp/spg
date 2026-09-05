@@ -242,8 +242,7 @@ setup_typed_table() { # $1=uri $2=table $3=rows
     -c "INSERT INTO $2 SELECT g, (((g::bigint*7919)%1000)::numeric)/100, decode(lpad(to_hex(g), 16, '0'), 'hex'), repeat(chr(97+(g%26)),200) FROM generate_series(1,$3) g" >/dev/null 2>&1
   "${PSQL}" --no-psqlrc -X -q "$1" \
     -c "CREATE INDEX ${2}_n ON $2 (n)" \
-    -c "CREATE INDEX ${2}_b ON $2 (b)" \
-    -c "CREATE INDEX ${2}_n_id ON $2 (n, id)" >/dev/null 2>&1
+    -c "CREATE INDEX ${2}_b ON $2 (b)" >/dev/null 2>&1
   local got
   got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
   [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
@@ -258,6 +257,35 @@ setup_typed_table() { # $1=uri $2=table $3=rows
 # cells timed an error response — three nearly identical numbers that
 # should have been questioned on sight. This asks each typed predicate
 # for its count before anything is timed, and refuses a zero.
+# v7.39.13 — the prefix-walk cells get a table of THEIR OWN, and the
+# reason is the panel's own rule about comparable history.
+#
+# The composite `(n, id)` these cells need was first added to
+# `setup_typed_table`, which is shared by sixteen cells whose history
+# was all measured without it. An index the planner may now choose
+# changes what those cells are, even where it does not change the plan
+# they get — and the first run after the change reported
+# `400000 numeric key` as a LOSS, on a host that was simultaneously
+# building another workspace, with no way to tell the two apart.
+#
+# Same generator, same thousand distinct values of `n`, so `n = 1.23`
+# still names a group of rows rather than one row.
+setup_walk_table() { # $1=uri $2=table $3=rows
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "DROP TABLE IF EXISTS $2" \
+    -c "CREATE TABLE $2 (id INT PRIMARY KEY, n NUMERIC, pad TEXT)" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "INSERT INTO $2 SELECT g, (((g::bigint*7919)%1000)::numeric)/100, repeat(chr(97+(g%26)),200) FROM generate_series(1,$3) g" >/dev/null 2>&1
+  "${PSQL}" --no-psqlrc -X -q "$1" \
+    -c "CREATE INDEX ${2}_n_id ON $2 (n, id)" >/dev/null 2>&1
+  local got
+  got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2")"
+  [[ "${got}" == "$3" ]] || { echo "SETUP FAILED: $2 on $1 has ${got} rows, wanted $3 — refusing to time" >&2; exit 2; }
+  # Rule 2: a predicate that selects nothing times an empty answer.
+  got="$("${PSQL}" --no-psqlrc -X -q -t -A "$1" -c "SELECT count(*) FROM $2 WHERE n = 1.23")"
+  [[ "${got}" -gt 0 ]] || { echo "SETUP FAILED: n = 1.23 selects no row of $2 on $1 — refusing to time" >&2; exit 2; }
+}
+
 verify_typed_predicates() { # $1=uri $2=table
   local q c
   for q in "SELECT count(*) FROM $2 WHERE n = 1.23" \
@@ -446,10 +474,10 @@ TYPED_SHAPES=(
   # needs. Both directions, because they take different code: ascending
   # is a forward range from the prefix, descending is the reverse
   # descent `range_rev_by` added.
-  'prefix walk, top-N desc|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id DESC LIMIT 20'
-  'prefix walk, top-N asc|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id ASC LIMIT 20'
+  'prefix walk, top-N desc|SELECT id FROM @W@ WHERE n = 1.23 ORDER BY id DESC LIMIT 20'
+  'prefix walk, top-N asc|SELECT id FROM @W@ WHERE n = 1.23 ORDER BY id ASC LIMIT 20'
   # And the unbounded form, which carries the send as well as the walk.
-  'prefix walk, all rows|SELECT id FROM @N@ WHERE n = 1.23 ORDER BY id DESC'
+  'prefix walk, all rows|SELECT id FROM @W@ WHERE n = 1.23 ORDER BY id DESC'
 )
 
 LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0
@@ -460,15 +488,18 @@ printf '%-8s %-26s %-16s %-16s %s\n' -------- -------------------------- -------
 for rows in ${SIZES}; do
   T="sweep_${rows}"
   NT="sweept_${rows}"
+  WT="sweepw_${rows}"
   setup_table "${SPG_URI}" "${T}" "${rows}"
   setup_table "${PG_URI}"  "${T}" "${rows}"
   setup_typed_table "${SPG_URI}" "${NT}" "${rows}"
   setup_typed_table "${PG_URI}"  "${NT}" "${rows}"
   verify_typed_predicates "${SPG_URI}" "${NT}"
   verify_typed_predicates "${PG_URI}"  "${NT}"
+  setup_walk_table "${SPG_URI}" "${WT}" "${rows}"
+  setup_walk_table "${PG_URI}"  "${WT}" "${rows}"
 
   for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
-    name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"
+    name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"; sql="${sql//@W@/${WT}}"
     # Three legs, not two: SPG, PG, and SPG a second time. The third is
     # this cell's own control, and it is timed HERE, between the other
     # two, rather than in a block after every size has finished.
