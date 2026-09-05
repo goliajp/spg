@@ -10,6 +10,8 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.40.3] — 2026-09-05
+
 ### Fixed — the counter pins paid for a fat link they never read
 
 ```text
