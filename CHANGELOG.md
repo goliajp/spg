@@ -10,6 +10,9 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [7.40.5] — 2026-09-06
+
 ### Fixed — a derived table's plan was a scan of a relation that does not exist
 
 `EXPLAIN ANALYZE SELECT count(*) FROM (SELECT t FROM s ORDER BY t) z`
