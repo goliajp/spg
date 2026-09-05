@@ -154,7 +154,77 @@ fn main() {
             let stamp = run_cmd("date -u +%Y%m%d%H%M%S");
             let sha = run_cmd("git rev-parse --short=7 HEAD");
             let runid = suitelib::reportlib::runid(stamp.trim(), sha.trim());
+            // v7.40.7 — the machine, before the code.
+            //
+            // Both of these produced red tiers during the 7.40 releases
+            // that had nothing to do with the tree being judged, and
+            // both said so in language that named something else: a
+            // missing `.rmeta` for a crate nobody touched, and a wire
+            // protocol error from a port another run of ours owned.
+            //
+            // The lock is taken FIRST and held for the whole run; the
+            // sweep is waited out after it, so a run that is waiting
+            // still holds the machine against a second one.
+            let _lock = match suitelib::preflightlib::RunLock::acquire(
+                &root.join("target"),
+                tier,
+                std::process::id(),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("suite-run: {e}");
+                    std::process::exit(3);
+                }
+            };
+            if let Ok(cwd) = std::env::current_dir() {
+                suitelib::preflightlib::wait_out_sweeper(&cwd.display().to_string());
+            }
             let mut ledger = suitelib::reportlib::Ledger::new(tier, &runid);
+            // v7.40.7 — `--resume`: do not re-run what this exact tree
+            // has already proved.
+            //
+            // Steps run serially and a failure skips the rest, so a red
+            // in a late step throws away every green ahead of it. Over
+            // the 7.40.0-7.40.6 releases that was 20 prerelease runs on
+            // the testbed, 11 of them red, 10.1 hours of wall clock —
+            // and three of the reds were `perf-sweep`, step seven of
+            // nine, each discarding the ~1,300 s already spent.
+            //
+            // The digest is what keeps it honest: HEAD, the worktree's
+            // delta against it, and the untracked files a build would
+            // see. One byte different and nothing is carried. A carried
+            // step is recorded as `carried`, never as `pass`.
+            let want_resume = args.iter().any(|a| a == "--resume");
+            let tree = suitelib::resumelib::tree_digest(root).ok();
+            ledger.tree.clone_from(&tree);
+            let carried = match (want_resume, tree.as_deref()) {
+                (true, Some(d)) => suitelib::resumelib::carried(&root.join("target"), tier, d),
+                (true, None) => {
+                    println!("resume: no tree digest (not a git repo?) — running every step");
+                    std::collections::BTreeMap::new()
+                }
+                (false, _) => std::collections::BTreeMap::new(),
+            };
+            if want_resume {
+                if carried.is_empty() {
+                    println!("resume: nothing carried — no earlier run over this tree");
+                } else {
+                    let mut saved_ms = 0u64;
+                    let mut from: std::collections::BTreeSet<&str> =
+                        std::collections::BTreeSet::new();
+                    for c in carried.values() {
+                        saved_ms += c.ms;
+                        from.insert(c.runid.as_str());
+                    }
+                    println!(
+                        "resume: carrying {} step(s) worth {:.0}s from {} — {}",
+                        carried.len(),
+                        saved_ms as f64 / 1000.0,
+                        from.iter().copied().collect::<Vec<_>>().join(", "),
+                        carried.keys().cloned().collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
             // D26 — budget banding: a base/engine-level change honestly
             // costs an engine rebuild; judging it by the cement-level
             // budget makes every deep commit a false red (A19).
@@ -408,10 +478,12 @@ fn main() {
                                 "prepare: {label} failed ({}) — nothing below would mean anything",
                                 o.status
                             );
+                            drop(_lock);
                             std::process::exit(1);
                         }
                         Err(e) => {
                             eprintln!("prepare: {label} could not run: {e}");
+                            drop(_lock);
                             std::process::exit(1);
                         }
                     }
@@ -426,6 +498,22 @@ fn main() {
                 if failed.is_some() {
                     ledger.record_skip(&s.name);
                     println!("  SKIP  {:<16} (earlier step failed)", s.name);
+                    idx += 1;
+                    continue;
+                }
+                // v7.40.7 — carried by `--resume`, over this same tree.
+                if let Some(c) = carried.get(&s.name) {
+                    ledger.record_carried(
+                        &s.name,
+                        std::time::Duration::from_millis(c.ms),
+                        &c.runid,
+                    );
+                    println!(
+                        "  carry {:<16} ({:.1}s, proved in {})",
+                        s.name,
+                        c.ms as f64 / 1000.0,
+                        c.runid
+                    );
                     idx += 1;
                     continue;
                 }
@@ -446,6 +534,7 @@ fn main() {
                                 "suite-run: step {} is internal — parallel groups take external steps only",
                                 bad.name
                             );
+                            drop(_lock);
                             std::process::exit(2);
                         }
                         println!(
@@ -461,6 +550,10 @@ fn main() {
                         )> = std::thread::scope(|scope| {
                             let handles: Vec<_> = batch
                                 .iter()
+                                // v7.40.7 — a carried member is not
+                                // spawned; it is recorded below, in
+                                // file order with the rest.
+                                .filter(|b| !carried.contains_key(&b.name))
                                 .map(|b| {
                                     let cmd = b.cmd.clone().expect("checked by parse");
                                     let name = b.name.clone();
@@ -482,7 +575,29 @@ fn main() {
                                 .map(|h| h.join().expect("group thread"))
                                 .collect()
                         });
-                        for (name, budget, dur, ok) in &results {
+                        // File order, whatever the threads did — and a
+                        // carried member takes its place in that order
+                        // rather than being appended after the rest.
+                        for b in &batch {
+                            if let Some(c) = carried.get(&b.name) {
+                                ledger.record_carried(
+                                    &b.name,
+                                    std::time::Duration::from_millis(c.ms),
+                                    &c.runid,
+                                );
+                                println!(
+                                    "  carry {:<16} ({:.1}s, proved in {})",
+                                    b.name,
+                                    c.ms as f64 / 1000.0,
+                                    c.runid
+                                );
+                                continue;
+                            }
+                            let Some((name, budget, dur, ok)) =
+                                results.iter().find(|(n, ..)| *n == b.name)
+                            else {
+                                continue;
+                            };
                             ledger.record_result(name, *budget, *dur, *ok);
                             println!(
                                 "  {}  {:<16} ({:.1}s)",
@@ -802,6 +917,12 @@ fn main() {
                     rc = 1;
                 }
             }
+            // v7.40.7 — `exit` does not run destructors, so the lock has
+            // to be handed back by name. Leaving it costs the NEXT run a
+            // "clearing a stale lock" line at best, and at worst refuses
+            // that run outright once the operating system has handed the
+            // pid to somebody else.
+            drop(_lock);
             std::process::exit(rc);
         }
         Some(other) => {
@@ -823,7 +944,12 @@ fn run_cmd(cmd: &str) -> String {
 fn usage() -> &'static str {
     "suite-run — SPG v7.38 test-suite orchestrator\n\
      \n\
-     USAGE: suite-run <TIER> [--json]\n\
+     USAGE: suite-run <TIER> [--json] [--resume]\n\
+     \n\
+     --resume  do not re-run a step this exact working tree has already\n\
+     proved. The digest covers HEAD, the worktree delta and the untracked\n\
+     files; one byte different and every step runs. A carried step is\n\
+     reported as `carried`, naming the run that ran it — never as `pass`.\n\
      \n\
      TIERS (by speed, each a superset of the last):\n\
        precommit    current-version pins + fastest regressions   (budget 150 s hard)\n\
