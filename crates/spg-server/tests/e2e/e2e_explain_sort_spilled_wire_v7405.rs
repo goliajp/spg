@@ -228,3 +228,39 @@ fn a_sort_inside_a_derived_table_still_appears_in_the_plan() {
         "a node that produced 40,000 rows must not report 0: {p:?}"
     );
 }
+
+/// v7.40.6 — and the same, when the derived table is on the JOIN side.
+///
+/// v7.40.5 fixed the FROM position and said joins were excluded on
+/// purpose. They are the same defect: measured against PG 18.6 on the
+/// same data,
+///
+/// ```text
+///   SPG    ->  Hash  (rows=0)
+///                ->  Seq Scan on z  (cost=0.00..1.00 rows=0 width=8)
+///
+///   PG18   ->  Hash
+///                ->  Sort
+///                      ->  Seq Scan on a
+/// ```
+///
+/// `z` is a sub-SELECT there too, and the plan claims a scan of it
+/// reporting zero rows for twenty thousand.
+#[test]
+fn a_derived_table_on_the_join_side_is_also_a_sub_plan() {
+    let (raw, mut s) = seeded();
+    let _guard = common::ChildGuard(raw);
+    rows(&mut s, "SET work_mem = 64");
+    let p = rows(
+        &mut s,
+        "EXPLAIN ANALYZE SELECT count(*) FROM s          JOIN (SELECT id FROM s ORDER BY t) z ON s.id = z.id",
+    );
+    assert!(
+        !p.iter().any(|l| l.contains("Seq Scan on z")),
+        "`z` is a derived table, not a relation to scan: {p:?}"
+    );
+    assert!(
+        p.iter().filter(|l| l.contains("Sort")).count() >= 1,
+        "the sort inside the joined sub-SELECT vanished: {p:?}"
+    );
+}
