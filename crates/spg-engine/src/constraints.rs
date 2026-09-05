@@ -1573,11 +1573,6 @@ fn exclusion_violation(
     ))
 }
 
-/// v7.39 (SQLSTATE fidelity) — PG's 23505 DETAIL body:
-/// ` DETAIL: Key (a, b)=(1, x) already exists.` Appended to the main
-/// message (the engine error is a single string; psql-style separate
-/// DETAIL packets are a wire-layer follow-up).
-
 /// v7.40.0 — each engine's own sentence for a unique violation.
 ///
 /// PostgreSQL 18.6 names the CONSTRAINT and lists the key columns beside
@@ -1626,6 +1621,10 @@ fn unique_violation(
     ))
 }
 
+/// v7.39 (SQLSTATE fidelity) — PG's 23505 DETAIL body:
+/// ` DETAIL: Key (a, b)=(1, x) already exists.` Appended to the main
+/// message (the engine error is a single string; psql-style separate
+/// DETAIL packets are a wire-layer follow-up).
 fn unique_key_detail(cols: &[String], key: &[Value<'_>]) -> String {
     let vals = key
         .iter()

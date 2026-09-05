@@ -4749,7 +4749,7 @@ impl Engine {
                 // The skip stays for a SYNTHESISED index — the
                 // constraint's own — where a second B-tree over the same
                 // column is pure cost with no name to lose.
-                let declared = matches!(explicit_name, Some(_)) && k == 0;
+                let declared = explicit_name.is_some() && k == 0;
                 let already = !declared
                     && table.indices().iter().any(|idx| {
                         matches!(idx.kind, spg_storage::IndexKind::BTree(_))
