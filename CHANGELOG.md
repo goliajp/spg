@@ -10,6 +10,83 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+## [7.40.2] — 2026-09-05
+
+### Fixed — a low-cardinality text sort paid for four random reads per comparison
+
+```text
+  400,000 rows, twenty-six distinct values, server-reported
+    200-byte values   94.5 -> 81.2 ms    1.45x of PG18 -> 1.24x
+      8-byte values   57.8 -> 56.8 ms    unchanged
+```
+
+When the sort's prefix key does not discriminate, it orders the keys
+and then proves per run whether every value in it is equal — a uniform
+run is already in stable order and is left alone. That proof is n-1
+comparisons and each one walked `order -> row -> values -> Value ->
+&str -> bytes`: four dependent reads, the first scattered across a
+400,000-element array of whole rows.
+
+Priced by ablation against the same binary with the path forced off
+(md5-witnessed, order digests identical): the path itself earns 1.82x
+at 200 bytes and nothing at 8, and the extra 192 bytes a row cost
+34.6 ms — 80 MB compared at 2.3 GB/s, an order of magnitude under this
+machine's memory bandwidth, because the cost is the misses.
+
+The column is collected into a `Vec<&str>` in one sequential pass now,
+and only for the branch that reads it: an exact key never asks the
+question, and building it for one charged 0.8 ms to a shape that does
+not read it.
+
+### Added — the sort panel says which kind of gap each cell has
+
+The panel judged on the client's wall clock, and the client does not
+reach the two engines the same way. On this testbed it is `docker exec`
+into the PostgreSQL container, so PostgreSQL answers over that
+container's loopback while SPG is reached back out through
+`host.docker.internal`. Moving the client to the host reverses the
+penalty rather than removing it. Same tree, same binaries:
+
+```text
+                                   client in PG container   client on host
+  sort only, text (26 values)              1.30x                0.67x
+  sort only, long text distinct            1.32x                0.68x
+```
+
+Server-reported time has no client and no socket in it, and printed
+beside the wall clock the disagreement is the answer:
+
+```text
+  long text, key not projected   wall 1.18x   server 1.03x
+  long text top-N                wall 1.28x   server 1.07x
+  text key, rows returned        wall 1.32x   server 1.97x
+```
+
+The ceiling still reads the wall clock. Moving it to the server column
+was tried and withdrawn: on shapes that RETURN their rows the two
+server numbers are not comparable — `EXPLAIN ANALYZE` discards the
+result rows and the engines discard different amounts of work — and the
+server number is not yet stable enough to gate on.
+
+### Fixed — three ways the toolchain could not tell you what it knew
+
+* **The host ruler was read once, at the start.** The v7.40.1 release
+  train was blocked by its own gate: `slt-smoke` took 129.3 s against a
+  15 s budget where its history reads 1.6-1.9 s, on a laptop carrying
+  somebody else's job. The factor that absorbs this is measured on
+  `fmt`, which runs FIRST — it read 1.05x at load 17 and the box was at
+  27 four steps later. `fmt` is re-run at the end and the slower reading
+  wins; both are printed. Against that run: 15 x 4 x 1.05 = 63 s and it
+  was over; 15 x 4 x 2.53 = 151.8 s and it is not.
+* **`release.sh --fast` runs its preflight through
+  `precommit-tier.sh`**, so the gate lands on the idle machine and
+  proves by `git write-tree` that it graded this tree.
+* **`release-finish.sh` starts the branch and refuses a dirty tree.**
+  Both gaps end in a message naming neither cause nor file — "start
+  point branch does not exist", and "failed to checkout target branch
+  'master'" where the file blocking it was that script itself.
+
+
 ## [7.40.1] — 2026-09-05
 
 ### Fixed — a nine-byte sort key was one byte too long for the prefix that sorts it
