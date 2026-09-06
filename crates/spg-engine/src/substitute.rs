@@ -804,6 +804,42 @@ pub fn substitute_placeholders(
 /// through here so a new AST slot only needs adding once.
 /// Expression-INTERNAL recursion (into subquery nodes inside an
 /// Expr) stays the visitor's own responsibility.
+/// v7.40.8 — every Expr slot a FROM item carries, not just its LATERAL
+/// subquery.
+///
+/// A `TableRef` holds three: the LATERAL subquery, `unnest_expr` and
+/// `generate_series_args`. The walk visited the first, so a `$N` inside
+/// `unnest($1)` or `generate_series($1, $2)` was never substituted and
+/// reached evaluation as a bare placeholder against an empty parameter
+/// buffer — `parameter $1 referenced but only 0 bound by client`, on a
+/// statement whose parameter had plainly arrived, because `= ANY($1)`
+/// in the same shape read it.
+///
+/// Reported by a customer against 7.40.7 as a live 500. Every fixture
+/// in the tree used a literal array in that position, which is what let
+/// it survive; `generate_series` had the same hole and nobody had hit
+/// it yet.
+///
+/// One function so a fourth slot added to `TableRef` has one place to
+/// be added to, rather than two call sites that have to agree.
+fn walk_table_ref_exprs_mut(
+    tref: &mut spg_sql::ast::TableRef,
+    f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
+) -> Result<(), EngineError> {
+    if let Some(sub) = &mut tref.lateral_subquery {
+        walk_select_exprs_mut(sub, f)?;
+    }
+    if let Some(e) = &mut tref.unnest_expr {
+        f(e)?;
+    }
+    if let Some(args) = &mut tref.generate_series_args {
+        for a in args.iter_mut() {
+            f(a)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn walk_select_exprs_mut(
     s: &mut SelectStatement,
     f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
@@ -826,13 +862,9 @@ pub(crate) fn walk_select_exprs_mut(
         }
     }
     if let Some(from) = &mut s.from {
-        if let Some(sub) = &mut from.primary.lateral_subquery {
-            walk_select_exprs_mut(sub, f)?;
-        }
+        walk_table_ref_exprs_mut(&mut from.primary, f)?;
         for j in &mut from.joins {
-            if let Some(sub) = &mut j.table.lateral_subquery {
-                walk_select_exprs_mut(sub, f)?;
-            }
+            walk_table_ref_exprs_mut(&mut j.table, f)?;
             if let Some(on) = &mut j.on {
                 f(on)?;
             }

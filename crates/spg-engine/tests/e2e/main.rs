@@ -326,6 +326,7 @@ mod e2e_float_round_half_even;
 mod e2e_float_to_int_range;
 mod e2e_format_minmax_round611;
 mod e2e_format_type;
+mod e2e_from_clause_placeholder_v7408;
 mod e2e_from_values;
 mod e2e_fromless_aggregate_round106;
 mod e2e_fts_catalogs_round650;
