@@ -147,13 +147,31 @@ jobs:
       # Verified locally against the same tree: after the build below,
       # `--test prod_ready` and `--test perf_gate` under this selection
       # compile nothing (0.31 s / 0.33 s).
+      #
+      # Two invocations, ONE selection. `cargo test --bins` is not a
+      # substitute for `cargo build --bins`: under `test` a bin target
+      # is compiled as a test harness into `deps/`, and the plain
+      # binary at `target/release/<name>` only appears as a side effect
+      # of building that package's INTEGRATION tests (so cargo can hand
+      # them `CARGO_BIN_EXE_*`). Shipping only the `test` form put
+      # `spg-server`, `spg` and `pg_isready` in place — those three
+      # packages have integration tests — and left `sqllogictest`,
+      # which has none, missing; the `biz` step failed in 0 s on run
+      # 34053412341. Sharing the selection is what keeps this cheap:
+      # the second invocation builds the three test harnesses and
+      # recompiles no library.
       - name: Build every target this job runs, once
         run: |
+          cargo build --release --locked \
+            -p spg-server -p spgctl -p sqllogictest \
+            -p spg-audit -p spg-crypto -p spg-engine \
+            -p spg-sql -p spg-storage -p spg-wire \
+            --bins
           cargo test --release --locked --no-run \
             -p spg-server -p spgctl -p sqllogictest \
             -p spg-audit -p spg-crypto -p spg-engine \
             -p spg-sql -p spg-storage -p spg-wire \
-            --bins --test prod_ready --test slo_smoke --test perf_gate
+            --test prod_ready --test slo_smoke --test perf_gate
       - name: prod_ready gate
         # Asserts every [machine] row in PROD_READY.md is backed by a
         # row_X_Y_* test. Failure means PROD_READY.md is over-claiming.
