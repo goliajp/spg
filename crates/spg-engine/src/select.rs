@@ -10085,6 +10085,35 @@ impl Engine {
         let Some(from) = &stmt.from else {
             return Ok(None);
         };
+        // v7.40.10 — the FROM kinds this path can actually produce rows
+        // for, as a match with NO wildcard arm: a kind added to
+        // `FromItemKind` is a compile error here rather than a statement
+        // that falls through to the table lookup and answers
+        // `relation "<the function's own name>" does not exist`.
+        //
+        // Which is what `SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)`
+        // did over the extended protocol, while `count(*)` over the same
+        // item answered — the aggregate gate below sends that one to the
+        // materialising executor, which handles every kind. The simple
+        // query protocol answered too, and so did all three of the
+        // embedded engine's own entry points. Present on the published
+        // 7.40.9; the guard that let it through named four of the seven
+        // slots a FROM item can carry.
+        const fn streaming_can_produce(k: spg_sql::ast::FromItemKind) -> bool {
+            use spg_sql::ast::FromItemKind as K;
+            match k {
+                K::Relation | K::Unnest | K::GenerateSeries | K::Subquery => true,
+                K::JsonbEach | K::TableFn | K::RowsFrom | K::JsonTable | K::ScalarFn => false,
+            }
+        }
+        if !streaming_can_produce(from.primary.kind())
+            || from
+                .joins
+                .iter()
+                .any(|j| !streaming_can_produce(j.table.kind()))
+        {
+            return Ok(None);
+        }
         // v7.37 (round 830) — decline anything a row-security policy binds
         // for this session. Policies are injected in
         // `exec_bare_select_cancel`, below this path, so a statement claimed
@@ -10218,11 +10247,18 @@ impl Engine {
         // rather than seeding the join by index — touching the stored
         // `PersistentVec` in place makes the whole table resident, which is
         // worse than the copy. Each batch is copied, then freed.
+        // v7.40.10 — the complete question, asked once.
+        //
+        // This named four of the seven slots a FROM item can carry, so
+        // `jsonb_each_text`, `ROWS FROM` and `JSON_TABLE` fell into a
+        // path that looks the item up as a table: `SELECT * FROM
+        // jsonb_each_text('{"a":1}'::jsonb)` answered `relation
+        // "jsonb_each_text" does not exist` over the extended protocol,
+        // while `count(*)` over the same item answered and the simple
+        // query protocol answered. See `TableRef::names_a_relation`.
         if from.joins.is_empty()
-            && from.primary.unnest_expr.is_none()
-            && from.primary.lateral_subquery.is_none()
+            && from.primary.names_a_relation()
             && from.primary.as_of_segment.is_none()
-            && from.primary.generate_series_args.is_none()
             && let Some(n) = self.try_stream_single_table(stmt, from, cancel, emit)?
         {
             return Ok(Some(n));
@@ -14634,16 +14670,10 @@ impl crate::Engine {
         // them. Refusing the check for joins left `SELECT … FROM a JOIN b
         // … WHERE nosuch = 1` labelled `'field list'` where MySQL 9.7.2
         // says `'where clause'`.
-        let plain = |t: &spg_sql::ast::TableRef| -> bool {
-            t.unnest_expr.is_none()
-                && t.generate_series_args.is_none()
-                && t.lateral_subquery.is_none()
-                && t.jsonb_each_text_arg.is_none()
-                && t.table_fn_call.is_none()
-                && t.rows_from.is_none()
-                && t.json_table.is_none()
-                && !t.scalar_fn_item
-        };
+        // v7.40.10 — this closure WAS the complete list, and the only
+        // complete one in the engine. It moved to the type so the other
+        // fifty-five sites can ask the same question.
+        let plain = |t: &spg_sql::ast::TableRef| -> bool { t.names_a_relation() };
         let cat = self.active_catalog();
         let mut sources: Vec<(String, &spg_storage::Table)> = Vec::new();
         for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
