@@ -11,6 +11,65 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
+## [7.40.9] — 2026-09-06
+
+### Fixed — a `timestamptz` lost its zone through every JSON builder but the scalar
+
+Reported against 7.40.7 by a customer whose CLI dumps and exports every
+table with `SELECT row_to_json(t) FROM <table> t`: a dump taken from SPG
+carried no timezone on any timestamp, and one taken from PostgreSQL did.
+
+Measured against PostgreSQL 18.6 first — the report is the input, not
+the specification — and reproduced on the published 7.40.7 image:
+
+```text
+                        SPG 7.40.7                    PG 18.6
+  to_jsonb(ts)      "2026-01-01T00:00:00+00:00" ✓   same
+  row_to_json(t)    "2026-01-01T00:00:00"       ✗   …+00:00
+  to_jsonb(t)       "2026-01-01T00:00:00"       ✗   …+00:00
+  json_build_object "2026-01-01T00:00:00"       ✗   …+00:00
+
+  under TimeZone = 'Asia/Tokyo', PG answers "2026-01-01T09:00:00+09:00"
+  for all four; SPG answered the scalar correctly and the rest with a
+  bare, unconverted "2026-01-01T00:00:00".
+```
+
+`Value` has `Timestamp(i64)` and no timestamptz variant: the zone-ness
+lives in the column's type. The scalar form worked because it could
+reach the argument's static type; a row builder gets names and values
+with no types, and an object builder never looked.
+
+The value is rewritten ahead of the dispatch rather than each builder
+taught separately — the JSON encoder passes a `json` value through
+verbatim, PG's own identity for json input, so one rewrite reaches the
+scalar, the whole row and the object builder alike. A whole row's field
+type comes from the row's own schema and only when the name is
+unambiguous. The keys of `json_build_object` are TEXT and are left
+alone.
+
+### Fixed — `generate_series()` in FROM described no columns at all
+
+```text
+  SELECT count(*) FROM generate_series(1,5) g
+    simple query        5
+    extended protocol   server sent data ("D" message) without prior
+                        row description ("T" message)
+```
+
+With and without bound parameters, so it is the shape and not the
+parameter. Present on 7.39.0, 7.40.7 and 7.40.8: **any driver that
+prepares statements got a protocol error rather than an answer**, on any
+query with `generate_series` in its FROM clause.
+
+Found by re-running a customer's own repro against the PUBLISHED 7.40.8
+image through a real Bind, after shipping the fix their report asked
+for. `describe` knew about `unnest_expr` because v7.38.3 taught it that
+slot — for the same customer — and `generate_series` has its own field.
+That is the same pair of slots the parameter-substitution walk had to
+learn about in 7.40.8: one shape, two places that must hear about it,
+both having heard about one.
+
+
 ## [7.40.8] — 2026-09-06
 
 ### Fixed — a bound parameter never reached `unnest()` or `generate_series()`
