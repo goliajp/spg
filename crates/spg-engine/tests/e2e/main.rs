@@ -448,6 +448,7 @@ mod e2e_json_object_text;
 mod e2e_json_table_format_round206;
 mod e2e_json_table_nested_round207;
 mod e2e_json_table_round205;
+mod e2e_json_timestamptz_v7409;
 mod e2e_jsonb_array_elements;
 mod e2e_jsonb_canonical_round603;
 mod e2e_jsonb_canonical_round619;

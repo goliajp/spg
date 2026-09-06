@@ -4233,37 +4233,72 @@ fn eval_function_call_positional(
     }
     let evaluated: Result<Vec<Value<'static>>, _> =
         args.iter().map(|a| eval_expr(a, row, ctx)).collect();
-    let evaluated = evaluated?;
-    // v7.39 (read01 json.c) — to_json(timestamptz) spells the instant in
-    // ISO 8601 WITH the session-zone offset ("2024-03-09T14:05:06+00:00"),
-    // unlike plain timestamp. The runtime value carries no tz tag, so the
-    // argument's static type is the witness.
-    if (name.eq_ignore_ascii_case("to_json") || name.eq_ignore_ascii_case("to_jsonb"))
-        && evaluated.len() == 1
-        && let Some(Value::Timestamp(t)) = evaluated.first()
-        && args.first().is_some_and(|a| {
-            crate::describe::describe_expr(a, ctx.columns)
-                .is_some_and(|sh| matches!(sh.ty, spg_storage::DataType::Timestamptz))
-        })
-    {
-        let off = ctx.session_tz_offset_at(*t);
-        let local = t + off;
-        let days = local.div_euclid(86_400_000_000);
-        let day_us = local.rem_euclid(86_400_000_000);
-        let (y, mo, d) = civil_from_days(i32::try_from(days).unwrap_or(0));
-        let secs = day_us / 1_000_000;
-        let frac = day_us % 1_000_000;
-        let (hh, mi, ss) = (secs / 3600, (secs / 60) % 60, secs % 60);
-        let mut txt = alloc::format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}");
-        if frac != 0 {
-            let f = alloc::format!("{frac:06}");
-            txt.push('.');
-            txt.push_str(f.trim_end_matches('0'));
+    let mut evaluated = evaluated?;
+    // v7.39 (read01 json.c) — a `timestamptz` in JSON is ISO 8601 WITH the
+    // session-zone offset ("2024-03-09T14:05:06+00:00"), unlike plain
+    // timestamp, and its instant is spelled IN that zone. The runtime value
+    // carries no tz tag — `Value` has `Timestamp(i64)` and no timestamptz
+    // variant — so the argument's static type is the only witness, and it
+    // is only in reach here, where the argument ASTs are.
+    //
+    // v7.40.9 — every builder, not only the one-argument scalar.
+    //
+    // `to_jsonb(ts)` was right and `row_to_json(t)`, `to_jsonb(t)` and
+    // `json_build_object('ts', ts)` all rendered a bare
+    // "2026-01-01T00:00:00": no offset, and not converted to the session
+    // zone either. Reported by a customer whose CLI dumps and exports every
+    // table with `SELECT row_to_json(t) FROM <table> t` — so a dump taken
+    // from SPG carried no timezone on any timestamp, and one taken from
+    // PostgreSQL did. Measured against PG 18.6 on the same row, session
+    // zone `Asia/Tokyo`: PG says "2026-01-01T09:00:00+09:00" for all four
+    // forms; SPG said "2026-01-01T00:00:00" for three of them.
+    //
+    // Rewriting the VALUE rather than special-casing each builder: the JSON
+    // encoder passes `Value::Json` through verbatim (PG's own identity for
+    // json input), so one rewrite ahead of the dispatch reaches the scalar,
+    // the composite and the object builder alike, and any builder added
+    // later.
+    if is_json_builder(name) {
+        let keys_are_odd = name.len() > 5 && name.to_ascii_lowercase().ends_with("build_object");
+        for (i, v) in evaluated.iter_mut().enumerate() {
+            // `json_build_object(k, v, k, v, …)`: a key is rendered as
+            // TEXT by PG, not as JSON, so only the values are rewritten.
+            if keys_are_odd && i % 2 == 0 {
+                continue;
+            }
+            match v {
+                Value::Timestamp(t) => {
+                    if args.get(i).is_some_and(|a| {
+                        crate::describe::describe_expr(a, ctx.columns)
+                            .is_some_and(|sh| matches!(sh.ty, spg_storage::DataType::Timestamptz))
+                    }) {
+                        let txt = json_timestamptz_text(*t, ctx);
+                        *v = Value::json(alloc::format!("\"{txt}\""));
+                    }
+                }
+                // A whole-row reference arrives as a composite whose
+                // fields carry names and values but no types. The row's
+                // own schema is in the context, so the field name is the
+                // way back to the type — and only when the name is
+                // unambiguous, because a joined schema can hold two
+                // columns called `ts` and picking either would be a
+                // guess.
+                Value::Composite(fields) => {
+                    for (fname, fv) in fields.iter_mut() {
+                        let Value::Timestamp(t) = fv else { continue };
+                        let mut matches = ctx.columns.iter().filter(|c| &c.name == fname);
+                        let (Some(c), None) = (matches.next(), matches.next()) else {
+                            continue;
+                        };
+                        if matches!(c.ty, spg_storage::DataType::Timestamptz) {
+                            let txt = json_timestamptz_text(*t, ctx);
+                            *fv = Value::json(alloc::format!("\"{txt}\""));
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-        let (sign, omag) = if off < 0 { ('-', -off) } else { ('+', off) };
-        let (oh, om) = (omag / 3_600_000_000, (omag / 60_000_000) % 60);
-        let _ = core::fmt::Write::write_fmt(&mut txt, format_args!("{sign}{oh:02}:{om:02}"));
-        return Ok(Value::json(alloc::format!("\"{txt}\"")));
     }
     // v7.39 (enum order knife) — greatest/least over enum-typed arguments
     // pick by member order, not label text (PG). The witness needs the arg
@@ -6830,6 +6865,48 @@ fn split_trailing_zone_name(txt: &str, order: format::DateOrder) -> Option<(i64,
     }
     let wall = format::parse_timestamp_literal_wall_ordered(head, order)?;
     Some((wall, tail))
+}
+
+/// The builders that spell a value AS JSON, and therefore owe a
+/// `timestamptz` its offset. Aggregates (`json_agg` and friends) build
+/// their arrays elsewhere and are not reached from here.
+fn is_json_builder(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "to_json"
+            | "to_jsonb"
+            | "row_to_json"
+            | "row_to_jsonb"
+            | "json_build_object"
+            | "jsonb_build_object"
+            | "json_build_array"
+            | "jsonb_build_array"
+    )
+}
+
+/// PG's JSON spelling of a `timestamptz`: ISO 8601 in the SESSION zone,
+/// with that zone's offset. Measured against PG 18.6 — the same instant
+/// is "2026-01-01T00:00:00+00:00" under `UTC` and
+/// "2026-01-01T09:00:00+09:00" under `Asia/Tokyo`.
+fn json_timestamptz_text(us: i64, ctx: &EvalContext<'_>) -> alloc::string::String {
+    let off = ctx.session_tz_offset_at(us);
+    let local = us + off;
+    let days = local.div_euclid(86_400_000_000);
+    let day_us = local.rem_euclid(86_400_000_000);
+    let (y, mo, d) = civil_from_days(i32::try_from(days).unwrap_or(0));
+    let secs = day_us / 1_000_000;
+    let frac = day_us % 1_000_000;
+    let (hh, mi, ss) = (secs / 3600, (secs / 60) % 60, secs % 60);
+    let mut txt = alloc::format!("{y:04}-{mo:02}-{d:02}T{hh:02}:{mi:02}:{ss:02}");
+    if frac != 0 {
+        let f = alloc::format!("{frac:06}");
+        txt.push('.');
+        txt.push_str(f.trim_end_matches('0'));
+    }
+    let (sign, omag) = if off < 0 { ('-', -off) } else { ('+', off) };
+    let (oh, om) = (omag / 3_600_000_000, (omag / 60_000_000) % 60);
+    let _ = core::fmt::Write::write_fmt(&mut txt, format_args!("{sign}{oh:02}:{om:02}"));
+    txt
 }
 
 #[cfg(test)]
