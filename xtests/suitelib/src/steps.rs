@@ -519,7 +519,18 @@ pins-current: slowest —    11s wall      2.9s in-test  spg-engine::e2e";
 /// # Errors
 /// Missing PG leg, server failure, or `losses>0` — the verdict line is
 /// quoted either way.
-pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
+/// `with_shipped_panel` — run the third, REPORTING panel too.
+///
+/// v7.40.8 — false in `prerelease`, true in `full`. Timed from the
+/// panels file's own clock it is about 300 s of a ~750 s step, and it
+/// renders no verdict: its `losses` is read by nobody, by design (the
+/// bar for it has not been chosen from a distribution yet). A gate step
+/// that cannot fail is a gate step that only costs, and the tier this
+/// repository releases from is the one that pays it.
+///
+/// It still runs nightly, where the numbers it produces are wanted and
+/// nothing is waiting on them.
+pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<String, String> {
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
         // v7.39.12 — the workspace selection, so this shares artefacts with
@@ -671,30 +682,34 @@ pub fn perf_sweep(root: &Path, runid: &str) -> Result<String, String> {
         // `ALLOW_COLLATION_MISMATCH` here: the two legs are supposed to
         // agree, and the script's own check should say so if they stop.
         let shipped_uri = format!("postgres://bench:bench@{host}:25432/bench");
-        let shipped = sh(
-            root,
-            &format!(
-                // v7.40.4 — N=3 on the panel that REPORTS.
-                //
-                // Timed from the panels file's own clock, the three
-                // panels cost about the same: roughly five, three and
-                // five minutes of a 753 s step, which is 31% of a
-                // 2,390 s tier. This one is 300 s of it and renders no
-                // verdict — `losses` here is read by nobody, by
-                // design, because the bar for it has not been chosen
-                // from a distribution yet.
-                //
-                // N is the sample count behind each cell's RANGE, and a
-                // range is how the other panels refuse to call an
-                // unresolved difference. A panel that decides nothing
-                // does not need five samples to decide it. Three is
-                // what `BENCH_PROTOCOL.md` rule 4 asks of a panel that
-                // DOES judge, so this stays at that floor rather than
-                // below it, and the saving is the two it does not need.
-                "PSQL='{psql}' PG_URI='{shipped_uri}' SPG_URI='{locale_uri}' SIZES=400000 N=3 \
+        let shipped = if !with_shipped_panel {
+            Ok("SKIPPED (prerelease; this panel renders no verdict — `full` runs it)".to_string())
+        } else {
+            sh(
+                root,
+                &format!(
+                    // v7.40.4 — N=3 on the panel that REPORTS.
+                    //
+                    // Timed from the panels file's own clock, the three
+                    // panels cost about the same: roughly five, three and
+                    // five minutes of a 753 s step, which is 31% of a
+                    // 2,390 s tier. This one is 300 s of it and renders no
+                    // verdict — `losses` here is read by nobody, by
+                    // design, because the bar for it has not been chosen
+                    // from a distribution yet.
+                    //
+                    // N is the sample count behind each cell's RANGE, and a
+                    // range is how the other panels refuse to call an
+                    // unresolved difference. A panel that decides nothing
+                    // does not need five samples to decide it. Three is
+                    // what `BENCH_PROTOCOL.md` rule 4 asks of a panel that
+                    // DOES judge, so this stays at that floor rather than
+                    // below it, and the saving is the two it does not need.
+                    "PSQL='{psql}' PG_URI='{shipped_uri}' SPG_URI='{locale_uri}' SIZES=400000 N=3 \
                  EXPECT_SPG_COLLATE=en_US.utf8 bash scripts/perf-endpoint-sweep.sh"
-            ),
-        );
+                ),
+            )
+        };
         roster2.reap_all();
         let _ = std::fs::remove_dir_all(&tmp2);
         // Both verdicts travel; the caller grades them separately.

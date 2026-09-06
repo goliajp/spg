@@ -27,7 +27,7 @@ fn main() {
                 "pins-current" => suitelib::steps::pins_current(root),
                 "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
                 "ironrules" => suitelib::steps::ironrules_full(root, &runid),
-                "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
+                "perf-sweep" => suitelib::steps::perf_sweep(root, &runid, true),
                 "perm-matrix" => suitelib::steps::perm_matrix(root),
                 "pgdump-roundtrip" => suitelib::steps::pgdump_roundtrip(root, &runid),
                 "oracle-three" => suitelib::steps::oracle_three(root),
@@ -548,14 +548,6 @@ fn main() {
                         batch.push(tier_steps[idx + batch.len()]);
                     }
                     if batch.len() > 1 {
-                        if let Some(bad) = batch.iter().find(|b| b.implementation != "external") {
-                            eprintln!(
-                                "suite-run: step {} is internal — parallel groups take external steps only",
-                                bad.name
-                            );
-                            drop(_lock);
-                            std::process::exit(2);
-                        }
                         println!(
                             "  ∥ group {:?}: {:?}",
                             s.group.as_deref().unwrap_or(""),
@@ -574,17 +566,31 @@ fn main() {
                                 // file order with the rest.
                                 .filter(|b| !carried.contains_key(&b.name))
                                 .map(|b| {
-                                    let cmd = b.cmd.clone().expect("checked by parse");
+                                    // v7.40.8 — an internal member runs its
+                                    // own Rust step on the thread. The guard
+                                    // that refused them cost `oracle-three`
+                                    // and `ironrules` their place in the one
+                                    // window where they are free: 115 s
+                                    // serial against a group whose longest
+                                    // member is 135 s.
+                                    let cmd = b.cmd.clone();
+                                    let internal = b.implementation != "external";
                                     let name = b.name.clone();
+                                    let iname = b.name.clone();
                                     let budget = b.budget_s.map(std::time::Duration::from_secs);
+                                    let graph = &graph;
+                                    let runid = &runid;
                                     scope.spawn(move || {
                                         let t0 = std::time::Instant::now();
-                                        let ok = std::process::Command::new("sh")
-                                            .arg("-c")
-                                            .arg(&cmd)
-                                            .status()
-                                            .map(|st| st.success())
-                                            .unwrap_or(false);
+                                        let out = if internal {
+                                            run_internal(&iname, root, graph, runid, tier)
+                                        } else {
+                                            run_external(cmd.as_deref().expect("checked by parse"))
+                                        };
+                                        let ok = out.is_ok();
+                                        if let Err(e) = &out {
+                                            eprintln!("  {iname}: {e}");
+                                        }
                                         (name, budget, t0.elapsed(), ok)
                                     })
                                 })
@@ -655,48 +661,8 @@ fn main() {
                 let budget = budget_secs.map(std::time::Duration::from_secs);
                 let name = s.name.clone();
                 let outcome = ledger.step(&name, budget, || match s.implementation.as_str() {
-                    "external" => {
-                        let cmd = s.cmd.clone().expect("checked by parse");
-                        let st = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(&cmd)
-                            .status()
-                            .map_err(|e| format!("spawn: {e}"))?;
-                        if st.success() {
-                            Ok(String::new())
-                        } else {
-                            Err(format!("`{cmd}` exited {st}"))
-                        }
-                    }
-                    _ => match s.name.as_str() {
-                        "clippy-changed" => suitelib::steps::clippy_changed(root, &graph),
-                        "unit-changed" => suitelib::steps::unit_changed(root, &graph),
-                        "pins-current" => suitelib::steps::pins_current(root),
-                        "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, &runid),
-                        // S1.3 — smoke plus the previous release's data
-                        // directory opened by the current binary.
-                        "ironrules" => suitelib::steps::ironrules_full(root, &runid),
-                        "perf-sweep" => suitelib::steps::perf_sweep(root, &runid),
-                        // full tier (CP3) — the two 元机制 carriers.
-                        "perm-matrix" => suitelib::steps::perm_matrix(root),
-                        "pgdump-roundtrip" => suitelib::steps::pgdump_roundtrip(root, &runid),
-                        "oracle-three" => suitelib::steps::oracle_three(root),
-                        // S4.1 — isolation battery.
-                        "isolation" => suitelib::isolib::run_all(
-                            root,
-                            std::path::Path::new("xtests/isolation"),
-                            false,
-                        ),
-                        // S4.2 — generative differ.
-                        "generative" => suitelib::steps::generative(root, &runid),
-                        // S4.3 — SQL:2016 coverage ledger check.
-                        "sql2016" => suitelib::steps::sql2016(root),
-                        // S5.1 — pgbench tpcb-like scoreboard.
-                        "pgbench" => suitelib::steps::pgbench(root, &runid),
-                        // S5.2 — sysbench MySQL-dialect leg.
-                        "sysbench" => suitelib::steps::sysbench(root, &runid),
-                        other => Err(format!("internal step `{other}` not wired yet")),
-                    },
+                    "external" => run_external(s.cmd.as_deref().expect("checked by parse")),
+                    _ => run_internal(&s.name, root, &graph, &runid, tier),
                 });
                 // S1.5 — generated-artifact discipline: an ordinary
                 // run restores the tracked harness reports the biz
@@ -944,6 +910,62 @@ fn main() {
             eprintln!("suite-run: unknown argument '{other}'\n\n{}", usage());
             std::process::exit(2);
         }
+    }
+}
+
+/// Run one EXTERNAL step: its shell command, its exit status.
+fn run_external(cmd: &str) -> Result<String, String> {
+    let st = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .status()
+        .map_err(|e| format!("spawn: {e}"))?;
+    if st.success() {
+        Ok(String::new())
+    } else {
+        Err(format!("`{cmd}` exited {st}"))
+    }
+}
+
+/// Run one INTERNAL step by name.
+///
+/// v7.40.8 — one place, because the parallel-group path needs it too.
+/// It used to live inline in the serial loop, which is why groups were
+/// restricted to external steps and why `ironrules` and `oracle-three`
+/// sat outside the one window where they cost nothing.
+fn run_internal(
+    name: &str,
+    root: &std::path::Path,
+    graph: &suitelib::crategraph::CrateGraph,
+    runid: &str,
+    tier: &str,
+) -> Result<String, String> {
+    match name {
+        "clippy-changed" => suitelib::steps::clippy_changed(root, graph),
+        "unit-changed" => suitelib::steps::unit_changed(root, graph),
+        "pins-current" => suitelib::steps::pins_current(root),
+        "ironrule-smoke" => suitelib::steps::ironrule_smoke(root, runid),
+        // S1.3 — smoke plus the previous release's data directory
+        // opened by the current binary.
+        "ironrules" => suitelib::steps::ironrules_full(root, runid),
+        "perf-sweep" => suitelib::steps::perf_sweep(root, runid, tier == "full"),
+        // full tier (CP3) — the two 元机制 carriers.
+        "perm-matrix" => suitelib::steps::perm_matrix(root),
+        "pgdump-roundtrip" => suitelib::steps::pgdump_roundtrip(root, runid),
+        "oracle-three" => suitelib::steps::oracle_three(root),
+        // S4.1 — isolation battery.
+        "isolation" => {
+            suitelib::isolib::run_all(root, std::path::Path::new("xtests/isolation"), false)
+        }
+        // S4.2 — generative differ.
+        "generative" => suitelib::steps::generative(root, runid),
+        // S4.3 — SQL:2016 coverage ledger check.
+        "sql2016" => suitelib::steps::sql2016(root),
+        // S5.1 — pgbench tpcb-like scoreboard.
+        "pgbench" => suitelib::steps::pgbench(root, runid),
+        // S5.2 — sysbench MySQL-dialect leg.
+        "sysbench" => suitelib::steps::sysbench(root, runid),
+        other => Err(format!("internal step `{other}` not wired yet")),
     }
 }
 

@@ -161,6 +161,13 @@ tier = "prerelease"
 name = "e2e"
 impl = "external"
 cmd = "scripts/gate.sh e2e"
+# v7.40.8 — these four run CONCURRENTLY (`group`), because they were
+# 708 s of the prerelease tier's 1,968 s and none of them needs another
+# to have finished. Measured medians over the last ten runs: e2e 142 s,
+# gates 273 s, biz 275 s, dogfood 18 s. `perf-sweep` is deliberately NOT
+# in the group: it is the timing gate and it needs the machine to
+# itself.
+group = "after-build"
 # observed 94 / 205 / 360 (min/med/max) over the last ten prerelease
 # runs recorded in target/suite. The line here used to read
 # "297 / 320 / 494 (n=6)" beside a budget of 480 -- 320 x 1.5, the rule
@@ -175,6 +182,7 @@ tier = "prerelease"
 name = "gates"
 impl = "external"
 cmd = "scripts/gate.sh gates"
+group = "after-build"
 # observed 665 / 696 / 743 (n=6) -- was 480, over on every run
 budget_s = 1080
 
@@ -189,7 +197,7 @@ cmd = "scripts/gate.sh biz"
 budget_s = 540
 # S4.6 — biz (embedded corpus + compat, no suite ports) and dogfood
 # (embedded replay, no ports) overlap safely; ~real CPU overlap.
-group = "corpus"
+group = "after-build"
 
 [[step]]
 tier = "prerelease"
@@ -198,25 +206,7 @@ impl = "external"
 cmd = "scripts/gate.sh dogfood"
 # observed 110 / 158 / 177 (n=6)
 budget_s = 270
-group = "corpus"
-
-[[step]]
-tier = "prerelease"
-name = "perf-sweep"
-impl = "internal"
-# observed 138 / 148 / 182 (n=4) with one SPG leg; the third control leg
-# costs ~34s. v7.38.19 added a SECOND panel -- a locale-collation leg
-# measured against the C leg, at the largest row count only -- because
-# all sixty-four cells of the first panel run under `C` and could not
-# see a factor-of-twenty-six regression that shipped in v7.38.18.
-# v7.38.24 -- that re-calibration, from measurement at last. The three
-# panels have now been recorded ten times: 350 / 376 / 397 / 359 / 367 /
-# 427 / 360 / 663 / 585 / 634 seconds, in that order (the third of those
-# is a run the step failed, timed anyway). The step really did get
-# longer where the third panel landed: the last three mean 627s against
-# 377s for the seven before them, and 600 sat under two of the three.
-# 663 x 1.5.
-budget_s = 1000
+group = "after-build"
 
 [[step]]
 tier = "prerelease"
@@ -226,6 +216,9 @@ impl = "internal"
 budget_s = 60
 
 # ── full ──────────────────────────────────────────────────────────────
+# v7.40.8 — in the concurrent group: 1 s and 114 s against a window
+# whose longest member is 135 s, so they cost nothing there.
+group = "after-build"
 
 [[step]]
 tier = "full"
@@ -287,6 +280,27 @@ name = "oracle-three"
 impl = "internal"
 # observed 101 / 104 / 108 (n=4) -- was 420
 budget_s = 180
+# v7.40.8 — in the concurrent group: 1 s and 114 s against a window
+# whose longest member is 135 s, so they cost nothing there.
+group = "after-build"
+
+[[step]]
+tier = "prerelease"
+name = "perf-sweep"
+impl = "internal"
+# observed 138 / 148 / 182 (n=4) with one SPG leg; the third control leg
+# costs ~34s. v7.38.19 added a SECOND panel -- a locale-collation leg
+# measured against the C leg, at the largest row count only -- because
+# all sixty-four cells of the first panel run under `C` and could not
+# see a factor-of-twenty-six regression that shipped in v7.38.18.
+# v7.38.24 -- that re-calibration, from measurement at last. The three
+# panels have now been recorded ten times: 350 / 376 / 397 / 359 / 367 /
+# 427 / 360 / 663 / 585 / 634 seconds, in that order (the third of those
+# is a run the step failed, timed anyway). The step really did get
+# longer where the third panel landed: the last three mean 627s against
+# 377s for the seven before them, and 600 sat under two of the three.
+# 663 x 1.5.
+budget_s = 1000
 
 [[step]]
 tier = "full"
