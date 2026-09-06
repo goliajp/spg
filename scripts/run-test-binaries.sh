@@ -27,15 +27,22 @@ cd "$(dirname "$0")/.."
 label="${1:?usage: run-test-binaries.sh <label> [cargo args...]}"
 shift
 
-list=$(mktemp -t spg-testbins)
-times=$(mktemp -t spg-testtimes)
+# v7.40.10 — `XXXXXX` in the template, because GNU coreutils requires it.
+#
+# macOS `mktemp -t foo` invents the suffix; GNU `mktemp -t foo` answers
+# `mktemp: too few X's in template 'foo'` and returns an empty path, and
+# the script then writes to "" and reports `the build failed` for a
+# build that never ran. Measured on a Linux CI runner the first time
+# this script was called from there.
+list=$(mktemp -t spg-testbins.XXXXXX)
+times=$(mktemp -t spg-testtimes.XXXXXX)
 
 # `--no-run` builds; the JSON stream names what it built and where the
 # package lives, which is the working directory cargo would have used.
 # v7.39.12 — the build's stderr is kept, because "the build failed" with
 # the reason discarded is a message nobody can act on. It cost one
 # release-gate run to read as an unexplained failure.
-build_err=$(mktemp -t spg-testbuild)
+build_err=$(mktemp -t spg-testbuild.XXXXXX)
 trap 'rm -f "$list" "$times" "$build_err"' EXIT
 if ! cargo test -q --locked "$@" --no-run --message-format=json 2>"$build_err" \
     | python3 -c '

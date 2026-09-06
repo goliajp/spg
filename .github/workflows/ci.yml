@@ -83,55 +83,42 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
-      - name: Build the release binaries and harnesses once
-        # v7.40.10 — the harnesses too, and over the WORKSPACE.
+      - name: Build the release binaries once
+        # v7.40.10 — this step was changed to build every test harness
+        # in the workspace, on the reasoning that fixed the LOCAL gate
+        # the same day, and the runner refuted it: 219 s became 2,057 s.
         #
-        # This built three binaries, and every step below it then ran
-        # `cargo test --release -p <one crate> --test <one>`. Cargo
-        # resolves features over the selected members, so a single-member
-        # selection after a workspace build is a different graph and
-        # rebuilds: measured on this runner, `prod_ready` 212 s and the
-        # eight-crate `perf_gate` loop 585 s, against 219 s for the build
-        # they were all supposed to share. 797 s of the job's 1,153 s was
-        # compiling what this step is named for.
-        #
-        # Same defect the local release gate had until this morning, and
-        # the same fix: one selection, named once, and nothing downstream
-        # compiles.
-        run: |
-          cargo build --release --locked --workspace \
-            --exclude spg-bench-competitor
-          cargo test --release --locked --workspace \
-            --exclude spg-bench-competitor --tests --no-run
+        # The local gate runs EVERY harness (e2e, gates, biz, dogfood),
+        # so building them once up front is strictly cheaper there. This
+        # job runs four of them. Building the workspace's test targets to
+        # run four is more work, not less, and the measurement says so.
+        run: cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
       - name: prod_ready gate
         # Asserts every [machine] row in PROD_READY.md is backed by a
         # row_X_Y_* test. Failure means PROD_READY.md is over-claiming.
-        #
-        # v7.40.10 — a filter over the harnesses already built, not a
-        # single-member `cargo test` that resolves features again and
-        # rebuilds. It measured 212 s doing that.
-        run: |
-          RUN_FILTER=prod_ready scripts/run-test-binaries.sh "ci: prod_ready" \
-            --release --workspace --exclude spg-bench-competitor --tests
+        run: cargo test --release -p spg-server --test prod_ready --locked
       - name: SLO smoke
         # Ceilings are deliberately loose (~2-3x baseline) so
         # shared-runner noise does not false-alarm.
-        run: |
-          RUN_FILTER=slo_smoke scripts/run-test-binaries.sh "ci: slo_smoke" \
-            --release --workspace --exclude spg-bench-competitor --tests
+        run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
       - name: perf_gate (every crate)
         # Each crate's perf_gate is `#![cfg(not(debug_assertions))]`,
         # so the debug `test` job above builds it empty; this is the
         # real gate.
         #
-        # v7.40.10 — ONE selection over the harnesses the step above
-        # built, not eight. The loop was there so a failure names the
-        # crate; the runner names the harness in its own output, which
-        # answers the same question without paying eight feature
-        # resolutions for it. Measured: 585 s for the loop.
+        # v7.40.10 — ONE invocation naming all eight crates, not eight.
+        # Cargo resolves features over the SELECTED members, so eight
+        # single-member selections are eight resolutions of the shared
+        # dependency graph; the harnesses themselves are the same work
+        # either way. Measured before: 585 s for the loop.
+        #
+        # Cargo names the failing crate in its own output, which is what
+        # the loop's `::group::` was for.
         run: |
-          RUN_FILTER=perf_gate scripts/run-test-binaries.sh "ci: perf_gate" \
-            --release --workspace --exclude spg-bench-competitor --tests
+          cargo test --release --locked \
+            -p spg-audit -p spg-crypto -p spg-engine -p spg-sql \
+            -p spg-storage -p spg-wire -p spgctl -p spg-server \
+            --test perf_gate -- --test-threads=1 --nocapture
       - name: biz (sqllogictest)
         run: cargo run -p sqllogictest --release --locked
       - name: Assemble candidate image
