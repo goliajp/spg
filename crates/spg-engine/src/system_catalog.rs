@@ -10880,6 +10880,23 @@ fn render_constraint_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> allo
     )
 }
 
+/// v7.40.11 — the `CREATE [UNIQUE] INDEX …` for ONE enumerated catalog
+/// index, whichever of the two renderers it needs.
+///
+/// `pg_indexes.indexdef` held this choice inline and `pg_get_indexdef`
+/// had no way to reach it: the function resolved an OID by REPLAYING
+/// `catalog_indexes`' counting rule over a different table list, so it
+/// answered a neighbouring table's index. Both now enumerate once and
+/// render from the entry.
+pub(crate) fn catalog_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> alloc::string::String {
+    if ci.is_storage
+        && let Some(idx) = t.indices().iter().find(|i| i.name == ci.name)
+    {
+        return render_indexdef(t, idx, &ci.table);
+    }
+    render_constraint_indexdef(t, ci)
+}
+
 pub(crate) fn render_indexdef(
     t: &spg_storage::Table,
     idx: &spg_storage::Index,
@@ -11092,14 +11109,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         };
         {
             let tname = ci.table.clone();
-            let indexdef = if ci.is_storage {
-                t.indices().iter().find(|i| i.name == ci.name).map_or_else(
-                    || render_constraint_indexdef(t, &ci),
-                    |i| render_indexdef(t, i, &tname),
-                )
-            } else {
-                render_constraint_indexdef(t, &ci)
-            };
+            let indexdef = catalog_indexdef(t, &ci);
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
                 Value::text(tname.clone()),

@@ -2256,6 +2256,12 @@ impl Parser {
             Token::Values => {
                 self.advance(); // VALUES
                 let mut head = self.parse_values_rows_body()?;
+                // v7.40.11 — and it may HEAD a set-operation chain:
+                // `VALUES (1) UNION ALL SELECT 2`. The CTE-body form has
+                // done this since the recursive-seed work; the top-level
+                // statement went straight to the tail and reported
+                // `syntax error at or near "UNION"`.
+                self.parse_setop_chain_into(&mut head)?;
                 self.parse_select_tail_into(&mut head)?;
                 Ok(Statement::Select(head))
             }
@@ -13676,6 +13682,21 @@ impl Parser {
     }
 
     fn parse_bare_select(&mut self) -> Result<SelectStatement, ParseError> {
+        // v7.40.11 — an UNPARENTHESISED `VALUES` list is a query block
+        // too, so it can be the PEER of a set operation:
+        //
+        //   SELECT 1 UNION ALL VALUES (2)
+        //
+        // The parenthesised form has been a peer since v7.37 D.20 and
+        // the CTE-body form since 17.6; these two unbracketed positions
+        // were the pair nobody wrote a case for. Modern psql builds its
+        // describe queries with `UNION ALL VALUES`, so every backslash
+        // command — `\d`, `\dt`, `\di` — failed with a syntax error
+        // pointing into a query the user did not write.
+        if matches!(self.peek(), Token::Values) {
+            self.advance(); // VALUES
+            return self.parse_values_rows_body();
+        }
         // v7.37.17 (17.6 siblings) — parenthesized set-operation
         // group: `( <select chain> )` usable anywhere a query block
         // is (head or peer of an outer chain). The group's own
