@@ -3015,6 +3015,23 @@ impl Parser {
                     // so a driver that issues `SHOW spam_setting`
                     // gets a clear runtime error instead of a
                     // confusing "unknown SHOW target".
+                    // v7.40.11 — PG's own spelling of the isolation
+                    // probe, which is what every driver sends and what
+                    // its own documentation writes. `transaction` is a
+                    // bare ident here, so the target matched and the two
+                    // words after it did not: the statement ended at
+                    // `transaction` and the parser reported
+                    // `syntax error at or near "ISOLATION"`.
+                    "transaction"
+                        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("isolation"))
+                            && matches!(self.tokens.get(self.pos + 1), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("level")) =>
+                    {
+                        self.advance(); // ISOLATION
+                        self.advance(); // LEVEL
+                        Ok(Statement::ShowParameter(
+                            "transaction_isolation".to_string(),
+                        ))
+                    }
                     other => {
                         // v7.38 (read01 P3.20) — a custom namespaced GUC
                         // (`SHOW app.foo`) arrives as `app` + `.` + `foo`;

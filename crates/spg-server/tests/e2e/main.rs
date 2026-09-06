@@ -104,6 +104,7 @@ mod e2e_chaos_logical;
     unused_variables
 )]
 mod e2e_chaos_netsplit;
+mod e2e_checkpoint_wire_v7411;
 mod e2e_collation_survives_restart;
 #[allow(unsafe_code)]
 mod e2e_compression_metrics;
@@ -545,6 +546,7 @@ mod e2e_tx_single_fsync_round177;
 mod e2e_unknown_column_empty_v7392;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_update_delete;
+mod e2e_utility_wire_shape_v7411;
 mod e2e_vector;
 #[allow(
     clippy::cast_lossless,

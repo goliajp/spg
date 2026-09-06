@@ -10079,6 +10079,63 @@ pub(crate) fn synth_pg_matviews(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// annotated (not inferred) because SPG stores memory / duration settings
 /// in human form ("4MB") where inference would read "string" — PG
 /// classifies work_mem as integer.
+/// v7.40.11 — the SHAPE `SHOW <name>` answers with, read by the
+/// executor and by Describe.
+///
+/// Describe answered `Vec::new()` for every statement that is not a
+/// SELECT or a DML with RETURNING, and Execute then emitted DataRows
+/// for it. That is a protocol violation with a name — psql prints
+/// `server sent data ("D" message) without prior row description
+/// ("T" message)` — and sqlx surfaces it as a row with zero columns.
+/// `SHOW TimeZone` is how a pooled client reads back the zone it asked
+/// for, so it was the first thing the reporter tried and could not run.
+///
+/// The column name is the GUC's CANONICAL spelling. PG answers a column
+/// called `TimeZone` for `SHOW timezone`, `SHOW TimeZone` and
+/// `SHOW TIMEZONE` alike; SPG lower-cased whatever arrived, so a client
+/// selecting that column BY NAME got nothing.
+pub(crate) fn show_parameter_columns(name: &str) -> Vec<ColumnSchema> {
+    if name.eq_ignore_ascii_case("all") {
+        return alloc::vec![
+            ColumnSchema::new("name", DataType::Text, false),
+            ColumnSchema::new("setting", DataType::Text, false),
+            ColumnSchema::new("description", DataType::Text, false),
+        ];
+    }
+    // MySQL's diagnostics-area forms, which carry their own headings.
+    if name.eq_ignore_ascii_case("warnings") {
+        return alloc::vec![
+            ColumnSchema::new("Level", DataType::Text, false),
+            ColumnSchema::new("Code", DataType::Int, false),
+            ColumnSchema::new("Message", DataType::Text, false),
+        ];
+    }
+    if name.eq_ignore_ascii_case("count(*) warnings") {
+        return alloc::vec![ColumnSchema::new(
+            "@@session.warning_count",
+            DataType::BigInt,
+            false
+        )];
+    }
+    alloc::vec![ColumnSchema::new(
+        canonical_guc_name(name),
+        DataType::Text,
+        false
+    )]
+}
+
+/// The spelling PostgreSQL prints for this parameter — its own, when
+/// the inventory knows it; otherwise what the caller wrote.
+pub(crate) fn canonical_guc_name(name: &str) -> alloc::string::String {
+    canonical_gucs()
+        .iter()
+        .find(|(n, ..)| n.eq_ignore_ascii_case(name))
+        .map_or_else(
+            || alloc::string::String::from(name),
+            |(n, ..)| alloc::string::String::from(*n),
+        )
+}
+
 pub(crate) fn canonical_gucs() -> &'static [(
     &'static str,
     &'static str,
