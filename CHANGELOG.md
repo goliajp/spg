@@ -11,6 +11,133 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
+## [7.40.10] — 2026-09-06
+
+### Fixed — a single-column `CREATE UNIQUE INDEX` on text did not enforce
+
+Reported against 7.40.9 as the most severe class in the
+correspondence: **silent, persisted, duplicated rows**, with
+`indisunique` reading `true` throughout.
+
+Boundary, measured on the published image under the collation SPG
+ships (`en_US.utf8`), two duplicates inserted by two separate
+statements:
+
+```text
+  int / date, single column                 rejected
+  text COLLATE "C" column                   rejected
+  index declared (t COLLATE "C")            rejected
+  text, multi-column                        rejected
+  UNIQUE column constraint                  rejected
+  CREATE UNIQUE INDEX on a text column      ACCEPTED — two rows
+  the same on varchar(32)                   ACCEPTED — two rows
+```
+
+Two more readings placed it exactly: creating the index over existing
+duplicates is refused, and two duplicates inside ONE statement are
+refused. So the flag is set and the batch-internal check works; only
+the probe against rows already committed fails.
+
+That probe asks the index's B-tree. For a locale-collated column the
+tree is keyed by ICU sort keys the engine produces, so a probe built
+from the raw value asks a question those keys cannot answer, and the
+empty answer reads as "no conflict". The CONSTRAINT path in the same
+file already declines such an index and folds the whole table — which
+is why every constraint spelling enforced and the commonest index
+spelling did not. The sibling site was checked and already carried the
+rule.
+
+The pin declares the shipped collation rather than inheriting one:
+every fixture in the tree runs under `C`, where the tree is keyed by
+bytes and the probe is answerable, so a test taking the default would
+have passed against the defect.
+
+### Fixed — `LIMIT $n` inside a derived table returned every row
+
+Silent, no error. Measured boundary, five rows with `LIMIT $1` bound
+to 2:
+
+```text
+  top level, and with OFFSET, and FOR UPDATE SKIP LOCKED    2 rows
+  inside a CTE / an IN subquery / a scalar subquery         2 rows
+  inside a DERIVED TABLE                                    5 rows
+  inside a LATERAL                                          5 rows
+```
+
+The LIMIT/OFFSET resolution recursed into CTE bodies and UNION peers,
+and a FROM item's subquery is neither. The expression walk does descend
+there — which is why `WHERE x = $1` inside one always worked — but a
+`LimitExpr` is not an `Expr` and was never on that route.
+
+### Fixed — `now()` did not exist inside an `INSERT … SELECT`
+
+```text
+  INSERT INTO d SELECT g, now() FROM src
+    ERROR:  function now() does not exist
+```
+
+The clock rewrite walked an INSERT's rows and its `ON CONFLICT` clause
+and not its SELECT source. The keyword spelling named the shape: the
+statement says `current_timestamp` and the error said
+`current_timestamp()`, a call the rewrite had made and then not folded.
+
+### Fixed — one traversal for a FROM item's slots, and three passes that each knew a different subset
+
+A `TableRef` carries seven slots that produce rows. The question "what
+is this FROM item" is asked in **fifty-six places** across the engine
+and exactly ONE of them listed every field; the rest were missing
+between one and five each, and the gaps were reachable:
+
+```text
+  the parameter walk knew one     unnest($1) — a customer's live 500
+  describe knew two              generate_series — a protocol error
+  the streaming executor knew four
+    SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)
+      ERROR:  relation "jsonb_each_text" does not exist
+```
+
+That last one reached only the wire: `count(*)` over the same item
+answered (the aggregate gate sends it to the materialising executor),
+the simple query protocol answered, and all three of the embedded
+engine's own entry points answered. So it was invisible from every
+direction except a driver that prepares statements.
+
+`TableRef::kind()` returns a `FromItemKind`, written beside the type as
+a total destructure with no `..`, and every consumer that must know the
+difference matches on it with no wildcard arm — a slot added to the
+type, or a kind added to the enum, is a **compile error** at each of
+them rather than a defect at whichever one the new shape reaches first.
+`try_for_each_slot_mut` is the same guarantee for the walks.
+`describe` gained the four arms it was missing, with names and counts
+measured against PostgreSQL 18.6.
+
+A wire test drives every FROM-item kind through a real
+Parse/Bind/Describe/Execute and asserts the client's own invariant — a
+RowDescription before any DataRow — plus the columns and the rows.
+
+### Fixed — a nested `Sort` reported nothing about itself
+
+A `Sort` that is not the top plan node carried no actuals, so a plan
+with a sort inside a derived table showed the sort and said nothing
+about it. It reports the rows it passed through and its loop count now;
+the TIME stays off, because filling it with the only number in reach
+would be a different measurement wearing that node's name. Not under a
+LIMIT, where a top-N sort emits fewer rows than it reads.
+
+### Performance — CI stopped compiling the workspace three times
+
+```text
+  before   release-profile gates   1,153 s
+             of which 797 s was rebuilding, in steps named for running
+```
+
+The build step built three binaries and no test harnesses, so every
+step below it ran a single-member `cargo test`, which resolves features
+again and rebuilds. One selection now, named once, and the steps below
+are filters over what it produced. Same defect the local release gate
+had in 7.40.7, same fix.
+
+
 ## [7.40.9] — 2026-09-06
 
 ### Fixed — a `timestamptz` lost its zone through every JSON builder but the scalar
