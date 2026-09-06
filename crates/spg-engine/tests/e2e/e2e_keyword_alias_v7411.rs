@@ -161,3 +161,59 @@ fn a_clause_keyword_is_still_the_clause() {
         "OFFSET too"
     );
 }
+
+/// v7.40.11 — `<alias>.*` as a function ARGUMENT is the whole row.
+///
+/// Reported against 7.40.9. Every spelling was `syntax error at or near
+/// "*"` while the bare alias — the same value — worked:
+///
+/// ```text
+///                        PG 18.6              SPG 7.40.9
+///   to_jsonb(t.*)     {"a": 1, "b": "x"}   syntax error at or near "*"
+///   row_to_json(t.*)  {"a":1,"b":"x"}      same
+///   pg_column_size(t.*) 30                 same
+///   count(t.*)        1                    same
+///   to_jsonb(t)       {"a": 1, "b": "x"}   {"a": 1, "b": "x"}
+/// ```
+///
+/// The reporter uses the bare-alias form, so it cost them nothing; they
+/// filed it because a user porting SQL would hit it.
+#[test]
+fn a_whole_row_reference_can_be_spelled_with_a_star() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE wr (a INT, b TEXT)").unwrap();
+    eng.execute("INSERT INTO wr VALUES (1, 'x')").unwrap();
+
+    let starred = one(&mut eng, "SELECT to_jsonb(t.*)::text FROM wr t");
+    let bare = one(&mut eng, "SELECT to_jsonb(t)::text FROM wr t");
+    assert_eq!(starred, bare, "the two spellings are one value");
+    assert_eq!(
+        starred,
+        vec![vec![Value::text("{\"a\": 1, \"b\": \"x\"}".to_string())]],
+        "and it is what PG 18.6 answers"
+    );
+
+    assert_eq!(
+        one(&mut eng, "SELECT row_to_json(t.*)::text FROM wr t"),
+        vec![vec![Value::text("{\"a\":1,\"b\":\"x\"}".to_string())]]
+    );
+    assert_eq!(
+        one(&mut eng, "SELECT count(t.*) FROM wr t"),
+        vec![vec![Value::BigInt(1)]]
+    );
+}
+
+/// And a select item's own `t.*` still expands to the column list —
+/// the two meanings live in different positions and must stay apart.
+#[test]
+fn a_select_items_star_still_expands() {
+    let mut eng = Engine::new();
+    eng.execute("CREATE TABLE wr2 (a INT, b TEXT)").unwrap();
+    eng.execute("INSERT INTO wr2 VALUES (1, 'x')").unwrap();
+    let rows = one(&mut eng, "SELECT t.* FROM wr2 t");
+    assert_eq!(
+        rows,
+        vec![vec![Value::Int(1), Value::text("x".to_string())]],
+        "two columns, not one composite"
+    );
+}

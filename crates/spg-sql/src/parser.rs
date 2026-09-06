@@ -22873,6 +22873,34 @@ impl Parser {
         if let Some(res) = self.try_parse_bit_string_literal() {
             return res;
         }
+        // v7.40.11 — `<alias>.*` in an EXPRESSION is the whole row, the
+        // same thing the bare alias is.
+        //
+        // Reported against 7.40.9: `to_jsonb(t.*)`, `row_to_json(t.*)`,
+        // `pg_column_size(t.*)` and `count(t.*)` were all
+        // `syntax error at or near "*"`, while `to_jsonb(t)` — the same
+        // value, differently spelled — worked. Measured on PG 18.6, the
+        // two spellings answer byte-identically:
+        //
+        //   to_jsonb(t.*)   {"a": 1, "b": "x"}
+        //   to_jsonb(t)     {"a": 1, "b": "x"}
+        //
+        // Here rather than in the argument list: nothing else in an
+        // expression position is `ident . *`, and a select item's own
+        // `t.*` is recognised before `parse_expr` is ever called, so
+        // `SELECT t.* FROM t` keeps expanding to the column list.
+        if let Token::Ident(q) | Token::QuotedIdent(q) = self.peek().clone()
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Star))
+        {
+            self.advance();
+            self.advance();
+            self.advance();
+            return Ok(Expr::Column(ColumnName {
+                qualifier: None,
+                name: q,
+            }));
+        }
         let tok_pos = self.pos;
         match self.advance() {
             Token::Integer(n) => Ok(Expr::Literal(Literal::Integer(n))),
