@@ -162,6 +162,7 @@ mod e2e_column_accepts_round643;
 mod e2e_column_acl_round59;
 mod e2e_column_case_v7393;
 mod e2e_column_labels_round505;
+mod e2e_column_size_v7411;
 mod e2e_comment_on_round50;
 mod e2e_common_type_unification;
 mod e2e_compaction;
