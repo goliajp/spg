@@ -226,6 +226,51 @@ else
     fi
 fi
 
+# v7.40.11 — the acceptance panel runs BEFORE anything unrecallable.
+#
+# It used to run last, against the image this script had just pushed,
+# after the crates were already on crates.io. So it could report a tail
+# and never prevent one — and `--fast` skipped it outright.
+#
+# 7.40.10 is why. It shipped a regression: the uniqueness fix in that
+# release taught one site a rule and left its ON CONFLICT arbiter
+# behind, and `round12.upsert_via_unique_index` went 68 of 69 against
+# the PUBLISHED image, minutes after the crates became permanent. The
+# panel found it; it just found it too late to matter.
+#
+# The candidate is built from the binaries the preflight gate already
+# produced, native architecture only — the panel exercises the code, not
+# the architecture, and the multi-arch build below still publishes both.
+# Same shape CI has used since v7.29 (`Dockerfile.ci`), which is where
+# this should have been copied from the first time.
+#
+# `--fast` does not skip this. `--fast` trades the heavy re-run of the
+# battery for the narrow gate; it was never meant to trade away the
+# check that says the artifact works.
+if [[ "$SKIP_DOCKER" == 0 ]]; then
+    banner "candidate image + drop-in acceptance (BEFORE publishing)"
+    # Built from SOURCE through buildx, for the host's own platform,
+    # and loaded locally rather than pushed.
+    #
+    # NOT `Dockerfile.ci`: that one packages binaries the runner already
+    # built, which is right on CI's Linux runner and wrong here — a
+    # `cargo build --release` on this macOS host produces a Mach-O
+    # binary, and a distroless Linux image carrying it answers nothing.
+    # Measured: 0 of 59, with the wire never coming up.
+    #
+    # The layers this produces are the ones the multi-arch push below
+    # reuses for this architecture, so the build is paid once.
+    docker buildx build --load -t "spg-candidate:v${VERSION}" .
+    scripts/dropin-acceptance.sh \
+        --image "spg-candidate:v${VERSION}" \
+        --no-pull \
+        --port 25433 \
+        --report "tmp/reports/dropin-acceptance-candidate-v${VERSION}.md"
+    echo "candidate accepted — publishing is now allowed"
+else
+    banner "candidate acceptance SKIPPED (--skip-docker)"
+fi
+
 if [[ "$SKIP_CRATES" == 0 ]]; then
     banner "crates.io publish × ${#CRATES[@]}"
     # v7.37.7 — crates.io's data-access policy now rejects bare-curl GETs
@@ -294,8 +339,12 @@ else
     banner "docker push SKIPPED (--skip-docker)"
 fi
 
-if [[ "$FAST" == 1 ]]; then
-    banner "drop-in acceptance SKIPPED (--fast)"
+# v7.40.11 — the SECOND run, against what was actually pushed. The
+# candidate above is the gate; this one confirms the published artifact
+# matches it, and runs on `--fast` too, because the thing it checks is
+# the thing a customer pulls.
+if [[ "$SKIP_DOCKER" == 1 ]]; then
+    banner "published-image acceptance SKIPPED (--skip-docker)"
 else
     banner "drop-in acceptance vs ${IMAGE_REPO}:${VERSION}"
     scripts/dropin-acceptance.sh \
@@ -321,13 +370,19 @@ fi
 banner "v${VERSION} published — remaining human steps"
 if [[ "$FAST" == 1 ]]; then
 cat <<EOF
-  This was a --fast release. It is published and unrecallable, and it
-  has had a smoke test rather than a release battery.
+  This was a --fast release: the narrow preflight gate instead of the
+  full battery. The drop-in acceptance panel ran TWICE and is not on
+  this list — once against the candidate before anything was published,
+  which is what allowed the publish, and once against the pushed image.
 
-  [ ] run \`scripts/suite.sh prerelease\` against tag v${VERSION}, and
-      \`scripts/dropin-acceptance.sh --image ${IMAGE_REPO}:${VERSION}\`,
-      as soon as the reason for the hurry is over
-  [ ] if either goes red: cut the next version. Never retag.
+  v7.40.11 — this list used to carry "run the acceptance panel as soon
+  as the reason for the hurry is over", and that sentence is how 7.40.10
+  shipped a regression: the panel found it, minutes after the crates
+  became permanent. A check that a release depends on does not belong on
+  a list of things to do afterwards.
+
+  [ ] run \`scripts/suite.sh prerelease\` against tag v${VERSION} if it
+      was not already green on these exact bytes before the tag
   [ ] mailrs ack note — include the manifest digest:
       $(cat "target/release-digest-v${VERSION}.txt" 2>/dev/null || echo '(docker step skipped)')
   [ ] say in the release note that this build shipped on the fast path,
