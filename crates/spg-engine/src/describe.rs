@@ -262,6 +262,51 @@ fn relation_columns(
         }
         return Some(cols);
     }
+    // v7.40.9 — `generate_series(...)` in FROM, the other slot.
+    //
+    // The v7.38.3 note above fixed set-returning functions in FROM and
+    // covered `unnest_expr` only. The parser lowers `generate_series`
+    // onto its OWN field, so any statement with one in FROM still
+    // described nothing — and a Describe that answers no columns while
+    // Execute sends rows is a protocol error, not a wrong answer:
+    //
+    //   SELECT count(*) FROM generate_series(1,5) g
+    //     simple query      5
+    //     extended protocol server sent data ("D" message) without
+    //                       prior row description ("T" message)
+    //
+    // Measured on the published images: 7.39.0, 7.40.7 and 7.40.8 all
+    // do this, with or without bound parameters, so every driver that
+    // prepares statements breaks on the shape. Found by running a
+    // customer's own repro through a real Bind after shipping 7.40.8.
+    //
+    // The same pair of slots that `substitute::walk_table_ref_exprs_mut`
+    // had to learn about on the same day. One field added to `TableRef`
+    // and two places that had to hear about it; both had heard about
+    // only one.
+    //
+    // BIGINT and this naming order because that is what the EXECUTOR
+    // projects (`join.rs`, the same three-step fallback). A Describe
+    // that disagrees with the row stream is the failure this is fixing,
+    // pointed the other way.
+    if t.generate_series_args.is_some() {
+        let first = t
+            .unnest_column_aliases
+            .first()
+            .cloned()
+            .or_else(|| t.alias.clone())
+            .unwrap_or_else(|| t.name.clone());
+        let mut cols = alloc::vec![ColumnSchema::new(first, DataType::BigInt, true)];
+        if t.with_ordinality {
+            let name = t
+                .unnest_column_aliases
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "ordinality".to_string());
+            cols.push(ColumnSchema::new(name, DataType::BigInt, false));
+        }
+        return Some(cols);
+    }
     // VALUES / anything else the executor synthesises has no catalog
     // shape to read here.
     None

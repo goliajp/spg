@@ -204,6 +204,7 @@ mod e2e_isolation_leak_round553;
 mod e2e_json;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_json_path;
+mod e2e_json_timestamptz_wire_v7409;
 mod e2e_ledger_red_l3_v7381;
 #[allow(unused_mut, unused_variables)]
 mod e2e_limits;
