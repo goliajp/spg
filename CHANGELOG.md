@@ -11,6 +11,70 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
+## [7.40.8] — 2026-09-06
+
+### Fixed — a bound parameter never reached `unnest()` or `generate_series()`
+
+Reported against 7.40.7 as a live 500 on a customer endpoint, traced by
+them from the failing request to the server's own log to one line:
+
+```text
+  PREPARE q (int[]) AS SELECT count(*) FROM unnest($1::int[]) AS t(x);
+  EXECUTE q (ARRAY[1,2]);
+    ERROR:  parameter $1 referenced but only 0 bound by client
+```
+
+The parameter had plainly arrived — `= ANY($1)` reads it in the same
+statement shape — and `unnest` did not see it:
+
+```text
+                                          PG 18.6   SPG 7.40.7
+  scalar parameter                            1          1
+  array parameter through = ANY($1)           2          2
+  array parameter through unnest($1)          2       raises
+  two arrays through unnest($1, $2)           2       raises
+  literal arrays through unnest(…)            2          2
+```
+
+`walk_select_exprs_mut` visits a FROM item's LATERAL subquery and a
+join's ON clause. A `TableRef` carries three expression slots and the
+walk knew about one: `unnest_expr` and `generate_series_args` were never
+visited, so a `$N` in either reached evaluation as a bare placeholder
+against an empty parameter buffer.
+
+Both slots, both positions, one helper. Nobody had reported the
+`generate_series($1, $2)` half; it is the same walk missing the same
+kind of field. The literal-array row above is why this survived — every
+fixture in the tree used one in that position.
+
+### Performance — the prerelease tier ran its independent steps one at a time
+
+```text
+  before   1,968 s   (median of ten runs)
+  after      702 s   nine steps green
+```
+
+Six steps that need nothing from one another now run as one concurrent
+group; `perf-sweep` is deliberately not in it, because it is the timing
+gate and needs the machine to itself.
+
+Two defects surfaced the moment they ran together, and both were there
+before. `gates` built its own `--profile release-counters --features
+perf-counters` artefacts — a second full compile of spg-engine and
+everything above it — plus a single-member `cargo build --release -p
+spg-server`; cargo holds an exclusive lock on the target directory, so
+the group measured `gates` 509.8 s and `biz` 527.1 s against 81.6 s and
+71.1 s for the same steps with nothing to build. They were queued behind
+a compile. That single-member build also relinked
+`target/release/spg-server` while `e2e` was spawning it —
+`server spawn: coalesce_nullif: No such file or directory`, which reads
+as a defect in the server and is a defect in the schedule. Nothing
+downstream of `release-build` compiles any more.
+
+The third performance panel moved to `full`: it renders no verdict by
+design, and a gate step that cannot fail is a gate step that only costs.
+
+
 ## [7.40.7] — 2026-09-06
 
 ### Fixed — the release gate threw away work it had already done, and
