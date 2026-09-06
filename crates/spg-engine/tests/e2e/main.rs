@@ -473,6 +473,7 @@ mod e2e_jsonpath_filter;
 mod e2e_jsonpath_like_mac;
 mod e2e_jsonpath_modes_round235;
 mod e2e_kcu_dialect_v73911;
+mod e2e_keyword_alias_v7411;
 mod e2e_large_object_round287;
 mod e2e_last_insert_id_round347;
 mod e2e_lastval;
