@@ -49,9 +49,40 @@ jobs:
       - name: cargo clippy --workspace --all-targets
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test --workspace
-        # Replication and backup e2e tests spawn `spg-server` child
-        # processes; serial runner keeps port-grabbing tests honest.
-        run: cargo test --workspace --locked -- --test-threads=1
+        # v7.40.11 — the default thread count, not one.
+        #
+        # `--test-threads=1` was here because "replication and backup
+        # e2e tests spawn `spg-server` child processes; serial runner
+        # keeps port-grabbing tests honest". The harness took that
+        # hazard away: every listener the test ServerBuilder starts is
+        # `127.0.0.1:0` and the port comes back from the child's own
+        # stderr, so there is nothing to grab. `grep` for a fixed port
+        # in `crates/spg-server/tests/e2e` finds none.
+        #
+        # What the flag costs, measured warm on a 16-core host, same
+        # tree, same selection:
+        #
+        #   default threads   89.0 s   9,310 passed, 0 failed
+        #   --test-threads=1  225.3 s
+        #
+        # On the runner the serial run was 325 s of the `check` job's
+        # 496 s, and one binary — spg-server's e2e — was 188 s of it.
+        #
+        # v7.40.11 — and without the benchmark crate, which the local
+        # tiers have excluded since v7.39.12 for the same reason:
+        # `spg-bench-competitor` has 56 binaries and ZERO tests, so
+        # `--workspace` compiled all 56 to run none. Measured here,
+        # debug, from clean: 98.8 s. Clippy still lints it, through
+        # `--workspace --all-targets` above.
+        #
+        # The spawn deadline is the local gate's, for the local gate's
+        # reason (7.38.1 S1.3): several servers starting at once on a
+        # busy host can take longer than the 10 s default to print
+        # `listening on`, and a shared runner is busier than this
+        # machine. A genuinely dead server still fails, later.
+        env:
+          SPG_TEST_SPAWN_DEADLINE_SECS: 30
+        run: cargo test --workspace --exclude spg-bench-competitor --locked
 
   # v7.39.11 — the release-profile battery, on one runner, after ONE
   # release build.
@@ -83,44 +114,87 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: Swatinem/rust-cache@v2
-      - name: Build the release binaries once
-        # v7.40.10 — this step was changed to build every test harness
-        # in the workspace, on the reasoning that fixed the LOCAL gate
-        # the same day, and the runner refuted it: 219 s became 2,057 s.
-        #
-        # The local gate runs EVERY harness (e2e, gates, biz, dogfood),
-        # so building them once up front is strictly cheaper there. This
-        # job runs four of them. Building the workspace's test targets to
-        # run four is more work, not less, and the measurement says so.
-        run: cargo build --release --locked --bin spg-server --bin spg --bin pg_isready
+      # v7.40.11 — ONE member selection for the whole job, and one
+      # build of everything it runs.
+      #
+      # The job made four cargo invocations naming four different
+      # member sets, and cargo resolves features over the SELECTED
+      # members: each set is its own artefact tree, so the same crates
+      # were compiled in the same profile up to four times. Counted
+      # from the runner log of 34028940830, a green run:
+      #
+      #   build --bin spg-server --bin spg --bin pg_isready   11 crates  225 s
+      #   test -p spg-server --test prod_ready                 9 crates  216 s
+      #   test -p spg-server --test slo_smoke                  1 crate     8 s
+      #   test -p <8 crates> --test perf_gate                 10 crates  275 s
+      #   run  -p sqllogictest                                 1 crate    86 s
+      #
+      # `slo_smoke` is the tell: it reused `prod_ready`'s selection and
+      # cost 8 s, while the two that changed selection cost 216 s and
+      # 275 s to build what was already built. That is ~490 s of a
+      # 939 s job.
+      #
+      # This is the same mechanism `steps::SHARED_MEMBERS` records for
+      # the local tiers (v7.39.13, measured there too). CI never got
+      # the fix.
+      #
+      # NOT `--workspace --all-targets`: v7.40.10 tried that and the
+      # runner refuted it, 219 s to 2,057 s, because it builds every
+      # integration harness in the workspace and this job runs four.
+      # The selection below is the packages that own the four bins and
+      # the three test targets this job runs, and nothing else.
+      #
+      # Verified locally against the same tree: after the build below,
+      # `--test prod_ready` and `--test perf_gate` under this selection
+      # compile nothing (0.31 s / 0.33 s).
+      - name: Build every target this job runs, once
+        run: |
+          cargo test --release --locked --no-run \
+            -p spg-server -p spgctl -p sqllogictest \
+            -p spg-audit -p spg-crypto -p spg-engine \
+            -p spg-sql -p spg-storage -p spg-wire \
+            --bins --test prod_ready --test slo_smoke --test perf_gate
       - name: prod_ready gate
         # Asserts every [machine] row in PROD_READY.md is backed by a
         # row_X_Y_* test. Failure means PROD_READY.md is over-claiming.
-        run: cargo test --release -p spg-server --test prod_ready --locked
+        run: |
+          cargo test --release --locked \
+            -p spg-server -p spgctl -p sqllogictest \
+            -p spg-audit -p spg-crypto -p spg-engine \
+            -p spg-sql -p spg-storage -p spg-wire \
+            --test prod_ready
       - name: SLO smoke
         # Ceilings are deliberately loose (~2-3x baseline) so
         # shared-runner noise does not false-alarm.
-        run: cargo test --release -p spg-server --test slo_smoke --locked -- --nocapture
+        run: |
+          cargo test --release --locked \
+            -p spg-server -p spgctl -p sqllogictest \
+            -p spg-audit -p spg-crypto -p spg-engine \
+            -p spg-sql -p spg-storage -p spg-wire \
+            --test slo_smoke -- --nocapture
       - name: perf_gate (every crate)
         # Each crate's perf_gate is `#![cfg(not(debug_assertions))]`,
         # so the debug `test` job above builds it empty; this is the
         # real gate.
         #
         # v7.40.10 — ONE invocation naming all eight crates, not eight.
-        # Cargo resolves features over the SELECTED members, so eight
-        # single-member selections are eight resolutions of the shared
-        # dependency graph; the harnesses themselves are the same work
-        # either way. Measured before: 585 s for the loop.
+        # v7.40.11 — and the same nine-member selection as every other
+        # step, so it compiles nothing.
         #
         # Cargo names the failing crate in its own output, which is what
         # the loop's `::group::` was for.
         run: |
           cargo test --release --locked \
-            -p spg-audit -p spg-crypto -p spg-engine -p spg-sql \
-            -p spg-storage -p spg-wire -p spgctl -p spg-server \
+            -p spg-server -p spgctl -p sqllogictest \
+            -p spg-audit -p spg-crypto -p spg-engine \
+            -p spg-sql -p spg-storage -p spg-wire \
             --test perf_gate -- --test-threads=1 --nocapture
       - name: biz (sqllogictest)
-        run: cargo run -p sqllogictest --release --locked
+        # v7.40.11 — the binary the build above produced, not
+        # `cargo run -p sqllogictest`, which is a tenth selection and
+        # relinked the world for it (86 s on the runner). It finds the
+        # workspace root itself.
+        run: ./target/release/sqllogictest
       - name: Assemble candidate image
         # The panel used to run against the previously PUBLISHED
         # image, which tested a constant: it could never catch a
