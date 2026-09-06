@@ -4421,6 +4421,43 @@ pub struct TableRef {
     pub json_table: Option<Box<JsonTable>>,
 }
 
+/// What a FROM item IS.
+///
+/// v7.40.10 — a boolean cannot make a consumer handle a new kind; an
+/// enum can. Every consumer that must know the difference writes a
+/// `match` with no wildcard arm, so a variant added here is a compile
+/// error at each of them rather than a defect at whichever one the new
+/// shape reaches first.
+///
+/// The engine asked "is this item synthesised?" in fifty-six places and
+/// exactly one of them listed every field. The rest were missing
+/// between one and five, and the gaps were reachable:
+/// `SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)` answered
+/// `relation "jsonb_each_text" does not exist` over the extended
+/// protocol because one such list named four of seven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FromItemKind {
+    /// A table, view or CTE named in the catalog.
+    Relation,
+    /// `unnest(...)` and the set-returning functions the parser lowers
+    /// onto the same slot (`string_to_table`, `jsonb_object_keys`, …).
+    Unnest,
+    /// `generate_series(...)`.
+    GenerateSeries,
+    /// A derived table or LATERAL subquery.
+    Subquery,
+    /// `jsonb_each(...)` / `jsonb_each_text(...)`.
+    JsonbEach,
+    /// A table function call the parser kept as a name plus arguments.
+    TableFn,
+    /// `ROWS FROM (...)`.
+    RowsFrom,
+    /// `JSON_TABLE(...)`.
+    JsonTable,
+    /// A scalar function in FROM position, which yields one row.
+    ScalarFn,
+}
+
 /// One walkable slot of a FROM item: an expression, or a nested SELECT.
 ///
 /// v7.40.10 — see [`TableRef::try_for_each_slot_mut`].
@@ -4431,6 +4468,80 @@ pub enum FromSlot<'a> {
 }
 
 impl TableRef {
+    /// Whether this FROM item NAMES A RELATION — a table, view or CTE —
+    /// rather than producing its own rows.
+    ///
+    /// **A total destructure, no `..`.** A field added to `TableRef` is a
+    /// compile error here.
+    ///
+    /// v7.40.10, on evidence. This question is asked in 56 places across
+    /// the engine and every one of them wrote its own list of fields.
+    /// Exactly one was complete. The others were missing between one and
+    /// five slots each, and each gap is a defect waiting for the shape
+    /// that reaches it:
+    ///
+    /// ```text
+    ///   try_stream_single_table's guard named four of seven, so
+    ///   SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)
+    ///     ERROR:  relation "jsonb_each_text" does not exist
+    ///   over the extended protocol, while count(*) over the same item
+    ///   answered and the simple query protocol answered.
+    /// ```
+    ///
+    /// `scalar_fn_item` counts as not-a-relation for the same reason the
+    /// rest do: the row comes from the item, not from the catalog.
+    #[must_use]
+    pub fn names_a_relation(&self) -> bool {
+        self.kind() == FromItemKind::Relation
+    }
+
+    /// What this FROM item is.
+    ///
+    /// **A total destructure, no `..`.** A field added to `TableRef` is
+    /// a compile error here — which is the point, because every
+    /// consumer matches exhaustively on the result.
+    ///
+    /// The slots are mutually exclusive by construction: the parser
+    /// fills exactly one of them, or none for a plain relation.
+    #[must_use]
+    pub fn kind(&self) -> FromItemKind {
+        let Self {
+            name: _,
+            alias: _,
+            only: _,
+            as_of_segment: _,
+            unnest_column_aliases: _,
+            with_ordinality: _,
+            scalar_fn_item,
+            unnest_expr,
+            generate_series_args,
+            lateral_subquery,
+            jsonb_each_text_arg,
+            table_fn_call,
+            rows_from,
+            json_table,
+        } = self;
+        if unnest_expr.is_some() {
+            FromItemKind::Unnest
+        } else if generate_series_args.is_some() {
+            FromItemKind::GenerateSeries
+        } else if lateral_subquery.is_some() {
+            FromItemKind::Subquery
+        } else if jsonb_each_text_arg.is_some() {
+            FromItemKind::JsonbEach
+        } else if table_fn_call.is_some() {
+            FromItemKind::TableFn
+        } else if rows_from.is_some() {
+            FromItemKind::RowsFrom
+        } else if json_table.is_some() {
+            FromItemKind::JsonTable
+        } else if *scalar_fn_item {
+            FromItemKind::ScalarFn
+        } else {
+            FromItemKind::Relation
+        }
+    }
+
     /// Every expression this FROM item carries, and the SELECT nested in
     /// it — in one place, for every pass that needs them.
     ///

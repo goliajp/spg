@@ -29,9 +29,9 @@
 //!
 //! Which is what every driver that prepares statements gets.
 //!
-//! **One thing this file does NOT assert, because it is still open.**
-//! Over the extended protocol with no bound parameters, a non-aggregate
-//! projection from three of these kinds cannot be executed at all:
+//! **The third pass, found by this very file and fixed with it.** The
+//! streaming wire executor produced rows for four of the nine kinds and
+//! read the rest as table names:
 //!
 //! ```text
 //!   SELECT * FROM jsonb_each_text('{"a":1}'::jsonb)
@@ -42,14 +42,12 @@
 //!     relation "jt" does not exist
 //! ```
 //!
-//! `count(*)` over the same items answers, the simple query protocol
-//! answers, and all three of the embedded engine's own paths answer —
-//! measured. So it is the STREAMING wire executor, which knows
-//! `unnest` and `generate_series` as FROM items and not these three.
-//! Present on the published 7.40.9, so not new here. The aggregate
-//! spelling is used below so this file pins the Describe half without
-//! asserting behaviour that is still open; see
-//! `tmp/docs/FINDING-2026-09-06-streaming-executor-from-items.md`.
+//! `count(*)` over the same items answered, because the aggregate gate
+//! sends those to the materialising executor. So did the simple query
+//! protocol, and so did all three of the embedded engine's own entry
+//! points — which is what made it wire-only and invisible. Its guard
+//! named four of seven slots; it now asks `TableRef::kind()` and
+//! matches on every variant with no wildcard arm.
 
 use crate::common;
 use std::io::{Read, Write};
@@ -221,26 +219,21 @@ fn every_from_item_kind_describes_its_columns() {
     let cases: &[(&str, &[&str], usize)] = &[
         ("SELECT * FROM unnest(ARRAY[1,2,3]) u", &["u"], 3),
         ("SELECT * FROM generate_series(1,3) g", &["g"], 3),
-        // These three describe correctly now and are read through an
-        // aggregate, because a non-aggregate projection over them
-        // cannot be executed by the streaming wire executor at all —
-        // see the note at the head of this file. `count(*)` reaches a
-        // different path and works.
         (
-            "SELECT count(*) FROM jsonb_each_text(cast('{\"a\":1}' as jsonb))",
-            &["count"],
+            "SELECT * FROM jsonb_each_text(cast('{\"a\":1}' as jsonb))",
+            &["key", "value"],
             1,
         ),
         (
-            "SELECT count(*) FROM ROWS FROM (generate_series(1,3))",
-            &["count"],
-            1,
+            "SELECT * FROM ROWS FROM (generate_series(1,3))",
+            &["generate_series"],
+            3,
         ),
         (
-            "SELECT count(*) FROM json_table(cast('[1,2]' as jsonb), '$[*]' \
+            "SELECT * FROM json_table(cast('[1,2]' as jsonb), '$[*]' \
              COLUMNS (v int PATH '$')) jt",
-            &["count"],
-            1,
+            &["v"],
+            2,
         ),
         ("SELECT * FROM string_to_table('a,b', ',') st", &["st"], 2),
     ];
@@ -271,14 +264,14 @@ fn every_from_item_kind_receives_a_bound_parameter() {
             3,
         ),
         (
-            "SELECT count(*) FROM jsonb_each_text($1::jsonb)",
+            "SELECT * FROM jsonb_each_text($1::jsonb)",
             &["{\"a\":1,\"b\":2}"],
-            1,
+            2,
         ),
         (
-            "SELECT count(*) FROM ROWS FROM (generate_series($1::int, $2::int))",
+            "SELECT * FROM ROWS FROM (generate_series($1::int, $2::int))",
             &["1", "3"],
-            1,
+            3,
         ),
         (
             "SELECT * FROM string_to_table($1, $2) st",
