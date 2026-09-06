@@ -619,6 +619,57 @@ impl Engine {
     /// v7.39 (round 462) — a SELECT over a system catalog view resolves
     /// against the same materialised catalog execution builds, so the
     /// two paths cannot disagree about what a system view looks like.
+    /// v7.40.11 — Describe, but refusing a statement that cannot run.
+    ///
+    /// `describe_prepared` answers a SHAPE and has no way to say "this
+    /// statement is not valid", so it answered one for statements
+    /// PostgreSQL refuses at Parse:
+    ///
+    /// ```text
+    ///                                  PG 18.6                     SPG
+    ///   SELECT * FROM no_such_table    relation … does not exist    no columns
+    ///   SELECT nosuchcol FROM pg_class column … does not exist      nosuchcol|text
+    /// ```
+    ///
+    /// The second is the worse one: it invents a column and gives it a
+    /// type. A driver that prepares such a statement is told it
+    /// succeeded and fails at Execute, one round trip later, and a tool
+    /// that only ever Describes — a schema browser, a query builder —
+    /// is told a lie it never gets corrected on.
+    ///
+    /// The checks are the ones the read path already runs before it
+    /// executes anything; this is the same pair, one step earlier, so
+    /// Describe and Execute cannot disagree about whether a statement
+    /// is valid.
+    ///
+    /// # Errors
+    /// Whatever the validation says: an unknown relation, an unknown
+    /// column, a function called with the wrong arity.
+    pub fn describe_prepared_checked(
+        &self,
+        stmt: &Statement,
+    ) -> Result<(Vec<u32>, Vec<ColumnSchema>), EngineError> {
+        if let Statement::Select(s) = stmt {
+            // The catalog `describe_prepared` will answer against, chosen
+            // the same way, so the check and the shape are taken from one
+            // view of the world. A system view the engine cannot
+            // materialise fails here with the message the read path gives
+            // it.
+            let staged = if crate::system_catalog::select_references_meta_view(s) {
+                Some(self.meta_view_catalog(s)?)
+            } else {
+                self.admin_view_catalog(s)
+            };
+            let cat = staged.as_ref().unwrap_or_else(|| self.active_catalog());
+            self.validate_from_relations(s, cat)?;
+            self.validate_clause_columns_in(s, cat)?;
+            self.validate_function_arity(s)?;
+        } else {
+            self.validate_dml(stmt, self.active_catalog())?;
+        }
+        Ok(self.describe_prepared(stmt))
+    }
+
     pub fn describe_prepared(&self, stmt: &Statement) -> (Vec<u32>, Vec<ColumnSchema>) {
         if let Statement::Select(s) = stmt {
             if crate::system_catalog::select_references_meta_view(s)
@@ -1202,6 +1253,13 @@ impl Engine {
                 "inconsistent types deduced for parameter ${n} DETAIL: {first} versus {second}"
             )));
         }
+        // v7.40.11 — PG runs parse analysis at PREPARE: `PREPARE p AS
+        // SELECT * FROM no_such_table` is an error there (measured on
+        // 18.6), and so is a statement naming a column no source has.
+        // SPG accepted both and failed at EXECUTE instead. Same entry
+        // point the wire's Parse uses, so the two cannot disagree about
+        // which statements are preparable.
+        self.describe_prepared_checked(&body)?;
         self.prepared_statements.insert(
             name,
             crate::PreparedSqlStatement {
@@ -2274,6 +2332,7 @@ impl Engine {
                 self.exec_create_index(s)
             }
             Statement::Insert(mut s) => {
+                self.validate_insert(&s, self.active_catalog())?;
                 // v7.39.13 — resolve scalar subqueries before the row
                 // walk, which UPDATE has done since embed round-12 and
                 // DELETE since round 157. INSERT never did, so
@@ -2326,6 +2385,7 @@ impl Engine {
                 Ok(r)
             }
             Statement::Update(mut s) => {
+                self.validate_update(&s, self.active_catalog())?;
                 // Materialise uncorrelated subqueries in SET / WHERE
                 // before the row walk — the SELECT path has done this
                 // since v4.10; UPDATE gained it for mailrs's
@@ -2353,6 +2413,7 @@ impl Engine {
                 Ok(r)
             }
             Statement::Delete(mut s) => {
+                self.validate_delete(&s, self.active_catalog())?;
                 // v7.39 (round 157) — see the Update arm: with a WITH
                 // clause the resolve runs after the CTE temps install.
                 if s.ctes.is_empty()

@@ -299,6 +299,7 @@ mod e2e_nowal_returning_round182;
 mod e2e_observability;
 mod e2e_panel_collation_v7395;
 mod e2e_parallel_freezer;
+mod e2e_parse_analysis_wire_v7411;
 #[allow(unused_mut, unused_variables)]
 mod e2e_persistence;
 mod e2e_pg_abort_firewall_round86;

@@ -1775,12 +1775,8 @@ impl Engine {
         // r1039 — the key space is the PEER's column, not the left value's
         // incidental type. `ON a.n = b.n` between an `int` and a `numeric`
         // column would otherwise probe an integer key against a
-        // numeric-keyed index and match nothing.
-        let peer_key_ty = table
-            .schema()
-            .columns
-            .get(idx.column_position)
-            .map(|c| c.ty);
+        // numeric-keyed index and match nothing. v7.40.11 — that column
+        // is now taken once, below, and carried into the probe.
         // v7.38.16 — and the key SPACE is bytes, which under MySQL is not
         // how the ON clause compares. `ON a.s = b.s` over 'alpha'/'ALPHA'
         // is a match there and this probe found none: an inner join
@@ -1790,14 +1786,24 @@ impl Engine {
         //
         // Hand the whole stage back for the same reason r1036 does above
         // — the hash join compares values, not index keys.
-        if !table
-            .schema()
-            .columns
-            .get(idx.column_position)
-            .is_some_and(|c| crate::collate::column_key_is_bytewise(c, ctx.mysql_dialect))
-        {
+        //
+        // v7.40.11 — and it asked the wrong function. `column_key_is_bytewise`
+        // reads the column's own declaration; a text column that declares
+        // NOTHING inherits the DATABASE's collation, and its index then keys
+        // on ICU sort keys while this probe stayed on raw text. Every
+        // shipped image runs `en_US.utf8`, so `FROM a JOIN b ON a.k = b.k`
+        // over indexed text answered the EMPTY SET there and one row under
+        // `C` — creating the index changed the answer. `probe_space` asks
+        // `Table::index_collation`, the function that built the entries,
+        // and it is asked ONCE per index rather than once per driving row.
+        let Some(peer_col) = table.schema().columns.get(idx.column_position) else {
             return Ok(false);
-        }
+        };
+        let Some(space) = crate::index_access::probe_space(table, idx, peer_col, ctx.mysql_dialect)
+        else {
+            return Ok(false);
+        };
+        let peer_col = peer_col.clone();
         let mut next: Vec<usize> = Vec::new();
         for tuple in pipe.working.chunks(pipe.stride) {
             cancel.check()?;
@@ -1816,13 +1822,10 @@ impl Engine {
             // the peer's space at all.
             let probe_key = match tuple_value(&pipe.sources, &pipe.offsets, tuple, lpos0) {
                 Some(Value::Null) => None,
-                Some(kv) => {
-                    let ty = peer_key_ty.ok_or(()).ok();
-                    match ty.and_then(|t| spg_storage::IndexKey::from_value_for_column(kv, t)) {
-                        Some(k) => Some(k),
-                        None => return Ok(false),
-                    }
-                }
+                Some(kv) => match crate::index_access::probe_in_space(&space, &peer_col, kv) {
+                    Some(k) => Some(k),
+                    None => return Ok(false),
+                },
                 None => None,
             };
             if let Some(key) = probe_key {

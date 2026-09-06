@@ -3070,6 +3070,82 @@ fn collated_probe(coll: &str, value: &Value<'_>) -> Option<IndexKey> {
     crate::collate::sort_key(coll, text).map(IndexKey::Bytes)
 }
 
+/// v7.40.11 — the ONE probe a caller outside this module should build.
+///
+/// [`probe_key`] is the funnel inside the seek layer, and it was the
+/// only place that asked whether the index keys under a collation. Two
+/// seeks in `table_access` — the join peer's, and the `IN` list's —
+/// built `IndexKey::from_value_for_column` straight from the value
+/// instead, so on a database with a locale collation (which is every
+/// shipped image) they probed a tree of ICU sort keys with raw text and
+/// found nothing. Nothing reads exactly like "no matching rows":
+///
+/// ```text
+///   SELECT b.k FROM t b JOIN a ON a.id = b.a_id WHERE b.k = 'k'
+///     en_US.utf8, k indexed        0 rows
+///     the same table, no index     1 row
+///     the same column COLLATE "C"  1 row
+/// ```
+///
+/// Creating an index changed the answer. This asks
+/// [`spg_storage::Table::index_collation`] — the function that BUILT
+/// the entries — rather than re-deriving the rule, and it answers
+/// `None` (decline the seek, take the scan) for every case it cannot
+/// probe correctly.
+pub(crate) fn probe_key_for_index(
+    table: &Table,
+    idx: &spg_storage::Index,
+    col: &ColumnSchema,
+    value: &Value<'_>,
+    mysql: bool,
+) -> Option<IndexKey> {
+    let space = probe_space(table, idx, col, mysql)?;
+    probe_in_space(&space, col, value)
+}
+
+/// The space one index's entries live in. Decided per INDEX, so a
+/// caller probing in a loop asks once — the join peel probes once per
+/// driving row, and re-deriving a collation there would be work per row
+/// for an answer that cannot change.
+pub(crate) enum ProbeSpace<'a> {
+    /// ICU sort keys under this collation.
+    Collated(&'a str),
+    /// The column's own value.
+    Bytewise,
+}
+
+/// `None` = this index cannot be probed correctly at all; take the scan.
+/// See [`probe_key_for_index`].
+pub(crate) fn probe_space<'a>(
+    table: &'a Table,
+    idx: &spg_storage::Index,
+    col: &ColumnSchema,
+    mysql: bool,
+) -> Option<ProbeSpace<'a>> {
+    if !index_is_usable(table, idx) {
+        return None;
+    }
+    if let Some(coll) = table.index_collation(idx) {
+        return Some(ProbeSpace::Collated(coll));
+    }
+    if !crate::collate::column_key_is_bytewise(col, mysql) {
+        return None;
+    }
+    Some(ProbeSpace::Bytewise)
+}
+
+/// One value, encoded into the space [`probe_space`] named.
+pub(crate) fn probe_in_space(
+    space: &ProbeSpace<'_>,
+    col: &ColumnSchema,
+    value: &Value<'_>,
+) -> Option<IndexKey> {
+    match space {
+        ProbeSpace::Collated(coll) => collated_probe(coll, value),
+        ProbeSpace::Bytewise => IndexKey::from_value_for_column(value, col.ty),
+    }
+}
+
 /// v7.38.18 (S0) — may this index be READ right now?
 ///
 /// A collated index's tree is filled by the engine, not by storage, so

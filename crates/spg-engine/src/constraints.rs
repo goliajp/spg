@@ -2950,6 +2950,7 @@ pub(crate) fn enforce_fk_inserts(
     child_table: &str,
     fks: &[spg_storage::ForeignKeyConstraint],
     rows: &[Vec<Value<'static>>],
+    mysql: bool,
 ) -> Result<(), EngineError> {
     for fk in fks {
         let parent_is_self = fk.parent_table == child_table;
@@ -2976,7 +2977,44 @@ pub(crate) fn enforce_fk_inserts(
         // the cold parent rows ONCE per FK (the composite path only
         // — single-column FKs already ride `idx.lookup_eq` which
         // surfaces both tiers).
-        let cold_parent_rows: alloc::vec::Vec<Row<'static>> = if fk.local_columns.len() == 1 {
+        // v7.40.11 — which index, if any, can answer the single-column
+        // fast path, and in what space its entries live. Decided once
+        // per FK rather than once per row.
+        //
+        // The probe was built straight from the value, so on a database
+        // with a locale collation — every shipped image — the parent's
+        // B-tree held ICU sort keys and this looked for raw text in it.
+        // A text FOREIGN KEY was therefore unusable: an INSERT naming a
+        // parent that exists was refused with
+        // `Key (pk)=(a) is not present in table "fk_p"`. Measured on
+        // 7.40.10 under `en_US.utf8`; correct under `C`, which is what
+        // every fixture in this tree runs.
+        //
+        // When no index can be probed correctly the FK is checked by the
+        // same row comparison the composite form uses — slower, and it
+        // compares VALUES, which is the answer.
+        let single_probe: Option<(&spg_storage::Index, crate::index_access::ProbeSpace<'_>)> =
+            if fk.local_columns.len() == 1 {
+                let parent_col = fk.parent_columns[0];
+                parent.schema().columns.get(parent_col).and_then(|col| {
+                    parent
+                        .indices()
+                        .iter()
+                        .filter(|idx| {
+                            matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                                && idx.column_position == parent_col
+                                && idx.partial_predicate.is_none()
+                        })
+                        .find_map(|idx| {
+                            crate::index_access::probe_space(parent, idx, col, mysql)
+                                .map(|space| (idx, space))
+                        })
+                })
+            } else {
+                None
+            };
+        let takes_fast_path = fk.local_columns.len() == 1 && single_probe.is_some();
+        let cold_parent_rows: alloc::vec::Vec<Row<'static>> = if takes_fast_path {
             Vec::new()
         } else {
             iter_cold_rows_of_parent(catalog, parent)
@@ -2985,33 +3023,33 @@ pub(crate) fn enforce_fk_inserts(
             // Single-column FK fast path: try the parent's BTree
             // index for an O(log n) lookup. Composite FKs fall back
             // to a parent-row scan.
-            if fk.local_columns.len() == 1 {
+            if let Some((idx, space)) = &single_probe {
                 let v = &row_values[fk.local_columns[0]];
                 if matches!(v, Value::Null) {
                     continue;
                 }
                 let parent_col = fk.parent_columns[0];
-                let key = spg_storage::IndexKey::from_value(v).ok_or_else(|| {
+                let col = parent.schema().columns.get(parent_col).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: fk.parent_table.clone(),
+                    })
+                })?;
+                let key = crate::index_access::probe_in_space(space, col, v).ok_or_else(|| {
                     EngineError::Unsupported(alloc::format!(
                         "FOREIGN KEY column value of type {} is not index-eligible",
                         crate::conversions::pg_type_name_for_error_opt(v.data_type())
                     ))
                 })?;
-                let present_committed = parent.indices().iter().any(|idx| {
-                    matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                        && idx.column_position == parent_col
-                        && idx.partial_predicate.is_none()
-                        // v7.37.15 (Phase C.3) — a tombstoned parent index
-                        // hit means the parent was DELETE-tombstoned under
-                        // the gate-on in-place path; the parent is gone, so
-                        // the child FK insert must FAIL "no parent" (PG
-                        // agrees — a deleted parent violates the FK). Gate-off
-                        // has no tombstones → every locator counts → unchanged.
-                        && idx
-                            .lookup_eq(&key)
-                            .iter()
-                            .any(|loc| !locator_is_tombstoned(parent, loc))
-                });
+                // v7.37.15 (Phase C.3) — a tombstoned parent index
+                // hit means the parent was DELETE-tombstoned under
+                // the gate-on in-place path; the parent is gone, so
+                // the child FK insert must FAIL "no parent" (PG
+                // agrees — a deleted parent violates the FK). Gate-off
+                // has no tombstones → every locator counts → unchanged.
+                let present_committed = idx
+                    .lookup_eq(&key)
+                    .iter()
+                    .any(|loc| !locator_is_tombstoned(parent, loc));
                 // v7.6.7 self-ref widening: also accept a match
                 // against earlier rows in this same batch when the
                 // FK points at the table being inserted into.
@@ -3772,7 +3810,7 @@ impl Engine {
                 .filter(|(i, _)| !t.headers().get(*i).is_some_and(|h| h.is_deleted()))
                 .map(|(_, r)| r.values.clone())
                 .collect();
-            enforce_fk_inserts(&st.catalog, tname, &fks, &rows)?;
+            enforce_fk_inserts(&st.catalog, tname, &fks, &rows, self.speaks_mysql)?;
         }
         // v7.39 (round 712) — and the deferred PK/UNIQUE constraints,
         // through the whole-table validator (the rows are already in the

@@ -70,11 +70,24 @@ fn an_unknown_column_is_still_unknown() {
     e.execute("CREATE TABLE `C` (`Col` INT)").expect("ddl");
     // Case-insensitive is not "anything goes": a name no column bears
     // is still refused, and the sentence names the clause.
-    // The PROJECTION path raises the engine's canonical sentence and
-    // the MySQL wire words it; the clause validator below words it
-    // in-engine, which is why the two assertions differ.
+    //
+    // v7.40.11 — the select list is checked in-engine now, so it words
+    // the sentence the way the other clauses already did. Measured on
+    // MySQL 9.7.2, which is where the wording comes from:
+    //
+    // ```text
+    //   SELECT nosuch FROM c        Unknown column 'nosuch' in 'field list'
+    //   SELECT Col FROM c WHERE …   Unknown column 'nope' in 'where clause'
+    // ```
+    //
+    // The wire error is unchanged either way — 1054 / 42S22 — because
+    // the `Unknown column '…'` arm and the PG sentence's arm carry the
+    // same pair.
     let err = format!("{}", e.execute("SELECT nosuch FROM C").unwrap_err());
-    assert!(err.contains("column \"nosuch\" does not exist"), "{err}");
+    assert!(
+        err.contains("Unknown column 'nosuch' in 'field list'"),
+        "{err}"
+    );
     let err = format!(
         "{}",
         e.execute("SELECT Col FROM C WHERE nope = 1").unwrap_err()

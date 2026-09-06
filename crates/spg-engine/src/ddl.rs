@@ -1107,6 +1107,7 @@ impl Engine {
             tbl,
             core::slice::from_ref(&storage_fk),
             &existing_rows,
+            self.speaks_mysql,
         )?;
         // Reject duplicate constraint name.
         let table = self

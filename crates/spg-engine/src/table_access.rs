@@ -388,10 +388,21 @@ impl Engine {
                         alias,
                     )
                 });
+                // v7.40.11 — through the shared probe, which asks the
+                // index what space its entries are in. Building the key
+                // from the value alone probed a locale-collated tree
+                // with raw text: the seek found nothing and the JOIN
+                // returned the empty set on every shipped image.
                 if let Some((pos, value)) = resolved
                     && let Some(idx) = table.index_on(pos)
                     && let Some(col) = cols.get(pos)
-                    && let Some(key) = spg_storage::IndexKey::from_value_for_column(&value, col.ty)
+                    && let Some(key) = crate::index_access::probe_key_for_index(
+                        table,
+                        idx,
+                        col,
+                        &value,
+                        self.speaks_mysql,
+                    )
                 {
                     let mut ids = Vec::new();
                     let mut all_hot = true;
@@ -591,7 +602,14 @@ impl Engine {
                 let col = cols.get(col_pos)?;
                 for l in lits {
                     let value = crate::index_access::literal_as_column_value(l, col, col_pos)?;
-                    let key = spg_storage::IndexKey::from_value_for_column(&value, col.ty)?;
+                    // v7.40.11 — same funnel as the equality seek above.
+                    let key = crate::index_access::probe_key_for_index(
+                        table,
+                        idx,
+                        col,
+                        &value,
+                        self.speaks_mysql,
+                    )?;
                     for loc in idx.lookup_eq(&key) {
                         match *loc {
                             spg_storage::RowLocator::Hot(i) => ids.push(i),

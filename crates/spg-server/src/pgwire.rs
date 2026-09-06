@@ -2145,10 +2145,15 @@ fn run_pg_session(
             // statement; reply ParseComplete (no ReadyForQuery — that
             // waits for Sync).
             b'P' => {
-                if let Err(msg) = handle_parse(body, &mut prepared, state) {
-                    send_error(&mut wbuf, "42601", &msg)?;
-                } else {
-                    send_msg(&mut wbuf, b'1', &[])?;
+                match handle_parse(body, &mut prepared, state) {
+                    Ok(()) => send_msg(&mut wbuf, b'1', &[])?,
+                    // v7.40.11 — the SQLSTATE travels with the message.
+                    // Parse now raises the analysis errors PG raises here
+                    // — `relation "x" does not exist` is 42P01, an unknown
+                    // column 42703 — and reporting all of them as 42601
+                    // (syntax error) would tell a driver the statement
+                    // could never be valid.
+                    Err((sqlstate, msg)) => send_error(&mut wbuf, sqlstate, &msg)?,
                 }
             }
             // Bind (B): create a portal with parameter values
@@ -3355,13 +3360,13 @@ fn handle_parse(
     body: &[u8],
     prepared: &mut std::collections::HashMap<String, PreparedStmt>,
     state: &Arc<ServerState>,
-) -> Result<(), String> {
+) -> Result<(), (&'static str, String)> {
     let mut cur = 0;
     let name = read_cstring(body, &mut cur)
-        .ok_or("Parse: name not null-terminated UTF-8")?
+        .ok_or(("42601", "Parse: name not null-terminated UTF-8".to_string()))?
         .to_string();
     let sql = read_cstring(body, &mut cur)
-        .ok_or("Parse: SQL not null-terminated UTF-8")?
+        .ok_or(("42601", "Parse: SQL not null-terminated UTF-8".to_string()))?
         .trim_end_matches(';')
         .trim()
         .to_string();
@@ -3370,12 +3375,12 @@ fn handle_parse(
     // Bind parameters can be decoded by the right type's wire
     // format.
     if cur + 2 > body.len() {
-        return Err("Parse: missing parameter type count".into());
+        return Err(("42601", "Parse: missing parameter type count".to_string()));
     }
     let oid_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
     cur += 2;
     if cur + oid_count * 4 > body.len() {
-        return Err("Parse: truncated parameter OIDs".into());
+        return Err(("42601", "Parse: truncated parameter OIDs".to_string()));
     }
     let mut param_type_oids: Vec<u32> = Vec::with_capacity(oid_count);
     for _ in 0..oid_count {
@@ -3396,16 +3401,24 @@ fn handle_parse(
     let mut eng = state
         .engine
         .write()
-        .map_err(|_| "Parse: engine lock poisoned".to_string())?;
+        .map_err(|_| ("XX000", "Parse: engine lock poisoned".to_string()))?;
     let ast = eng
         .prepare_cached(&sql)
-        .map_err(|e| format!("Parse: {e}"))?;
+        .map_err(|e| ("42601", format!("Parse: {e}")))?;
     // v7.37 (SPGS small-query bar) — describe at Parse time and
     // cache the wire-format RowDescription body. For repeated
     // executions of the same prepared statement (the sqlx hot
     // shape) every Execute now skips re-deriving the column shape
     // and re-encoding the protocol body.
-    let (inferred_oids, columns) = eng.describe_prepared(&ast);
+    // v7.40.11 — and PG's parse analysis, which runs here: a statement
+    // naming a relation or a column that does not exist is refused at
+    // Parse there, not at Execute. Describing it instead answered a
+    // shape — for `SELECT nosuchcol FROM pg_class`, an invented column
+    // with a type — and a client that only ever Describes was never
+    // corrected.
+    let (inferred_oids, columns) = eng
+        .describe_prepared_checked(&ast)
+        .map_err(|e| engine_error_to_wire(&e))?;
     drop(eng);
     let row_desc_body: Option<Vec<u8>> = if columns.is_empty() {
         None
