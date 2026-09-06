@@ -133,6 +133,28 @@ ensure_release_build() {
     cargo build --release --locked --workspace --exclude spg-bench-competitor
     cargo test --release --locked --workspace --exclude spg-bench-competitor \
         --tests --no-run
+    # v7.40.8 — the perf-counters harnesses too, so NOTHING downstream
+    # compiles.
+    #
+    # `gates` built these itself, under a different profile AND a
+    # different feature set, which is a whole second compile of
+    # spg-engine and everything above it. Serially that was invisible;
+    # concurrently it is not, because cargo holds an exclusive lock on
+    # the target directory. Measured with one engine source file
+    # changed, six steps running as a group: gates 509.8 s and biz
+    # 527.1 s, against 81.6 s and 71.1 s for the same two when nothing
+    # needed building. They were queued behind this compile, not doing
+    # their own work.
+    #
+    # It also removed a binary out from under a running step. `gates`
+    # ran `cargo build --release -p spg-server` — a single-member
+    # selection, which resolves features over that member and relinks —
+    # while `e2e` was spawning `target/release/spg-server`, and the spawn
+    # landed in the window where the file did not exist:
+    # `server spawn: coalesce_nullif: No such file or directory`. That
+    # reads as a defect in the server and is a defect in the schedule.
+    cargo test --profile release-counters --locked -p spg-engine \
+        --features perf-counters --tests --no-run
     _release_built=1
 }
 
@@ -253,7 +275,9 @@ run_gates() {
     # time. A pin outside the gate that runs is a pin that does not
     # exist — same words as the counter pins above, same lesson.
     banner "gates: sqlx-pgwire (binary Bind/results, own server)"
-    cargo build --release --locked -p spg-server
+    # v7.40.8 — no build here. `ensure_release_build` above produced this
+    # binary from the WORKSPACE selection; naming one member resolves
+    # features again and relinks the file other steps are spawning.
     rm -rf /tmp/spg-gate-sqlx-db /tmp/spg-gate-sqlx-wal /tmp/spg-gate-sqlx-audit
     SPG_PG_ADDR=127.0.0.1:25460 ./target/release/spg-server 127.0.0.1:25461 \
         /tmp/spg-gate-sqlx-db /tmp/spg-gate-sqlx-audit /tmp/spg-gate-sqlx-wal \
