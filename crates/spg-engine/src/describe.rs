@@ -61,6 +61,16 @@ fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSch
         Statement::Insert(i) => (&i.table, i.returning.as_ref()),
         Statement::Update(u) => (&u.table, u.returning.as_ref()),
         Statement::Delete(d) => (&d.table, d.returning.as_ref()),
+        // v7.40.11 — the two other statement kinds that produce rows.
+        // Answering nothing for them is what put a DataRow on the wire
+        // with no RowDescription in front of it: Execute emits rows for
+        // a statement Describe called NoData, and psql refuses the
+        // stream outright. Both shapes come from the same function the
+        // executor builds its columns with.
+        Statement::ShowParameter(name) => {
+            return crate::system_catalog::show_parameter_columns(name);
+        }
+        Statement::Explain(e) => return crate::explain::explain_columns(e),
         _ => return Vec::new(),
     };
     let Some(items) = items else {

@@ -743,7 +743,7 @@ impl Engine {
         &self,
         name: alloc::string::String,
     ) -> Result<QueryResult, EngineError> {
-        use spg_storage::{ColumnSchema, DataType, Row, Value};
+        use spg_storage::{Row, Value};
         // v7.37.17 (17.6 sibling) — `SHOW ALL` returns a
         // (name, setting, description) triple for every
         // parameter SPG knows about. PG's shape is the same.
@@ -762,11 +762,7 @@ impl Engine {
                 .unwrap_or_else(|| boot.into())
         };
         if name.eq_ignore_ascii_case("all") {
-            let cols = alloc::vec![
-                ColumnSchema::new("name", DataType::Text, false),
-                ColumnSchema::new("setting", DataType::Text, false),
-                ColumnSchema::new("description", DataType::Text, false),
-            ];
+            let cols = crate::system_catalog::show_parameter_columns(&name);
             let mut rows: Vec<Row> = Vec::new();
             // Dynamic params outside the static canonical table.
             rows.push(Row::new(alloc::vec![
@@ -854,11 +850,7 @@ impl Engine {
         // this one sentinel so no GUC can collide with it. Same dialect
         // gate as `SHOW WARNINGS` above, for the same reason.
         if self.speaks_mysql && name.eq_ignore_ascii_case("count(*) warnings") {
-            let cols = alloc::vec![ColumnSchema::new(
-                alloc::string::String::from("@@session.warning_count"),
-                spg_storage::DataType::BigInt,
-                false
-            )];
+            let cols = crate::system_catalog::show_parameter_columns(&name);
             let n = i64::try_from(self.mysql_warnings.len()).unwrap_or(i64::MAX);
             return Ok(QueryResult::Rows {
                 columns: cols,
@@ -867,23 +859,7 @@ impl Engine {
         }
 
         if self.speaks_mysql && name.eq_ignore_ascii_case("warnings") {
-            let cols = alloc::vec![
-                ColumnSchema::new(
-                    alloc::string::String::from("Level"),
-                    spg_storage::DataType::Text,
-                    false
-                ),
-                ColumnSchema::new(
-                    alloc::string::String::from("Code"),
-                    spg_storage::DataType::Int,
-                    false
-                ),
-                ColumnSchema::new(
-                    alloc::string::String::from("Message"),
-                    spg_storage::DataType::Text,
-                    false
-                ),
-            ];
+            let cols = crate::system_catalog::show_parameter_columns(&name);
             let rows: Vec<Row> = self
                 .mysql_warnings
                 .iter()
@@ -956,7 +932,10 @@ impl Engine {
             }
         };
         Ok(QueryResult::Rows {
-            columns: alloc::vec![ColumnSchema::new(name, DataType::Text, false)],
+            // v7.40.11 — through the shared shape, so the column Describe
+            // names and the column Execute sends are one answer, and both
+            // carry the GUC's canonical spelling.
+            columns: crate::system_catalog::show_parameter_columns(&name),
             rows: alloc::vec![Row::new(alloc::vec![Value::text(value)])],
         })
     }

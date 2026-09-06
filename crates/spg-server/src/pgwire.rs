@@ -469,6 +469,20 @@ fn handle_pg_simple_query(
     // trimmed form and are left alone. `parse_statement` swallows a
     // trailing `;` itself, so no valid statement changes meaning.
     let sql_exec: &str = sql_str.trim();
+    // v7.40.11 — CHECKPOINT. See the multi-statement path below for
+    // why this host has to intercept it: the parser leaves
+    // `Statement::Empty`, so without this the statement reached the
+    // engine, did nothing, and reported success while the WAL grew.
+    if crate::commands::parse_checkpoint_intent(sql) {
+        match crate::commands::perform_checkpoint(state) {
+            Ok(()) => send_command_complete(wbuf, "CHECKPOINT")?,
+            Err(msg) => send_error(wbuf, "25001", &msg)?,
+        }
+        send_ready_for_query(wbuf, *tx_state)?;
+        stream.write_all(wbuf)?;
+        wbuf.clear();
+        return Ok(());
+    }
     // v4.17: COPY ... FROM STDIN / TO STDOUT runs its own
     // multi-frame protocol; intercept before the regular
     // execute path tries to parse them.
@@ -1317,6 +1331,25 @@ fn handle_pg_simple_query_one_into_wbuf(
         // tag is the closest portable equivalent SPG handles).
         send_command_complete(wbuf, "")?;
         return Ok(());
+    }
+    // v7.40.11 — CHECKPOINT, which this host never intercepted.
+    //
+    // The parser turns it into `Statement::Empty`, so it reached the
+    // engine as a statement with no effect and came back as a normal
+    // completion: the WAL grew by the bytes of the statement and was
+    // never truncated (measured: 1,771 bytes before, 1,789 after). The
+    // native protocol has intercepted it since v5.3.2 and the embedded
+    // host since Epic Du; pgwire is the host that did not, which is the
+    // one every operator and backup script actually uses.
+    //
+    // The transaction test is THIS connection's slot, not the engine's
+    // global one: another connection's open transaction is not a reason
+    // to refuse this checkpoint, and PG refuses only inside a block.
+    if crate::commands::parse_checkpoint_intent(sql) {
+        return match crate::commands::perform_checkpoint(state) {
+            Ok(()) => send_command_complete(wbuf, "CHECKPOINT"),
+            Err(msg) => send_error(wbuf, "25001", &msg),
+        };
     }
     // SET name=value — same dispatch as the single-stmt path (v7.39
     // GUC: dual-write the wire cache and ALWAYS fall through to the
@@ -4182,6 +4215,16 @@ fn handle_execute(
     // streamable shapes (joined non-aggregate projection) the engine
     // also skips the per-cell `.cloned()` and emits cell references
     // straight out of the source tables.
+    // v7.40.11 — CHECKPOINT, on the protocol every driver uses. Same
+    // interception as the simple path above, for the same reason: the
+    // parser leaves nothing in the AST to route on, so the statement's
+    // own text is what says it is one.
+    if crate::commands::parse_checkpoint_intent(stmt.sql.trim_end_matches(';').trim()) {
+        return match crate::commands::perform_checkpoint(state) {
+            Ok(()) => send_command_complete(stream, "CHECKPOINT").map_err(|e| proto(e.to_string())),
+            Err(msg) => Err(("25001", msg)),
+        };
+    }
     let cached_row_desc = stmt.row_desc_body.clone();
     let wants_binary = portal.result_formats.iter().any(|&f| f == 1);
     // r1058 — same gate as the simple path (pgwire.rs `!conn_in_tx`,
@@ -4602,6 +4645,33 @@ fn command_tag_for_ast(stmt: &spg_sql::ast::Statement, affected: usize) -> Strin
         // v6.1.4 — symmetric for subscriptions.
         Statement::CreateSubscription(_) => "CREATE SUBSCRIPTION".to_string(),
         Statement::DropSubscription { .. } => "DROP SUBSCRIPTION".to_string(),
+        // v7.40.11 — the utility statements, which every one of them
+        // tagged `OK` over the extended protocol while the simple path
+        // (which reads the SQL's first word) got them right. Two
+        // functions answering one question; this is the half that had
+        // no arms. Measured on PostgreSQL 18.6 through Parse/Bind/
+        // Execute — the left column is what a driver is told:
+        //
+        //   SET work_mem='5MB'        SET          COMMENT ON …   COMMENT
+        //   RESET work_mem            RESET        GRANT …        GRANT
+        //   RESET ALL                 RESET        REVOKE …       REVOKE
+        //   SET LOCAL …               SET          PREPARE p AS   PREPARE
+        //   DISCARD ALL               DISCARD ALL  DEALLOCATE p   DEALLOCATE
+        //   ANALYZE / VACUUM / CHECKPOINT   their own verb
+        //
+        // A tag is not decoration: psycopg and JDBC read it to decide
+        // whether a statement returned rows, and pgbouncer reads it to
+        // track transaction state.
+        Statement::SetParameter { .. } | Statement::SetParameterList(_) => "SET".to_string(),
+        Statement::ResetParameter(_) => "RESET".to_string(),
+        Statement::Discard(target) => format!("DISCARD {target}"),
+        Statement::Analyze(_) => "ANALYZE".to_string(),
+        Statement::Vacuum { .. } => "VACUUM".to_string(),
+        Statement::CommentOn { .. } => "COMMENT".to_string(),
+        Statement::Grant(_) => "GRANT".to_string(),
+        Statement::Revoke(_) => "REVOKE".to_string(),
+        Statement::Prepare { .. } => "PREPARE".to_string(),
+        Statement::Deallocate(_) => "DEALLOCATE".to_string(),
         // Select / Show / Explain go through the Rows path above.
         _ => "OK".to_string(),
     }

@@ -180,35 +180,70 @@ pub(crate) fn run_checkpoint_command(
     stream: &mut TcpStream,
     state: &ServerState,
 ) -> std::io::Result<()> {
+    match perform_checkpoint(state) {
+        Ok(()) => write_frame(stream, &build_command_complete(0)),
+        Err(msg) => write_frame(stream, &build_error_response(&msg)),
+    }
+}
+
+/// v7.40.11 — the checkpoint itself, with no protocol attached.
+///
+/// It was welded to the native protocol's frames, and `main.rs`'s
+/// dispatch was the only caller — so `CHECKPOINT` over the PostgreSQL
+/// wire parsed to `Statement::Empty`, reached the engine as a statement
+/// with no effect, and came back as a normal completion. The WAL grew
+/// by the bytes of the statement itself and was never truncated:
+/// measured, 1,771 bytes before and 1,789 after.
+///
+/// A checkpoint is a durability operation. An operator running it
+/// before a maintenance window, a backup script running it before
+/// copying the data directory, and a restart expecting a short replay
+/// were all told the work had happened. The embedded host has
+/// intercepted the statement since Epic Du and does the real thing;
+/// pgwire is the host that never did.
+///
+/// `open_tx` overrides the engine-wide transaction test for a caller
+/// that knows its own slot — a pgwire connection asks about ITS
+/// transaction, not about whether any connection has one open.
+///
+/// # Errors
+/// The sentence to report, already worded for the operator.
+pub(crate) fn perform_checkpoint(state: &ServerState) -> Result<(), String> {
     let Some(db_path) = state.db_path.as_deref() else {
-        return write_frame(
-            stream,
-            &build_error_response("CHECKPOINT requires a db_path (server started without one)"),
-        );
+        return Err("CHECKPOINT requires a db_path (server started without one)".into());
     };
     // Acquire write lock so no concurrent mutation can land between
     // snapshot capture and WAL truncate.
-    let snapshot_bytes = {
+    let (snapshot_bytes, any_tx_open) = {
         let engine = state
             .engine
             .write()
-            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
-        if engine.in_transaction() {
-            return write_frame(
-                stream,
-                &build_error_response("CHECKPOINT refused: an open transaction is in flight"),
-            );
-        }
+            .map_err(|_| String::from("engine rwlock poisoned"))?;
+        // v7.40.11 — an open transaction bars the TRUNCATE, not the
+        // checkpoint.
+        //
+        // This used to refuse outright, and PostgreSQL does not:
+        // `BEGIN; CHECKPOINT; COMMIT;` succeeds there, and so does a
+        // multi-statement script ending in one — which psql -f and
+        // sqlx::migrate!() send as a single frame wrapped in an
+        // implicit block, so the refusal took out the ordinary case.
+        //
+        // The snapshot is COMMITTED state by construction (an open
+        // TX's shadow is never serialised), so writing it is always
+        // safe. The WAL is the part that is not: an in-flight
+        // transaction's records are already in it, and truncating
+        // would leave its later COMMIT replaying alone with nothing to
+        // apply. So the snapshot and the manifest always land, and the
+        // WAL is reclaimed only when nothing is in flight — which is
+        // the same reason PostgreSQL cannot recycle a segment a
+        // running transaction still needs.
+        let any_tx_open = engine.in_transaction();
         let bytes = engine.snapshot();
         drop(engine);
-        bytes
+        (bytes, any_tx_open)
     };
-    if let Err(e) = write_atomic(db_path, &snapshot_bytes) {
-        return write_frame(
-            stream,
-            &build_error_response(&format!("CHECKPOINT snapshot write failed: {e}")),
-        );
-    }
+    write_atomic(db_path, &snapshot_bytes)
+        .map_err(|e| format!("CHECKPOINT snapshot write failed: {e}"))?;
     let cold_paths = state
         .cold_segment_paths
         .lock()
@@ -217,37 +252,32 @@ pub(crate) fn run_checkpoint_command(
     // Post-truncate the WAL will start at byte 0, so the manifest's
     // `wal_baseline_offset` for the *next* boot is also 0 — every
     // byte after this point is post-checkpoint and must be replayed.
+    // When the truncate is skipped the baseline stays 0 as well, which
+    // replays the whole WAL over the fresh snapshot: more work at boot,
+    // and every record still applied exactly once.
     write_manifest_alongside(db_path, &snapshot_bytes, &cold_paths, 0);
     // Truncate WAL last — until the manifest lands, a crash here
     // would leave the WAL holding old bytes that the manifest CRC
     // check will detect on the next boot.
+    if any_tx_open {
+        return Ok(());
+    }
     if let Some(wal_mutex) = state.wal.as_ref() {
         let wal_lock = wal_mutex
             .lock()
-            .map_err(|_| std::io::Error::other("WAL mutex poisoned"))?;
-        if let Err(e) = wal_lock.set_len(0) {
-            // Best-effort: log + report. The snapshot + manifest
-            // already landed; on next boot the manifest's CRC will
-            // match and the residual WAL bytes will replay as a
-            // (defensive) no-op idempotency replay. Not a hard
-            // failure.
-            return write_frame(
-                stream,
-                &build_error_response(&format!("CHECKPOINT WAL truncate failed: {e}")),
-            );
-        }
-        if let Err(e) = wal_lock.sync_data() {
-            return write_frame(
-                stream,
-                &build_error_response(&format!("CHECKPOINT WAL sync failed: {e}")),
-            );
-        }
+            .map_err(|_| String::from("WAL mutex poisoned"))?;
+        // Best-effort on failure: the snapshot + manifest already
+        // landed; on next boot the manifest's CRC will match and the
+        // residual WAL bytes replay as a (defensive) no-op.
+        wal_lock
+            .set_len(0)
+            .map_err(|e| format!("CHECKPOINT WAL truncate failed: {e}"))?;
+        wal_lock
+            .sync_data()
+            .map_err(|e| format!("CHECKPOINT WAL sync failed: {e}"))?;
         drop(wal_lock);
     }
-    // Return 0 in the affected-rows slot — there's no natural row
-    // count for a checkpoint. Operators can poll `wal_path` size
-    // afterwards to confirm the truncate.
-    write_frame(stream, &build_command_complete(0))
+    Ok(())
 }
 
 /// v6.7.3 — parse `COMPACT COLD SEGMENTS` (case-insensitive,

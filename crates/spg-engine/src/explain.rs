@@ -1884,7 +1884,7 @@ impl Engine {
             let ms = us as f64 / 1000.0;
             lines.push(alloc::format!("Execution Time: {ms:.3} ms"));
         }
-        let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
+        let columns = explain_columns(e);
         let rows: Vec<Row<'static>> = lines
             .into_iter()
             .map(|l| Row::new(alloc::vec![Value::text(l)]))
@@ -2150,7 +2150,7 @@ impl Engine {
         // default is text (one row per line). Non-text formats
         // bundle the whole plan into a single TEXT row whose body
         // wraps the line list in the chosen container.
-        let columns = alloc::vec![ColumnSchema::new("QUERY PLAN", DataType::Text, false)];
+        let columns = explain_columns(e);
         let rows: Vec<Row<'static>> = match e.format {
             spg_sql::ast::ExplainFormat::Text => lines
                 .into_iter()
@@ -2270,4 +2270,31 @@ fn xml_escape(s: &str) -> alloc::string::String {
 /// same escapes JSON uses.
 fn yaml_scalar(s: &str) -> alloc::string::String {
     json_string_lit(s)
+}
+
+/// v7.40.11 — the SHAPE `EXPLAIN` answers with, read by the executor
+/// and by Describe.
+///
+/// Describe answered no columns for EXPLAIN, so over the extended
+/// protocol the rows arrived with no RowDescription in front of them —
+/// psql: `server sent data ("D" message) without prior row description
+/// ("T" message)`.
+///
+/// The type follows the FORMAT, which is how a client knows to parse
+/// the payload rather than print it. Measured on PostgreSQL 18.6 with
+/// `\gdesc`:
+///
+/// ```text
+///   EXPLAIN SELECT 1                  QUERY PLAN  text
+///   EXPLAIN (FORMAT JSON) SELECT 1    QUERY PLAN  json
+///   EXPLAIN (FORMAT XML) SELECT 1     QUERY PLAN  xml
+///   EXPLAIN (FORMAT YAML) SELECT 1    QUERY PLAN  text
+/// ```
+pub(crate) fn explain_columns(e: &spg_sql::ast::ExplainStatement) -> Vec<ColumnSchema> {
+    let ty = match e.format {
+        spg_sql::ast::ExplainFormat::Json => DataType::Json,
+        spg_sql::ast::ExplainFormat::Xml => DataType::Xml,
+        spg_sql::ast::ExplainFormat::Text | spg_sql::ast::ExplainFormat::Yaml => DataType::Text,
+    };
+    alloc::vec![ColumnSchema::new("QUERY PLAN", ty, false)]
 }
