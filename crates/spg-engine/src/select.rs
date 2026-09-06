@@ -2493,26 +2493,8 @@ impl Engine {
     /// Callers decide whether to return it directly (`SELECT *`) or stage
     /// it as a temp table for the full query pipeline.
     fn meta_view_result(&self, name: &str) -> Option<QueryResult> {
-        Some(match name {
-            "spg_statistic" => self.exec_spg_statistic(),
-            "spg_stat_replication" => self.exec_spg_stat_replication(),
-            "spg_stat_segment" => self.exec_spg_stat_segment(),
-            "spg_memory_stats" => self.exec_spg_memory_stats(),
-            "spg_stat_query" => self.exec_spg_stat_query(),
-            "pg_stat_statements" => self.exec_pg_stat_statements(),
-            "spg_stat_activity" => self.exec_spg_stat_activity(),
-            "pg_stat_activity" => self.exec_pg_stat_activity(),
-            "pg_locks" => self.exec_pg_locks(),
-            "pg_statio_user_tables" => self.exec_pg_statio_user_tables(),
-            "spg_stat_mvcc" => self.exec_spg_stat_mvcc(),
-            "spg_partition_health" => self.exec_spg_partition_health(),
-            "spg_audit_chain" => self.exec_spg_audit_chain(),
-            "spg_audit_verify" => self.exec_spg_audit_verify(),
-            "spg_table_ddl" => self.exec_spg_table_ddl(),
-            "spg_role_ddl" => self.exec_spg_role_ddl(),
-            "spg_database_ddl" => self.exec_spg_database_ddl(),
-            _ => return None,
-        })
+        let (_, build) = META_VIEWS.iter().find(|(n, _)| *n == name)?;
+        Some(build(self))
     }
 
     /// v7.39 (round 462) — the catalog an admin / stat view SELECT
@@ -6584,7 +6566,13 @@ impl Engine {
             // COUNT of zero rather than fall back to a scan.
             let col = schema.columns.get(col_pos)?;
             let v = crate::index_access::literal_as_column_value(l, col, col_pos)?;
-            let key = spg_storage::IndexKey::from_value_for_column(&v, col.ty)?;
+            // v7.40.11 — and through the shared probe, which asks the
+            // index what space its entries are in. This tally has no
+            // scan to fall back to, so a key built in the wrong space
+            // would answer a COUNT of zero — the comment above said so
+            // and the key was still built from the value alone.
+            let key =
+                crate::index_access::probe_key_for_index(table, idx, col, &v, self.speaks_mysql)?;
             if !idx.lookup_eq(&key).is_empty() {
                 count += 1;
             }
@@ -14654,9 +14642,325 @@ impl crate::Engine {
         Ok(())
     }
 
+    /// v7.40.11 — the DML half of [`Self::validate_from_relations`].
+    ///
+    /// PostgreSQL analyses an INSERT / UPDATE / DELETE at PREPARE the
+    /// same way it analyses a SELECT, and measured on 18.6 it refuses
+    /// all of these:
+    ///
+    /// ```text
+    ///   INSERT INTO no_such_table VALUES (1)      relation … does not exist
+    ///   UPDATE no_such_table SET a = 1            relation … does not exist
+    ///   DELETE FROM no_such_table                 relation … does not exist
+    ///   INSERT INTO dr (nosuchcol) VALUES (1)     column "nosuchcol" of relation "dr" …
+    ///   UPDATE dr SET nosuchcol = 1               column "nosuchcol" of relation "dr" …
+    ///   DELETE FROM dr WHERE nosuchcol = 1        column "nosuchcol" does not exist
+    /// ```
+    ///
+    /// The last row is not a Describe defect at all: SPG ran that DELETE
+    /// and reported success. A predicate naming a column the table does
+    /// not have matches nothing, so the statement deleted nothing and
+    /// said so in the shape of a normal answer — the WHERE clause of a
+    /// DELETE was the one clause nothing checked.
+    ///
+    /// Called from the execute path as well as from Describe, so the
+    /// wording cannot depend on which protocol carried the statement.
+    ///
+    /// # Errors
+    /// The relation or the column, in PostgreSQL 18.6's words.
+    pub(crate) fn validate_dml(
+        &self,
+        stmt: &Statement,
+        cat: &spg_storage::Catalog,
+    ) -> Result<(), EngineError> {
+        match stmt {
+            Statement::Insert(ins) => self.validate_insert(ins, cat),
+            Statement::Update(upd) => self.validate_update(upd, cat),
+            Statement::Delete(del) => self.validate_delete(del, cat),
+            _ => Ok(()),
+        }
+    }
+
+    pub(crate) fn validate_insert(
+        &self,
+        ins: &spg_sql::ast::InsertStatement,
+        cat: &spg_storage::Catalog,
+    ) -> Result<(), EngineError> {
+        {
+            {
+                self.require_relation(cat, &ins.table)?;
+                let mut scope = self.check_dml_ctes(&ins.ctes, cat)?;
+                if let Some(sel) = &ins.select_source {
+                    self.check_select_relations(sel, cat, &mut scope)?;
+                }
+                if let Some(cols) = &ins.columns {
+                    self.require_target_columns(cat, &ins.table, cols.iter().map(String::as_str))?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn validate_update(
+        &self,
+        upd: &spg_sql::ast::UpdateStatement,
+        cat: &spg_storage::Catalog,
+    ) -> Result<(), EngineError> {
+        {
+            {
+                self.require_relation(cat, &upd.table)?;
+                self.check_dml_ctes(&upd.ctes, cat)?;
+                self.require_target_columns(
+                    cat,
+                    &upd.table,
+                    upd.assignments.iter().map(|(c, _)| c.as_str()),
+                )?;
+                // An extra source (UPDATE … FROM) or a CTE puts names in
+                // scope this synthetic one-source SELECT does not know
+                // about, and refusing one of those would break a working
+                // statement. The target check above still applies.
+                if upd.from_sources.is_none() && upd.ctes.is_empty() {
+                    self.validate_clause_columns_in(
+                        &dml_shaped_select(
+                            &upd.table,
+                            upd.alias.as_deref(),
+                            upd.where_.as_ref(),
+                            upd.returning.as_deref(),
+                        ),
+                        cat,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn validate_delete(
+        &self,
+        del: &spg_sql::ast::DeleteStatement,
+        cat: &spg_storage::Catalog,
+    ) -> Result<(), EngineError> {
+        {
+            {
+                self.require_relation(cat, &del.table)?;
+                self.check_dml_ctes(&del.ctes, cat)?;
+                // `DELETE … USING` is lowered at parse into an EXISTS
+                // subquery inside the WHERE, and the reference walk does
+                // not descend into a subquery — so the extra source's
+                // columns are never mistaken for the target's.
+                if del.ctes.is_empty() {
+                    self.validate_clause_columns_in(
+                        &dml_shaped_select(
+                            &del.table,
+                            del.alias.as_deref(),
+                            del.where_.as_ref(),
+                            del.returning.as_deref(),
+                        ),
+                        cat,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The CTE bodies of a DML statement, checked as the SELECTs they
+    /// are; returns their names so the statement's own sources can see
+    /// them.
+    fn check_dml_ctes(
+        &self,
+        ctes: &[spg_sql::ast::Cte],
+        cat: &spg_storage::Catalog,
+    ) -> Result<Vec<String>, EngineError> {
+        let mut scope: Vec<String> = Vec::with_capacity(ctes.len());
+        for cte in ctes {
+            scope.push(cte.name.clone());
+            if let Some(body) = cte.body.as_select() {
+                self.check_select_relations(body, cat, &mut scope)?;
+            }
+        }
+        Ok(scope)
+    }
+
+    fn require_relation(&self, cat: &spg_storage::Catalog, name: &str) -> Result<(), EngineError> {
+        if self.relation_resolves(cat, name) {
+            return Ok(());
+        }
+        Err(EngineError::Storage(
+            spg_storage::StorageError::TableNotFound {
+                name: name.to_string(),
+            },
+        ))
+    }
+
+    /// The columns a DML statement WRITES must exist on its target. PG's
+    /// wording names the relation as well as the column, which is what
+    /// the INSERT path here has always said; UPDATE said only the
+    /// column, so the same mistake read differently depending on the
+    /// verb.
+    fn require_target_columns<'n>(
+        &self,
+        cat: &spg_storage::Catalog,
+        table: &str,
+        columns: impl Iterator<Item = &'n str>,
+    ) -> Result<(), EngineError> {
+        let Some(t) = cat.get(table) else {
+            return Ok(());
+        };
+        for c in columns {
+            if is_system_column(c)
+                || t.schema()
+                    .columns
+                    .iter()
+                    .any(|sc| self.col_name_eq(&sc.name, c))
+            {
+                continue;
+            }
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column \"{c}\" of relation \"{table}\" does not exist"
+            )));
+        }
+        Ok(())
+    }
+
+    /// v7.40.11 — every FROM item that NAMES a relation names one that
+    /// exists.
+    ///
+    /// The read path gets this for free: it looks the name up when it
+    /// goes to read the rows, and says `relation "x" does not exist`.
+    /// Describe never reads rows, so it said nothing at all — a client
+    /// that prepared a statement against a table it had misspelled was
+    /// told Parse succeeded and found out one round trip later, and a
+    /// tool that only ever Describes was never corrected.
+    ///
+    /// PostgreSQL runs this analysis at Parse (`PREPARE p AS SELECT *
+    /// FROM no_such_table` is an error there, measured on 18.6), which
+    /// is the point this is called from.
+    ///
+    /// The accepted half is the load-bearing half. A name in FROM
+    /// reaches its rows by six routes — a table, a view, a sequence, a
+    /// CTE in scope, a synthesised `pg_catalog`/`information_schema`
+    /// view, one of the [`META_VIEWS`] built inside its own `exec_*` —
+    /// and refusing a name that any of them would have resolved turns a
+    /// working query into a Parse error. So the check only fires when
+    /// every route has been asked and all of them said no.
+    ///
+    /// # Errors
+    /// [`spg_storage::StorageError::TableNotFound`] for the first
+    /// unresolvable name, which is the message and the SQLSTATE (42P01)
+    /// the read path already produces for it.
+    pub(crate) fn validate_from_relations(
+        &self,
+        stmt: &SelectStatement,
+        cat: &spg_storage::Catalog,
+    ) -> Result<(), EngineError> {
+        let mut ctes_in_scope: Vec<String> = Vec::new();
+        self.check_select_relations(stmt, cat, &mut ctes_in_scope)
+    }
+
+    fn check_select_relations(
+        &self,
+        stmt: &SelectStatement,
+        cat: &spg_storage::Catalog,
+        ctes_in_scope: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let outer = ctes_in_scope.len();
+        // A CTE is visible to its own body (WITH RECURSIVE), to the CTEs
+        // after it, and to the statement itself. Pushing the name before
+        // walking the body covers all three.
+        for cte in &stmt.ctes {
+            ctes_in_scope.push(cte.name.clone());
+            if let Some(body) = cte.body.as_select() {
+                self.check_select_relations(body, cat, ctes_in_scope)?;
+            }
+        }
+        let result = self.check_select_relations_inner(stmt, cat, ctes_in_scope);
+        ctes_in_scope.truncate(outer);
+        result
+    }
+
+    fn check_select_relations_inner(
+        &self,
+        stmt: &SelectStatement,
+        cat: &spg_storage::Catalog,
+        ctes_in_scope: &mut Vec<String>,
+    ) -> Result<(), EngineError> {
+        let mut nested: Vec<&SelectStatement> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if t.kind() == spg_sql::ast::FromItemKind::Relation
+                    && !ctes_in_scope.iter().any(|c| c == &t.name)
+                    && !self.relation_resolves(cat, &t.name)
+                {
+                    return Err(EngineError::Storage(
+                        spg_storage::StorageError::TableNotFound {
+                            name: t.name.clone(),
+                        },
+                    ));
+                }
+                collect_nested_selects_of_table(t, &mut nested);
+            }
+            for on in from.joins.iter().filter_map(|j| j.on.as_ref()) {
+                collect_nested_selects(on, &mut nested);
+            }
+        }
+        for item in &stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                collect_nested_selects(expr, &mut nested);
+            }
+        }
+        for e in stmt
+            .where_
+            .iter()
+            .chain(stmt.having.iter())
+            .chain(stmt.group_by.iter().flatten())
+            .chain(stmt.window_check_exprs.iter())
+            .chain(stmt.order_by.iter().map(|o| &o.expr))
+        {
+            collect_nested_selects(e, &mut nested);
+        }
+        for sub in nested {
+            self.check_select_relations(sub, cat, ctes_in_scope)?;
+        }
+        for (_, peer) in &stmt.unions {
+            self.check_select_relations(peer, cat, ctes_in_scope)?;
+        }
+        Ok(())
+    }
+
+    /// Can this name in FROM position reach rows at all? Every route the
+    /// executor can take, asked in turn. See
+    /// [`Self::validate_from_relations`] for why the list has to be
+    /// complete rather than merely long.
+    fn relation_resolves(&self, cat: &spg_storage::Catalog, name: &str) -> bool {
+        cat.get(name).is_some()
+            || cat.has_view(name)
+            || cat.sequence(name).is_some()
+            || cat.materialized_views().contains_key(name)
+            || is_meta_view_name(&name.to_ascii_lowercase())
+    }
+
     pub(crate) fn validate_clause_columns(
         &self,
         stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        self.validate_clause_columns_in(stmt, self.active_catalog())
+    }
+
+    /// v7.40.11 — the same check against a NAMED catalog.
+    ///
+    /// The read path reaches a system view by materialising it into a
+    /// catalog and re-entering itself, so by the time this check runs
+    /// there the view is an ordinary table and its columns are known.
+    /// Describe never re-enters, so it ran the check against a catalog
+    /// where `pg_class` does not exist, took the "not a table I know"
+    /// exit, and answered `nosuchcol|text` — a column it invented, with
+    /// a type. Handing Describe the same catalog execution uses is what
+    /// makes the two answer alike.
+    pub(crate) fn validate_clause_columns_in(
+        &self,
+        stmt: &SelectStatement,
+        cat: &spg_storage::Catalog,
     ) -> Result<(), EngineError> {
         let Some(from) = &stmt.from else {
             return Ok(());
@@ -14674,7 +14978,6 @@ impl crate::Engine {
         // complete one in the engine. It moved to the type so the other
         // fifty-five sites can ask the same question.
         let plain = |t: &spg_sql::ast::TableRef| -> bool { t.names_a_relation() };
-        let cat = self.active_catalog();
         let mut sources: Vec<(String, &spg_storage::Table)> = Vec::new();
         for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
             if !plain(t) {
@@ -14685,13 +14988,22 @@ impl crate::Engine {
             };
             sources.push((t.alias.clone().unwrap_or_else(|| t.name.clone()), table));
         }
-        let known = |c: &spg_sql::ast::ColumnName| -> bool {
+        let known = |c: &spg_sql::ast::ColumnName, ctx: &str| -> bool {
             // A system column is not in a table's list and is a perfectly
             // good predicate: `WHERE ctid = '(0,4)'::tid` and `WHERE
             // tableoid::regclass::text = 'pm_a'` are both real, and the
             // first draft of this check refused them. The e2e suite said
             // so immediately, which is what it is for.
             if is_system_column(&c.name) {
+                return true;
+            }
+            // v7.40.11 — a bare name that IS one of the sources is a
+            // WHOLE-ROW reference, not a column: `SELECT to_jsonb(x)
+            // FROM emp x` passes the row itself. Sixteen pins said so
+            // the first time the select list was checked at all — the
+            // other clauses never met the shape because a whole row is
+            // something you project, not something you filter on.
+            if c.qualifier.is_none() && sources.iter().any(|(a, _)| self.col_name_eq(a, &c.name)) {
                 return true;
             }
             if let Some(q) = &c.qualifier {
@@ -14719,13 +15031,21 @@ impl crate::Engine {
                 })
                 // An output name the statement itself defines: ORDER BY,
                 // GROUP BY and HAVING may all name one.
-                || stmt.items.iter().any(|it| match it {
+                //
+                // v7.40.11 — but the SELECT LIST cannot name its own
+                // output. Letting it made every unknown column in the
+                // projection vouch for itself: the reference `nosuchcol`
+                // matched the item `nosuchcol` and the check passed. Only
+                // the clauses that are evaluated AFTER the projection get
+                // this.
+                || (ctx != "field list"
+                    && stmt.items.iter().any(|it| match it {
                     SelectItem::Expr { expr, alias } => {
                         alias.as_deref() == Some(c.name.as_str())
                             || matches!(expr, Expr::Column(pc) if pc.name == c.name)
                     }
                     _ => false,
-                })
+                }))
         };
         // v7.39.2 — the CLAUSE travels with the reference, because MySQL
         // names it: `Unknown column 'x' in 'where clause'`, `'order
@@ -14743,6 +15063,17 @@ impl crate::Engine {
             collect_plain_column_refs(e, &mut here);
             out.extend(here.into_iter().map(|c| (c, ctx)));
         };
+        // v7.40.11 — and the select list, which MySQL 9.7.2 calls the
+        // `field list`. It was the one clause left out, so `SELECT
+        // nosuchcol FROM t` reached Describe unexamined and was answered
+        // with an invented column and a type. The read path already
+        // refuses it at row time with this same `ColumnNotFound`; naming
+        // it here is what lets Describe say so too.
+        for item in &stmt.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                push(expr, "field list", &mut refs);
+            }
+        }
         if let Some(w) = &stmt.where_ {
             push(w, "where clause", &mut refs);
         }
@@ -14766,7 +15097,7 @@ impl crate::Engine {
             }
         }
         for (c, ctx) in &refs {
-            if !known(c) {
+            if !known(c, ctx) {
                 if self.speaks_mysql {
                     // The QUALIFIER travels with it: MySQL 9.7.2 answers
                     // `Unknown column 'j1.nosuch' in 'on clause'`, not the
@@ -16653,4 +16984,103 @@ fn try_count_over_const_unnest(
     });
     out.where_ = counted.where_.clone();
     Some(out)
+}
+/// The meta views that never reach the catalog: each is a fixed row set
+/// built inside its own `exec_*`.
+///
+/// v7.40.11 — one table rather than a `match`, because two questions are
+/// asked of this list and they must not be able to disagree. Describe
+/// needs "is this name a relation at all?" and answering it by
+/// re-listing the names is how a name gets added to one list and not the
+/// other; answering it by BUILDING the view would make a Describe of
+/// `pg_stat_activity` walk every session. Membership and dispatch now
+/// come from the same array.
+type MetaViewFn = fn(&Engine) -> QueryResult;
+static META_VIEWS: &[(&str, MetaViewFn)] = &[
+    ("spg_statistic", Engine::exec_spg_statistic),
+    ("spg_stat_replication", Engine::exec_spg_stat_replication),
+    ("spg_stat_segment", Engine::exec_spg_stat_segment),
+    ("spg_memory_stats", Engine::exec_spg_memory_stats),
+    ("spg_stat_query", Engine::exec_spg_stat_query),
+    ("pg_stat_statements", Engine::exec_pg_stat_statements),
+    ("spg_stat_activity", Engine::exec_spg_stat_activity),
+    ("pg_stat_activity", Engine::exec_pg_stat_activity),
+    ("pg_locks", Engine::exec_pg_locks),
+    ("pg_statio_user_tables", Engine::exec_pg_statio_user_tables),
+    ("spg_stat_mvcc", Engine::exec_spg_stat_mvcc),
+    ("spg_partition_health", Engine::exec_spg_partition_health),
+    ("spg_audit_chain", Engine::exec_spg_audit_chain),
+    ("spg_audit_verify", Engine::exec_spg_audit_verify),
+    ("spg_table_ddl", Engine::exec_spg_table_ddl),
+    ("spg_role_ddl", Engine::exec_spg_role_ddl),
+    ("spg_database_ddl", Engine::exec_spg_database_ddl),
+];
+
+/// Is this (lowercased) name one of [`META_VIEWS`]? The cheap half of
+/// the same question `meta_view_result` answers expensively.
+fn is_meta_view_name(name: &str) -> bool {
+    META_VIEWS.iter().any(|(n, _)| *n == name)
+}
+
+/// Every `SelectStatement` nested directly inside `e`. Split out so the
+/// walk that needs them can hold one `&mut Vec` rather than a closure
+/// inside a closure.
+fn collect_nested_selects<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    let _: Result<(), core::convert::Infallible> = e.for_each_subquery(&mut |s| {
+        out.push(s);
+        Ok(())
+    });
+}
+
+/// The same, for the row-producing slots of one FROM item. Total by
+/// construction: it goes through `try_for_each_slot`, whose destructure
+/// is a compile error when a slot is added.
+fn collect_nested_selects_of_table<'a>(
+    t: &'a spg_sql::ast::TableRef,
+    out: &mut Vec<&'a SelectStatement>,
+) {
+    let _: Result<(), core::convert::Infallible> = t.try_for_each_slot(&mut |slot| {
+        match slot {
+            spg_sql::ast::FromSlotRef::Expr(e) => collect_nested_selects(e, out),
+            spg_sql::ast::FromSlotRef::Select(s) => out.push(s),
+        }
+        Ok(())
+    });
+}
+
+/// A one-source SELECT with a DML statement's WHERE and RETURNING, so
+/// the column check written for SELECT can read them. Nothing executes
+/// it; only the reference walk looks at it.
+fn dml_shaped_select(
+    table: &str,
+    alias: Option<&str>,
+    where_: Option<&Expr>,
+    returning: Option<&[SelectItem]>,
+) -> SelectStatement {
+    let mut primary = crate::acl::bare_table_ref(table.to_string());
+    primary.alias = alias.map(alloc::string::ToString::to_string);
+    // PG 18's `RETURNING OLD.col / NEW.col` names the target row before
+    // and after the change. Both carry the target's own columns, so
+    // staging them as two more sources of the SAME table is what makes
+    // the reference walk accept them without teaching it a special case.
+    let pseudo = |a: &str| spg_sql::ast::FromJoin {
+        kind: spg_sql::ast::JoinKind::Cross,
+        table: {
+            let mut t = crate::acl::bare_table_ref(table.to_string());
+            t.alias = Some(a.to_string());
+            t
+        },
+        on: None,
+        using_cols: None,
+        natural: false,
+    };
+    SelectStatement {
+        from: Some(spg_sql::ast::FromClause {
+            primary,
+            joins: alloc::vec![pseudo("old"), pseudo("new")],
+        }),
+        items: returning.map(<[SelectItem]>::to_vec).unwrap_or_default(),
+        where_: where_.cloned(),
+        ..SelectStatement::default()
+    }
 }

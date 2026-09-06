@@ -1368,7 +1368,7 @@ impl Engine {
 /// A minimal `TableRef` naming a base table — the synthetic FROM the UPDATE /
 /// DELETE gates build so their WHERE and RETURNING go through the same
 /// column-read walker a SELECT does.
-fn bare_table_ref(name: String) -> TableRef {
+pub(crate) fn bare_table_ref(name: String) -> TableRef {
     TableRef {
         name,
         alias: None,

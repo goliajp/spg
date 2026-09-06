@@ -898,9 +898,13 @@ impl Engine {
                 }
                 let rows: Vec<Vec<spg_storage::Value<'static>>> =
                     ws.inserted.iter().map(|(_, r)| r.values.clone()).collect();
-                if let Err(e) =
-                    crate::constraints::enforce_fk_inserts(&st.catalog, tname, &fks, &rows)
-                {
+                if let Err(e) = crate::constraints::enforce_fk_inserts(
+                    &st.catalog,
+                    tname,
+                    &fks,
+                    &rows,
+                    self.speaks_mysql,
+                ) {
                     fk_conflict = Some(alloc::format!("{e}"));
                     break 'fk;
                 }

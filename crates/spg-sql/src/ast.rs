@@ -4071,6 +4071,107 @@ impl Expr {
         }
         Ok(())
     }
+
+    /// The shared twin of [`Self::for_each_subquery_mut`], for analysis
+    /// that reads a statement rather than rewriting it.
+    ///
+    /// Same wildcard-free match, same iterative walk. Rust cannot write
+    /// one body generic over `&`/`&mut`, so the two must be edited
+    /// together; exhaustiveness is what makes that a compile error
+    /// rather than a silent gap in one of them.
+    ///
+    /// # Errors
+    /// Whatever `f` returns.
+    pub fn for_each_subquery<'a, E>(
+        &'a self,
+        f: &mut impl FnMut(&'a SelectStatement) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut stack: Vec<&'a Self> = alloc::vec![self];
+        while let Some(e) = stack.pop() {
+            match e {
+                Self::Literal(_) | Self::Column(_) | Self::Placeholder(_) => {}
+                Self::NamedArg { expr, .. }
+                | Self::Collate { expr, .. }
+                | Self::Variadic(expr)
+                | Self::Unary { expr, .. }
+                | Self::Cast { expr, .. }
+                | Self::FieldAccess { base: expr, .. }
+                | Self::IsNull { expr, .. }
+                | Self::BoolTest { expr, .. }
+                | Self::Extract { source: expr, .. } => stack.push(expr),
+                Self::Binary { lhs, rhs, .. } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+                Self::Like { expr, pattern, .. } => {
+                    stack.push(expr);
+                    stack.push(pattern);
+                }
+                Self::ArraySubscript { target, index } => {
+                    stack.push(target);
+                    stack.push(index);
+                }
+                Self::ArraySlice { target, lo, hi } => {
+                    stack.push(target);
+                    stack.extend(lo.iter().chain(hi.iter()).map(|b| &**b));
+                }
+                Self::AnyAll { expr, array, .. } => {
+                    stack.push(expr);
+                    stack.push(array);
+                }
+                Self::FunctionCall { args, .. } | Self::Array(args) => {
+                    stack.extend(args.iter());
+                }
+                Self::AggregateOrdered {
+                    call,
+                    order_by,
+                    filter,
+                    ..
+                } => {
+                    stack.push(call);
+                    stack.extend(order_by.iter().map(|o| &o.expr));
+                    stack.extend(filter.iter().map(|b| &**b));
+                }
+                Self::WindowFunction {
+                    args,
+                    partition_by,
+                    order_by,
+                    filter,
+                    ..
+                } => {
+                    stack.extend(args.iter().chain(partition_by.iter()));
+                    stack.extend(order_by.iter().map(|(e, _, _)| e));
+                    stack.extend(filter.iter().map(|b| &**b));
+                }
+                Self::InList { expr, list, .. } => {
+                    stack.push(expr);
+                    stack.extend(list.iter());
+                }
+                Self::Case {
+                    operand,
+                    branches,
+                    else_branch,
+                } => {
+                    stack.extend(operand.iter().chain(else_branch.iter()).map(|b| &**b));
+                    for (when, then) in branches {
+                        stack.push(when);
+                        stack.push(then);
+                    }
+                }
+                Self::ScalarSubquery(s) | Self::Exists { subquery: s, .. } => f(s)?,
+                Self::InSubquery { expr, subquery, .. } => {
+                    stack.push(expr);
+                    f(subquery)?;
+                }
+                Self::RowInSubquery { row, subquery, .. }
+                | Self::RowCmpSubquery { row, subquery, .. } => {
+                    stack.extend(row.iter());
+                    f(subquery)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// v7.9.24 — LIMIT / OFFSET value. Integer literal at parse
@@ -4467,6 +4568,18 @@ pub enum FromSlot<'a> {
     Select(&'a mut SelectStatement),
 }
 
+/// The shared half of [`FromSlot`].
+///
+/// v7.40.11 — analysis reads a statement it must not modify, and Rust
+/// has no way to write one walk that is generic over `&`/`&mut`. The two
+/// bodies are the same destructure and must move together; the
+/// destructures are total, so a new slot fails to compile in both.
+#[derive(Debug)]
+pub enum FromSlotRef<'a> {
+    Expr(&'a Expr),
+    Select(&'a SelectStatement),
+}
+
 impl TableRef {
     /// Whether this FROM item NAMES A RELATION — a table, view or CTE —
     /// rather than producing its own rows.
@@ -4634,6 +4747,73 @@ impl TableRef {
             visit(FromSlot::Expr(doc))?;
             for (_, e) in passing.iter_mut() {
                 visit(FromSlot::Expr(e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The shared twin of [`Self::try_for_each_slot_mut`], for analysis
+    /// that reads a statement rather than rewriting it. Same total
+    /// destructure — a new slot is a compile error in both.
+    ///
+    /// # Errors
+    /// Whatever `visit` returns.
+    pub fn try_for_each_slot<'a, E>(
+        &'a self,
+        visit: &mut dyn FnMut(FromSlotRef<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Self {
+            name: _,
+            alias: _,
+            only: _,
+            as_of_segment: _,
+            unnest_column_aliases: _,
+            with_ordinality: _,
+            scalar_fn_item: _,
+            unnest_expr,
+            generate_series_args,
+            lateral_subquery,
+            jsonb_each_text_arg,
+            table_fn_call,
+            rows_from,
+            json_table,
+        } = self;
+        if let Some(e) = unnest_expr {
+            visit(FromSlotRef::Expr(e))?;
+        }
+        if let Some(args) = generate_series_args {
+            for a in args {
+                visit(FromSlotRef::Expr(a))?;
+            }
+        }
+        if let Some(sub) = lateral_subquery {
+            visit(FromSlotRef::Select(sub))?;
+        }
+        if let Some((_, e)) = jsonb_each_text_arg {
+            visit(FromSlotRef::Expr(e))?;
+        }
+        if let Some(call) = table_fn_call {
+            for a in &call.1 {
+                visit(FromSlotRef::Expr(a))?;
+            }
+        }
+        if let Some(items) = rows_from {
+            for (_, args) in items {
+                for a in args {
+                    visit(FromSlotRef::Expr(a))?;
+                }
+            }
+        }
+        if let Some(jt) = json_table {
+            let JsonTable {
+                doc,
+                row_path: _,
+                columns: _,
+                passing,
+            } = jt.as_ref();
+            visit(FromSlotRef::Expr(doc))?;
+            for (_, e) in passing {
+                visit(FromSlotRef::Expr(e))?;
             }
         }
         Ok(())

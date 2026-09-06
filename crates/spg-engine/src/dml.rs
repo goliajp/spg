@@ -1890,7 +1890,13 @@ impl Engine {
             // here; COMMIT (or SET CONSTRAINTS IMMEDIATE) runs it.
             let now = self.immediate_fks(&self_fks);
             if !now.is_empty() {
-                enforce_fk_inserts(self.active_catalog(), &stmt.table, &now, &new_rows)?;
+                enforce_fk_inserts(
+                    self.active_catalog(),
+                    &stmt.table,
+                    &now,
+                    &new_rows,
+                    self.speaks_mysql,
+                )?;
             }
         }
         // v7.13.0 — CHECK constraint enforcement on UPDATE
@@ -5106,7 +5112,13 @@ impl Engine {
             // v7.39 (round 288) — same split on the INSERT path.
             let now = self.immediate_fks(&fks);
             if !now.is_empty() {
-                enforce_fk_inserts(self.active_catalog(), &stmt.table, &now, &all_values)?;
+                enforce_fk_inserts(
+                    self.active_catalog(),
+                    &stmt.table,
+                    &now,
+                    &all_values,
+                    self.speaks_mysql,
+                )?;
             }
         }
         // v7.13.0 — CHECK constraint enforcement (mailrs round-5 G3).
