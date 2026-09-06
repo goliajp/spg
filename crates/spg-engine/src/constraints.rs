@@ -377,10 +377,16 @@ fn on_conflict_key_exists(
     let Some(idx_key) = spg_storage::IndexKey::from_value(key) else {
         return false;
     };
-    table.indices().iter().any(|idx| {
+    let probed = table.indices().iter().any(|idx| {
         matches!(idx.kind, spg_storage::IndexKind::BTree(_))
             && idx.column_position == column_pos
             && idx.partial_predicate.is_none()
+            // v7.40.11 — not a locale-collated index. Its tree is keyed
+            // by ICU sort keys, so `lookup_eq` of a RAW value answers
+            // "no locators" whatever is stored, and this reads that as
+            // "no conflict". See the twin rule in `uc_probe_choice` and
+            // in `enforce_unique_index_inserts`.
+            && table.index_collation(idx).is_none()
             // v7.37.15 (Phase C.3) — a tombstoned index hit is not a
             // live conflict: the key was freed by a gate-on DELETE, so
             // re-inserting it must NOT trip ON CONFLICT. Gate-off has no
@@ -389,6 +395,45 @@ fn on_conflict_key_exists(
                 .lookup_eq(&idx_key)
                 .iter()
                 .any(|loc| !locator_is_tombstoned(table, loc))
+    });
+    if probed {
+        return true;
+    }
+    // v7.40.11 — and if no index could answer, ASK THE ROWS.
+    //
+    // 7.40.10 taught the INSERT-time uniqueness check to decline a
+    // locale-collated index and fold the table; this arbiter kept
+    // probing, found nothing, and let the row through to be refused by
+    // the check that had just been fixed:
+    //
+    //   INSERT … ON CONFLICT (email) DO UPDATE …
+    //     ERROR:  duplicate key value violates unique constraint
+    //
+    // Caught by the drop-in panel against the published 7.40.10 image.
+    // Before that release the second row was simply stored, so the case
+    // passed for the wrong reason and neither half was visible.
+    //
+    // Only when a unique index on this column exists but could not be
+    // probed — an unindexed column has no arbiter and no conflict, and
+    // must keep answering false.
+    let has_unprobable_unique = table.indices().iter().any(|idx| {
+        idx.is_unique
+            && idx.column_position == column_pos
+            && idx.extra_column_positions.is_empty()
+            && idx.partial_predicate.is_none()
+            && idx.expression.is_none()
+            && table.index_collation(idx).is_some()
+    });
+    if !has_unprobable_unique {
+        return false;
+    }
+    let schema = table.schema();
+    let want = collated_key_cell(key, column_pos, schema, false);
+    table.rows().iter().enumerate().any(|(row_idx, r)| {
+        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted())
+            && r.values
+                .get(column_pos)
+                .is_some_and(|v| collated_key_cell(v, column_pos, schema, false) == want)
     })
 }
 

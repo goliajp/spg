@@ -661,8 +661,14 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
         let r = sh(
             root,
             &format!(
+                // v7.40.11 — SELF_COMPARISON=1: this panel is one
+                // binary against itself under two collations, so a cell
+                // where the two legs launched a different number of
+                // processes is not a verdict about collation. See the
+                // note at the withdrawal in `perf-endpoint-sweep.sh`.
                 "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
                  EXPECT_SPG_COLLATE=en_US.utf8 ALLOW_COLLATION_MISMATCH=1 \
+                 SELF_COMPARISON=1 \
                  SORT_CEILING=2.0 \
                  bash scripts/perf-endpoint-sweep.sh"
             ),
