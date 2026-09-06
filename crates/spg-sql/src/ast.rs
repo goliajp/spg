@@ -4421,6 +4421,114 @@ pub struct TableRef {
     pub json_table: Option<Box<JsonTable>>,
 }
 
+/// One walkable slot of a FROM item: an expression, or a nested SELECT.
+///
+/// v7.40.10 — see [`TableRef::try_for_each_slot_mut`].
+#[derive(Debug)]
+pub enum FromSlot<'a> {
+    Expr(&'a mut Expr),
+    Select(&'a mut SelectStatement),
+}
+
+impl TableRef {
+    /// Every expression this FROM item carries, and the SELECT nested in
+    /// it — in one place, for every pass that needs them.
+    ///
+    /// **Written as a TOTAL destructure, with no `..`.** A field added
+    /// to `TableRef` is a compile error here, rather than a defect in
+    /// each pass that enumerated the slots for itself. That is the whole
+    /// point of the function existing.
+    ///
+    /// v7.40.10, on evidence. `TableRef` carries seven expression slots
+    /// and three separate passes each knew a different subset of them.
+    /// In one day: the parameter-substitution walk knew only
+    /// `lateral_subquery`, so `unnest($1)` reached execution still
+    /// holding a placeholder (a customer's live 500); `describe` knew
+    /// only `unnest_expr`, so `generate_series(…)` described no columns
+    /// and a driver got a protocol error; and the LIMIT/OFFSET
+    /// resolution knew CTEs and UNION peers but not a FROM subquery, so
+    /// `LIMIT $n` inside a derived table returned every row.
+    ///
+    /// Fixing those three one at a time left four slots unvisited.
+    /// Measured after the third fix shipped, all on the same message:
+    ///
+    /// ```text
+    ///   jsonb_each_text($1)  parameter $1 referenced but only 0 bound
+    ///   ROWS FROM (…$1…)     parameter $1 referenced but only 0 bound
+    ///   json_table($1, …)    parameter $1 referenced but only 0 bound
+    /// ```
+    ///
+    /// Those were the next three reports. This is what stops the fourth.
+    ///
+    /// # Errors
+    /// Whatever the callbacks return; the walk stops at the first.
+    pub fn try_for_each_slot_mut<E>(
+        &mut self,
+        visit: &mut dyn FnMut(FromSlot<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // One callback rather than two, so a caller that needs the same
+        // state for both — every caller so far — does not have to lend
+        // it twice.
+        let Self {
+            // Not expressions — named so the destructure stays total.
+            name: _,
+            alias: _,
+            only: _,
+            as_of_segment: _,
+            unnest_column_aliases: _,
+            with_ordinality: _,
+            scalar_fn_item: _,
+            // The seven that carry something to walk.
+            unnest_expr,
+            generate_series_args,
+            lateral_subquery,
+            jsonb_each_text_arg,
+            table_fn_call,
+            rows_from,
+            json_table,
+        } = self;
+        if let Some(e) = unnest_expr {
+            visit(FromSlot::Expr(e))?;
+        }
+        if let Some(args) = generate_series_args {
+            for a in args.iter_mut() {
+                visit(FromSlot::Expr(a))?;
+            }
+        }
+        if let Some(sub) = lateral_subquery {
+            visit(FromSlot::Select(sub))?;
+        }
+        if let Some((_, e)) = jsonb_each_text_arg {
+            visit(FromSlot::Expr(e))?;
+        }
+        if let Some(call) = table_fn_call {
+            for a in call.1.iter_mut() {
+                visit(FromSlot::Expr(a))?;
+            }
+        }
+        if let Some(items) = rows_from {
+            for (_, args) in items.iter_mut() {
+                for a in args.iter_mut() {
+                    visit(FromSlot::Expr(a))?;
+                }
+            }
+        }
+        if let Some(jt) = json_table {
+            let JsonTable {
+                doc,
+                row_path: _,
+                columns: _,
+                passing,
+            } = jt.as_mut();
+            visit(FromSlot::Expr(doc))?;
+            for (_, e) in passing.iter_mut() {
+                visit(FromSlot::Expr(e))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// v7.39 (round 205) — a `JSON_TABLE` FROM item.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JsonTable {

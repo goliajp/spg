@@ -826,18 +826,10 @@ fn walk_table_ref_exprs_mut(
     tref: &mut spg_sql::ast::TableRef,
     f: &mut impl FnMut(&mut Expr) -> Result<(), EngineError>,
 ) -> Result<(), EngineError> {
-    if let Some(sub) = &mut tref.lateral_subquery {
-        walk_select_exprs_mut(sub, f)?;
-    }
-    if let Some(e) = &mut tref.unnest_expr {
-        f(e)?;
-    }
-    if let Some(args) = &mut tref.generate_series_args {
-        for a in args.iter_mut() {
-            f(a)?;
-        }
-    }
-    Ok(())
+    tref.try_for_each_slot_mut(&mut |slot| match slot {
+        spg_sql::ast::FromSlot::Expr(e) => f(e),
+        spg_sql::ast::FromSlot::Select(sub) => walk_select_exprs_mut(sub, f),
+    })
 }
 
 pub(crate) fn walk_select_exprs_mut(
@@ -1064,6 +1056,19 @@ pub(crate) fn substitute_select(
     for (_, peer) in &mut s.unions {
         resolve_limit_offset_placeholders(peer, params)?;
     }
+    // v7.40.10 — a FROM item's subquery carries its own LIMIT/OFFSET
+    // and is neither a CTE nor a UNION peer. See the note in
+    // `resolve_limit_offset_placeholders`.
+    if let Some(from) = &mut s.from {
+        if let Some(sub) = &mut from.primary.lateral_subquery {
+            resolve_limit_offset_placeholders(sub, params)?;
+        }
+        for j in &mut from.joins {
+            if let Some(sub) = &mut j.table.lateral_subquery {
+                resolve_limit_offset_placeholders(sub, params)?;
+            }
+        }
+    }
     // v7.9.24 — LIMIT $N / OFFSET $N placeholder resolution.
     // mailrs H2. After this pass each LIMIT/OFFSET that was a
     // Placeholder is rewritten to Literal so the existing
@@ -1096,6 +1101,36 @@ fn resolve_limit_offset_placeholders(
     }
     for (_, peer) in &mut s.unions {
         resolve_limit_offset_placeholders(peer, params)?;
+    }
+    // v7.40.10 — and a FROM item's subquery, which is neither a CTE nor
+    // a UNION peer.
+    //
+    // A derived table's `LIMIT $n` was never substituted, so it reached
+    // execution as a placeholder and the limit was dropped: the
+    // statement returned every row, with no error. Reported against
+    // 7.40.9. Measured boundary, five rows and `LIMIT $1` bound to 2 —
+    // top level, `OFFSET`, `FOR UPDATE SKIP LOCKED`, a CTE, an `IN`
+    // subquery and a scalar subquery all correct; a derived table and a
+    // LATERAL both returned all five.
+    //
+    // The expression walk DOES descend into these subqueries, which is
+    // why `WHERE x = $1` inside one has always worked. A `LimitExpr` is
+    // not an `Expr`, so it was never on that walk's route — the same
+    // gap the walk itself had for `unnest_expr` in 7.40.8, one field
+    // along.
+    //
+    // The shape this cost a deployment: `INSERT … SELECT … FROM (…
+    // ORDER BY … LIMIT $n) x`, capping a push send's audience. It
+    // inserted every matching row.
+    if let Some(from) = &mut s.from {
+        if let Some(sub) = &mut from.primary.lateral_subquery {
+            resolve_limit_offset_placeholders(sub, params)?;
+        }
+        for j in &mut from.joins {
+            if let Some(sub) = &mut j.table.lateral_subquery {
+                resolve_limit_offset_placeholders(sub, params)?;
+            }
+        }
     }
     Ok(())
 }

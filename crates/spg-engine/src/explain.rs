@@ -943,6 +943,7 @@ fn fill_actuals(
     result_rows: u64,
     elapsed_ms: Option<f64>,
     deltas: &alloc::collections::BTreeMap<String, u64>,
+    has_limit_above: bool,
 ) {
     /// The table a scan node reads, if the head names one.
     fn scan_table(head: &str) -> Option<(&str, bool)> {
@@ -1014,7 +1015,38 @@ fn fill_actuals(
         }
     }
     for c in &mut node.children {
-        fill_actuals(c, false, engine, result_rows, elapsed_ms, deltas);
+        fill_actuals(
+            c,
+            false,
+            engine,
+            result_rows,
+            elapsed_ms,
+            deltas,
+            has_limit_above,
+        );
+    }
+    // v7.40.10 — a Sort that is not the top node carried no actuals at
+    // all, so a plan with a sort inside a derived table showed the sort
+    // and said nothing about it. PG instruments every node; we do not,
+    // and the honest subset is the part that follows from the child.
+    //
+    // A sort emits exactly what it consumes, so its row count is its
+    // child's. `loops` is 1: nothing here re-executes a sub-plan per
+    // outer row. The TIME is not derivable without per-node
+    // instrumentation and is left off rather than filled with the only
+    // number in reach, which would be a different measurement wearing
+    // this node's name — the same rule the filtered-scan arm above
+    // already follows.
+    //
+    // Not under a LIMIT: a top-N sort emits fewer rows than it reads,
+    // and the count that would be printed is the one it did not emit.
+    if node.head == "Sort"
+        && node.actual.is_none()
+        && !has_limit_above
+        && let [child] = node.children.as_slice()
+        && let Some((_, rows)) = child.actual
+    {
+        node.actual = Some((None, rows));
     }
 }
 
@@ -2021,7 +2053,15 @@ impl Engine {
                     .files
                     .load(core::sync::atomic::Ordering::Relaxed)
                     .saturating_sub(spill_before.0);
-                fill_actuals(tree, true, self, row_count as u64, elapsed_ms, &deltas);
+                fill_actuals(
+                    tree,
+                    true,
+                    self,
+                    row_count as u64,
+                    elapsed_ms,
+                    &deltas,
+                    sel.limit.is_some(),
+                );
                 annotate_sort_method(
                     tree,
                     sel.limit.is_some(),

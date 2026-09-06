@@ -124,6 +124,24 @@ pub(crate) fn rewrite_clock_calls(
                     rewrite_expr_clock(w, now, mysql, tz_offset);
                 }
             }
+            // v7.40.10 — and the SELECT it inserts FROM.
+            //
+            // `INSERT INTO d SELECT g, now() FROM src` answered
+            // `function now() does not exist`, because the rewrite that
+            // folds a clock call to a literal never reached this
+            // statement's source and the generic resolver has no `now`
+            // — the clock pass IS its implementation. The keyword
+            // spelling named the shape out loud: the SQL says
+            // `current_timestamp` and the error said
+            // `current_timestamp()`, a call the rewrite had made and
+            // then not folded.
+            //
+            // `substitute_placeholders`'s INSERT arm learned about this
+            // field in v7.33 and this walk never did. Reported against
+            // 7.40.9; 7.40.7 and 7.40.8 refuse it too.
+            if let Some(sel) = &mut ins.select_source {
+                rewrite_select_clock(sel, now, mysql, tz_offset);
+            }
         }
         // `UPDATE … SET seen_at = NOW() WHERE …` / `DELETE … WHERE
         // ts < NOW()` (mailrs embed round-12 — previously only
