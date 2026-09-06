@@ -2034,9 +2034,31 @@ pub(crate) fn enforce_unique_index_inserts(
         // non-partial) unique index IS its own probe btree: check each
         // batch row via lookup_eq instead of folding the whole table.
         // Same qualification rules as the constraint path (A1).
+        // v7.40.10 — and not a locale-collated index.
+        //
+        // Its B-tree is keyed by ICU sort keys the engine produces, so a
+        // probe built from the RAW value asks a question those keys
+        // cannot answer, and the empty answer reads as "no conflict".
+        // A single-column `CREATE UNIQUE INDEX` on a text column
+        // therefore accepted duplicates, silently and persistently, on
+        // the collation SPG ships — while `indisunique` read true, the
+        // creation-time duplicate check refused, and two duplicates in
+        // ONE statement were refused by the batch set beside this probe.
+        // Only rows already committed slipped through.
+        //
+        // `enforce_uniqueness_inserts` — the CONSTRAINT path, in this
+        // same file — already declines such an index for exactly this
+        // reason and folds the whole table instead. One rule, two sites,
+        // and only one of them had heard it. That is why every UNIQUE
+        // constraint spelling enforced and the commonest index spelling
+        // did not.
+        //
+        // Declining sends this index down the O(table) fold below, which
+        // goes through `collated_key_cell` and is answerable.
         if idx.expression.is_none()
             && idx.partial_predicate.is_none()
             && !idx.nulls_not_distinct
+            && table.index_collation(idx).is_none()
             && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
         {
             let positions = unique_key_positions(idx);

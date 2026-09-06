@@ -307,9 +307,141 @@ fn relation_columns(
         }
         return Some(cols);
     }
+    // v7.40.10 — the remaining FROM-item slots, on evidence.
+    //
+    // `TableRef` carries seven slots that produce rows and this
+    // function knew two of them: `unnest_expr` (v7.38.3) and
+    // `generate_series_args` (v7.40.9). Measured on the published
+    // 7.40.9 image through the extended protocol, with LITERAL
+    // arguments so no parameter is involved:
+    //
+    // ```text
+    //   jsonb_each_text('{"a":1}'::jsonb)   D message without prior T
+    //   ROWS FROM (generate_series(1,3))    D message without prior T
+    //   json_table('[1,2]'::jsonb, …)       D message without prior T
+    // ```
+    //
+    // A Describe that answers no columns while Execute sends rows is a
+    // protocol error, not a wrong answer: every driver that prepares
+    // statements fails on the shape. Same failure `generate_series` had
+    // until 7.40.9, at the four slots that fix did not reach.
+    //
+    // Column NAMES and COUNT are what a driver breaks on and they are
+    // exact here. Types follow what the executor produces for the
+    // functions it knows; `srf_column_type` is the one place that
+    // mapping lives.
+    if let Some((fname, _)) = &t.jsonb_each_text_arg {
+        // The executor's own pair: `key text`, and `value` as text for
+        // the `_text` spelling and json otherwise. PG 18.6 agrees on
+        // the names and on `text`/`jsonb` for the value.
+        let as_text = fname.ends_with("_text");
+        let value_ty = if as_text {
+            DataType::Text
+        } else {
+            DataType::Json
+        };
+        return Some(alloc::vec![
+            ColumnSchema::new("key".to_string(), DataType::Text, false),
+            ColumnSchema::new("value".to_string(), value_ty, true),
+        ]);
+    }
+    if let Some(entries) = &t.rows_from {
+        // One column per item, named for its function — PG's shape,
+        // measured: `ROWS FROM (generate_series(1,3), generate_series(1,2))`
+        // describes two columns, both named `generate_series`.
+        let mut cols: Vec<ColumnSchema> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (fname, _))| {
+                let name = t
+                    .unnest_column_aliases
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| fname.clone());
+                ColumnSchema::new(name, srf_column_type(fname), true)
+            })
+            .collect();
+        if t.with_ordinality {
+            let name = t
+                .unnest_column_aliases
+                .get(cols.len())
+                .cloned()
+                .unwrap_or_else(|| "ordinality".to_string());
+            cols.push(ColumnSchema::new(name, DataType::BigInt, false));
+        }
+        return (!cols.is_empty()).then_some(cols);
+    }
+    if let Some(call) = &t.table_fn_call {
+        let name = t
+            .unnest_column_aliases
+            .first()
+            .cloned()
+            .or_else(|| t.alias.clone())
+            .unwrap_or_else(|| call.0.clone());
+        return Some(alloc::vec![ColumnSchema::new(
+            name,
+            srf_column_type(&call.0),
+            true
+        )]);
+    }
+    if let Some(jt) = &t.json_table {
+        // Its COLUMNS list IS the shape, declared in the statement, so
+        // this one needs no inference at all.
+        fn flatten(out: &mut Vec<ColumnSchema>, cols: &[spg_sql::ast::JsonTableColumn]) {
+            for c in cols {
+                if let spg_sql::ast::JsonTableColumn::Nested { columns, .. } = c {
+                    flatten(out, columns);
+                } else if let Some(cs) = json_table_column_schema(c) {
+                    out.push(cs);
+                }
+            }
+        }
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        flatten(&mut cols, &jt.columns);
+        return (!cols.is_empty()).then_some(cols);
+    }
     // VALUES / anything else the executor synthesises has no catalog
     // shape to read here.
     None
+}
+
+/// One JSON_TABLE column's schema entry, or `None` where the column
+/// contributes no single column of its own.
+///
+/// v7.40.10 — `NESTED` flattens into the parent's list, which is how
+/// the executor emits it and how PG describes it.
+fn json_table_column_schema(c: &spg_sql::ast::JsonTableColumn) -> Option<ColumnSchema> {
+    use spg_sql::ast::JsonTableColumn as J;
+    match c {
+        J::Ordinality { name } => Some(ColumnSchema::new(name.clone(), DataType::BigInt, false)),
+        J::Regular {
+            name, ty, exists, ..
+        } => Some(ColumnSchema::new(
+            name.clone(),
+            if *exists {
+                DataType::Bool
+            } else {
+                crate::conversions::column_type_to_data_type(*ty)
+            },
+            true,
+        )),
+        // Handled by the caller, which flattens the child list.
+        J::Nested { .. } => None,
+    }
+}
+
+/// The type a set-returning function's single column carries, for the
+/// names this build knows.
+///
+/// v7.40.10 — one place, because Describe and the executor disagreeing
+/// about it is the failure being fixed, pointed the other way. Anything
+/// unknown is TEXT, which is what the SRFs outside this list return.
+fn srf_column_type(fname: &str) -> DataType {
+    match fname.to_ascii_lowercase().as_str() {
+        "generate_series" | "generate_subscripts" => DataType::BigInt,
+        "jsonb_array_elements" | "json_array_elements" => DataType::Json,
+        _ => DataType::Text,
+    }
 }
 
 /// v7.38.7 — what PG names an unaliased select item.

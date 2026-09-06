@@ -264,3 +264,50 @@ fn a_derived_table_on_the_join_side_is_also_a_sub_plan() {
         "the sort inside the joined sub-SELECT vanished: {p:?}"
     );
 }
+
+/// v7.40.10 — a Sort that is not the top node carried no actuals at all.
+///
+/// Reported against 7.40.7: the plan shows the sort now (7.40.5/7.40.6)
+/// and then says nothing about it, where PostgreSQL prints
+/// `actual time=… rows=… loops=…` on every node.
+///
+/// We do not instrument every node, and the honest subset is what
+/// follows from the child: a sort emits exactly what it consumes, and
+/// nothing here re-executes a sub-plan per outer row. The TIME stays
+/// off — filling it with the only number in reach would be a different
+/// measurement wearing this node's name.
+#[test]
+fn a_nested_sort_reports_the_rows_it_passed_through() {
+    let (raw, mut s) = seeded();
+    let _guard = common::ChildGuard(raw);
+    let plan = rows(
+        &mut s,
+        "EXPLAIN ANALYZE SELECT count(*) FROM (SELECT t FROM s ORDER BY t) z",
+    );
+    let sort = plan
+        .iter()
+        .find(|l| l.trim_start().starts_with("->  Sort"))
+        .unwrap_or_else(|| panic!("no nested Sort node in {plan:?}"));
+    assert!(
+        sort.contains("actual rows=40000") && sort.contains("loops=1"),
+        "the nested sort passes 40,000 rows through: {sort}"
+    );
+}
+
+/// And NOT under a LIMIT, where a top-N sort emits fewer rows than it
+/// reads and the count in reach is the one it did not emit.
+#[test]
+fn a_top_n_sort_is_left_un_annotated_rather_than_wrong() {
+    let (raw, mut s) = seeded();
+    let _guard = common::ChildGuard(raw);
+    let plan = rows(&mut s, "EXPLAIN ANALYZE SELECT t FROM s ORDER BY t LIMIT 5");
+    let sort = plan
+        .iter()
+        .find(|l| l.trim_start().starts_with("->  Sort"))
+        .unwrap_or_else(|| panic!("no Sort node in {plan:?}"));
+    assert!(
+        !sort.contains("actual rows="),
+        "40,000 read and 5 emitted — neither number belongs on that line \
+         without instrumentation: {sort}"
+    );
+}

@@ -163,6 +163,7 @@ mod e2e_flusher_idle_gate_round176;
     unused_variables
 )]
 mod e2e_freezer;
+mod e2e_from_item_describe_wire_v7410;
 mod e2e_fsync_fail_round190;
 mod e2e_function_visible_same_query;
 #[allow(
