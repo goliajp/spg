@@ -30,6 +30,43 @@ pub(super) fn apply_function_lower(
     apply_function_dispatch(name_lower, args, ctx)
 }
 
+/// PG's on-disk width for a `numeric`, in bytes.
+///
+/// v7.40.11 — PostgreSQL stores the value in base-10000 groups, with a
+/// six-byte short header and two bytes per group. Derived from PG 18.6
+/// rather than from its source:
+///
+/// ```text
+///   0                                6
+///   1                                8
+///   1.5                             10
+///   12345                           10
+///   123456789012345678901234567890  22
+/// ```
+///
+/// The groups are counted on each side of the point separately, because
+/// that is how the alignment falls: `1.5` is `1` and `5000` — two
+/// groups, not one.
+fn numeric_column_size(scaled: i128, scale: u16) -> i32 {
+    const HEADER: i32 = 6;
+    if scaled == 0 {
+        return HEADER;
+    }
+    let digits = {
+        let mut n = scaled.unsigned_abs();
+        let mut d = 0u32;
+        while n > 0 {
+            n /= 10;
+            d += 1;
+        }
+        d
+    };
+    let frac = u32::from(scale);
+    let int_digits = digits.saturating_sub(frac);
+    let groups = int_digits.div_ceil(4) + frac.div_ceil(4);
+    HEADER + 2 * i32::try_from(groups.max(1)).unwrap_or(i32::MAX)
+}
+
 /// v7.38 (read01) — PG's `gcd`/`lcm` keep the wider of their two integer
 /// argument widths (`gcd(int, int)` → integer, `gcd(bigint, int)` → bigint).
 /// v7.39 (RLS) — the effective session role from the eval context (the
@@ -2984,14 +3021,52 @@ fn apply_function_dispatch(
                 Value::Int(_) => 4,
                 Value::BigInt(_) => 8,
                 Value::Float(_) => 8,
+                // v7.40.11 — the fixed-width types, measured on PG 18.6
+                // rather than approximated.
+                //
+                // These fell through to the `{:?}` fallback below, which
+                // is the LENGTH OF A RUST DEBUG STRING. `uuid` answered
+                // 58 — that is `Uuid([0, 0, …, 1])` plus four — against
+                // PostgreSQL's 16, and `timestamptz` 31 against 8.
+                //
+                // Reported against 7.40.9: `sum(pg_column_size(col))` is
+                // the ordinary way to size a column before a migration,
+                // and it over-reported `uuid` by 3.6x and `timestamptz`
+                // by 3.9x. The catalog's own `typlen` said 16 and 8 in
+                // the same build, so the two disagreed about one fact.
+                //
+                // It also leaked the internal representation into a
+                // user-facing number, which is the same class as the
+                // `UuidArray([Some([0, …]))` that appeared in an error
+                // message the same round.
+                Value::Real(_) => 4,
+                Value::Uuid(_) => 16,
+                Value::Timestamp(_) => 8,
+                Value::Date(_) => 4,
+                Value::Time(_) => 8,
+                Value::TimeTz { .. } => 12,
+                Value::Interval { .. } => 16,
+                Value::Numeric { scaled, scale, .. } => {
+                    // PG stores numeric in base-10000 groups: a 6-byte
+                    // short header plus two bytes per group. Measured:
+                    // 0 -> 6, 1 -> 8, 1.5 -> 10, 12345 -> 10, and a
+                    // thirty-digit integer -> 22.
+                    numeric_column_size(*scaled, *scale)
+                }
                 Value::Text(s) => {
                     // PG includes the 4-byte length header for varlena.
                     (s.len() as i32).saturating_add(4)
                 }
                 Value::Bytes(b) => (b.len() as i32).saturating_add(4),
+                Value::Json(s) => (s.len() as i32).saturating_add(4),
                 other => {
                     // Fallback: format the value to estimate byte size
-                    // (composite / array / range).
+                    // (composite / array / range). Every type whose
+                    // width is FIXED is named above; anything reaching
+                    // here is variable-width and this is an estimate,
+                    // which is what the comment on this arm has always
+                    // said and what the arms above stopped it claiming
+                    // about types that have an exact answer.
                     let s = alloc::format!("{other:?}");
                     (s.len() as i32).saturating_add(4)
                 }
