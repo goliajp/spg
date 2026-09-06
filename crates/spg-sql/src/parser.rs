@@ -21710,7 +21710,31 @@ impl Parser {
             // surface the error on the next expectation", but when AS is
             // the LAST token there is no next expectation: `SELECT 1 AS`
             // parsed clean and silently dropped the alias. PG rejects it.
+            // v7.40.11 — a keyword is a legal alias after AS.
+            //
+            // `expect_ident_like` has known the unreserved class since
+            // v7.17, and this guard never let a keyword token reach it.
+            // So every one of them was a syntax error in alias position
+            // while being accepted as a column name in the same build:
+            //
+            //   CREATE TABLE rk (release int)   accepted
+            //   SELECT release FROM rk          accepted
+            //   SELECT 1 AS release             syntax error
+            //
+            // Reported against 7.40.9 for `release` and `savepoint` —
+            // two statements in a shipped subcommand of the reporter's
+            // could not be parsed — and it is the whole class, `show`
+            // and `index` included.
+            //
+            // Measured on PG 18.6: after AS, EVERY keyword is a legal
+            // label, `limit` and `between` included. This accepts the
+            // ones this parser can name, which is the unreserved class;
+            // a reserved keyword after AS is still refused here and PG
+            // takes it.
             if let Token::Ident(_) | Token::QuotedIdent(_) = self.peek() {
+                return self.expect_ident_like().map(Some);
+            }
+            if unreserved_keyword_text(self.peek()).is_some() {
                 return self.expect_ident_like().map(Some);
             }
             return Err(self.err(alloc::format!(
@@ -21729,6 +21753,19 @@ impl Parser {
             if is_alias_stopword(s) {
                 return Ok(None);
             }
+            return Ok(self.expect_ident_like().ok());
+        }
+        // v7.40.11 — and a keyword, WITHOUT `AS`, which PG also takes:
+        // `SELECT 1 release` answers 1 there.
+        //
+        // Not the ones that begin a trailing clause. PG reserves those
+        // for exactly this reason and so must this: measured on PG 18.6,
+        // `SELECT 1 limit` is `syntax error at end of input` — it read
+        // `limit` as the clause, not as a label. Swallowing it here
+        // would turn `SELECT 1 limit 2` into a two-token nonsense.
+        if !matches!(self.peek(), Token::Limit | Token::Offset)
+            && unreserved_keyword_text(self.peek()).is_some()
+        {
             return Ok(self.expect_ident_like().ok());
         }
         Ok(None)
