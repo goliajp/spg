@@ -15523,22 +15523,32 @@ fn apply_function_dispatch(
                         Value::SmallInt(n) => i64::from(*n),
                         _ => unreachable!(),
                     };
-                    let mut counter = 100_000i64;
-                    let mut found = None;
-                    'find: for tname in cat.table_names() {
-                        let Some(t) = cat.get(&tname) else { continue };
-                        for idx in t.indices() {
-                            counter += 1;
-                            if counter == oid {
-                                found = Some(idx.name.clone());
-                                break 'find;
-                            }
-                        }
-                    }
-                    let Some(nm) = found else {
+                    // v7.40.11 — read the list the forward direction
+                    // PRODUCES, rather than replaying the count and
+                    // getting it wrong. `catalog_indexes` is what assigns
+                    // the OIDs `pg_index` and `pg_class` report: it walks
+                    // `visible_table_names()` and SKIPS the probe indexes
+                    // SPG derives for a constraint's non-leading columns,
+                    // which PostgreSQL has no equivalent of. This replay
+                    // walked `table_names()` and skipped nothing, so every
+                    // derived index shifted the mapping by one and the
+                    // function described a NEIGHBOURING table's index:
+                    //
+                    //   release_artifacts_pkey -> CREATE UNIQUE INDEX
+                    //                             releases_pkey ON
+                    //                             public.releases (id)
+                    //
+                    // The `relname` beside it came from pg_class and was
+                    // right, so nothing reading a schema back could
+                    // notice. It also let this name one of the derived
+                    // indexes, which `pg_index` does not list at all.
+                    let Some(entry) = crate::system_catalog::catalog_indexes(cat)
+                        .into_iter()
+                        .find(|ci| ci.oid == oid)
+                    else {
                         return Ok(Value::Null);
                     };
-                    resolved = nm;
+                    resolved = entry.name;
                     resolved.as_str()
                 }
                 // v7.39 (round 337, V62) — an index name now resolves to a
@@ -15560,41 +15570,41 @@ fn apply_function_dispatch(
                 Some(Value::SmallInt(n)) => i64::from(*n),
                 _ => 0,
             };
-            for tname in cat.table_names() {
-                let Some(t) = cat.get(&tname) else { continue };
-                for idx in t.indices() {
-                    if idx.name != bare {
-                        continue;
-                    }
-                    if col_no > 0 {
-                        // Column form: the N-th (1-based) key column.
-                        let col_at = |pos: usize| -> String {
-                            t.schema()
-                                .columns
-                                .get(pos)
-                                .map_or_else(|| String::from("?"), |c| c.name.clone())
-                        };
-                        let mut positions = alloc::vec![idx.column_position];
-                        positions.extend(idx.extra_column_positions.iter().copied());
-                        let col_names: Vec<String> =
-                            positions.iter().map(|&p| col_at(p)).collect();
-                        return Ok(col_names.get((col_no - 1) as usize).map_or(
-                            Value::Null,
-                            |c| Value::text(c.clone()),
-                        ));
-                    }
-                    // v7.39 (read01 round 83) — the full statement form was a
-                    // second, poorer copy of the renderer: it ignored the
-                    // index EXPRESSION (so `lower(name)` came back as `name`)
-                    // and the constraint-backing check (so a primary key
-                    // printed `CREATE INDEX`, not `CREATE UNIQUE INDEX`). Share
-                    // the one `pg_indexes.indexdef` already uses.
-                    return Ok(Value::text(crate::system_catalog::render_indexdef(
-                        t, idx, &tname,
-                    )));
-                }
+            // v7.39 (read01 round 83) — the full statement form was a
+            // second, poorer copy of the renderer: it ignored the index
+            // EXPRESSION (so `lower(name)` came back as `name`) and the
+            // constraint-backing check (so a primary key printed
+            // `CREATE INDEX`, not `CREATE UNIQUE INDEX`).
+            // v7.40.11 — and it searched STORAGE for the name, where a
+            // constraint's own index does not appear under the name the
+            // catalog reports for it. `pg_index` lists `t_a_b_key`;
+            // storage calls the B-tree behind it `t_a_key_0_0`, so the
+            // search found nothing and the function answered NULL for
+            // every table-level UNIQUE. One enumeration answers both
+            // which object this is and how to spell it.
+            let Some(ci) = crate::system_catalog::catalog_indexes(cat)
+                .into_iter()
+                .find(|ci| ci.name == bare)
+            else {
+                return Ok(Value::Null);
+            };
+            let Some(t) = cat.get(&ci.table) else {
+                return Ok(Value::Null);
+            };
+            if col_no > 0 {
+                // Column form: the N-th (1-based) key column.
+                let col_at = |pos: usize| -> String {
+                    t.schema()
+                        .columns
+                        .get(pos)
+                        .map_or_else(|| String::from("?"), |c| c.name.clone())
+                };
+                let col_names: Vec<String> = ci.columns.iter().map(|&p| col_at(p)).collect();
+                return Ok(col_names
+                    .get((col_no - 1) as usize)
+                    .map_or(Value::Null, |c| Value::text(c.clone())));
             }
-            Ok(Value::Null)
+            Ok(Value::text(crate::system_catalog::catalog_indexdef(t, &ci)))
         }
         // pg_get_constraintdef(conname [, pretty]) — REAL for
         // PK / UNIQUE / FK: rebuilt from live catalog state using
