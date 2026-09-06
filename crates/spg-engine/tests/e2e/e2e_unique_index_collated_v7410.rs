@@ -190,3 +190,61 @@ fn the_shapes_that_always_enforced_still_do() {
         "UNIQUE column constraint"
     );
 }
+
+/// v7.40.11 — `ON CONFLICT` must find the row the uniqueness check
+/// finds.
+///
+/// 7.40.10 taught the INSERT-time uniqueness check to decline a
+/// locale-collated index and fold the table. It did not teach the
+/// ON CONFLICT arbiter the same thing, and that one probes the index
+/// with a RAW value — the same question those ICU-keyed trees cannot
+/// answer. So the upsert found no conflict, inserted, and was refused
+/// by the check that had just been fixed:
+///
+/// ```text
+///   CREATE UNIQUE INDEX r12_a_email ON r12_a (email);
+///   INSERT … ('a@x','first')  ON CONFLICT (email) DO UPDATE …   ok
+///   INSERT … ('a@x','third')  ON CONFLICT (email) DO UPDATE …
+///     ERROR:  duplicate key value violates unique constraint "r12_a_email"
+/// ```
+///
+/// Caught by the drop-in panel against the PUBLISHED 7.40.10 image —
+/// `round12.upsert_via_unique_index`, 68 of 69 — which is the panel
+/// that exists to run what a customer pulls. Before 7.40.10 the second
+/// INSERT simply stored a duplicate, so the case passed for the wrong
+/// reason and neither half was visible.
+#[test]
+fn on_conflict_finds_the_row_the_uniqueness_check_finds() {
+    let mut eng = shipped_collation_engine();
+    eng.execute("CREATE TABLE r12 (id INT, email TEXT NOT NULL, reason TEXT NOT NULL)")
+        .unwrap();
+    eng.execute("CREATE UNIQUE INDEX r12_email ON r12 (email)")
+        .unwrap();
+    eng.execute("INSERT INTO r12 VALUES (1, 'a@x', 'first') ON CONFLICT (email) DO UPDATE SET reason = 'second'")
+        .expect("first insert");
+    eng.execute("INSERT INTO r12 VALUES (2, 'a@x', 'third') ON CONFLICT (email) DO UPDATE SET reason = 'second'")
+        .expect("the conflict must be FOUND, not raised");
+    assert_eq!(count(&mut eng, "r12"), 1, "one row, updated in place");
+    match eng.execute("SELECT reason FROM r12").expect("read") {
+        QueryResult::Rows { rows, .. } => assert_eq!(
+            rows[0].values[0],
+            Value::text("second".to_string()),
+            "DO UPDATE ran"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `DO NOTHING` takes the same arbiter and must also find it.
+#[test]
+fn do_nothing_finds_it_too() {
+    let mut eng = shipped_collation_engine();
+    eng.execute("CREATE TABLE dn (id INT, email TEXT NOT NULL)")
+        .unwrap();
+    eng.execute("CREATE UNIQUE INDEX dn_email ON dn (email)")
+        .unwrap();
+    eng.execute("INSERT INTO dn VALUES (1,'a@x')").unwrap();
+    eng.execute("INSERT INTO dn VALUES (2,'a@x') ON CONFLICT (email) DO NOTHING")
+        .expect("DO NOTHING must absorb it");
+    assert_eq!(count(&mut eng, "dn"), 1);
+}

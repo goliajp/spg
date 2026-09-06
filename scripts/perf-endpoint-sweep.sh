@@ -60,6 +60,14 @@ cd "$(dirname "$0")/.."
 PG_URI="${PG_URI:-}"
 SPG_URI="${SPG_URI:-}"
 N="${N:-5}"
+# v7.40.11 — this panel compares one binary against ITSELF (the locale
+# panel does: `PG_URI` is the C leg and `SPG_URI` the en_US leg of the
+# same server build). Set it there and nowhere else.
+#
+# It exists because a self-comparison has one asymmetry a cross-engine
+# one does not: if one leg launches parallel sort workers and the other
+# does not, the cell is not measuring the thing the panel is named for.
+SELF_COMPARISON="${SELF_COMPARISON:-0}"
 SIZES="${SIZES:-1000 10000 50000 400000}"
 PSQL="${PSQL:-psql}"
 
@@ -622,12 +630,40 @@ for rows in ${SIZES}; do
         v="unresolved"
       fi
     fi
+    pgcpu="$(pg_cores_one "${PG_URI}" "${sql}" "${PG_WM}")"
+    # v7.40.11 — on a SELF comparison, a cell where the two legs used a
+    # different number of processes is not a verdict about the thing the
+    # panel varies.
+    #
+    # `400000 top-N LIMIT 10` on the locale panel, across nine runs:
+    # SPG's own leg 6.6-8.1 ms throughout, and the verdict walking
+    # win / win / win / win / LOSS / unresolved / unresolved / LOSS —
+    # tracking the OTHER leg, which read 11.1-12.5 ms whenever it
+    # launched three processes and 6.8-7.5 ms whenever it launched one.
+    # The panel printed that count from v7.40.4 and never consulted it.
+    #
+    # One of those flips red a release gate, cost twelve minutes to
+    # disprove by re-running the step, and then a full 26-minute re-run.
+    # That is the third version in which a flickering cell was answered
+    # by proving it is not a regression, which is the polish this panel's
+    # own header warns about.
+    #
+    # Not applied to a cross-engine panel: PostgreSQL using three
+    # processes where SPG uses one is the comparison, not a defect in it.
+    if [[ "${SELF_COMPARISON}" == 1 && "${v}" != unresolved ]]; then
+      spgcpu="$(pg_cores_one "${SPG_URI}" "${sql}" "${SPG_WM}")"
+      if [[ "${spgcpu}" != "${pgcpu}" ]]; then
+        note="  <- withdrawn: the two legs of one binary used ${spgcpu} and ${pgcpu} processes"
+        DEMOTED=$((DEMOTED + 1))
+        v="unresolved"
+      fi
+    fi
     [[ "${v}" == LOSS ]] && LOSSES=$((LOSSES + 1))
     CELLS=$((CELLS + 1))
     # v7.40.4 — how many processes the other engine used. A verdict of
     # LOSS against three PostgreSQL processes is a different fact from
     # the same verdict against one, and the panel printed neither.
-    pgcpu="$(pg_cores_one "${PG_URI}" "${sql}" "${PG_WM}")"
+    # (Measured above, before the verdict, since v7.40.11 consults it.)
     printf '%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s%s\n' \
       "${rows}" "${name}" "${smin}-${smax}" "${gmin}-${gmax}" \
       "${ssrv}" "${gsrv}" "${pgcpu}" "${v}" "${note}"
