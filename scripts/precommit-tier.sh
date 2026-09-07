@@ -54,6 +54,31 @@ ssh -n -o BatchMode=yes -o ConnectTimeout=4 "$host" true 2>/dev/null || {
 
 local_tree=$(git write-tree)
 
+# v7.40.12 — do not rsync over a tier that is already running there.
+#
+# The offload and the long tiers share one directory on the testbed, and
+# this script's rsync `--delete`s into it. Committing while a `full` run
+# was in flight replaced that run's sources underneath it, and the run
+# then failed to COMPILE against half-swapped crates -- twice, with an
+# error naming an enum variant that was plainly present in the file it
+# was reading. Two forty-minute runs were thrown away chasing code that
+# was never wrong.
+#
+# The offload is an optimisation. When the testbed is busy, grading here
+# is the honest answer, and it is the same answer this script already
+# gives when the tree differs or the ssh fails.
+#
+# The witness is the run lock's own owner pid, checked on the far side:
+# a stale lock directory left by a killed run does not count.
+if ssh -n "$host" "cd ${path} 2>/dev/null || exit 1
+    [ -d target/suite/.running ] || exit 1
+    p=\$(sed -n 's/^pid //p' target/suite/.running/owner 2>/dev/null)
+    [ -n \"\$p\" ] || exit 1
+    kill -0 \"\$p\" 2>/dev/null" 2>/dev/null; then
+    echo "precommit: ${host} is running a tier of its own — running here"
+    run_local
+fi
+
 rsync -a --delete --exclude target --exclude .git ./ "${host}:${path}/" || {
     echo "precommit: rsync to ${host} failed — running here"
     run_local
