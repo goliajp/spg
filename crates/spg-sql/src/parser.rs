@@ -4285,12 +4285,17 @@ impl Parser {
                     // restore session, so accepting it and doing nothing
                     // meant the restore ran at a level nobody chose.
                     //
-                    // The trailing READ ONLY / [NOT] DEFERRABLE modes are
-                    // still consumed and dropped. `default_transaction_read_only`
-                    // exists in the GUC inventory but nothing enforces it,
-                    // and setting a value no code honours is the very
-                    // defect this version is about — a session told it
-                    // holds a guarantee it does not.
+                    // v7.39 wired READ ONLY here for the same reason,
+                    // once something enforced it.
+                    //
+                    // v7.40.12 — and DEFERRABLE, once something honoured
+                    // it. This was the LAST of the three still being
+                    // consumed and dropped: measured on PG 18.6,
+                    // `SET SESSION CHARACTERISTICS AS TRANSACTION
+                    // DEFERRABLE; SHOW default_transaction_deferrable`
+                    // answers `on`, and SPG answered `off` while
+                    // answering the READ ONLY and ISOLATION LEVEL forms
+                    // of the same statement correctly.
                     let modes = self.parse_isolation_level_clauses()?;
                     self.consume_until_statement_boundary();
                     let mut pairs: alloc::vec::Vec<(
@@ -4309,6 +4314,16 @@ impl Parser {
                         pairs.push((
                             alloc::string::String::from("default_transaction_read_only"),
                             crate::ast::SetValue::Ident(alloc::string::String::from(if ro {
+                                "on"
+                            } else {
+                                "off"
+                            })),
+                        ));
+                    }
+                    if let Some(d) = modes.deferrable {
+                        pairs.push((
+                            alloc::string::String::from("default_transaction_deferrable"),
+                            crate::ast::SetValue::Ident(alloc::string::String::from(if d {
                                 "on"
                             } else {
                                 "off"

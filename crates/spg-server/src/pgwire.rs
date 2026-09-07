@@ -6972,7 +6972,7 @@ fn process_copy_chunk(
                 }
             }
         } else {
-            let values = decode_copy_text_row(row_text);
+            let values = decode_copy_text_row(row_text, opts);
             if let Err(msg) = copy_row_arity(&values, expected_names) {
                 if opts.on_error_set_null {
                     continue;
@@ -7181,8 +7181,15 @@ fn read_json_value_as_sql(
 /// backslash escapes \\b \f \n \r \t \v. v7.22 — delegates to the
 /// shared `spg_engine::copy` helper (single home with the embed
 /// import path).
-fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
-    spg_engine::copy::decode_copy_text_row(line)
+fn decode_copy_text_row(line: &str, opts: &CopyOptions) -> Vec<Option<String>> {
+    // v7.40.12 — DELIMITER and NULL apply to the TEXT format too, and
+    // this path used the built-in defaults whatever the client asked
+    // for. The COPY TO side above has read them since round 94.
+    spg_engine::copy::decode_copy_text_row_opts(
+        line,
+        opts.csv_delimiter.unwrap_or('\t'),
+        opts.null_string.as_deref().unwrap_or("\\N"),
+    )
 }
 
 /// Build `INSERT INTO <table> VALUES (...)` from a decoded row.

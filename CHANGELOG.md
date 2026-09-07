@@ -280,6 +280,39 @@ because it is the obvious reading. A bare `'300 milliseconds'` is
 `unknown` to PG and coerced to `interval`, so it is cast the same way
 here; without that, the spelling in PG's own documentation slept 0.25 ms.
 
+### Fixed — three more clauses that were carried and not honoured
+
+Found by sweeping the parser for its own admissions — the phrases
+"consumed and dropped", "parsed-and-ignored", "accept-and-no-op" — and
+then measuring each against PG 18.6 rather than trusting the reasoning
+written beside it.
+
+`SET SESSION CHARACTERISTICS AS TRANSACTION DEFERRABLE` was the last of
+that statement's three modes still being dropped; the READ ONLY and
+ISOLATION LEVEL forms had been wired in v7.39 and answered correctly.
+Measured: PG sets `default_transaction_deferrable` to `on`, SPG left it
+`off`.
+
+`COPY … WITH (DELIMITER …)` and `WITH (NULL …)` apply to the TEXT format
+too, not only to CSV. Both options were parsed and then read only on the
+CSV path, so the text format — which is what `COPY … FROM stdin` is
+without a FORMAT — kept the built-in tab and `\N` whatever the client
+asked for:
+
+```text
+  COPY cp FROM stdin WITH (DELIMITER '|')   PG: 2 rows loaded
+                                            SPG: ERROR missing data for
+                                                 column "b", 0 rows
+  COPY cp FROM stdin WITH (NULL 'NIL')      PG: the column is NULL
+                                            SPG: the column holds 'NIL'
+                                                 and it answered COPY 1
+```
+
+The second stored wrong data and reported success. The COPY TO side has
+honoured both since round 94, which is what made the gap findable at
+all: one direction of the same option pair read it and the other did
+not.
+
 
 
 ## [7.40.11] — 2026-09-07
