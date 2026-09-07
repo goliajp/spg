@@ -520,6 +520,32 @@ impl Engine {
     /// Measured on PG18: with all four scopes set, a new session got the
     /// role-in-database value. So the least specific is applied first and
     /// the most specific last, each overwriting.
+    /// v7.40.11 — seed a freshly installed session the way PostgreSQL
+    /// seeds a backend, in its order of specificity: the SERVER's own
+    /// `-c name=value`, then the recorded `ALTER DATABASE/ROLE SET`.
+    ///
+    /// What the CONNECTION asked for goes on top, and stays with the
+    /// caller because only the caller knows what was asked — the
+    /// startup packet is a PostgreSQL-wire idea.
+    ///
+    /// One function because there are two wire hosts and the first cut
+    /// of the boot settings reached one: a pgwire session got them and
+    /// a mysql-wire session got neither them NOR the db/role defaults,
+    /// which pgwire had been applying alone since v7.39 round 547. The
+    /// same shape this release keeps finding — one question, two
+    /// surfaces, and only one of them had heard the answer.
+    pub fn apply_server_defaults(
+        &mut self,
+        boot: &[(alloc::string::String, alloc::string::String)],
+        database: &str,
+        role: &str,
+    ) {
+        for (k, v) in boot {
+            let _ = self.execute(&alloc::format!("SET {k} = '{v}'"));
+        }
+        self.apply_db_role_settings(database, role);
+    }
+
     pub fn apply_db_role_settings(&mut self, database: &str, role: &str) {
         let scopes: alloc::vec::Vec<(alloc::string::String, alloc::string::String)> = alloc::vec![
             (alloc::string::String::new(), alloc::string::String::new()),

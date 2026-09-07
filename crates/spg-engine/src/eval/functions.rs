@@ -15339,7 +15339,32 @@ fn apply_function_dispatch(
                 // unique_checks 1, foreign_key_checks 1, sql_notes 1,
                 // note_verbosity `basic,explain`,
                 // sql_quote_show_create 1, innodb_stats_on_metadata 0.
-                "time_zone" => "SYSTEM",
+                // v7.40.11 — one session has ONE zone, and this said
+                // otherwise.
+                //
+                // The lookup above prefers the session's own value, so
+                // `SET time_zone = 'Asia/Tokyo'` was found and answered.
+                // The PostgreSQL spelling writes the same zone under
+                // the canonical name `timezone`, which this constant
+                // never consulted — so `-c TimeZone=Asia/Tokyo` and
+                // `SET TimeZone` moved the zone the engine actually
+                // uses while a MySQL client reading `@@time_zone` was
+                // told `SYSTEM`. Measured: `current_setting('TimeZone')`
+                // answered `Asia/Tokyo` in the same session.
+                //
+                // `SYSTEM` stays the answer when nothing has set one,
+                // which is MySQL 9.7.2's own default (measured) and what
+                // every mysqldump preamble reads back.
+                "time_zone" => {
+                    return Ok(Value::text(
+                        ctx.engine
+                            .and_then(|e| e.session_param("timezone"))
+                            .map_or_else(
+                                || alloc::string::String::from("SYSTEM"),
+                                alloc::string::ToString::to_string,
+                            ),
+                    ));
+                }
                 "system_time_zone" => "UTC",
                 "unique_checks" | "foreign_key_checks" | "sql_notes"
                 | "sql_quote_show_create" => "1",

@@ -482,7 +482,15 @@ impl Engine {
             // a client that reads sql_mode back after setting it was told
             // the default regardless.
             ("sql_mode", crate::MYSQL_DEFAULT_SQL_MODE),
-            ("time_zone", "SYSTEM"),
+            // v7.40.11 — the session's ONE zone, or `SYSTEM` when
+            // nothing has set one. See the `@@` arm: the loop below
+            // prefers a session value stored under THIS name, so
+            // `SET time_zone` was honoured and the PostgreSQL spelling —
+            // which writes the same zone under `timezone` — was not.
+            (
+                "time_zone",
+                self.session_param("timezone").unwrap_or("SYSTEM"),
+            ),
             // v7.39 — the LIVE level, via the one function all three
             // surfaces now ask. This held the literal `REPEATABLE-READ`
             // (MySQL's default) while the engine ran read committed and

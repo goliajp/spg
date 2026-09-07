@@ -655,6 +655,18 @@ fn command_loop(
             if !database.is_empty() {
                 engine.set_session_database(&database);
             }
+            // v7.40.11 — the server's own `-c name=value` and the
+            // recorded `ALTER DATABASE/ROLE SET`, in PostgreSQL's order
+            // of specificity.
+            //
+            // This host had NEITHER. The db/role defaults have been
+            // applied on the pgwire side since v7.39 round 547 and were
+            // never wired here, and the boot settings landed in v7.40.11
+            // on that same one side — so an operator who set something
+            // for the whole deployment got it on one wire and not the
+            // other. Seeded through the shared function, after the
+            // identity and database this connection just installed.
+            engine.apply_server_defaults(&state.boot_gucs, &database, user);
             engine.alloc_tx_id()
         }
         Err(_) => spg_engine::IMPLICIT_TX,
