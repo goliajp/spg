@@ -34,6 +34,16 @@
 #     not perform is the same defect as a compatibility table nobody
 #     re-ran.
 #
+#     v7.40.11 — and the sentence above was STILL ahead of the code.
+#     The control was consulted, but only for "did the same binary
+#     separate from itself at all"; when it had not, any gap however
+#     small stood as a verdict. `400000 numeric distinct` was called a
+#     LOSS on 0.004 ms between bands 0.18 ms wide, and re-measured twice
+#     at N=21 on an idle box it called LOSS once and ran the other way
+#     round the second time. A verdict must now clear the span the same
+#     binary shows TWICE in the same window — which is what the control
+#     leg was added to measure. See `verdict()`.
+#
 #   * It covered the dogfood corpus only. The whole ORDER BY surface was
 #     outside it, which is how 29 losing cells out of 32 went unreported
 #     until a one-off sweep found them (see
@@ -269,11 +279,49 @@ pg_cores_one() { # $1=uri $2=sql $3=work_mem setting
 lo() { printf '%s\n' "$@" | sort -g | head -1; }
 hi() { printf '%s\n' "$@" | sort -g | tail -1; }
 
-# a-range strictly above b-range => LOSS; strictly below => win; else the
-# panel cannot tell them apart at this resolution.
-verdict() { # $1=amin $2=amax $3=bmin $4=bmax
-  awk -v amin="$1" -v amax="$2" -v bmin="$3" -v bmax="$4" \
-    'BEGIN { if (amin > bmax) print "LOSS"; else if (amax < bmin) print "win"; else print "unresolved" }'
+# a-range above b-range by more than `floor` => LOSS; below by more than
+# `floor` => win; else the panel cannot tell them apart at this
+# resolution.
+#
+# v7.40.11 — `floor`, because separation alone is not resolution.
+#
+# The header above has promised since v7.38.18 that a cell exits 0 "when
+# no cell LOSES beyond its own control's resolution". The code did not
+# do that: it asked whether the same binary separated from ITSELF at all
+# and, when it had not, let any gap however small stand as a verdict. On
+# `400000 numeric distinct` that was a 0.004 ms gap between bands 0.18 ms
+# wide — 2% of the leg's own spread — reported as a LOSS. Measured twice
+# at N=21 on an idle machine, the cell called LOSS in one run and, in the
+# other, ran the SAME two legs the OTHER way round: a real cost does not
+# change sign.
+#
+# The floor is the span of the same binary measured TWICE in the same
+# window (the `s` and `c` legs), which is what the control leg was added
+# to provide. It is measured per cell, so it needs no threshold constant
+# and it scales with whatever the cell and the machine are doing.
+#
+# `floor` defaults to 0, which is exactly the old behaviour — that is
+# what the control's own s-versus-c call still wants.
+verdict() { # $1=amin $2=amax $3=bmin $4=bmax [$5=floor]
+  awk -v amin="$1" -v amax="$2" -v bmin="$3" -v bmax="$4" -v floor="${5:-0}" \
+    'BEGIN { if (amin - bmax > floor) print "LOSS"; else if (bmin - amax > floor) print "win"; else print "unresolved" }'
+}
+
+# This cell's demonstrated resolution, in the window it was demonstrated
+# in: the span of the two same-binary legs together, and the span of the
+# other engine's band, whichever is wider.
+#
+# Both, because the verdict is a claim that one band sits above the
+# other, and the uncertainty in where a band SITS is its own width. A
+# gap narrower than either band's width is a claim neither band can
+# support. The same-binary pair is the honest measure of the machine's
+# contribution; the other leg carries its own variability on top.
+resolution() { # $1=smin $2=smax $3=cmin $4=cmax $5=gmin $6=gmax
+  awk -v s1="$1" -v s2="$2" -v c1="$3" -v c2="$4" -v g1="$5" -v g2="$6" \
+    'BEGIN {
+       lo = (s1 < c1 ? s1 : c1); hi = (s2 > c2 ? s2 : c2);
+       sc = hi - lo; g = g2 - g1;
+       printf "%.6f\n", (sc > g ? sc : g) }'
 }
 
 setup_table() { # $1=uri $2=table $3=rows $4=work_mem-setting
@@ -549,7 +597,7 @@ TYPED_SHAPES=(
   'prefix walk, all rows|SELECT id FROM @W@ WHERE n = 1.23 ORDER BY id DESC'
 )
 
-LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0
+LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0; BELOW_RES=0
 
 printf '\n%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s\n' \
   SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' 'SRV-SPG' 'SRV-PG' PGCPU VERDICT
@@ -617,11 +665,29 @@ for rows in ${SIZES}; do
     smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
     gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
     cmin="$(lo "${c[@]}")"; cmax="$(hi "${c[@]}")"
-    v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
+    # v7.40.11 — the verdict must clear this cell's own resolution, which
+    # the control leg measures. `raw` is the pre-floor call, kept only so
+    # the withdrawal can be counted and named.
+    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}")"
+    raw="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
+    v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}" "${res}")"
     # The same binary against itself. If THAT separates, this cell has no
     # resolution left to spend on a verdict about PG.
     cv="$(verdict "${smin}" "${smax}" "${cmin}" "${cmax}")"
     note=""
+    # v7.40.11 — its OWN counter, not `withdrawn`.
+    #
+    # `withdrawn` means "the machine was too noisy to read this cell at
+    # all" — the same binary separated from itself — and the suite grades
+    # the locale panel on `withdrawn=0`. This is a different fact: a cell
+    # whose gap is inside its own resolution is the ORDINARY state of a
+    # cell with no difference to report, and it happens on most runs.
+    # Counted together, a healthy panel would have read as an unreadable
+    # one and failed the step. (It did, once, before they were split.)
+    if [[ "${raw}" != unresolved && "${v}" == unresolved ]]; then
+      note="  <- would have said ${raw}; the gap is inside this cell own resolution (${res})"
+      BELOW_RES=$((BELOW_RES + 1))
+    fi
     if [[ "${cv}" != unresolved ]]; then
       CONTROL_DIFFS=$((CONTROL_DIFFS + 1))
       if [[ "${v}" != unresolved ]]; then
@@ -783,12 +849,20 @@ done
 
 echo
 echo "load after: $(uptime)"
-echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} below_resolution=${BELOW_RES} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
 if (( CONTROL_DIFFS > 0 )); then
   echo "NOTE: on ${CONTROL_DIFFS} cell(s) the binary separated from ITSELF in the same"
   echo "      window. ${DEMOTED} verdict(s) were withdrawn on that ground and report"
   echo "      \`unresolved\`. A machine this busy cannot certify a small difference;"
   echo "      re-run on a quiet box or raise N before acting on any single cell."
+fi
+if (( BELOW_RES > 0 )); then
+  echo "NOTE: ${BELOW_RES} cell(s) separated by less than their own resolution and are"
+  echo "      reported \`unresolved\`. That is the ordinary answer for a cell with no"
+  echo "      difference to report, not a fault: the panel does not get to call a"
+  echo "      verdict it cannot support. Each such line says what it WOULD have"
+  echo "      claimed, so a withheld LOSS is visible and not just a smaller number."
+  echo "      Raise N to certify a smaller difference."
 fi
 (( LOSSES == 0 )) || exit 1
 if (( SORT_OVER > 0 )); then

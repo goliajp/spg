@@ -986,6 +986,13 @@ fn locale_panel_passes(verdict: &str) -> bool {
     // run that failed. One gate run went green on exactly that. Refusing
     // multi-line input makes the misuse impossible rather than
     // remembered.
+    // v7.40.11 — `withdrawn` still means what it meant: the same binary
+    // separated from ITSELF, so the machine could not read that cell.
+    // The sweep gained a SECOND counter in the same release,
+    // `below_resolution`, for cells whose gap is inside their own
+    // resolution — which is the ordinary answer for a cell with no
+    // difference and is deliberately NOT graded here. Counted together
+    // they made a healthy panel read as an unreadable one.
     !verdict.contains('\n')
         && verdict.contains("sort_over_ceiling=0")
         && verdict.contains("control_false_differences=0")
@@ -1035,6 +1042,26 @@ mod locale_panel_verdict_tests {
     #[test]
     fn a_few_percent_on_the_shapes_is_not_a_cost_class_change() {
         assert!(locale_panel_passes(CLEAN));
+    }
+
+    /// v7.40.11 — `below_resolution` is not `withdrawn`.
+    ///
+    /// The sweep gained a resolution floor this release: a gap smaller
+    /// than the cell's own measured spread is no longer a verdict. That
+    /// is the ordinary outcome for a cell with no difference to report,
+    /// and it happens on most runs. Counted into `withdrawn`, which this
+    /// function grades on being 0, a healthy panel read as an unreadable
+    /// one and failed the step — measured, once, before the counters
+    /// were split.
+    #[test]
+    fn a_cell_below_its_own_resolution_is_not_an_unreadable_panel() {
+        assert!(locale_panel_passes(
+            "cells=19 losses=0 control_false_differences=0 withdrawn=0 below_resolution=3 sort_worst=1.02x sort_over_ceiling=0"
+        ));
+        // And the counter it is NOT: that one still fails.
+        assert!(!locale_panel_passes(
+            "cells=19 losses=0 control_false_differences=0 withdrawn=1 below_resolution=0 sort_worst=1.02x sort_over_ceiling=0"
+        ));
     }
 
     #[test]
