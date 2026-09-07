@@ -355,7 +355,10 @@ fn the_ok_packet_carries_the_key_this_statement_made() {
     assert_eq!(ok_of(&mut s, "INSERT INTO k (n) VALUES (2)"), (1, 2));
     // An EXPLICIT key is reported here even though it leaves
     // `LAST_INSERT_ID()` alone.
-    assert_eq!(ok_of(&mut s, "INSERT INTO k (id, n) VALUES (100, 3)"), (1, 100));
+    assert_eq!(
+        ok_of(&mut s, "INSERT INTO k (id, n) VALUES (100, 3)"),
+        (1, 100)
+    );
     // A statement that made no key reports none — the stale value would
     // be a wrong generated key, which is worse than no key.
     assert_eq!(ok_of(&mut s, "UPDATE k SET n = n + 1"), (3, 0));

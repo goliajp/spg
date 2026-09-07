@@ -158,7 +158,10 @@ pub(crate) const CONSTANT: &[(&str, VarValue)] = &[
         "version_comment",
         VarValue::Text(crate::MYSQL_VERSION_COMMENT),
     ),
-    ("version_compile_os", VarValue::Text(crate::MYSQL_COMPILE_OS)),
+    (
+        "version_compile_os",
+        VarValue::Text(crate::MYSQL_COMPILE_OS),
+    ),
     ("wait_timeout", VarValue::Text("0")),
 ];
 

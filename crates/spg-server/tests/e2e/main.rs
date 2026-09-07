@@ -132,8 +132,6 @@ mod e2e_cursor_isolation_round321;
 mod e2e_cursor_lazy_round792;
 mod e2e_cursor_wire_round219;
 mod e2e_derived_sort_work_mem_v7411;
-mod e2e_mysql_variable_surfaces_v7411;
-mod e2e_mysqlwire_server_defaults_v7411;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -231,6 +229,7 @@ mod e2e_limits;
 mod e2e_manifest;
 mod e2e_materialised_cancel_round824;
 mod e2e_midstream_error_round791;
+mod e2e_mysql_variable_surfaces_v7411;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
@@ -283,6 +282,7 @@ mod e2e_mysqlwire_messages_v7400;
 )]
 mod e2e_mysqlwire_query;
 mod e2e_mysqlwire_returning_durability_round181;
+mod e2e_mysqlwire_server_defaults_v7411;
 mod e2e_mysqlwire_ssl;
 #[allow(
     clippy::cast_lossless,
