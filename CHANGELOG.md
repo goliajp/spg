@@ -10,6 +10,9 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [7.40.11] — 2026-09-07
+
 ### Fixed — Connector/J could not open a connection at all
 
 Filed as a coverage gap: `SHOW VARIABLES` listed 19 names where MySQL
