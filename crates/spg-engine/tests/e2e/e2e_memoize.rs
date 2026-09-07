@@ -54,20 +54,32 @@ fn correlated_subquery_completes_in_reasonable_time() {
     // SELECT 500 times. With the cache, only KEY_DOMAIN = 10 inner
     // executions actually run; the other 490 outer rows hit cache.
     //
-    // Wall-clock gate: the whole SELECT must complete inside 2 s
-    // on a release build. (Without the cache, the test takes
-    // 10×+ longer.)
+    // v7.40.11 — the wall-clock gate is gone; the elapsed number is
+    // still printed.
+    //
+    // It asserted `< 2 s` for a query that answers in milliseconds, so
+    // only a catastrophe could trip it — and this harness runs inside
+    // `e2e`, which the suite runs CONCURRENTLY with five other steps, so
+    // what it could trip on was the machine. A bound that cannot catch
+    // the regression it names and can fail for a reason it does not is
+    // worse than none.
+    //
+    // The mechanism is pinned, exactly, by
+    // `cache_hits_dominate_repeated_key_workload` below: 5 misses and 95
+    // hits out of 100 evaluations, counted rather than timed. The
+    // engine's own `memoize::counters` are NOT used here on purpose —
+    // they are process-global and this harness runs its tests
+    // concurrently, which is the trap that cost `group_commit` three red
+    // CI runs in this same version.
     let mut e = setup();
     let sql = "SELECT id FROM outer_t WHERE k = \
                (SELECT k FROM inner_t WHERE inner_t.k = outer_t.k LIMIT 1)";
     let t0 = Instant::now();
     let r = e.execute(sql).expect("correlated SELECT");
     let elapsed = t0.elapsed();
-    eprintln!("memoize: elapsed={}ms", elapsed.as_millis());
-    assert!(
-        elapsed.as_secs() < 2,
-        "memoize-cached query took {:?}; gate ≤ 2 s",
-        elapsed
+    eprintln!(
+        "memoize: elapsed={}ms (printed, not asserted)",
+        elapsed.as_millis()
     );
     let n = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows.len(),

@@ -209,6 +209,31 @@ budget_s = 270
 group = "after-build"
 
 [[step]]
+# v7.40.11 — the latency gates, on a machine of their own.
+#
+# `slo_smoke` and `perf_gate` used to run inside `gates`, which is in
+# the concurrent group above. They are LATENCY measurements. The note
+# beside `perf-sweep` has said since v7.40.8 that a timing gate "needs
+# the machine to itself"; it was written for one timing gate and two
+# others were left in the group.
+#
+# What it cost: a prerelease run read SEL p99 4759 us against a 2000 us
+# ceiling while the machine it shared went from load 5.8 to 12.3, and
+# reported it as the engine blowing its SLO.
+#
+# No `group`, so it runs alone, after the concurrent set and before
+# `perf-sweep`.
+tier = "prerelease"
+name = "gates-timing"
+impl = "external"
+cmd = "scripts/gate.sh gates-timing"
+# First calibration: slo_smoke ~13 s and perf_gate ~76 s when they ran
+# inside `gates`, both while sharing the box. Alone they can only be
+# faster; the budget is set from those observations x1.5 and will be
+# recalibrated from recorded runs like every other line here.
+budget_s = 140
+
+[[step]]
 tier = "prerelease"
 name = "ironrules"
 impl = "internal"
