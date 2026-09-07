@@ -1158,6 +1158,17 @@ fn mysql_error_parts_inner(
         {
             (1292, "22007", detail.clone())
         }
+        // v7.40.11 — `SET <name> = NULL`. MySQL 9.7.2 answers
+        // `ERROR 1231 (42000) Variable 'sql_mode' can't be set to the
+        // value of 'NULL'` (measured); this reached the wire as 1064, a
+        // SYNTAX error, which is not what happened. The engine words it,
+        // because only it knows the name.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("Variable '")
+                && m.ends_with("can't be set to the value of 'NULL'") =>
+        {
+            (1231, "42000", m.clone())
+        }
         spg_engine::EngineError::Storage(spg_storage::StorageError::DuplicateTable { name }) => {
             (1050, "42S01", format!("Table '{name}' already exists"))
         }
@@ -1669,7 +1680,7 @@ fn handle_com_query(
     // statements and never collide with another connection (V22).
     // 7.38.1 S2.2 — the row-lock wait loop, mysql-wire edition.
     let mut waits = 0u32;
-    let outcome = loop {
+    let (outcome, insert_id) = loop {
         let attempt = {
             let Ok(mut engine) = state.engine.write() else {
                 return write_packet(
@@ -1691,9 +1702,16 @@ fn handle_com_query(
             if !*autocommit && !is_tx_control(sql) && !engine.is_tx_open(conn_tx_id) {
                 let _ = engine.execute_in("BEGIN", conn_tx_id);
             }
-            engine.execute_in(sql, conn_tx_id)
+            // v7.40.11 — read the OK packet's insert id under the SAME
+            // guard that ran the statement. It lives on the shared
+            // engine, so a concurrent connection's insert between the
+            // unlock and the reply would otherwise be reported as this
+            // connection's generated key.
+            let r = engine.execute_in(sql, conn_tx_id);
+            let insert_id = engine.statement_insert_id();
+            (r, insert_id)
         };
-        if matches!(attempt, Err(spg_engine::EngineError::LockWouldBlock)) {
+        if matches!(attempt.0, Err(spg_engine::EngineError::LockWouldBlock)) {
             crate::lock_wait_backoff(waits);
             waits += 1;
             continue;
@@ -1744,6 +1762,7 @@ fn handle_com_query(
                 start_seqno,
                 &encode_ok_with_affected(
                     affected as u64,
+                    insert_id,
                     tx_status(state, conn_tx_id, *autocommit),
                 ),
             )?;
@@ -2015,7 +2034,7 @@ fn handle_com_stmt_execute(
     // Bind + execute via engine.
     // 7.38.1 S2.2 — row-lock wait loop (see handle_com_query).
     let mut waits = 0u32;
-    let (outcome, render) = loop {
+    let (outcome, render, insert_id) = loop {
         let attempt = {
             let Ok(mut engine) = state.engine.write() else {
                 return write_packet(
@@ -2048,10 +2067,11 @@ fn handle_com_stmt_execute(
                     .ok()
                     .map(|()| bind.to_string())
             };
-            (
-                engine.execute_prepared_in(stmt, &params, conn_tx_id),
-                render,
-            )
+            // See the COM_QUERY path: the insert id is read under the
+            // guard that ran the statement.
+            let r = engine.execute_prepared_in(stmt, &params, conn_tx_id);
+            let insert_id = engine.statement_insert_id();
+            (r, render, insert_id)
         };
         if matches!(attempt.0, Err(spg_engine::EngineError::LockWouldBlock)) {
             crate::lock_wait_backoff(waits);
@@ -2102,7 +2122,11 @@ fn handle_com_stmt_execute(
             write_packet(
                 stream,
                 start_seqno,
-                &encode_ok_with_affected(affected as u64, tx_status(state, conn_tx_id, autocommit)),
+                &encode_ok_with_affected(
+                    affected as u64,
+                    insert_id,
+                    tx_status(state, conn_tx_id, autocommit),
+                ),
             )?;
         }
         Ok(QueryResult::Rows { columns, rows }) => {
@@ -2732,11 +2756,18 @@ fn column_length_for(ty: DataType) -> u32 {
 
 // ---- OK / lenenc helpers ------------------------------------
 
-pub(crate) fn encode_ok_with_affected(affected: u64, status: u16) -> Vec<u8> {
+/// v7.40.11 — the third field is the key the statement just made, and
+/// it was the literal 0 for every statement this server has ever
+/// answered. JDBC reads it back as `getGeneratedKeys()`, so every
+/// `RETURN_GENERATED_KEYS` insert through Connector/J failed with
+/// `Illegal operation on empty result set` — measured — while the row
+/// itself was written and `SELECT LAST_INSERT_ID()` answered correctly.
+/// The two are different quantities; see `Engine::statement_insert_id`.
+pub(crate) fn encode_ok_with_affected(affected: u64, insert_id: u64, status: u16) -> Vec<u8> {
     let mut out = Vec::with_capacity(11);
     out.push(0x00);
     encode_lenenc_int(&mut out, affected);
-    out.push(0); // last_insert_id = 0
+    encode_lenenc_int(&mut out, insert_id);
     out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // warnings
     out

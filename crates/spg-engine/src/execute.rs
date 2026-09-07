@@ -346,6 +346,12 @@ impl Engine {
         // unwind reaches here; active in dev/test (`panic = "unwind"`)
         // and once a later slice flips the release profile.
         let pre_in_tx = self.in_transaction();
+        // v7.40.11 — the OK packet's insert id describes THIS statement,
+        // so it is cleared before the statement rather than after: an
+        // UPDATE that follows an INSERT must report no key, and a JDBC
+        // caller turns whatever is here into `getGeneratedKeys()`.
+        self.statement_insert_id
+            .store(0, core::sync::atomic::Ordering::Relaxed);
         let result = self.execute_inner_catching(sql, cancel);
         // v7.39 (round 426) — MySQL's ROW_COUNT() reads what the LAST
         // statement did. Measured on MariaDB 11: a DML statement leaves the
@@ -2763,6 +2769,9 @@ impl Engine {
                 if let Some(msg) = self.reject_unsettable_guc(&name) {
                     return Err(EngineError::Unsupported(msg));
                 }
+                if let Some(msg) = Self::null_set_rejection(&name, &value) {
+                    return Err(EngineError::Unsupported(msg));
+                }
                 // v7.38 (read01) — SPG serves the wire as UTF8, so a
                 // non-UTF8 client_encoding can't be honoured (the bytes
                 // stay UTF8). Reject it rather than silently store a value
@@ -2774,6 +2783,7 @@ impl Engine {
                         | spg_sql::ast::SetValue::Ident(s)
                         | spg_sql::ast::SetValue::Number(s) => s.as_str(),
                         spg_sql::ast::SetValue::Default => "UTF8",
+                        spg_sql::ast::SetValue::Null => "NULL",
                     };
                     let norm: alloc::string::String = v
                         .trim()
@@ -2948,8 +2958,11 @@ impl Engine {
             // mysqldump preamble) are recorded then ignored.
             Statement::SetParameterList(pairs) => {
                 // Same validation as the single form (round 501).
-                for (name, _) in &pairs {
+                for (name, value) in &pairs {
                     if let Some(msg) = self.reject_unsettable_guc(name) {
+                        return Err(EngineError::Unsupported(msg));
+                    }
+                    if let Some(msg) = Self::null_set_rejection(name, value) {
                         return Err(EngineError::Unsupported(msg));
                     }
                 }

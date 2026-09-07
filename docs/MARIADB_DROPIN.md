@@ -13,13 +13,20 @@ features called out here.
 
 ## Current state — wire protocol (v7.17)
 
-Verified clients:
+Clients. See [MYSQL_DROPIN.md](./MYSQL_DROPIN.md) for why this list
+distinguishes what is gated from what is merely reported: v7.40.11
+found that the JDBC entry on the MySQL side had never been run, and
+that when it was, it did not work.
 
-- `mariadb` CLI 11.x
-- MariaDB Connector/J (JDBC)
-- MariaDB Connector/Node.js
-- Standard MariaDB-compatible drivers in Python (`mariadb`,
-  `mysql.connector`) and Go (`go-sql-driver/mysql`).
+Exercised by the release acceptance panel:
+
+- `mariadb` CLI 12.3, with MariaDB's own expectations
+
+Reported working and NOT gated here — treat as unverified by this
+project:
+
+- MariaDB Connector/J (JDBC), Connector/Node.js
+- Python `mariadb` / `mysql.connector`, Go `go-sql-driver/mysql`
 
 Start the listener identically to MySQL mode:
 

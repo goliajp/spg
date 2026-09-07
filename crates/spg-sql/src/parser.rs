@@ -8484,6 +8484,13 @@ impl Parser {
             // DEFAULT lexes as its keyword token, so the ident arm above
             // never saw it and the everyday reset form was a syntax error.
             Token::Default => Ok(crate::ast::SetValue::Default),
+            // v7.40.11 — MySQL 9.7.2 accepts `NULL` here for exactly one
+            // variable and rejects it with error 1231 for every other
+            // (both measured); PostgreSQL 18.6 rejects the token itself
+            // with `syntax error at or near "NULL"`. So the token is
+            // admitted only for a MySQL session and the per-variable
+            // decision is the executor's.
+            Token::Null if self.mysql_dialect => Ok(crate::ast::SetValue::Null),
             Token::On => Ok(crate::ast::SetValue::Ident("on".to_string())),
             Token::True => Ok(crate::ast::SetValue::Ident("true".to_string())),
             Token::False => Ok(crate::ast::SetValue::Ident("false".to_string())),
@@ -28145,6 +28152,7 @@ fn set_value_text(v: &crate::ast::SetValue) -> alloc::string::String {
         | crate::ast::SetValue::Ident(s)
         | crate::ast::SetValue::Number(s) => s.clone(),
         crate::ast::SetValue::Default => "DEFAULT".into(),
+        crate::ast::SetValue::Null => "NULL".into(),
     }
 }
 

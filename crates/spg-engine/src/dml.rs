@@ -4940,6 +4940,9 @@ impl Engine {
         // (immutable) table borrow.
         let overriding = stmt.overriding;
         let mut first_auto: Option<i64> = None;
+        // v7.40.11 — the OK packet's key, which includes an explicit one;
+        // see `Engine::statement_insert_id`.
+        let mut first_auto_key: Option<i64> = None;
         // v7.38.18 (C12) — collected here, published to the session
         // after the statement so `SHOW WARNINGS` can read it.
         let mut stmt_warnings: Vec<crate::MysqlWarning> = Vec::new();
@@ -4956,6 +4959,7 @@ impl Engine {
             &set_variant_lookup,
             overriding,
             &mut first_auto,
+            &mut first_auto_key,
             insert_mysql,
             // v7.39 (round 470) — `INSERT IGNORE` bends values, and so does
             // a non-strict `sql_mode`. Same conversion, different trigger.
@@ -5016,6 +5020,10 @@ impl Engine {
         // borrow on `table` is released.
         if let Some(v) = first_auto {
             self.last_insert_id
+                .store(v, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(v) = first_auto_key {
+            self.statement_insert_id
                 .store(v, core::sync::atomic::Ordering::Relaxed);
         }
         // v7.37.7(sentori Epic 3 P1)— stored generated-column
@@ -7209,6 +7217,7 @@ fn parse_insert_rows(
     // `None` when the statement generated none, in which case MariaDB
     // leaves the session's previous value alone.
     first_auto: &mut Option<i64>,
+    first_auto_key: &mut Option<i64>,
     // v7.39 (round 367, M20) — the session dialect, so a `0x…` / `X'…'`
     // binary-string literal coerces into its target column the MySQL way
     // (big-endian number into a numeric column, bytes-as-string into a
@@ -7412,6 +7421,9 @@ fn parse_insert_rows(
                     if first_auto.is_none() {
                         *first_auto = Some(next);
                     }
+                    if first_auto_key.is_none() {
+                        *first_auto_key = Some(next);
+                    }
                     raw = Value::BigInt(next);
                 } else if mysql
                     && col.auto_increment
@@ -7433,6 +7445,17 @@ fn parse_insert_rows(
                         None => auto_cursor_seed(table, i, col, seq_floors)?,
                     };
                     auto_cursors.insert(i, cursor.max(n.saturating_add(1)));
+                    // v7.40.11 — an explicit key does NOT move
+                    // `LAST_INSERT_ID()` (measured: it still reads the
+                    // earlier insert's value), but it IS what the OK
+                    // packet reports and what JDBC hands back from
+                    // `getGeneratedKeys()`. Measured on MySQL 9.7.2
+                    // through a driver reading the packet:
+                    // `INSERT INTO t (id, n) VALUES (100, 3)` reports
+                    // 100.
+                    if first_auto_key.is_none() {
+                        *first_auto_key = Some(n);
+                    }
                 }
                 // v7.39 (round 263) — a COMPOSITE column relabels + coerces
                 // its value through the declared type first; ROW()'s
@@ -7556,6 +7579,9 @@ fn parse_insert_rows(
                     if first_auto.is_none() {
                         *first_auto = Some(next);
                     }
+                    if first_auto_key.is_none() {
+                        *first_auto_key = Some(next);
+                    }
                     raw = Value::BigInt(next);
                 } else if mysql
                     && col.auto_increment
@@ -7577,6 +7603,17 @@ fn parse_insert_rows(
                         None => auto_cursor_seed(table, i, col, seq_floors)?,
                     };
                     auto_cursors.insert(i, cursor.max(n.saturating_add(1)));
+                    // v7.40.11 — an explicit key does NOT move
+                    // `LAST_INSERT_ID()` (measured: it still reads the
+                    // earlier insert's value), but it IS what the OK
+                    // packet reports and what JDBC hands back from
+                    // `getGeneratedKeys()`. Measured on MySQL 9.7.2
+                    // through a driver reading the packet:
+                    // `INSERT INTO t (id, n) VALUES (100, 3)` reports
+                    // 100.
+                    if first_auto_key.is_none() {
+                        *first_auto_key = Some(n);
+                    }
                 }
                 let raw = crate::conversions::normalize_composite_for_column(raw, col, catalog)?;
                 let raw = crate::conversions::mysql_bytes_for_column(raw, col.ty, mysql);

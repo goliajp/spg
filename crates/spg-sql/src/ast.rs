@@ -1072,6 +1072,13 @@ pub enum SetValue {
     Ident(String),
     Number(String),
     Default,
+    /// v7.40.11 — MySQL only. `SET character_set_results = NULL` is the
+    /// second statement Connector/J sends on every connection, and it
+    /// means "send results in the column's own charset, do not
+    /// transcode". PostgreSQL 18.6 answers `syntax error at or near
+    /// "NULL"` for the same shape (measured), so the parser produces
+    /// this variant only for a MySQL-dialect session.
+    Null,
 }
 
 /// v7.38 轴 4 — PG-standard isolation levels. SPG accepts all four
@@ -6751,6 +6758,7 @@ impl fmt::Display for Statement {
                     SetValue::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
                     SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s),
                     SetValue::Default => f.write_str("DEFAULT"),
+                    SetValue::Null => f.write_str("NULL"),
                 }
             }
             Self::SetTransaction { modes } => {
@@ -6793,6 +6801,7 @@ impl fmt::Display for Statement {
                         SetValue::String(s) => write!(f, "'{}'", s.replace('\'', "''"))?,
                         SetValue::Ident(s) | SetValue::Number(s) => f.write_str(s)?,
                         SetValue::Default => f.write_str("DEFAULT")?,
+                        SetValue::Null => f.write_str("NULL")?,
                     }
                 }
                 Ok(())

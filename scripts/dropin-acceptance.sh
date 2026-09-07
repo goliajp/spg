@@ -510,6 +510,190 @@ else
   CASES+=("mariadb.wire|FAIL|no answer on port $MYPORT")
 fi
 
+
+echo "=== JDBC driver panel ==="
+
+# v7.40.11 — `docs/MYSQL_DROPIN.md` listed JDBC among "confirmed-working
+# clients (each verified by an e2e test)". Nothing ran a JDBC driver
+# anywhere in this repository, and when one finally was run against
+# 7.40.10 it could not open a connection at all:
+#
+#   java.sql.SQLException: Unknown system variable 'auto_increment_increment'
+#       at com.mysql.cj.jdbc.ConnectionImpl.createNewIO(ConnectionImpl.java:839)
+#
+# Connector/J reads nineteen system variables in ONE statement before it
+# hands back a Connection, and reads `@@transaction_read_only` before
+# every statement after that, so the shapes it needs are not reachable
+# from a CLI panel — the `mysql` client asks for none of them. This
+# panel is that claim, checked.
+#
+# The jar is fetched on the HOST, where this script already pulls
+# images, and mounted in: a container that has to reach Maven Central
+# itself is a second network dependency at a different layer.
+CONNECTOR_J_VERSION="9.4.0"
+CONNECTOR_J_URL="https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/${CONNECTOR_J_VERSION}/mysql-connector-j-${CONNECTOR_J_VERSION}.jar"
+JDBC_IMAGE="eclipse-temurin:21-jdk"
+JDBC_DIR="$(mktemp -d)"
+
+cat > "$JDBC_DIR/Probe.java" <<'JAVA'
+import java.sql.*;
+
+/** Each case prints one `jdbc.<name>|PASS|` or `jdbc.<name>|FAIL|<msg>`
+ *  line, which the harness folds into its own tally. Every shape here
+ *  was a real failure against 7.40.10. */
+public class Probe {
+    static int rc = 0;
+
+    static void pass(String name) {
+        System.out.println("jdbc." + name + "|PASS|");
+    }
+
+    static void fail(String name, String msg) {
+        System.out.println("jdbc." + name + "|FAIL|" + msg.replace('|', '/').replace('\n', ' '));
+        rc = 1;
+    }
+
+    static void expect(String name, String got, String want) {
+        if (want.equals(got)) {
+            pass(name);
+        } else {
+            fail(name, "want '" + want + "', got '" + got + "'");
+        }
+    }
+
+    public static void main(String[] args) {
+        String url = "jdbc:mysql://127.0.0.1:" + args[0] + "/spg?user=spg&password=";
+        try (Connection c = DriverManager.getConnection(url)) {
+            // Getting here at all is the headline: the driver reads
+            // nineteen variables before it returns a Connection.
+            pass("connect");
+
+            try (Statement s = c.createStatement()) {
+                s.execute("DROP TABLE IF EXISTS jdbc_probe");
+                s.execute("CREATE TABLE jdbc_probe (id INT AUTO_INCREMENT PRIMARY KEY, "
+                        + "name VARCHAR(64), n INT)");
+                pass("ddl");
+            } catch (SQLException e) {
+                fail("ddl", String.valueOf(e.getMessage()));
+                System.exit(rc);
+            }
+
+            // getGeneratedKeys reads the OK packet's insert id, which
+            // was the literal 0 for every statement this server sent.
+            try (PreparedStatement p = c.prepareStatement(
+                    "INSERT INTO jdbc_probe (name, n) VALUES (?, ?)",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                p.setString(1, "a");
+                p.setInt(2, 10);
+                p.executeUpdate();
+                try (ResultSet k = p.getGeneratedKeys()) {
+                    expect("generated keys", k.next() ? String.valueOf(k.getInt(1)) : "<none>", "1");
+                }
+            } catch (SQLException e) {
+                fail("generated keys", String.valueOf(e.getMessage()));
+            }
+
+            try (PreparedStatement p = c.prepareStatement(
+                    "SELECT name FROM jdbc_probe WHERE n >= ?")) {
+                p.setInt(1, 5);
+                try (ResultSet r = p.executeQuery()) {
+                    expect("prepared select", r.next() ? r.getString(1) : "<none>", "a");
+                }
+            } catch (SQLException e) {
+                fail("prepared select", String.valueOf(e.getMessage()));
+            }
+
+            // A rollback: the driver reads @@transaction_read_only
+            // around every one of these.
+            try {
+                c.setAutoCommit(false);
+                try (Statement s = c.createStatement()) {
+                    s.execute("UPDATE jdbc_probe SET n = 0");
+                }
+                c.rollback();
+                c.setAutoCommit(true);
+                try (Statement s = c.createStatement();
+                     ResultSet r = s.executeQuery("SELECT n FROM jdbc_probe")) {
+                    expect("rollback", r.next() ? String.valueOf(r.getInt(1)) : "<none>", "10");
+                }
+            } catch (SQLException e) {
+                fail("rollback", String.valueOf(e.getMessage()));
+            }
+
+            // getColumns wraps UPPER() around numeric CASE arms, which
+            // the engine refused; every JDBC caller that reflects a
+            // table went through it.
+            try (ResultSet r = c.getMetaData().getColumns(null, null, "jdbc_probe", null)) {
+                StringBuilder cols = new StringBuilder();
+                while (r.next()) {
+                    if (cols.length() > 0) {
+                        cols.append(',');
+                    }
+                    cols.append(r.getString("COLUMN_NAME"));
+                }
+                expect("metadata getColumns", cols.toString(), "id,name,n");
+            } catch (SQLException e) {
+                fail("metadata getColumns", String.valueOf(e.getMessage()));
+            }
+
+            try (Statement s = c.createStatement()) {
+                s.execute("DROP TABLE jdbc_probe");
+            } catch (SQLException e) {
+                fail("cleanup", String.valueOf(e.getMessage()));
+            }
+        } catch (SQLException e) {
+            fail("connect", String.valueOf(e.getMessage()));
+        }
+        System.exit(rc);
+    }
+}
+JAVA
+
+# A client we could not obtain is a HARNESS problem and a wire that
+# refuses it is a PRODUCT problem — the same split the MySQL panel
+# above makes, for the same reason.
+if ! curl -sSfLo "$JDBC_DIR/mysql-connector-j.jar" "$CONNECTOR_J_URL" 2>/dev/null; then
+  echo "[jdbc] FAIL harness could not fetch Connector/J $CONNECTOR_J_VERSION"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("jdbc.driver-jar|FAIL|could not fetch $CONNECTOR_J_URL")
+elif ! docker image inspect "$JDBC_IMAGE" >/dev/null 2>&1 \
+     && ! docker pull -q "$JDBC_IMAGE" >/dev/null 2>&1; then
+  echo "[jdbc] FAIL harness could not obtain $JDBC_IMAGE"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("jdbc.client-image|FAIL|could not pull $JDBC_IMAGE")
+else
+  jdbc_out=$(docker run --rm --network host -v "$JDBC_DIR:/w" -w /w "$JDBC_IMAGE" \
+      java -cp mysql-connector-j.jar Probe.java "$MYPORT" 2>&1)
+  # Lines the probe did not write are the JVM's own (a crash, a stack
+  # trace); reporting them as a case keeps a silent exit from reading
+  # as a pass.
+  if ! printf '%s\n' "$jdbc_out" | grep -q '^jdbc\.'; then
+    echo "[jdbc] FAIL driver produced no cases"
+    echo "$jdbc_out" | head -5
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    first_line=$(printf '%s\n' "$jdbc_out" | head -1 | tr -d '\r' | tr '|' '/')
+    CASES+=("jdbc.probe|FAIL|no cases; first line: $first_line")
+  else
+    while IFS= read -r line; do
+      case "$line" in
+        jdbc.*\|PASS\|*)
+          echo "[jdbc] ok   ${line%%|*}"
+          PASS_COUNT=$((PASS_COUNT+1))
+          CASES+=("$line")
+          ;;
+        jdbc.*\|FAIL\|*)
+          echo "[jdbc] FAIL $line"
+          FAIL_COUNT=$((FAIL_COUNT+1))
+          CASES+=("$line")
+          ;;
+      esac
+    done <<EOF
+$jdbc_out
+EOF
+  fi
+fi
+rm -rf "$JDBC_DIR"
+
 FIXTURE_REPORT=""
 if [ "${#FIXTURES[@]}" -eq 0 ]; then
   # Say so. The panel is optional, and an optional panel that is silent

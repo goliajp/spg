@@ -950,7 +950,15 @@ pub(super) fn value_to_format_text_styled(v: &Value, style: &super::format::Rend
             kind,
         } => super::format::format_numeric_kind(*kind, *scaled, *scale),
         Value::Bool(b) => {
-            if *b {
+            // v7.40.11 — MySQL has no boolean: `TRUE` is the integer 1,
+            // and it renders as `1` everywhere a value becomes text.
+            // Measured, `CONCAT('x', TRUE)` is `x1` on MySQL 9.7.2 and
+            // was `xt` here — PostgreSQL's spelling handed to a MySQL
+            // session. The wire already sent a bare `SELECT TRUE` as 1,
+            // so the two disagreed inside one session.
+            if style.mysql {
+                if *b { "1".into() } else { "0".into() }
+            } else if *b {
                 "t".into()
             } else {
                 "f".into()

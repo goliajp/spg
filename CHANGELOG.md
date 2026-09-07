@@ -10,6 +10,289 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — Connector/J could not open a connection at all
+
+Filed as a coverage gap: `SHOW VARIABLES` listed 19 names where MySQL
+9.7.2 lists 655. Measured, it was not a gap in coverage.
+
+MySQL Connector/J 9.4.0 opens every connection by reading NINETEEN
+system variables in one statement (captured from the MySQL 9.7.2
+oracle's own `general_log` while the driver connected to it, not
+transcribed from the driver). Seven of them did not exist here, so the
+driver never got a session:
+
+```text
+  java.sql.SQLException: Unknown system variable 'auto_increment_increment'
+      at com.mysql.cj.jdbc.ConnectionImpl.createNewIO(ConnectionImpl.java:839)
+```
+
+Running the driver rather than reading it then found four more, each
+of which stopped ordinary JDBC work after the handshake:
+
+```text
+  SET character_set_results = NULL   the driver's 2nd statement — syntax error
+  @@transaction_read_only            read before EVERY statement — absent
+  UPPER() over a numeric CASE arm    getColumns() — "upper() needs text, got bigint"
+  the OK packet's insert id          getGeneratedKeys() — empty result set
+```
+
+The constant part of the inventory now has ONE definition
+(`mysql_vars::CONSTANT`) that both `SHOW VARIABLES` and `@@name`
+render, so a name can no longer be added to one surface alone; the
+computed entries are pinned by an e2e test that walks every row of the
+listing and asks `@@name` for it. The listing is sorted, as MySQL's is
+(measured across all 655 of its rows), and no longer leaks
+PostgreSQL's dotted custom-GUC names — not one of MySQL's 655 contains
+a dot.
+
+Every added value is a statement about SPG rather than a copy of
+MySQL's, and the two differ where the truth does:
+
+```text
+  license                MIT OR Apache-2.0   (MySQL: GPL)
+  performance_schema     OFF                 SPG has none
+  wait_timeout           0                   measured: with
+                                             SPG_IDLE_TIMEOUT_SEC=2 set, a
+                                             mysql-wire connection was still
+                                             answering after six seconds idle
+  auto_increment_increment 1                 measured: ids 1, 2, 3
+```
+
+The full JDBC workload — DDL, batched prepared inserts, generated
+keys, prepared select, rollback, `getTables`, `getColumns`,
+`ResultSetMetaData` — now returns the same output against SPG as
+against MySQL 9.7.2, line for line.
+
+### Fixed — the OK packet's insert id was the literal 0
+
+`getGeneratedKeys()` returned an empty result set for every insert
+through JDBC, while the row itself was written and `SELECT
+LAST_INSERT_ID()` answered correctly. The two are different
+quantities: measured on MySQL 9.7.2 through a driver reading the
+packet, an insert with an EXPLICIT key reports it there while
+`LAST_INSERT_ID()` is left alone by it, and an UPDATE reports 0 where
+`LAST_INSERT_ID()` still holds the earlier insert's value. SPG's six
+readings now match MySQL's six exactly. The value is read under the
+same engine guard that ran the statement, so a concurrent connection's
+insert cannot be reported as this connection's key.
+
+### Fixed — `SET character_set_results = NULL`, and `UPPER()` over a number
+
+Both are MySQL spellings PostgreSQL refuses, so both are dialect-gated
+rather than universal. Measured: MySQL accepts NULL for exactly one
+variable — `character_set_results`, where `@@` then answers SQL NULL
+and `SHOW VARIABLES` an empty value — and answers
+`ERROR 1231 (42000) Variable 'x' can't be set to the value of 'NULL'`
+for every other; PostgreSQL 18.6 answers `syntax error at or near
+"NULL"`. `UPPER(123)` is `123` on MySQL and
+`function upper(integer) does not exist` on PostgreSQL.
+
+`CONCAT('x', TRUE)` was `xt` here and is `x1` on MySQL — PostgreSQL's
+boolean spelling handed to a MySQL session, which disagreed with the
+same session's bare `SELECT TRUE`. Found by the pin written for the
+`UPPER` fix.
+
+### Fixed — a mysql-wire session got neither `-c` settings nor role defaults
+
+A server started with `-c TimeZone=Asia/Tokyo` answered `SYSTEM` on
+the mysql port and UTC on the pg port, for the same setting, in the
+same process. The seeding is now one funnel on the engine and both
+wire hosts call it. Separately, `@@time_zone` returned the literal
+`SYSTEM` no matter what the session held, so even a plain
+`SET time_zone` could not be read back.
+
+### Added — the oracle differential checks that the running engine is the pinned one
+
+The MariaDB oracle ran 12.3.2 while its Dockerfile pinned 12.3.3.
+Rebuilding cured that occurrence; the assertion nobody was making
+stayed unmade, and every fixture passes against the old engine, so
+nothing goes red. The runner now asks each live container for its
+version and refuses to run when it disagrees with the `FROM image:tag`
+its Dockerfile pins. Verified against all three containers and by
+ablation (pin the pg18 Dockerfile to 18.5 and the runner exits 1).
+
+### Fixed — a composite index could not order a NULLABLE column
+
+`WHERE project_id = ? ORDER BY received_at DESC LIMIT 20` over an
+index on `(project_id, received_at)` sorted the table. SPG has walked
+such a prefix since v7.39.13 and refused it whenever the ordering
+column was nullable — and `NOT NULL` is not the default, so the common
+declaration paid for the uncommon one. The capability was present and
+the gate never asked for it; the change is the refusal, deleted, with
+a pin written and run BEFORE the deletion.
+
+### Fixed — a sort inside a derived table was unbounded
+
+A subquery sorting a large table used memory proportional to the table
+on a server configured not to. Two roads: the streaming entry honoured
+`work_mem`, and the derived-table materialisers called the fallback
+directly. Measured as the engine's own spill counter around PLAIN
+statements at `work_mem = 64 kB` over 40,000 rows: `SELECT t FROM s
+ORDER BY t` spilled 5 runs, the same sort inside `FROM ( … ) z`
+spilled 0. One function now answers "the rows of a derived table",
+because there are three materialisers and the first cut fixed one.
+
+### Fixed — `timestamptz + interval '1 day'` was 24 hours
+
+For a timestamptz, the MONTHS and DAYS fields of an interval are
+calendar steps in the session zone; only the time part is an absolute
+duration. Measured on PG 18.6 under America/Denver from
+`2026-03-07 12:00-07`:
+
+```text
+                        PG 18.6 delta    SPG 7.40.10
+  + interval '1 day'     +82800 (23 h)    +86400
+  + interval '24 hours'  +86400 (24 h)    +86400
+```
+
+PostgreSQL disagreeing with itself between those two is the whole
+distinction. Anyone deploying with a local session zone got daily
+aggregates, "same time tomorrow" schedules and retention windows an
+hour wrong on two days a year.
+
+### Fixed — a declared array parameter arrived as its own `Debug` string
+
+`PREPARE q (uuid[])` then `EXECUTE q (ARRAY[…]::uuid[])` answered
+`unnest() expects an array argument, got text`, and where the coercion
+raised instead the internal spelling reached the user
+(`malformed array literal: "UuidArray([Some([0, …, 1])])"`).
+Substitution went through a literal type that could express only
+text/int/bigint arrays and Debug-printed the rest; it now rebuilds the
+`ARRAY[…]` through the per-type element menu the rest of the engine
+uses.
+
+### Added — `-c name=value` at boot, and the startup packet's settings
+
+Between them there was NO way to change a setting for a deployment
+rather than for one session.
+
+```text
+  docker run … postgres:18        -c work_mem=64MB  →  running, 64MB
+  docker run … goliakk/spg:7.40.9 -c work_mem=64MB  →  exited (1)
+```
+
+Every argument was positional, so `-c` landed in `db_path` and the
+container died with `fatal: invalid socket address` — a message naming
+the wrong component. All three of PostgreSQL's spellings are accepted
+and validated by APPLYING them at boot.
+
+The startup packet was parsed and thrown away: nothing raised, every
+query answered, and the answers were in a format the client did not
+ask for and had no reason to check. A client that pins `search_path`
+at connect time read and wrote the wrong tables. Both channels — the
+named parameters and the `options` string — are applied now, in
+PostgreSQL's order of specificity, and a setting that cannot be
+applied refuses the connection and names it.
+
+### Fixed — SHOW and EXPLAIN sent rows with no header; CHECKPOINT did nothing
+
+psql names the first exactly: `server sent data ("D" message) without
+prior row description ("T" message)`. `SHOW TimeZone` could not run
+under sqlx. Describe answered a shape for SELECT and DML RETURNING and
+nothing else, while Execute emitted rows for SHOW and EXPLAIN anyway;
+both shapes now come from the function the executor builds its columns
+with. Three more fell out of the same measurement against PG 18.6: the
+column name is the GUC's canonical spelling, EXPLAIN's column type
+follows the FORMAT, and `SHOW TRANSACTION ISOLATION LEVEL` was a
+syntax error.
+
+Ten utility verbs were tagged `OK` over the extended protocol while
+the simple path got them right. A tag is not decoration — psycopg and
+JDBC read it to decide whether a statement returned rows.
+
+CHECKPOINT (not reported; found here) was intercepted by SQL text in
+the native dispatch only, so over pgwire it reached the engine as a
+statement with no effect and came back as a normal completion. The WAL
+grew by the bytes of the statement and was never truncated — measured,
+1,771 bytes before and 1,789 after. An operator running it before a
+maintenance window was told the work had happened. All three pgwire
+entry points now intercept it.
+
+### Fixed — `pg_get_indexdef` described another table's index
+
+```text
+  release_artifacts_pkey  ->  CREATE UNIQUE INDEX releases_pkey
+                              ON public.releases USING btree (id)
+```
+
+The `relname` beside it comes from `pg_class` and was right, so a
+migration tool, schema diff or dump was told about the wrong table
+with nothing to notice. The function replayed an OID assignment over a
+different enumeration than the one that made the OIDs. Fixing it
+surfaced a second: the NAME form searched storage, where a
+constraint's own index does not appear under the catalog's name, so
+`pg_get_indexdef('t_a_b_key'::regclass)` — psql's spelling — answered
+NULL for every table-level UNIQUE.
+
+### Fixed — VALUES could not be a branch of a set operation
+
+```text
+  SELECT 1 UNION ALL VALUES (2)    syntax error at or near "VALUES"
+  VALUES (1) UNION ALL SELECT 2    syntax error at or near "UNION"
+```
+
+Modern psql builds its describe queries this way, so `\d`, `\dt`,
+`\di` and the rest failed with a syntax error pointing into a query
+the user did not write.
+
+### Fixed — Describe answered shapes for statements that cannot run
+
+```text
+  SELECT * FROM no_such_table      PG 42P01 at Parse   SPG: no columns
+  SELECT nosuchcol FROM pg_class   PG 42703 at Parse   SPG: nosuchcol|text
+```
+
+The second invents a column and gives it a type. Also fixed with it:
+an indexed text column lost rows in a join.
+
+### Fixed — `pg_column_size` measured the length of a Rust `Debug` string
+
+### Fixed — `f(t.*)` is the whole row, as it is in PostgreSQL
+
+### Fixed — a keyword is a legal alias, and every one of them was a syntax error
+
+### Fixed — the release acceptance panel gates the publish instead of reporting on it
+
+### Fixed — 7.40.10 fixed the uniqueness check and left its arbiter behind
+
+### Changed — CI: the release job compiled the same crates four times
+
+Counted from a green develop push. Cargo resolves features over the
+SELECTED members, so a job naming four different member sets builds
+four artefact trees:
+
+```text
+  build --bin spg-server --bin spg --bin pg_isready   11 crates  225 s
+  test -p spg-server --test prod_ready                 9 crates  216 s
+  test -p spg-server --test slo_smoke                  1 crate     8 s
+  test -p <8 crates> --test perf_gate                 10 crates  275 s
+  run  -p sqllogictest                                 1 crate    86 s
+```
+
+`slo_smoke` is the tell: it reused the previous selection and cost 8 s
+while the two that changed selection spent 216 s and 275 s rebuilding
+what was already built. One nine-member selection now covers every
+target the job runs. Also removed: `--test-threads=1` over the whole
+workspace, for a fixed-port hazard the harness took away years of
+commits ago (89.0 s against 225.3 s, same tree, 9,310 passed), and the
+compilation of 56 benchmark binaries that own no tests (98.8 s).
+
+`release_gates` 939 s → 546 s, `check` 496 s → 316 s, both green.
+
+Also measured and NOT changed, so the next reader does not re-measure
+it: BuildKit cargo cache mounts in the Dockerfile are worth 8% here
+(116.5 s → 107.7 s) because the workspace has almost no external
+dependencies.
+
+### Fixed — `cargo test --bins` does not produce the plain binaries
+
+Under `cargo test` a bin target compiles as a test harness into
+`deps/`. The plain binary appears only as a side effect of building
+that package's INTEGRATION tests, so `sqllogictest` — which has none —
+was absent and the `biz` gate step failed in 0 s. The local check that
+said otherwise was reading a binary an earlier `cargo build` had left
+behind.
+
 
 ## [7.40.10] — 2026-09-06
 
