@@ -53,6 +53,22 @@
 # Inputs:
 #   PG_URI      — postgres://... for the PG18 leg (required)
 #   SPG_URI     — postgres://... for the SPGS leg (required)
+#   BASELINE_URI — optional, comma-separated. Further processes
+#                 configured IDENTICALLY to the PG_URI leg. Where the two
+#                 arms of a panel cannot be one process — a database
+#                 collation is a boot setting, so comparing two
+#                 collations is comparing two servers — these measure
+#                 what identical processes differ by, and no verdict is
+#                 called inside that. See `resolution`.
+#
+#                 TWO of them, not one, because a spread needs three
+#                 points: with a single baseline the comparison side has
+#                 one pairwise difference, and when those two processes
+#                 happen to agree the spread is invisible. Measured on an
+#                 idle testbed, four identical processes ran
+#                 `top-N LIMIT 10` at medians 8.03 / 8.74 / 8.65 /
+#                 8.56 ms — 8.8% apart — and a run that sampled the
+#                 close pair called a 22% gap a LOSS.
 #   N           — timings per side per cell (default 5; rule 4 wants >= 3,
 #                 and 3 has proved too few to separate 10% at this size)
 #   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
@@ -69,6 +85,7 @@ cd "$(dirname "$0")/.."
 
 PG_URI="${PG_URI:-}"
 SPG_URI="${SPG_URI:-}"
+BASELINE_URI="${BASELINE_URI:-}"
 N="${N:-5}"
 # v7.40.11 — this panel compares one binary against ITSELF (the locale
 # panel does: `PG_URI` is the C leg and `SPG_URI` the en_US leg of the
@@ -136,6 +153,27 @@ leg_collation() {
 spg_coll="$(leg_collation "${SPG_URI}")"
 pg_coll="$(leg_collation "${PG_URI}")"
 echo "leg SPGS collation: ${spg_coll:-<unknown>}   leg PG18 collation: ${pg_coll:-<unknown>}"
+# v7.40.11 — "configured identically" is a claim, so it is checked.
+#
+# The baseline leg exists to say what two IDENTICAL processes differ by.
+# One that differs in its collation would fold a collation cost into the
+# floor meant to exclude it, and the floor would then hide the very
+# thing the panel is for. The comment saying they match is not enough:
+# nothing would have noticed.
+if [[ -n "${BASELINE_URI}" ]]; then
+  IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+  for _bu in "${_bases[@]}"; do
+  base_coll="$(leg_collation "${_bu}")"
+  echo "leg BASELINE collation: ${base_coll:-<unknown>} (must equal PG18's)"
+  if [[ "${base_coll}" != "${pg_coll}" ]]; then
+    echo "fatal: a baseline leg collates ${base_coll:-<unknown>} and the leg it duplicates" >&2
+    echo "       collates ${pg_coll:-<unknown>}. It is there to measure what two IDENTICAL" >&2
+    echo "       processes are worth; differing in the panel's own variable would fold" >&2
+    echo "       that variable into the floor built to exclude it." >&2
+    exit 2
+  fi
+  done
+fi
 # v7.38.19 — the two legs must ORDER TEXT THE SAME WAY, or the text
 # cells are not a comparison.
 #
@@ -316,11 +354,34 @@ verdict() { # $1=amin $2=amax $3=bmin $4=bmax [$5=floor]
 # gap narrower than either band's width is a claim neither band can
 # support. The same-binary pair is the honest measure of the machine's
 # contribution; the other leg carries its own variability on top.
-resolution() { # $1=smin $2=smax $3=cmin $4=cmax $5=gmin $6=gmax
+# v7.40.11 — and the CROSS-PROCESS term, when a baseline leg is given.
+#
+# A database collation is a boot setting, so the locale panel's two arms
+# cannot be one process: comparing two collations is comparing two
+# servers. Measured by swapping which of the two is judged, the
+# difference followed the LEG and not the position — the same server ran
+# `narrow, non-indexed key` 2-4% faster whichever side it was timed on,
+# on a cell that sorts an INT and cannot consult a collation at all. Two
+# processes of the same binary are not interchangeable, and a panel that
+# names the collation as its variable was reporting that difference as
+# one.
+#
+# `BASELINE_URI` is a second process configured exactly like the PG_URI
+# leg, so `g` and `b` differ in nothing the panel claims to vary. Their
+# pooled span is what two identical processes are worth on this cell, in
+# this window, and no verdict is called inside it.
+resolution() { # $1=smin $2=smax $3=cmin $4=cmax $5=gmin $6=gmax [$7=bmin $8=bmax]
   awk -v s1="$1" -v s2="$2" -v c1="$3" -v c2="$4" -v g1="$5" -v g2="$6" \
+      -v b1="${7:-}" -v b2="${8:-}" \
     'BEGIN {
        lo = (s1 < c1 ? s1 : c1); hi = (s2 > c2 ? s2 : c2);
-       sc = hi - lo; g = g2 - g1;
+       sc = hi - lo;
+       glo = g1; ghi = g2;
+       if (b1 != "") {
+         if (b1 < glo) glo = b1;
+         if (b2 > ghi) ghi = b2;
+       }
+       g = ghi - glo;
        printf "%.6f\n", (sc > g ? sc : g) }'
 }
 
@@ -597,7 +658,7 @@ TYPED_SHAPES=(
   'prefix walk, all rows|SELECT id FROM @W@ WHERE n = 1.23 ORDER BY id DESC'
 )
 
-LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0; BELOW_RES=0
+LOSSES=0; CELLS=0; CONTROL_DIFFS=0; DEMOTED=0; BELOW_RES=0; CROSS_DIFFS=0
 
 printf '\n%-8s %-26s %-16s %-16s %-9s %-9s %-6s %s\n' \
   SIZE SHAPE 'SPGS(min-max)' 'PG18(min-max)' 'SRV-SPG' 'SRV-PG' PGCPU VERDICT
@@ -610,12 +671,31 @@ for rows in ${SIZES}; do
   WT="sweepw_${rows}"
   setup_table "${SPG_URI}" "${T}" "${rows}"
   setup_table "${PG_URI}"  "${T}" "${rows}"
+  # v7.40.11 — the baseline leg gets the same fixtures as the leg it
+  # duplicates. It was added without them once: every one of its timings
+  # was a psql error, `time_one` returned the empty string, and the
+  # verdicts came out of comparisons against nothing. The failure is
+  # silent by construction — an error is not a number, and a missing
+  # number reads as a fast one — which is why the answer-first rule
+  # below covers this leg too.
+  if [[ -n "${BASELINE_URI}" ]]; then
+    IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+    for _bu in "${_bases[@]}"; do setup_table "${_bu}" "${T}" "${rows}"; done
+  fi
   setup_typed_table "${SPG_URI}" "${NT}" "${rows}"
   setup_typed_table "${PG_URI}"  "${NT}" "${rows}"
+  if [[ -n "${BASELINE_URI}" ]]; then
+    IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+    for _bu in "${_bases[@]}"; do setup_typed_table "${_bu}" "${NT}" "${rows}"; done
+  fi
   verify_typed_predicates "${SPG_URI}" "${NT}"
   verify_typed_predicates "${PG_URI}"  "${NT}"
   setup_walk_table "${SPG_URI}" "${WT}" "${rows}"
   setup_walk_table "${PG_URI}"  "${WT}" "${rows}"
+  if [[ -n "${BASELINE_URI}" ]]; then
+    IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+    for _bu in "${_bases[@]}"; do setup_walk_table "${_bu}" "${WT}" "${rows}"; done
+  fi
 
   for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
     name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"; sql="${sql//@W@/${WT}}"
@@ -636,7 +716,7 @@ for rows in ${SIZES}; do
     #
     # A separation the same binary produces against ITSELF, in the same
     # window, on the same shape, is not a verdict about SPG.
-    s=(); g=(); c=()
+    s=(); g=(); c=(); b=()
     for ((i = 0; i < N; i++)); do
       # Rule 4: alternate, and rotate which leg starts each round, so no
       # leg is systematically last while the machine drifts.
@@ -657,6 +737,15 @@ for rows in ${SIZES}; do
           g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
           ;;
       esac
+      # v7.40.11 — the baseline leg, when one is given: a second process
+      # configured exactly like the comparison leg. Timed inside the same
+      # round as the other three so it shares their window.
+      if [[ -n "${BASELINE_URI}" ]]; then
+        IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+        for _bu in "${_bases[@]}"; do
+          b+=("$(time_one "${_bu}" "${sql}" "${PG_WM}")")
+        done
+      fi
     done
     # The transport-free reading, once per leg, AFTER the alternating
     # wall-clock rounds so it cannot disturb them.
@@ -665,15 +754,27 @@ for rows in ${SIZES}; do
     smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
     gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
     cmin="$(lo "${c[@]}")"; cmax="$(hi "${c[@]}")"
+    bmin=""; bmax=""
+    if [[ -n "${BASELINE_URI}" ]]; then
+      bmin="$(lo "${b[@]}")"; bmax="$(hi "${b[@]}")"
+    fi
     # v7.40.11 — the verdict must clear this cell's own resolution, which
     # the control leg measures. `raw` is the pre-floor call, kept only so
     # the withdrawal can be counted and named.
-    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}")"
+    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}" "${bmin}" "${bmax}")"
     raw="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
     v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}" "${res}")"
     # The same binary against itself. If THAT separates, this cell has no
     # resolution left to spend on a verdict about PG.
     cv="$(verdict "${smin}" "${smax}" "${cmin}" "${cmax}")"
+    # v7.40.11 — and the same question across PROCESSES: two servers
+    # configured identically, separating on a cell. A direct reading of
+    # how interchangeable this box's processes are, which the panel's
+    # verdict has to clear before it may name the collation.
+    if [[ -n "${BASELINE_URI}" ]] \
+       && [[ "$(verdict "${gmin}" "${gmax}" "${bmin}" "${bmax}")" != unresolved ]]; then
+      CROSS_DIFFS=$((CROSS_DIFFS + 1))
+    fi
     note=""
     # v7.40.11 — its OWN counter, not `withdrawn`.
     #
@@ -849,7 +950,9 @@ done
 
 echo
 echo "load after: $(uptime)"
-echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} below_resolution=${BELOW_RES} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
+cross_note=""
+[[ -n "${BASELINE_URI}" ]] && cross_note=" cross_process_differences=${CROSS_DIFFS}"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} below_resolution=${BELOW_RES}${cross_note} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
 if (( CONTROL_DIFFS > 0 )); then
   echo "NOTE: on ${CONTROL_DIFFS} cell(s) the binary separated from ITSELF in the same"
   echo "      window. ${DEMOTED} verdict(s) were withdrawn on that ground and report"
