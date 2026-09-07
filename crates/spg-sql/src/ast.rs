@@ -3676,6 +3676,14 @@ pub struct TransactionModes {
     pub isolation: Option<IsolationLevel>,
     /// `Some(true)` = READ ONLY, `Some(false)` = READ WRITE.
     pub read_only: Option<bool>,
+    /// v7.40.12 — `Some(true)` = DEFERRABLE, `Some(false)` = NOT
+    /// DEFERRABLE. PG reports it through `transaction_deferrable`, and
+    /// consults it only for a SERIALIZABLE READ ONLY transaction, where
+    /// it may make the transaction WAIT for a snapshot it can run
+    /// against without serialization failures. SPG reports the property
+    /// and does not defer; the difference a client can observe is a
+    /// wait, never a different answer.
+    pub deferrable: Option<bool>,
 }
 
 /// v7.39 — what a read-only transaction refuses, and what PG calls it.

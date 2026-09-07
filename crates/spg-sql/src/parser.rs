@@ -3032,6 +3032,36 @@ impl Parser {
                             "transaction_isolation".to_string(),
                         ))
                     }
+                    // v7.40.12 — PG's two-word spelling of the
+                    // `timezone` GUC, and the one psql's own `\timing`
+                    // era documentation and every ORM's dialect probe
+                    // send. Until now only the pgwire host recognised
+                    // it, in a shortcut that answered SHOW from a copy;
+                    // removing that shortcut moved the spelling here,
+                    // where the embedded API gets it too. Same shape as
+                    // the isolation-level arm above: `time` is a bare
+                    // ident, so without this the statement ended there
+                    // and `ZONE` was a syntax error.
+                    "time"
+                        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("zone")) =>
+                    {
+                        self.advance(); // ZONE
+                        Ok(Statement::ShowParameter("timezone".to_string()))
+                    }
+                    // v7.40.12 — `SHOW SESSION AUTHORIZATION`, PG's
+                    // spelling of the login identity. `session` is a bare
+                    // ident, so the statement ended there and `AUTHORIZATION`
+                    // was a syntax error; the engine already knows the
+                    // answer, as `SELECT session_user` on the same
+                    // connection shows.
+                    "session"
+                        if matches!(self.peek(), Token::Ident(w) if w.eq_ignore_ascii_case("authorization")) =>
+                    {
+                        self.advance(); // AUTHORIZATION
+                        Ok(Statement::ShowParameter(
+                            "session_authorization".to_string(),
+                        ))
+                    }
                     other => {
                         // v7.38 (read01 P3.20) — a custom namespaced GUC
                         // (`SHOW app.foo`) arrives as `app` + `.` + `foo`;
@@ -8523,8 +8553,6 @@ impl Parser {
     /// (default `ReadCommitted` if no `ISOLATION LEVEL` clause was
     /// present). Modes are comma-separated per PG; SPG also
     /// accepts space-separated for tolerance. READ ONLY / WRITE
-    /// / DEFERRABLE are parsed-and-ignored (recorded for future
-    /// surface but not behaviorally honoured today).
     /// Parse the trailing `[ISOLATION LEVEL …] [READ ONLY|WRITE]
     /// [[NOT] DEFERRABLE]` modes of BEGIN / START TRANSACTION / SET
     /// TRANSACTION. Returns `Some(level)` only when an explicit `ISOLATION
@@ -8538,6 +8566,10 @@ impl Parser {
         // v7.39 — READ ONLY / READ WRITE used to be consumed and dropped,
         // so `BEGIN READ ONLY` opened an ordinary read-write transaction.
         let mut read_only: Option<bool> = None;
+        // v7.40.12 — DEFERRABLE was consumed and dropped, the way READ
+        // ONLY was before v7.39. Measured on PG 18.6: `BEGIN DEFERRABLE;
+        // SHOW transaction_deferrable` -> on; SPG answered off.
+        let mut deferrable: Option<bool> = None;
         loop {
             // ISOLATION LEVEL …
             let saw_isolation =
@@ -8621,9 +8653,11 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                deferrable = Some(false);
             } else if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("deferrable"))
             {
                 self.advance();
+                deferrable = Some(true);
             } else {
                 break;
             }
@@ -8635,6 +8669,7 @@ impl Parser {
         Ok(crate::ast::TransactionModes {
             isolation: have_level.then_some(level),
             read_only,
+            deferrable,
         })
     }
 
@@ -29529,6 +29564,7 @@ mod tests {
             Statement::Begin(crate::ast::TransactionModes {
                 isolation: Some(IsolationLevel::RepeatableRead),
                 read_only: None,
+                deferrable: None,
             })
         );
         assert_eq!(
@@ -29536,6 +29572,7 @@ mod tests {
             Statement::Begin(crate::ast::TransactionModes {
                 isolation: Some(IsolationLevel::Serializable),
                 read_only: None,
+                deferrable: None,
             })
         );
         // v7.39 — this line used to read
@@ -29553,6 +29590,7 @@ mod tests {
             Statement::Begin(crate::ast::TransactionModes {
                 isolation: None,
                 read_only: Some(true),
+                deferrable: None,
             })
         );
         assert_eq!(
@@ -29560,6 +29598,7 @@ mod tests {
             Statement::Begin(crate::ast::TransactionModes {
                 isolation: None,
                 read_only: Some(false),
+                deferrable: None,
             })
         );
         assert_eq!(
@@ -29567,7 +29606,67 @@ mod tests {
             Statement::Begin(crate::ast::TransactionModes {
                 isolation: Some(IsolationLevel::Serializable),
                 read_only: Some(true),
+                deferrable: None,
             })
+        );
+        // v7.40.12 — DEFERRABLE was consumed and dropped, the way READ
+        // ONLY was before v7.39, and for the same reason nothing noticed:
+        // the statement parsed, so the clause looked handled. Measured on
+        // PG 18.6, `BEGIN DEFERRABLE; SHOW transaction_deferrable` -> on.
+        assert_eq!(
+            parse("BEGIN DEFERRABLE"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: None,
+                read_only: None,
+                deferrable: Some(true),
+            })
+        );
+        assert_eq!(
+            parse("BEGIN NOT DEFERRABLE"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: None,
+                read_only: None,
+                deferrable: Some(false),
+            })
+        );
+        assert_eq!(
+            parse("BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE"),
+            Statement::Begin(crate::ast::TransactionModes {
+                isolation: Some(IsolationLevel::Serializable),
+                read_only: Some(true),
+                deferrable: Some(true),
+            })
+        );
+    }
+
+    /// v7.40.12 — PG's multi-word SHOW spellings. `SHOW TIME ZONE` was
+    /// known only to a pgwire shortcut that answered SHOW from a copy;
+    /// when that shortcut went, the spelling had to live here, where the
+    /// embedded API gets it too. `SHOW SESSION AUTHORIZATION` was known
+    /// nowhere: `session` is a bare ident, so the statement ended there
+    /// and the next word was a syntax error.
+    #[test]
+    fn show_multi_word_spellings_parse() {
+        assert_eq!(
+            parse("SHOW TIME ZONE"),
+            Statement::ShowParameter("timezone".to_string())
+        );
+        assert_eq!(
+            parse("SHOW SESSION AUTHORIZATION"),
+            Statement::ShowParameter("session_authorization".to_string())
+        );
+        assert_eq!(
+            parse("SHOW TRANSACTION ISOLATION LEVEL"),
+            Statement::ShowParameter("transaction_isolation".to_string())
+        );
+        // The single-word spellings still reach the same handler.
+        assert_eq!(
+            parse("SHOW timezone"),
+            Statement::ShowParameter("timezone".to_string())
+        );
+        assert_eq!(
+            parse("SHOW session_authorization"),
+            Statement::ShowParameter("session_authorization".to_string())
         );
     }
 

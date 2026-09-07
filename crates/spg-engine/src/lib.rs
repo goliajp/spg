@@ -1731,6 +1731,11 @@ pub struct Engine {
     /// parsed and discarded, so the mode existed only in the SQL text and
     /// every write inside such a transaction was accepted and committed.
     pub(crate) current_tx_read_only: bool,
+    /// v7.40.12 — the open transaction's DEFERRABLE property, reported
+    /// by `transaction_deferrable`. Parsed and dropped until now, so
+    /// `BEGIN DEFERRABLE; SHOW transaction_deferrable` answered `off`
+    /// where PG 18.6 answers `on`.
+    pub(crate) current_tx_deferrable: bool,
 }
 
 /// v7.12.7 — hard cap on nested trigger-emitted embedded SQL
@@ -1961,6 +1966,7 @@ impl Engine {
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             current_tx_read_only: false,
+            current_tx_deferrable: false,
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2491,6 +2497,7 @@ impl Engine {
             redo_capture: false,
             current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
             current_tx_read_only: false,
+            current_tx_deferrable: false,
             last_redo: Vec::new(),
             table_change_seq: alloc::collections::BTreeMap::new(),
             matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2637,6 +2644,7 @@ impl Engine {
                     redo_capture: false,
                     current_isolation_level: spg_sql::ast::IsolationLevel::ReadCommitted,
                     current_tx_read_only: false,
+                    current_tx_deferrable: false,
                     last_redo: Vec::new(),
                     table_change_seq: alloc::collections::BTreeMap::new(),
                     matview_refresh_watermark: alloc::collections::BTreeMap::new(),
@@ -2732,6 +2740,7 @@ impl Engine {
         self.last_sequence_used = incoming.last_sequence_used;
         self.current_isolation_level = incoming.isolation_level;
         self.current_tx_read_only = self.default_read_only();
+        self.current_tx_deferrable = self.default_deferrable();
         self.current_session = id;
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
@@ -3694,6 +3703,30 @@ impl Engine {
                 .load(core::sync::atomic::Ordering::Relaxed),
         )
         .unwrap_or(0)
+    }
+
+    /// v7.40.12 — the session default for DEFERRABLE, the sibling of
+    /// [`Self::default_read_only`].
+    #[must_use]
+    pub fn default_deferrable(&self) -> bool {
+        self.session_params
+            .get("default_transaction_deferrable")
+            .is_some_and(|v| matches!(v.as_str(), "on" | "true" | "1" | "yes"))
+    }
+
+    /// v7.40.12 — what `transaction_deferrable` reports: the open
+    /// transaction's property inside a block, the session default
+    /// outside one. Same witness as [`Self::transaction_read_only`].
+    #[must_use]
+    pub fn transaction_deferrable(&self) -> bool {
+        if self
+            .current_tx
+            .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+        {
+            self.current_tx_deferrable
+        } else {
+            self.default_deferrable()
+        }
     }
 
     #[must_use]

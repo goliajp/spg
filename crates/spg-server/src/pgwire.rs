@@ -371,7 +371,17 @@ fn handle_pg_simple_query(
     // pool keepalives don't need to show up in `spg_stat_activity` —
     // an integer ping has no diagnostic value to surface there.
     // Saves ~2-3 µs / query at the floor.
-    {
+    //
+    // v7.40.12 — ONLY outside a transaction block. A pool keepalive is
+    // sent in autocommit, which is the whole population this fast path
+    // exists for; inside a block `SELECT 1` is a query like any other,
+    // and PG counts it. Answering it here meant the engine never saw a
+    // statement run, so `BEGIN; SELECT 1; SET TRANSACTION ISOLATION
+    // LEVEL SERIALIZABLE` was ACCEPTED where PG raises 25001 — the
+    // refusal keys on the transaction's statement counter, and the
+    // counter had not moved. `SELECT * FROM t` in the same position
+    // refused correctly, which is what named the shortcut.
+    if *tx_state == b'I' {
         let trimmed_bytes = trim_ascii(sql_bytes);
         let trimmed_bytes = if trimmed_bytes.last() == Some(&b';') {
             trim_ascii(&trimmed_bytes[..trimmed_bytes.len() - 1])
@@ -559,37 +569,32 @@ fn handle_pg_simple_query(
             }
         }
     }
-    // v4.19: SHOW name / SHOW ALL.
-    if let Some(name) = parse_show_statement(sql) {
-        // v7.39 (GUC) — the engine store wins: it sees SET LOCAL
-        // (tx-scoped undo) and engine-side writes the wire cache
-        // can't. Fall back to the cache + known defaults.
-        let engine_val: Option<String> = if name != "all" {
-            state
-                .engine
-                .read()
-                .ok()
-                .and_then(|e| e.session_param(&name).map(str::to_string))
-        } else {
-            None
-        };
-        let resp = match engine_val {
-            Some(v) => Some(CannedResponse::Rows {
-                columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
-                rows: vec![Row::new(vec![Value::text(v)])],
-            }),
-            None => render_show(&name, settings),
-        };
-        // r1058 — None: nothing here knows the name; fall through to
-        // the engine dispatch below, which answers or errors properly.
-        if let Some(resp) = resp {
-            send_canned(wbuf, &resp)?;
-            send_ready_for_query(wbuf, *tx_state)?;
-            stream.write_all(wbuf)?;
-            wbuf.clear();
-            return Ok(());
-        }
-    }
+    // v7.40.12 — the wire no longer answers `SHOW` at all.
+    //
+    // It used to short-circuit every `SHOW <name>` here: the engine's
+    // STORED session_params first, then a 21-entry table of frozen
+    // defaults. Both are copies, and a copy cannot answer a DERIVED
+    // value. Measured against PG 18.6, four answers were wrong and the
+    // engine had all four right:
+    //
+    //   BEGIN READ ONLY; SHOW transaction_read_only  -> off   (PG: on)
+    //   SET default_transaction_isolation = 'repeatable read';
+    //     SHOW transaction_isolation                 -> read committed
+    //     (PG: repeatable read — the stored copy is written by BEGIN,
+    //      not by SET, so SHOW answered one statement behind)
+    //   SHOW ALL                                     -> 21 rows, no
+    //     descriptions (PG: 399; the engine already returns 399, and
+    //     `SELECT count(*) FROM pg_settings` through the engine
+    //     answered 399 on the same connection that saw 21)
+    //
+    // Round 118 removed `transaction_isolation` from a canned list for
+    // exactly this reason and left the same name in this one. The name
+    // list was never the defect — answering from a copy is. The engine
+    // resolves session overrides, SET LOCAL, boot values, the live
+    // isolation level and read-only mode, and PG's error for an
+    // unknown name; the startup packet's parameters reach it too
+    // (measured: `application_name=probe_app` in the startup packet,
+    // `SHOW application_name` -> probe_app with this block gone).
     // v7.39 (round 343, V40) — `lo_import` / `lo_export` are the only
     // lo_* calls that touch a server file, and the engine is `no_std`.
     // Same contract COPY-from-a-file uses since round 249: the engine
@@ -668,7 +673,7 @@ fn handle_pg_simple_query(
     // psql sends startup probes like "SELECT version()" /
     // "SHOW search_path". Stub the common ones with sane
     // canned answers so the client doesn't error out.
-    if let Some(canned) = canned_response(sql, state) {
+    if let Some(canned) = canned_response(sql, state, *tx_state) {
         send_canned(wbuf, &canned)?;
         send_ready_for_query(wbuf, *tx_state)?;
         stream.write_all(wbuf)?;
@@ -1400,31 +1405,8 @@ fn handle_pg_simple_query_one_into_wbuf(
             }
         }
     }
-    if let Some(name) = parse_show_statement(sql) {
-        // v7.39 (GUC) — engine store first, same as the single-stmt path.
-        let engine_val: Option<String> = if name != "all" {
-            state
-                .engine
-                .read()
-                .ok()
-                .and_then(|e| e.session_param(&name).map(str::to_string))
-        } else {
-            None
-        };
-        let resp = match engine_val {
-            Some(v) => Some(CannedResponse::Rows {
-                columns: vec![ColumnSchema::new(name.clone(), DataType::Text, false)],
-                rows: vec![Row::new(vec![Value::text(v)])],
-            }),
-            None => render_show(&name, settings),
-        };
-        // r1058 — None falls through to the engine dispatch (see the
-        // simple-path twin).
-        if let Some(resp) = resp {
-            send_canned(wbuf, &resp)?;
-            return Ok(());
-        }
-    }
+    // v7.40.12 — SHOW goes to the engine here too; see the
+    // single-statement path for the four answers this used to get wrong.
     if parse_copy_intent(sql).is_some() {
         send_error(
             wbuf,
@@ -1434,7 +1416,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         )?;
         return Ok(());
     }
-    if let Some(canned) = canned_response(sql, state) {
+    if let Some(canned) = canned_response(sql, state, *tx_state) {
         send_canned(wbuf, &canned)?;
         return Ok(());
     }
@@ -3028,7 +3010,8 @@ fn command_tag_ddl_object(sql: &str, first: &str) -> String {
 /// v7.34.3 (select_1 SPGS hot-path) — case-insensitive byte-level
 /// `starts_with`. Replaces the previous `sql.trim().to_ascii_lowercase()`
 /// allocations that each non-canned query paid through every
-/// `parse_set_statement` / `parse_show_statement` / `parse_copy_intent`
+/// `parse_set_statement` / the SHOW probe (gone in v7.40.12) /
+/// `parse_copy_intent`
 /// / `canned_response` probe in `handle_pg_simple_query`. Four String
 /// allocations + four full-string lowercase walks per query cost ~5-10 µs
 /// before the simple-query dispatch ever reached the engine — the
@@ -3061,7 +3044,25 @@ fn trim_ascii(b: &[u8]) -> &[u8] {
     &b[start..end]
 }
 
-fn canned_response(sql: &str, state: &Arc<ServerState>) -> Option<CannedResponse> {
+fn canned_response(sql: &str, state: &Arc<ServerState>, tx_state: u8) -> Option<CannedResponse> {
+    // v7.40.12 — nothing is canned inside a transaction block.
+    //
+    // Two answers are left in here, `SELECT <int>` and `SELECT NULL`;
+    // every other one was removed in an earlier round for its own
+    // version of one reason: an answer the engine never saw leaves the
+    // engine's idea of the session behind. Inside a block that reason
+    // has teeth, because a transaction COUNTS its statements — measured
+    // on PG 18.6, `BEGIN; SELECT 1; SET TRANSACTION ISOLATION LEVEL
+    // SERIALIZABLE` raises 25001, and SPG answered `SET` because the
+    // counter had not moved. `SELECT 1+0` in the same position refused
+    // correctly, which is how the shortcut was named.
+    //
+    // The population this fast path exists for is unaffected: a pool
+    // keepalive, a liveness probe and a BI canary are all sent in
+    // autocommit.
+    if tx_state != b'I' {
+        return None;
+    }
     let trimmed = sql.trim();
     let b = trimmed.as_bytes();
     // v7.37.x (SPGS PLUCK 红线) — pure-literal SELECTs ("SELECT 1",
@@ -4773,125 +4774,6 @@ fn parse_set_statement(sql: &str) -> Option<(String, String)> {
     Some((name, value))
 }
 
-/// Parse `SHOW name` / `SHOW ALL` / `SHOW SESSION AUTHORIZATION`.
-/// Returns the requested name, lowercased, or None.
-fn parse_show_statement(sql: &str) -> Option<String> {
-    let trimmed = sql.trim();
-    if !ci_starts_with(trimmed.as_bytes(), b"show ") {
-        return None;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("show ")?;
-    // PG spells the timezone GUC as two words in SHOW.
-    if rest.trim().trim_end_matches(';').trim() == "time zone" {
-        return Some("timezone".to_string());
-    }
-    // v7.39 (read01 round 118, B3) — `SHOW TRANSACTION ISOLATION LEVEL` is PG's
-    // multi-word spelling of the `transaction_isolation` GUC; normalise it so
-    // the live-value path (`session_param`) serves it, not the first word
-    // ("transaction").
-    if rest.trim().trim_end_matches(';').trim() == "transaction isolation level" {
-        return Some("transaction_isolation".to_string());
-    }
-    let name = rest.split_ascii_whitespace().next()?.to_string();
-    Some(name)
-}
-
-/// Render a SHOW result: the value from `settings` first, else a
-/// known default. SHOW ALL emits one row per known setting.
-fn render_show(
-    name: &str,
-    settings: &std::collections::HashMap<String, String>,
-) -> Option<CannedResponse> {
-    if name == "all" {
-        let mut entries: Vec<(String, String)> = known_defaults()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        // Overlay session overrides.
-        for (k, v) in settings {
-            if let Some(pos) = entries.iter().position(|(name, _)| name == k) {
-                entries[pos].1.clone_from(v);
-            } else {
-                entries.push((k.clone(), v.clone()));
-            }
-        }
-        entries.sort();
-        let columns = vec![
-            ColumnSchema::new("name", DataType::Text, false),
-            ColumnSchema::new("setting", DataType::Text, false),
-            ColumnSchema::new("description", DataType::Text, true),
-        ];
-        let rows: Vec<Row<'static>> = entries
-            .into_iter()
-            .map(|(n, v)| Row::new(vec![Value::text(n), Value::text(v), Value::Null]))
-            .collect();
-        return Some(CannedResponse::Rows { columns, rows });
-    }
-    let value = settings
-        .get(name)
-        .cloned()
-        .or_else(|| {
-            known_defaults()
-                .iter()
-                .find(|(k, _)| *k == name)
-                .map(|(_, v)| (*v).to_string())
-        })
-        // v7.39 (round 534) — a parameter PG18 knows but this list does
-        // not reports its compiled-in default. The wire answers SHOW
-        // from its own small inventory and `unwrap_or_default()` turned
-        // everything else into an EMPTY ROW, so `SHOW fsync` over the
-        // wire returned a blank where PG returns `on` — and where the
-        // engine, asked the same question, now answers too.
-        // r1058 — no more `unwrap_or_default()`: a name NOBODY here
-        // recognises is not an empty row, it is the engine's problem.
-        // Returning None lets the statement fall through to the full
-        // dispatch, where the engine answers `is_superuser`, the
-        // isolation level, and errors on unrecognised parameters the
-        // way PG does. The wire's inventory answered `SHOW
-        // is_superuser` with a blank and `SHOW spam_x` with success —
-        // both caught by the perm-runner's wire legs.
-        .or_else(|| spg_engine::pg_guc_boot_value(name).map(str::to_string))?;
-    let columns = vec![ColumnSchema::new(name.to_string(), DataType::Text, false)];
-    Some(CannedResponse::Rows {
-        columns,
-        rows: vec![Row::new(vec![Value::text(value)])],
-    })
-}
-
-/// Built-in PG GUCs we report sane defaults for so clients
-/// configuring themselves at startup don't get an empty SHOW.
-fn known_defaults() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("application_name", ""),
-        ("client_encoding", "UTF8"),
-        ("datestyle", "ISO, MDY"),
-        // v7.39 (read01 round 44) — PG's initdb default for english/UTF-8.
-        ("default_text_search_config", "pg_catalog.english"),
-        ("default_transaction_isolation", "read committed"),
-        ("default_transaction_read_only", "off"),
-        // v7.39 (round 204) — memory GUC boot defaults so `SHOW
-        // work_mem` on a fresh connection reports PG's value, not
-        // empty. Canonicalized human units (the engine stores + SHOWs
-        // these forms; see session::render_pg_mem_kb).
-        ("work_mem", "4MB"),
-        ("maintenance_work_mem", "64MB"),
-        ("shared_buffers", "128MB"),
-        ("effective_cache_size", "4GB"),
-        ("client_min_messages", "notice"),
-        ("intervalstyle", "postgres"),
-        ("search_path", "\"$user\", public"),
-        ("server_encoding", "UTF8"),
-        ("server_version", spg_engine::PG_SERVER_VERSION),
-        ("server_version_num", spg_engine::PG_SERVER_VERSION_NUM),
-        ("standard_conforming_strings", "on"),
-        ("statement_timeout", "0"),
-        ("timezone", "UTC"),
-        ("transaction_isolation", "read committed"),
-        ("transaction_read_only", "off"),
-    ]
-}
-
 // ---- v7.17.0 Phase 2.3 — statement_timeout ----
 
 /// Monotonic now in microseconds. Origin = first call into
@@ -5282,6 +5164,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // in a read-only transaction`), which PG spells the same way.
             "25006"
         } else if msg.contains("must be called before any query")
+            // v7.40.12 — PG spells the read-write half of the same rule
+            // with a different verb: "transaction read-write mode must
+            // be SET before any query" (measured, 25001). Matching only
+            // the "called" wording would have left the new refusal on
+            // the generic 42000.
+            || msg.contains("must be set before any query")
             // PG's PreventInTransactionBlock family — VACUUM, ALTER
             // SYSTEM, CREATE DATABASE, the CONCURRENTLY index forms,
             // DISCARD ALL. All 25001, all phrased this way.
@@ -5383,6 +5271,14 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // `operator class "weird_garbage" does not exist for access
             // method "gin"`, 42704.
             || msg.contains("operator class \"")
+            // v7.40.12 — and a GUC name nothing recognises. Measured on
+            // PG 18.6: `SHOW spam_x` -> 42704, `find_option, guc.c:1276`.
+            // SPG reported PG's sentence under the generic 42000, so a
+            // driver that keys on the class saw a stranger where it had
+            // just been given PG's own words. Found while removing the
+            // wire's SHOW shortcut, which used to answer this name with
+            // an empty row and never reached the error at all.
+            || msg.contains("unrecognized configuration parameter \"")
         {
             "42704"
         // v7.39 (read01 round 89) — a column named twice in an INSERT target

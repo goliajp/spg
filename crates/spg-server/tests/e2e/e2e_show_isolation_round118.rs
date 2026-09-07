@@ -175,3 +175,216 @@ fn show_transaction_isolation_reports_live_level() {
         "read committed"
     );
 }
+
+/// Count the rows a query returns over the wire.
+fn row_count(s: &mut TcpStream, sql: &str) -> usize {
+    send_query(s, sql);
+    read_until_ready(s).iter().filter(|m| m.ty == b'D').count()
+}
+
+/// The SQLSTATE of the ErrorResponse, or None when the statement was accepted.
+fn err_code(s: &mut TcpStream, sql: &str) -> Option<String> {
+    send_query(s, sql);
+    let msgs = read_until_ready(s);
+    let e = msgs.iter().find(|m| m.ty == b'E')?;
+    // ErrorResponse: NUL-terminated fields, each prefixed by a type byte;
+    // 'C' carries the SQLSTATE.
+    let mut i = 0usize;
+    while i < e.body.len() && e.body[i] != 0 {
+        let field = e.body[i];
+        let start = i + 1;
+        let mut end = start;
+        while end < e.body.len() && e.body[end] != 0 {
+            end += 1;
+        }
+        if field == b'C' {
+            return Some(String::from_utf8_lossy(&e.body[start..end]).into_owned());
+        }
+        i = end + 1;
+    }
+    None
+}
+
+/// v7.40.12 — round 118 removed ONE canned answer and left the shortcut that
+/// produced it. The shortcut answered every `SHOW` from a copy: the engine's
+/// stored session_params first, then a 21-entry table of frozen defaults. A
+/// copy cannot carry a DERIVED value, so four more answers were wrong, and the
+/// engine had all four right on the same connection. Measured against
+/// PostgreSQL 18.6; every expectation below is PG's own answer.
+///
+/// The corpus has pinned three of these since v7.39 — but only through the
+/// perm-runner's wire legs, which run in the `full` tier. They are here so the
+/// e2e gate, which runs on every commit, asks the same questions.
+#[test]
+fn show_answers_derived_values_not_a_stale_copy() {
+    let dir = unique_tmpdir("derived");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    // (1) `transaction_read_only` inside a read-only block. PG: on.
+    // The shortcut answered `off` from the frozen table while
+    // `current_setting('transaction_read_only')` — same connection, same
+    // transaction, the engine's own reading — answered `on`.
+    assert_eq!(first_cell(&mut s, "SHOW transaction_read_only"), "off");
+    run_ok(&mut s, "BEGIN READ ONLY");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_read_only"), "on");
+    assert_eq!(
+        first_cell(&mut s, "SELECT current_setting('transaction_read_only')"),
+        "on",
+        "the two surfaces must not disagree — that disagreement is what named this"
+    );
+    run_ok(&mut s, "ROLLBACK");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_read_only"), "off");
+
+    // (2) `transaction_isolation` after `SET default_transaction_isolation`.
+    // The stored copy is written by BEGIN, not by SET, so SHOW answered one
+    // statement behind: `read committed` here, then `repeatable read` after
+    // it had been set back.
+    run_ok(
+        &mut s,
+        "SET default_transaction_isolation = 'repeatable read'",
+    );
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "repeatable read"
+    );
+    run_ok(
+        &mut s,
+        "SET default_transaction_isolation = 'read committed'",
+    );
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "read committed"
+    );
+
+    // (3) `SHOW ALL`. PG 18.6 returns 399 rows; the engine returns 399 and
+    // `SELECT count(*) FROM pg_settings` answered 399 on the connection that
+    // saw the shortcut's 21.
+    let all = row_count(&mut s, "SHOW ALL");
+    let settings = first_cell(&mut s, "SELECT count(*) FROM pg_settings");
+    assert_eq!(
+        all.to_string(),
+        settings,
+        "SHOW ALL and pg_settings are one inventory; the shortcut had its own"
+    );
+    assert!(
+        all > 300,
+        "SHOW ALL returned {all} rows — the wire's 21-entry table is back"
+    );
+
+    // (4) PG's two-word spelling of the timezone GUC. Only the shortcut knew
+    // it; with the shortcut gone the parser has to.
+    assert_eq!(first_cell(&mut s, "SHOW TIME ZONE"), "UTC");
+    assert_eq!(first_cell(&mut s, "SHOW timezone"), "UTC");
+
+    // (5) PG's spelling of the login identity, both ways. It has no
+    // `pg_settings` row in PG either, so `SHOW ALL` above stays at PG's
+    // count; `SELECT session_user` already answered on this connection
+    // while `SHOW session_authorization` denied the name existed.
+    let who = first_cell(&mut s, "SELECT session_user");
+    assert_eq!(first_cell(&mut s, "SHOW session_authorization"), who);
+    assert_eq!(first_cell(&mut s, "SHOW SESSION AUTHORIZATION"), who);
+
+    // An unknown name is still PG's error, not an empty row.
+    assert_eq!(err_code(&mut s, "SHOW spam_x").as_deref(), Some("42704"));
+}
+
+/// v7.40.12 — `SELECT 1` inside a transaction block is a query, and PG counts
+/// it: the next `SET TRANSACTION ISOLATION LEVEL` is refused with 25001.
+/// SPG answered pure-integer selects from a wire fast path that never reached
+/// the engine, so the transaction's statement counter never moved and the
+/// switch was accepted. `SELECT * FROM t` in the same position refused
+/// correctly, which is what named the shortcut.
+///
+/// Measured on PostgreSQL 18.6: the isolation level is refused after the
+/// first query, `SET TRANSACTION READ ONLY` is not.
+#[test]
+fn an_integer_select_inside_a_block_is_a_query() {
+    let dir = unique_tmpdir("intselect");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").as_deref(),
+        Some("25001"),
+        "the fast path answered SELECT 1 without telling the engine a query ran"
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // Before the first query it is still allowed.
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_isolation"),
+        "serializable"
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // The read/write half is a DIFFERENT rule, and the refusal used to
+    // cover the whole statement. Measured on PG 18.6, after a query:
+    // tightening is always allowed, and only LOOSENING a read-only
+    // transaction is refused — with its own wording, and 25001 too.
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    run_ok(&mut s, "SET TRANSACTION READ ONLY"); // tighten: allowed
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    run_ok(&mut s, "SET TRANSACTION READ WRITE"); // no change: allowed
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN READ ONLY");
+    run_ok(&mut s, "SET TRANSACTION READ WRITE"); // before any query: allowed
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN READ ONLY");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION READ WRITE").as_deref(),
+        Some("25001"),
+        "loosening a read-only transaction after a query is PG's 25001"
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // DEFERRABLE is the third of the clause and was parsed and dropped,
+    // the way READ ONLY was before v7.39. Measured on PG 18.6: `off` by
+    // default, `on` inside `BEGIN DEFERRABLE`, `off` again afterwards,
+    // and 25001 after a query — in BOTH directions, unlike read/write.
+    assert_eq!(first_cell(&mut s, "SHOW transaction_deferrable"), "off");
+    run_ok(&mut s, "BEGIN DEFERRABLE");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_deferrable"), "on");
+    run_ok(&mut s, "ROLLBACK");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_deferrable"), "off");
+
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SET TRANSACTION DEFERRABLE");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_deferrable"), "on");
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION DEFERRABLE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION NOT DEFERRABLE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // Outside a block the fast path still answers, which is its whole
+    // population: pool keepalives are sent in autocommit.
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(first_cell(&mut s, "SELECT -42"), "-42");
+}
