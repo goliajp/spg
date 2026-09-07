@@ -626,3 +626,112 @@ fn a_begin_inside_a_transaction_still_carries_its_modes() {
         "command tag: {out:?}"
     );
 }
+
+/// v7.40.12 — `SERIALIZABLE READ ONLY DEFERRABLE` waits for a snapshot
+/// it can run against without serialization failures, which means
+/// waiting for every concurrent SERIALIZABLE read-write transaction to
+/// finish. Until now SPG carried the word and did nothing with it.
+///
+/// Measured on PG 18.6 with the same script on both engines: with a
+/// serializable writer open, the reader's first `SELECT` took 2,996 ms
+/// with DEFERRABLE and 0.9 ms with NOT DEFERRABLE, and `BEGIN` was
+/// instant in both — the wait is at the first snapshot, not at BEGIN.
+/// The wait is cancelled by `statement_timeout` and NOT by
+/// `lock_timeout`; both measured, both pinned below.
+///
+/// Every assertion here is bounded by a timeout on purpose: a pin for a
+/// wait must FAIL when the wait is wrong, never hang.
+#[test]
+fn a_deferrable_reader_waits_for_a_safe_snapshot() {
+    let dir = unique_tmpdir("deferrable");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let addr = addrs.pgwire.as_ref().unwrap();
+
+    let mut setup = open(addr);
+    run_ok(&mut setup, "CREATE TABLE dfr (id INT PRIMARY KEY, v INT)");
+    run_ok(&mut setup, "INSERT INTO dfr VALUES (1, 10), (2, 20)");
+
+    // A serializable WRITER, left open.
+    let mut writer = open(addr);
+    run_ok(&mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run_ok(&mut writer, "UPDATE dfr SET v = v + 1 WHERE id = 1");
+
+    // NOT DEFERRABLE does not wait: it answers inside its own timeout.
+    let mut plain = open(addr);
+    run_ok(&mut plain, "SET statement_timeout = '4s'");
+    run_ok(
+        &mut plain,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY NOT DEFERRABLE",
+    );
+    assert_eq!(first_cell(&mut plain, "SELECT sum(v) FROM dfr"), "30");
+    run_ok(&mut plain, "COMMIT");
+
+    // DEFERRABLE waits, and the only thing that ends the wait here is
+    // the statement timeout — the writer is still open.
+    let mut deferred = open(addr);
+    run_ok(&mut deferred, "SET statement_timeout = '700ms'");
+    run_ok(
+        &mut deferred,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE",
+    );
+    let started = std::time::Instant::now();
+    let code = err_code(&mut deferred, "SELECT sum(v) FROM dfr");
+    let waited = started.elapsed();
+    assert!(
+        code.is_some(),
+        "the deferrable reader did not wait: it answered in {waited:?}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(500),
+        "it returned in {waited:?}, too fast to have waited for the timeout"
+    );
+    run_ok(&mut deferred, "ROLLBACK");
+
+    // lock_timeout does NOT end this wait — measured on PG 18.6. With a
+    // short lock_timeout and a longer statement_timeout, the statement
+    // timeout is the one that fires.
+    let mut both = open(addr);
+    run_ok(&mut both, "SET lock_timeout = '300ms'");
+    run_ok(&mut both, "SET statement_timeout = '1200ms'");
+    run_ok(
+        &mut both,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE",
+    );
+    let started = std::time::Instant::now();
+    assert!(err_code(&mut both, "SELECT sum(v) FROM dfr").is_some());
+    let waited = started.elapsed();
+    assert!(
+        waited >= std::time::Duration::from_millis(900),
+        "lock_timeout ended the wait at {waited:?}; only statement_timeout may"
+    );
+    run_ok(&mut both, "ROLLBACK");
+
+    // Once the writer is gone the wait ends and the reader proceeds.
+    run_ok(&mut writer, "COMMIT");
+    let mut after = open(addr);
+    run_ok(&mut after, "SET statement_timeout = '4s'");
+    run_ok(
+        &mut after,
+        "BEGIN ISOLATION LEVEL SERIALIZABLE READ ONLY DEFERRABLE",
+    );
+    let started = std::time::Instant::now();
+    assert_eq!(first_cell(&mut after, "SELECT sum(v) FROM dfr"), "31");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "nothing was open to wait for, yet it waited"
+    );
+    run_ok(&mut after, "COMMIT");
+
+    // A read-WRITE serializable transaction never defers, whatever the
+    // word says: PG only defers a READ ONLY one.
+    run_ok(&mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE");
+    run_ok(&mut writer, "UPDATE dfr SET v = v + 1 WHERE id = 2");
+    let mut rw = open(addr);
+    run_ok(&mut rw, "SET statement_timeout = '4s'");
+    run_ok(&mut rw, "BEGIN ISOLATION LEVEL SERIALIZABLE DEFERRABLE");
+    assert_eq!(first_cell(&mut rw, "SELECT sum(v) FROM dfr"), "31");
+    run_ok(&mut rw, "COMMIT");
+    run_ok(&mut writer, "ROLLBACK");
+}

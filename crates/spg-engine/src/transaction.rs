@@ -633,6 +633,11 @@ impl Engine {
                 users: None,
                 savepoints: Vec::new(),
                 opened_implicitly: false,
+                // v7.40.12 — the session copies, frozen onto the slot so
+                // another connection can read what THIS transaction is.
+                isolation: self.current_isolation_level,
+                read_only: self.current_tx_read_only,
+                deferrable: self.current_tx_deferrable,
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
                 read_tables: alloc::collections::BTreeSet::new(),

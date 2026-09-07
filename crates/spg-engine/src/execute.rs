@@ -895,6 +895,19 @@ impl Engine {
         if let Some(d) = modes.deferrable {
             self.current_tx_deferrable = d;
         }
+        // v7.40.12 — and the slot copies other connections read.
+        if let Some(tx_id) = self.current_tx {
+            let (iso, ro, def) = (
+                self.current_isolation_level,
+                self.current_tx_read_only,
+                self.current_tx_deferrable,
+            );
+            if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+                st.isolation = iso;
+                st.read_only = ro;
+                st.deferrable = def;
+            }
+        }
         let isolation = self.current_isolation_level;
         // v7.37.17 (Phase E2) — inside an open tx, switching to
         // RR/SER BEFORE the first query freezes the tx's view by
@@ -1796,6 +1809,18 @@ impl Engine {
         // `takes_a_snapshot` for the measured list and why the counter
         // needs it.
         let takes_snapshot = crate::transaction::takes_a_snapshot(&stmt);
+        // v7.40.12 — a `SERIALIZABLE READ ONLY DEFERRABLE` transaction
+        // waits for a snapshot it can run against safely, and this is
+        // the moment it would take one. The wait itself cannot happen
+        // here: the engine lock is held, and the transaction it is
+        // waiting for needs that lock to COMMIT. Report and let the host
+        // retry after the guard drops, the same shape row locks use.
+        if takes_snapshot
+            && let Some(tx_id) = self.current_tx
+            && self.deferrable_must_wait(tx_id)
+        {
+            return Err(EngineError::DeferrableWouldBlock);
+        }
         let result = self.dispatch_stmt_inner(stmt, cancel);
         if result.is_ok() {
             self.record_tx_stmt(&tx_class, takes_snapshot);

@@ -421,6 +421,17 @@ pub enum EngineError {
     /// write lock — doing so would stop the whole server, including the
     /// transaction whose commit would release the lock.
     LockWouldBlock,
+    /// v7.40.12 — a `SERIALIZABLE READ ONLY DEFERRABLE` transaction is
+    /// waiting for a snapshot it can run against without serialization
+    /// failures, which means waiting for every concurrent SERIALIZABLE
+    /// read-write transaction to finish. Like `LockWouldBlock`, the WAIT
+    /// cannot happen inside the engine lock -- that would stop the very
+    /// connection whose COMMIT ends it -- so the engine reports this and
+    /// the host retries after the guard drops.
+    ///
+    /// Measured on PG 18.6: the wait is cancelled by `statement_timeout`
+    /// and NOT by `lock_timeout`.
+    DeferrableWouldBlock,
     /// v7.39 (round 299) — granting the wait would close a wait-for
     /// cycle. PG's 40P01.
     LockDeadlock,
@@ -487,6 +498,9 @@ impl fmt::Display for EngineError {
             Self::TransactionAlreadyOpen => f.write_str("a transaction is already open"),
             Self::NoActiveTransaction => f.write_str("no active transaction"),
             Self::LockWouldBlock => f.write_str("row is locked by another transaction"),
+            Self::DeferrableWouldBlock => {
+                f.write_str("deferrable transaction is waiting for a safe snapshot")
+            }
             Self::LockDeadlock => f.write_str("deadlock detected"),
             Self::InFailedTransaction => f.write_str(
                 "current transaction is aborted, commands ignored until end of transaction block",
@@ -753,6 +767,16 @@ struct TxState {
     /// apart on its own — the wire says so with
     /// [`Engine::mark_tx_implicit`] right after it opens the wrap.
     opened_implicitly: bool,
+    /// v7.40.12 — this transaction's OWN isolation level, read/write
+    /// mode and DEFERRABLE property. The engine also keeps a session
+    /// copy of each, which is what one connection reads about itself;
+    /// these are what OTHER connections' transactions have to be judged
+    /// by, and a `SERIALIZABLE READ ONLY DEFERRABLE` reader has to judge
+    /// them: it waits until no concurrent SERIALIZABLE read-write
+    /// transaction is in flight.
+    isolation: spg_sql::ast::IsolationLevel,
+    read_only: bool,
+    deferrable: bool,
     /// v7.37.15 (Phase E) — cached MVCC snapshot for REPEATABLE
     /// READ / SERIALIZABLE. Captured at `exec_begin` time when the
     /// session's `current_isolation_level` is RR/SER; read paths
@@ -3331,6 +3355,44 @@ impl Engine {
     /// this is false for the autocommit id.
     pub fn is_tx_open(&self, tx_id: TxId) -> bool {
         self.tx_catalogs.contains_key(&tx_id)
+    }
+
+    /// v7.40.12 — must this connection's transaction WAIT before taking
+    /// its first snapshot?
+    ///
+    /// `SERIALIZABLE READ ONLY DEFERRABLE` asks for a snapshot it can run
+    /// against without ever hitting a serialization failure, and without
+    /// causing one. PG gets that by waiting until no concurrent
+    /// SERIALIZABLE read-write transaction is in flight. Measured on
+    /// PG 18.6 with the same script on both engines: with a serializable
+    /// writer open, the reader's first `SELECT` took 2,996 ms with
+    /// DEFERRABLE and 0.9 ms with NOT DEFERRABLE, and the `BEGIN` itself
+    /// was instant in both — the wait is at the first snapshot, not at
+    /// BEGIN.
+    ///
+    /// Answering needs each transaction's OWN modes, not the session
+    /// copies: the writer is on another connection. That is why
+    /// `TxState` carries them.
+    ///
+    /// The caller must NOT hold anything while it waits; see
+    /// [`EngineError::DeferrableWouldBlock`].
+    #[must_use]
+    pub fn deferrable_must_wait(&self, tx_id: TxId) -> bool {
+        use spg_sql::ast::IsolationLevel::Serializable;
+        let Some(me) = self.tx_catalogs.get(&tx_id) else {
+            return false;
+        };
+        if !(me.deferrable && me.read_only && me.isolation == Serializable) {
+            return false;
+        }
+        // Only before the first snapshot. Once this transaction has one,
+        // deferring is meaningless -- and PG stops waiting too.
+        if me.stmts_run > 0 {
+            return false;
+        }
+        self.tx_catalogs
+            .iter()
+            .any(|(id, st)| *id != tx_id && st.isolation == Serializable && !st.read_only)
     }
 
     /// v7.40.12 — the host is about to run a multi-statement script and
