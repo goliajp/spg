@@ -376,6 +376,53 @@ fn the_ok_packet_carries_the_key_this_statement_made() {
     );
 }
 
+/// `SET SESSION transaction_read_only = 1` reached nothing. The engine
+/// has refused a write in a read-only transaction since v7.39 —
+/// measured over pgwire, both `BEGIN READ ONLY` and
+/// `SET default_transaction_read_only = on` do — and the MySQL spelling
+/// was stored, echoed back, and ignored. A connection pool doing
+/// read/write splitting marks a connection this way before routing it
+/// to a replica.
+///
+/// Every reading below is MySQL 9.7.2's, measured through a driver.
+#[test]
+fn a_read_only_mysql_session_refuses_a_write() {
+    let (_guard, addr) = open_server("read-only");
+    let mut s = auth_open(&addr);
+
+    ok_of(&mut s, "CREATE TABLE ro (n INT)");
+    assert_eq!(
+        rows(&mut s, "SELECT @@transaction_read_only")[0][0].as_deref(),
+        Some("0"),
+        "a fresh session is read-write"
+    );
+
+    ok_of(&mut s, "SET SESSION transaction_read_only = 1");
+    assert_eq!(
+        rows(&mut s, "SELECT @@transaction_read_only")[0][0].as_deref(),
+        Some("1")
+    );
+    ok_of(&mut s, "START TRANSACTION");
+    let (errno, sqlstate, msg) = error_of(&mut s, "INSERT INTO ro VALUES (1)");
+    assert_eq!(errno, 1792);
+    assert_eq!(sqlstate, "25006");
+    assert!(
+        msg.contains("Cannot execute statement in a READ ONLY transaction"),
+        "unexpected message: {msg}"
+    );
+    ok_of(&mut s, "ROLLBACK");
+
+    // The control: turn it off and the same write lands, so the test
+    // above is reading a refusal rather than a broken session.
+    ok_of(&mut s, "SET SESSION transaction_read_only = 0");
+    assert_eq!(ok_of(&mut s, "INSERT INTO ro VALUES (2)").0, 1);
+    assert_eq!(
+        rows(&mut s, "SELECT count(*) FROM ro")[0][0].as_deref(),
+        Some("1"),
+        "exactly the row that was allowed"
+    );
+}
+
 /// `UPPER()` over a non-text value, which is what
 /// `DatabaseMetaData.getColumns` does to its numeric CASE arms.
 #[test]

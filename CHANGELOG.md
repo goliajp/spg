@@ -95,6 +95,40 @@ boolean spelling handed to a MySQL session, which disagreed with the
 same session's bare `SELECT TRUE`. Found by the pin written for the
 `UPPER` fix.
 
+### Fixed — a read-only MySQL session wrote anyway
+
+`SET SESSION transaction_read_only = 1` was stored, echoed back by
+`@@transaction_read_only`, and reached nothing. A connection pool doing
+read/write splitting marks a connection this way before routing it to a
+replica; SPG accepted the writes. The engine has refused a write in a
+read-only transaction since v7.39 — measured over pgwire, both
+`BEGIN READ ONLY` and `SET default_transaction_read_only = on` do — so
+the capability was there and the MySQL spelling did not reach it. It
+now answers `ERROR 1792 (25006) Cannot execute statement in a READ ONLY
+transaction.`, which is MySQL 9.7.2's own reading of the same three
+statements.
+
+### Added — the two differential corpora provision and pin their own reference
+
+`xtests/diffcorpus/run.sh` and `xtests/mysqlcorpus/run.sh` both named a
+container that nothing in this repository creates. On the testbed the
+PostgreSQL one reported `the SPG leg answered '<nothing>' to SELECT 1 —
+it is not up`, which names the wrong component twice over: the SPG
+server was up and listening, and what was missing was the container
+holding the psql BOTH legs are asked through. `spg-bench-mysql` had
+never existed anywhere at all.
+
+Both now create the container when it is absent, start it when it is
+stopped, and refuse to score when what is RUNNING is not what is
+PINNED — the same assertion the oracle runner gained above. The
+PostgreSQL reference was a `postgres:18` someone resolved by hand,
+which was 18.4 while the rest of this project compares against 18.6:
+the differential everything else is measured against was quietly a
+version behind and nothing said so. Measured, the corpus is byte-for-
+byte the same against 18.6 as against 18.4 — the same thirteen
+differing lines, the same per-file distribution — so the pin moved and
+no baseline did.
+
 ### Fixed — a mysql-wire session got neither `-c` settings nor role defaults
 
 A server started with `-c TimeZone=Asia/Tokyo` answered `SYSTEM` on

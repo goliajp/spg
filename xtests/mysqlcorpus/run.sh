@@ -18,6 +18,50 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 SPG_PORT="${SPG_MYSQL_PORT:-26010}"
 ORACLE="${MYSQL_ORACLE_CONTAINER:-spg-bench-mysql}"
 
+# v7.40.11 — the oracle leg's container, provisioned here.
+#
+# It was named and never created: nothing in the repository made a
+# `spg-bench-mysql`, so this corpus could only ever run where somebody
+# had built one by hand. The PostgreSQL half had the same hole and
+# reported it as "the SPG leg is not up", which names the wrong
+# component — the SPG server is up; the container holding the client is
+# not there. Both halves provision now, and both assert that what is
+# RUNNING is what is PINNED, the way the oracle runner does.
+MYSQL_REF_IMAGE="${MYSQL_REF_IMAGE:-mysql:9.7.2}"
+MYSQL_REF_PIN="${MYSQL_REF_IMAGE##*:}"; MYSQL_REF_PIN="${MYSQL_REF_PIN%%-*}"
+
+if ! docker inspect "$ORACLE" >/dev/null 2>&1; then
+  echo "mysqlcorpus: creating the oracle leg $ORACLE from $MYSQL_REF_IMAGE" >&2
+  docker run -d --name "$ORACLE" -e MYSQL_ROOT_PASSWORD=bench "$MYSQL_REF_IMAGE" >/dev/null || {
+    echo "mysqlcorpus: could not create $ORACLE from $MYSQL_REF_IMAGE" >&2; exit 2; }
+elif [ "$(docker inspect -f '{{.State.Running}}' "$ORACLE" 2>/dev/null)" != "true" ]; then
+  docker start "$ORACLE" >/dev/null || {
+    echo "mysqlcorpus: could not start $ORACLE" >&2; exit 2; }
+fi
+# The readiness probe is the QUERY, not a ping: measured on a first
+# boot, `mysqladmin ping` answered while the server was still
+# initialising its data directory and the version query returned
+# nothing for another half-minute — which this script would then have
+# reported as a version mismatch, naming the wrong cause. A first boot
+# took about ninety seconds here.
+ref_version=""
+for _ in $(seq 1 240); do
+  ref_version="$(docker exec "$ORACLE" mysql -uroot -pbench -N -B -e 'SELECT VERSION();' 2>/dev/null \
+      | tr -d '[:space:]')"
+  [ -n "$ref_version" ] && break
+  sleep 1
+done
+case "$ref_version" in
+  "$MYSQL_REF_PIN"*) ;;
+  *)
+    echo "mysqlcorpus: the oracle leg is running '${ref_version:-<nothing>}' and this corpus pins $MYSQL_REF_PIN." >&2
+    echo "             Every expectation here was recorded against the pin; measuring against" >&2
+    echo "             another build reports differences that are the other build's." >&2
+    echo "             Recreate it: docker rm -f $ORACLE && rerun this script." >&2
+    exit 2
+    ;;
+esac
+
 OWN_SERVER=""
 if [ "${SPG_REUSE:-0}" = 1 ] && (exec 3<>/dev/tcp/127.0.0.1/"$SPG_PORT") 2>/dev/null; then
   :
