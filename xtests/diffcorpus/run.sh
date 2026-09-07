@@ -24,44 +24,17 @@ SPG_PORT="${SPG_PORT:-26000}"
 # what is PINNED.
 PG_REF_CONTAINER="${PG_REF_CONTAINER:-spg-bench-postgres}"
 PG_REF_PORT="${PG_REF_PORT:-25432}"
-PG_REF_IMAGE="${PG_REF_IMAGE:-postgres:18.6}"
-PG_REF_PIN="${PG_REF_IMAGE##*:}"; PG_REF_PIN="${PG_REF_PIN%%-*}"
 
-if ! docker inspect "$PG_REF_CONTAINER" >/dev/null 2>&1; then
-  echo "diffcorpus: creating the reference leg $PG_REF_CONTAINER from $PG_REF_IMAGE" >&2
-  docker run -d --name "$PG_REF_CONTAINER" \
-      -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
-      -p "$PG_REF_PORT":5432 "$PG_REF_IMAGE" >/dev/null || {
-        echo "diffcorpus: could not create $PG_REF_CONTAINER from $PG_REF_IMAGE" >&2; exit 2; }
-elif [ "$(docker inspect -f '{{.State.Running}}' "$PG_REF_CONTAINER" 2>/dev/null)" != "true" ]; then
-  docker start "$PG_REF_CONTAINER" >/dev/null || {
-    echo "diffcorpus: could not start $PG_REF_CONTAINER" >&2; exit 2; }
-fi
-# The readiness probe is the QUERY, not `pg_isready`: on a machine that
-# has to PULL the image first, `pg_isready` answered while the server
-# was still initialising and the query returned nothing — which this
-# script then reported as a version mismatch, naming the wrong cause.
-# Seen on the testbed, where the container had never existed.
+# v7.40.11 — one provisioning point, not one per caller.
 #
-# `SHOW server_version` because `version()` is a whole sentence and the
-# pin is bare — the same shape the oracle runner needed.
-ref_version=""
-for _ in $(seq 1 240); do
-  ref_version="$(docker exec "$PG_REF_CONTAINER" psql -U bench -d bench -tA \
-      -c 'SHOW server_version;' 2>/dev/null | tr -d '[:space:]')"
-  [ -n "$ref_version" ] && break
-  sleep 1
-done
-case "$ref_version" in
-  "$PG_REF_PIN"*) ;;
-  *)
-    echo "diffcorpus: the reference leg is running '${ref_version:-<nothing>}' and this corpus pins $PG_REF_PIN." >&2
-    echo "            Every expectation here was recorded against the pin; measuring against" >&2
-    echo "            another build reports differences that are the other build's." >&2
-    echo "            Recreate it: docker rm -f $PG_REF_CONTAINER && rerun this script." >&2
-    exit 2
-    ;;
-esac
+# This block used to create and pin the container inline. So did
+# `xtests/mysqlcorpus/run.sh`, for its own engine. Meanwhile five suite
+# steps used the same container and provisioned nothing, which is what
+# treating a class one instance at a time looks like. The pin, the
+# readiness probe and the version refusal now live in
+# `scripts/ensure-bench-pg.sh`, and every caller asks it.
+BENCH_PG_CONTAINER="$PG_REF_CONTAINER" BENCH_PG_PORT="$PG_REF_PORT" \
+  "$ROOT/scripts/ensure-bench-pg.sh" || exit 2
 
 # v7.39 (round 666) — start our own server when nothing is serving, so the
 # gate protocol can run this unattended. `xtests/dump_compat/run.sh` has done

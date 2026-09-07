@@ -9,6 +9,29 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
+/// v7.40.11 — the PostgreSQL bench container, provisioned once for
+/// every step that needs it.
+///
+/// `spg-bench-postgres` on 25432 underpins `perf-sweep`'s PostgreSQL
+/// leg, the `generative` differential, `pgbench`, `pgdump-roundtrip`
+/// and a second dump path — five steps here, plus
+/// `xtests/diffcorpus/run.sh`. Nothing in this repository created it:
+/// it existed because somebody once typed `docker run` on one machine.
+/// Two callers were given their own inline provisioning first, which
+/// fixed two places and left five — a class treated one instance at a
+/// time.
+///
+/// Failing here is deliberate rather than warning and carrying on: a
+/// step that measures against a container it could not provision is
+/// measuring against whatever was there.
+///
+/// # Errors
+/// When the container cannot be created, started, or is running a
+/// build other than the pinned one.
+fn ensure_bench_pg(root: &Path) -> Result<(), String> {
+    sh(root, "scripts/ensure-bench-pg.sh").map(|_| ())
+}
+
 fn sh(root: &Path, cmd: &str) -> Result<String, String> {
     let out = Command::new("sh")
         .arg("-c")
@@ -531,6 +554,7 @@ pins-current: slowest —    11s wall      2.9s in-test  spg-engine::e2e";
 /// It still runs nightly, where the numbers it produces are wanted and
 /// nothing is waiting on them.
 pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<String, String> {
+    ensure_bench_pg(root)?;
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
         // v7.39.12 — the workspace selection, so this shares artefacts with
@@ -1453,6 +1477,7 @@ fn tail_lines(out: &str, n: usize) -> String {
 /// # Errors
 /// Build failure, or any divergence (drafts land in 15_regressions).
 pub fn generative(root: &Path, runid: &str) -> Result<String, String> {
+    ensure_bench_pg(root)?;
     sh(
         root,
         // v7.39.12 — the workspace selection; see the note in
@@ -1551,6 +1576,7 @@ pub fn sql2016(root: &Path) -> Result<String, String> {
 /// Server/build failure, init failure, or a single-client failure
 /// count above zero.
 pub fn pgbench(root: &Path, runid: &str) -> Result<String, String> {
+    ensure_bench_pg(root)?;
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
         // v7.39.12 — the workspace selection, so this shares artefacts with
@@ -1802,6 +1828,7 @@ pub fn sysbench(root: &Path, runid: &str) -> Result<String, String> {
 /// pg_dump non-zero, any restore error on the SPG leg, or a count
 /// mismatch across the three sides.
 pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
+    ensure_bench_pg(root)?;
     let bin = root.join("target/release/spg-server");
     if !bin.exists() {
         // v7.39.12 — the workspace selection, so this shares artefacts with
