@@ -37,15 +37,21 @@ elif [ "$(docker inspect -f '{{.State.Running}}' "$PG_REF_CONTAINER" 2>/dev/null
   docker start "$PG_REF_CONTAINER" >/dev/null || {
     echo "diffcorpus: could not start $PG_REF_CONTAINER" >&2; exit 2; }
 fi
-for _ in $(seq 1 60); do
-  docker exec "$PG_REF_CONTAINER" pg_isready -U bench -q 2>/dev/null && break
-  sleep 0.5
-done
-
+# The readiness probe is the QUERY, not `pg_isready`: on a machine that
+# has to PULL the image first, `pg_isready` answered while the server
+# was still initialising and the query returned nothing — which this
+# script then reported as a version mismatch, naming the wrong cause.
+# Seen on the testbed, where the container had never existed.
+#
 # `SHOW server_version` because `version()` is a whole sentence and the
-# pin is bare — the same shape the oracle runner's gate needed.
-ref_version="$(docker exec "$PG_REF_CONTAINER" psql -U bench -d bench -tA \
-    -c 'SHOW server_version;' 2>/dev/null | tr -d '[:space:]')"
+# pin is bare — the same shape the oracle runner needed.
+ref_version=""
+for _ in $(seq 1 240); do
+  ref_version="$(docker exec "$PG_REF_CONTAINER" psql -U bench -d bench -tA \
+      -c 'SHOW server_version;' 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$ref_version" ] && break
+  sleep 1
+done
 case "$ref_version" in
   "$PG_REF_PIN"*) ;;
   *)
