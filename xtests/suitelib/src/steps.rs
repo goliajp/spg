@@ -655,6 +655,52 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
             &format!("{psql} --no-psqlrc -X -q -tA '{locale_uri}' -c 'SELECT 1'"),
         )
         .map_err(|e| format!("locale leg {locale_uri} not answering: {e}"))?;
+        // v7.40.11 — a THIRD leg, configured exactly like the comparison
+        // one, because this panel cannot make its two arms one process.
+        //
+        // A database collation is a boot setting here — SPG is
+        // single-database, so `CREATE DATABASE … LC_COLLATE` sets the
+        // server's — and comparing two collations is therefore comparing
+        // two SERVERS. Measured by swapping which of the two was judged,
+        // the difference followed the LEG and not the position: the same
+        // process ran `narrow, non-indexed key` 2-4% faster whichever
+        // side it was timed on, on a cell that sorts an INT and cannot
+        // consult a collation at all. The panel named the collation as
+        // its variable while varying two.
+        //
+        // This leg differs from the comparison leg in nothing the panel
+        // claims to vary, so what the two of them differ by is what a
+        // PROCESS is worth on that cell, in that window. The sweep folds
+        // it into the resolution a verdict must clear and reports it as
+        // `cross_process_differences=` — measured on an idle testbed,
+        // one to four cells of nineteen, every run.
+        // TWO of them, because a spread needs three points. With one
+        // baseline the comparison side has a single pairwise difference,
+        // and when those two processes happen to agree the spread is
+        // invisible: measured on an idle testbed, four identical
+        // processes ran `top-N LIMIT 10` at medians 8.03 / 8.74 / 8.65 /
+        // 8.56 ms — 8.8% apart — and a run that sampled the close pair
+        // called a 22% gap a LOSS.
+        let mut roster3 = Roster::new();
+        let mut baseline_uris = Vec::new();
+        for n in 1..=2 {
+            let port = roster3.spawn_server_env(
+                &format!("sweep-leg-baseline-{n}"),
+                &bin,
+                &crate::proclib::run_tmp_dir(&format!("{runid}-sweep-baseline-{n}")),
+                Duration::from_secs(20),
+                bind,
+                &[("SPG_LC_COLLATE", "C")],
+            )?;
+            let uri = format!("postgres://bench:bench@{host}:{port}/bench");
+            sh(
+                root,
+                &format!("{psql} --no-psqlrc -X -q -tA '{uri}' -c 'SELECT 1'"),
+            )
+            .map_err(|e| format!("baseline leg {uri} not answering: {e}"))?;
+            baseline_uris.push(uri);
+        }
+        let baseline_uri = baseline_uris.join(",");
         // `SIZES` trimmed to the largest band only: the question is a
         // cost CLASS, which the widest row count answers most clearly,
         // and the whole panel twice would not fit the tier's budget.
@@ -666,7 +712,8 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
                 // where the two legs launched a different number of
                 // processes is not a verdict about collation. See the
                 // note at the withdrawal in `perf-endpoint-sweep.sh`.
-                "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' SIZES=400000 \
+                "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' \
+                 BASELINE_URI='{baseline_uri}' SIZES=400000 \
                  EXPECT_SPG_COLLATE=en_US.utf8 ALLOW_COLLATION_MISMATCH=1 \
                  SELF_COMPARISON=1 \
                  SORT_CEILING=2.0 \
@@ -716,6 +763,7 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
                 ),
             )
         };
+        roster3.reap_all();
         roster2.reap_all();
         let _ = std::fs::remove_dir_all(&tmp2);
         // Both verdicts travel; the caller grades them separately.
