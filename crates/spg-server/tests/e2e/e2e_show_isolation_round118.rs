@@ -735,3 +735,81 @@ fn a_deferrable_reader_waits_for_a_safe_snapshot() {
     run_ok(&mut rw, "COMMIT");
     run_ok(&mut writer, "ROLLBACK");
 }
+
+/// v7.40.12 — `pg_sleep` sleeps.
+///
+/// It used to answer instantly. Measured: PG 18.6 takes 2,082 ms for
+/// `pg_sleep(2)` and SPG took 23 ms. It is not a cosmetic difference —
+/// a client pacing itself in SQL did not pace, and this project's own
+/// concurrency probe was fooled by it while investigating something
+/// else, which is how it was found.
+///
+/// The engine does NOT sleep: it holds the shared engine lock, and PG's
+/// `pg_sleep` stalls no other connection. The pre-pass records the
+/// request, the host serves it after dropping the guard, and the last
+/// assertion here is what makes that difference observable.
+#[test]
+fn pg_sleep_sleeps_and_blocks_nobody() {
+    let dir = unique_tmpdir("pgsleep");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let addr = addrs.pgwire.as_ref().unwrap();
+    let mut s = open(addr);
+    run_ok(&mut s, "CREATE TABLE sl (x INT)");
+
+    // It sleeps, and close to the time asked for: measured in-session,
+    // PG 2,007.6 ms and SPG 2,003.1 ms for `pg_sleep(2)`. A slice
+    // counter that subtracted the REQUESTED slice each time accumulated
+    // its overshoot to 2,428 ms, so the host slices against an absolute
+    // end instead — 250 ms is short enough for that to show.
+    let started = std::time::Instant::now();
+    run_ok(&mut s, "SELECT pg_sleep(0.25)");
+    let took = started.elapsed();
+    assert!(
+        took >= std::time::Duration::from_millis(230),
+        "pg_sleep(0.25) returned in {took:?}"
+    );
+    assert!(
+        took < std::time::Duration::from_millis(600),
+        "pg_sleep(0.25) took {took:?} — the slicing is accumulating overshoot"
+    );
+
+    // statement_timeout ends it; lock_timeout does not. Both measured on
+    // PG 18.6 (568 ms and 1,060 ms for the same two statements).
+    run_ok(&mut s, "SET statement_timeout = '400ms'");
+    let started = std::time::Instant::now();
+    assert!(
+        err_code(&mut s, "SELECT pg_sleep(5)").is_some(),
+        "statement_timeout did not end the sleep"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    run_ok(&mut s, "RESET statement_timeout");
+
+    run_ok(&mut s, "SET lock_timeout = '100ms'");
+    let started = std::time::Instant::now();
+    run_ok(&mut s, "SELECT pg_sleep(0.4)");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(350),
+        "lock_timeout ended the sleep; only statement_timeout may"
+    );
+    run_ok(&mut s, "RESET lock_timeout");
+
+    // And it blocks nobody: a writer on another connection goes through
+    // while this one sleeps. Measured against PG, whose writer took
+    // 49 ms in the same shape.
+    let mut sleeper = open(addr);
+    let handle = std::thread::spawn(move || {
+        run_ok(&mut sleeper, "SELECT pg_sleep(2)");
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut writer = open(addr);
+    let started = std::time::Instant::now();
+    run_ok(&mut writer, "INSERT INTO sl VALUES (1)");
+    let wrote_in = started.elapsed();
+    assert!(
+        wrote_in < std::time::Duration::from_millis(900),
+        "the writer waited {wrote_in:?} — the sleep is holding the engine lock"
+    );
+    handle.join().unwrap();
+}
