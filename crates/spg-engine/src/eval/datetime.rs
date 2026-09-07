@@ -683,7 +683,10 @@ pub(super) fn age(args: &[Value<'_>]) -> Result<Value<'static>, EvalError> {
 
 /// v7.17.0 Phase 3.P0-29 — MySQL `DATE_FORMAT(t, fmt)`.
 ///
-/// Format tokens (MySQL 8.0 surface):
+/// Format tokens, measured on MySQL 9.7.2 — the release SPG advertises
+/// — and unchanged from the 8.0 line this list was first drawn from
+/// (v7.40.11 checked every token below against the oracle, including
+/// that an unknown `%Q` still passes through as `Q`):
 ///   * `%Y` — 4-digit year  `%y` — 2-digit year
 ///   * `%m` — 01-12 month   `%c` — 1-12 month (no zero pad)
 ///   * `%d` — 01-31 day     `%e` — 1-31 day (no zero pad)

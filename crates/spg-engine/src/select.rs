@@ -11604,8 +11604,8 @@ fn mysql_dedup_fold(v: &Value, pads: bool) -> Option<String> {
     match v {
         // v7.38.17 — CHAR's trailing spaces are padding; TEXT's are
         // data. The comment above named `utf8mb4_uca1400_ai_ci`, which
-        // is MariaDB's default and PAD SPACE. SPG advertises MySQL 8.0,
-        // whose default is NO PAD, so `'alpha'` and `'alpha  '` are two
+        // is MariaDB's default and PAD SPACE. SPG advertises MySQL
+        // 9.7.2, whose default is NO PAD, so `'alpha'` and `'alpha  '` are two
         // rows to a `SELECT DISTINCT` and one to `count(DISTINCT)` was
         // the same question answered twice.
         // v7.38.18 — a CHAR's padding is the TYPE's and never counts; a

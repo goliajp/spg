@@ -5,7 +5,7 @@ edition      = { workspace = true }
 authors      = { workspace = true }
 license      = { workspace = true }
 publish      = false
-description  = "v7.38 differential oracle — runs SPG vs PG18 / MySQL 8 / MariaDB 11, sort-then-byte-equal compare with adjust_*() normalisation pipeline."
+description  = "v7.38 differential oracle — runs SPG vs PG18 / MySQL 9 / MariaDB 12, sort-then-byte-equal compare with adjust_*() normalisation pipeline."
 
 # v7.38 C scaffolding: at this stage the crate compiles as a bin with
 # stub adapters; full sqlx/docker wiring (PG/MySQL/MariaDB clients,

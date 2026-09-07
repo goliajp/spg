@@ -426,6 +426,29 @@ impl<'a> EvalContext<'a> {
         self.tz_offset_fn.and_then(|f| f(zone, utc_micros))
     }
 
+    /// v7.40.11 — the session zone's NAME, for the operations that need
+    /// the zone itself rather than an offset. `None` means no zone is
+    /// set, which is UTC and steps nothing.
+    #[must_use]
+    pub fn session_zone(&self) -> Option<&str> {
+        self.session_gucs
+            .and_then(|g| g.get("timezone"))
+            .map(alloc::string::String::as_str)
+    }
+
+    /// v7.40.11 — a local wall clock in the session zone back to the
+    /// instant it names, with PostgreSQL's DST disambiguation. `None`
+    /// when the host has no tzdb or the zone is a fixed offset (which
+    /// the caller can handle by arithmetic).
+    #[must_use]
+    pub fn session_localize(&self, local_micros: i64) -> Option<i64> {
+        let zone = self.session_zone()?;
+        if let Some(off) = datetime::resolve_zone_offset(zone) {
+            return Some(local_micros - off);
+        }
+        self.tz_localize_fn.and_then(|f| f(zone, local_micros))
+    }
+
     /// v7.39 (tz epic) — the SESSION zone's offset at a UTC instant
     /// (per-value: DST zones vary within one statement).
     #[must_use]
@@ -5435,6 +5458,15 @@ pub fn eval_expr(
             // — the helper is a no-op outside Text-Text equality
             // and inequality.
             let (l, r) = collation_fold_for_compare(*op, lhs, rhs, l, r, ctx);
+            // v7.40.11 — `timestamptz ± interval` is a CALENDAR step in
+            // the session zone for the months and days fields, and an
+            // absolute duration only for the time part. See
+            // `tstz_interval_hook`.
+            if matches!(op, BinOp::Add | BinOp::Sub)
+                && let Some(out) = tstz_interval_hook(*op, lhs, rhs, &l, &r, ctx)?
+            {
+                return Ok(out);
+            }
             // v7.39 (GUC knife 4) — `date/interval/float || text` textifies
             // through the out-functions, which honour the session render
             // style. Pre-render the style-sensitive operand here (the
@@ -6907,6 +6939,111 @@ fn json_timestamptz_text(us: i64, ctx: &EvalContext<'_>) -> alloc::string::Strin
     let (oh, om) = (omag / 3_600_000_000, (omag / 60_000_000) % 60);
     let _ = core::fmt::Write::write_fmt(&mut txt, format_args!("{sign}{oh:02}:{om:02}"));
     txt
+}
+
+/// v7.40.11 — `timestamptz ± interval`: the months and days fields are
+/// CALENDAR steps taken in the session zone; only the time part is an
+/// absolute duration.
+///
+/// SPG applied the duration reading to both, so in a zone with daylight
+/// saving a day-or-larger interval came out an hour off — twice a year,
+/// silently, in the direction that depends on which edge you cross.
+/// Reported by sentori against 7.40.9 (§3.19). Measured on the PG 18.6
+/// oracle under `America/Denver`, from `'2026-03-07 12:00-07'`:
+///
+/// ```text
+///                          PG 18.6 delta      SPG 7.40.10
+///   + interval '1 day'     +82800  (23 h)     +86400
+///   + interval '24 hours'  +86400  (24 h)     +86400
+/// ```
+///
+/// That pair is the whole rule: PostgreSQL disagrees with ITSELF
+/// between the two, which is the entire distinction between a duration
+/// and a calendar step. Across the November edge the day is 25 hours.
+///
+/// A `timestamp` WITHOUT a zone has no zone to step in and keeps the
+/// naive arithmetic, which is why `Value::Timestamp` alone cannot decide
+/// this — the value is the same for both types and only the EXPRESSION's
+/// declared type says which one it is. The tests below are ordered
+/// cheapest first, so an ordinary `timestamp + interval` pays one match
+/// and two integer comparisons.
+///
+/// # Errors
+/// Whatever the calendar arithmetic reports (overflow).
+#[inline(never)]
+fn tstz_interval_hook(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    l: &Value<'static>,
+    r: &Value<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Option<Value<'static>>, EvalError> {
+    let (ts_expr, ts, iv, sign) = match (l, r) {
+        (Value::Timestamp(t), Value::Interval { .. }) => {
+            (lhs, *t, r, if matches!(op, BinOp::Sub) { -1i64 } else { 1 })
+        }
+        // `interval + timestamptz` is the same sum; `interval - timestamptz`
+        // is not a thing PG accepts, so only Add commutes.
+        (Value::Interval { .. }, Value::Timestamp(t)) if matches!(op, BinOp::Add) => {
+            (rhs, *t, l, 1)
+        }
+        _ => return Ok(None),
+    };
+    let Value::Interval {
+        months,
+        days,
+        micros,
+        kind,
+    } = iv
+    else {
+        return Ok(None);
+    };
+    if !matches!(kind, spg_storage::IntervalKind::Finite) {
+        return Ok(None);
+    }
+    // A pure duration already lands where PG puts it.
+    if *months == 0 && *days == 0 {
+        return Ok(None);
+    }
+    // No session zone, or UTC, and nothing steps.
+    let Some(zone) = ctx.session_zone() else {
+        return Ok(None);
+    };
+    if zone.eq_ignore_ascii_case("utc") {
+        return Ok(None);
+    }
+    // The one test that costs anything: is this side a timestamptz?
+    if crate::describe::describe_expr_type(ts_expr, ctx.columns)
+        != Some(spg_storage::DataType::Timestamptz)
+    {
+        return Ok(None);
+    }
+    let signed_months = i64::from(*months) * sign;
+    let signed_days = i64::from(*days) * sign;
+    let signed_micros = micros
+        .checked_mul(sign)
+        .ok_or_else(|| EvalError::TypeMismatch {
+            detail: "INTERVAL micros overflows on negation".into(),
+        })?;
+    // Into the zone's wall clock, step the calendar there, back out to
+    // the instant that wall clock names — then the time part, which is
+    // an absolute duration and is added last (measured: `+ '1 day 2
+    // hours'` across the spring edge is 23 h then 2 h, not 25 h).
+    let off = ctx.session_tz_offset_at(ts);
+    let local = ts.checked_add(off).ok_or_else(|| EvalError::TypeMismatch {
+        detail: "TIMESTAMPTZ ± INTERVAL overflows i64 microseconds".into(),
+    })?;
+    let stepped = binop::add_interval_to_micros(local, signed_months, signed_days, 0)?;
+    let back = ctx
+        .session_localize(stepped)
+        .unwrap_or_else(|| stepped - off);
+    Ok(Some(Value::Timestamp(binop::add_interval_to_micros(
+        back,
+        0,
+        0,
+        signed_micros,
+    )?)))
 }
 
 #[cfg(test)]

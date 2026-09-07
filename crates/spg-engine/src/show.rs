@@ -473,6 +473,10 @@ impl Engine {
                 crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
             ),
             ("max_allowed_packet", "67108864"),
+            // v7.40.11 — both surfaces or neither, which is the rule the
+            // entries above were each added under. See the `@@` arm for
+            // why this name and not `default_authentication_plugin`.
+            ("authentication_policy", crate::MYSQL_AUTHENTICATION_POLICY),
             ("autocommit", "ON"),
             // v7.39 (round 470) — the session's own value when it set one;
             // a client that reads sql_mode back after setting it was told

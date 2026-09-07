@@ -404,7 +404,7 @@ echo "=== MySQL dialect panel ==="
 # not exist. A check that silently depends on something only present
 # where its author sits is the very defect this release spent itself
 # on, committed by the person fixing it.
-MYSQL_CLIENT_IMAGE="mysql:8.4"
+MYSQL_CLIENT_IMAGE="mysql:9.7.2"
 MYSQL_CLI="docker run --rm -i --network host $MYSQL_CLIENT_IMAGE mysql -h 127.0.0.1 -P $MYPORT -u spg -N"
 
 my_case() {

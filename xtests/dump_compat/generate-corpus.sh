@@ -19,8 +19,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # the round-13 gaps stayed invisible. Override via env when probing
 # a different major.
 PG_IMAGE="${PG_IMAGE:-postgres:18}"
-MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.4}"
-MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:11.4}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:9.7.2}"
+MARIADB_IMAGE="${MARIADB_IMAGE:-mariadb:12.3.3}"
 
 # ---- shared seed fixtures (per-app, dialect-agnostic-ish SQL) ----
 

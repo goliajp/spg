@@ -15222,6 +15222,15 @@ fn apply_function_dispatch(
                 // is 1 until the session says otherwise; the wire keeps
                 // the same answer in its status flags.
                 "autocommit" => "1",
+                // v7.40.11 — `default_authentication_plugin` was REMOVED
+                // and this replaced it. SPG already declined the removed
+                // one (the `tx_isolation` / `have_ssl` work below is the
+                // same class) and had never gained the replacement, so a
+                // client asking 9.7.2 which plugin a new account gets was
+                // told the variable does not exist. Measured on stock
+                // `mysql:9.7.2`: `*,,` — the compiled-in default, which
+                // is `caching_sha2_password`, and is what SPG verifies.
+                "authentication_policy" => crate::MYSQL_AUTHENTICATION_POLICY,
                 "version" => crate::MYSQL_SERVER_VERSION,
                 "version_comment" => crate::MYSQL_VERSION_COMMENT,
                 "sql_mode" => crate::MYSQL_DEFAULT_SQL_MODE,

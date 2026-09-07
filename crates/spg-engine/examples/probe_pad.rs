@@ -1,5 +1,5 @@
-//! PAD SPACE or NO PAD — SPG advertises `8.0.0-spg-v…` on the MySQL
-//! wire, and MySQL 8.0's default collation `utf8mb4_0900_ai_ci` is NO
+//! PAD SPACE or NO PAD — SPG advertises `9.7.2-spg` on the MySQL
+//! wire, and MySQL 9.7.2's default collation `utf8mb4_0900_ai_ci` is NO
 //! PAD. `mysql_compare_fold` trims trailing spaces unconditionally; its
 //! own comment says "measured on MariaDB 11", whose default IS PAD
 //! SPACE. So the rule was calibrated against the engine we do not claim
