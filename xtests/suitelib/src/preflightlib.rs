@@ -154,6 +154,10 @@ pub fn newly_dirty(before: &str, after: &str) -> Vec<String> {
 #[derive(Debug)]
 pub struct RunLock {
     dir: PathBuf,
+    /// v7.40.11 — this run did not take the lock, it is running INSIDE
+    /// the run that holds it. Dropping must not remove the parent's
+    /// directory.
+    borrowed: bool,
 }
 
 impl RunLock {
@@ -178,12 +182,48 @@ impl RunLock {
                         run("hostname", &["-s"]).trim()
                     );
                     let _ = std::fs::write(dir.join("owner"), owner);
-                    return Ok(Self { dir });
+                    return Ok(Self {
+                        dir,
+                        borrowed: false,
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
                     let owner = std::fs::read_to_string(dir.join("owner")).unwrap_or_default();
                     let held = owner_pid(&owner);
                     match held {
+                        // v7.40.11 — the holder is our PARENT: this is a
+                        // tier running a tier, which is how `full` is
+                        // built (its second step is
+                        // `scripts/suite.sh prerelease`, and the tiers
+                        // are supersets by design). The lock refused it,
+                        // so `full` could never reach its third step —
+                        // measured, the whole tier failed in 5.3 s at
+                        // step two with nine steps skipped, and nothing
+                        // schedules the tier so nobody found out.
+                        //
+                        // The parent names itself in the environment
+                        // when it spawns a step; borrowing needs that
+                        // name to MATCH the pid in the owner file, so
+                        // two genuinely concurrent runs still collide.
+                        Some(p)
+                            if pid_alive(p)
+                                && std::env::var("SPG_SUITE_LOCK_OWNER")
+                                    .ok()
+                                    .and_then(|v| v.trim().parse::<u32>().ok())
+                                    == Some(p) =>
+                        {
+                            println!(
+                                "suite: running inside the {} run that holds the lock (pid {p})",
+                                owner
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("tier "))
+                                    .unwrap_or("suite")
+                            );
+                            return Ok(Self {
+                                dir,
+                                borrowed: true,
+                            });
+                        }
                         Some(p) if pid_alive(p) => {
                             return Err(format!(
                                 "a {} run is already in progress here (pid {p}) — \
@@ -214,6 +254,11 @@ impl RunLock {
 
 impl Drop for RunLock {
     fn drop(&mut self) {
+        // A borrowed lock belongs to the parent run, which is still
+        // going; removing it here would let a third run in.
+        if self.borrowed {
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -385,6 +430,52 @@ mod tests {
         );
         drop(first);
         RunLock::acquire(&d, "prerelease", std::process::id()).expect("after the first finished");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// v7.40.11 — a tier running a tier borrows the lock; anyone else
+    /// is still refused; and the borrower must not take the lock away.
+    ///
+    /// The `full` tier's second step is `scripts/suite.sh prerelease`,
+    /// so this is the ordinary shape and the lock made it impossible:
+    /// measured, `full` failed in 5.3 s at step two with nine steps
+    /// skipped, on the first machine that ever ran it.
+    #[test]
+    fn a_tier_inside_a_tier_borrows_the_lock_and_nobody_else_does() {
+        let d = std::env::temp_dir().join(format!("spg-lock-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let parent_pid = std::process::id();
+        let parent = RunLock::acquire(&d, "full", parent_pid).expect("parent");
+
+        // Anyone who cannot name the holder is still refused.
+        unsafe { std::env::remove_var("SPG_SUITE_LOCK_OWNER") };
+        assert!(
+            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            "a run that is not inside this one must still collide"
+        );
+
+        // Naming the WRONG pid is not a licence either.
+        unsafe { std::env::set_var("SPG_SUITE_LOCK_OWNER", "4000000") };
+        assert!(
+            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            "the name has to match the pid in the owner file"
+        );
+
+        // The child of this very run borrows it.
+        unsafe { std::env::set_var("SPG_SUITE_LOCK_OWNER", parent_pid.to_string()) };
+        let child = RunLock::acquire(&d, "prerelease", parent_pid).expect("nested run");
+
+        // And dropping the borrower leaves the parent holding it: a
+        // third run is still refused afterwards.
+        drop(child);
+        unsafe { std::env::remove_var("SPG_SUITE_LOCK_OWNER") };
+        assert!(
+            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            "the borrower must not have removed the parent's lock"
+        );
+
+        drop(parent);
+        RunLock::acquire(&d, "prerelease", parent_pid).expect("after the parent finished");
         let _ = std::fs::remove_dir_all(&d);
     }
 
