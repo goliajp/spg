@@ -131,6 +131,12 @@ fn split_statements(body: &str) -> Vec<String> {
 pub fn run(paths: &[String]) -> i32 {
     let files: Vec<PathBuf> = if paths.is_empty() {
         let mut v = vec![PathBuf::from("README.md")];
+        // v7.40.11 — say so when the directory is not there. Silently
+        // walking one file instead of twelve is how a gate keeps its
+        // verdict while losing its subject.
+        if std::fs::metadata("docs").is_err() {
+            eprintln!("docs: no `docs` directory here — only README.md will be read");
+        }
         if let Ok(rd) = std::fs::read_dir("docs") {
             let mut docs: Vec<PathBuf> = rd
                 .filter_map(Result::ok)
@@ -216,5 +222,32 @@ pub fn run(paths: &[String]) -> i32 {
         "docs corpus: files={} blocks={n_blocks} (skipped {n_skipped}) statements={n_stmts} failures={failures}",
         files.len()
     );
+    // v7.40.11 — a run that executed nothing is an instrument failure,
+    // not a clean run.
+    //
+    // The verdict was `failures > 0`, so zero blocks and zero statements
+    // returned success. Measured by ablation: with `docs/` moved aside
+    // the step printed `files=1 blocks=1 statements=5 failures=0` and
+    // passed — the same block count as with the directory present,
+    // because all five statements come from README.md and the eleven
+    // files in `docs/` carry no SQL fence at all. Remove README's one
+    // fence and this gate would have gone on passing while executing
+    // nothing.
+    //
+    // Naming the files it looked at, because "no blocks" is a fact
+    // about a file set and the reader cannot see which one from here.
+    if n_blocks == 0 {
+        eprintln!(
+            "docs: no ```sql block in any of the {} file(s) looked at — this gate ran nothing.\n\
+             docs:   {}",
+            files.len(),
+            files
+                .iter()
+                .map(|f| f.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return 1;
+    }
     i32::from(failures > 0)
 }
