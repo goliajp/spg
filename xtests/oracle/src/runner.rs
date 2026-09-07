@@ -38,25 +38,104 @@ use crate::normalise::AdjustPipeline;
 /// shape, yields `"?"` rather than failing the run. The value is context
 /// for a mismatch, never a gate.
 fn oracle_collation(oracle: Oracle) -> String {
+    ask_oracle(
+        oracle,
+        match oracle {
+            Oracle::Pg18 => {
+                "SELECT datcollate FROM pg_database WHERE datname = current_database();"
+            }
+            Oracle::Mysql | Oracle::Mariadb => "SELECT @@collation_database;",
+        },
+    )
+}
+
+/// v7.40.11 — the version the container is actually running.
+///
+/// Not decoration, and unlike the collation this one is a GATE. The
+/// Dockerfile beside each oracle states a version; nothing checked that
+/// the container answering was built from it, and `docker compose up`
+/// reuses an image it already has. Found by asking: `mariadb/Dockerfile`
+/// pinned 12.3.3 and the container answered 12.3.2, so the differential
+/// had been measuring against a release older than the repository
+/// claimed — with the corpus green, because a patch release rarely
+/// changes an answer.
+///
+/// The file this reads says the same thing about itself two comments up:
+/// "the image could not be rebuilt from its own Dockerfile for days.
+/// Nothing noticed, because `docker compose up` reuses a built image."
+/// A name is a claim; this checks it.
+fn oracle_version(oracle: Oracle) -> String {
+    // A BARE version from each, because the pin is bare: PostgreSQL's
+    // `version()` is a whole sentence ("PostgreSQL 18.6 on aarch64-…"),
+    // and the first cut of this compared that against `18.6` and failed
+    // its own green run.
+    ask_oracle(
+        oracle,
+        match oracle {
+            Oracle::Pg18 => "SHOW server_version;",
+            Oracle::Mysql | Oracle::Mariadb => "SELECT VERSION();",
+        },
+    )
+}
+
+/// The compose SERVICE name, which is not the fixture suffix: the
+/// PostgreSQL service is `pg18` and its suffix is `pg`. The hint below
+/// tells an operator what to run, so it has to name the thing that
+/// exists.
+fn compose_service(oracle: Oracle) -> &'static str {
+    match oracle {
+        Oracle::Pg18 => "pg18",
+        Oracle::Mysql => "mysql",
+        Oracle::Mariadb => "mariadb",
+    }
+}
+
+/// The version the oracle's own Dockerfile pins, as `FROM image:tag`.
+///
+/// `None` when the file cannot be read or names no tag — the gate then
+/// reports the running version and does not judge it, because a missing
+/// file is a different failure from a mismatched one.
+fn pinned_version(oracle: Oracle) -> Option<String> {
+    let dir = match oracle {
+        Oracle::Pg18 => "pg18",
+        Oracle::Mysql => "mysql",
+        Oracle::Mariadb => "mariadb",
+    };
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(dir)
+        .join("Dockerfile");
+    let text = std::fs::read_to_string(path).ok()?;
+    let from = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("FROM "))?
+        .trim()
+        .strip_prefix("FROM ")?
+        .split_whitespace()
+        .next()?;
+    // `postgres:18.6-alpine` -> `18.6`, `mysql:9.7.2` -> `9.7.2`.
+    let tag = from.rsplit_once(':')?.1;
+    Some(tag.split('-').next().unwrap_or(tag).to_string())
+}
+
+/// One question, asked of whichever oracle. Best-effort: a stack that is
+/// down yields `"?"`.
+fn ask_oracle(oracle: Oracle, sql: &str) -> String {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
-    let (container, args, sql): (&str, Vec<&str>, &str) = match oracle {
+    let (container, args): (&str, Vec<&str>) = match oracle {
         Oracle::Pg18 => (
             "spg-oracle-pg18",
             vec![
                 "psql", "-X", "-q", "-tA", "-U", "testuser", "-d", "testdb", "-f", "-",
             ],
-            "SELECT datcollate FROM pg_database WHERE datname = current_database();",
         ),
         Oracle::Mysql => (
             "spg-oracle-mysql",
             vec!["mysql", "-uroot", "-ptestpass", "-N", "--batch", "testdb"],
-            "SELECT @@collation_database;",
         ),
         Oracle::Mariadb => (
             "spg-oracle-mariadb",
             vec!["mariadb", "-uroot", "-ptestpass", "-N", "--batch", "testdb"],
-            "SELECT @@collation_database;",
         ),
     };
     let mut cmd = Command::new("docker");
@@ -118,11 +197,32 @@ pub fn run_all(corpus: &Path, expected: &Path, oracle: Oracle, bless: bool) -> R
         }
     }
 
+    let running = oracle_version(oracle);
+    let pinned = pinned_version(oracle);
     println!(
-        "oracle={oracle:?} collation={} fixtures={total} failed={failed} skipped_by_partition={skipped}{}",
+        "oracle={oracle:?} version={running} pinned={} collation={} fixtures={total} \
+         failed={failed} skipped_by_partition={skipped}{}",
+        pinned.as_deref().unwrap_or("?"),
         oracle_collation(oracle),
         if bless { " [BLESS]" } else { "" }
     );
+    // v7.40.11 — the container has to be the one the Dockerfile names.
+    // `?` on either side means the stack is down or the file is
+    // unreadable, which is a different failure and not this one's to
+    // report.
+    if let Some(pin) = pinned.as_deref()
+        && running != "?"
+        && !running.starts_with(pin)
+    {
+        bail!(
+            "oracle {oracle:?} is running {running} and its Dockerfile pins {pin} — \
+             the differential would be measuring against a version this repository \
+             does not claim. `docker compose build {} && docker compose up -d \
+             --force-recreate {}` in xtests/oracle.",
+            compose_service(oracle),
+            compose_service(oracle)
+        );
+    }
     if failed > 0 {
         bail!("{failed}/{total} fixtures failed on oracle {oracle:?}");
     }
