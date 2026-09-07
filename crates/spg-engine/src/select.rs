@@ -129,6 +129,79 @@ fn plan_recursive_term<'t>(
     })
 }
 
+/// v7.40.11 — the rows of a derived table (`FROM ( SELECT … ) alias`),
+/// through the entry that reads `work_mem`.
+///
+/// Reported against 7.40.9 (sentori §3.7), and it began as the
+/// reporter's own correction of a wrong reading: they had filed the
+/// `quicksort` LABEL as the defect, and the label is honest — the
+/// behaviour underneath it is unbounded, which is worse. A subquery
+/// sorting a large table used memory proportional to the table on a
+/// server configured not to.
+///
+/// Two roads: the streaming entry tries the bounded sort and falls back
+/// to `exec_select_cancel` — the union-aware wrapper — for every shape
+/// it declines. The derived-table materialisers called the fallback
+/// DIRECTLY, so the budget reached one road and not the other.
+/// Measured at `work_mem = 64 kB` over 40k rows, as the engine's own
+/// spill counter around PLAIN statements:
+///
+/// ```text
+///   SELECT t FROM s ORDER BY t                             +5 runs
+///   SELECT count(*) FROM (SELECT t FROM s ORDER BY t) z     +0
+/// ```
+///
+/// Not `EXPLAIN ANALYZE` for that measurement: that road spills on its
+/// own and moved the counter by 5 for the derived form while the plain
+/// statement moved it by 0.
+///
+/// Only a SORTED inner takes the streaming entry, because a sort is the
+/// only shape whose memory the budget bounds; for everything else the
+/// streaming entry would fall back anyway and the round trip would cost
+/// a Vec built, walked and rebuilt. The rows still land in a Vec — a
+/// derived table IS a materialised relation — but the sort no longer
+/// holds the whole input in its own scratch on top of that.
+///
+/// ONE function, because there are three materialisers and the first
+/// cut of this fixed one: `FROM ( … ) z` spilled and the same subquery
+/// as a JOIN peer did not.
+///
+/// # Errors
+/// Whatever the inner SELECT reports.
+impl Engine {
+    pub(crate) fn materialise_derived_rows(
+        &self,
+        inner: &SelectStatement,
+        cancel: CancelToken<'_>,
+    ) -> Result<(Vec<ColumnSchema>, Vec<Row<'static>>), EngineError> {
+        if inner.order_by.is_empty() {
+            let QueryResult::Rows { columns, rows } = self.exec_select_cancel(inner, cancel)?
+            else {
+                return Err(EngineError::Unsupported(
+                    "derived table subquery must return rows".into(),
+                ));
+            };
+            return Ok((columns, rows));
+        }
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        let mut out: Vec<Row<'static>> = Vec::new();
+        self.execute_readonly_select_streaming_prepared(inner, cancel, |item| {
+            match item {
+                crate::StreamItem::Header(c) => cols = c.to_vec(),
+                crate::StreamItem::Row(cells) => {
+                    let mut vals = Vec::with_capacity(cells.len());
+                    for i in 0..cells.len() {
+                        vals.push(cells.get(i).cloned().unwrap_or(Value::Null));
+                    }
+                    out.push(Row::new(vals));
+                }
+            }
+            Ok(())
+        })?;
+        Ok((cols, out))
+    }
+}
+
 impl Engine {
     /// v4.12 window executor. Implements `ROW_NUMBER` / `RANK` /
     /// `DENSE_RANK` and the partition-aware aggregates `SUM` /
@@ -5833,17 +5906,7 @@ impl Engine {
             .lateral_subquery
             .as_deref()
             .expect("caller guards lateral_subquery.is_some()");
-        // exec_select_cancel is the union-aware wrapper — the inner
-        // SELECT may carry UNION tails on stmt.unions.
-        let QueryResult::Rows {
-            columns: inner_cols,
-            rows,
-        } = self.exec_select_cancel(inner, cancel)?
-        else {
-            return Err(EngineError::Unsupported(
-                "derived table subquery must return rows".into(),
-            ));
-        };
+        let (inner_cols, rows) = self.materialise_derived_rows(inner, cancel)?;
         let alias = primary
             .alias
             .clone()

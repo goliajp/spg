@@ -131,6 +131,7 @@ mod e2e_cte;
 mod e2e_cursor_isolation_round321;
 mod e2e_cursor_lazy_round792;
 mod e2e_cursor_wire_round219;
+mod e2e_derived_sort_work_mem_v7411;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
