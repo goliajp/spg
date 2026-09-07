@@ -355,9 +355,27 @@ pub fn copy_buffer_inserts(
 /// `\N` = NULL, C-style backslash escapes.
 #[must_use]
 pub fn decode_copy_text_row(line: &str) -> Vec<Option<String>> {
-    line.split('\t')
+    decode_copy_text_row_opts(line, '\t', "\\N")
+}
+
+/// v7.40.12 — the same, with PG's `DELIMITER` and `NULL` options.
+///
+/// They apply to the TEXT format too, not only to CSV: measured on
+/// PG 18.6, `COPY t FROM stdin WITH (DELIMITER '|')` loads
+/// `1|hello` as two columns, and `WITH (NULL 'NIL')` turns the token
+/// `NIL` into a SQL NULL. SPG parsed both options and used them only on
+/// the CSV path, so the first ERRORED with `missing data for column
+/// "b"` and the second silently stored the literal text `NIL`. The
+/// COPY TO side has honoured both since round 94; only the FROM side's
+/// text decoder still had the defaults written into it.
+pub fn decode_copy_text_row_opts(
+    line: &str,
+    delimiter: char,
+    null_string: &str,
+) -> Vec<Option<String>> {
+    line.split(delimiter)
         .map(|cell| {
-            if cell == "\\N" {
+            if cell == null_string {
                 None
             } else {
                 let mut out = String::with_capacity(cell.len());

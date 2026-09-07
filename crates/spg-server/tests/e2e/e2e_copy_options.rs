@@ -178,3 +178,80 @@ fn format_json_one_row_per_line() {
     let n = count_rows(&mut s, "SELECT count(*) FROM t");
     assert_eq!(n, 3);
 }
+
+/// Read one cell from a single-row single-column query.
+fn scalar(s: &mut TcpStream, sql: &str) -> String {
+    send_query(s, sql);
+    let msgs = read_until_ready(s);
+    let d = msgs
+        .iter()
+        .find(|m| m.ty == b'D')
+        .unwrap_or_else(|| panic!("no DataRow for {sql}"));
+    let body = &d.body;
+    let len = i32::from_be_bytes([body[2], body[3], body[4], body[5]]);
+    assert!(len >= 0, "NULL cell for {sql}");
+    let start = 6usize;
+    String::from_utf8_lossy(&body[start..start + len as usize]).into_owned()
+}
+
+/// Run one `COPY … FROM STDIN` with the given options and payload.
+fn copy_in(s: &mut TcpStream, sql: &str, payload: &str) {
+    send_query(s, sql);
+    let g = read_message(s);
+    assert_eq!(g.ty, b'G', "server did not enter COPY mode for {sql}");
+    send_msg(s, b'd', payload.as_bytes());
+    send_msg(s, b'c', &[]);
+    let msgs = read_until_ready(s);
+    assert!(msgs.iter().all(|m| m.ty != b'E'), "COPY failed for {sql}");
+}
+
+/// v7.40.12 — `DELIMITER` and `NULL` apply to the TEXT format too.
+///
+/// Both options were parsed and then used only on the CSV path, so the
+/// text format — which is what `COPY … FROM stdin` is without a FORMAT
+/// — kept the built-in tab and `\N` whatever the client asked for.
+/// Measured on PostgreSQL 18.6 with the same two scripts:
+///
+/// ```text
+///   COPY cp FROM stdin WITH (DELIMITER '|')   PG: 2 rows
+///                                             SPG: ERROR missing data
+///                                                  for column "b", 0 rows
+///   COPY cp FROM stdin WITH (NULL 'NIL')      PG: b IS NULL
+///                                             SPG: b is the text 'NIL'
+/// ```
+///
+/// The second is the worse one: it stored wrong data and said `COPY 1`.
+/// The COPY TO side has honoured both since round 94, which is what
+/// made the gap findable — one direction of the same option pair read
+/// it and the other did not.
+#[test]
+fn text_format_copy_honours_delimiter_and_null() {
+    let dir = unique_tmpdir("text-opts");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    exec_simple(&mut s, "CREATE TABLE d (a INT, b TEXT)");
+    copy_in(
+        &mut s,
+        "COPY d FROM STDIN WITH (DELIMITER '|')",
+        "1|hello\n2|world\n",
+    );
+    assert_eq!(count_rows(&mut s, "SELECT count(*) FROM d"), 2);
+    assert_eq!(scalar(&mut s, "SELECT min(b) FROM d"), "hello");
+
+    exec_simple(&mut s, "CREATE TABLE n (a INT, b TEXT)");
+    copy_in(&mut s, "COPY n FROM STDIN WITH (NULL 'NIL')", "1\tNIL\n");
+    assert_eq!(
+        count_rows(&mut s, "SELECT count(*) FROM n WHERE b IS NULL"),
+        1,
+        "the NULL token was stored as literal text"
+    );
+
+    // Neither option given: PG's defaults, unchanged.
+    exec_simple(&mut s, "CREATE TABLE p (a INT, b TEXT)");
+    copy_in(&mut s, "COPY p FROM STDIN", "1\thello\n2\t\\N\n");
+    assert_eq!(count_rows(&mut s, "SELECT count(*) FROM p"), 2);
+    assert_eq!(count_rows(&mut s, "SELECT count(b) FROM p"), 1);
+}
