@@ -738,9 +738,23 @@ fn main() {
                     .filter(|n| !ran.contains(n))
                     .collect();
                 if !skipped.is_empty() {
+                    // v7.40.11 — and say HOW LONG it has been, because a
+                    // line that names steps is a line a reader skips.
+                    //
+                    // The v7.38.17 note above is right that a total which
+                    // cannot show what it excluded overstates. It named
+                    // the excluded steps and left the reader to guess
+                    // whether that mattered. `scripts/nightly-full.sh`
+                    // was added in the same commit to be "the other
+                    // half", with its own crontab line in its header and
+                    // installation left to whoever owns the machine —
+                    // and sixteen days later nothing had installed it,
+                    // on either box, while this line printed on every
+                    // run. An age is harder to skip than a list.
                     println!(
-                        "NOT RUN ({} full-tier step(s), no schedule runs these): {}",
+                        "NOT RUN ({} full-tier step(s), {}): {}",
                         skipped.len(),
+                        last_full_run_phrase(root),
                         skipped.join(", ")
                     );
                 }
@@ -1034,4 +1048,80 @@ fn tmp_spg_entries() -> std::collections::BTreeSet<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// v7.40.11 — how long since the `full` tier last ran HERE, for the
+/// NOT RUN line.
+///
+/// The line used to name the excluded steps and stop. Naming them tells
+/// a reader what is missing; it does not tell them the thing that makes
+/// them act, which is that it has been missing for a fortnight. The
+/// tier writes `target/suite/report-full-<runid>.json` on every run, so
+/// the answer is on disk and needs no new bookkeeping.
+///
+/// Reads the file's mtime rather than parsing the runid out of its
+/// name: the filesystem's answer needs no agreement about the stamp's
+/// format or timezone, and a report that was copied here is honestly
+/// "as old as it is here".
+fn last_full_run_phrase(root: &std::path::Path) -> String {
+    let dir = root.join("target").join("suite");
+    let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
+        rd.filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("report-full-") && n.ends_with(".json"))
+            })
+            .filter_map(|e| e.metadata().ok()?.modified().ok())
+            .max()
+    });
+    match newest.and_then(|t| std::time::SystemTime::now().duration_since(t).ok()) {
+        None => "the full tier has NEVER run here".to_string(),
+        Some(age) => {
+            let secs = age.as_secs();
+            let days = secs / 86_400;
+            let hours = (secs % 86_400) / 3_600;
+            if days > 0 {
+                format!("last full run was {days}d {hours}h ago")
+            } else {
+                format!("last full run was {hours}h ago")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod last_full_run_tests {
+    use super::last_full_run_phrase;
+
+    /// The phrase a machine with no full-tier report gives. This is the
+    /// state every machine was in for the sixteen days between
+    /// `nightly-full.sh` being written and this line being able to say
+    /// so.
+    #[test]
+    fn no_report_reads_as_never() {
+        let d = std::env::temp_dir().join(format!("spg-lfr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("target").join("suite")).unwrap();
+        assert_eq!(last_full_run_phrase(&d), "the full tier has NEVER run here");
+
+        // A report of another tier is not a full run.
+        std::fs::write(
+            d.join("target")
+                .join("suite")
+                .join("report-prerelease-x.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(last_full_run_phrase(&d), "the full tier has NEVER run here");
+
+        // One of the right tier, written now, reads as hours not never.
+        std::fs::write(
+            d.join("target").join("suite").join("report-full-x.json"),
+            "{}",
+        )
+        .unwrap();
+        assert_eq!(last_full_run_phrase(&d), "last full run was 0h ago");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
