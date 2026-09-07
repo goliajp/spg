@@ -2594,7 +2594,7 @@ impl Engine {
                     session_params: BTreeMap::new(),
                     cursors: BTreeMap::new(),
                     last_insert_id: core::sync::atomic::AtomicI64::new(0),
-            statement_insert_id: core::sync::atomic::AtomicI64::new(0),
+                    statement_insert_id: core::sync::atomic::AtomicI64::new(0),
                     row_count: 0,
                     user_vars: BTreeMap::new(),
                     temp_tables: BTreeSet::new(),

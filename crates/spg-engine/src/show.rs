@@ -438,7 +438,11 @@ impl Engine {
             // session.
             (
                 "lower_case_table_names",
-                String::from(if self.folds_relation_names() { "1" } else { "0" }),
+                String::from(if self.folds_relation_names() {
+                    "1"
+                } else {
+                    "0"
+                }),
             ),
             // v7.40.11 — one session has ONE zone. `SET time_zone`
             // stores it under this name and the PostgreSQL spelling
@@ -471,7 +475,10 @@ impl Engine {
             // v7.40.11 — MySQL lists this among its 655 and SPG answered
             // it on `@@` only, which is the drift this inventory exists
             // to end.
-            ("warning_count", alloc::format!("{}", self.mysql_warning_count())),
+            (
+                "warning_count",
+                alloc::format!("{}", self.mysql_warning_count()),
+            ),
             // v7.40.11 — Connector/J reads this before EVERY statement,
             // to decide whether the connection may be routed read-only,
             // so an engine that does not answer it cannot run a single
@@ -489,7 +496,11 @@ impl Engine {
             // the one `default_read_only()` answers.
             (
                 "transaction_read_only",
-                String::from(if self.default_read_only() { "ON" } else { "OFF" }),
+                String::from(if self.default_read_only() {
+                    "ON"
+                } else {
+                    "OFF"
+                }),
             ),
         ];
         // Live values must not be shadowed by a stale copy in the
@@ -553,12 +564,7 @@ impl Engine {
         named.sort_by(|a, b| a.0.cmp(b.0));
         let rows: Vec<Row<'static>> = named
             .into_iter()
-            .map(|(k, v)| {
-                Row::new(alloc::vec![
-                    Value::text::<String>(k.into()),
-                    Value::text(v),
-                ])
-            })
+            .map(|(k, v)| Row::new(alloc::vec![Value::text::<String>(k.into()), Value::text(v),]))
             .collect();
         QueryResult::Rows { columns, rows }
     }
