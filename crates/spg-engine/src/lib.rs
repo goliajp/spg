@@ -167,6 +167,16 @@ pub const PG_VERSION_STRING: &str = "PostgreSQL 18.6 (spg)";
 /// splits on `-` reads `9.7.2`; the suffix says which server answered.
 pub const MYSQL_SERVER_VERSION: &str = "9.7.2-spg";
 
+/// v7.40.11 — `@@authentication_policy`, the 9.x replacement for
+/// `default_authentication_plugin`.
+///
+/// MySQL removed the old variable and answers `*,,` here on a stock
+/// `mysql:9.7.2`: three comma-separated factors, empty meaning "the
+/// compiled-in default", which is `caching_sha2_password` — the plugin
+/// SPG's own password verification implements. A client that asks 9.x
+/// which plugin a new account gets reads THIS name.
+pub const MYSQL_AUTHENTICATION_POLICY: &str = "*,,";
+
 /// What `@@version_comment` / `SHOW VARIABLES LIKE 'version_comment'`
 /// answer. MySQL puts its edition here ("MySQL Community Server - GPL");
 /// SPG says what it is, which is the one place on this surface where

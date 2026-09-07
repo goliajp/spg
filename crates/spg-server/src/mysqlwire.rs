@@ -3188,7 +3188,7 @@ mod tests {
     fn handshake_v10_round_trip_through_cursor() {
         let g = HandshakeV10Greeting {
             protocol_version: 10,
-            server_version: "8.0.0-spg-vtest".to_string(),
+            server_version: "9.7.2-spg-vtest".to_string(),
             connection_id: 42,
             scramble: vec![b'a'; 20],
             capability_flags: SERVER_CAPABILITIES,
@@ -3201,7 +3201,7 @@ mod tests {
         // where the spec says it should be.
         let mut p = Cursor::new(&bytes);
         assert_eq!(p.u8().unwrap(), 10);
-        assert_eq!(p.null_string().unwrap(), "8.0.0-spg-vtest");
+        assert_eq!(p.null_string().unwrap(), "9.7.2-spg-vtest");
         assert_eq!(p.u32_le().unwrap(), 42);
         let scramble_pt1 = p.bytes(8).unwrap();
         assert_eq!(scramble_pt1, vec![b'a'; 8]);

@@ -14,8 +14,8 @@ use alloc::string::{String, ToString};
 use spg_sql::ast::{Expr, Literal, SelectItem, SelectStatement, Statement};
 use spg_storage::Value;
 
+use crate::EngineError;
 use crate::eval::EvalError;
-use crate::{EngineError, value_to_literal};
 
 /// v4.10 helper: materialise a runtime `Value` back into an AST
 /// `Expr::Literal` for the subquery-rewrite path. Supports the
@@ -252,6 +252,17 @@ pub(crate) fn value_to_literal_expr_typed(
                 args,
             });
         }
+        // v7.40.11 — an array rebuilds as the `ARRAY[…]` it came from,
+        // on THIS road too. It was only on the permissive one, so a
+        // placeholder or a scalar subquery carrying an array whose type
+        // had no arm above fell to the text-and-cast arm below — which
+        // the comment on `array_elements` records does not resolve for
+        // an array, so the value arrived as text.
+        other if array_elements(&other).is_some() => {
+            return Ok(Expr::Array(
+                array_elements(&other).expect("checked by the guard"),
+            ));
+        }
         // v7.38.7 — the general case, instead of one more whitelist entry.
         //
         // Every arm above names a type someone hit and reported. The list
@@ -310,39 +321,41 @@ pub(crate) fn value_to_literal_expr_typed(
 /// produce a `Named` for those. Rebuilding the literal sidesteps the question:
 /// `ARRAY[1,2]` is what the row was written with in the first place.
 ///
-/// Each element goes back through this same function, so a NULL element stays
+/// Each element goes back through this same file, so a NULL element stays
 /// NULL and an element type that cannot be materialised still says so rather
 /// than being quietly dropped.
+///
+/// v7.40.11 — through `eval::values::array_elements`, the per-type element
+/// menu the rest of the engine already uses, instead of a second list that
+/// named ten of the twenty-three array variants and ended in a wildcard.
+///
+/// The two it was missing are exactly the two sentori reported against
+/// 7.40.9 (§3.8): a `PREPARE`-declared `uuid[]` or `timestamptz[]`
+/// parameter reached `unnest()` as TEXT —
+/// `unnest() expects an array argument, got text` — because the value fell
+/// past this to the generic text-and-cast arm, whose own comment says a
+/// constructed `CastTarget::Named` does not resolve for an array. `bigint[]`
+/// and `text[]` had arms, so they worked; the wire path was fixed in
+/// 7.39.12 and this one was not.
+///
+/// The ELEMENT type is carried into each element, because
+/// `array_element_at` gives a `timestamptz[]`'s elements as
+/// `Value::Timestamp` — the same value a `timestamp[]` has — and only the
+/// declared type says which one it is.
 fn array_elements(v: &Value) -> Option<alloc::vec::Vec<Expr>> {
-    fn build<T, F>(xs: &[Option<T>], f: F) -> Option<alloc::vec::Vec<Expr>>
-    where
-        F: Fn(&T) -> Value<'static>,
-    {
-        xs.iter()
-            .map(|x| match x {
-                None => Ok(Expr::Literal(Literal::Null)),
-                Some(e) => value_to_literal_expr_permissive(f(e)),
-            })
-            .collect::<Result<alloc::vec::Vec<_>, _>>()
-            .ok()
-    }
-    match v {
-        Value::IntArray(xs) => build(xs, |n| Value::Int(*n)),
-        Value::BigIntArray(xs) => build(xs, |n| Value::BigInt(*n)),
-        Value::SmallIntArray(xs) => build(xs, |n| Value::SmallInt(*n)),
-        Value::FloatArray(xs) => build(xs, |n| Value::Float(*n)),
-        Value::BoolArray(xs) => build(xs, |b| Value::Bool(*b)),
-        Value::TextArray(xs) => build(xs, |s| Value::text(s.clone())),
-        Value::NumericArray(xs) => build(xs, |(scaled, scale)| Value::Numeric {
-            scaled: *scaled,
-            scale: *scale,
-            kind: spg_storage::NumericKind::Finite,
-        }),
-        Value::DateArray(xs) => build(xs, |d| Value::Date(*d)),
-        Value::TimestampArray(xs) => build(xs, |t| Value::Timestamp(*t)),
-        Value::UuidArray(xs) => build(xs, |u| Value::Uuid(*u)),
-        _ => None,
-    }
+    let items = crate::eval::values::array_elements(v)?;
+    let elem_ty = v.data_type().and_then(crate::describe::array_element_type);
+    items
+        .into_iter()
+        .map(|e| {
+            if matches!(e, Value::Null) {
+                Ok(Expr::Literal(Literal::Null))
+            } else {
+                value_to_literal_expr_typed(e, elem_ty)
+            }
+        })
+        .collect::<Result<alloc::vec::Vec<_>, _>>()
+        .ok()
 }
 
 /// that need lossy textual round-trip (BYTEA, arrays, ts*)
@@ -1196,7 +1209,30 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
                 bound: u16::try_from(params.len()).unwrap_or(u16::MAX),
             })
         })?;
-        *e = Expr::Literal(value_to_literal(v.clone()));
+        // v7.40.11 — through the EXPRESSION funnel, not the Literal one.
+        //
+        // `clock::value_to_literal` returns a `Literal`, which cannot
+        // express an array at all beyond the three variants
+        // `Literal::{Text,Int,BigInt}Array` — and its last arm renders
+        // anything else with `{v:?}`. So a `PREPARE`-declared `uuid[]`
+        // or `timestamptz[]` parameter arrived as the Rust Debug form of
+        // the value, and the reporter got the internal spelling back in
+        // a user-facing error:
+        //
+        //   ERROR:  malformed array literal: "UuidArray([Some([0, 0, …, 1])])"
+        //
+        // and, where the coercion did not raise,
+        // `unnest() expects an array argument, got text`. `bigint[]` and
+        // `text[]` had `Literal` arms, so those two worked and every
+        // other element type did not — measured here for `numeric[]` and
+        // `inet[]` as well as the two reported (sentori §3.8).
+        //
+        // The permissive road rebuilds an array as the `ARRAY[…]` it came
+        // from, through the per-type element menu the rest of the engine
+        // uses, and a scalar through its own text form cast back to its
+        // own type. A value with no round trip raises here instead of
+        // being Debug-printed into the statement.
+        *e = value_to_literal_expr_permissive(v.clone())?;
         return Ok(());
     }
     match e {

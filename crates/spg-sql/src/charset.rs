@@ -22,8 +22,10 @@
 /// either engine.**
 ///
 /// `None` — nothing declared — is the session default, and SPG
-/// advertises `8.0.0-spg-v…` on the MySQL wire, so that is MySQL 8.0's
-/// `utf8mb4_0900_ai_ci`: NO PAD.
+/// advertises `9.7.2-spg` on the MySQL wire, so that is MySQL 9.7.2's
+/// `utf8mb4_0900_ai_ci`: NO PAD. (v7.40.11 — this named the `8.0.0-spg-v…`
+/// string SPG dropped in v7.39; the default collation is the same one,
+/// measured on stock `mysql:9.7.2`.)
 /// v7.39 — the collation a MySQL session compares under when the
 /// session has not said otherwise.
 ///

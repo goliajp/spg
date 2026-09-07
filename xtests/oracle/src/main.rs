@@ -1,7 +1,7 @@
 //! `spg-oracle-runner` — v7.38 元机制 C 差分 oracle.
 //!
 //! Three-master differential test harness. Runs the same SQL on
-//! SPG (embedded path) and on a reference master (PG18 / MySQL 8 /
+//! SPG (embedded path) and on a reference master (PG18 / MySQL 9 /
 //! MariaDB 11), normalises both result sets through `adjust_*`,
 //! sorts, and asserts byte-equal.
 //!
@@ -25,7 +25,7 @@ mod self_diff;
 #[derive(Parser, Debug)]
 #[command(
     name = "spg-oracle-runner",
-    about = "v7.38 differential oracle — SPG vs PG18 / MySQL 8 / MariaDB 11"
+    about = "v7.38 differential oracle — SPG vs PG18 / MySQL 9 / MariaDB 12"
 )]
 struct Cli {
     /// Override corpus root (default `xtests/oracle/sql`).

@@ -1923,9 +1923,11 @@ pub fn mysql_ci_fold(s: &str) -> String {
 /// v7.38.17 — this used to strip trailing spaces first, and its comment
 /// said why: "measured on MariaDB 11". MariaDB's default collation is
 /// PAD SPACE, so that measurement was right about MariaDB. SPG
-/// advertises `8.0.0-spg-v…` on the MySQL wire, and MySQL 8.0's default
-/// `utf8mb4_0900_ai_ci` is **NO PAD**. The rule had been calibrated
-/// against the engine we do not claim to be.
+/// advertises `9.7.2-spg` on the MySQL wire (v7.40.11 — this said
+/// `8.0.0-spg-v…`, which SPG stopped saying in v7.39), and MySQL's
+/// default `utf8mb4_0900_ai_ci` is **NO PAD** — measured on stock
+/// `mysql:9.7.2`, unchanged from the 8.0 line. The rule had been
+/// calibrated against the engine we do not claim to be.
 ///
 /// Measured today, MySQL 9.7.2 against MariaDB 12.3.2, each in its own
 /// default collation, over rows `'alpha'` and `'alpha  '`:
