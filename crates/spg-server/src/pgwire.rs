@@ -1787,6 +1787,29 @@ fn run_pg_session(
         })
         .unwrap_or_default();
 
+    // v7.40.11 — the settings this connection asked for at connect
+    // time, from both channels PostgreSQL offers.
+    //
+    // The startup packet's own keys are GUCs except for the four the
+    // protocol reserves; `options` carries the same
+    // `-c name=value` pairs a command line does, which is what
+    // `PGOPTIONS`, `?options=` in a URL, `PgConnectOptions::options`
+    // and pgbouncer's per-pool settings all produce.
+    let mut requested_settings: Vec<(String, String)> = Vec::new();
+    for (k, v) in &params {
+        if matches!(
+            k.as_str(),
+            "user" | "database" | "replication" | "options" | "client_encoding_is_reserved"
+        ) {
+            continue;
+        }
+        requested_settings.push((k.clone(), v.clone()));
+    }
+    if let Some((_, opts)) = params.iter().find(|(k, _)| k == "options") {
+        requested_settings.extend(parse_startup_options(opts));
+    }
+    let mut startup_setting_error: Option<(&'static str, String)> = None;
+
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
     // v7.39 (round 283) — one TX slot per connection, so two clients can
@@ -1841,11 +1864,47 @@ fn run_pg_session(
         if !startup_db.is_empty() {
             let _ = e.execute(&format!("SET spg.database = '{startup_db}'"));
         }
+        // v7.40.11 — PostgreSQL's order of specificity, lowest first:
+        // the SERVER's own `-c name=value`, then the recorded
+        // `ALTER DATABASE/ROLE SET` defaults, then whatever this
+        // connection asked for in its startup packet.
+        //
+        // The first and the third did not exist. `-c` was read as a
+        // positional path and killed the container (sentori §3.14), and
+        // the startup packet's settings were parsed and thrown away
+        // (§3.13) — on BOTH channels, the named parameters and the
+        // `options` string. sqlx sends `extra_float_digits = 2` on
+        // every connection it opens and was told `1`; a client that
+        // pins `search_path` at connect time, which is the only place a
+        // POOLED client can put it, read and wrote the wrong tables.
+        for (k, v) in &state.boot_gucs {
+            let _ = e.execute(&format!("SET {k} = '{v}'"));
+        }
         // v7.39 (round 547) — the GUC defaults `ALTER ROLE … SET` and
         // `ALTER DATABASE … SET` recorded, applied in PG's order of
-        // specificity. Last, so they land on top of the identity and
-        // database this connection just seeded.
+        // specificity.
         e.apply_db_role_settings(&startup_db, &user);
+        // And this connection's own request, on top of both.
+        for (k, v) in &requested_settings {
+            if let Err(err) = e.execute(&format!("SET {k} = '{v}'")) {
+                startup_setting_error = Some(engine_error_to_wire(&err));
+                break;
+            }
+        }
+    }
+    // A setting the server cannot apply refuses the CONNECTION, which
+    // is what PostgreSQL does and what the reporter asked for:
+    // "applied, or the connection is refused with an error naming what
+    // was not applied".
+    // The engine's own sentence and SQLSTATE, not a second diagnosis
+    // written here. PostgreSQL says `unrecognized configuration
+    // parameter "x"` for a name it does not know and `invalid value for
+    // parameter "x": "y"` for a value it will not take, and so does the
+    // engine — a wrapper that asserted the first for both reported a
+    // recognised parameter as unrecognised.
+    if let Some((sqlstate, msg)) = startup_setting_error {
+        send_error(stream, sqlstate, &msg)?;
+        return Ok(());
     }
 
     // v7.39 (read01 pgstatfuncs.c) — stamp this connection's pid into the
@@ -10021,4 +10080,56 @@ mod tests {
             spg_storage::Value::text("{11111111-1111-4111-8111-111111111111}")
         );
     }
+}
+
+/// v7.40.11 — the `options` startup parameter, which carries the same
+/// `-c name=value` pairs a command line does.
+///
+/// PostgreSQL's own rule: whitespace-separated, `-c name=value` or
+/// `--name=value`, and a backslash escapes the next character so a
+/// value may contain a space. Anything that is not one of those two
+/// shapes is ignored rather than fatal — `options` also carries
+/// non-GUC switches on the real server.
+fn parse_startup_options(opts: &str) -> Vec<(String, String)> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    for ch in opts.chars() {
+        if escaped {
+            cur.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch.is_whitespace() {
+            if !cur.is_empty() {
+                words.push(core::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = &words[i];
+        let pair = if w == "-c" {
+            i += 1;
+            words.get(i).cloned()
+        } else if let Some(rest) = w.strip_prefix("-c") {
+            Some(rest.to_string())
+        } else {
+            w.strip_prefix("--").map(ToString::to_string)
+        };
+        if let Some(p) = pair
+            && let Some((k, v)) = p.split_once('=')
+            && !k.is_empty()
+        {
+            out.push((k.to_string(), v.to_string()));
+        }
+        i += 1;
+    }
+    out
 }
