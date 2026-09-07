@@ -64,7 +64,20 @@ for line in sys.stdin:
     seen.add(exe)
     pkg_dir = os.path.dirname(d.get("manifest_path", ""))
     name = d["target"]["name"]
-    pkg = d["package_id"].split("#")[0].rstrip("/").split("/")[-1]
+    # v7.40.11 — the package NAME, which is not always the directory
+    # name. Cargo spells a package id as `path+file:///…/<dir>#<version>`
+    # when the two agree and `path+file:///…/<dir>#<name>@<version>` when
+    # they do not, and this read the last path segment either way. So
+    # `spg-sqlx-pgwire`, which lives in `xtests/sqlx-pgwire`, was
+    # labelled `sqlx-pgwire::smoke`, and the
+    # `RUN_FILTER=spg-sqlx-pgwire` in gate.sh matched nothing. The sqlx
+    # binary-protocol leg reported `0/0 harnesses green, 0 tests`,
+    # exited 0, and the gate around it passed.
+    head, sep, tail = d["package_id"].partition("#")
+    if sep and "@" in tail:
+        pkg = tail.split("@", 1)[0]
+    else:
+        pkg = head.rstrip("/").split("/")[-1]
     print(exe + "\t" + pkg_dir + "\t" + pkg + "::" + name)
 ' > "$list"; then
     echo "$label: the build failed" >&2
@@ -76,6 +89,7 @@ n=$(grep -c . "$list" || true)
 [ "$n" -gt 0 ] || { echo "$label: the selection produced no test binaries" >&2; exit 1; }
 
 pass=0; fail=0; tests=0; failed_names=""
+selected=0
 while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
     [ -x "$exe" ] || continue
     # RUN_FILTER is a comma-separated list of substrings; a harness runs
@@ -104,6 +118,7 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
         done
         [ "$drop" = 0 ] || continue
     fi
+    selected=$((selected+1))
     # cargo runs a test binary with the package root as its working
     # directory, and fixtures are opened relative to it.
     started=$(date +%s)
@@ -142,6 +157,20 @@ while IFS=$'\t' read -r exe pkg name || [ -n "${exe:-}" ]; do
         printf '%s\n' "$out" | tail -40 >&2
     fi
 done < "$list"
+
+# v7.40.11 — a filter that matches nothing is an instrument failure, not
+# a clean run. `gate.sh` asked for `RUN_FILTER=spg-sqlx-pgwire`, the
+# label carried the directory name instead of the package name, no
+# harness matched, and this printed `0/0 harnesses green, 0 tests` and
+# exited 0 — so the sqlx binary-protocol gate had been running no tests
+# at all while the step around it reported PASS. The name fix is above;
+# this is the assertion that makes the next such mismatch red.
+if [ -n "${RUN_FILTER:-}" ] && [ "$selected" -eq 0 ]; then
+    echo "$label: RUN_FILTER='$RUN_FILTER' matched none of the $n harness(es) built." >&2
+    echo "$label: what was built:" >&2
+    cut -f3 "$list" | sed 's/^/    /' >&2
+    exit 1
+fi
 
 echo "$label: $pass/$((pass+fail)) harnesses green, $tests tests"
 # The five slowest, so a step's cost is attributable from its own log.
