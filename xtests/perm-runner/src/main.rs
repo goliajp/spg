@@ -262,6 +262,23 @@ fn cmd_all(file: &PermFile, rest: &[String], workspace_root: &Path) -> ExitCode 
 
     eprintln!("[perm-runner] tier={tier:?} permutations={:?}", perm_names);
 
+    // v7.40.11 — a tier that selected nothing is a configuration
+    // failure, not a clean run.
+    //
+    // The verdict below is `overall_fail > 0`, so an empty selection ran
+    // no child, counted nothing, and returned success. `verify` already
+    // refuses "no permutations defined"; `all`, which is what the
+    // suite's `perm-matrix` step calls, did not. Same shape as a test
+    // filter that matches no harness and a docs corpus with no block:
+    // the report cannot tell "all good" from "nothing looked at".
+    if perm_names.is_empty() {
+        eprintln!(
+            "all: tier {tier:?} selected NO permutation out of the {} defined — nothing would run",
+            file.permutations.len()
+        );
+        return ExitCode::from(2);
+    }
+
     // Find ourselves so we can re-exec per permutation. Fork model:
     // parent runs only the dispatcher; each permutation gets its own
     // child process with its env extended by the permutation's [env]
@@ -285,7 +302,17 @@ fn cmd_all(file: &PermFile, rest: &[String], workspace_root: &Path) -> ExitCode 
         let perm = match file.by_name(name) {
             Some(p) => p,
             None => {
-                eprintln!("all: unknown permutation `{name}` — skipped");
+                // v7.40.11 — counted, not skipped. These names come
+                // from the file's own tier lists, so one that does not
+                // resolve means the lists disagree with the
+                // permutations — a rename that updated one and not the
+                // other. Skipping it silently is how a tier quietly
+                // stops covering what its list says it covers.
+                eprintln!(
+                    "all: `{name}` is named by tier {tier:?} but no permutation defines it — the tier list and the permutations disagree"
+                );
+                overall_fail += 1;
+                child_summaries.push((name.clone(), -1, 0));
                 continue;
             }
         };
