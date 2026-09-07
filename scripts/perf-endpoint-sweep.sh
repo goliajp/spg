@@ -64,11 +64,10 @@
 #                 TWO of them, not one, because a spread needs three
 #                 points: with a single baseline the comparison side has
 #                 one pairwise difference, and when those two processes
-#                 happen to agree the spread is invisible. Measured on an
-#                 idle testbed, four identical processes ran
-#                 `top-N LIMIT 10` at medians 8.03 / 8.74 / 8.65 /
-#                 8.56 ms — 8.8% apart — and a run that sampled the
-#                 close pair called a 22% gap a LOSS.
+#                 happen to agree the spread is invisible — which is how
+#                 a 22% gap on `top-N LIMIT 10` stood as a LOSS on the
+#                 first end-to-end run with one baseline, and read
+#                 `losses=0` with two.
 #   N           — timings per side per cell (default 5; rule 4 wants >= 3,
 #                 and 3 has proved too few to separate 10% at this size)
 #   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
@@ -358,13 +357,21 @@ verdict() { # $1=amin $2=amax $3=bmin $4=bmax [$5=floor]
 #
 # A database collation is a boot setting, so the locale panel's two arms
 # cannot be one process: comparing two collations is comparing two
-# servers. Measured by swapping which of the two is judged, the
+# servers. Under load those two servers diverge, and the panel was
+# reporting the divergence as the cost of the collation. Measured by
+# swapping which of the two was judged, on a box at load 8-11: the
 # difference followed the LEG and not the position — the same server ran
 # `narrow, non-indexed key` 2-4% faster whichever side it was timed on,
-# on a cell that sorts an INT and cannot consult a collation at all. Two
-# processes of the same binary are not interchangeable, and a panel that
-# names the collation as its variable was reporting that difference as
-# one.
+# on a cell that sorts an INT and cannot consult a collation at all.
+#
+# It is NOT that two processes of one binary are inherently different.
+# Measured again on the same box at load 1.6, six identical processes
+# timed forward and backward with a spill witness on every single
+# timing: 24 runs every time, 128-135 ms every time, no per-process and
+# no per-position pattern. What this term measures is how far identical
+# processes drift APART IN THIS WINDOW — which is exactly the quantity a
+# verdict has to clear before it may name the collation, and which is
+# zero on a quiet box and one to four cells of nineteen on a busy one.
 #
 # `BASELINE_URI` is a second process configured exactly like the PG_URI
 # leg, so `g` and `b` differ in nothing the panel claims to vary. Their

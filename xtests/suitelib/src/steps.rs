@@ -655,32 +655,34 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
             &format!("{psql} --no-psqlrc -X -q -tA '{locale_uri}' -c 'SELECT 1'"),
         )
         .map_err(|e| format!("locale leg {locale_uri} not answering: {e}"))?;
-        // v7.40.11 — a THIRD leg, configured exactly like the comparison
-        // one, because this panel cannot make its two arms one process.
+        // v7.40.11 — further legs, configured exactly like the
+        // comparison one, because this panel cannot make its two arms
+        // one process.
         //
         // A database collation is a boot setting here — SPG is
         // single-database, so `CREATE DATABASE … LC_COLLATE` sets the
         // server's — and comparing two collations is therefore comparing
-        // two SERVERS. Measured by swapping which of the two was judged,
-        // the difference followed the LEG and not the position: the same
-        // process ran `narrow, non-indexed key` 2-4% faster whichever
-        // side it was timed on, on a cell that sorts an INT and cannot
-        // consult a collation at all. The panel named the collation as
-        // its variable while varying two.
+        // two SERVERS. Under load those two diverge, and the panel was
+        // reporting the divergence as the cost of the collation.
+        // Measured by swapping which of the two was judged, at load
+        // 8-11: the difference followed the LEG and not the position,
+        // on `narrow, non-indexed key`, a cell that sorts an INT and
+        // cannot consult a collation at all.
         //
-        // This leg differs from the comparison leg in nothing the panel
-        // claims to vary, so what the two of them differ by is what a
-        // PROCESS is worth on that cell, in that window. The sweep folds
-        // it into the resolution a verdict must clear and reports it as
-        // `cross_process_differences=` — measured on an idle testbed,
-        // one to four cells of nineteen, every run.
+        // Not because two processes of one binary are inherently
+        // different — measured again at load 1.6, six identical
+        // processes forward and backward with a spill witness on every
+        // timing, they agree to 1-2%. These legs measure how far
+        // identical processes drift apart IN THIS WINDOW, which is the
+        // quantity a verdict must clear before it may name the
+        // collation. The sweep folds it into the resolution and reports
+        // it as `cross_process_differences=`.
         // TWO of them, because a spread needs three points. With one
         // baseline the comparison side has a single pairwise difference,
         // and when those two processes happen to agree the spread is
-        // invisible: measured on an idle testbed, four identical
-        // processes ran `top-N LIMIT 10` at medians 8.03 / 8.74 / 8.65 /
-        // 8.56 ms — 8.8% apart — and a run that sampled the close pair
-        // called a 22% gap a LOSS.
+        // invisible: with one baseline a 22% gap on `top-N LIMIT 10`
+        // stood as a LOSS on the first end-to-end run, and with two the
+        // panel read `losses=0`.
         let mut roster3 = Roster::new();
         let mut baseline_uris = Vec::new();
         for n in 1..=2 {
