@@ -117,6 +117,13 @@ Both PostgreSQL tables are consulted, because they are not the same
 list: `default_transaction_read_only` is only in the fuller one, and
 asking a single table let it through.
 
+The other end of the rule is kept too. Measured, MySQL 9.7.2's 655
+names and this engine's PostgreSQL catalogue share exactly six, and a
+name both engines have is exempt from the filter — dropping it would
+hide a value the client itself set, which is the same defect at the
+other end. `lc_messages` is the one of the six a MySQL session can set,
+and it is pinned.
+
 ### Fixed — a read-only MySQL session wrote anyway
 
 `SET SESSION transaction_read_only = 1` was stored, echoed back by

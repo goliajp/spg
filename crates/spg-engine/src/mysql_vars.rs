@@ -165,6 +165,38 @@ pub(crate) const CONSTANT: &[(&str, VarValue)] = &[
     ("wait_timeout", VarValue::Text("0")),
 ];
 
+/// Names MySQL and PostgreSQL BOTH have.
+///
+/// `SHOW VARIABLES` filters a session parameter out when PostgreSQL's
+/// own catalogue knows it, because SPG writes PostgreSQL settings into
+/// a mysql-wire session itself (`spg.database`, a `-c` boot GUC, the
+/// PostgreSQL spelling behind `SET transaction_read_only`). A name both
+/// engines have is not one of those, and dropping it would hide a value
+/// the client itself set — the one-question-two-surfaces defect this
+/// file exists to prevent, at the other end.
+///
+/// Measured: MySQL 9.7.2's 655 names and this engine's PostgreSQL GUC
+/// catalogue share exactly six, and `transaction_isolation` and
+/// `transaction_read_only` are in the inventory above, so the filter
+/// never sees them. These are the other four. Of them only
+/// `lc_messages` is session-settable on MySQL; the rest are listed for
+/// the same reason, because a name that appears in both catalogues is a
+/// fact about the two engines and not about what a client may do with
+/// it today.
+pub(crate) const SHARED_WITH_POSTGRESQL: &[&str] = &[
+    "lc_messages",
+    "log_error_verbosity",
+    "max_connections",
+    "port",
+];
+
+/// Is this a name both engines have? See `SHARED_WITH_POSTGRESQL`.
+pub(crate) fn shared_with_postgresql(name: &str) -> bool {
+    SHARED_WITH_POSTGRESQL
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(name))
+}
+
 /// The constant inventory by name, case-insensitively — MySQL system
 /// variable names compare caselessly.
 pub(crate) fn constant(name: &str) -> Option<VarValue> {
