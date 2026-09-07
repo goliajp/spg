@@ -262,20 +262,20 @@ fn cmd_all(file: &PermFile, rest: &[String], workspace_root: &Path) -> ExitCode 
 
     eprintln!("[perm-runner] tier={tier:?} permutations={:?}", perm_names);
 
-    // v7.40.11 — a tier that selected nothing is a configuration
-    // failure, not a clean run.
+    // v7.40.11 — refuse a selection that covers nothing, BEFORE
+    // spawning anything.
     //
     // The verdict below is `overall_fail > 0`, so an empty selection ran
-    // no child, counted nothing, and returned success. `verify` already
-    // refuses "no permutations defined"; `all`, which is what the
-    // suite's `perm-matrix` step calls, did not. Same shape as a test
-    // filter that matches no harness and a docs corpus with no block:
-    // the report cannot tell "all good" from "nothing looked at".
-    if perm_names.is_empty() {
-        eprintln!(
-            "all: tier {tier:?} selected NO permutation out of the {} defined — nothing would run",
-            file.permutations.len()
-        );
+    // no child, counted nothing, and returned success; and a name that
+    // did not resolve was printed as "skipped" and stepped over, which
+    // is a tier quietly not covering what its own list says it covers.
+    // `verify` already refused both; `all` — which is what the suite's
+    // `perm-matrix` step calls — did not.
+    //
+    // The rule itself lives on `PermFile` so it can be pinned without
+    // spending the matrix: see `validate_selection`.
+    if let Err(e) = file.validate_selection(&format!("{tier:?}"), &perm_names) {
+        eprintln!("all: {e}");
         return ExitCode::from(2);
     }
 

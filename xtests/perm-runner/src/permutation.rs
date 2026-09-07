@@ -75,6 +75,52 @@ impl PermFile {
     pub fn non_full_only(&self) -> impl Iterator<Item = &Permutation> {
         self.permutations.iter().filter(|p| !p.full_only)
     }
+
+    /// v7.40.11 — is this tier's selection something that can be run?
+    ///
+    /// Two ways `all` used to report success having covered nothing.
+    /// An EMPTY selection ran no child, counted nothing, and the
+    /// verdict (`overall_fail > 0`) came out clean. And a name that did
+    /// not resolve was printed as "unknown permutation — skipped" and
+    /// stepped over; those names come from this file's own tier lists,
+    /// so one that does not resolve means the lists disagree with the
+    /// permutations — a rename that updated one side only. Skipped
+    /// silently, a tier quietly stops covering what its list says it
+    /// covers while the summary still reads `fail=0`.
+    ///
+    /// Checked before any child is spawned, because a matrix missing a
+    /// row is not a matrix and there is no reason to spend the run
+    /// finding out.
+    ///
+    /// # Errors
+    /// When the selection is empty, or names anything this file does
+    /// not define.
+    pub fn validate_selection(&self, tier_label: &str, names: &[String]) -> Result<(), String> {
+        if names.is_empty() {
+            return Err(format!(
+                "tier {tier_label} selected NO permutation out of the {} defined — nothing would run",
+                self.permutations.len()
+            ));
+        }
+        let missing: Vec<&str> = names
+            .iter()
+            .filter(|n| self.by_name(n).is_none())
+            .map(String::as_str)
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "tier {tier_label} names {} that no permutation defines — \
+                 the tier list and the permutations disagree",
+                missing
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +363,61 @@ fn split_top_level(s: &str, sep: char) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v7.40.11 — the two ways `all` used to cover nothing and say so
+    /// with a zero.
+    ///
+    /// Demonstrated against the real file by pointing the fast tier at
+    /// a permutation nobody defines: before, that path printed
+    /// "unknown permutation — skipped" and the run ended
+    /// `pass=635 fail=0 rc=0` minus the missing row; after, `fail=1`
+    /// and `rc=1`. This pins the same two facts without spending the
+    /// matrix to find them.
+    #[test]
+    fn a_selection_that_covers_nothing_is_refused() {
+        let src = r#"
+[default]
+corpus_root = "xtests/sqllogictest/corpus"
+include_globs = ["spg_baseline"]
+fast_tier = ["embedded"]
+fast_tier_sample = "spg_baseline/01_basic_dml"
+timeout_secs = 30
+
+[[permutation]]
+name = "embedded"
+mode = "embedded"
+env  = { }
+"#;
+        let f = parse(src).expect("parse");
+
+        // The ordinary case still passes.
+        f.validate_selection("Fast", &["embedded".to_string()])
+            .expect("a name this file defines");
+
+        // Nothing selected: the verdict could not tell this from
+        // "everything green".
+        let empty = f.validate_selection("Fast", &[]);
+        assert!(empty.is_err(), "an empty selection must be refused");
+        let msg = empty.unwrap_err();
+        assert!(msg.contains("selected NO permutation"), "{msg}");
+        assert!(
+            msg.contains("out of the 1 defined"),
+            "the message has to say how many there were: {msg}"
+        );
+
+        // A name the tier list carries and the permutations do not.
+        let gone = f.validate_selection("Fast", &["embedded".into(), "renamed_away".into()]);
+        assert!(gone.is_err(), "a name nothing defines must be refused");
+        let msg = gone.unwrap_err();
+        assert!(
+            msg.contains("`renamed_away`"),
+            "name the one that is missing: {msg}"
+        );
+        assert!(
+            msg.contains("disagree"),
+            "say WHY it is missing — the lists disagree, it is not `unknown`: {msg}"
+        );
+    }
 
     #[test]
     fn parses_minimal_file() {
