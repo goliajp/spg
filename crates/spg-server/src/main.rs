@@ -360,6 +360,12 @@ pub(crate) fn commit_queue_execute(
 }
 
 pub(crate) struct ServerState {
+    /// v7.40.11 — the settings this server was started with
+    /// (`-c name=value`), applied to every session before the
+    /// `ALTER DATABASE/ROLE SET` defaults and before whatever the
+    /// connection itself asks for. PostgreSQL's order of specificity,
+    /// lowest first.
+    pub(crate) boot_gucs: Vec<(String, String)>,
     /// v4.0: `RwLock` instead of `Mutex` so read-only statements
     /// (SELECT / SHOW outside an active TX) can run in parallel
     /// across connections. The write path takes `.write()`; the
@@ -808,6 +814,51 @@ fn parse_optional_path(arg: Option<String>) -> Option<PathBuf> {
 
 /// Resolve a path setting from (CLI arg | env var) — CLI wins, env fills in
 /// when the CLI slot is omitted (or passed as `-`).
+/// v7.40.11 — pull `-c name=value` out of the argument list.
+///
+/// Three spellings, all of which `postgres` takes: `-c name=value` as
+/// two arguments (what `docker run … -c work_mem=64MB` produces),
+/// `-cname=value` joined, and `--name=value`. Everything else stays
+/// positional, in order, so the address and the three paths land where
+/// they always did.
+///
+/// `--replay-only` has no `=`, so the long form cannot swallow it.
+fn split_boot_settings(raw: Vec<String>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut gucs: Vec<(String, String)> = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    let mut it = raw.into_iter();
+    while let Some(a) = it.next() {
+        if a == "-c" {
+            match it.next() {
+                Some(pair) => push_boot_setting(&pair, &mut gucs),
+                None => {
+                    eprintln!("spg-server: fatal: -c needs a name=value argument");
+                    std::process::exit(1);
+                }
+            }
+        } else if let Some(pair) = a.strip_prefix("-c") {
+            push_boot_setting(pair, &mut gucs);
+        } else if let Some(pair) = a.strip_prefix("--")
+            && pair.contains('=')
+        {
+            push_boot_setting(pair, &mut gucs);
+        } else {
+            rest.push(a);
+        }
+    }
+    (gucs, rest)
+}
+
+fn push_boot_setting(pair: &str, into: &mut Vec<(String, String)>) {
+    match pair.split_once('=') {
+        Some((k, v)) if !k.is_empty() => into.push((k.to_string(), v.to_string())),
+        _ => {
+            eprintln!("spg-server: fatal: expected name=value, got {pair:?}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn resolve_path(cli: Option<String>, env_key: &str) -> Option<PathBuf> {
     parse_optional_path(cli).or_else(|| {
         env::var(env_key)
@@ -855,7 +906,19 @@ fn main() {
     // and for sandboxed forensic restores.
     let raw_args: Vec<String> = env::args().skip(1).collect();
     let replay_only = raw_args.iter().any(|a| a == "--replay-only");
-    let mut args = raw_args.into_iter().filter(|a| a != "--replay-only");
+    // v7.40.11 — `-c name=value`, PostgreSQL's own spelling, and the
+    // documented way to set a server GUC in its image. `command:` in a
+    // compose file carries exactly this.
+    //
+    // Every argument was positional, so `-c` landed in `db_path` and
+    // the setting in `audit_path`; the container then died with
+    // `spg-server: fatal: invalid socket address` — a message naming
+    // the wrong component, so an operator looks at ports for a cause
+    // that is an unrecognised argument. Reported against 7.40.9
+    // (sentori §3.14). With §3.13 it meant there was NO way at all to
+    // change a setting for a deployment rather than one session.
+    let (boot_gucs, positional) = split_boot_settings(raw_args);
+    let mut args = positional.into_iter().filter(|a| a != "--replay-only");
     let addr = args
         .next()
         .or_else(|| env::var("SPG_ADDR").ok())
@@ -916,7 +979,9 @@ fn main() {
         eprintln!("spg-server: --replay-only complete; exiting 0");
         return;
     }
-    if let Err(e) = run(&addr, db_path, audit_path, wal_path, password, limits) {
+    if let Err(e) = run(
+        &addr, db_path, audit_path, wal_path, password, limits, boot_gucs,
+    ) {
         eprintln!("spg-server: fatal: {e}");
         process::exit(1);
     }
@@ -1923,6 +1988,7 @@ fn run(
     wal_path: Option<PathBuf>,
     password: Option<String>,
     limits: Limits,
+    boot_gucs: Vec<(String, String)>,
 ) -> std::io::Result<()> {
     // v5.3.1: pre-allocated path map so the manifest reader can
     // populate it before ServerState is built. After `run` finishes
@@ -2099,6 +2165,19 @@ fn run(
 
     bootstrap_admin_from_env(&mut engine, db_path.as_deref())?;
 
+    // v7.40.11 — validate the `-c` settings by APPLYING them, which is
+    // the same rule `SET` uses rather than a second list that could
+    // drift from it. A name the server does not know stops the boot and
+    // says which one: accepting a setting and discarding it is the
+    // worst of the three available behaviours, and that is exactly what
+    // the startup packet was doing (sentori §3.13).
+    for (k, v) in &boot_gucs {
+        if let Err(e) = engine.execute(&format!("SET {k} = '{v}'")) {
+            eprintln!("spg-server: fatal: -c {k}={v}: {e}");
+            std::process::exit(1);
+        }
+    }
+
     let (wal, wal_sync_clone) = open_wal_for_append(wal_path.as_deref())?;
 
     let auth_msg = if password.is_some() {
@@ -2118,6 +2197,7 @@ fn run(
         parse_env_u64("SPG_HOT_TIER_BYTES").unwrap_or(DEFAULT_HOT_TIER_BYTES);
     let cluster_id = load_or_generate_cluster_id(wal_path.as_deref(), db_path.as_deref());
     let state = Arc::new(ServerState {
+        boot_gucs,
         engine: RwLock::new(engine),
         db_path,
         audit_log: Mutex::new(audit_log),

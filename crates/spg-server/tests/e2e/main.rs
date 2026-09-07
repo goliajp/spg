@@ -53,6 +53,7 @@ mod e2e_autovacuum_worker_round173;
 )]
 mod e2e_backup;
 mod e2e_bare_column_streaming_round823;
+mod e2e_boot_and_startup_settings_v7411;
 mod e2e_canned_audit_round320;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
 mod e2e_cascade;
