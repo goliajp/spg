@@ -3,7 +3,9 @@
 #
 # The test surface is split into five categories (see docs/TESTING.md):
 #
-#   lint   cargo fmt --check + clippy -D warnings
+#   lint          cargo fmt --check + clippy -D warnings
+#   gates-timing  the latency gates (slo_smoke, perf_gate), which need
+#                 the machine to themselves
 #   unit   in-crate #[test] (--lib --bins) + doc tests, debug
 #   e2e    every integration-test target (--tests), debug,
 #          followed by the v7.38 element-B permutation matrix
@@ -29,13 +31,13 @@
 # tests (1M-row gates, SQ8 kNN, exploratory benches). biz has a
 # single tier — its harnesses are corpus-driven, not #[ignore]-split.
 #
-# Usage: scripts/gate.sh <lint|unit|e2e|gates|biz|dogfood|perf|all> [--full]
+# Usage: scripts/gate.sh <lint|unit|e2e|gates|gates-timing|biz|dogfood|perf|all> [--full]
 # Offload to the mini.local testbed: scripts/test-on-mini.sh <same args>
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-    echo "usage: $0 <lint|unit|release-build|e2e|gates|biz|dogfood|perf|all> [--full]" >&2
+    echo "usage: $0 <lint|unit|release-build|e2e|gates|gates-timing|biz|dogfood|perf|all> [--full]" >&2
     exit 2
 }
 
@@ -242,10 +244,18 @@ run_gates() {
     ensure_release_build
     RUN_FILTER=prod_ready scripts/run-test-binaries.sh "gates: prod_ready" \
         --release --workspace --exclude spg-bench-competitor --tests
-    RUN_FILTER=slo_smoke scripts/run-test-binaries.sh "gates: slo_smoke" \
-        --release --workspace --exclude spg-bench-competitor --tests
-    RUN_FILTER=perf_gate scripts/run-test-binaries.sh "gates: perf_gate" \
-        --release --workspace --exclude spg-bench-competitor --tests
+    # v7.40.11 — `slo_smoke` and `perf_gate` moved to `gates-timing`.
+    #
+    # This step runs CONCURRENTLY with e2e, biz, dogfood, ironrules and
+    # oracle-three (`group = "after-build"` in xtests/suite.toml), and
+    # those two are LATENCY gates. The suite already knew this and wrote
+    # it down for the other one — "`perf-sweep` is deliberately NOT in
+    # the group: it is the timing gate and it needs the machine to
+    # itself" — and then left two timing gates inside a step that is.
+    #
+    # It cost a prerelease run: `slo_smoke` read SEL p99 4759 µs against
+    # a 2000 µs ceiling while the machine it was sharing went from load
+    # 5.8 to 12.3, and reported it as the engine blowing its SLO.
     # r1018 — the two counter pins, each its own cargo invocation.
     #
     # They read process-global `UNIQ_PROBE_*` counters, which only exist
@@ -340,6 +350,20 @@ run_biz() {
     xtests/mysqlcorpus/run.sh
 }
 
+# v7.40.11 — the latency gates, alone on the machine.
+#
+# `gates` above is in the concurrent group and these two are not
+# measurements a shared machine can make. Same reasoning the sweep has
+# carried since v7.40.8, applied to the two gates it was not applied to.
+run_gates_timing() {
+    banner "gates-timing (latency gates, exclusive)"
+    ensure_release_build
+    RUN_FILTER=slo_smoke scripts/run-test-binaries.sh "gates-timing: slo_smoke" \
+        --release --workspace --exclude spg-bench-competitor --tests
+    RUN_FILTER=perf_gate scripts/run-test-binaries.sh "gates-timing: perf_gate" \
+        --release --workspace --exclude spg-bench-competitor --tests
+}
+
 run_dogfood() {
     banner dogfood
     ensure_release_build
@@ -428,6 +452,7 @@ run_perf() {
 START=$SECONDS
 case "$CATEGORY" in
     lint)    run_lint ;;
+    gates-timing) run_gates_timing ;;
     unit)    run_unit ;;
     # v7.39.13 — the release build is a step, not a side effect.
     #
@@ -446,7 +471,7 @@ case "$CATEGORY" in
     dogfood) run_dogfood ;;
     perf)    run_perf ;;
     all)     run_lint; run_unit; ensure_release_build; run_e2e; run_gates
-             run_biz; run_dogfood; run_perf ;;
+             run_biz; run_dogfood; run_gates_timing; run_perf ;;
     *) usage ;;
 esac
 printf '\n══ gate.sh %s%s: PASS (%ss) ══\n' \

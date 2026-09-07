@@ -226,6 +226,42 @@ fn slo_smoke_select_and_insert_p99_under_budget() {
         round_trip(&mut s, "SELECT count(*) FROM slo");
     }
 
+    // v7.40.11 — the machine's own floor, measured in the SAME window.
+    //
+    // The published SLO is end-to-end p99, so it is a claim about the
+    // engine PLUS the wire PLUS whatever else has the CPU. When this
+    // gate fails, the reader has to know which. An empty round-trip
+    // does no engine work worth the name, so its p99 is the floor the
+    // box is imposing right now, and a floor at or above the ceiling
+    // means the box cannot certify the claim either way — that is a
+    // fact, not a threshold anyone chose.
+    //
+    // The line below carries it. `run-test-binaries.sh` only forwards a
+    // harness's stderr when the harness FAILS, so in practice a reader
+    // sees this when it matters — and `cargo test -- --nocapture` shows
+    // it any time someone wants the trend.
+    // Warmed the same way the measured shape is: before this loop
+    // existed the reading was 75 µs against a warmed SEL of 48 µs, which
+    // is a comparison between a cold statement and a hot one rather than
+    // between the box and the engine.
+    //
+    // It is not a strict lower bound on SEL and does not need to be —
+    // measured warm on a quiet box, 33-72 µs against SEL's 37-43. What
+    // it tracks is the BOX: it rises with load, and the assertion below
+    // fires on the fact that it rose past the ceiling, not on a number
+    // anyone chose.
+    const FLOOR_N: usize = 200;
+    for _ in 0..FLOOR_N {
+        round_trip(&mut s, "SELECT 1");
+    }
+    let mut floor = Vec::with_capacity(FLOOR_N);
+    for _ in 0..FLOOR_N {
+        let t = Instant::now();
+        round_trip(&mut s, "SELECT 1");
+        floor.push(t.elapsed().as_micros());
+    }
+    let floor_p99 = p99(&mut floor);
+
     // Measure.
     const N: usize = 500;
     let mut sel = Vec::with_capacity(N);
@@ -245,16 +281,31 @@ fn slo_smoke_select_and_insert_p99_under_budget() {
     let sel_p99 = p99(&mut sel);
     let ins_p99 = p99(&mut ins);
     eprintln!(
-        "SLO smoke: SEL p99 = {sel_p99} µs (SLO ≤ {SLO_SEL_P99_US}) | INS p99 = {ins_p99} µs (SLO ≤ {SLO_INS_P99_US})"
+        "SLO smoke: SEL p99 = {sel_p99} µs (SLO ≤ {SLO_SEL_P99_US}) | INS p99 = {ins_p99} µs (SLO ≤ {SLO_INS_P99_US}) | empty round-trip p99 = {floor_p99} µs"
     );
 
+    // The box could not certify this either way: an empty round-trip
+    // alone was over the ceiling. Still a failure — a release does not
+    // go out on an unverified SLO — but the message names the machine
+    // so nobody spends the afternoon hunting an engine regression.
+    assert!(
+        floor_p99 <= SLO_SEL_P99_US,
+        "this machine cannot certify the SLO: an EMPTY round-trip p99 was {floor_p99} µs, \
+         itself over the {SLO_SEL_P99_US} µs ceiling (SEL p99 {sel_p99}, INS p99 {ins_p99}). \
+         Nothing here is a statement about the engine. Re-run with the box to itself — \
+         this gate is `gates-timing`, which the suite runs outside its concurrent group."
+    );
     assert!(
         sel_p99 <= SLO_SEL_P99_US,
-        "SEL p99 {sel_p99} µs blew the SLO ceiling of {SLO_SEL_P99_US} µs — see PERFORMANCE.md §SLO and xbench/competitor/src/bin/latency.rs"
+        "SEL p99 {sel_p99} µs blew the SLO ceiling of {SLO_SEL_P99_US} µs (an empty round-trip \
+         was {floor_p99} µs, so the floor is not the story) — see PERFORMANCE.md §SLO and \
+         xbench/competitor/src/bin/latency.rs"
     );
     assert!(
         ins_p99 <= SLO_INS_P99_US,
-        "INS p99 {ins_p99} µs blew the SLO ceiling of {SLO_INS_P99_US} µs — see PERFORMANCE.md §SLO and xbench/competitor/src/bin/latency.rs"
+        "INS p99 {ins_p99} µs blew the SLO ceiling of {SLO_INS_P99_US} µs (an empty round-trip \
+         was {floor_p99} µs, so the floor is not the story) — see PERFORMANCE.md §SLO and \
+         xbench/competitor/src/bin/latency.rs"
     );
 }
 
