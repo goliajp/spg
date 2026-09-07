@@ -5170,6 +5170,12 @@ pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
             // the "called" wording would have left the new refusal on
             // the generic 42000.
             || msg.contains("must be set before any query")
+            // v7.40.12 — the subtransaction siblings, each with PG's own
+            // verb: "must not be called in a subtransaction", "cannot be
+            // called within a subtransaction", and the read-write one
+            // that names neither. All three measured at 25001.
+            || msg.contains("subtransaction")
+            || msg.contains("cannot set transaction read-write mode")
             // PG's PreventInTransactionBlock family — VACUUM, ALTER
             // SYSTEM, CREATE DATABASE, the CONCURRENTLY index forms,
             // DISCARD ALL. All 25001, all phrased this way.

@@ -139,9 +139,16 @@ pub enum ValidateOnlyKind {
     /// `LOCK TABLE <t> [, …]` — the relation must exist.
     LockTable,
     /// Every role named must exist: `DROP OWNED BY <r> [, …]`,
-    /// `REASSIGN OWNED BY <r> [, …] TO <r>`, and (round 697)
-    /// `SET SESSION AUTHORIZATION <r>`.
+    /// `REASSIGN OWNED BY <r> [, …] TO <r>`, `ALTER ROLE <r> …`.
     RoleName,
+    /// v7.40.12 — `SET SESSION AUTHORIZATION <r>`. It used to share
+    /// `RoleName` with the three above, and one question separates
+    /// them: PG does NOT count this statement as a query, so a later
+    /// `SET TRANSACTION ISOLATION LEVEL` still succeeds, while after
+    /// `DROP OWNED BY`, `REASSIGN OWNED BY` or `ALTER ROLE` it is
+    /// refused with 25001. All four measured on PG 18.6. The role check
+    /// is identical; the snapshot answer is not.
+    SessionAuthorization,
     /// `SECURITY LABEL …` — PG refuses unconditionally, because no label
     /// provider is loaded. SPG has none either.
     SecurityLabel,
@@ -6150,6 +6157,9 @@ impl fmt::Display for Statement {
                 ValidateOnlyKind::LockTable => write!(f, "LOCK TABLE {}", names.join(", ")),
                 ValidateOnlyKind::RoleName => {
                     write!(f, "DROP OWNED BY {}", names.join(", "))
+                }
+                ValidateOnlyKind::SessionAuthorization => {
+                    write!(f, "SET SESSION AUTHORIZATION {}", names.join(", "))
                 }
                 ValidateOnlyKind::SecurityLabel => f.write_str("SECURITY LABEL"),
                 ValidateOnlyKind::ExtensionAvailable => {
