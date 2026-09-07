@@ -929,9 +929,23 @@ fn main() {
 
 /// Run one EXTERNAL step: its shell command, its exit status.
 fn run_external(cmd: &str) -> Result<String, String> {
+    // v7.40.11 — tell a nested suite whose run it is inside.
+    //
+    // The `full` tier's second step is `scripts/suite.sh prerelease` —
+    // a suite inside a suite, by design, since the tiers are supersets.
+    // The run lock refused it: a run WAS in progress, and it was the
+    // parent. So the tier could never reach its own third step, and
+    // nothing schedules the tier, so nobody found out — measured, the
+    // whole of `full` failed in 5.3 s at step two with nine steps
+    // skipped.
+    //
+    // The child compares this against the pid in the lock's owner file
+    // and borrows the lock only when they match. Two genuinely
+    // concurrent runs still collide, which is what the lock is for.
     let st = std::process::Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .env("SPG_SUITE_LOCK_OWNER", std::process::id().to_string())
         .status()
         .map_err(|e| format!("spawn: {e}"))?;
     if st.success() {
