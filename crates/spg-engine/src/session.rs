@@ -333,6 +333,36 @@ impl Engine {
             normalised.to_ascii_lowercase().as_str(),
             "1" | "on" | "true"
         );
+        // v7.40.11 — MySQL's spelling of "this session's transactions are
+        // read only", which a connection pool doing read/write splitting
+        // sets on a connection it means to route to a replica.
+        //
+        // SPG has enforced a read-only transaction since v7.39 —
+        // measured over pgwire, both `BEGIN READ ONLY` and
+        // `SET default_transaction_read_only = on` refuse an INSERT with
+        // `cannot execute INSERT in a read-only transaction`. The MySQL
+        // name reached none of it: it was stored, echoed back by
+        // `@@transaction_read_only`, and the session went on writing.
+        // Measured against MySQL 9.7.2, same three statements:
+        //
+        //   SET SESSION transaction_read_only = 1
+        //   START TRANSACTION
+        //   INSERT INTO ro VALUES (1)
+        //     MySQL  ERROR 1792 (25006) Cannot execute statement in a
+        //            READ ONLY transaction.
+        //     SPG    accepted
+        //
+        // It writes the PostgreSQL name and does not keep its own copy,
+        // so `default_read_only()` — which both variable surfaces and
+        // the transaction machinery ask — is the one answer.
+        if key == "transaction_read_only" && self.speaks_mysql && (value_on || value_off) {
+            self.session_params.insert(
+                alloc::string::String::from("default_transaction_read_only"),
+                alloc::string::String::from(if value_on { "on" } else { "off" }),
+            );
+            self.refresh_render_style();
+            return;
+        }
         // v7.39 — `SET NAMES <charset>` sets the three character_set_*
         // session variables and, unless a `COLLATE` clause follows,
         // the charset's DEFAULT collation. The parser emits the charset

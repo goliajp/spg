@@ -6,6 +6,57 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 SPG_PORT="${SPG_PORT:-26000}"
 
+# v7.40.11 — the reference leg's container, provisioned here.
+#
+# It was created by hand, once, on the machine this corpus was written
+# on, and nothing in the repository made one. On any other machine the
+# corpus reported "the SPG leg answered '<nothing>' to SELECT 1 — it is
+# not up" — which names the wrong component twice over: the SPG server
+# was up and listening, and what was missing was the container holding
+# the psql BOTH legs are asked through. The release gate hit exactly
+# that on the testbed, where the container had never existed.
+#
+# It is also pinned now. The hand-made one was `postgres:18` resolved
+# whenever its author ran `docker run`, which was 18.4 while the rest of
+# this project compares against 18.6 — so the differential everything
+# else is measured against was quietly a version behind, and nothing
+# said so. Same assertion as the oracle runner: what is RUNNING must be
+# what is PINNED.
+PG_REF_CONTAINER="${PG_REF_CONTAINER:-spg-bench-postgres}"
+PG_REF_PORT="${PG_REF_PORT:-25432}"
+PG_REF_IMAGE="${PG_REF_IMAGE:-postgres:18.6}"
+PG_REF_PIN="${PG_REF_IMAGE##*:}"; PG_REF_PIN="${PG_REF_PIN%%-*}"
+
+if ! docker inspect "$PG_REF_CONTAINER" >/dev/null 2>&1; then
+  echo "diffcorpus: creating the reference leg $PG_REF_CONTAINER from $PG_REF_IMAGE" >&2
+  docker run -d --name "$PG_REF_CONTAINER" \
+      -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+      -p "$PG_REF_PORT":5432 "$PG_REF_IMAGE" >/dev/null || {
+        echo "diffcorpus: could not create $PG_REF_CONTAINER from $PG_REF_IMAGE" >&2; exit 2; }
+elif [ "$(docker inspect -f '{{.State.Running}}' "$PG_REF_CONTAINER" 2>/dev/null)" != "true" ]; then
+  docker start "$PG_REF_CONTAINER" >/dev/null || {
+    echo "diffcorpus: could not start $PG_REF_CONTAINER" >&2; exit 2; }
+fi
+for _ in $(seq 1 60); do
+  docker exec "$PG_REF_CONTAINER" pg_isready -U bench -q 2>/dev/null && break
+  sleep 0.5
+done
+
+# `SHOW server_version` because `version()` is a whole sentence and the
+# pin is bare — the same shape the oracle runner's gate needed.
+ref_version="$(docker exec "$PG_REF_CONTAINER" psql -U bench -d bench -tA \
+    -c 'SHOW server_version;' 2>/dev/null | tr -d '[:space:]')"
+case "$ref_version" in
+  "$PG_REF_PIN"*) ;;
+  *)
+    echo "diffcorpus: the reference leg is running '${ref_version:-<nothing>}' and this corpus pins $PG_REF_PIN." >&2
+    echo "            Every expectation here was recorded against the pin; measuring against" >&2
+    echo "            another build reports differences that are the other build's." >&2
+    echo "            Recreate it: docker rm -f $PG_REF_CONTAINER && rerun this script." >&2
+    exit 2
+    ;;
+esac
+
 # v7.39 (round 666) — start our own server when nothing is serving, so the
 # gate protocol can run this unattended. `xtests/dump_compat/run.sh` has done
 # this since it was written; this corpus was the one gate that still assumed
@@ -60,8 +111,8 @@ norm() { sed -E 's/^psql:[^:]*:[0-9]+: //; /^LINE [0-9]+:/d; /^ *\^ *$/d; /^HINT
 # v7.39 (round 621) — stdbuf -o0. psql block-buffers stdout when it is not a
 # tty while stderr stays unbuffered, so an ERROR could land BEFORE or AFTER the
 # marker line of its own statement, run to run.
-SPG() { docker exec -i -e PGSSLMODE=disable spg-bench-postgres stdbuf -o0 -e0 psql -h host.docker.internal -p "$SPG_PORT" -U postgres -d postgres -tA -q -v ON_ERROR_STOP=0 -c "\\pset null '<NULL>'" -f -; }
-PGG() { docker exec -i -e PGPASSWORD=bench spg-bench-postgres stdbuf -o0 -e0 psql -h host.docker.internal -p 25432 -U bench -d bench -tA -q -v ON_ERROR_STOP=0 -c "\\pset null '<NULL>'" -f -; }
+SPG() { docker exec -i -e PGSSLMODE=disable "$PG_REF_CONTAINER" stdbuf -o0 -e0 psql -h host.docker.internal -p "$SPG_PORT" -U postgres -d postgres -tA -q -v ON_ERROR_STOP=0 -c "\\pset null '<NULL>'" -f -; }
+PGG() { docker exec -i -e PGPASSWORD=bench "$PG_REF_CONTAINER" stdbuf -o0 -e0 psql -h host.docker.internal -p "$PG_REF_PORT" -U bench -d bench -tA -q -v ON_ERROR_STOP=0 -c "\\pset null '<NULL>'" -f -; }
 
 # v7.39 (round 621) — RESET BOTH SIDES first.
 #

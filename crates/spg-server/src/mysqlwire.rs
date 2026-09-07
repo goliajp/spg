@@ -1158,6 +1158,19 @@ fn mysql_error_parts_inner(
         {
             (1292, "22007", detail.clone())
         }
+        // v7.40.11 — a write inside a read-only transaction. MySQL
+        // 9.7.2: `ERROR 1792 (25006) Cannot execute statement in a READ
+        // ONLY transaction.` (measured); the engine words it
+        // PostgreSQL's way, naming the verb.
+        spg_engine::EngineError::Unsupported(m)
+            if m.starts_with("cannot execute ") && m.ends_with(" in a read-only transaction") =>
+        {
+            (
+                1792,
+                "25006",
+                "Cannot execute statement in a READ ONLY transaction.".to_string(),
+            )
+        }
         // v7.40.11 — `SET <name> = NULL`. MySQL 9.7.2 answers
         // `ERROR 1231 (42000) Variable 'sql_mode' can't be set to the
         // value of 'NULL'` (measured); this reached the wire as 1064, a
