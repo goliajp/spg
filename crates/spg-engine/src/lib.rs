@@ -79,6 +79,7 @@ mod limit_expr;
 pub mod locks;
 mod maintenance;
 pub mod memoize;
+mod mysql_vars;
 mod notify;
 mod numeric;
 mod opclass;
@@ -1501,6 +1502,20 @@ pub struct Engine {
     /// `Cell` would have taken away (spg-embedded-tokio shares one across
     /// tasks; clippy caught it there before the tests did).
     pub(crate) last_insert_id: core::sync::atomic::AtomicI64,
+    /// v7.40.11 — what THIS statement put in an AUTO_INCREMENT column,
+    /// which is a different quantity from `LAST_INSERT_ID()` and is the
+    /// one the MySQL wire's OK packet carries. Measured on MySQL 9.7.2
+    /// through a driver reading the packet: an insert that generated a
+    /// key reports it, an insert that supplied an EXPLICIT key reports
+    /// that (while `LAST_INSERT_ID()` is left alone by it), and an
+    /// UPDATE or DELETE reports 0 — where `LAST_INSERT_ID()` still holds
+    /// the earlier insert's value.
+    ///
+    /// Reset by the statement driver before every statement, so a stale
+    /// value can never be reported as a key this statement made: JDBC
+    /// turns this field into `getGeneratedKeys()`, and a wrong key there
+    /// is worse than none.
+    pub(crate) statement_insert_id: core::sync::atomic::AtomicI64,
     /// v7.39 (round 426) — the current session's ROW_COUNT(). Swapped
     /// with [`SessionBag`] like every other per-connection slot. A plain
     /// i64: unlike LAST_INSERT_ID it is only ever WRITTEN from the
@@ -1903,6 +1918,7 @@ impl Engine {
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
+            statement_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
             user_vars: BTreeMap::new(),
             temp_tables: BTreeSet::new(),
@@ -2432,6 +2448,7 @@ impl Engine {
             session_params: BTreeMap::new(),
             cursors: BTreeMap::new(),
             last_insert_id: core::sync::atomic::AtomicI64::new(0),
+            statement_insert_id: core::sync::atomic::AtomicI64::new(0),
             row_count: 0,
             user_vars: BTreeMap::new(),
             temp_tables: BTreeSet::new(),
@@ -2577,6 +2594,7 @@ impl Engine {
                     session_params: BTreeMap::new(),
                     cursors: BTreeMap::new(),
                     last_insert_id: core::sync::atomic::AtomicI64::new(0),
+            statement_insert_id: core::sync::atomic::AtomicI64::new(0),
                     row_count: 0,
                     user_vars: BTreeMap::new(),
                     temp_tables: BTreeSet::new(),
@@ -3665,6 +3683,19 @@ impl Engine {
     /// one. Same shape as `current_isolation_level`, and for the same
     /// reason — the witness for "a block is open" is `tx_catalogs`, not
     /// the session slot, which a connected session always holds.
+    /// v7.40.11 — the key THIS statement put in an AUTO_INCREMENT
+    /// column, or 0. The MySQL wire's OK packet carries it and JDBC
+    /// reads it back as `getGeneratedKeys()`; see the field for why it
+    /// is not `LAST_INSERT_ID()`.
+    #[must_use]
+    pub fn statement_insert_id(&self) -> u64 {
+        u64::try_from(
+            self.statement_insert_id
+                .load(core::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap_or(0)
+    }
+
     #[must_use]
     pub fn transaction_read_only(&self) -> bool {
         if self

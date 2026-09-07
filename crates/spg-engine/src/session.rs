@@ -270,6 +270,25 @@ impl Engine {
         self.refresh_render_style();
     }
 
+    /// v7.40.11 — `SET <name> = NULL`. Measured on MySQL 9.7.2, exactly
+    /// one variable accepts it — `character_set_results`, where it means
+    /// "send results in the column's own charset, do not transcode" —
+    /// and every other name answers
+    /// `ERROR 1231 (42000) Variable 'x' can't be set to the value of 'NULL'`.
+    /// Connector/J 9.4.0 sends the accepted spelling as the second
+    /// statement of every connection it opens.
+    pub(crate) fn null_set_rejection(name: &str, value: &spg_sql::ast::SetValue) -> Option<String> {
+        if !matches!(value, spg_sql::ast::SetValue::Null)
+            || name.eq_ignore_ascii_case("character_set_results")
+        {
+            return None;
+        }
+        Some(alloc::format!(
+            "Variable '{}' can't be set to the value of 'NULL'",
+            name.to_ascii_lowercase()
+        ))
+    }
+
     pub(crate) fn set_session_param(&mut self, name: String, value: spg_sql::ast::SetValue) {
         let normalised = match value {
             spg_sql::ast::SetValue::String(s) => s,
@@ -283,6 +302,17 @@ impl Engine {
                 self.clear_session_param(&name);
                 return;
             }
+            // v7.40.11 — the empty string is the marker for "set to
+            // NULL", and it is unambiguous because no ordinary SET can
+            // produce it: measured on MySQL 9.7.2,
+            // `SET character_set_results = ''` is
+            // `ERROR 1115 Unknown character set: ''`. `SHOW VARIABLES`
+            // renders it as the empty value MySQL renders, and the `@@`
+            // surface reads it back as SQL NULL — which is what MySQL
+            // answers there (measured: `@@character_set_results IS NULL`
+            // is 1). `null_set_rejection` has already refused this
+            // spelling for every other name.
+            spg_sql::ast::SetValue::Null => alloc::string::String::new(),
         };
         let key = name.to_ascii_lowercase();
         // v7.14.0 — mysqldump preamble emits

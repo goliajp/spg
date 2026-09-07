@@ -411,85 +411,44 @@ impl Engine {
 
     /// v7.17.0 Phase 3.P0-61 — `SHOW VARIABLES`. Returns server-side
     /// variables MySQL/MariaDB clients probe at connect time.
+    ///
+    /// v7.40.11 — the constant part of the inventory moved to
+    /// `mysql_vars::CONSTANT`, which the `@@name` surface renders from
+    /// too. It used to be a second table maintained by hand beside that
+    /// one, and every release found another name in one and not the
+    /// other. What made that expensive rather than untidy: measured,
+    /// Connector/J 9.4.0 opens a connection by reading NINETEEN
+    /// variables in a single statement, and seven of them were absent
+    /// here — so the driver never got a session at all, failing in
+    /// `createNewIO` with `Unknown system variable
+    /// 'auto_increment_increment'`.
     pub(crate) fn exec_show_variables(&self) -> QueryResult {
         let columns = alloc::vec![
             ColumnSchema::new("Variable_name", DataType::Text, false),
             ColumnSchema::new("Value", DataType::Text, false),
         ];
-        let mut rows: Vec<Row<'static>> = Vec::new();
-        let canonical: &[(&str, &str)] = &[
-            ("version", crate::MYSQL_SERVER_VERSION),
-            ("version_comment", crate::MYSQL_VERSION_COMMENT),
-            // v7.39 — `SHOW VARIABLES LIKE 'collation%'` listed ONE of
-            // MySQL's three and `LIKE 'character_set%'` one of its
-            // eight, while `@@collation_connection` answered on the
-            // other surface. Same disagreement between two surfaces this
-            // release keeps finding, in the inventory rather than in a
-            // value: a client that enumerates gets a different world
-            // from one that asks by name.
-            //
-            // The loop below prefers the session's own value, so these
-            // follow `SET NAMES` exactly as the `@@` path does — except
-            // the two database-scoped names, which MySQL does not scope
-            // to the session.
-            // v7.39.2 — the inventory carried no entry for it at all,
-            // while the `@@` surface answered. Same one-question-two-
-            // surfaces shape as the collation names above.
+        // The names this engine computes rather than declares. They are
+        // not in `CONSTANT` because their value is a fact about THIS
+        // session or THIS engine; the `@@` surface computes the same
+        // four the same way.
+        let computed: [(&str, String); 5] = [
+            // v7.39.2 — live, and truthful. It said `0`, which claims
+            // names are compared with case and stored as written; SPG
+            // folds an unquoted one, so `0` was never right for a MySQL
+            // session.
             (
                 "lower_case_table_names",
-                if self.folds_relation_names() {
-                    "1"
-                } else {
-                    "0"
-                },
+                String::from(if self.folds_relation_names() { "1" } else { "0" }),
             ),
-            ("character_set_client", "utf8mb4"),
-            ("character_set_connection", "utf8mb4"),
-            ("character_set_results", "utf8mb4"),
-            ("character_set_database", "utf8mb4"),
-            ("character_set_server", "utf8mb4"),
-            // See the `@@` surface for the reasoning behind these
-            // three: identifiers here really are utf8mb4 (MySQL's own
-            // answer is utf8mb3 because it truncates a four-byte one),
-            // names are used as bytes, and the directory is a claim
-            // about the shape of the answer rather than about this
-            // filesystem.
-            ("character_set_system", "utf8mb4"),
-            ("character_set_filesystem", "binary"),
-            // v7.39.3 — the third one. Both surfaces or neither: one
-            // question with two answers is the shape this file keeps
-            // being fixed for.
-            ("character_sets_dir", crate::MYSQL_CHARACTER_SETS_DIR),
-            (
-                "collation_connection",
-                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
-            ),
-            (
-                "collation_database",
-                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
-            ),
-            (
-                "collation_server",
-                crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION,
-            ),
-            ("max_allowed_packet", "67108864"),
-            // v7.40.11 — both surfaces or neither, which is the rule the
-            // entries above were each added under. See the `@@` arm for
-            // why this name and not `default_authentication_plugin`.
-            ("authentication_policy", crate::MYSQL_AUTHENTICATION_POLICY),
-            ("autocommit", "ON"),
-            // v7.39 (round 470) — the session's own value when it set one;
-            // a client that reads sql_mode back after setting it was told
-            // the default regardless.
-            ("sql_mode", crate::MYSQL_DEFAULT_SQL_MODE),
-            // v7.40.11 — the session's ONE zone, or `SYSTEM` when
-            // nothing has set one. See the `@@` arm: the loop below
-            // prefers a session value stored under THIS name, so
-            // `SET time_zone` was honoured and the PostgreSQL spelling —
-            // which writes the same zone under `timezone` — was not.
+            // v7.40.11 — one session has ONE zone. `SET time_zone`
+            // stores it under this name and the PostgreSQL spelling
+            // stores the same zone under `timezone`, so this reads the
+            // canonical one; `SYSTEM` when nothing has set a zone, which
+            // is MySQL 9.7.2's own default (measured) and what every
+            // mysqldump preamble reads back on its fifth line.
             (
                 "time_zone",
-                self.session_param("timezone").unwrap_or("SYSTEM"),
+                String::from(self.session_param("timezone").unwrap_or("SYSTEM")),
             ),
             // v7.39 — the LIVE level, via the one function all three
             // surfaces now ask. This held the literal `REPEATABLE-READ`
@@ -507,45 +466,100 @@ impl Engine {
             // separately. Reporting truthfully does not wait on it.
             (
                 "transaction_isolation",
-                self.current_isolation_level().as_mysql_str(),
+                String::from(self.current_isolation_level().as_mysql_str()),
+            ),
+            // v7.40.11 — MySQL lists this among its 655 and SPG answered
+            // it on `@@` only, which is the drift this inventory exists
+            // to end.
+            ("warning_count", alloc::format!("{}", self.mysql_warning_count())),
+            // v7.40.11 — Connector/J reads this before EVERY statement,
+            // to decide whether the connection may be routed read-only,
+            // so an engine that does not answer it cannot run a single
+            // JDBC query (measured: `Unknown system variable
+            // 'transaction_read_only'` on a CREATE TABLE).
+            //
+            // The SESSION default, not the open transaction's mode. The
+            // two engines genuinely differ and this surface has to match
+            // the one it claims to be: measured, MySQL 9.7.2 answers 0
+            // inside `START TRANSACTION READ ONLY` and 1 after
+            // `SET SESSION transaction_read_only=1`, while PostgreSQL
+            // 18.6 answers `on` inside `BEGIN READ ONLY` and `off` after
+            // it commits. `transaction_read_only()` implements PG's
+            // reading and stays on the PG surface; MySQL's question is
+            // the one `default_read_only()` answers.
+            (
+                "transaction_read_only",
+                String::from(if self.default_read_only() { "ON" } else { "OFF" }),
             ),
         ];
-        for &(k, v) in canonical {
+        // Live values must not be shadowed by a stale copy in the
+        // session map: `SET transaction_isolation` records a string
+        // there, and reporting it back would hide what the engine
+        // actually runs. `time_zone` and the character-set names are the
+        // other way round — the session's own value IS the answer.
+        let live = |k: &str| {
+            matches!(
+                k,
+                "lower_case_table_names"
+                    | "transaction_isolation"
+                    | "transaction_read_only"
+                    | "warning_count"
+            )
+        };
+        let mut named: Vec<(&str, String)> = Vec::new();
+        for &(k, v) in crate::mysql_vars::CONSTANT {
             // v7.39 — a canonical name used to report its DEFAULT here
-            // forever, because this pushed the constant and the
-            // session-parameter loop below skips any name already in this
-            // table. So `SET sql_mode = 'NO_ZERO_DATE'` was honoured by
-            // `@@sql_mode` and ignored by `SHOW VARIABLES`, which went on
-            // naming the default — and the same held for every other
-            // canonical name, `SET NAMES` included.
-            //
-            // Measured on MySQL 9.7.2: after `SET sql_mode='NO_ZERO_DATE'`
-            // both surfaces answer `NO_ZERO_DATE`.
-            //
-            // `transaction_isolation` and `transaction_read_only` are
-            // excluded because their value here is computed live from the
-            // engine, not stored: a stale copy in the parameter map would
-            // shadow the truth rather than reveal it.
-            let live = matches!(k, "transaction_isolation" | "transaction_read_only");
-            let value = if live {
+            // forever, because the session-parameter loop below skips
+            // any name already in this table. So `SET sql_mode =
+            // 'NO_ZERO_DATE'` was honoured by `@@sql_mode` and ignored
+            // by `SHOW VARIABLES`, which went on naming the default —
+            // and the same held for every other canonical name,
+            // `SET NAMES` included. Measured on MySQL 9.7.2: after
+            // `SET sql_mode='NO_ZERO_DATE'` both surfaces answer
+            // `NO_ZERO_DATE`.
+            let value = self
+                .session_params
+                .get(k)
+                .map_or_else(|| String::from(v.show()), Clone::clone);
+            named.push((k, value));
+        }
+        for (k, v) in computed {
+            let value = if live(k) {
                 v
             } else {
-                self.session_params.get(k).map_or(v, String::as_str)
+                self.session_params.get(k).map_or(v, Clone::clone)
             };
-            rows.push(Row::new(alloc::vec![
-                Value::text::<String>(k.into()),
-                Value::text::<String>(value.into()),
-            ]));
+            named.push((k, value));
         }
-        // Session-set parameters surface here too.
+        // Session-set parameters surface here too — except the
+        // PostgreSQL-namespaced ones.
+        //
+        // v7.40.11 — `spg.database`, which every mysql-wire session
+        // carries, was listed here as a MySQL system variable. Not one
+        // of MySQL 9.7.2's 655 names contains a dot (measured), and it
+        // refuses to set an unknown name at all, so a tool that dumps
+        // this listing and replays it as `SET` produced a statement no
+        // MySQL would accept. A dotted name is PostgreSQL's custom-GUC
+        // spelling and belongs to `SHOW`/`current_setting`, which is
+        // where it still answers.
         for (k, v) in &self.session_params {
-            if !canonical.iter().any(|(n, _)| (*n).eq_ignore_ascii_case(k)) {
-                rows.push(Row::new(alloc::vec![
-                    Value::text(k.clone()),
-                    Value::text(v.clone()),
-                ]));
+            if !k.contains('.') && !named.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
+                named.push((k.as_str(), v.clone()));
             }
         }
+        // MySQL 9.7.2 answers `SHOW VARIABLES` sorted by name — measured
+        // across all 655 of its rows — and a client that renders the
+        // listing shows it in whatever order it arrives.
+        named.sort_by(|a, b| a.0.cmp(b.0));
+        let rows: Vec<Row<'static>> = named
+            .into_iter()
+            .map(|(k, v)| {
+                Row::new(alloc::vec![
+                    Value::text::<String>(k.into()),
+                    Value::text(v),
+                ])
+            })
+            .collect();
         QueryResult::Rows { columns, rows }
     }
 

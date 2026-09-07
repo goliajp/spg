@@ -26,13 +26,36 @@ protocol shim:
   `SHOW STATUS` / `SHOW VARIABLES` / `SHOW PROCESSLIST`).
 - SSL upgrade via `CLIENT_SSL` capability bit.
 
-Confirmed-working clients (each verified by an e2e test):
+Clients, and what each claim rests on. v7.40.11 rewrote this list:
+it used to say "confirmed-working clients (each verified by an e2e
+test)" and name six, while the only client any test ran was the
+`mysql` CLI. When a JDBC driver was finally run against 7.40.10 it
+could not open a connection at all — Connector/J reads nineteen system
+variables in one statement before it hands back a `Connection`, and
+seven of them did not exist. A list that names a client nothing runs
+is a claim, not a result.
 
-- `mysql` CLI 8.0 / 8.4
-- `mariadb` CLI 11
-- JDBC (`mysql-connector-j` / MariaDB Connector/J)
+Exercised by the release acceptance panel, against the published
+image, on every release:
+
+- `mysql` CLI 9.7.2 — the official image, dialect and collation cases
+- `mariadb` CLI 12.3 — its own expectations, not a second name for
+  MySQL's
+- JDBC `mysql-connector-j` 9.4.0 — connect, `getGeneratedKeys()`,
+  prepared statements, rollback, `DatabaseMetaData.getColumns()`
+
+Exercised by tests over the wire, but not by the driver itself:
+
+- the statement Connector/J opens every connection with, captured
+  from MySQL 9.7.2's own `general_log`
+  (`crates/spg-server/tests/e2e/e2e_mysql_variable_surfaces_v7411.rs`)
+
+Reported working and NOT gated here — treat as unverified by this
+project:
+
 - Python `mysql.connector` / `pymysql`
 - Go `go-sql-driver/mysql`
+- MariaDB Connector/J, Connector/Node.js
 - Rust `sqlx` MySQL backend
 
 Enable with the `SPG_MYSQLWIRE_ADDR` env var on the SPG

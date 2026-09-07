@@ -6959,6 +6959,23 @@ fn apply_function_dispatch(
                     .last()
                     .and_then(|s| s.upper.as_ref())
                     .map_or(Value::Null, |v| (**v).clone())),
+                // v7.40.11 — MySQL's UPPER takes any type and renders it
+                // first: measured on 9.7.2, `UPPER(123)` is `123`,
+                // `LOWER(45.6)` is `45.6`, `UPPER(TRUE)` is `1`.
+                // PostgreSQL 18.6 refuses the same call
+                // (`function upper(integer) does not exist`), so the
+                // coercion is dialect-gated rather than universal.
+                //
+                // Found by running Connector/J's own
+                // `DatabaseMetaData.getColumns` query, which wraps
+                // `UPPER(...)` around a CASE whose arms are numeric
+                // (`NUMERIC_SCALE`, column sizes): every JDBC caller
+                // that reflects a table hit `upper() needs text, got
+                // bigint` and got no columns back.
+                other if ctx.mysql_dialect => Ok(Value::text(
+                    super::strings::value_to_format_text_styled_ref(other, &ctx.render_style)
+                        .to_uppercase(),
+                )),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("upper() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
@@ -6993,6 +7010,13 @@ fn apply_function_dispatch(
                     .first()
                     .and_then(|s| s.lower.as_ref())
                     .map_or(Value::Null, |v| (**v).clone())),
+                // See `upper` above — same measurement, same dialect gate.
+                other if ctx.mysql_dialect => Ok(Value::text(
+                    super::strings::value_to_format_text_styled_ref(other, &ctx.render_style)
+                        .chars()
+                        .flat_map(char::to_lowercase)
+                        .collect::<alloc::string::String>(),
+                )),
                 other => Err(EvalError::TypeMismatch {
                     detail: format!("lower() needs text, got {}", crate::conversions::pg_type_name_for_error_opt(other.data_type())),
                 }),
@@ -15184,6 +15208,17 @@ fn apply_function_dispatch(
                 && let Some(gucs) = ctx.session_gucs
                 && let Some(v) = gucs.get(lname.as_str())
             {
+                // v7.40.11 — `SET character_set_results = NULL` records
+                // the empty string (see `session.rs::set_session_param`
+                // for why that marker is unambiguous), and MySQL answers
+                // SQL NULL for it on this surface: measured on 9.7.2,
+                // `@@character_set_results IS NULL` is 1 while
+                // `SHOW VARIABLES` renders an empty value. Returning the
+                // empty string here would tell a client the results are
+                // transcoded to a charset with no name.
+                if v.is_empty() && lname == "character_set_results" {
+                    return Ok(Value::Null);
+                }
                 return Ok(Value::text(v.clone()));
             }
             // v7.38.18 (C12) — `@@warning_count` is LIVE, not a constant
@@ -15213,93 +15248,60 @@ fn apply_function_dispatch(
                     e.current_isolation_level().as_mysql_str(),
                 )));
             }
+            // v7.40.11 — the SESSION default, which is the question
+            // MySQL's variable of this name asks; see the entry in
+            // `show.rs` for the measurements that separate it from
+            // PostgreSQL's same-named one, which `current_setting`
+            // answers with `transaction_read_only()` further down.
+            //
+            // Connector/J reads this before EVERY statement, to decide
+            // whether the connection may be routed read-only, so an
+            // engine that does not answer it cannot run a single JDBC
+            // query.
+            if lname == "transaction_read_only"
+                && let Some(e) = ctx.engine
+            {
+                return Ok(Value::text::<String>(
+                    if e.default_read_only() { "1" } else { "0" }.into(),
+                ));
+            }
             if lname == "warning_count" {
                 let n = ctx.engine.map_or(0, crate::Engine::mysql_warning_count);
                 return Ok(Value::BigInt(n as i64));
             }
             let val = match lname.as_str() {
-                // MySQL-side variables a connector asks for. `autocommit`
-                // is 1 until the session says otherwise; the wire keeps
-                // the same answer in its status flags.
-                "autocommit" => "1",
-                // v7.40.11 — `default_authentication_plugin` was REMOVED
-                // and this replaced it. SPG already declined the removed
-                // one (the `tx_isolation` / `have_ssl` work below is the
-                // same class) and had never gained the replacement, so a
-                // client asking 9.7.2 which plugin a new account gets was
-                // told the variable does not exist. Measured on stock
-                // `mysql:9.7.2`: `*,,` — the compiled-in default, which
-                // is `caching_sha2_password`, and is what SPG verifies.
-                "authentication_policy" => crate::MYSQL_AUTHENTICATION_POLICY,
-                "version" => crate::MYSQL_SERVER_VERSION,
-                "version_comment" => crate::MYSQL_VERSION_COMMENT,
-                "sql_mode" => crate::MYSQL_DEFAULT_SQL_MODE,
-                // Measured on MySQL 9.7.2: 67108864 on both surfaces.
-                // `show.rs` already said so; this said 16777216.
-                "max_allowed_packet" => "67108864",
-                // v7.39 — `character_set_database` and
-                // `collation_database` were missing from both surfaces,
-                // so a MySQL session asking for either got
-                // `ERROR 1064 Unknown system variable` where MySQL 9.7.2
-                // answers `utf8mb4` / `utf8mb4_0900_ai_ci`. ORMs read
-                // them to reflect a schema; a hard error there is not a
-                // gap the caller can work around.
+                // v7.40.11 — everything this arm used to spell out by
+                // hand now comes from `mysql_vars::CONSTANT`, which
+                // `SHOW VARIABLES` renders from as well. The two were
+                // separate tables and drifted every release; the reason
+                // that mattered is in `show.rs` — measured, Connector/J
+                // could not open a connection at all.
                 //
-                // The value is a true statement about this database:
-                // measured, a MySQL-dialect session compares `'A' = 'a'`
-                // as equal, which is what `utf8mb4_0900_ai_ci` means.
-                // Unlike the connection pair these do NOT follow
-                // `SET NAMES` — MySQL scopes them to the database.
-                "character_set_client" | "character_set_connection"
-                | "character_set_results" | "character_set_server"
-                | "character_set_database" => "utf8mb4",
-                // v7.39.2 — the two of MySQL's remaining three that SPG
-                // can answer truthfully.
+                // What stays here is what this surface COMPUTES.
                 //
-                // `character_set_system` is what the server stores
-                // IDENTIFIERS in, and MySQL 9.7.2 says `utf8mb3` because
-                // it cannot hold a four-byte one: measured, it stores
-                // `` `z4b😀` `` as `z4b?`. SPG keeps `z4b😀`. So the true
-                // answer here is `utf8mb4` and it differs from MySQL's —
-                // reporting `utf8mb3` to match would be a claim about
-                // SPG that its own catalog contradicts.
+                // v7.40.11 — one session has ONE zone, and this said
+                // otherwise. The lookup above prefers the session's own
+                // value, so `SET time_zone = 'Asia/Tokyo'` was found and
+                // answered. The PostgreSQL spelling writes the same zone
+                // under the canonical name `timezone`, which the old
+                // constant never consulted — so `-c TimeZone=Asia/Tokyo`
+                // and `SET TimeZone` moved the zone the engine actually
+                // uses while a MySQL client reading `@@time_zone` was
+                // told `SYSTEM`. Measured: `current_setting('TimeZone')`
+                // answered `Asia/Tokyo` in the same session.
                 //
-                // `character_set_filesystem` is `binary` on MySQL, which
-                // means names are used as bytes rather than transcoded.
-                // That is true here too.
-                //
-                "character_set_system" => "utf8mb4",
-                "character_set_filesystem" => "binary",
-                // v7.39.3 — `character_sets_dir` IS answered now, and the
-                // reasoning that left it out has to be written down
-                // because it was good reasoning about the wrong cost.
-                //
-                // It names a directory of charset definition files.
-                // SPG has no such directory — its charsets are compiled
-                // in — so the note here said a path invented to fill the
-                // row would be a fabricated fact rather than a
-                // compatibility gain. What that weighed against was a
-                // DIFFERENT string; what a client actually gets is
-                // `ERROR: Unknown system variable`, and an error is not
-                // a more honest answer than a path, it is a broken
-                // session. `time_zone` is in this list for exactly that
-                // reason: without it no mysqldump could be restored at
-                // all, because every dump reads it on line five.
-                //
-                // The value is the path MySQL 9.7.2 reports, because
-                // that is the version SPG answers as
-                // (`MYSQL_SERVER_VERSION`), measured on the oracle:
-                // `/usr/share/mysql-9.7/charsets/`. It is a claim about
-                // the SHAPE of the answer, not about this filesystem —
-                // the same kind of claim as reporting `ENGINE=InnoDB`
-                // for a table SPG stores its own way, which the drop-in
-                // has made since it had an ENGINE clause at all. No
-                // client can observe the difference across the wire; one
-                // that opens the path would fail against a real MySQL
-                // whose directory had moved, too.
-                "character_sets_dir" => crate::MYSQL_CHARACTER_SETS_DIR,
-                "collation_connection" | "collation_server" | "collation_database" => {
-                    crate::collate::MYSQL_DEFAULT_CONNECTION_COLLATION
+                // `SYSTEM` stays the answer when nothing has set one,
+                // which is MySQL 9.7.2's own default (measured) and what
+                // every mysqldump preamble reads back on its fifth line.
+                "time_zone" => {
+                    return Ok(Value::text(
+                        ctx.engine
+                            .and_then(|e| e.session_param("timezone"))
+                            .map_or_else(
+                                || alloc::string::String::from("SYSTEM"),
+                                alloc::string::ToString::to_string,
+                            ),
+                    ));
                 }
                 // v7.39.2 — live, and truthful. It said `0`, which claims
                 // names are compared with case and stored as written;
@@ -15314,63 +15316,29 @@ fn apply_function_dispatch(
                         "0"
                     }
                 }
-                // v7.39 — `have_ssl` was REMOVED in MySQL 8.0.26 and
-                // MySQL 9.7.2 answers nothing for it on either surface
-                // (measured). SPG answered `YES` for a variable the
-                // engine it claims to be does not have; a client that
-                // asks now gets the same "unknown system variable" it
-                // would get from MySQL. `performance_schema` and
-                // `SHOW STATUS` are where TLS state lives in 8.0+.
-                "version_compile_os" => crate::MYSQL_COMPILE_OS,
-                // v7.39 (round 554) — the rest of what a mysqldump
-                // preamble reads back before it changes anything.
-                //
-                // The dump-compat gate had been blocked on this machine
-                // for rounds by a local Gatekeeper hang; run on the
-                // testbed it went straight through and reported 14
-                // failing fixtures with ONE cause — every MySQL and
-                // MariaDB dump stops at its fifth line:
-                //
-                //     /*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
-                //     ERROR: Unknown system variable 'time_zone'
-                //
-                // so no mysqldump could be restored at all. MariaDB 11
-                // readings: time_zone SYSTEM, system_time_zone UTC,
-                // unique_checks 1, foreign_key_checks 1, sql_notes 1,
-                // note_verbosity `basic,explain`,
-                // sql_quote_show_create 1, innodb_stats_on_metadata 0.
-                // v7.40.11 — one session has ONE zone, and this said
-                // otherwise.
-                //
-                // The lookup above prefers the session's own value, so
-                // `SET time_zone = 'Asia/Tokyo'` was found and answered.
-                // The PostgreSQL spelling writes the same zone under
-                // the canonical name `timezone`, which this constant
-                // never consulted — so `-c TimeZone=Asia/Tokyo` and
-                // `SET TimeZone` moved the zone the engine actually
-                // uses while a MySQL client reading `@@time_zone` was
-                // told `SYSTEM`. Measured: `current_setting('TimeZone')`
-                // answered `Asia/Tokyo` in the same session.
-                //
-                // `SYSTEM` stays the answer when nothing has set one,
-                // which is MySQL 9.7.2's own default (measured) and what
-                // every mysqldump preamble reads back.
-                "time_zone" => {
-                    return Ok(Value::text(
-                        ctx.engine
-                            .and_then(|e| e.session_param("timezone"))
-                            .map_or_else(
-                                || alloc::string::String::from("SYSTEM"),
-                                alloc::string::ToString::to_string,
-                            ),
-                    ));
-                }
-                "system_time_zone" => "UTC",
-                "unique_checks" | "foreign_key_checks" | "sql_notes"
-                | "sql_quote_show_create" => "1",
+                // MariaDB-only: MySQL 9.7.2 has no such variable
+                // (measured — zero rows on both surfaces), so it is
+                // deliberately absent from the inventory that
+                // `SHOW VARIABLES` lists, and answered here only because
+                // a MariaDB mysqldump preamble reads it back.
                 "note_verbosity" => "basic,explain",
-                "innodb_stats_on_metadata" => "0",
                 _ => {
+                    if let Some(v) = crate::mysql_vars::constant(&lname) {
+                        return Ok(Value::text::<String>(v.at_at().into()));
+                    }
+                    // v7.39 — `have_ssl` was REMOVED in MySQL 8.0.26 and
+                    // MySQL 9.7.2 answers nothing for it on either
+                    // surface (measured). SPG answered `YES` for a
+                    // variable the engine it claims to be does not have;
+                    // a client that asks now gets the same "unknown
+                    // system variable" it would get from MySQL.
+                    // `performance_schema` and `SHOW STATUS` are where
+                    // TLS state lives in 8.0+. `tx_isolation` is gone
+                    // for the same reason: MySQL 8.0.3 REMOVED that
+                    // spelling and 9.7.2 answers `Unknown system
+                    // variable 'tx_isolation'` on `@@` and zero rows on
+                    // SHOW (measured).
+                    //
                     // Fall through to the PG GUC inventory, so
                     // `@@server_version` and friends still answer — but
                     // ONLY for a name it actually knows. MariaDB answers an
