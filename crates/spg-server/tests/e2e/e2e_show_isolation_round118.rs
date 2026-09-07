@@ -526,3 +526,103 @@ fn a_subtransaction_refuses_the_isolation_switch() {
     );
     run_ok(&mut s, "ROLLBACK");
 }
+
+/// Run a whole multi-statement script as ONE simple query — the shape
+/// `psql -c "a; b; c"` sends, and the one the pgwire multi-statement
+/// path wraps in a transaction of its own.
+fn run_script(s: &mut TcpStream, sql: &str) -> Vec<String> {
+    send_query(s, sql);
+    read_until_ready(s)
+        .iter()
+        .filter_map(|m| match m.ty {
+            b'C' | b'E' => Some(
+                String::from_utf8_lossy(&m.body)
+                    .replace('\0', " ")
+                    .trim()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// v7.40.12 — `BEGIN <modes>` on an already-open transaction applies the
+/// modes. It used to warn and throw them away.
+///
+/// This is the safety-critical face of it: the pgwire multi-statement
+/// path wraps every script in a transaction, so EVERY leading `BEGIN` in
+/// a script is a nested one. `BEGIN READ ONLY; INSERT …; COMMIT;` sent
+/// as one script therefore opened nothing read-only, ACCEPTED the write
+/// and committed it. PG 18.6 refuses it and the table stays empty —
+/// measured on both engines with the same one-line script.
+///
+/// Applications open read-only transactions as a safety measure, which
+/// is why the corpus file that pins the single-statement form says
+/// accepting the write is the worst available answer.
+#[test]
+fn a_begin_inside_a_transaction_still_carries_its_modes() {
+    let dir = unique_tmpdir("nestedbegin");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+    run_ok(&mut s, "CREATE TABLE roro (x INT)");
+
+    // The headline. One script, one round trip.
+    let out = run_script(
+        &mut s,
+        "BEGIN READ ONLY; INSERT INTO roro VALUES (1); COMMIT;",
+    );
+    assert!(
+        out.iter()
+            .any(|m| m.contains("cannot execute INSERT in a read-only transaction")),
+        "the write was not refused: {out:?}"
+    );
+    assert_eq!(first_cell(&mut s, "SELECT count(*) FROM roro"), "0");
+
+    // The modes arrive wherever the BEGIN sits in the script, which is
+    // PG's behaviour too — its implicit block is converted in place.
+    let out = run_script(
+        &mut s,
+        "SELECT 1; BEGIN READ ONLY; INSERT INTO roro VALUES (2); COMMIT;",
+    );
+    assert!(
+        out.iter()
+            .any(|m| m.contains("cannot execute INSERT in a read-only transaction")),
+        "a BEGIN after a statement lost its modes: {out:?}"
+    );
+    assert_eq!(first_cell(&mut s, "SELECT count(*) FROM roro"), "0");
+
+    // And the refusals come with the modes: PG reports SET TRANSACTION's
+    // own message for a statement the user spelled BEGIN.
+    let out = run_script(
+        &mut s,
+        "SELECT 1; BEGIN ISOLATION LEVEL SERIALIZABLE; SELECT 1;",
+    );
+    assert!(
+        out.iter()
+            .any(|m| m.contains("SET TRANSACTION ISOLATION LEVEL must be called before any query")),
+        "{out:?}"
+    );
+
+    // Nested inside an EXPLICIT block, one statement per round trip: PG
+    // warns AND applies. The warning is a NoticeResponse, not an error.
+    run_ok(&mut s, "BEGIN");
+    assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
+    assert_eq!(first_cell(&mut s, "SHOW transaction_read_only"), "off");
+    run_ok(&mut s, "BEGIN READ ONLY");
+    assert_eq!(
+        first_cell(&mut s, "SHOW transaction_read_only"),
+        "on",
+        "the nested BEGIN warned and threw its modes away"
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // PG's tag for this statement is both words; the default arm
+    // answered `START`.
+    let out = run_script(&mut s, "START TRANSACTION READ ONLY; COMMIT;");
+    assert!(
+        out.iter().any(|m| m.contains("START TRANSACTION")),
+        "command tag: {out:?}"
+    );
+}

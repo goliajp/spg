@@ -1577,6 +1577,13 @@ fn dispatch_pg_simple_query_multi(
                 settings,
                 &mut discard,
             )?;
+            // v7.40.12 — tell the engine this transaction is OURS, so a
+            // `BEGIN` in the script does not warn about it. PG does not
+            // warn inside its own implicit block; it does inside an
+            // explicit one, and both are measured.
+            if let Ok(mut e) = state.engine.write() {
+                e.mark_tx_implicit(conn_state.tx_id);
+            }
             implicit_tx = true;
         }
         let pre_len = wbuf.len();
@@ -2848,6 +2855,12 @@ fn command_tag(sql: &str, affected: usize) -> String {
         "UPDATE" => format!("UPDATE {affected}"),
         "DELETE" => format!("DELETE {affected}"),
         "BEGIN" => "BEGIN".to_string(),
+        // v7.40.12 — PG's tag for this one is BOTH words. The default
+        // arm uppercased the first and answered `START`, so a driver
+        // that keys on the tag saw a command it does not have. Measured
+        // on PG 18.6: `START TRANSACTION` and `START TRANSACTION READ
+        // ONLY` both answer `START TRANSACTION`.
+        "START" => "START TRANSACTION".to_string(),
         // v7.39 (round 320, V53) — PG tags DISCARD with the target it
         // named: `DISCARD ALL` / `DISCARD PLANS` / …
         "DISCARD" => {

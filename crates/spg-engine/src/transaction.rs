@@ -632,6 +632,7 @@ impl Engine {
                 },
                 users: None,
                 savepoints: Vec::new(),
+                opened_implicitly: false,
                 cached_snapshot,
                 touched_tables: alloc::collections::BTreeSet::new(),
                 read_tables: alloc::collections::BTreeSet::new(),
