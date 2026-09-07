@@ -10,6 +10,87 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the wire answered `SHOW` from a copy, and a copy cannot carry a live value
+
+Found by the `full` tier, which had not run for 19 days: two
+`spg_baseline/16_isolation` fixtures failed in the `server_simple`
+permutation and passed in `embedded`. Engine right, wire wrong.
+
+`handle_pg_simple_query` and its multi-statement twin intercepted every
+`SHOW <name>` before the engine saw it — the engine's STORED
+`session_params` first, then a 21-entry table of frozen defaults —
+and `canned_response` did the same for `SELECT <int>` / `SELECT NULL`.
+Round 118 removed one name, `transaction_isolation`, from a canned list
+for exactly this reason and left the same name in this one. The name
+list was never the defect. Measured against PostgreSQL 18.6:
+
+```text
+  BEGIN READ ONLY; SHOW transaction_read_only        off     PG: on
+  SET default_transaction_isolation='repeatable read';
+    SHOW transaction_isolation               read committed  PG: repeatable read
+  BEGIN DEFERRABLE; SHOW transaction_deferrable      off     PG: on
+  SHOW ALL                                21 rows, no descs  PG: 399 rows
+  SHOW spam_x                                      42000     PG: 42704
+  SHOW SESSION AUTHORIZATION                syntax error     PG: the login name
+  BEGIN; SELECT 1; SET TRANSACTION ISOLATION LEVEL …  SET    PG: ERROR 25001
+```
+
+The stale copy is visible in the act on line 2: the stored string is
+written by `BEGIN`, not by `SET`, so `SHOW` answered one statement
+behind. The cheapest detector for the whole class is one extra line in
+a probe — inside one transaction on one connection,
+`SELECT current_setting('transaction_read_only')` answered `on` while
+`SHOW transaction_read_only` answered `off`.
+
+`SHOW ALL` hid its own arithmetic. `SELECT count(*) FROM pg_settings`
+answered 399 on the connection that saw 21, so the count was right and
+the inventory was not: diffing the two name lists showed SPG missing
+PG's `output_plugin_libraries` and carrying an internal
+`__spg_session_user` key whose own doc comment says the prefix "keeps
+it out of the user-visible GUC namespace". Two errors that cancelled to
+PG's number.
+
+The last line is the same defect wearing the perf fast path. The
+engine's refusal keys on the transaction's statement counter, and a
+canned `SELECT 1` never told the engine a query had run — `SELECT 1+0`
+in the same position refused correctly, which is what named it.
+
+The wire no longer answers `SHOW` at all, and nothing is canned inside
+a transaction block. The population the fast paths exist for — pool
+keepalives, liveness probes, BI canaries — is sent in autocommit, so
+they still answer there. The parser learned `SHOW TIME ZONE` (only the
+deleted shortcut had known it) and `SHOW SESSION AUTHORIZATION`
+(nothing had). `DEFERRABLE` is now carried rather than parsed and
+dropped, the way `READ ONLY` was before v7.39; SPG reports the property
+and does not defer, so the only difference a client can observe against
+PG is a wait, never a different answer.
+
+Fixing the statement counter made a pre-existing OVER-refusal visible
+for the first time: SPG refused the whole of `SET TRANSACTION` after a
+query. PG has three separate rules there, and now so does SPG —
+measured, after a query in a block:
+
+```text
+  SET TRANSACTION READ ONLY                        SET
+  SET TRANSACTION READ WRITE   (read-write block)  SET
+  SET TRANSACTION READ WRITE   (READ ONLY block)   25001 "transaction read-write
+                                                          mode must be set before
+                                                          any query"
+  SET TRANSACTION ISOLATION LEVEL <any>            25001 "… must be called before
+                                                          any query"
+  SET TRANSACTION [NOT] DEFERRABLE                 25001 (both directions)
+```
+
+Tightening is always allowed; only loosening a read-only transaction,
+and changing the level or the deferrable property, are refused.
+
+The three corpus fixtures carrying these have pinned the behaviour
+since v7.39 — but the corpus only runs over the WIRE in the
+perm-runner's server legs, which live in the `full` tier. The new
+assertions are in `e2e_show_isolation_round118.rs`, the test that fixed
+one face of this defect and did not ask about the others, because the
+e2e gate runs on every commit.
+
 
 ## [7.40.11] — 2026-09-07
 

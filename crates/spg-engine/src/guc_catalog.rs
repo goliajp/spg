@@ -2541,6 +2541,22 @@ pub(crate) const PG_GUC_CONTEXTS: &[(&str, &str, &str, &str, &str, &str, &str, &
         "Lists libraries that may be called to validate OAuth v2 bearer tokens.",
     ),
     (
+        // v7.40.12 — PG 18.6 has this row and SPG's table did not, so
+        // `SHOW ALL` returned 398 names where PG returns 399. Found by
+        // diffing the two lists name by name, which is the only way a
+        // one-row gap in a 399-row inventory shows itself; the counts
+        // had matched by coincidence, SPG's extra row being an internal
+        // `__spg_` key that leaked into `pg_settings`.
+        "output_plugin_libraries",
+        "superuser",
+        "pgoutput, test_decoding",
+        "string",
+        "Replication / Sending Servers",
+        "",
+        "pgoutput, test_decoding",
+        "Lists libraries that may be named as logical decoding output plugins.",
+    ),
+    (
         "parallel_leader_participation",
         "user",
         "on",

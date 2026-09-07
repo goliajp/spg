@@ -10639,6 +10639,16 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         if k.contains('.') {
             continue;
         }
+        // v7.40.12 — nor the reserved `__spg_` keys. Their own doc
+        // comment says the prefix "keeps it out of the user-visible GUC
+        // namespace", and this loop was the place that did not honour
+        // it: every wire connection sets `__spg_session_user`, so every
+        // wire connection had a `pg_settings` row PG has no name for.
+        // It hid a real gap, too — the row count matched PG's 399 while
+        // the inventory was one PG name short.
+        if k.starts_with("__spg_") {
+            continue;
+        }
         let vartype = infer_guc_vartype(v);
         rows.push(Row::new(alloc::vec![
             Value::text(k.clone()),

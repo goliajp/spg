@@ -906,7 +906,28 @@ impl Engine {
                     "off"
                 })
             }
+            // v7.40.12 — the DEFERRABLE sibling of the two above, and
+            // wrong for the same reason: the clause was parsed and
+            // dropped. Measured on PG 18.6: `off` by default, `on`
+            // inside `BEGIN DEFERRABLE`, `off` again after it ends.
+            "transaction_deferrable" => {
+                alloc::string::String::from(if self.transaction_deferrable() {
+                    "on"
+                } else {
+                    "off"
+                })
+            }
             "is_superuser" => alloc::string::String::from("on"),
+            // v7.40.12 — PG answers `SHOW session_authorization` with the
+            // LOGIN identity, and has no `pg_settings` row for it — the
+            // same shape as `is_superuser` directly above, measured on
+            // PG 18.6 (`SHOW session_authorization` -> testuser, and
+            // `SELECT … FROM pg_settings WHERE name='session_authorization'`
+            // -> no rows). SPG answered `unrecognized configuration
+            // parameter` while `SELECT session_user` on the same
+            // connection answered correctly: one identity, two surfaces,
+            // one of them denying the name exists.
+            "session_authorization" => alloc::string::String::from(self.session_user()),
             _ => {
                 // Canonical GUC? report the session override or its
                 // boot default. Otherwise a user-set custom GUC, or a
@@ -2890,15 +2911,54 @@ impl Engine {
                 // after the transaction's first query (SQLSTATE 25001);
                 // silently applying it to the remaining statements would
                 // give a tx that is half one level, half another.
-                if let Some(tx_id) = self.current_tx
-                    && self
-                        .tx_catalogs
+                //
+                // v7.40.12 — but ONLY the isolation half, and only that
+                // one plus the read-write half of a read-only block.
+                // This refusal covered the whole statement, so
+                // `BEGIN; SELECT 1; SET TRANSACTION READ ONLY` was
+                // refused where PG answers `SET`. It had been invisible
+                // over the wire because a canned `SELECT 1` never told
+                // the engine a query had run, so the refusal fired for
+                // nothing; fixing the counter is what exposed it.
+                //
+                // Measured on PostgreSQL 18.6, after a query in a block:
+                //   SET TRANSACTION READ ONLY                 -> SET
+                //   SET TRANSACTION READ WRITE (r/w block)    -> SET
+                //   SET TRANSACTION READ WRITE (r/o block)    -> 25001
+                //     "transaction read-write mode must be set before
+                //      any query"
+                //   SET TRANSACTION ISOLATION LEVEL <any>     -> 25001
+                // Tightening is allowed at any point; only LOOSENING a
+                // read-only transaction, and only changing the level,
+                // are refused once a snapshot has been taken.
+                let ran_a_query = self.current_tx.is_some_and(|tx_id| {
+                    self.tx_catalogs
                         .get(&tx_id)
                         .is_some_and(|st| st.stmts_run > 0)
-                {
-                    return Err(EngineError::Unsupported(
-                        "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
-                    ));
+                });
+                if ran_a_query {
+                    if modes.isolation.is_some() {
+                        return Err(EngineError::Unsupported(
+                            "SET TRANSACTION ISOLATION LEVEL must be called before any query"
+                                .into(),
+                        ));
+                    }
+                    if modes.read_only == Some(false) && self.current_tx_read_only {
+                        return Err(EngineError::Unsupported(
+                            "transaction read-write mode must be set before any query".into(),
+                        ));
+                    }
+                    // PG's third rule, and its own wording. Measured:
+                    // `BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE` ->
+                    // 25001. Unlike the read/write half this refuses in
+                    // BOTH directions, which is why it is not gated on
+                    // the current value.
+                    if modes.deferrable.is_some() {
+                        return Err(EngineError::Unsupported(
+                            "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
+                                .into(),
+                        ));
+                    }
                 }
                 if let Some(isolation) = modes.isolation {
                     self.current_isolation_level = isolation;
@@ -2907,6 +2967,10 @@ impl Engine {
                 // parsed and dropped with the rest of the clause.
                 if let Some(ro) = modes.read_only {
                     self.current_tx_read_only = ro;
+                }
+                // v7.40.12 — the DEFERRABLE third of the same clause.
+                if let Some(d) = modes.deferrable {
+                    self.current_tx_deferrable = d;
                 }
                 let isolation = self.current_isolation_level;
                 // v7.37.17 (Phase E2) — inside an open tx, switching to

@@ -10,11 +10,25 @@
 # Two surfaces said the parameter was real and the third said it was
 # not, for 367 of PG's 398 names. Every expectation below was read from
 # a live PG 18.4.
+#
+# v7.40.12 — 398 -> 399. The number moved because the inventory was
+# wrong in two places that happened to cancel: SPG was missing PG's
+# `output_plugin_libraries` and was publishing an internal
+# `__spg_session_user` key as a row. Over the wire, where that key is
+# always set, the count read 399 and looked right; embedded it read 398
+# and looked right against this line. Neither was PG's list.
+#
+# The count is the weakest possible judge of an inventory, and it had
+# just proved it, so this was settled name by name against a live
+# PG 18.6 instead: `SELECT name FROM pg_settings ORDER BY 1` on both
+# engines, diffed, ZERO names on either side. `SHOW ALL` returns the
+# same 399 names on both, too — one inventory, three surfaces, still
+# agreeing.
 
 query I
 SELECT count(*) FROM pg_settings
 ----
-398
+399
 
 # The name round 474 chose as its example of a knob worth hiding. It was
 # never hidden — SHOW answered for it the whole time.
@@ -94,8 +108,8 @@ SELECT count(*) FROM pg_settings WHERE name = 'nosuchknob'
 0
 
 # PG 18.4 answers `SHOW is_superuser` and yet has NO pg_settings row for
-# it. That asymmetry is PG's, so it is SPG's: it was the single reason
-# SHOW ALL returned 399 where PG returns 398.
+# it. That asymmetry is PG's, so it is SPG's — and it is why the count
+# above is not simply "every name SHOW answers".
 query I
 SELECT count(*) FROM pg_settings WHERE name = 'is_superuser'
 ----
@@ -105,3 +119,43 @@ query T
 SHOW is_superuser
 ----
 on
+
+# v7.40.12 — `session_authorization` is the second name shaped that way,
+# measured the same way on PG 18.6: `SHOW session_authorization` answers
+# the login identity and `pg_settings` has no row for it. SPG answered
+# `unrecognized configuration parameter` while `SELECT session_user` on
+# the same session answered correctly — one identity, two surfaces, one
+# of them denying the name existed.
+query I
+SELECT count(*) FROM pg_settings WHERE name = 'session_authorization'
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT session_user) t WHERE session_user IS NOT NULL
+----
+1
+
+# v7.40.12 — DEFERRABLE was consumed and dropped by the parser, so a
+# transaction that asked for it was told nothing had happened. Measured
+# on PG 18.6: off by default, on inside the block, off again after.
+query T
+SHOW transaction_deferrable
+----
+off
+
+statement ok
+BEGIN DEFERRABLE
+
+query T
+SHOW transaction_deferrable
+----
+on
+
+statement ok
+ROLLBACK
+
+query T
+SHOW transaction_deferrable
+----
+off
