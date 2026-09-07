@@ -169,6 +169,13 @@ pub(crate) fn classify_stmt_for_tx(stmt: &spg_sql::ast::Statement) -> TxStmtClas
         | S::ShowProcesslist
         | S::ShowColumns { .. }
         | S::ShowUsers
+        // v7.40.12 — `SHOW <param>`, `RESET <param>` and `LOCK TABLE`
+        // were missing from this list, so they fell to `Other` and
+        // POISONED the RC rebase: a plain `SHOW work_mem` inside a
+        // transaction cost that transaction its rebase for the rest of
+        // its life. None of the three writes a row.
+        | S::ShowParameter(_)
+        | S::ResetParameter(_)
         | S::Explain { .. }
         | S::Empty => TxStmtClass::ReadOnly,
         _ => TxStmtClass::Other,
@@ -527,22 +534,27 @@ impl Engine {
         None
     }
 
-    pub(crate) fn record_tx_stmt(&mut self, class: &TxStmtClass) {
+    pub(crate) fn record_tx_stmt(&mut self, class: &TxStmtClass, takes_snapshot: bool) {
         let Some(tx_id) = self.current_tx else { return };
         let Some(st) = self.tx_catalogs.get_mut(&tx_id) else {
             return;
         };
+        // v7.40.12 — the counter answers exactly one question, "has this
+        // transaction taken a snapshot", and a utility statement has
+        // not. It used to be bumped by every statement in every class,
+        // which over-refused `SET TRANSACTION` after a `SET` or a
+        // `SHOW`. `takes_a_snapshot` carries the measured list.
+        if takes_snapshot {
+            st.stmts_run = st.stmts_run.saturating_add(1);
+        }
         match class {
-            TxStmtClass::TxControl => {}
-            TxStmtClass::ReadOnly => st.stmts_run = st.stmts_run.saturating_add(1),
+            TxStmtClass::TxControl | TxStmtClass::ReadOnly => {}
             TxStmtClass::Dml(tables) => {
-                st.stmts_run = st.stmts_run.saturating_add(1);
                 for t in tables {
                     st.touched_tables.insert(t.clone());
                 }
             }
             TxStmtClass::Other => {
-                st.stmts_run = st.stmts_run.saturating_add(1);
                 st.rebase_poisoned = true;
             }
         }
@@ -1269,4 +1281,57 @@ impl crate::Engine {
             st.aborted = on;
         }
     }
+}
+
+/// v7.40.12 — does this statement take a snapshot?
+///
+/// PG refuses `SET TRANSACTION ISOLATION LEVEL` (and the DEFERRABLE and
+/// read-write halves) once the transaction has taken one, and a
+/// UTILITY statement does not take one. The counter this feeds used to
+/// be bumped by every statement, which was invisible until the pgwire
+/// SHOW shortcut was removed and `SHOW` started reaching the engine:
+/// `BEGIN; SHOW work_mem; SET TRANSACTION ISOLATION LEVEL …` then
+/// refused where PG answers `SET`. `SET` had been over-counted the
+/// whole time — it always reached the engine.
+///
+/// The list is measured, not read out of PG's source: each statement
+/// below was run inside `BEGIN`, followed by the isolation switch, on a
+/// live PG 18.6, and these are the ones the switch SURVIVED. Everything
+/// else counted, including the ones that look like plumbing —
+/// `DISCARD PLANS`, `DEALLOCATE ALL`, `COMMENT ON`, `PREPARE`,
+/// `EXPLAIN`, `DECLARE … CURSOR`.
+///
+/// Savepoints and the transaction verbs never reach here: they are
+/// `TxStmtClass::TxControl`, which records nothing.
+pub(crate) fn takes_a_snapshot(stmt: &spg_sql::ast::Statement) -> bool {
+    use spg_sql::ast::{Statement as S, ValidateOnlyKind as K};
+    !matches!(
+        stmt,
+        // The transaction verbs themselves. They used to be excluded by
+        // living in `TxStmtClass::TxControl`, whose arm did no
+        // recording; moving the counter out of that match made `BEGIN`
+        // bump it, so EVERY transaction looked like it had already run
+        // a query. Measured on PG 18.6: `BEGIN; SAVEPOINT sp; SET
+        // TRANSACTION ISOLATION LEVEL …` is accepted.
+        S::Begin(_)
+            | S::Commit
+            | S::Rollback
+            | S::Savepoint(_)
+            | S::RollbackToSavepoint(_)
+            | S::ReleaseSavepoint(_)
+            | S::SetTransaction { .. }
+            | S::SetParameter { .. }
+            | S::SetParameterList(_)
+            | S::SetUserVars(..)
+            | S::SetRole(_)
+            | S::ShowParameter(_)
+            | S::ResetParameter(_)
+            | S::Listen(_)
+            | S::Unlisten(_)
+            | S::Notify { .. }
+            | S::ValidateOnly {
+                kind: K::LockTable | K::SessionAuthorization,
+                ..
+            }
+    )
 }

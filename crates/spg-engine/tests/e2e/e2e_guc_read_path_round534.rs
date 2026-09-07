@@ -152,7 +152,18 @@ fn round534_unknown_names_are_still_unknown() {
 #[test]
 fn round534_pg_settings_reports_every_pg18_parameter() {
     let mut e = engine();
-    assert_eq!(text(&mut e, "SELECT count(*) FROM pg_settings"), "398");
+    // v7.40.12 — 398 -> 399. The inventory was wrong in two places that
+    // happened to cancel: SPG was missing PG's `output_plugin_libraries`
+    // and was publishing an internal `__spg_session_user` key as a row.
+    // Over the wire, where that key is always set, the count read 399
+    // and looked right; embedded it read 398 and looked right against
+    // this line. Neither was PG's list.
+    //
+    // The count is the weakest possible judge of an inventory and it had
+    // just proved it, so this was settled name by name against a live
+    // PG 18.6: `SELECT name FROM pg_settings ORDER BY 1` on both
+    // engines, diffed, ZERO names on either side.
+    assert_eq!(text(&mut e, "SELECT count(*) FROM pg_settings"), "399");
     // The one round 474 named as the case for staying curated.
     assert_eq!(
         text(

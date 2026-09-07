@@ -4404,7 +4404,7 @@ impl Parser {
                         Token::String(r) | Token::Ident(r) | Token::QuotedIdent(r) => {
                             self.advance();
                             return Ok(Statement::ValidateOnly {
-                                kind: crate::ast::ValidateOnlyKind::RoleName,
+                                kind: crate::ast::ValidateOnlyKind::SessionAuthorization,
                                 names: alloc::vec![r],
                             });
                         }

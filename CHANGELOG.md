@@ -91,6 +91,59 @@ assertions are in `e2e_show_isolation_round118.rs`, the test that fixed
 one face of this defect and did not ask about the others, because the
 e2e gate runs on every commit.
 
+### Fixed — a `SET` or a `SHOW` counted as a query, and a subtransaction did not
+
+The refusal above keys on whether the transaction has taken a snapshot,
+and a UTILITY statement does not take one. SPG's counter was bumped by
+every statement instead, so `BEGIN; SHOW work_mem; SET TRANSACTION
+ISOLATION LEVEL …` refused where PG answers `SET`. `SET` had been
+over-counted the whole time — it always reached the engine — and `SHOW`
+joined it the moment the wire stopped answering `SHOW` itself, which is
+how the over-count came to light at all.
+
+The dividing line is measured, not read out of PG's source: each of
+these was run inside `BEGIN`, followed by the isolation switch, on a
+live PG 18.6.
+
+```text
+  does not count   SET, SET LOCAL, SET ROLE, SHOW, RESET, SAVEPOINT,
+                   LOCK TABLE, LISTEN, UNLISTEN, NOTIFY,
+                   SET SESSION AUTHORIZATION
+  counts           SELECT, INSERT, CREATE TABLE, TRUNCATE, EXPLAIN,
+                   COMMENT ON, PREPARE, DEALLOCATE ALL, DISCARD PLANS,
+                   DROP OWNED BY, REASSIGN OWNED BY, ALTER ROLE
+```
+
+"Utility statement" is not the line — `DISCARD PLANS` and `DEALLOCATE
+ALL` are in the counting half. Splitting the list also split an SPG AST
+variant: `SET SESSION AUTHORIZATION` shared `ValidateOnlyKind::RoleName`
+with `DROP OWNED BY`, `REASSIGN OWNED BY` and `ALTER ROLE`, and PG
+answers this one question differently for it than for the other three.
+
+A subtransaction is a second rule SPG did not have. Measured on PG 18.6
+in `BEGIN; SAVEPOINT sp; …`, all three 25001 and each worded its own
+way:
+
+```text
+  ISOLATION LEVEL     must not be called in a subtransaction
+  [NOT] DEFERRABLE    cannot be called within a subtransaction
+  READ ONLY           accepted (tightening always is)
+  READ WRITE, in a read-only block
+                      cannot set transaction read-write mode inside a
+                      read-only transaction
+```
+
+The savepoint has to be OPEN: after `RELEASE SAVEPOINT` the switch is
+accepted again, and after `ROLLBACK TO SAVEPOINT` it is not, because PG
+keeps the savepoint there and so does SPG's stack. The snapshot rule is
+checked first, which is PG's order too — with a query already run AND a
+savepoint open, PG reports the "before any query" message.
+
+`pg_settings` moved from 398 rows to 399 as part of the inventory fix
+above; the two tests that pinned 398 now pin PG's number, settled name
+by name rather than by count.
+
+
 
 ## [7.40.11] — 2026-09-07
 

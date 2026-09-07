@@ -1617,9 +1617,13 @@ impl Engine {
         // v7.39 (round 552) — what a SERIALIZABLE tx READ, taken before
         // the statement is consumed, recorded after it succeeds.
         let read_tables = crate::transaction::read_tables_of(&stmt);
+        // v7.40.12 — taken before the statement is consumed; see
+        // `takes_a_snapshot` for the measured list and why the counter
+        // needs it.
+        let takes_snapshot = crate::transaction::takes_a_snapshot(&stmt);
         let result = self.dispatch_stmt_inner(stmt, cancel);
         if result.is_ok() {
-            self.record_tx_stmt(&tx_class);
+            self.record_tx_stmt(&tx_class, takes_snapshot);
             self.record_tx_reads(read_tables);
         }
         // v7.39 (round 298) — the witness is THIS connection's slot.
@@ -2038,7 +2042,7 @@ impl Engine {
                             }
                         }
                     }
-                    K::RoleName => {
+                    K::RoleName | K::SessionAuthorization => {
                         for n in names {
                             if !self.role_exists(n.as_str()) {
                                 return Err(EngineError::Unsupported(alloc::format!(
@@ -2956,6 +2960,52 @@ impl Engine {
                     if modes.deferrable.is_some() {
                         return Err(EngineError::Unsupported(
                             "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
+                                .into(),
+                        ));
+                    }
+                }
+                // v7.40.12 — inside a SUBTRANSACTION, PG refuses two of
+                // the three whatever the snapshot says, each with its own
+                // wording, and all three 25001. Measured on PG 18.6, in
+                // `BEGIN; SAVEPOINT sp; ...`:
+                //
+                //   ISOLATION LEVEL   must not be called in a subtransaction
+                //   [NOT] DEFERRABLE  cannot be called within a subtransaction
+                //   READ ONLY         accepted
+                //   READ WRITE, in a read-only block
+                //                     cannot set transaction read-write mode
+                //                     inside a read-only transaction
+                //
+                // The savepoint has to be OPEN: after `RELEASE SAVEPOINT`
+                // the switch is accepted again, and after `ROLLBACK TO
+                // SAVEPOINT` it is not -- PG keeps the savepoint there,
+                // and so does this stack. The snapshot rule above is
+                // checked first, which is PG's order too: with a query
+                // already run AND a savepoint open, PG reports the
+                // "before any query" message.
+                let in_subtransaction = self
+                    .current_tx
+                    .and_then(|tx_id| self.tx_catalogs.get(&tx_id))
+                    .is_some_and(|st| !st.savepoints.is_empty());
+                if in_subtransaction {
+                    if modes.isolation.is_some() {
+                        return Err(EngineError::Unsupported(
+                            "SET TRANSACTION ISOLATION LEVEL must not be called in a \
+                             subtransaction"
+                                .into(),
+                        ));
+                    }
+                    if modes.deferrable.is_some() {
+                        return Err(EngineError::Unsupported(
+                            "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a \
+                             subtransaction"
+                                .into(),
+                        ));
+                    }
+                    if modes.read_only == Some(false) && self.current_tx_read_only {
+                        return Err(EngineError::Unsupported(
+                            "cannot set transaction read-write mode inside a read-only \
+                             transaction"
                                 .into(),
                         ));
                     }

@@ -388,3 +388,141 @@ fn an_integer_select_inside_a_block_is_a_query() {
     assert_eq!(first_cell(&mut s, "SELECT 1"), "1");
     assert_eq!(first_cell(&mut s, "SELECT -42"), "-42");
 }
+
+/// v7.40.12 — which statements make a transaction "have run a query".
+///
+/// PG refuses `SET TRANSACTION ISOLATION LEVEL` once the transaction has
+/// taken a snapshot, and a UTILITY statement does not take one. SPG's
+/// counter was bumped by every statement instead. It was invisible while
+/// the pgwire shortcut answered `SHOW` without the engine; removing that
+/// shortcut made `BEGIN; SHOW work_mem; SET TRANSACTION …` refuse where
+/// PG answers `SET` — and `SET` had been over-counted the whole time,
+/// since it always reached the engine.
+///
+/// Every row below was run against a live PostgreSQL 18.6 in exactly
+/// this shape (`BEGIN; <statement>; SET TRANSACTION ISOLATION LEVEL
+/// SERIALIZABLE`) and carries PG's answer, including the ones that look
+/// like plumbing and still count.
+#[test]
+fn only_a_snapshot_makes_a_transaction_have_run_a_query() {
+    let dir = unique_tmpdir("snapshot");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+    run_ok(&mut s, "CREATE TABLE ro (x INT)");
+
+    // Does NOT count — the switch still succeeds after each of these.
+    for stmt in [
+        "SET application_name = 'x'",
+        "SET LOCAL work_mem = '8MB'",
+        "SHOW work_mem",
+        "RESET application_name",
+        "SAVEPOINT sp",
+        "LOCK TABLE ro",
+        "LISTEN ch",
+        "UNLISTEN ch",
+        "NOTIFY ch",
+    ] {
+        run_ok(&mut s, "BEGIN");
+        run_ok(&mut s, stmt);
+        // SAVEPOINT opens a subtransaction, where PG refuses the switch
+        // for a DIFFERENT reason and with different words — that rule is
+        // pinned below. Here only the counter is under test.
+        let code = err_code(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+        if stmt == "SAVEPOINT sp" {
+            assert_eq!(code.as_deref(), Some("25001"), "after {stmt}");
+        } else {
+            assert_eq!(code, None, "`{stmt}` must not count as a query");
+        }
+        run_ok(&mut s, "ROLLBACK");
+    }
+
+    // Counts. `DISCARD PLANS`, `DEALLOCATE ALL`, `COMMENT ON`, `PREPARE`
+    // and `EXPLAIN` are in this half, measured — "utility statement" is
+    // not the dividing line, taking a snapshot is.
+    for stmt in [
+        "SELECT 1",
+        "SELECT * FROM ro",
+        "INSERT INTO ro VALUES (1)",
+        "CREATE TABLE zz (a INT)",
+        "TRUNCATE ro",
+        "EXPLAIN SELECT 1",
+        "COMMENT ON TABLE ro IS 'x'",
+        "PREPARE p1 AS SELECT 1",
+        "DEALLOCATE ALL",
+        "DISCARD PLANS",
+    ] {
+        run_ok(&mut s, "BEGIN");
+        run_ok(&mut s, stmt);
+        assert_eq!(
+            err_code(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").as_deref(),
+            Some("25001"),
+            "`{stmt}` must count as a query"
+        );
+        run_ok(&mut s, "ROLLBACK");
+    }
+}
+
+/// v7.40.12 — inside a SUBTRANSACTION, PG refuses two of the three
+/// halves of `SET TRANSACTION` whatever the snapshot says, each with its
+/// own wording and all three 25001. Measured on PG 18.6.
+///
+/// The savepoint has to be OPEN: after `RELEASE SAVEPOINT` the switch is
+/// accepted again, and after `ROLLBACK TO SAVEPOINT` it is not, because
+/// PG keeps the savepoint there.
+#[test]
+fn a_subtransaction_refuses_the_isolation_switch() {
+    let dir = unique_tmpdir("subtx");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SAVEPOINT sp");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SAVEPOINT sp");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION DEFERRABLE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // READ ONLY is accepted in a subtransaction — tightening always is.
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SAVEPOINT sp");
+    run_ok(&mut s, "SET TRANSACTION READ ONLY");
+    run_ok(&mut s, "ROLLBACK");
+
+    // Loosening is not, and PG words this one differently again.
+    run_ok(&mut s, "BEGIN READ ONLY");
+    run_ok(&mut s, "SAVEPOINT sp");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION READ WRITE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+
+    // RELEASE ends the subtransaction; ROLLBACK TO does not.
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SAVEPOINT sp");
+    run_ok(&mut s, "RELEASE SAVEPOINT sp");
+    run_ok(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    run_ok(&mut s, "ROLLBACK");
+
+    run_ok(&mut s, "BEGIN");
+    run_ok(&mut s, "SAVEPOINT sp");
+    run_ok(&mut s, "ROLLBACK TO SAVEPOINT sp");
+    assert_eq!(
+        err_code(&mut s, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE").as_deref(),
+        Some("25001")
+    );
+    run_ok(&mut s, "ROLLBACK");
+}
