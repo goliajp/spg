@@ -94,6 +94,44 @@ if [[ "${1:-}" == "--on-mini" ]]; then
         ssh "$HOST" "cd '$RDIR' && xargs -I{} touch {} 2>/dev/null" < /tmp/spg-synced.txt
         echo "suite: refreshed mtimes on $(wc -l < /tmp/spg-synced.txt | tr -d ' ') synced source files"
     fi
+    # v7.40.12 — witness the bytes, the way `precommit-tier.sh` has since
+    # r1035. Without it a compile failure on the testbed has two possible
+    # causes and no way to tell them apart, and this cost three full-tier
+    # runs: the same
+    #
+    #   error[E0599]: no variant ... named `SessionAuthorization`
+    #
+    # three times, against a file where `grep -c SessionAuthorization`
+    # on the testbed answered 2 both times it was checked, and which
+    # compiled by hand there in 51 s. What the runs actually had in
+    # common was that NO `libspg_sql-*.rlib` was written on the testbed
+    # between Sep 6 19:23 and the hand-run — the failing runs never
+    # rebuilt that crate and linked a two-day-old artifact.
+    #
+    # The mechanism is not pinned down. The witness does not fix it; it
+    # tells the next reader, in one line, which half to look at: trees
+    # equal means the sources are right and the artifacts are not.
+    #
+    # The local side is computed in a THROWAWAY index: `git write-tree`
+    # reads the index, not the worktree, and a tier is routinely launched
+    # with unstaged edits. Staging them to make the trees agree would
+    # mutate the user's index as a side effect of running a test.
+    # `mktemp -u`, not `mktemp`: git refuses an index file that exists
+    # and is empty ("index file smaller than expected").
+    local_tree=$(
+        _idx=$(mktemp -u) && export GIT_INDEX_FILE="$_idx" &&
+            git add -A && git write-tree
+        _rc=$?
+        rm -f "$_idx"
+        exit $_rc
+    )
+    remote_tree=$(ssh -n "$HOST" "cd '$RDIR' && git read-tree --empty && git add -A && git write-tree" 2>/dev/null) || remote_tree=""
+    if [ "$local_tree" != "$remote_tree" ]; then
+        echo "suite: ${HOST}'s tree is ${remote_tree:-unreadable}, this run is ${local_tree}" >&2
+        echo "suite: it would be grading something else — refusing to start" >&2
+        exit 3
+    fi
+    echo "suite: ${HOST} tree ${local_tree} — the same bytes as here"
     # v7.38.14 — kill the RUNNER, not only the suite it wrapped.
     #
     # This killed the inner `scripts/suite.sh` and left
