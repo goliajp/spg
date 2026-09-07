@@ -8547,11 +8547,28 @@ impl Engine {
         {
             return None;
         }
-        // A NULL key is not in the tree, and this walk has no separate
-        // pass for those rows the way the leading-column one does.
-        if order_col.nullable {
-            return None;
-        }
+        // v7.40.11 — a nullable ordering column no longer refuses this
+        // walk, because the pass it needed was already built.
+        //
+        // The comment here said "this walk has no separate pass for
+        // those rows the way the leading-column one does". Both walks
+        // feed ONE stream, and that stream has emitted the NULL-keyed
+        // rows since r1046 — first for `NULLS FIRST`, last otherwise.
+        // The capability was present and this gate never asked for it.
+        //
+        // What it cost: `NOT NULL` is not the default, so the common
+        // declaration paid for the uncommon one. The reporter's
+        // production shape is
+        // `WHERE project_id = ? ORDER BY received_at DESC LIMIT 20`
+        // over an index on `(project_id, received_at)` — the equality
+        // picks a prefix group the index already holds in order — and
+        // it sorted the table (sentori §3.12):
+        //
+        //   received_at TIMESTAMPTZ            Sort over an Index Scan
+        //   received_at TIMESTAMPTZ NOT NULL   Index Scan, Order By
+        //
+        // Same sentence r1046 wrote when it lifted this exact refusal
+        // from the leading-column walk.
         let where_ = stmt.where_.as_ref()?;
         for index in table.indices() {
             if !matches!(index.kind, spg_storage::IndexKind::BTreeMulti(_))

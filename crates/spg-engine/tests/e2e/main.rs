@@ -776,6 +776,7 @@ mod e2e_plpgsql_subquery_round335;
 mod e2e_plpgsql_type_ref;
 mod e2e_plpgsql_while;
 mod e2e_positional_order_round80;
+mod e2e_prefix_walk_nullable_v7411;
 mod e2e_prepare_execute_pg_dump_compat;
 mod e2e_prepare_param_deduction_v7384;
 mod e2e_prepared_array_param_v7411;
