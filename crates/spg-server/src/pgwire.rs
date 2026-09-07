@@ -1877,13 +1877,12 @@ fn run_pg_session(
         // every connection it opens and was told `1`; a client that
         // pins `search_path` at connect time, which is the only place a
         // POOLED client can put it, read and wrote the wrong tables.
-        for (k, v) in &state.boot_gucs {
-            let _ = e.execute(&format!("SET {k} = '{v}'"));
-        }
         // v7.39 (round 547) — the GUC defaults `ALTER ROLE … SET` and
         // `ALTER DATABASE … SET` recorded, applied in PG's order of
-        // specificity.
-        e.apply_db_role_settings(&startup_db, &user);
+        // specificity, under the server's own `-c` settings.
+        // v7.40.11 — through the shared seeder, so the mysql wire gets
+        // the same two in the same order.
+        e.apply_server_defaults(&state.boot_gucs, &startup_db, &user);
         // And this connection's own request, on top of both.
         for (k, v) in &requested_settings {
             if let Err(err) = e.execute(&format!("SET {k} = '{v}'")) {
