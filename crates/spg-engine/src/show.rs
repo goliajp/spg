@@ -542,19 +542,41 @@ impl Engine {
             };
             named.push((k, value));
         }
-        // Session-set parameters surface here too — except the
-        // PostgreSQL-namespaced ones.
+        // Session-set parameters surface here too — except the ones that
+        // are PostgreSQL's and not MySQL's.
         //
-        // v7.40.11 — `spg.database`, which every mysql-wire session
-        // carries, was listed here as a MySQL system variable. Not one
-        // of MySQL 9.7.2's 655 names contains a dot (measured), and it
-        // refuses to set an unknown name at all, so a tool that dumps
-        // this listing and replays it as `SET` produced a statement no
-        // MySQL would accept. A dotted name is PostgreSQL's custom-GUC
-        // spelling and belongs to `SHOW`/`current_setting`, which is
-        // where it still answers.
+        // v7.40.11 — this listing was carrying names MySQL 9.7.2 does
+        // not have, three ways, all of them written by SPG itself
+        // rather than by the client:
+        //
+        //   spg.database                    every mysql-wire session
+        //   work_mem                        a `-c work_mem=…` at boot
+        //   default_transaction_read_only   `SET transaction_read_only=1`
+        //
+        // Not one of MySQL's 655 names contains a dot (measured), and
+        // its `default%` and `work%` listings share nothing with these.
+        // MySQL refuses to SET a name it does not know, so a tool that
+        // dumps this listing and replays it produced statements no
+        // MySQL would accept.
+        //
+        // The rule: a dotted name is PostgreSQL's custom-GUC spelling,
+        // and a name PostgreSQL's own inventory knows while this one
+        // does not is a PostgreSQL setting. Both still answer on
+        // `SHOW` / `current_setting`, which is where they belong. A
+        // name that reaches BOTH engines is in the inventory above and
+        // was pushed before this loop, so it is not reachable here.
         for (k, v) in &self.session_params {
-            if !k.contains('.') && !named.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
+            // Both PostgreSQL tables, because they are not the same
+            // list: `canonical_gucs` is what `SHOW` and `pg_settings`
+            // render, and `PG_GUC_CONTEXTS` is the fuller catalogue —
+            // `default_transaction_read_only` is only in the second, and
+            // asking one of them let it through.
+            let postgres_only = k.contains('.')
+                || crate::guc_catalog::guc_context(k).is_some()
+                || crate::system_catalog::canonical_gucs()
+                    .iter()
+                    .any(|g| g.0.eq_ignore_ascii_case(k));
+            if !postgres_only && !named.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
                 named.push((k.as_str(), v.clone()));
             }
         }

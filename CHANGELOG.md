@@ -95,6 +95,28 @@ boolean spelling handed to a MySQL session, which disagreed with the
 same session's bare `SELECT TRUE`. Found by the pin written for the
 `UPPER` fix.
 
+### Fixed — the MySQL listing carried PostgreSQL's settings
+
+Three names reached `SHOW VARIABLES` on the mysql wire, and every one
+was written by SPG itself rather than by the client:
+
+```text
+  spg.database                    every mysql-wire session carries it
+  work_mem                        from a `-c work_mem=…` at boot
+  default_transaction_read_only   from `SET transaction_read_only = 1`
+```
+
+MySQL 9.7.2 has none of them — measured, not one of its 655 names
+contains a dot, and its `default%` and `work%` listings share nothing
+with these — and it refuses to SET a name it does not know, so a tool
+that dumped this listing and replayed it produced statements no MySQL
+would accept. A dotted name is PostgreSQL's custom-GUC spelling, and a
+name PostgreSQL's own inventory knows while the MySQL one does not is a
+PostgreSQL setting; both still answer on `SHOW` and `current_setting`.
+Both PostgreSQL tables are consulted, because they are not the same
+list: `default_transaction_read_only` is only in the fuller one, and
+asking a single table let it through.
+
 ### Fixed — a read-only MySQL session wrote anyway
 
 `SET SESSION transaction_read_only = 1` was stored, echoed back by

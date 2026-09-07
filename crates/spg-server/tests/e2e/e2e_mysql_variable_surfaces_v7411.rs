@@ -288,6 +288,54 @@ fn every_listed_variable_answers_on_the_at_at_surface() {
     }
 }
 
+/// A MySQL client must not be shown PostgreSQL's settings.
+///
+/// Three names reached this listing, and every one was written by SPG
+/// itself rather than by the client: `spg.database`, which every
+/// mysql-wire session carries; `work_mem`, from a `-c work_mem=…` at
+/// boot; and `default_transaction_read_only`, which
+/// `SET transaction_read_only = 1` records. MySQL 9.7.2 has none of
+/// them — measured, none of its 655 names contains a dot and its
+/// `default%` and `work%` listings share nothing with these — and it
+/// refuses to SET a name it does not know, so a tool that dumped this
+/// listing and replayed it produced statements no MySQL would accept.
+#[test]
+fn the_listing_carries_no_postgresql_settings() {
+    let dir = unique_dir("pg-only");
+    let (child, addrs) = common::ServerBuilder::new()
+        .arg("-c")
+        .arg("work_mem=64MB")
+        .arg_path(&dir.join("d.spgdb"))
+        .with_mysqlwire()
+        .spawn();
+    let _guard = common::ChildGuard(child);
+    let addr = addrs.mysqlwire.expect("mysql-wire addr");
+    let mut s = auth_open(&addr);
+
+    // The session has all three set by the time this runs.
+    ok_of(&mut s, "SET SESSION transaction_read_only = 1");
+
+    let listed = rows(&mut s, "SHOW VARIABLES");
+    let names: Vec<String> = listed
+        .iter()
+        .map(|r| r[0].clone().expect("Variable_name is never NULL"))
+        .collect();
+    for absent in ["spg.database", "work_mem", "default_transaction_read_only"] {
+        assert!(
+            !names.iter().any(|n| n == absent),
+            "`{absent}` is PostgreSQL's, and MySQL 9.7.2 has no such variable: {names:?}"
+        );
+    }
+    // The control: the MySQL name for the same state IS there, and it
+    // reports what was set — so the filter above removed a spelling,
+    // not the answer.
+    assert!(names.iter().any(|n| n == "transaction_read_only"));
+    assert_eq!(
+        rows(&mut s, "SELECT @@transaction_read_only")[0][0].as_deref(),
+        Some("1")
+    );
+}
+
 /// The statement that could not run: Connector/J's connection setup.
 #[test]
 fn the_connector_j_setup_statement_runs() {
