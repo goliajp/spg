@@ -284,13 +284,13 @@ impl Engine {
         // (true LATERAL) refs never reach here — join.rs routes them
         // through the per-outer-row machinery before materialising.
         if let Some(inner) = tref.lateral_subquery.as_deref() {
-            let crate::QueryResult::Rows { mut columns, rows } =
-                self.exec_select_cancel(inner, crate::CancelToken::none())?
-            else {
-                return Err(EngineError::Unsupported(
-                    "derived table subquery must return rows".into(),
-                ));
-            };
+            // v7.40.11 — through `materialise_derived_rows`, which reads
+            // `work_mem`. This is the road a derived table takes as a
+            // JOIN peer, and the first cut of that fix reached only the
+            // FROM-primary road: `FROM ( … ) z` spilled and
+            // `JOIN ( … ) z ON …` did not. See that function.
+            let (mut columns, rows) =
+                self.materialise_derived_rows(inner, crate::CancelToken::none())?;
             for (i, new_name) in tref.unnest_column_aliases.iter().enumerate() {
                 if let Some(col) = columns.get_mut(i) {
                     col.name = new_name.clone();
