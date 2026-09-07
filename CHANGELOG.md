@@ -217,6 +217,30 @@ text/int/bigint arrays and Debug-printed the rest; it now rebuilds the
 `ARRAY[…]` through the per-type element menu the rest of the engine
 uses.
 
+### Changed — the MySQL line SPG compares itself against is 9.x throughout
+
+SPG has advertised `9.7.2-spg` since v7.39, and the material around it
+had not moved: four comments still described the `8.0.0-spg-v…` string
+it dropped, the acceptance panel's mysql CLIENT was `mysql:8.4`, the
+dump-compat corpus generator was `mysql:8.4` / `mariadb:11.4`, the
+handshake fixture still said `8.0.0-spg-vtest`, and the oracle
+described itself as comparing against "MySQL 8 / MariaDB 11". All moved
+to the 9.x community line and MariaDB 12.x. References that are FACTS
+about upstream history — `tx_isolation` removed in 8.0.3, `have_ssl` in
+8.0.26, caching_sha2 the default since 8.0 — are unchanged, because
+rewriting those to 9 would make them false.
+
+Checked by digest against Docker Hub: PostgreSQL 18.6 IS `latest`;
+MySQL 9.7.2 IS the newest of the 9.x community line (the 26.x year-line
+is the `innovation` tag and this project does not ride it).
+
+The sweep found one real gap: `default_authentication_plugin` was
+REMOVED upstream and `authentication_policy` replaced it. SPG already
+declined the removed one and had never gained the replacement, so a
+client asking 9.7.2 which plugin a new account gets was told the
+variable does not exist. Both surfaces answer `*,,` now, measured on
+stock `mysql:9.7.2`.
+
 ### Added — `-c name=value` at boot, and the startup packet's settings
 
 Between them there was NO way to change a setting for a deployment
