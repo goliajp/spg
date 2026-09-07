@@ -108,6 +108,25 @@ now answers `ERROR 1792 (25006) Cannot execute statement in a READ ONLY
 transaction.`, which is MySQL 9.7.2's own reading of the same three
 statements.
 
+### Fixed — the sqlx binary-protocol gate was running no tests
+
+`gate.sh` asks for `RUN_FILTER=spg-sqlx-pgwire`. The harness labels came
+from the last path segment of cargo's package id, which is the DIRECTORY
+name — and that package lives in `xtests/sqlx-pgwire`. Nothing matched,
+`run-test-binaries.sh` printed `0/0 harnesses green, 0 tests`, exited 0,
+and the `gates` step around it reported PASS.
+
+Cargo spells a package id as `…/<dir>#<version>` when the directory and
+the package agree and `…/<dir>#<name>@<version>` when they do not; the
+label now reads the name. Wired up, the leg runs 3 harnesses and 17
+tests, all green — the tests were fine, they were not running. This is
+the leg r1049 added precisely because "a pin outside the gate that runs
+is a pin that does not exist", and it had gone back to not existing.
+
+A `RUN_FILTER` that matches no harness is now an error that names the
+filter and lists what was built, so the next mismatch is red instead of
+silent.
+
 ### Added — the two differential corpora provision and pin their own reference
 
 `xtests/diffcorpus/run.sh` and `xtests/mysqlcorpus/run.sh` both named a
