@@ -775,6 +775,42 @@ fn pg_sleep_sleeps_and_blocks_nobody() {
         "pg_sleep(0.25) took {took:?} — the slicing is accumulating overshoot"
     );
 
+    // The whole family, and every spelling of its argument. Measured on
+    // PG 18.6, in this order: 307.7 / 0.2 / 304.4 / 304.0 / 347.9 /
+    // 265.9 / 401.7 / 0.5 ms. `pg_sleep_for` and `pg_sleep_until` were
+    // still answering at once after `pg_sleep` was fixed, because the
+    // first version matched a literal argument and the idiomatic
+    // spellings carry none — `now() + interval '…'` has to be
+    // EVALUATED. A day is 86,400 s and a month is 30 days here because
+    // that is what PG answered, not because it is the obvious reading.
+    for (sql, lo, hi) in [
+        ("SELECT pg_sleep(0.3)", 250u64, 700u64),
+        ("SELECT pg_sleep(-1)", 0, 150),
+        ("SELECT pg_sleep_for('300 milliseconds')", 250, 700),
+        ("SELECT pg_sleep_for(interval '0.3 seconds')", 250, 700),
+        ("SELECT pg_sleep_for('0.000004 days')", 300, 750),
+        ("SELECT pg_sleep_for('0.0000001 months')", 210, 660),
+        (
+            "SELECT pg_sleep_until(now() + interval '0.4 seconds')",
+            340,
+            800,
+        ),
+        (
+            "SELECT pg_sleep_until(now() - interval '10 seconds')",
+            0,
+            150,
+        ),
+    ] {
+        let started = std::time::Instant::now();
+        run_ok(&mut s, sql);
+        let took = started.elapsed().as_millis();
+        let took = u64::try_from(took).unwrap_or(u64::MAX);
+        assert!(
+            took >= lo && took <= hi,
+            "{sql} took {took} ms, expected {lo}..={hi}"
+        );
+    }
+
     // statement_timeout ends it; lock_timeout does not. Both measured on
     // PG 18.6 (568 ms and 1,060 ms for the same two statements).
     run_ok(&mut s, "SET statement_timeout = '400ms'");

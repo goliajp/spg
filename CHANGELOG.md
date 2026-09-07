@@ -255,8 +255,30 @@ Still not matched: `pg_sleep` returns SQL `void` in PG, so
 its value system and answers NULL for the whole void family
 (`pg_advisory_unlock_all` and the rest), so this is one type's gap
 rather than one function's, and it is not fixed here.
-`pg_sleep_until(timestamp)` still answers immediately: working out how
-long that is needs the wall clock, which the pass does not have.
+The rest of the family followed, and needed a different shape: the first
+version matched a LITERAL argument, and `pg_sleep_until(now() + interval
+'…')` — the spelling PG's own documentation uses — carries no literal at
+all. The pass evaluates the argument instead, which is safe there
+because it has already folded every nested state-changing call to a
+literal, so nothing runs twice. Measured, both engines, same statements:
+
+```text
+                                                     PG 18.6      SPG
+  pg_sleep(0.3)                                      307.7 ms   303.1 ms
+  pg_sleep(-1)                                         0.2 ms     0.1 ms
+  pg_sleep_for('300 milliseconds')                   304.4 ms   300.8 ms
+  pg_sleep_for(interval '0.3 seconds')               304.0 ms   301.9 ms
+  pg_sleep_for('0.000004 days')                      347.9 ms   346.6 ms
+  pg_sleep_for('0.0000001 months')                   265.9 ms   259.8 ms
+  pg_sleep_until(now() + interval '0.4 seconds')     401.7 ms   404.7 ms
+  pg_sleep_until(now() - interval '10 seconds')        0.5 ms     0.2 ms
+```
+
+A day is 86,400 seconds and a month is 30 days in this conversion
+because that is what PG answered for the two rows that isolate them, not
+because it is the obvious reading. A bare `'300 milliseconds'` is
+`unknown` to PG and coerced to `interval`, so it is cast the same way
+here; without that, the spelling in PG's own documentation slept 0.25 ms.
 
 
 

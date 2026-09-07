@@ -371,64 +371,130 @@ impl Engine {
     /// deferring it changes only WHEN the client is answered — which is
     /// the entire observable point of the function.
     ///
-    /// Measured on PG 18.6: `pg_sleep(2)` takes 2,082 ms and is
-    /// cancelled by `statement_timeout` (`SET statement_timeout='500ms';
-    /// SELECT pg_sleep(3)` errors at 579 ms) but not by `lock_timeout`.
-    /// SPG answered in 23 ms.
+    /// Measured on PG 18.6:
     ///
-    /// A non-literal argument is left to the value dispatch, which keeps
-    /// the old immediate answer: the pass runs before evaluation and
-    /// cannot resolve a column or a parameter here.
+    /// ```text
+    ///   pg_sleep(2)                                2,082 ms
+    ///   pg_sleep(-1)                                   0 ms
+    ///   pg_sleep_for('300 milliseconds')             305 ms
+    ///   pg_sleep_for('0.000004 days')                348 ms   day = 86400 s
+    ///   pg_sleep_for('0.0000001 months')             262 ms   month = 30 d
+    ///   pg_sleep_until(now() + interval '0.4 s')     406 ms
+    ///   pg_sleep_until(now() - interval '10 s')        0 ms
+    /// ```
     ///
-    /// `pg_sleep_until(timestamp)` needs the wall clock to work out how
-    /// long that is, which this pass does not have; it keeps answering
-    /// immediately, and says so here rather than pretending.
+    /// SPG answered every one of them in about 20 ms.
+    ///
+    /// The argument is EVALUATED here rather than pattern-matched as a
+    /// literal, because `pg_sleep_until(now() + interval '…')` is the
+    /// idiomatic spelling and carries no literal at all. That is safe in
+    /// this pass: the loop above has already folded every nested
+    /// state-changing call to a literal, so evaluating what is left
+    /// repeats no side effect. The evaluation borrows `self` immutably
+    /// and finishes before the request is recorded.
     pub(crate) fn eval_sleep_call(
         &mut self,
         lc: &str,
         args: &[Expr],
     ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
-        if !matches!(lc, "pg_sleep" | "pg_sleep_for") {
+        if !matches!(lc, "pg_sleep" | "pg_sleep_for" | "pg_sleep_until") {
             return Ok(None);
         }
-        let Some(first) = args.first() else {
+        let Some(arg) = args.first() else {
             return Ok(Some(spg_storage::Value::Null));
         };
-        // Seconds, as PG spells it. `pg_sleep_for` takes an interval,
-        // which this pass does not evaluate — it falls through.
-        let seconds: f64 = match first {
-            Expr::Literal(spg_sql::ast::Literal::Integer(n)) => {
-                if lc == "pg_sleep_for" {
-                    return Ok(None);
-                }
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    *n as f64
+        let value = {
+            let cols: [spg_storage::ColumnSchema; 0] = [];
+            let ctx = self.ev_ctx(&cols, None);
+            let row = spg_storage::Row::new(alloc::vec::Vec::new());
+            match crate::eval::eval_expr(arg, &row, &ctx) {
+                Ok(v) => v,
+                // Not evaluable here (a column, a parameter). Leave it
+                // to the value dispatch, which keeps answering at once —
+                // and say so rather than sleeping for a guess.
+                Err(_) => return Ok(None),
+            }
+        };
+        let micros = match (lc, &value) {
+            // Seconds, as a number.
+            ("pg_sleep", v) => match Self::sleep_seconds_of(v) {
+                Some(secs) => (secs * 1_000_000.0) as i64,
+                None => return Ok(None),
+            },
+            // An interval. Measured: a day is 86,400 s and a month is
+            // 30 days, both read back from PG rather than assumed.
+            // A bare string literal: PG types it `unknown` and coerces
+            // it to the parameter's `interval`, so `pg_sleep_for('300
+            // milliseconds')` sleeps 301 ms there. Evaluating it here
+            // yields Text, so cast it the same way — without this the
+            // spelling PG's own documentation uses slept 0.25 ms.
+            ("pg_sleep_for", spg_storage::Value::Text(t)) => {
+                match crate::eval::cast_value(
+                    spg_storage::Value::text(t.as_ref()),
+                    spg_sql::ast::CastTarget::Interval,
+                ) {
+                    Ok(spg_storage::Value::Interval {
+                        months,
+                        days,
+                        micros,
+                        ..
+                    }) => {
+                        let d = i64::from(months) * 30 + i64::from(days);
+                        d.saturating_mul(86_400_000_000).saturating_add(micros)
+                    }
+                    _ => return Ok(None),
                 }
             }
-            Expr::Literal(spg_sql::ast::Literal::Float(f)) => {
-                if lc == "pg_sleep_for" {
-                    return Ok(None);
-                }
-                *f
+            (
+                "pg_sleep_for",
+                spg_storage::Value::Interval {
+                    months,
+                    days,
+                    micros,
+                    ..
+                },
+            ) => {
+                let d = i64::from(*months) * 30 + i64::from(*days);
+                d.saturating_mul(86_400_000_000).saturating_add(*micros)
             }
-            Expr::Literal(spg_sql::ast::Literal::Numeric { unscaled, scale }) => {
-                if lc == "pg_sleep_for" {
+            // An absolute instant: sleep the remainder, if any.
+            ("pg_sleep_until", spg_storage::Value::Timestamp(at)) => {
+                let Some(clock) = self.clock else {
                     return Ok(None);
-                }
-                #[allow(clippy::cast_precision_loss)]
-                {
-                    (*unscaled as f64) / libm_pow10(*scale)
-                }
+                };
+                at.saturating_sub(clock())
             }
             _ => return Ok(None),
         };
-        if seconds > 0.0 {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let micros = (seconds * 1_000_000.0) as u64;
-            self.request_sleep_us(micros);
+        if micros > 0 {
+            #[allow(clippy::cast_sign_loss)]
+            self.request_sleep_us(micros as u64);
         }
         Ok(Some(spg_storage::Value::Null))
+    }
+
+    /// The seconds a `pg_sleep` argument names, whatever numeric shape
+    /// it arrived in.
+    fn sleep_seconds_of(v: &spg_storage::Value<'_>) -> Option<f64> {
+        #[allow(clippy::cast_precision_loss)]
+        match v {
+            spg_storage::Value::Int(n) => Some(f64::from(*n)),
+            spg_storage::Value::BigInt(n) => Some(*n as f64),
+            spg_storage::Value::Float(f) => Some(*f),
+            spg_storage::Value::Real(f) => Some(f64::from(*f)),
+            spg_storage::Value::Numeric {
+                scaled,
+                scale,
+                kind: spg_storage::NumericKind::Finite,
+            } => {
+                let mut d = 1.0_f64;
+                for _ in 0..*scale {
+                    d *= 10.0;
+                }
+                Some((*scaled as f64) / d)
+            }
+            _ => None,
+        }
     }
 
     pub(crate) fn eval_advisory_call(
@@ -1246,13 +1312,4 @@ impl Engine {
             EngineError::Unsupported(alloc::format!("invalid large-object descriptor: {fd}"))
         })
     }
-}
-
-/// 10^scale as an f64, without `std`'s `powi`.
-fn libm_pow10(scale: u16) -> f64 {
-    let mut out = 1.0_f64;
-    for _ in 0..scale {
-        out *= 10.0;
-    }
-    out
 }
