@@ -181,6 +181,39 @@ and does inside an explicit one; both measured.
 answers `START TRANSACTION` — the tag came from the default arm, which
 uppercases the first word.
 
+### Fixed — `DEFERRABLE` was carried and not honoured
+
+A `SERIALIZABLE READ ONLY DEFERRABLE` transaction asks for a snapshot it
+can run against without ever hitting a serialization failure, and
+without causing one. PG gets that by waiting until no concurrent
+SERIALIZABLE read-write transaction is in flight. SPG accepted the word
+and did nothing with it.
+
+Measured with the same script on both engines — one connection holding
+`BEGIN ISOLATION LEVEL SERIALIZABLE; UPDATE …` open, another reading:
+
+```text
+  reader                              PG 18.6     SPG (before)  SPG (now)
+  … READ ONLY NOT DEFERRABLE            63 ms         26 ms        26 ms
+  … READ ONLY DEFERRABLE,
+      statement_timeout 800ms          870 ms         26 ms       830 ms → cancelled
+      lock_timeout 800ms +
+        statement_timeout 3s          3068 ms         26 ms      3035 ms → cancelled
+      writer commits after 2s,
+        statement_timeout 10s         2020 ms         26 ms      2013 ms → answers
+```
+
+`BEGIN` itself is instant on both: the wait is at the first snapshot,
+not at BEGIN. The wait is ended by `statement_timeout` and NOT by
+`lock_timeout` — measured on PG, and the third row is the pin for it.
+
+Answering "is a concurrent serializable writer in flight" needs each
+transaction's OWN isolation level and read/write mode, not the session
+copies, because the writer is on another connection; those now live on
+the transaction slot. The wait itself happens with the engine lock
+DROPPED, the same shape row locks use since round 299 — waiting inside
+the lock would stop the very connection whose COMMIT ends the wait.
+
 
 
 ## [7.40.11] — 2026-09-07

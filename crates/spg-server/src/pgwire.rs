@@ -2649,6 +2649,22 @@ fn execute_with_role(
                 r
             }; // guard drops here — the holder can now commit
             match attempt {
+                // v7.40.12 — a deferrable reader waiting for a safe
+                // snapshot. Same shape as a row lock: retry with the
+                // guard dropped, so the transaction it waits for can
+                // commit. Different DEADLINE, though — measured on
+                // PG 18.6, `statement_timeout` cancels this wait and
+                // `lock_timeout` does not, so the cancel token (which
+                // carries statement_timeout) is the judge here.
+                Err(EngineError::DeferrableWouldBlock) => {
+                    if cancel.is_cancelled() {
+                        return Err(EngineError::Unsupported(
+                            "canceling statement due to statement timeout".into(),
+                        ));
+                    }
+                    crate::lock_wait_backoff(waits);
+                    waits += 1;
+                }
                 Err(EngineError::LockWouldBlock) => {
                     if let Some(d) = deadline
                         && std::time::Instant::now() >= d
