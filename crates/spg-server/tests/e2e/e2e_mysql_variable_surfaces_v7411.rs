@@ -330,6 +330,17 @@ fn the_listing_carries_no_postgresql_settings() {
     // reports what was set — so the filter above removed a spelling,
     // not the answer.
     assert!(names.iter().any(|n| n == "transaction_read_only"));
+
+    // And the other end of the same rule: a name BOTH engines have,
+    // which the client set itself, must survive the filter. Measured,
+    // MySQL 9.7.2's 655 names and this engine's PostgreSQL catalogue
+    // share exactly six, and `lc_messages` is the one of them a MySQL
+    // session can set. Dropping it would hide a value the client wrote
+    // — the same one-question-two-surfaces defect, at the other end.
+    ok_of(&mut s, "SET lc_messages = 'en_US'");
+    let after = rows(&mut s, "SHOW VARIABLES LIKE 'lc_messages'");
+    assert_eq!(after.len(), 1, "a name both engines have must stay listed");
+    assert_eq!(after[0][1].as_deref(), Some("en_US"));
     assert_eq!(
         rows(&mut s, "SELECT @@transaction_read_only")[0][0].as_deref(),
         Some("1")

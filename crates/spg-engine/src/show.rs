@@ -571,11 +571,12 @@ impl Engine {
             // render, and `PG_GUC_CONTEXTS` is the fuller catalogue —
             // `default_transaction_read_only` is only in the second, and
             // asking one of them let it through.
-            let postgres_only = k.contains('.')
-                || crate::guc_catalog::guc_context(k).is_some()
-                || crate::system_catalog::canonical_gucs()
-                    .iter()
-                    .any(|g| g.0.eq_ignore_ascii_case(k));
+            let postgres_only = !crate::mysql_vars::shared_with_postgresql(k)
+                && (k.contains('.')
+                    || crate::guc_catalog::guc_context(k).is_some()
+                    || crate::system_catalog::canonical_gucs()
+                        .iter()
+                        .any(|g| g.0.eq_ignore_ascii_case(k)));
             if !postgres_only && !named.iter().any(|(n, _)| n.eq_ignore_ascii_case(k)) {
                 named.push((k.as_str(), v.clone()));
             }
