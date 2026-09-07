@@ -61,6 +61,12 @@ pub const MUTATING_CALL_NEEDLES: &[&[u8]] = &[
     b"lastval(",
     // Session GUC store.
     b"set_config(",
+    // v7.40.12 — the sleep family. `pg_sleep` does not mutate, but the
+    // `&self` executor cannot record the request the host has to serve,
+    // and this list is what routes a call to the pass that can.
+    b"pg_sleep(",
+    b"pg_sleep_for(",
+    b"pg_sleep_until(",
     // Advisory locks — round 279's registry, keyed by session.
     b"pg_advisory_lock(",
     b"pg_advisory_xact_lock(",
@@ -224,6 +230,20 @@ impl Engine {
                 // ever sees `&EvalContext`; this statement-level pass is
                 // the established home for a state-changing function
                 // (nextval / setval land here for the same reason).
+                // v7.40.12 — `pg_sleep` lands here for the same reason,
+                // and one more: the value dispatch would have to sleep
+                // while the engine lock is held, stalling every writer
+                // for the duration. PG's `pg_sleep` stalls nobody. So
+                // this pass RECORDS the request, folds the call to its
+                // return value, and the host sleeps after it has
+                // dropped the guard. Measured: PG 18.6 takes 2,082 ms
+                // for `pg_sleep(2)`; SPG took 23 ms, because the value
+                // dispatch answered NULL and never slept. It fooled this
+                // project's own concurrency probe before anyone noticed.
+                if let Some(v) = self.eval_sleep_call(&lc, args)? {
+                    *expr = Expr::Literal(value_to_literal(v));
+                    return Ok(());
+                }
                 if let Some(v) = self.eval_advisory_call(&lc, args)? {
                     *expr = Expr::Literal(value_to_literal(v));
                     return Ok(());
@@ -341,6 +361,76 @@ impl Engine {
     /// PG's key is either one bigint or two ints packed into one; both
     /// spellings address the same space, which is why they fold into a
     /// single i64 here.
+    /// v7.40.12 — `pg_sleep` / `pg_sleep_for` / `pg_sleep_until`.
+    ///
+    /// Records how long the host should sleep and answers with the
+    /// function's own return value; the HOST sleeps once it has dropped
+    /// the engine guard. Sleeping here would hold the shared lock for
+    /// the whole duration and stall every writer, and PG's `pg_sleep`
+    /// stalls nobody. The answer does not depend on the sleep, so
+    /// deferring it changes only WHEN the client is answered — which is
+    /// the entire observable point of the function.
+    ///
+    /// Measured on PG 18.6: `pg_sleep(2)` takes 2,082 ms and is
+    /// cancelled by `statement_timeout` (`SET statement_timeout='500ms';
+    /// SELECT pg_sleep(3)` errors at 579 ms) but not by `lock_timeout`.
+    /// SPG answered in 23 ms.
+    ///
+    /// A non-literal argument is left to the value dispatch, which keeps
+    /// the old immediate answer: the pass runs before evaluation and
+    /// cannot resolve a column or a parameter here.
+    ///
+    /// `pg_sleep_until(timestamp)` needs the wall clock to work out how
+    /// long that is, which this pass does not have; it keeps answering
+    /// immediately, and says so here rather than pretending.
+    pub(crate) fn eval_sleep_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        if !matches!(lc, "pg_sleep" | "pg_sleep_for") {
+            return Ok(None);
+        }
+        let Some(first) = args.first() else {
+            return Ok(Some(spg_storage::Value::Null));
+        };
+        // Seconds, as PG spells it. `pg_sleep_for` takes an interval,
+        // which this pass does not evaluate — it falls through.
+        let seconds: f64 = match first {
+            Expr::Literal(spg_sql::ast::Literal::Integer(n)) => {
+                if lc == "pg_sleep_for" {
+                    return Ok(None);
+                }
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    *n as f64
+                }
+            }
+            Expr::Literal(spg_sql::ast::Literal::Float(f)) => {
+                if lc == "pg_sleep_for" {
+                    return Ok(None);
+                }
+                *f
+            }
+            Expr::Literal(spg_sql::ast::Literal::Numeric { unscaled, scale }) => {
+                if lc == "pg_sleep_for" {
+                    return Ok(None);
+                }
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    (*unscaled as f64) / libm_pow10(*scale)
+                }
+            }
+            _ => return Ok(None),
+        };
+        if seconds > 0.0 {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let micros = (seconds * 1_000_000.0) as u64;
+            self.request_sleep_us(micros);
+        }
+        Ok(Some(spg_storage::Value::Null))
+    }
+
     pub(crate) fn eval_advisory_call(
         &mut self,
         lc: &str,
@@ -1156,4 +1246,13 @@ impl Engine {
             EngineError::Unsupported(alloc::format!("invalid large-object descriptor: {fd}"))
         })
     }
+}
+
+/// 10^scale as an f64, without `std`'s `powi`.
+fn libm_pow10(scale: u16) -> f64 {
+    let mut out = 1.0_f64;
+    for _ in 0..scale {
+        out *= 10.0;
+    }
+    out
 }

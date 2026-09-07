@@ -1439,6 +1439,14 @@ pub struct Engine {
     /// Optional wall clock used to satisfy `NOW()` / `CURRENT_TIMESTAMP`
     /// / `CURRENT_DATE`. Set by the host environment.
     clock: Option<ClockFn>,
+    /// v7.40.12 — microseconds this statement's `pg_sleep` calls asked
+    /// for. The engine does NOT sleep: it holds the shared engine lock,
+    /// so sleeping here would stall every writer for the duration, and
+    /// PG's `pg_sleep` stalls nobody. The pre-pass records the request
+    /// and the HOST sleeps after the guard drops. Cleared at the start
+    /// of every statement so an undrained request cannot leak into the
+    /// next one.
+    pending_sleep_us: u64,
     /// v4.1 cryptographic RNG for per-user password salt. Set by the
     /// host. `None` means SQL-driven `CREATE USER` uses a
     /// deterministic fallback — see `SaltFn`.
@@ -1936,6 +1944,7 @@ impl Engine {
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
+            pending_sleep_us: 0,
             salt_fn: None,
             max_query_rows: None,
             max_query_bytes: None,
@@ -2467,6 +2476,7 @@ impl Engine {
             tx_writer_versions: BTreeMap::new(),
             stmt_writer_version: None,
             clock: None,
+            pending_sleep_us: 0,
             salt_fn: None,
             max_query_rows: None,
             max_query_bytes: None,
@@ -2614,6 +2624,7 @@ impl Engine {
                     tx_writer_versions: BTreeMap::new(),
                     stmt_writer_version: None,
                     clock: None,
+                    pending_sleep_us: 0,
                     salt_fn: None,
                     max_query_rows: None,
                     max_query_bytes: None,
@@ -3189,6 +3200,26 @@ impl Engine {
     pub const fn with_clock(mut self, clock: ClockFn) -> Self {
         self.clock = Some(clock);
         self
+    }
+
+    /// v7.40.12 — take the microseconds this statement's `pg_sleep`
+    /// calls asked for, and clear the request.
+    ///
+    /// The HOST does the sleeping, after it has dropped the engine
+    /// guard. Sleeping inside the engine would hold the shared lock for
+    /// the whole duration and stall every writer; PG's `pg_sleep`
+    /// stalls nobody. The result does not depend on the sleep — PG's
+    /// `pg_sleep` returns void whatever happens — so deferring it to
+    /// the host changes only WHEN the client is answered, which is the
+    /// entire observable point of the function.
+    pub fn take_pending_sleep_us(&mut self) -> u64 {
+        core::mem::take(&mut self.pending_sleep_us)
+    }
+
+    /// v7.40.12 — record a `pg_sleep` request; see
+    /// [`Self::take_pending_sleep_us`].
+    pub(crate) fn request_sleep_us(&mut self, micros: u64) {
+        self.pending_sleep_us = self.pending_sleep_us.saturating_add(micros);
     }
 
     /// Builder: attach an OS-backed RNG for per-user password salts.

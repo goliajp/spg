@@ -317,6 +317,9 @@ impl Engine {
         self.pending_notices.clear();
         let saved = self.current_tx;
         self.current_tx = Some(tx_id);
+        // v7.40.12 — an undrained `pg_sleep` request must not leak into
+        // the next statement.
+        self.pending_sleep_us = 0;
         // v7.37.15 (Epic W slice 2) — memoized autocommit writer version
         // is scoped to one statement. Save + reset like `current_tx` so
         // a re-entrant execute (e.g. deferred trigger SQL) can't leak its

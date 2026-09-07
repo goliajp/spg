@@ -214,6 +214,50 @@ the transaction slot. The wait itself happens with the engine lock
 DROPPED, the same shape row locks use since round 299 — waiting inside
 the lock would stop the very connection whose COMMIT ends the wait.
 
+### Fixed — `pg_sleep` did not sleep
+
+It answered immediately and returned NULL. Measured: PG 18.6 takes
+2,082 ms for `pg_sleep(2)`; SPG took 23 ms. The code said this was
+deliberate — "tests that use pg_sleep are typically doing it as a shape
+marker" — which is a claim about why someone might call it, not about
+what the function is. A client pacing itself in SQL did not pace.
+
+It was found the way these are worth finding: it fooled this project's
+own probe. The concurrency experiment for `DEFERRABLE` above held a
+writer open with `pg_sleep(4)`, the writer never stayed open, and the
+whole first round of that measurement was of nothing.
+
+The engine does not sleep. It holds the shared engine lock, and PG's
+`pg_sleep` stalls no other connection — so the statement-level pass that
+already handles the state-changing function family records how long, and
+the HOST sleeps once it has dropped the guard. Measured in-session
+afterwards:
+
+```text
+                        PG 18.6      SPG
+  pg_sleep(2)          2,007.6 ms   2,003.1 ms
+  pg_sleep(0.25)         255.2 ms     252.9 ms
+  statement_timeout 500ms, pg_sleep(3)
+                         568 ms       533 ms   both "canceling statement
+                                               due to statement timeout"
+  lock_timeout 500ms, pg_sleep(1)   1,060 ms   1,227 ms   neither cancels
+  a writer on another connection while one sleeps 3s
+                          49 ms        25 ms   neither waits
+```
+
+The host slices against an ABSOLUTE end rather than a running
+remainder: every `thread::sleep` overshoots a little, and subtracting
+the requested slice each time accumulated it — `pg_sleep(2)` took
+2,428 ms that way.
+
+Still not matched: `pg_sleep` returns SQL `void` in PG, so
+`pg_sleep(x) IS NULL` is false there and true here. SPG has no void in
+its value system and answers NULL for the whole void family
+(`pg_advisory_unlock_all` and the rest), so this is one type's gap
+rather than one function's, and it is not fixed here.
+`pg_sleep_until(timestamp)` still answers immediately: working out how
+long that is needs the wall clock, which the pass does not have.
+
 
 
 ## [7.40.11] — 2026-09-07

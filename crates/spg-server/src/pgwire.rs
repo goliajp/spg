@@ -2646,8 +2646,23 @@ fn execute_with_role(
                         spg_engine::MATVIEW_DELTA_BAILED.load(Ordering::Relaxed),
                     );
                 }
-                r
+                // v7.40.12 — how long `pg_sleep` asked the host to
+                // sleep. Read while the guard is still held so no other
+                // connection's request can be picked up; the sleep
+                // itself happens below, with the guard gone.
+                let sleep_us = engine.take_pending_sleep_us();
+                (r, sleep_us)
             }; // guard drops here — the holder can now commit
+            let (attempt, sleep_us) = attempt;
+            // v7.40.12 — serve the sleep out here. PG's `pg_sleep`
+            // stalls nobody, so this must not hold the engine lock;
+            // measured, PG takes 2,082 ms for `pg_sleep(2)` and answers
+            // `canceling statement due to statement timeout` at 579 ms
+            // when `statement_timeout` is 500 ms, while `lock_timeout`
+            // does not touch it.
+            if sleep_us > 0 && attempt.is_ok() {
+                serve_pg_sleep(sleep_us, cancel)?;
+            }
             match attempt {
                 // v7.40.12 — a deferrable reader waiting for a safe
                 // snapshot. Same shape as a row lock: retry with the
@@ -2679,6 +2694,35 @@ fn execute_with_role(
                 other => return other,
             }
         }
+    }
+}
+
+/// v7.40.12 — sleep the microseconds `pg_sleep` asked for, in slices,
+/// giving up as soon as the statement's own cancel token trips.
+///
+/// The engine records the request and does not sleep: it holds the
+/// shared engine lock, and PG's `pg_sleep` stalls no other connection.
+/// The slice is small enough that a 500 ms `statement_timeout` lands
+/// within a few milliseconds of PG's, and large enough not to spin.
+fn serve_pg_sleep(micros: u64, cancel: CancelToken<'_>) -> Result<(), EngineError> {
+    // Slice against an ABSOLUTE end, not a remaining count: every
+    // `thread::sleep` overshoots a little, and subtracting the REQUESTED
+    // slice each time accumulates that overshoot. Measured with 5 ms
+    // slices and a running counter, `pg_sleep(2)` took 2,428 ms where PG
+    // took 2,067; against a fixed end it self-corrects.
+    let end = std::time::Instant::now() + std::time::Duration::from_micros(micros);
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+    loop {
+        let now = std::time::Instant::now();
+        if now >= end {
+            return Ok(());
+        }
+        if cancel.is_cancelled() {
+            return Err(EngineError::Unsupported(
+                "canceling statement due to statement timeout".into(),
+            ));
+        }
+        std::thread::sleep((end - now).min(SLICE));
     }
 }
 
