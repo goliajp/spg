@@ -746,6 +746,13 @@ struct TxState {
     /// after it; `RELEASE <name>` discards the entry and everything
     /// after; COMMIT/ROLLBACK clears the whole stack.
     savepoints: Vec<(String, Catalog, Option<crate::users::UserStore>)>,
+    /// v7.40.12 — the host opened this transaction itself, to wrap a
+    /// multi-statement script. PG does not warn when a `BEGIN` lands
+    /// inside its own implicit block, and does warn inside an explicit
+    /// one; both measured on PG 18.6. The engine cannot tell the two
+    /// apart on its own — the wire says so with
+    /// [`Engine::mark_tx_implicit`] right after it opens the wrap.
+    opened_implicitly: bool,
     /// v7.37.15 (Phase E) — cached MVCC snapshot for REPEATABLE
     /// READ / SERIALIZABLE. Captured at `exec_begin` time when the
     /// session's `current_isolation_level` is RR/SER; read paths
@@ -3324,6 +3331,25 @@ impl Engine {
     /// this is false for the autocommit id.
     pub fn is_tx_open(&self, tx_id: TxId) -> bool {
         self.tx_catalogs.contains_key(&tx_id)
+    }
+
+    /// v7.40.12 — the host is about to run a multi-statement script and
+    /// has just opened a transaction to wrap it. A `BEGIN` inside that
+    /// wrap must not warn, because PG does not warn inside its own
+    /// implicit block. See `opened_implicitly`.
+    pub fn mark_tx_implicit(&mut self, tx_id: TxId) {
+        if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+            st.opened_implicitly = true;
+        }
+    }
+
+    /// Whether THIS connection's open transaction is the host's script
+    /// wrap rather than one the client asked for.
+    #[must_use]
+    pub fn current_tx_is_implicit(&self) -> bool {
+        self.current_tx
+            .and_then(|tx| self.tx_catalogs.get(&tx))
+            .is_some_and(|st| st.opened_implicitly)
     }
 
     /// v7.37 (round 828) — the user store THIS session should read:

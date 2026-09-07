@@ -143,6 +143,44 @@ savepoint open, PG reports the "before any query" message.
 above; the two tests that pinned 398 now pin PG's number, settled name
 by name rather than by count.
 
+### Fixed — a read-only transaction opened in a multi-statement script was not read-only
+
+`BEGIN <modes>` on an already-open transaction warned `there is already
+a transaction in progress` and threw the modes away. The row semantics
+were right — the BEGIN is a no-op for the transaction, and that is what
+the measurement behind the old comment established — but the modes are
+not a no-op in PG.
+
+The pgwire multi-statement path wraps every script in a transaction of
+its own, so EVERY leading `BEGIN` in a script is a nested one. Sent as
+one query, measured on both engines:
+
+```text
+  BEGIN READ ONLY; INSERT INTO t VALUES (1); COMMIT;
+    PG 18.6   ERROR: cannot execute INSERT in a read-only transaction
+              0 rows
+    SPG       INSERT 0 1 / COMMIT
+              1 row
+```
+
+Applications open read-only transactions as a safety measure, which is
+the reason the corpus file pinning the single-statement form says
+accepting the write is the worst available answer. The single-statement
+form has been correct since v7.39; the script form was never asked.
+
+PG's rule is one sentence, and it is what SPG does now: `BEGIN <modes>`
+inside an open transaction is a warning plus exactly `SET TRANSACTION
+<modes>`, refusals included. `SELECT 1; BEGIN ISOLATION LEVEL
+SERIALIZABLE` reports `SET TRANSACTION ISOLATION LEVEL must be called
+before any query` — PG's words for a statement the user spelled
+`BEGIN`. The warning is skipped when the open transaction is the host's
+own script wrap, because PG does not warn inside its own implicit block
+and does inside an explicit one; both measured.
+
+`START TRANSACTION` also answered the command tag `START`, where PG
+answers `START TRANSACTION` — the tag came from the default arm, which
+uppercases the first word.
+
 
 
 ## [7.40.11] — 2026-09-07

@@ -745,6 +745,181 @@ impl Engine {
     /// READ-ONLY dispatcher can serve it too: the wire routes SHOW as a
     /// read, and its fallthrough (unknown-to-the-wire names) landed on
     /// `WriteRequired` instead of this answer.
+    /// v7.40.12 — the whole of `SET TRANSACTION <modes>`, extracted so
+    /// a nested `BEGIN <modes>` can run exactly the same thing.
+    ///
+    /// Measured on PG 18.6: `BEGIN` while a transaction is already open
+    /// warns `there is already a transaction in progress` AND applies the
+    /// modes, refusals included — `SELECT 1; BEGIN ISOLATION LEVEL
+    /// SERIALIZABLE` reports `SET TRANSACTION ISOLATION LEVEL must be
+    /// called before any query`, PG's own words for a statement the user
+    /// spelled `BEGIN`. SPG warned and threw the modes away, so a
+    /// `BEGIN READ ONLY` that landed inside an open transaction opened
+    /// nothing read-only — and the pgwire multi-statement path wraps every
+    /// script in one, which made `BEGIN READ ONLY; INSERT ...; COMMIT;`
+    /// sent as a single script ACCEPT the write and commit it.
+    fn apply_set_transaction(
+        &mut self,
+        modes: spg_sql::ast::TransactionModes,
+    ) -> Result<QueryResult, EngineError> {
+        // v7.39 — outside a transaction block PG WARNS and does
+        // nothing. Measured on PG 18.6:
+        //
+        //     SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+        //     WARNING:  SET TRANSACTION can only be used in transaction blocks
+        //     SHOW transaction_isolation;  ->  read committed
+        //
+        // SPG applied it to the session instead, so a bare
+        // `SET TRANSACTION` silently changed every later
+        // transaction — the opposite of PG, where it changes
+        // nothing. `Session::warning`'s own doc comment names
+        // `SET CONSTRAINTS` outside a transaction block as the
+        // case it exists for; this is its sibling, and only one
+        // of them had been wired.
+        if !self
+            .current_tx
+            .is_some_and(|id| self.tx_catalogs.contains_key(&id))
+        {
+            self.warning("SET TRANSACTION can only be used in transaction blocks".into());
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
+        // v7.37.17 (Phase E3) — PG rejects an isolation switch
+        // after the transaction's first query (SQLSTATE 25001);
+        // silently applying it to the remaining statements would
+        // give a tx that is half one level, half another.
+        //
+        // v7.40.12 — but ONLY the isolation half, and only that
+        // one plus the read-write half of a read-only block.
+        // This refusal covered the whole statement, so
+        // `BEGIN; SELECT 1; SET TRANSACTION READ ONLY` was
+        // refused where PG answers `SET`. It had been invisible
+        // over the wire because a canned `SELECT 1` never told
+        // the engine a query had run, so the refusal fired for
+        // nothing; fixing the counter is what exposed it.
+        //
+        // Measured on PostgreSQL 18.6, after a query in a block:
+        //   SET TRANSACTION READ ONLY                 -> SET
+        //   SET TRANSACTION READ WRITE (r/w block)    -> SET
+        //   SET TRANSACTION READ WRITE (r/o block)    -> 25001
+        //     "transaction read-write mode must be set before
+        //      any query"
+        //   SET TRANSACTION ISOLATION LEVEL <any>     -> 25001
+        // Tightening is allowed at any point; only LOOSENING a
+        // read-only transaction, and only changing the level,
+        // are refused once a snapshot has been taken.
+        let ran_a_query = self.current_tx.is_some_and(|tx_id| {
+            self.tx_catalogs
+                .get(&tx_id)
+                .is_some_and(|st| st.stmts_run > 0)
+        });
+        if ran_a_query {
+            if modes.isolation.is_some() {
+                return Err(EngineError::Unsupported(
+                    "SET TRANSACTION ISOLATION LEVEL must be called before any query".into(),
+                ));
+            }
+            if modes.read_only == Some(false) && self.current_tx_read_only {
+                return Err(EngineError::Unsupported(
+                    "transaction read-write mode must be set before any query".into(),
+                ));
+            }
+            // PG's third rule, and its own wording. Measured:
+            // `BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE` ->
+            // 25001. Unlike the read/write half this refuses in
+            // BOTH directions, which is why it is not gated on
+            // the current value.
+            if modes.deferrable.is_some() {
+                return Err(EngineError::Unsupported(
+                    "SET TRANSACTION [NOT] DEFERRABLE must be called before any query".into(),
+                ));
+            }
+        }
+        // v7.40.12 — inside a SUBTRANSACTION, PG refuses two of
+        // the three whatever the snapshot says, each with its own
+        // wording, and all three 25001. Measured on PG 18.6, in
+        // `BEGIN; SAVEPOINT sp; ...`:
+        //
+        //   ISOLATION LEVEL   must not be called in a subtransaction
+        //   [NOT] DEFERRABLE  cannot be called within a subtransaction
+        //   READ ONLY         accepted
+        //   READ WRITE, in a read-only block
+        //                     cannot set transaction read-write mode
+        //                     inside a read-only transaction
+        //
+        // The savepoint has to be OPEN: after `RELEASE SAVEPOINT`
+        // the switch is accepted again, and after `ROLLBACK TO
+        // SAVEPOINT` it is not -- PG keeps the savepoint there,
+        // and so does this stack. The snapshot rule above is
+        // checked first, which is PG's order too: with a query
+        // already run AND a savepoint open, PG reports the
+        // "before any query" message.
+        let in_subtransaction = self
+            .current_tx
+            .and_then(|tx_id| self.tx_catalogs.get(&tx_id))
+            .is_some_and(|st| !st.savepoints.is_empty());
+        if in_subtransaction {
+            if modes.isolation.is_some() {
+                return Err(EngineError::Unsupported(
+                    "SET TRANSACTION ISOLATION LEVEL must not be called in a \
+                     subtransaction"
+                        .into(),
+                ));
+            }
+            if modes.deferrable.is_some() {
+                return Err(EngineError::Unsupported(
+                    "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a \
+                     subtransaction"
+                        .into(),
+                ));
+            }
+            if modes.read_only == Some(false) && self.current_tx_read_only {
+                return Err(EngineError::Unsupported(
+                    "cannot set transaction read-write mode inside a read-only \
+                     transaction"
+                        .into(),
+                ));
+            }
+        }
+        if let Some(isolation) = modes.isolation {
+            self.current_isolation_level = isolation;
+        }
+        // v7.39 — the read/write half of the same statement. It was
+        // parsed and dropped with the rest of the clause.
+        if let Some(ro) = modes.read_only {
+            self.current_tx_read_only = ro;
+        }
+        // v7.40.12 — the DEFERRABLE third of the same clause.
+        if let Some(d) = modes.deferrable {
+            self.current_tx_deferrable = d;
+        }
+        let isolation = self.current_isolation_level;
+        // v7.37.17 (Phase E2) — inside an open tx, switching to
+        // RR/SER BEFORE the first query freezes the tx's view by
+        // caching a snapshot now (PG allows the switch until the
+        // first query; the RC rebase keys off cached_snapshot).
+        // Switching (back) to RC/RU clears it so the rebase
+        // resumes.
+        if let Some(tx_id) = self.current_tx
+            && self.tx_catalogs.contains_key(&tx_id)
+        {
+            let cache = match isolation {
+                spg_sql::ast::IsolationLevel::RepeatableRead
+                | spg_sql::ast::IsolationLevel::Serializable => Some(self.current_snapshot()),
+                spg_sql::ast::IsolationLevel::ReadUncommitted
+                | spg_sql::ast::IsolationLevel::ReadCommitted => None,
+            };
+            if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
+                st.cached_snapshot = cache;
+            }
+        }
+        Ok(QueryResult::CommandOk {
+            affected: 0,
+            modified_catalog: false,
+        })
+    }
     pub(crate) fn exec_show_parameter(
         &self,
         name: alloc::string::String,
@@ -2513,16 +2688,42 @@ impl Engine {
             // `in_transaction()`: the server shares one Engine, so the global
             // form makes connection B's BEGIN see connection A's transaction
             // (rounds 279 / 283 / 298 / 304 / 443 / 444 are the same trap).
-            Statement::Begin(_)
+            Statement::Begin(modes)
                 if self.current_tx.is_some_and(|t| self.is_tx_open(t)) && !self.speaks_mysql =>
             {
-                self.warning(alloc::string::String::from(
-                    "there is already a transaction in progress",
-                ));
-                Ok(QueryResult::CommandOk {
-                    affected: 0,
-                    modified_catalog: false,
-                })
+                // v7.40.12 — the BEGIN is a no-op for the transaction's
+                // ROWS, which is what the measurement above established;
+                // it is NOT a no-op for its MODES, which this dropped.
+                // Measured on PG 18.6, one statement per round trip:
+                //
+                //   BEGIN; SELECT 1;
+                //   SHOW transaction_read_only        -> off
+                //   BEGIN READ ONLY                   -> WARNING …
+                //   SHOW transaction_read_only        -> on
+                //
+                // and the refusals come with it: `SELECT 1; BEGIN
+                // ISOLATION LEVEL SERIALIZABLE` reports `SET TRANSACTION
+                // ISOLATION LEVEL must be called before any query` —
+                // PG's words for a statement the user spelled `BEGIN`.
+                //
+                // The pgwire multi-statement path wraps every script in
+                // a transaction, so EVERY leading `BEGIN` in a script is
+                // a nested one: dropping the modes there made
+                // `BEGIN READ ONLY; INSERT …; COMMIT;` sent as one
+                // script accept the write and commit it. A read-only
+                // transaction is a safety mechanism; accepting the write
+                // is the worst available answer.
+                //
+                // No warning when the open transaction is the host's own
+                // implicit script wrap: PG does not warn there either
+                // (measured — `SELECT 1; BEGIN READ ONLY; …` is silent,
+                // while the same thing inside an explicit block warns).
+                if !self.current_tx_is_implicit() {
+                    self.warning(alloc::string::String::from(
+                        "there is already a transaction in progress",
+                    ));
+                }
+                self.apply_set_transaction(modes)
             }
             Statement::Begin(modes) if self.current_tx.is_some_and(|t| self.is_tx_open(t)) => {
                 // MySQL dialect: commit what is open, then start fresh.
@@ -2886,169 +3087,7 @@ impl Engine {
             // transaction does not see a concurrent commit and a READ
             // COMMITTED one does. The comment outlived the code by
             // three versions.
-            Statement::SetTransaction { modes } => {
-                // v7.39 — outside a transaction block PG WARNS and does
-                // nothing. Measured on PG 18.6:
-                //
-                //     SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-                //     WARNING:  SET TRANSACTION can only be used in transaction blocks
-                //     SHOW transaction_isolation;  ->  read committed
-                //
-                // SPG applied it to the session instead, so a bare
-                // `SET TRANSACTION` silently changed every later
-                // transaction — the opposite of PG, where it changes
-                // nothing. `Session::warning`'s own doc comment names
-                // `SET CONSTRAINTS` outside a transaction block as the
-                // case it exists for; this is its sibling, and only one
-                // of them had been wired.
-                if !self
-                    .current_tx
-                    .is_some_and(|id| self.tx_catalogs.contains_key(&id))
-                {
-                    self.warning("SET TRANSACTION can only be used in transaction blocks".into());
-                    return Ok(QueryResult::CommandOk {
-                        affected: 0,
-                        modified_catalog: false,
-                    });
-                }
-                // v7.37.17 (Phase E3) — PG rejects an isolation switch
-                // after the transaction's first query (SQLSTATE 25001);
-                // silently applying it to the remaining statements would
-                // give a tx that is half one level, half another.
-                //
-                // v7.40.12 — but ONLY the isolation half, and only that
-                // one plus the read-write half of a read-only block.
-                // This refusal covered the whole statement, so
-                // `BEGIN; SELECT 1; SET TRANSACTION READ ONLY` was
-                // refused where PG answers `SET`. It had been invisible
-                // over the wire because a canned `SELECT 1` never told
-                // the engine a query had run, so the refusal fired for
-                // nothing; fixing the counter is what exposed it.
-                //
-                // Measured on PostgreSQL 18.6, after a query in a block:
-                //   SET TRANSACTION READ ONLY                 -> SET
-                //   SET TRANSACTION READ WRITE (r/w block)    -> SET
-                //   SET TRANSACTION READ WRITE (r/o block)    -> 25001
-                //     "transaction read-write mode must be set before
-                //      any query"
-                //   SET TRANSACTION ISOLATION LEVEL <any>     -> 25001
-                // Tightening is allowed at any point; only LOOSENING a
-                // read-only transaction, and only changing the level,
-                // are refused once a snapshot has been taken.
-                let ran_a_query = self.current_tx.is_some_and(|tx_id| {
-                    self.tx_catalogs
-                        .get(&tx_id)
-                        .is_some_and(|st| st.stmts_run > 0)
-                });
-                if ran_a_query {
-                    if modes.isolation.is_some() {
-                        return Err(EngineError::Unsupported(
-                            "SET TRANSACTION ISOLATION LEVEL must be called before any query"
-                                .into(),
-                        ));
-                    }
-                    if modes.read_only == Some(false) && self.current_tx_read_only {
-                        return Err(EngineError::Unsupported(
-                            "transaction read-write mode must be set before any query".into(),
-                        ));
-                    }
-                    // PG's third rule, and its own wording. Measured:
-                    // `BEGIN; SELECT 1; SET TRANSACTION DEFERRABLE` ->
-                    // 25001. Unlike the read/write half this refuses in
-                    // BOTH directions, which is why it is not gated on
-                    // the current value.
-                    if modes.deferrable.is_some() {
-                        return Err(EngineError::Unsupported(
-                            "SET TRANSACTION [NOT] DEFERRABLE must be called before any query"
-                                .into(),
-                        ));
-                    }
-                }
-                // v7.40.12 — inside a SUBTRANSACTION, PG refuses two of
-                // the three whatever the snapshot says, each with its own
-                // wording, and all three 25001. Measured on PG 18.6, in
-                // `BEGIN; SAVEPOINT sp; ...`:
-                //
-                //   ISOLATION LEVEL   must not be called in a subtransaction
-                //   [NOT] DEFERRABLE  cannot be called within a subtransaction
-                //   READ ONLY         accepted
-                //   READ WRITE, in a read-only block
-                //                     cannot set transaction read-write mode
-                //                     inside a read-only transaction
-                //
-                // The savepoint has to be OPEN: after `RELEASE SAVEPOINT`
-                // the switch is accepted again, and after `ROLLBACK TO
-                // SAVEPOINT` it is not -- PG keeps the savepoint there,
-                // and so does this stack. The snapshot rule above is
-                // checked first, which is PG's order too: with a query
-                // already run AND a savepoint open, PG reports the
-                // "before any query" message.
-                let in_subtransaction = self
-                    .current_tx
-                    .and_then(|tx_id| self.tx_catalogs.get(&tx_id))
-                    .is_some_and(|st| !st.savepoints.is_empty());
-                if in_subtransaction {
-                    if modes.isolation.is_some() {
-                        return Err(EngineError::Unsupported(
-                            "SET TRANSACTION ISOLATION LEVEL must not be called in a \
-                             subtransaction"
-                                .into(),
-                        ));
-                    }
-                    if modes.deferrable.is_some() {
-                        return Err(EngineError::Unsupported(
-                            "SET TRANSACTION [NOT] DEFERRABLE cannot be called within a \
-                             subtransaction"
-                                .into(),
-                        ));
-                    }
-                    if modes.read_only == Some(false) && self.current_tx_read_only {
-                        return Err(EngineError::Unsupported(
-                            "cannot set transaction read-write mode inside a read-only \
-                             transaction"
-                                .into(),
-                        ));
-                    }
-                }
-                if let Some(isolation) = modes.isolation {
-                    self.current_isolation_level = isolation;
-                }
-                // v7.39 — the read/write half of the same statement. It was
-                // parsed and dropped with the rest of the clause.
-                if let Some(ro) = modes.read_only {
-                    self.current_tx_read_only = ro;
-                }
-                // v7.40.12 — the DEFERRABLE third of the same clause.
-                if let Some(d) = modes.deferrable {
-                    self.current_tx_deferrable = d;
-                }
-                let isolation = self.current_isolation_level;
-                // v7.37.17 (Phase E2) — inside an open tx, switching to
-                // RR/SER BEFORE the first query freezes the tx's view by
-                // caching a snapshot now (PG allows the switch until the
-                // first query; the RC rebase keys off cached_snapshot).
-                // Switching (back) to RC/RU clears it so the rebase
-                // resumes.
-                if let Some(tx_id) = self.current_tx
-                    && self.tx_catalogs.contains_key(&tx_id)
-                {
-                    let cache = match isolation {
-                        spg_sql::ast::IsolationLevel::RepeatableRead
-                        | spg_sql::ast::IsolationLevel::Serializable => {
-                            Some(self.current_snapshot())
-                        }
-                        spg_sql::ast::IsolationLevel::ReadUncommitted
-                        | spg_sql::ast::IsolationLevel::ReadCommitted => None,
-                    };
-                    if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
-                        st.cached_snapshot = cache;
-                    }
-                }
-                Ok(QueryResult::CommandOk {
-                    affected: 0,
-                    modified_catalog: false,
-                })
-            }
+            Statement::SetTransaction { modes } => self.apply_set_transaction(modes),
             // v7.38 轴 4 surface expansion — `SHOW <parameter>`
             // returns a 1-row 1-column TEXT result (the PG psql
             // wire shape). The handler dispatches per-name:
