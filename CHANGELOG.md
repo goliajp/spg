@@ -364,6 +364,27 @@ an indexed text column lost rows in a join.
 
 ### Fixed — 7.40.10 fixed the uniqueness check and left its arbiter behind
 
+### Fixed — removing `--test-threads=1` uncovered a second hazard behind it
+
+The CI change below removed workspace-wide serial testing after
+measuring that the hazard it named — e2e tests on fixed ports — was
+gone. There was a second one nothing named: the three tests in
+`crates/spg-embedded-tokio/tests/group_commit.rs` share the
+PROCESS-global `WAL_FSYNC_COUNT`, and one of them measures it as a
+delta across its own window while the other two each perform 64
+concurrent inserts.
+
+Run concurrently, that window absorbed their fsyncs. The test read 2
+here and 66, 67 and 76 on the two-core runner, against a bound of 64,
+and reported `each write paid for its own, so group-commit is not
+batching at all` while the engine was batching perfectly. The first
+commit to go red under it changed one shell script, which is what made
+it clear the cause was not in the diff.
+
+A file-local lock serialises the three. Every other test binary is its
+own process, so the measurement is restored without putting the
+workspace back on one thread.
+
 ### Changed — CI: the release job compiled the same crates four times
 
 Counted from a green develop push. Cargo resolves features over the

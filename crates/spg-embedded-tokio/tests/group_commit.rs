@@ -13,6 +13,30 @@
 
 use spg_embedded_tokio::AsyncDatabase;
 
+/// v7.40.11 — the three tests in this file run CONCURRENTLY, and
+/// `WAL_FSYNC_COUNT` is a PROCESS-global counter.
+///
+/// `concurrent_writes_share_fsync` measures it as a delta across its own
+/// window, so every fsync the other two tests performed inside that
+/// window was counted as one of its own — and both of them also do 64
+/// concurrent inserts. It read 2 on this machine and 66, 67 and 76 on a
+/// two-core CI runner, against a bound of 64, and reported it as "each
+/// write paid for its own, so group-commit is not batching at all"
+/// while the engine was batching perfectly.
+///
+/// The concurrency is new: v7.40.11 removed `--test-threads=1` from the
+/// workspace test job after measuring that the hazard it named (e2e
+/// tests on fixed ports) was gone. This was a SECOND hazard behind the
+/// same flag, and nothing named it. The first commit to go red under it
+/// changed one shell script, which is what made it obvious that the
+/// cause was not in the diff.
+///
+/// A file-local lock is enough: every other test binary is its own
+/// process, and this restores the measurement without putting the
+/// workspace back on one thread.
+static WAL_COUNTER: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 fn unique_dir(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -26,6 +50,8 @@ fn unique_dir(name: &str) -> std::path::PathBuf {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_writes_share_fsync() {
+    // See `WAL_COUNTER`: these three share a process-global counter.
+    let _serialised = WAL_COUNTER.lock().await;
     let dir = unique_dir("share");
     let db_path = dir.join("gc.db");
     let db = AsyncDatabase::open_path(&db_path).await.unwrap();
@@ -113,6 +139,8 @@ async fn concurrent_writes_share_fsync() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn durability_survives_reopen() {
+    // See `WAL_COUNTER`: these three share a process-global counter.
+    let _serialised = WAL_COUNTER.lock().await;
     let dir = unique_dir("dura");
     let db_path = dir.join("gc.db");
     {
@@ -146,6 +174,8 @@ async fn durability_survives_reopen() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wal_lsns_stay_monotonic_under_concurrency() {
+    // See `WAL_COUNTER`: these three share a process-global counter.
+    let _serialised = WAL_COUNTER.lock().await;
     use spg_embedded::parse_wal_records;
     let dir = unique_dir("order");
     let db_path = dir.join("gc.db");
