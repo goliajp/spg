@@ -155,6 +155,10 @@ pub enum DataType {
     Date,
     /// `TIMESTAMP` (a.k.a. `MySQL` `DATETIME`) — instant with microsecond
     /// precision, stored as `i64` microseconds since the Unix epoch.
+    /// v8.0 — SQL `void`, the type of a void-returning function's
+    /// answer. PG has no `pg_settings`-style row for it; it exists so
+    /// `pg_typeof` can name it and the wire can send OID 2278.
+    Void,
     Timestamp,
     /// v7.9.2 `TIMESTAMPTZ` — bit-identical to `Timestamp` on disk
     /// (i64 microseconds, UTC by convention). Carried as a distinct
@@ -527,6 +531,8 @@ impl RangeKind {
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            // v8.0 — PG spells it lowercase in `pg_typeof`.
+            Self::Void => f.write_str("void"),
             Self::SmallInt => f.write_str("SMALLINT"),
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
@@ -818,6 +824,14 @@ pub enum Value<'arena> {
     NumericBig(alloc::boxed::Box<crate::bignum::BigNumeric>),
     /// Days since the Unix epoch (1970-01-01). Negative for earlier dates.
     Date(i32),
+    /// v8.0 — SQL `void`: the value a void-returning function answers
+    /// with. NOT `Null`, which is the difference a client can see:
+    /// measured on PG 18.6, `SELECT pg_sleep(0.001) IS NULL` is FALSE
+    /// and `pg_typeof(pg_sleep(0.001))` is `void`, while SPG answered
+    /// `t` and `unknown` for the whole void-returning family.
+    ///
+    /// Transient: never persisted, never a sort or index key.
+    Void,
     /// Microseconds since the Unix epoch (1970-01-01T00:00:00Z).
     Timestamp(i64),
     /// Calendar span: `months` + `days` + `micros`. Three fields are
@@ -1185,6 +1199,9 @@ impl<'arena> Value<'arena> {
     /// Type tag, or `None` for `NULL` (unknown at value level).
     pub fn data_type(&self) -> Option<DataType> {
         match self {
+            // v8.0 — `void` HAS a type, unlike NULL. That is the whole
+            // point: `pg_typeof(pg_sleep(0.001))` is `void` on PG 18.6.
+            Self::Void => Some(DataType::Void),
             Self::SmallInt(_) => Some(DataType::SmallInt),
             Self::Int(_) => Some(DataType::Int),
             Self::BigInt(_) => Some(DataType::BigInt),
@@ -1322,6 +1339,7 @@ impl<'arena> Value<'arena> {
     /// outer enum at `'static`.
     pub fn into_owned(self) -> Value<'static> {
         match self {
+            Value::Void => Value::Void,
             Value::SmallInt(n) => Value::SmallInt(n),
             Value::Int(n) => Value::Int(n),
             Value::BigInt(n) => Value::BigInt(n),
@@ -3070,6 +3088,8 @@ impl IndexKey {
 
     pub fn from_value(v: &Value<'_>) -> Option<Self> {
         match v {
+            // v8.0 — `void` is never a sort or index key.
+            Value::Void => None,
             // v7.37.43 (INSUBQ B-4) — BigInt hits first (the dominant
             // INSUBQ shape probes PK as BigInt). Tiny micro-win.
             Value::BigInt(n) => Some(Self::Int(*n)),
@@ -3784,6 +3804,8 @@ pub(crate) fn compose_multi_key(
 /// the arms are grouped by the reason, so the answer is also readable.
 pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
     match ty {
+        // v8.0 — `void` is never a column, so never a key component.
+        DataType::Void => false,
         // Integers, and everything whose storage IS an i64 with the
         // same order: dates, both timestamps, times, money, year.
         DataType::SmallInt

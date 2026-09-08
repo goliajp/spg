@@ -2424,18 +2424,26 @@ fn apply_function_dispatch(
         | "pg_ls_logicalsnapdir" => Ok(Value::Null),
         // Replication-origin family — pg_recvlogical / pglogical
         // probe. SPG has no logical replication yet.
-        "pg_replication_origin_advance"
-        | "pg_replication_origin_create"
-        | "pg_replication_origin_drop"
+        // v8.0 — the six PG types `void` are split out below. They were
+        // in this arm, which comes FIRST and therefore won: the new arm
+        // was unreachable and `pg_typeof(pg_replication_origin_xact_reset())`
+        // still answered `unknown`. Caught by running the whole family
+        // against PG rather than the one function that started it.
+        "pg_replication_origin_create"
         | "pg_replication_origin_oid"
         | "pg_replication_origin_progress"
         | "pg_replication_origin_session_is_setup"
         | "pg_replication_origin_session_progress"
+        | "pg_show_replication_origin_status" => Ok(Value::Null),
+        // v8.0 — the void-returning members of the same family. PG types
+        // `advance` / `drop` / the four session+xact ones `void`; the
+        // rest of the arm above returns a value or NULL and stays.
+        "pg_replication_origin_advance"
+        | "pg_replication_origin_drop"
         | "pg_replication_origin_session_reset"
         | "pg_replication_origin_session_setup"
         | "pg_replication_origin_xact_reset"
-        | "pg_replication_origin_xact_setup"
-        | "pg_show_replication_origin_status" => Ok(Value::Null),
+        | "pg_replication_origin_xact_setup" => Ok(Value::Void),
         // v7.39 (round 550) — replication-slot admin, for real.
         //
         // The whole family answered NULL, with a note saying a
@@ -2506,8 +2514,11 @@ fn apply_function_dispatch(
         // pg_nextoid(rel, col, index) — binary-upgrade-only oid
         // allocator; binary_upgrade_* setters are pg_upgrade
         // internals. NULL keeps pg_upgrade-generated dumps moving.
-        "pg_nextoid"
-        | "binary_upgrade_set_next_pg_type_oid"
+        // v8.0 — `pg_nextoid` is NOT in this group's return type: PG
+        // types it `oid`, the ten setters below `void`. They were one
+        // arm answering NULL for both.
+        "pg_nextoid" => Ok(Value::Null),
+        "binary_upgrade_set_next_pg_type_oid"
         | "binary_upgrade_set_next_array_pg_type_oid"
         | "binary_upgrade_set_next_heap_pg_class_oid"
         | "binary_upgrade_set_next_index_pg_class_oid"
@@ -2516,7 +2527,7 @@ fn apply_function_dispatch(
         | "binary_upgrade_set_next_pg_authid_oid"
         | "binary_upgrade_set_record_init_privs"
         | "binary_upgrade_set_missing_value"
-        | "binary_upgrade_create_empty_extension" => Ok(Value::Null),
+        | "binary_upgrade_create_empty_extension" => Ok(Value::Void),
         // v7.37.17 (17.6 siblings) — pg_stat_reset* family. Returns
         // void (NULL) — monitoring / admin dashboards call these on
         // schedule to reset counters. SPG's counters are session-
@@ -2529,13 +2540,13 @@ fn apply_function_dispatch(
         | "pg_stat_reset_single_function_counters"
         | "pg_stat_reset_slru"
         | "pg_stat_reset_replication_slot"
-        | "pg_stat_reset_subscription_stats" => Ok(Value::Null),
+        | "pg_stat_reset_subscription_stats" => Ok(Value::Void),
         // pg_stat_clear_snapshot — clear the per-session stats
         // snapshot. Same treatment: return void.
-        "pg_stat_clear_snapshot" => Ok(Value::Null),
+        "pg_stat_clear_snapshot" => Ok(Value::Void),
         // pg_stat_force_next_flush — force next stats flush to
         // shared memory. SPG's stats are synchronous; no-op.
-        "pg_stat_force_next_flush" => Ok(Value::Null),
+        "pg_stat_force_next_flush" => Ok(Value::Void),
         // v7.37.17 (17.6 siblings) — transaction ID probes. SPG
         // uses u64 tx IDs that never wrap; these return the current
         // tx ID as BigInt. txid_ names are pre-PG 13 aliases for
@@ -10706,7 +10717,12 @@ fn apply_function_dispatch(
             // PG prints it as the empty string, so `'x:' || setseed(0.5)::text`
             // is `x:`, not NULL. SPG returned NULL and swallowed the whole
             // surrounding expression.
-            Ok(Value::text(""))
+            //
+            // v8.0 — an empty TEXT was the closest thing available then.
+            // `Value::Void` exists now, so the value is the type it
+            // claims to be: `pg_typeof(setseed(0.5))` said `text` and
+            // now says `void`, and the rendering is unchanged.
+            Ok(Value::Void)
         }
         // v7.17.0 — PG `gen_random_uuid()` (built-in, no extension)
         // and the historical uuid-ossp `uuid_generate_v4()` alias.
@@ -14676,7 +14692,10 @@ fn apply_function_dispatch(
         "gin_clean_pending_list"
         | "brin_summarize_new_values" => Ok(Value::BigInt(0)),
         // brin_summarize_range / brin_desummarize_range are void.
-        "brin_summarize_range" | "brin_desummarize_range" => Ok(Value::Null),
+        // v8.0 — measured: PG types `brin_desummarize_range` void and
+        // `brin_summarize_range` integer. One arm answered NULL for both.
+        "brin_summarize_range" => Ok(Value::Null),
+        "brin_desummarize_range" => Ok(Value::Void),
         // amvalidate(oid) — validates an access-method operator
         // class. Always true for SPG's builtin BTree.
         "amvalidate" => Ok(Value::Bool(true)),
@@ -16707,7 +16726,7 @@ fn apply_function_dispatch(
         // pg_notify(channel, payload) — LISTEN/NOTIFY delivery.
         // SPG has no async notification channel yet; accept + return
         // void (NULL).
-        "pg_notify" => Ok(Value::Null),
+        "pg_notify" => Ok(Value::Void),
         // information_schema._pg_* internal helpers — SQLAlchemy,
         // asyncpg and JDBC's DatabaseMetaData introspection queries
         // call these. The typmod math is real (PG's atttypmod
@@ -18067,8 +18086,10 @@ fn apply_function_dispatch(
         "pg_available_extensions"
         | "pg_available_extension_versions"
         | "pg_extension_update_paths"
-        | "pg_extension_config_dump"
         | "pg_visible_in_snapshot_txid" => Ok(Value::Null),
+        // v8.0 — measured: PG types this one `void`; its neighbours in
+        // the arm above return values.
+        "pg_extension_config_dump" => Ok(Value::Void),
         // pg_load_extension is used by CREATE EXTENSION machinery.
         // Return void.
         "pg_load_extension" => Ok(Value::Null),
@@ -18308,7 +18329,7 @@ fn apply_function_dispatch(
         "pg_wal_replay_pause"
         | "pg_wal_replay_resume"
         | "pg_xlog_replay_pause"   // pre-PG 10 name
-        | "pg_xlog_replay_resume" => Ok(Value::Null),
+        | "pg_xlog_replay_resume" => Ok(Value::Void),
         "pg_get_wal_replay_pause_state" => {
             Ok(Value::text::<String>("not paused".into()))
         }
@@ -18501,21 +18522,24 @@ fn apply_function_dispatch(
             // Returning void keeps the old accept-everything behaviour
             // rather than failing the statement.
             let _ = args;
-            Ok(Value::Null)
+            Ok(Value::Void)
         }
         "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" | "pg_try_advisory_lock_shared"
         | "pg_try_advisory_xact_lock_shared"
         | "pg_advisory_unlock"
         | "pg_advisory_unlock_shared" => Ok(Value::Bool(true)),
-        "pg_advisory_unlock_all" => Ok(Value::Null),
-        // v7.37.17 (17.6 siblings) — pg_sleep / pg_sleep_for /
-        // pg_sleep_until. Return void (NULL) without actually
-        // sleeping. Tests that use pg_sleep to trigger cache
-        // eviction / stat rollup are typically doing it as a
-        // shape marker; SPG's stats are synchronous so a real
-        // sleep isn't useful. Preserves parse-through for
-        // migration scripts + regression tests.
-        "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => Ok(Value::Null),
+        "pg_advisory_unlock_all" => Ok(Value::Void),
+        // v8.0 — the sleep itself is served by the host (see
+        // `sequence::eval_sleep_call`, which records the request before
+        // this dispatch runs); what is left here is the RETURN VALUE.
+        //
+        // It is `void`, not NULL. Measured on PG 18.6:
+        // `SELECT pg_sleep(0.001) IS NULL` -> f and
+        // `pg_typeof(pg_sleep(0.001))` -> void, while answering NULL
+        // here made both come out the other way. The comment this
+        // replaces said "return void (NULL)", which is two different
+        // things written as if they were one.
+        "pg_sleep" | "pg_sleep_for" | "pg_sleep_until" => Ok(Value::Void),
         // pg_xact_commit_timestamp(xid) — commit-timestamp
         // extension probe (typically off by default). Return NULL.
         "pg_xact_commit_timestamp" | "pg_last_committed_xact" => Ok(Value::Null),

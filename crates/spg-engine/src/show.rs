@@ -1059,6 +1059,11 @@ fn prefix_of(idx_name: &str, cat: &spg_storage::Catalog, table: &str) -> Option<
 
 fn render_data_type(ty: DataType) -> String {
     match ty {
+        // v8.0 — `void` is never a column type, so this renderer (which
+        // names column types for SHOW CREATE TABLE / SHOW COLUMNS) can
+        // only reach it through a value that has no business being in a
+        // schema. Named rather than folded into TEXT so it is visible.
+        DataType::Void => "void".into(),
         DataType::SmallInt => "SMALLINT".into(),
         DataType::Int => "INT".into(),
         DataType::BigInt => "BIGINT".into(),

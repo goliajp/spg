@@ -399,6 +399,9 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         }
         Value::Interval { kind, .. } => crate::eval::format_interval_kinded(0, 0, 0, *kind),
         Value::Null => "NULL".into(),
+        // v8.0 — PG renders `void` as the EMPTY STRING, not as a name:
+        // measured, `'['||pg_sleep(0.001)::text||']'` is `[]` there.
+        Value::Void => String::new(),
         // v7.10.4 — BYTEA renders as PG hex form.
         // v7.39 (round 524) — unless the session asked for `escape`.
         Value::Bytes(b) => {

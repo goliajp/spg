@@ -8910,6 +8910,10 @@ fn write_cell_int(out: &mut Vec<u8>, n: i64) -> std::io::Result<()> {
 /// as a readable string rather than confusing the client.
 const fn pg_type_oid(ty: DataType) -> u32 {
     match ty {
+        // v8.0 — PG's `void`. Without it a void-returning function's
+        // column described as text (25), and `pg_typeof` answered
+        // `unknown` where PG 18.6 answers `void`.
+        DataType::Void => 2278,
         DataType::Bool => 16,
         // v7.39 (round 291) — PG's identifier type carries its own OID;
         // reporting text (25) here would make every catalog column

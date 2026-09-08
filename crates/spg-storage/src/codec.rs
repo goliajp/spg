@@ -1236,6 +1236,10 @@ pub(crate) fn write_nsw_graph(out: &mut Vec<u8>, g: &NswGraph) {
 
 pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
     match t {
+        // v8.0 — `void` is never a column type, so it never reaches the
+        // on-disk schema. Encoded as the unknown tag rather than given a
+        // number nobody will read back.
+        DataType::Void => out.push(0),
         DataType::Int => out.push(1),
         DataType::BigInt => out.push(2),
         DataType::Float => out.push(3),
@@ -1966,6 +1970,9 @@ fn value_body_encoded_len(v: &Value<'_>, _ty: DataType) -> usize {
         // v7.38 (read01, T9) — a composite/record is a transient value
         // (row() → to_json); it is never persisted, so it has no on-disk body.
         Value::Composite(_) => 0,
+        // v8.0 — `void` is transient for the same reason: it is what a
+        // void-returning function answers with, never a stored column.
+        Value::Void => 0,
         // v7.39 (round 640) — an `xid` column persists the 8-byte body
         // its BIGINT sibling does.
         Value::Xid(_) => 8,
@@ -2858,6 +2865,8 @@ pub(crate) fn write_value(out: &mut Vec<u8>, v: &Value<'_>) {
         // binary codec encodes it as absent (the text protocol renders it via
         // value_to_text and row_to_json converts it to JSON before storage).
         Value::Composite(_) => out.push(0),
+        // v8.0 — `void`, transient like the composite above.
+        Value::Void => out.push(0),
         Value::RegClass(..)
         | Value::RegProc(..)
         | Value::RegType(..)
@@ -3968,6 +3977,8 @@ impl<'a> Cursor<'a> {
     /// reads its own type tag) so DEFAULT round-trips without a schema.
     pub(crate) fn read_value_body(&mut self, ty: DataType) -> Result<Value<'static>, StorageError> {
         match ty {
+            // v8.0 — `void` has no body; `write_value` never wrote one.
+            DataType::Void => Ok(Value::Void),
             DataType::SmallInt => {
                 let s = self.take(2)?;
                 Ok(Value::SmallInt(i16::from_le_bytes([s[0], s[1]])))

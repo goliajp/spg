@@ -84,6 +84,10 @@ fn column_schema_to_desc(c: &ColumnSchema) -> ColumnDesc {
 
 const fn data_type_to_wire(t: DataType) -> WireType {
     match t {
+        // v8.0 — the native wire has no void tag; it renders as text,
+        // which is what PG's own text protocol sends for it (an empty
+        // string, not a NULL).
+        DataType::Void => WireType::Text,
         // v1.11 surfaces SMALLINT as INT on the wire — the wire layer
         // doesn't (yet) carry a separate 16-bit tag, and PG drivers
         // happily render an i32 for any narrower integer column.
