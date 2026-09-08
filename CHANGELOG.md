@@ -580,7 +580,7 @@ Re-measured at load 1.6, six identical processes timed three times each
 in both directions with every timing carrying its own spill witness, the
 processes are interchangeable. It was the machine.
 
-### Changed — the NOT RUN line says how long, not just which
+### Changed — the NOT RUN line says how long, and whose machine
 
 v7.38.17 made a tier report name the full-tier steps it did not run,
 with the reason beside each: a total that cannot show what it excluded
@@ -591,6 +591,22 @@ to whoever owns the machine. Sixteen days later nothing had installed
 it — `crontab -l` and `~/Library/LaunchAgents` are empty of it on this
 machine and the testbed, there is no workflow for it, and
 `target/suite/nightly-full-*.log` does not exist anywhere.
+
+The age answers about the machine it is printed on, which its own doc
+comment says and its NEVER arm printed — while the other two arms did
+not. So the line read `last full run was 20d 5h ago` on a development
+box while a full run was in flight on the testbed and another had
+finished there that morning. `full` runs on the TESTBED (`suite.sh
+--on-mini`), so the local answer is not stale by accident; it is
+systematically stale, and the sentence as printed made a claim about the
+project rather than about the box.
+
+The pin for it is the property — every arm names whose machine it means
+— rather than the strings. Its first version asserted the strings and
+stayed green with the word removed from the days arm, because a report
+written `now` can only reach the hours arm; it backdates the file and
+checks `20d` is really in the answer before checking the property. Both
+directions verified by negative control.
 
 ## [7.40.11] — 2026-09-07
 
