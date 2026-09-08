@@ -21,8 +21,50 @@ cd "$(dirname "$0")/.."
 # this particular lie to point -- it invites killing a healthy run and
 # starting it over. Caught during the 7.38.13 release, on a run whose
 # clippy was visibly still going.
+HOST="${SPG_MINI_HOST:-mini.local}"
+RDIR="${SPG_MINI_DIR:-workspace/goliajp/spg-ci}"
+
+# 8.0.1 — bring the evidence back to the machine that will be asked for it.
+#
+# `prerelease` and `full` run on the TESTBED, so their reports are
+# written there. `release.sh`'s preflight asks `prerelease-verdict.sh`
+# for a green prerelease report on HEAD, and that script reads the LOCAL
+# `target/suite/`. So the sanctioned way to run the battery put the
+# evidence in the one place the gate cannot see it.
+#
+# What that cost, on the v8.0.0 train: the preflight found no report,
+# fell back to running `gate.sh all` here, and its perf step answered
+# "PG_URI and SPG_URI are unset, so nothing was compared" — because that
+# step configures both legs itself only when it detects the testbed.
+# The release was blocked by a gate that cannot pass on this machine
+# while the testbed's own green report for the same SHA sat unread. It
+# was copied by hand. A step that needs someone to remember is the next
+# step that gets forgotten.
+#
+# Reports are named `report-<tier>-<runid>.json` and the runid ends in
+# HEAD's 7-character short SHA, which is exactly what the verdict script
+# matches on — so fetching by that SHA cannot bring back evidence for
+# another tree.
+fetch_reports() {
+    local sha rc
+    sha=$(git rev-parse --short=7 HEAD 2>/dev/null) || return 0
+    mkdir -p target/suite
+    set +e
+    scp -q "${HOST}:${RDIR}/target/suite/report-"*"-${sha}.json" target/suite/ 2>/dev/null
+    rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+        local n
+        n=$(ls -1 target/suite/report-*-"${sha}".json 2>/dev/null | wc -l | tr -d " ")
+        echo "suite: fetched ${n} report(s) for ${sha} from ${HOST} into target/suite/"
+    else
+        echo "suite: no report for ${sha} on ${HOST} — nothing fetched"
+    fi
+}
+
 if [[ "${1:-}" == "--result" ]]; then
-    exec ssh "${SPG_MINI_HOST:-mini.local}" '
+    set +e
+    out=$(ssh "$HOST" '
         if [ -f /tmp/spg-suite.done ]; then
             tail -20 /tmp/spg-suite.log
         elif pgrep -qf "mini-suite-runner\.sh|suite-run (precommit|prerelease|full)"; then
@@ -30,7 +72,16 @@ if [[ "${1:-}" == "--result" ]]; then
         else
             echo "NOT RUNNING and no sentinel — the run died. Last lines:"
             tail -5 /tmp/spg-suite.log; exit 1
-        fi'
+        fi')
+    rc=$?
+    set -e
+    printf "%s\n" "$out"
+    # Only when the run has finished: a report copied mid-run describes
+    # a tier that has not reached its own verdict.
+    if [[ $rc -eq 0 ]] && ! printf "%s" "$out" | grep -q "^still running:"; then
+        fetch_reports
+    fi
+    exit $rc
 fi
 
 TIER="${1:-}"
@@ -44,8 +95,6 @@ shift
 # r1022), launch detached via the runner file, come back for the
 # verdict with `suite.sh --result`.
 if [[ "${1:-}" == "--on-mini" ]]; then
-    HOST="${SPG_MINI_HOST:-mini.local}"
-    RDIR="${SPG_MINI_DIR:-workspace/goliajp/spg-ci}"
     # v7.38.14 — `rsync -a` preserves mtimes, and cargo decides what to
     # rebuild from mtimes. A source file edited at 00:14 and synced at
     # 00:27 lands on the testbed looking OLDER than the artifact built

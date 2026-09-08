@@ -8,7 +8,7 @@
 #
 #   1. preflight   on master, clean tree, synced with origin,
 #                  tag vX.Y.Z == HEAD, workspace version == X.Y.Z
-#   2. crates      cargo publish × 11 in topological order;
+#   2. crates      cargo publish × 13 in topological order;
 #                  versions already on crates.io are skipped
 #   3. docker      buildx multi-arch (amd64+arm64), tags X.Y.Z / X.Y /
 #                  latest, --push; manifest digest captured to stdout
@@ -29,6 +29,27 @@ shift
 
 SKIP_CRATES=0
 SKIP_DOCKER=0
+
+# 8.0.1 — ONE fixture list, used by BOTH acceptance panels.
+#
+# There were two lists. The panel that runs BEFORE publishing — the one
+# that decides whether the crates and the image may land — passed no
+# `--fixture` at all, and the panel that runs AFTER, which only reports,
+# passed these two. So v8.0.0 shipped with the gating panel at 75 cases
+# and the reporting panel at 77, and the two it did not gate on were the
+# CUSTOMER's own schema. By the time they ran, the tag and the crates
+# were unrecallable.
+#
+# `dropin-acceptance.sh` was never dishonest about it: with no
+# `--fixture` it prints "=== Fixture panel === none requested" and
+# excludes it from the count. The lie was in the caller, in an argument
+# list, which is the one place neither reading the tool nor reading its
+# PASS can show you. The check after the second panel compares the two
+# case lists so this cannot come back quietly.
+DROPIN_FIXTURES=(
+    --fixture scripts/fixtures/mailrs-pg-extensions.sql
+    --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql
+)
 # --fast: the end-of-the-line path. Ships the same artefacts through the
 # same preflight, and replaces the ~40-minute battery (dogfood + gate.sh
 # all + the 59-cell drop-in panel) with the precommit tier, whose own
@@ -265,6 +286,7 @@ if [[ "$SKIP_DOCKER" == 0 ]]; then
         --image "spg-candidate:v${VERSION}" \
         --no-pull \
         --port 25433 \
+        "${DROPIN_FIXTURES[@]}" \
         --report "tmp/reports/dropin-acceptance-candidate-v${VERSION}.md"
     echo "candidate accepted — publishing is now allowed"
 else
@@ -350,8 +372,7 @@ else
     scripts/dropin-acceptance.sh \
         --image "${IMAGE_REPO}:${VERSION}" \
         --port 25433 \
-        --fixture scripts/fixtures/mailrs-pg-extensions.sql \
-        --fixture scripts/fixtures/mailrs-init-schema-v1.7.142.sql \
+        "${DROPIN_FIXTURES[@]}" \
         --report "tmp/reports/dropin-acceptance-report-v${VERSION}.md"
     # v7.39.11 — the reports are internal working material and are not
     # tracked. The public repository carries what a USER of SPG needs;
@@ -365,6 +386,33 @@ else
     # file that goes stale, which is what it had done (it said
     # `goliakk/spg:7.37.15` and `panel cases: 57` while the panel had
     # been 66 for several releases).
+
+    # 8.0.1 — the gate may never be narrower than the report.
+    #
+    # Both panels now take `DROPIN_FIXTURES`, so they agree by
+    # construction; this is the check that says so, because an argument
+    # list is exactly the kind of thing that drifts back apart. It
+    # compares the CASE NAMES, not the counts: two panels can hold the
+    # same number of different cases.
+    cand_report="tmp/reports/dropin-acceptance-candidate-v${VERSION}.md"
+    pub_report="tmp/reports/dropin-acceptance-report-v${VERSION}.md"
+    if [[ -f "$cand_report" && -f "$pub_report" ]]; then
+        missing=$(comm -13 \
+            <(grep -o '^| `[^`]*`' "$cand_report" | sort -u) \
+            <(grep -o '^| `[^`]*`' "$pub_report"  | sort -u))
+        if [[ -n "$missing" ]]; then
+            echo "release: the panel that GATED the publish covered less \
+than the panel that reports on it. These cases ran only after the \
+crates and the image were already permanent:" >&2
+            echo "$missing" >&2
+            exit 1
+        fi
+        echo "acceptance: the gating panel covered every case the report does"
+    else
+        echo "release: one of the two acceptance reports is missing — \
+cannot show the gate was as wide as the report" >&2
+        exit 1
+    fi
 fi
 
 banner "v${VERSION} published — remaining human steps"
