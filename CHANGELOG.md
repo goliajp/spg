@@ -10,6 +10,69 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the panel that gated the publish covered less than the panel that reports on it
+
+`release.sh` runs `dropin-acceptance.sh` twice: once against the
+candidate image BEFORE anything is published — the run that decides
+whether the crates and the image may land — and once against the pushed
+image afterwards, which only reports. The two calls did not pass the
+same arguments:
+
+```text
+  before publishing   no --fixture              75 cases
+  after publishing    --fixture ×2              77 cases
+```
+
+The two the gate did not cover were the CUSTOMER's own schema —
+`mailrs-pg-extensions.sql` and `mailrs-init-schema-v1.7.142.sql`. By the
+time they ran, the tag and the crates were unrecallable. v8.0.0 shipped
+that way.
+
+`dropin-acceptance.sh` was never dishonest about it: with no `--fixture`
+it prints `=== Fixture panel === none requested` and excludes it from
+the count. The claim that was false lived in the caller's argument list,
+which is the one place that neither reading the tool nor reading its
+PASS will show you — it was found by diffing the two reports' case
+NAMES after noticing the count had gone 77 → 75 since the previous
+release.
+
+One list now feeds both calls, and a check after the second compares the
+case names and fails the run if the gating panel was narrower. Verified
+against the two real v8.0.0 reports: it names exactly those two
+fixtures, and does not fire when the lists agree.
+
+### Fixed — the sanctioned way to run the battery hid the evidence from the gate
+
+`release.sh`'s preflight accepts a green `prerelease` report on HEAD in
+place of re-running the battery, via `prerelease-verdict.sh`, which
+reads the LOCAL `target/suite/`. But `prerelease` and `full` run on the
+testbed (`suite.sh --on-mini`), which writes its reports there.
+
+So the release train found no report, fell back to running `gate.sh all`
+on the development machine, and its perf step answered
+
+```text
+  perf: PG_URI and SPG_URI are unset, so nothing was compared.
+```
+
+— because that step configures both legs itself only when it detects the
+testbed. The release was blocked by a gate that cannot pass anywhere but
+the testbed, while the testbed's own green report for the same SHA sat
+unread. It was copied across by hand.
+
+`suite.sh --result` now fetches the reports for HEAD's short SHA back
+into `target/suite/` once the run has finished, and says how many it
+brought. Reports are matched on the SHA the verdict script already keys
+on, so this cannot carry evidence from another tree. Verified end to
+end against the testbed: with the local reports deleted the verdict
+script refuses, `--result` fetches two, the verdict script accepts, and
+both files hash identically to the testbed's.
+
+### Fixed — `release.sh`'s header said eleven crates and there are thirteen
+
+The banner has printed `${#CRATES[@]}` all along, so the run was right;
+the comment a reader consults was not.
+
 
 ## [8.0.0] — 2026-09-08
 
