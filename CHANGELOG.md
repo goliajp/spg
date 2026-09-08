@@ -13,10 +13,16 @@ the current build; this file is a release-organized view.
 
 ## [8.0.1] — 2026-09-08
 
-The release train's own two blind spots, both found by running the
-v8.0.0 train and neither visible from inside the tools they live in.
+The release train's own two blind spots — plus a stale number in its
+own header — all three found by running the v8.0.0 train, and neither
+of the two visible from inside the tool it lives in: one was a claim
+in a caller's argument list, the other was a claim about which machine
+a file landed on.
+
 No engine, wire, SQL or storage change: the thirteen crates carry the
-same code as 8.0.0.
+same code as 8.0.0, and `cargo-semver-checks --workspace
+--baseline-version 8.0.0` exits 0 with every library crate reporting
+`no semver update required`.
 
 ### Fixed — the panel that gated the publish covered less than the panel that reports on it
 
