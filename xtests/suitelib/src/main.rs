@@ -1087,6 +1087,15 @@ fn tmp_spg_entries() -> std::collections::BTreeSet<String> {
 /// name: the filesystem's answer needs no agreement about the stamp's
 /// format or timezone, and a report that was copied here is honestly
 /// "as old as it is here".
+///
+/// 8.0.0 — the word HERE is in the printed line, not only in this
+/// comment. `full` is a tier that runs on the TESTBED (`suite.sh
+/// --on-mini`), so the answer on a development box is systematically
+/// stale: this line read "last full run was 20d 5h ago" on a machine
+/// while a full run was in flight on the testbed and another had
+/// finished that morning. The `NEVER` arm already said "here" and the
+/// other arm did not, which is how the omission shows: one function,
+/// two arms, two different claims about the same scope.
 fn last_full_run_phrase(root: &std::path::Path) -> String {
     let dir = root.join("target").join("suite");
     let newest = std::fs::read_dir(&dir).ok().and_then(|rd| {
@@ -1106,9 +1115,9 @@ fn last_full_run_phrase(root: &std::path::Path) -> String {
             let days = secs / 86_400;
             let hours = (secs % 86_400) / 3_600;
             if days > 0 {
-                format!("last full run was {days}d {hours}h ago")
+                format!("last full run HERE was {days}d {hours}h ago")
             } else {
-                format!("last full run was {hours}h ago")
+                format!("last full run HERE was {hours}h ago")
             }
         }
     }
@@ -1145,7 +1154,58 @@ mod last_full_run_tests {
             "{}",
         )
         .unwrap();
-        assert_eq!(last_full_run_phrase(&d), "last full run was 0h ago");
+        assert_eq!(last_full_run_phrase(&d), "last full run HERE was 0h ago");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Both arms answer about the SAME scope, and say so.
+    ///
+    /// This is the pin the omission needed. Asserting each phrase
+    /// separately only copies whatever the function currently prints —
+    /// it was doing that, and still passed while one arm claimed "here"
+    /// and the other claimed the world. The property is that a reader
+    /// cannot get an age out of this function without being told whose
+    /// age it is.
+    #[test]
+    fn every_arm_says_whose_machine_it_is_talking_about() {
+        let d = std::env::temp_dir().join(format!("spg-lfr-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("target").join("suite")).unwrap();
+
+        let never = last_full_run_phrase(&d);
+
+        // FRESH — the hours arm.
+        let report = d.join("target").join("suite").join("report-full-x.json");
+        std::fs::write(&report, "{}").unwrap();
+        let fresh = last_full_run_phrase(&d);
+
+        // STALE — the days arm, which a report written `now` can never
+        // reach. A first version of this test wrote one file and called
+        // it coverage; removing the word from the days arm left it
+        // green, which is what a pin that cannot reach its branch looks
+        // like.
+        let twenty_days_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 86_400);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&report)
+            .unwrap()
+            .set_modified(twenty_days_ago)
+            .unwrap();
+        let stale = last_full_run_phrase(&d);
+        let _ = std::fs::remove_dir_all(&d);
+
+        assert!(
+            stale.contains("20d"),
+            "the days arm was not reached: {stale:?}"
+        );
+        assert_ne!(never, fresh);
+        assert_ne!(fresh, stale);
+        for phrase in [&never, &fresh, &stale] {
+            assert!(
+                phrase.to_lowercase().contains("here"),
+                "phrase does not say whose machine it means: {phrase:?}"
+            );
+        }
     }
 }
