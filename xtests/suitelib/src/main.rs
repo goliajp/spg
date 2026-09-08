@@ -165,10 +165,20 @@ fn main() {
             // The lock is taken FIRST and held for the whole run; the
             // sweep is waited out after it, so a run that is waiting
             // still holds the machine against a second one.
+            // v7.40.12 — the environment is read HERE and passed in, not
+            // read inside the lock. `std::env` is process-global and the
+            // lock's own tests share a process: one of them set this
+            // variable and another, in a different thread, borrowed the
+            // lock it was meant to be refused. Green here, red on the
+            // testbed — a race, not a difference.
+            let inside = std::env::var("SPG_SUITE_LOCK_OWNER")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok());
             let _lock = match suitelib::preflightlib::RunLock::acquire(
                 &root.join("target"),
                 tier,
                 std::process::id(),
+                inside,
             ) {
                 Ok(l) => l,
                 Err(e) => {
