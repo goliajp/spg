@@ -10,6 +10,14 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [8.0.1] — 2026-09-08
+
+The release train's own two blind spots, both found by running the
+v8.0.0 train and neither visible from inside the tools they live in.
+No engine, wire, SQL or storage change: the thirteen crates carry the
+same code as 8.0.0.
+
 ### Fixed — the panel that gated the publish covered less than the panel that reports on it
 
 `release.sh` runs `dropin-acceptance.sh` twice: once against the
