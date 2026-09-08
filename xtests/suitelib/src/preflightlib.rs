@@ -169,7 +169,21 @@ impl RunLock {
     ///
     /// # Errors
     /// If a live run holds it, or the directory cannot be created.
-    pub fn acquire(target_dir: &Path, tier: &str, pid: u32) -> Result<Self, String> {
+    /// v7.40.12 — `inside` is the pid of the run this process was told
+    /// it is nested in, or `None`. It is a PARAMETER rather than a read
+    /// of `SPG_SUITE_LOCK_OWNER` here because `std::env` is
+    /// process-global and the tests share a process: the test that
+    /// pins the nested borrow sets that variable, and the test that
+    /// pins the refusal saw it from another thread and borrowed
+    /// instead. It passed on one machine and failed on the testbed —
+    /// a race, not a difference. `main` reads the environment; this
+    /// function is told.
+    pub fn acquire(
+        target_dir: &Path,
+        tier: &str,
+        pid: u32,
+        inside: Option<u32>,
+    ) -> Result<Self, String> {
         let dir = target_dir.join("suite").join(".running");
         if let Some(parent) = dir.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -205,13 +219,7 @@ impl RunLock {
                         // when it spawns a step; borrowing needs that
                         // name to MATCH the pid in the owner file, so
                         // two genuinely concurrent runs still collide.
-                        Some(p)
-                            if pid_alive(p)
-                                && std::env::var("SPG_SUITE_LOCK_OWNER")
-                                    .ok()
-                                    .and_then(|v| v.trim().parse::<u32>().ok())
-                                    == Some(p) =>
-                        {
+                        Some(p) if pid_alive(p) && inside == Some(p) => {
                             println!(
                                 "suite: running inside the {} run that holds the lock (pid {p})",
                                 owner
@@ -421,15 +429,16 @@ mod tests {
     fn the_second_run_is_refused_and_the_first_keeps_the_lock() {
         let d = std::env::temp_dir().join(format!("spg-lock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        let first = RunLock::acquire(&d, "prerelease", std::process::id()).expect("first");
-        let second = RunLock::acquire(&d, "prerelease", std::process::id());
+        let first = RunLock::acquire(&d, "prerelease", std::process::id(), None).expect("first");
+        let second = RunLock::acquire(&d, "prerelease", std::process::id(), None);
         assert!(second.is_err(), "two runs share the target and the ports");
         assert!(
             second.unwrap_err().contains("already in progress"),
             "the message has to say what to do about it"
         );
         drop(first);
-        RunLock::acquire(&d, "prerelease", std::process::id()).expect("after the first finished");
+        RunLock::acquire(&d, "prerelease", std::process::id(), None)
+            .expect("after the first finished");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -445,37 +454,34 @@ mod tests {
         let d = std::env::temp_dir().join(format!("spg-lock-nest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         let parent_pid = std::process::id();
-        let parent = RunLock::acquire(&d, "full", parent_pid).expect("parent");
+        let parent = RunLock::acquire(&d, "full", parent_pid, None).expect("parent");
 
         // Anyone who cannot name the holder is still refused.
-        unsafe { std::env::remove_var("SPG_SUITE_LOCK_OWNER") };
         assert!(
-            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            RunLock::acquire(&d, "prerelease", parent_pid, None).is_err(),
             "a run that is not inside this one must still collide"
         );
 
         // Naming the WRONG pid is not a licence either.
-        unsafe { std::env::set_var("SPG_SUITE_LOCK_OWNER", "4000000") };
         assert!(
-            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            RunLock::acquire(&d, "prerelease", parent_pid, Some(4_000_000)).is_err(),
             "the name has to match the pid in the owner file"
         );
 
         // The child of this very run borrows it.
-        unsafe { std::env::set_var("SPG_SUITE_LOCK_OWNER", parent_pid.to_string()) };
-        let child = RunLock::acquire(&d, "prerelease", parent_pid).expect("nested run");
+        let child =
+            RunLock::acquire(&d, "prerelease", parent_pid, Some(parent_pid)).expect("nested run");
 
         // And dropping the borrower leaves the parent holding it: a
         // third run is still refused afterwards.
         drop(child);
-        unsafe { std::env::remove_var("SPG_SUITE_LOCK_OWNER") };
         assert!(
-            RunLock::acquire(&d, "prerelease", parent_pid).is_err(),
+            RunLock::acquire(&d, "prerelease", parent_pid, None).is_err(),
             "the borrower must not have removed the parent's lock"
         );
 
         drop(parent);
-        RunLock::acquire(&d, "prerelease", parent_pid).expect("after the parent finished");
+        RunLock::acquire(&d, "prerelease", parent_pid, None).expect("after the parent finished");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -486,7 +492,7 @@ mod tests {
         let dir = d.join("suite").join(".running");
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join("owner"), "pid 4000000\ntier prerelease\n").expect("write");
-        RunLock::acquire(&d, "prerelease", std::process::id())
+        RunLock::acquire(&d, "prerelease", std::process::id(), None)
             .expect("a lock nobody holds must not block the next run");
         let _ = std::fs::remove_dir_all(&d);
     }
