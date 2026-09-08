@@ -33,6 +33,7 @@ pub const MYSQL_NATIVE_HASH_LEN: usize = 20;
 pub const CACHING_SHA2_HASH_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Role {
     Admin,
     ReadWrite,
@@ -292,6 +293,7 @@ pub struct UserStore {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UserError {
     Exists,
     NotFound,
@@ -738,6 +740,7 @@ pub(crate) fn serialize_users(store: &UserStore) -> Vec<u8> {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UserDeserializeError {
     Truncated,
     BadRole(u8),

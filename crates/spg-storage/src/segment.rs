@@ -164,6 +164,7 @@ const FOOTER_LEN: usize = 4;
 /// Errors surfaced by the segment reader. Includes the inner
 /// `BloomError` since the bloom is parsed during `open`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SegmentError {
     TooShort {
         got: usize,

@@ -1074,6 +1074,7 @@ mod tests {
 
 /// Error type for `Sq8Vector` byte-encoding parse failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QuantizeError {
     /// Input ran out before the declared structure was complete.
     Truncated,

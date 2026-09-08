@@ -46,6 +46,7 @@ pub struct AuditLog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuditError {
     /// On-disk file is shorter than expected, or an integer / hash field
     /// is missing its tail bytes.

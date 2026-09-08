@@ -50,6 +50,7 @@ pub struct Subscriptions {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SubscriptionError {
     DuplicateName(String),
     Corrupt(String),

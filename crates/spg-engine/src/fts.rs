@@ -23,6 +23,7 @@ use crate::eval::EvalError;
 
 /// v7.12.1 — supported tokeniser configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TsConfig {
     /// `simple` / `pg_catalog.simple` — lowercase + split, no
     /// stopword drop, no stem.
@@ -902,6 +903,7 @@ fn sqrt_approx(x: f32) -> f32 {
 /// DROPPED. That is the difference between indexing `<b>x</b>` as `x`,
 /// which PG does, and as `b`, `x`, `b`, which SPG did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TokenType {
     AsciiWord = 1,
     Word = 2,
@@ -1016,6 +1018,7 @@ impl TokenType {
 
 /// The two dictionaries SPG has (round 650).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TsDict {
     Simple,
     EnglishStem,

@@ -40,6 +40,7 @@ const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = MIN_MATCH + (1 << LENGTH_BITS) - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LzssError {
     /// Input ran out mid-frame (header / flag byte / token bytes).
     Truncated,

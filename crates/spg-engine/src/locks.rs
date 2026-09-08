@@ -43,6 +43,7 @@ use spg_storage::row_header::{RelId, RowId};
 /// a key-touching UPDATE or any DELETE takes `Exclusive`; a non-key
 /// UPDATE takes `NoKeyUpdate`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum LockMode {
     KeyShare,
     Share,
@@ -77,6 +78,7 @@ impl LockMode {
 /// What a caller wants to happen when the lock it requests is not
 /// immediately available. Mirrors PG's `LockWaitPolicy`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WaitPolicy {
     /// Block until the lock is granted (the default DML behaviour and
     /// bare `FOR UPDATE`).
@@ -89,6 +91,7 @@ pub enum WaitPolicy {
 
 /// The result of an [`LockTable::acquire`] attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LockOutcome {
     /// The lock is held by the requesting version.
     Granted,

@@ -2583,6 +2583,7 @@ impl TableSchema {
 /// has SQL-three-valued semantics, and Vector belongs to the (future) HNSW
 /// path. Index lookups on those columns fall back to full scan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum IndexKey {
     Int(i64),
     Text(String),
@@ -5395,6 +5396,7 @@ impl Clone for ColdReadStats {
 /// per-transaction dirty window (see `Catalog::dirty_nontable`). One
 /// entry class per side-map the poisoned-commit merge reconciles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum NonTableKind {
     Sequence,
     View,

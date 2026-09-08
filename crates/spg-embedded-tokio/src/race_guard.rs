@@ -69,6 +69,7 @@ use tokio::sync::watch;
 /// Inflight state for one keyed race. `Done(V)` carries the
 /// computed value; followers `borrow_and_update()` to receive it.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum RaceState<V: Clone> {
     InFlight,
     Done(V),
@@ -128,6 +129,7 @@ impl<V: Clone> RaceShared<V> {
 /// the elected leader for this key — run the work + publish";
 /// `Existing` means "another caller is mid-flight; await on the
 /// shared".
+#[non_exhaustive]
 pub enum RaceLookup<V: Clone> {
     First(Arc<RaceShared<V>>),
     Existing(Arc<RaceShared<V>>),

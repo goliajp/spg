@@ -295,6 +295,7 @@ pub type SequenceResolver<'a> = dyn Fn(SequenceOp) -> Result<i64, EvalError> + '
 
 /// v7.17.0 — sequence operation requested by an Expr eval.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SequenceOp {
     Next(String),
     Curr(String),
@@ -750,6 +751,7 @@ pub(crate) fn session_read_temporal_text(
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EvalError {
     /// v7.39.2 — a qualified reference whose QUALIFIER resolves but
     /// whose column does not. PostgreSQL prints it unquoted and dotted;

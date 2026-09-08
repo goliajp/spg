@@ -56,6 +56,7 @@ pub struct DeferredEmbeddedStmt {
 /// What the trigger function returned. Drives the row-write path
 /// the trigger fired from.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TriggerOutcome {
     /// `RETURN NEW;` (or `RETURN OLD;`) — write this row.
     /// For BEFORE triggers, the row may differ from the input
@@ -74,6 +75,7 @@ pub enum TriggerOutcome {
 /// failure modes (`OLD.col := …`, unsupported PL/pgSQL feature,
 /// body that fails to re-parse, …).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum TriggerError {
     /// Body source stored in the catalog can't be re-parsed.
     /// Usually means the function was created against a newer

@@ -168,6 +168,7 @@ pub type ExistsSet = (
 /// 14 byte comparisons per lookup (~70 ns), hash set is O(1) ≈ 5 ns.
 /// Net win on the docker-fair NOTEX bench: 4.4 ms → ~2 ms.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum InListSet {
     Int(hashbrown::HashSet<i64>),
     Text(hashbrown::HashSet<alloc::string::String>),
