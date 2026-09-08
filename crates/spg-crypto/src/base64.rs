@@ -37,6 +37,7 @@ pub fn encode(input: &[u8]) -> String {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     InvalidLength,
     InvalidChar(u8),

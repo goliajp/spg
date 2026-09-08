@@ -105,6 +105,7 @@ pub struct ColdSegmentEntry {
 /// variants are part of the v10 stability contract — adding a new
 /// failure mode is a major bump.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestError {
     /// First 8 bytes weren't `SPGMAN01`.
     BadMagic { got: [u8; 8] },

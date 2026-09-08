@@ -26,6 +26,7 @@ use alloc::string::String;
 /// Why a spill operation could not proceed. The host maps its own I/O
 /// errors into `Io`; the engine only ever reports them upward.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TempStoreError {
     /// The host's storage refused the operation (disk full, permissions,
     /// the temp directory vanished mid-query).

@@ -51,6 +51,7 @@ use crate::row_header::{HEAP_XMIN_FROZEN, RowHeader, XMAX_ALIVE};
 /// `in_progress` set returns the same answer forever — which is why
 /// the snapshot stays a value type and only the oracle is shared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum XactStatus {
     /// Allocated but not yet committed or aborted.
     InProgress,

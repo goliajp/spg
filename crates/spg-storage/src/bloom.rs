@@ -73,6 +73,7 @@ const NUM_HASHES_MAX: u32 = 32;
 /// doesn't match the v1 layout. All variants carry enough context
 /// for the caller to log a precise reason.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BloomError {
     /// Byte slice was shorter than the fixed header.
     TooShort { got: usize, need: usize },

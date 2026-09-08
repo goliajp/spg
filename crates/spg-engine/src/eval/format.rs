@@ -24,6 +24,7 @@ use super::{MONTH_ABBR, MONTH_FULL, civil_from_days};
 // Every shape below is verified against live PG18 (knife-3 probe).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum DateOrder {
     Mdy,
     Dmy,
@@ -31,6 +32,7 @@ pub enum DateOrder {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum DateStyleKind {
     Iso,
     German,
@@ -39,6 +41,7 @@ pub enum DateStyleKind {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum IntervalStyleKind {
     Postgres,
     SqlStandard,

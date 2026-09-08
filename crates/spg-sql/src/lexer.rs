@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Token {
     // Keywords
     Select,
@@ -314,6 +315,7 @@ pub enum Token {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LexErrorKind {
     /// v7.39 (round 773, F31 J3) — an E-string's byte escapes decoded
     /// to an invalid UTF-8 sequence. PG decodes `\NNN` / `\xHH` as

@@ -57,6 +57,7 @@ const TAG_COLD: u8 = 0x01;
 /// Errors surfaced by `RowLocator::read_le` when the byte slice
 /// doesn't match either tagged variant layout.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RowLocatorError {
     /// Slice was shorter than the minimum tagged-variant length.
     TooShort { got: usize, need: usize },

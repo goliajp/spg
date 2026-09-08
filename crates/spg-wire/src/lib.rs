@@ -126,6 +126,7 @@ impl Frame {
 /// Decode-side errors. Encode never produces these unless the caller exceeded
 /// [`MAX_PAYLOAD`]; see [`encode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FrameError {
     /// Fewer than [`FRAME_HEADER_LEN`] bytes in the buffer.
     ShortHeader,
@@ -212,6 +213,7 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), FrameError> {
 /// On-wire type tags. Stable bytes — never renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum WireType {
     Null = 0x00,
     Int = 0x01,    // i32 LE

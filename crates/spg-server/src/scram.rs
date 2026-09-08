@@ -29,6 +29,7 @@ use spg_engine::ScramSecrets;
 
 #[derive(Debug)]
 #[allow(dead_code)] // NonceMismatch is reachable via the nonce-check arm in the helper
+#[non_exhaustive]
 pub enum ScramError {
     BadInitial(String),
     BadFinal(String),
@@ -49,6 +50,7 @@ impl core::fmt::Display for ScramError {
 
 /// The GS2 channel-binding flag from the client-first GS2 header.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Gs2CbindFlag {
     /// `n` — the client does not support channel binding.
     NotSupported,

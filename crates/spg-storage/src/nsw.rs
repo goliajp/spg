@@ -578,6 +578,7 @@ fn cell_to_query_metric_distance(
 /// For the corpus-sized graphs this loses negligible recall vs
 /// building separate per-metric graphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NswMetric {
     /// Squared Euclidean — ranks "smaller = closer" (the sqrt is
     /// monotonic so we skip it for ordering).

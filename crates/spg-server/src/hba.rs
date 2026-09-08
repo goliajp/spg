@@ -32,6 +32,7 @@ use std::net::IpAddr;
 
 /// What a matching rule says to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Method {
     /// Let the connection in with no credential.
     Trust,

@@ -43,6 +43,7 @@ pub struct Publications {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PublicationError {
     DuplicateName(String),
     /// v6.1.2 raises this only for malformed deserialise input.

@@ -45,6 +45,7 @@ const KIND_FULL: u8 = 0;
 const KIND_INCREMENTAL: u8 = 1;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BackupError {
     Io(std::io::Error),
     NoWal,

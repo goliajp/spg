@@ -73,6 +73,7 @@ pub struct Statistics {
 // just don't claim Eq.
 
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StatisticsError {
     Corrupt(String),
 }

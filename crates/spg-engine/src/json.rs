@@ -38,6 +38,7 @@ use spg_storage::Value;
 use crate::eval::EvalError;
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum JsonValue {
     Null,
     Bool(bool),
@@ -1576,6 +1577,7 @@ pub fn path_get(lhs: &Value, rhs: &Value, as_text: bool) -> Result<Value<'static
 // ---- Tiny recursive-descent JSON parser ----
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ParseError {
     Unexpected(char, usize),
     Truncated,
@@ -4034,6 +4036,7 @@ mod tests {
 /// v7.37.17 (17.6 siblings) — one step of a MySQL JSON path
 /// (`$.key`, `$."quoted key"`, `$[0]`).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MysqlPathStep {
     Key(String),
     Index(usize),

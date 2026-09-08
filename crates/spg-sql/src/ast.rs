@@ -15,6 +15,7 @@ use core::fmt;
 /// (tab-separated, `\N` nulls, backslash escapes); `csv` follows
 /// RFC-4180-style quoting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum CopyFormat {
     #[default]
     Text,
@@ -114,6 +115,7 @@ impl fmt::Display for DiscardTarget {
 /// relation, SCHEMA names a schema, and SYSTEM / DATABASE name neither
 /// in a way SPG can refuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MaintainKind {
     ReindexRelation,
     ReindexSchema,
@@ -1339,6 +1341,7 @@ pub struct AlterIndexStatement {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlterIndexTarget {
     /// `REBUILD [WITH (encoding = <enc>)]`. `encoding = None`
     /// rebuilds the existing graph in place without touching the
@@ -2215,6 +2218,7 @@ pub enum PlPgSqlStmt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RaiseLevel {
     /// `RAISE NOTICE` — diagnostic message, observable in the
     /// server log. Does not affect the trigger's outcome.
@@ -3619,6 +3623,7 @@ pub struct InsertStatement {
 
 /// v7.38 (read01) — `OVERRIDING { SYSTEM | USER } VALUE` on an INSERT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum Overriding {
     /// No `OVERRIDING` clause.
     #[default]
@@ -5239,6 +5244,7 @@ pub enum Expr {
 /// in the offset walk. `Ignore` causes the function to skip NULL
 /// values in the argument expression, returning the next non-NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum NullTreatment {
     #[default]
     Respect,
@@ -6013,6 +6019,7 @@ pub struct GrantPriv {
 /// privileges; every other object class parses and is accepted as a no-op, so
 /// a pg_dump that grants on schemas / sequences / functions still restores.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GrantObject {
     /// `ON [TABLE] a, b` — the enforced case.
     Tables(Vec<String>),

@@ -652,6 +652,7 @@ pub type TzAllFn =
 /// consumed per-VALUE by the timestamptz renderers (a DST zone's
 /// offset depends on the instant being rendered).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum SessionTz {
     Utc,
     /// Fixed offset, µs east.
@@ -1863,6 +1864,7 @@ pub type ActivityProvider = fn() -> Vec<ActivityRow>;
 /// several drivers surface warnings to the application while dropping
 /// notices. Emitting everything as NOTICE loses that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NoticeSeverity {
     Notice,
     Warning,

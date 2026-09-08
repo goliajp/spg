@@ -62,6 +62,7 @@ pub struct EnvConfig {
 
 /// Semantics of the `compute_query_id` knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum ComputeQueryId {
     /// Production: hash + emit query id in EXPLAIN output.
     #[default]
