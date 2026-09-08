@@ -30,10 +30,11 @@ fn maintenance_counters_return_zero() {
 #[test]
 fn range_ops_return_null() {
     let mut e = Engine::new();
-    for f in &[
-        "brin_summarize_range('idx1', 1)",
-        "brin_desummarize_range('idx1', 1)",
-    ] {
+    // v8.0 — the two are NOT the same shape: PG types
+    // `brin_summarize_range` `integer` and `brin_desummarize_range`
+    // `void`, and one arm answered NULL for both.
+    {
+        let f = &"brin_summarize_range('idx1', 1)";
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),
@@ -60,5 +61,21 @@ fn gin_support_probes_return_zero() {
             spg_storage::Value::Int(0) => {}
             other => panic!("SELECT {f}: got {other:?}"),
         }
+    }
+}
+
+/// v8.0 — the void-returning members that used to sit in the NULL list
+/// above. Measured on PG 18.6: each is typed `void`, and void is not
+/// NULL, so `IS NULL` is `f` and `pg_typeof` names it.
+#[test]
+fn index_maintenance_probes_void_members_return_void() {
+    let mut e = Engine::new();
+    {
+        let f = &r#"brin_desummarize_range('idx1', 1)"#;
+        let sql = format!("SELECT {f}");
+        assert!(
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f} should be void"
+        );
     }
 }

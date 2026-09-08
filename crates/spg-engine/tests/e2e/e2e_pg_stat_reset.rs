@@ -29,9 +29,11 @@ fn pg_stat_reset_variants_return_null() {
         "pg_stat_force_next_flush()",
     ] {
         let sql = format!("SELECT {f}");
+        // v8.0 — PG types every one of these `void`, and void is not
+        // NULL: `pg_stat_reset() IS NULL` is `f` there.
         assert!(
-            matches!(first(&mut e, &sql), spg_storage::Value::Null),
-            "SELECT {f}: should be NULL"
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f}: should be void"
         );
     }
 }

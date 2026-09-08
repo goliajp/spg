@@ -16,13 +16,17 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
 #[test]
 fn pg_sleep_returns_void() {
     let mut e = Engine::new();
+    // v8.0 — the name said `void` and the assertion said `Null`, which
+    // are different values: measured on PG 18.6,
+    // `SELECT pg_sleep(0.001) IS NULL` is `f`. This pin was defending
+    // the difference rather than catching it.
     assert!(matches!(
         first(&mut e, "SELECT pg_sleep(0.1)"),
-        spg_storage::Value::Null
+        spg_storage::Value::Void
     ));
     assert!(matches!(
         first(&mut e, "SELECT pg_sleep_for('1 second')"),
-        spg_storage::Value::Null
+        spg_storage::Value::Void
     ));
 }
 

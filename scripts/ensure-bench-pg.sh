@@ -35,10 +35,43 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 2
 fi
 
+# v8.0 — the auth method is part of what this container has to BE, not
+# an incidental default.
+#
+# `postgres:18` initdb's default for host connections is scram-sha-256,
+# and `xtests/suitelib/src/wireclient.rs` — the client the generative
+# differential connects its live-PG leg with — speaks exactly two
+# methods: 0 (trust) and 3 (cleartext). So the `generative` step died
+# with
+#
+#   connect live PG leg: "wire: auth method 10 not spoken by this client"
+#
+# the first time anything actually reached this container. It was not a
+# regression: the container had always been scram-only from the host
+# (loopback inside the container is `trust`, but a connection through
+# docker's NAT is not loopback). Nothing had connected with that client
+# before, so nothing had said so.
+#
+# Baked at initdb, so an existing container with the wrong method has to
+# be REPLACED rather than reconfigured. It holds only fixtures the
+# harness rebuilds.
+AUTH_WANTED="trust"
+container_auth() {
+  docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null \
+    | sed -n 's/^POSTGRES_HOST_AUTH_METHOD=//p' | head -1
+}
+if docker inspect "$NAME" >/dev/null 2>&1 \
+   && [ "$(container_auth "$NAME")" != "$AUTH_WANTED" ]; then
+  echo "ensure-bench-pg: $NAME has host auth '$(container_auth "$NAME")', wants \
+'${AUTH_WANTED}' — replacing it (initdb bakes this in)" >&2
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+fi
+
 if ! docker inspect "$NAME" >/dev/null 2>&1; then
   echo "ensure-bench-pg: creating $NAME from $IMAGE on port $PORT" >&2
   docker run -d --name "$NAME" \
       -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+      -e POSTGRES_HOST_AUTH_METHOD="$AUTH_WANTED" \
       -p "$PORT":5432 "$IMAGE" >/dev/null || {
     echo "ensure-bench-pg: could not create $NAME from $IMAGE" >&2; exit 2; }
 elif [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then

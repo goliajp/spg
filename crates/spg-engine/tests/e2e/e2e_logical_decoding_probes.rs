@@ -90,15 +90,32 @@ fn trigger_fn_names_and_binary_upgrade_return_null() {
             "SELECT {f}: wanted a trigger-manager rejection, said {m:?}"
         );
     }
-    for f in &[
-        "pg_nextoid(1259, 1, 2662)",
-        "binary_upgrade_set_next_pg_type_oid(16384)",
-        "binary_upgrade_create_empty_extension('x', 'public', false, '1.0', NULL, NULL, NULL)",
-    ] {
+    {
+        // v8.0 — `pg_nextoid` alone: PG types it `oid`, and the two
+        // `binary_upgrade_*` calls that were here `void`.
+        let f = &"pg_nextoid(1259, 1, 2662)";
         let sql = format!("SELECT {f}");
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),
             "SELECT {f} should be NULL"
+        );
+    }
+}
+
+/// v8.0 — the void-returning members that used to sit in the NULL list
+/// above. Measured on PG 18.6: each is typed `void`, and void is not
+/// NULL, so `IS NULL` is `f` and `pg_typeof` names it.
+#[test]
+fn logical_decoding_probes_void_members_return_void() {
+    let mut e = Engine::new();
+    for f in &[
+        r#"binary_upgrade_set_next_pg_type_oid(16384)"#,
+        r#"binary_upgrade_create_empty_extension('x', 'public', false, '1.0', NULL, NULL, NULL)"#,
+    ] {
+        let sql = format!("SELECT {f}");
+        assert!(
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f} should be void"
         );
     }
 }

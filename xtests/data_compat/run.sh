@@ -150,7 +150,12 @@ run_fixture() {
 {
     echo "# SPG data-compat report (gate #4 — pg_dump data round-trip)"
     echo
-    echo "Generated $(date -u +%Y-%m-%dT%H:%M:%SZ) against SPG \`$VERSION\`."
+    # v8.0 — no timestamp. It was the ONLY thing that changed on a
+    # re-run, so every run left the tree dirty and the `tree-dirtied`
+    # gate could not be green without committing a report whose content
+    # was identical. When the file was generated is what git records;
+    # what it was generated AGAINST is what this line has to say.
+    echo "Generated against SPG \`$VERSION\`."
     echo
     echo "| Fixture | Status | Errors | Row counts (got/expected) |"
     echo "|---|---|---|---|"

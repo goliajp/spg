@@ -1693,6 +1693,12 @@ fn handle_com_query(
     // statements and never collide with another connection (V22).
     // 7.38.1 S2.2 — the row-lock wait loop, mysql-wire edition.
     let mut waits = 0u32;
+    // v8.0 — how long `pg_sleep` asked the host to sleep, taken under
+    // the engine guard and served after it drops. The pgwire path has
+    // done this since the sleep became real; this one had not, so the
+    // same statement slept over one wire and returned at once over the
+    // other.
+    let mut pending_sleep_us;
     let (outcome, insert_id) = loop {
         let attempt = {
             let Ok(mut engine) = state.engine.write() else {
@@ -1722,6 +1728,7 @@ fn handle_com_query(
             // connection's generated key.
             let r = engine.execute_in(sql, conn_tx_id);
             let insert_id = engine.statement_insert_id();
+            pending_sleep_us = engine.take_pending_sleep_us();
             (r, insert_id)
         };
         if matches!(attempt.0, Err(spg_engine::EngineError::LockWouldBlock)) {
@@ -1731,6 +1738,9 @@ fn handle_com_query(
         }
         break attempt;
     };
+    if pending_sleep_us > 0 && outcome.is_ok() {
+        let _ = crate::pgwire::serve_pg_sleep(pending_sleep_us, spg_engine::CancelToken::none());
+    }
     // v7.33 (A1) — persist the write (WAL/snapshot + audit) before
     // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
     // a COM_QUERY write was lost on crash. A durability failure turns
