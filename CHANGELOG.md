@@ -421,6 +421,177 @@ not.
 
 
 
+### Fixed — the `full` tier could never reach its own third step
+
+The tiers are supersets by design, so `full`'s second step runs
+`scripts/suite.sh prerelease` — a suite inside a suite. The run lock
+refused it, because a run WAS in progress and it was the parent. On the
+first machine ever to run the tier:
+
+```text
+  ok    unit
+  FAIL  prerelease-all
+    suite-run: a full run is already in progress here (pid 39511)
+  SKIP  deep-tier, pgdump-roundtrip, perm-matrix, isolation,
+        generative, sql2016, pgbench, sysbench, doc-corpus
+  total 5.275904292s   SUITE EXIT=1
+```
+
+A nested tier now borrows the lock its parent holds instead of being
+refused by it.
+
+### Fixed — the long tiers ran on the testbed with no proof of the bytes
+
+`precommit-tier.sh` has witnessed the testbed's tree since r1035 —
+`git write-tree` on both sides, refuse if they differ. `suite.sh
+--on-mini`, which is what runs `prerelease` and `full`, never did. So a
+compile failure there had two possible causes and no way to tell them
+apart, and that cost three full-tier runs to one error:
+
+```text
+  error[E0599]: no variant ... named `SessionAuthorization` found for
+                enum `ValidateOnlyKind`
+```
+
+against a file that plainly contained it — `grep -c` on the testbed
+answered 2 while the log said otherwise.
+
+**This corrects an earlier commit in this same release**, which had
+attributed the failure to the precommit offload rsyncing over a tier
+already in flight. That guard is right and stays, but the third
+occurrence's timeline does not support it as the cause: the run spanned
+20:51–21:01 with no commit in the window. The mechanism is still
+unknown. What changed is that the tier now refuses to run at all unless
+both sides hash to the same tree, so the next occurrence can only have
+one explanation.
+
+### Fixed — the run lock read process-global state its own tests mutate
+
+`RunLock::acquire` read `SPG_SUITE_LOCK_OWNER` from the environment to
+decide whether a nested tier may borrow the lock. `std::env` is
+process-global and the lock's tests share a process: the test that pins
+the nested borrow set that variable, and the test that pins the refusal,
+running in another thread, saw it and borrowed the lock it was supposed
+to be refused.
+
+```text
+  suite: running inside the prerelease run that holds the lock (pid 67525)
+  panicked: two runs share the target and the ports
+```
+
+Green on this machine and red on the testbed — a race, not a difference.
+The environment is read once in `main` and handed to `acquire` as an
+argument, so the decision is a function of its inputs.
+
+### Fixed — two latency gates were running inside the concurrent group
+
+`xtests/suite.toml` puts e2e, gates, biz, dogfood, ironrules and
+oracle-three in one concurrent group, and excludes `perf-sweep` from it
+with the reason written down since v7.40.8: "it is the timing gate and
+it needs the machine to itself".
+
+`gates` runs `prod_ready`, `slo_smoke` and `perf_gate`. The last two ARE
+latency gates, and `gates` was in the group. The rule had been written
+for one timing gate and two others were left inside a step that shares
+the box with five. It cost a prerelease run: `slo_smoke` read SEL p99
+4759 us against a 2000 us ceiling while the machine it shared went from
+load 5.8 to 12.3, and reported it as the engine blowing its SLO.
+
+### Fixed — three gates passed while covering nothing
+
+The same defect three times, each one an instrument that cannot go red
+when it stops measuring.
+
+```text
+  docs-corpus    verdict `failures > 0`; zero blocks and zero statements
+                 returned success. With `docs/` moved aside the run
+                 reported the same block count as with it present.
+  perm-runner    `all` with an empty selection ran no child, counted
+                 nothing, and returned success — while `verify` already
+                 refused "no permutations defined".
+  perm-runner    a name that did not resolve was printed and `continue`d:
+                 `all: unknown permutation \`x\` — skipped`. Those names
+                 come from the file's OWN tier lists, so one that does
+                 not resolve means the lists disagree.
+```
+
+Each now refuses, names what it found, and says how many it expected.
+The two `perm-runner` rules moved onto `PermFile::validate_selection`,
+where they are facts about a file and a name list rather than about a
+process tree, and each has a pin — a guard demonstrated by hand is a
+guard with no pin.
+
+### Fixed — the generative differential could not connect, and two reports dirtied the tree
+
+Both found by the `full` tier, which reached its last step for the first
+time in this train.
+
+`wireclient.rs` — the client the generative differential connects its
+live-PG leg with — speaks exactly two auth methods: 0 (trust) and 3
+(cleartext). `postgres:18`'s initdb default for host connections is
+scram-sha-256, so the step died with `wire: auth method 10 not spoken by
+this client`. Not a regression: the step had never run to this point
+before.
+
+And `xtests/data_compat` and `xtests/dump_compat` each stamped a
+generation timestamp into a checked-in `report.md`, so every run left
+the tree dirty and every release train had to decide whether that
+mattered.
+
+### Fixed — one provisioning point for the PostgreSQL bench container
+
+`spg-bench-postgres` on port 25432 underpins `perf-sweep`'s PostgreSQL
+leg, the `generative` differential, `pgbench`, `pgdump-roundtrip` and a
+second dump path — five steps in `suitelib` — plus
+`xtests/diffcorpus/run.sh`. Nothing in this repository created it. It
+existed because somebody once typed `docker run` on one machine, and
+every one of those steps was one `docker rm` away from failing with a
+message about the step rather than about the container. Earlier in this
+same version two callers were given their own inline provisioning, which
+fixed two places and left five.
+
+`scripts/ensure-bench-pg.sh` is now the only place that creates it, and
+it also asserts the container's auth method rather than assuming it.
+
+### Fixed — a sweep verdict must clear the cell's own resolution
+
+The rule was "the two min-max bands do not overlap", with nothing
+requiring the gap to exceed the measurement's own spread. A cell reading
+~2.5 ms with bands 0.18 ms wide was called a LOSS on a 0.004 ms
+separation — 2% of the leg's own noise. The header has promised
+otherwise since v7.38.18: "Exit 0 when no cell LOSES beyond its own
+control's resolution". The control leg WAS consulted, but only for "did
+the same binary separate from ITSELF at all"; when it had not, any gap
+however small stood.
+
+The locale panel had a second defect underneath it: it compares one
+binary under `C` against the same binary under `en_US.utf8`, and a
+database collation is a boot setting — so two collations are necessarily
+two PROCESSES, and the panel named one variable while varying two.
+Diagnosed by swapping which leg is judged rather than by argument: the
+difference followed the LEG, not the position.
+
+**And a retraction.** The commit that established the second leg
+justified it with a claim — "two processes are not interchangeable" —
+that does not survive measurement, and it does not survive it because
+this repository's own rule was broken while making it: the run it rested
+on read the spill counter on ONE port and inferred the other five.
+Re-measured at load 1.6, six identical processes timed three times each
+in both directions with every timing carrying its own spill witness, the
+processes are interchangeable. It was the machine.
+
+### Changed — the NOT RUN line says how long, not just which
+
+v7.38.17 made a tier report name the full-tier steps it did not run,
+with the reason beside each: a total that cannot show what it excluded
+overstates. It named them and left the reader to judge whether that
+mattered. `scripts/nightly-full.sh` was added in the same commit to be
+"the other half", carrying its own crontab line and leaving installation
+to whoever owns the machine. Sixteen days later nothing had installed
+it — `crontab -l` and `~/Library/LaunchAgents` are empty of it on this
+machine and the testbed, there is no workflow for it, and
+`target/suite/nightly-full-*.log` does not exist anywhere.
+
 ## [7.40.11] — 2026-09-07
 
 ### Fixed — Connector/J could not open a connection at all
