@@ -2704,7 +2704,7 @@ fn execute_with_role(
 /// shared engine lock, and PG's `pg_sleep` stalls no other connection.
 /// The slice is small enough that a 500 ms `statement_timeout` lands
 /// within a few milliseconds of PG's, and large enough not to spin.
-fn serve_pg_sleep(micros: u64, cancel: CancelToken<'_>) -> Result<(), EngineError> {
+pub(crate) fn serve_pg_sleep(micros: u64, cancel: CancelToken<'_>) -> Result<(), EngineError> {
     // Slice against an ABSOLUTE end, not a remaining count: every
     // `thread::sleep` overshoots a little, and subtracting the REQUESTED
     // slice each time accumulates that overshoot. Measured with 5 ms

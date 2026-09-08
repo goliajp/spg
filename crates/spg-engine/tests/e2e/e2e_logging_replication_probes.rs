@@ -42,17 +42,11 @@ fn config_file_probes_return_null() {
 fn replication_origin_probes_return_null() {
     let mut e = Engine::new();
     for f in &[
-        "pg_replication_origin_advance('n', '0/0')",
         "pg_replication_origin_create('n')",
-        "pg_replication_origin_drop('n')",
         "pg_replication_origin_oid('n')",
         "pg_replication_origin_progress('n', true)",
         "pg_replication_origin_session_is_setup()",
         "pg_replication_origin_session_progress(true)",
-        "pg_replication_origin_session_reset()",
-        "pg_replication_origin_session_setup('n')",
-        "pg_replication_origin_xact_reset()",
-        "pg_replication_origin_xact_setup('0/0', '2020-01-01'::timestamp)",
         "pg_show_replication_origin_status()",
     ] {
         let sql = format!("SELECT {f}");
@@ -91,6 +85,28 @@ fn replication_slot_admin_probes_return_null() {
         assert!(
             e.execute(&sql).is_err(),
             "SELECT {f} must refuse, not answer nothing"
+        );
+    }
+}
+
+/// v8.0 — the void-returning members that used to sit in the NULL list
+/// above. Measured on PG 18.6: each is typed `void`, and void is not
+/// NULL, so `IS NULL` is `f` and `pg_typeof` names it.
+#[test]
+fn logging_replication_probes_void_members_return_void() {
+    let mut e = Engine::new();
+    for f in &[
+        r#"pg_replication_origin_advance('n', '0/0')"#,
+        r#"pg_replication_origin_drop('n')"#,
+        r#"pg_replication_origin_session_reset()"#,
+        r#"pg_replication_origin_session_setup('n')"#,
+        r#"pg_replication_origin_xact_reset()"#,
+        r#"pg_replication_origin_xact_setup('0/0', '2020-01-01'::timestamp)"#,
+    ] {
+        let sql = format!("SELECT {f}");
+        assert!(
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f} should be void"
         );
     }
 }

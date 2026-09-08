@@ -29,9 +29,10 @@ fn wal_replay_control_returns_null() {
         "pg_xlog_replay_resume()",
     ] {
         let sql = format!("SELECT {f}");
+        // v8.0 — PG types all four `void`; `IS NULL` is `f` there.
         assert!(
-            matches!(first(&mut e, &sql), spg_storage::Value::Null),
-            "SELECT {f} should be NULL"
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f} should be void"
         );
     }
 }

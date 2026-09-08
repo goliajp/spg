@@ -21,9 +21,12 @@ fn setseed_returns_void() {
     //   SELECT 'x' || setseed(0.5)::text     -> x
     // This asserted Value::Null, so any expression WRAPPING setseed came back
     // NULL and swallowed itself.
+    // v8.0 — an empty TEXT was the closest thing available in round 79.
+    // `Value::Void` exists now, so the value carries the type it claims;
+    // the rendering is unchanged and `pg_typeof` went text -> void.
     assert!(matches!(
         first(&mut e, "SELECT setseed(0.5)"),
-        spg_storage::Value::Text(ref s) if s.is_empty()
+        spg_storage::Value::Void
     ));
     assert!(matches!(
         first(&mut e, "SELECT setseed(0.5) IS NULL"),

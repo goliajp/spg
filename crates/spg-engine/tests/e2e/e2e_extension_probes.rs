@@ -20,7 +20,6 @@ fn extension_introspection_returns_null() {
         "pg_available_extensions()",
         "pg_available_extension_versions()",
         "pg_extension_update_paths('pgcrypto')",
-        "pg_extension_config_dump('pg_class', 'WHERE oid > 100')",
         "pg_load_extension('pgcrypto')",
         "pg_extension_check_version('pgcrypto')",
         "extension_version('pgcrypto')",
@@ -30,6 +29,22 @@ fn extension_introspection_returns_null() {
         assert!(
             matches!(first(&mut e, &sql), spg_storage::Value::Null),
             "SELECT {f} should be NULL"
+        );
+    }
+}
+
+/// v8.0 — the void-returning members that used to sit in the NULL list
+/// above. Measured on PG 18.6: each is typed `void`, and void is not
+/// NULL, so `IS NULL` is `f` and `pg_typeof` names it.
+#[test]
+fn extension_probes_void_members_return_void() {
+    let mut e = Engine::new();
+    {
+        let f = &r#"pg_extension_config_dump('pg_class', 'WHERE oid > 100')"#;
+        let sql = format!("SELECT {f}");
+        assert!(
+            matches!(first(&mut e, &sql), spg_storage::Value::Void),
+            "SELECT {f} should be void"
         );
     }
 }
