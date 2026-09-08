@@ -849,3 +849,89 @@ fn pg_sleep_sleeps_and_blocks_nobody() {
     );
     handle.join().unwrap();
 }
+
+/// v8.0 — the void-returning family answers `void`, not NULL.
+///
+/// SPG's value system had no `void`, so every void-returning function
+/// answered NULL. Two things a client sees differ, measured on
+/// PG 18.6 for each function below:
+///
+/// ```text
+///   SELECT pg_sleep(0.001) IS NULL        PG f      SPG t
+///   SELECT pg_typeof(pg_sleep(0.001))     PG void   SPG unknown
+/// ```
+///
+/// It was recorded as "522 `Value::Null` match arms to decide, one type's
+/// gap across a family" and left alone on that number. The number was a
+/// grep upper bound and wrong as a cost: `Value` already carries
+/// `#[non_exhaustive]`, so adding the variant broke FIVE sites in the
+/// crate that defines it, and thirteen across the tree once
+/// `DataType::Void` came with it.
+///
+/// The family was swept rather than the one function fixed: PG's own
+/// catalog lists the void-returning functions, thirty-nine of which SPG
+/// recognises. Sweeping found two arms that had grouped a void function
+/// with a non-void one and answered NULL for both — `pg_nextoid` (PG
+/// types it `oid`) sat with the ten `binary_upgrade_*` setters, and
+/// `brin_summarize_range` (`integer`) with `brin_desummarize_range`.
+#[test]
+fn the_void_returning_family_answers_void() {
+    let dir = unique_tmpdir("void");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    for call in [
+        "pg_sleep(0.001)",
+        "pg_sleep_for('1 microsecond')",
+        "pg_sleep_until(now())",
+        "pg_advisory_unlock_all()",
+        "pg_advisory_lock(9911)",
+        "pg_advisory_xact_lock(9912)",
+        "pg_stat_reset()",
+        "pg_stat_reset_shared('bgwriter')",
+        "pg_stat_clear_snapshot()",
+        "pg_stat_force_next_flush()",
+        "pg_replication_origin_xact_reset()",
+        "pg_notify('c','p')",
+        "setseed(0.5)",
+    ] {
+        assert_eq!(
+            first_cell(&mut s, &format!("SELECT pg_typeof({call})::text")),
+            "void",
+            "pg_typeof({call})"
+        );
+        assert_eq!(
+            first_cell(&mut s, &format!("SELECT ({call}) IS NULL")),
+            "f",
+            "({call}) IS NULL — void is not NULL"
+        );
+    }
+
+    // PG renders `void` as the empty string, not as a name and not as
+    // NULL: `'['||pg_sleep(0.001)::text||']'` is `[]` there.
+    assert_eq!(
+        first_cell(&mut s, "SELECT '[' || pg_sleep(0.001)::text || ']'"),
+        "[]"
+    );
+
+    // And the void half of an arm that used to answer NULL for a
+    // non-void sibling too. Measured on PG 18.6 over a BRIN index:
+    // `brin_summarize_range` is `integer` and `brin_desummarize_range`
+    // is `void`; SPG answered NULL for both from one arm.
+    //
+    // Only the void half is asserted. SPG answers `unknown` for the
+    // integer one because it returns a bare NULL and the value system
+    // has no TYPED null — a different gap from this one, and not fixed
+    // here, so it is named rather than quietly asserted away.
+    run_ok(&mut s, "CREATE TABLE brn (a INT)");
+    run_ok(&mut s, "CREATE INDEX brn_idx ON brn USING brin (a)");
+    assert_eq!(
+        first_cell(
+            &mut s,
+            "SELECT pg_typeof(brin_desummarize_range('brn_idx'::regclass, 0))::text"
+        ),
+        "void"
+    );
+}

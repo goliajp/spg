@@ -757,6 +757,9 @@ pub(super) fn format_string(
 /// what real PostgreSQL emits (NOT SPG's UPPERCASE Display shape).
 pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
     match v {
+        // v8.0 — measured on PG 18.6: `pg_typeof(pg_sleep(0.001))` is
+        // `void`. It fell to the "unknown" arm while the value was NULL.
+        Value::Void => "void",
         Value::SmallInt(_) => "smallint",
         Value::Int(_) => "integer",
         Value::BigInt(_) => "bigint",

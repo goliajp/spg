@@ -10,6 +10,46 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Added — SQL `void`, and the family that had been answering NULL instead
+
+Every void-returning function answered `Value::Null`, and two things a
+client sees came out wrong for all of them. Measured on PG 18.6:
+
+```text
+  SELECT pg_sleep(0.001) IS NULL       PG f      SPG t
+  SELECT pg_typeof(pg_sleep(0.001))    PG void   SPG unknown
+```
+
+This was recorded as "522 `Value::Null` match arms to decide" and left
+alone on that number. **The number was a grep upper bound and wrong as a
+cost.** `Value` already carries `#[non_exhaustive]`, so adding the
+variant broke FIVE sites in the crate that defines it, and thirteen
+across the whole tree once `DataType::Void` came with it — one
+afternoon, not a project.
+
+The family was swept rather than the one function fixed: PG's own
+catalog lists its void-returning functions, and thirty-nine of them are
+names SPG recognises. Sweeping found two arms that had grouped a void
+function with a non-void one and answered NULL for both — `pg_nextoid`
+(PG types it `oid`) sat with the ten `binary_upgrade_*` setters, and
+`brin_summarize_range` (`integer`) with `brin_desummarize_range`.
+
+Two shapes needed more than a changed return value:
+
+* The statement-level pre-pass folds a call to an `Expr::Literal` once
+  it has done the side effect, and `ast::Literal` has no void — so
+  `pg_sleep` and the advisory-lock family now do the side effect and
+  leave the CALL in the tree for the value dispatch to answer.
+* `setseed` had returned an empty TEXT since round 79 to imitate void's
+  rendering. It returns the type it claims to be now; the rendering is
+  unchanged.
+
+Not fixed, and named rather than asserted away: `setseed(NULL)` is a
+NULL of type `void` in PG and SPG has no TYPED null, so `pg_typeof` of
+that answers `unknown`. Same gap makes `brin_summarize_range` report
+`unknown` where PG says `integer`.
+
+
 ### Fixed — the wire answered `SHOW` from a copy, and a copy cannot carry a live value
 
 Found by the `full` tier, which had not run for 19 days: two

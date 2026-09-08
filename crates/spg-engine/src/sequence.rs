@@ -401,7 +401,7 @@ impl Engine {
             return Ok(None);
         }
         let Some(arg) = args.first() else {
-            return Ok(Some(spg_storage::Value::Null));
+            return Ok(None);
         };
         let value = {
             let cols: [spg_storage::ColumnSchema; 0] = [];
@@ -470,7 +470,14 @@ impl Engine {
             #[allow(clippy::cast_sign_loss)]
             self.request_sleep_us(micros as u64);
         }
-        Ok(Some(spg_storage::Value::Null))
+        // v8.0 — record the duration and leave the CALL in the tree.
+        //
+        // This used to fold to a literal, which meant the answer had to
+        // be expressible as one — and `ast::Literal` has no `void`, so
+        // it folded to NULL and `pg_sleep(x) IS NULL` came out `t` where
+        // PG 18.6 says `f`. The value dispatch answers `Value::Void`;
+        // this pass only has to book the sleep the host will serve.
+        Ok(None)
     }
 
     /// The seconds a `pg_sleep` argument names, whatever numeric shape
@@ -531,7 +538,11 @@ impl Engine {
         let is_unlock = matches!(lc, "pg_advisory_unlock" | "pg_advisory_unlock_shared");
         if lc == "pg_advisory_unlock_all" {
             self.advisory_unlock_all();
-            return Ok(Some(spg_storage::Value::Null));
+            // v8.0 — the side effect is done; the ANSWER is `void`, and
+            // folding to a literal cannot carry one (`ast::Literal` has
+            // no void). Leave the node for the value dispatch, which
+            // answers `Value::Void`. Same reason as `eval_sleep_call`.
+            return Ok(None);
         }
         if !(is_take || is_try || is_unlock) {
             return Ok(None);
@@ -546,7 +557,9 @@ impl Engine {
             // held; it takes the lock when free and returns void either
             // way, which is PG's answer for every uncontended call.
             let _ = self.advisory_try_lock(key);
-            return Ok(Some(spg_storage::Value::Null));
+            // v8.0 — see `pg_advisory_unlock_all` above: the answer is
+            // `void` and a folded literal cannot carry it.
+            return Ok(None);
         }
         if is_try {
             return Ok(Some(spg_storage::Value::Bool(self.advisory_try_lock(key))));

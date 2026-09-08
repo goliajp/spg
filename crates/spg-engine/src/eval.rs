@@ -5753,6 +5753,7 @@ fn like_match(text: &str, pattern: &str) -> Result<bool, EvalError> {
 pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'static str> {
     use spg_storage::DataType as D;
     Some(match t {
+        D::Void => "void",
         D::SmallInt => "smallint",
         D::Int => "integer",
         D::BigInt => "bigint",
