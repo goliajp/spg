@@ -25,7 +25,7 @@ members = [
 ]
 
 [workspace.package]
-version      = "7.40.11"
+version      = "8.0.0"
 edition      = "2024"
 authors      = ["GOLIA K.K. <lihao@golia.jp>"]
 license      = "MIT OR Apache-2.0"
@@ -51,23 +51,23 @@ bumpalo     = { version = "3", default-features = false, features = ["collection
 # `version = "X.Y"` alongside the `path = …`. crates.io strips paths
 # and uses the version; `path` keeps local development from going via
 # the registry. All ten crates share the workspace version.
-spg-wire     = { path = "crates/spg-wire", version = "7.34" }
-spg-crypto   = { path = "crates/spg-crypto", version = "7.34" }
-spg-sql      = { path = "crates/spg-sql", version = "7.34" }
-spg-storage  = { path = "crates/spg-storage", version = "7.34" }
-spg-audit    = { path = "crates/spg-audit", version = "7.34" }
-spg-manifest = { path = "crates/spg-manifest", version = "7.34" }
-spg-tzif     = { path = "crates/spg-tzif", version = "7.34" }
-spg-engine   = { path = "crates/spg-engine", version = "7.34" }
-spg-embedded = { path = "crates/spg-embedded", version = "7.34" }
+spg-wire     = { path = "crates/spg-wire", version = "8.0" }
+spg-crypto   = { path = "crates/spg-crypto", version = "8.0" }
+spg-sql      = { path = "crates/spg-sql", version = "8.0" }
+spg-storage  = { path = "crates/spg-storage", version = "8.0" }
+spg-audit    = { path = "crates/spg-audit", version = "8.0" }
+spg-manifest = { path = "crates/spg-manifest", version = "8.0" }
+spg-tzif     = { path = "crates/spg-tzif", version = "8.0" }
+spg-engine   = { path = "crates/spg-engine", version = "8.0" }
+spg-embedded = { path = "crates/spg-embedded", version = "8.0" }
 # v7.10.0 — tokio adapter for spg-embedded. Bumps the published
 # version to 7.10 right at introduction; spg-embedded stays 0-deps
 # and this is the *only* crate that pulls tokio.
-spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "7.34" }
+spg-embedded-tokio = { path = "crates/spg-embedded-tokio", version = "8.0" }
 # v7.16.0 — sqlx 0.8 adapter for spg-embedded. Lets mailrs-shape
 # in-process callers use sqlx::query / query_as / pool.begin against
 # an in-process SPG (no TCP listener).
-spg-sqlx = { path = "crates/spg-sqlx", version = "7.34" }
+spg-sqlx = { path = "crates/spg-sqlx", version = "8.0" }
 
 # v7.39 (round 678) — Unicode collation for F36. Chosen by measurement, not
 # reputation: `docs/COLLATION_RFC.md` records that libc `strcoll` was
