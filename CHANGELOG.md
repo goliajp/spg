@@ -10,6 +10,72 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [8.0.0] — 2026-09-08
+
+### The major, and why one was needed
+
+`cargo-semver-checks` against the published 7.40.11 answers it: eleven of
+the twelve published library crates need no version bump at all, and
+`spg-sql` needs a MAJOR on two counts, both inherent to the features in
+this release rather than to how they were written:
+
+```text
+  constructible_struct_adds_field   TransactionModes.deferrable
+        every field is `pub` and none private, so a downstream exhaustive
+        struct literal or destructuring breaks. This repository's own
+        tests broke in five places the moment the field went in.
+
+  enum_variant_added                ValidateOnlyKind::SessionAuthorization
+        the enum has no `#[non_exhaustive]`, and adding that attribute
+        after the fact is itself a MAJOR — so the cost is paid once,
+        here, or paid again at every future addition.
+```
+
+A third failure existed briefly and was removed rather than accepted: the
+new variant had been INSERTED where it read best, shifting thirteen
+discriminants, which `cargo-semver-checks` counts as its own break for
+anyone casting the enum. Appending costs nothing and breaks nobody.
+
+Major bumps are not new here — 1, 2, 3, 4, 6 and 7 all exist. The
+thirteen crates share one workspace version, so `spg-sql` needing a major
+moves the set, and the internal dependency bounds move from `7.x` to
+`8.0` with it.
+
+
+### Changed — `#[non_exhaustive]` on the 56 public enums nothing here matches exhaustively
+
+Adding a variant to a public enum without `#[non_exhaustive]` is a MAJOR
+change, and adding the attribute later is MAJOR too — so it can only be
+done during one, and this is the one. Measured before the change: 150
+public enums across the thirteen published crates, **5** with the
+attribute. The other 145 were each a future major waiting to happen.
+
+Blanket-adding it is not the answer and the compiler said so: marking all
+145 produced 250 errors, 249 of them non-exhaustive matches, all in
+`spg-engine`. Each would need a `_ =>` arm — which is what
+`type/no-catchall-match` forbids, because a catch-all is what makes "a
+new variant nobody handled" compile silently. That trades a versioning
+tax for a correctness signal.
+
+So the compiler did the classification: mark, build, un-mark whatever it
+names, repeat until green. It converged in two rounds.
+
+```text
+  56 enums take the attribute — build and `cargo test --no-run` both
+     green with ZERO catch-all arms added
+  89 do not — `Expr`, `SelectItem`, `CteBody`, `Literal`, `RowLocator`,
+     `TsQueryAst`, `NumericKind` and the rest of the AST and decision
+     types the engine matches on purpose
+```
+
+The split reads the way it should: what took the attribute is the error
+enums (`AuditError`, `BackupError`, `DecodeError`, `EvalError`,
+`FrameError`) and the outward-facing kinds (`CopyFormat`, `DateOrder`,
+`GrantObject`, `AlterIndexTarget`) — things consumers READ. What did not
+is the things this workspace DECIDES on. After this, adding a variant to
+any of the 56 is a minor release.
+
 ### Added — SQL `void`, and the family that had been answering NULL instead
 
 Every void-returning function answered `Value::Null`, and two things a

@@ -16,10 +16,10 @@ name = "spg-perm-runner"
 path = "src/main.rs"
 
 [dependencies]
-spg-engine  = { path = "../../crates/spg-engine", version = "7.34" }
-spg-storage = { path = "../../crates/spg-storage", version = "7.34" }
-sqllogictest = { path = "../sqllogictest", version = "7.38" }
-suitelib = { path = "../suitelib", version = "7.38" }
+spg-engine  = { path = "../../crates/spg-engine", version = "8.0" }
+spg-storage = { path = "../../crates/spg-storage", version = "8.0" }
+sqllogictest = { path = "../sqllogictest", version = "8.0" }
+suitelib = { path = "../suitelib", version = "8.0" }
 
 [lints]
 workspace = true
