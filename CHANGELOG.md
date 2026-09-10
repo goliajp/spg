@@ -27,6 +27,42 @@ and needs almost nothing in the startup packet; the acceptance panel
 now runs a driver that asks for binary, and that panel is the one that
 gates the publish.
 
+### Fixed — the extended protocol had no error state
+
+sentori's §3.15, reported as the shape their client saw: psql refusing
+a `D` message "without prior row description". The root is one message
+earlier.
+
+PostgreSQL, on an error inside an extended-query sequence, skips every
+message until the next `Sync`. SPG had no such state and kept
+answering. Measured with a raw protocol client — `SHOW $1`, sent as
+Parse / Describe / Bind / Execute / Sync:
+
+```text
+  PG 18.6    E Z
+  SPG 8.0.1  E t n E E Z
+```
+
+The `t` (ParameterDescription) and `n` (NoData) are answers to a
+Describe that came AFTER the error, and the two trailing `E`s are the
+cascade — Bind reporting a statement Parse never created, Execute
+reporting a portal Bind never created. A client that reads them as
+answers to what it asked is reading someone else's mail. Where the
+statement gets far enough to have rows, one of those answers is a
+`DataRow`, which is what they saw.
+
+Every extended message but `Sync` is now skipped while the state is
+set; `Sync` clears it, and so does the simple protocol's `Q`, which is
+its own sequence.
+
+The error's own wording is still narrower than PostgreSQL's — `syntax
+error at end of input` against `syntax error at or near "$1"`, and no
+`Position` field. That is the same gap as §3.27 and needs the parser to
+carry source spans through 73 `ColumnName` construction sites; it is
+named here rather than guessed at. What did change: the message no
+longer carries a `Parse: ` prefix, which named an internal step of ours
+and meant nothing to a client.
+
 ### Fixed — a view whose definition names the clock was unusable
 
 sentori's §3.6 named `INSERT … SELECT now()`. The shape is wider: four

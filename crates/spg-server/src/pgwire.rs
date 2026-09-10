@@ -2171,6 +2171,24 @@ fn run_pg_session(
     // until explicitly Closed (`C` message) or the connection ends.
     let mut prepared: std::collections::HashMap<String, PreparedStmt> =
         std::collections::HashMap::default();
+    // 8.0.2 — the extended protocol's ERROR STATE.
+    //
+    // PostgreSQL, on an error inside an extended-query sequence, skips
+    // every message until the next `Sync`. SPG had no such state: after
+    // a failed Parse it went on answering Describe, Bind and Execute,
+    // so one client mistake produced a cascade of messages the client
+    // was not expecting. Measured with a raw protocol client,
+    // `SHOW $1`, Parse/Describe/Bind/Execute/Sync:
+    //
+    //   PG 18.6    E Z
+    //   SPG 8.0.1  E t n E E Z
+    //
+    // The `t` (ParameterDescription) and `n` (NoData) are answers to a
+    // Describe that came AFTER the error. Reported by sentori as §3.15
+    // in the shape their client saw it — psql refusing a `D` message
+    // "without prior row description", which is the same thing when the
+    // statement gets far enough to have rows.
+    let mut ext_error = false;
     let mut portals: std::collections::HashMap<String, Portal> =
         std::collections::HashMap::default();
     // v4.19: per-connection SET / SHOW state. PG clients SET
@@ -2288,6 +2306,16 @@ fn run_pg_session(
         trace_frontend_message(msg_type, body, tx_state);
         let timing_start = timing_enabled().then(std::time::Instant::now);
 
+        // 8.0.2 — while the extended sequence is in its error state,
+        // every message but `Sync` is skipped, which is PostgreSQL's
+        // rule. `Terminate` still ends the connection, and the simple
+        // protocol's `Q` is its own sequence and clears the state.
+        if ext_error && matches!(msg_type, b'P' | b'B' | b'D' | b'E' | b'C' | b'H') {
+            continue;
+        }
+        if matches!(msg_type, b'S' | b'Q') {
+            ext_error = false;
+        }
         match msg_type {
             b'Q' => handle_pg_simple_query(
                 stream,
@@ -2321,7 +2349,10 @@ fn run_pg_session(
                     // column 42703 — and reporting all of them as 42601
                     // (syntax error) would tell a driver the statement
                     // could never be valid.
-                    Err((sqlstate, msg)) => send_error(&mut wbuf, sqlstate, &msg)?,
+                    Err((sqlstate, msg)) => {
+                        send_error(&mut wbuf, sqlstate, &msg)?;
+                        ext_error = true;
+                    }
                 }
             }
             // Bind (B): create a portal with parameter values
@@ -2332,7 +2363,10 @@ fn run_pg_session(
                         portals.insert(portal.0.clone(), portal.1);
                         send_msg(&mut wbuf, b'2', &[])?; // BindComplete
                     }
-                    Err(msg) => send_error(&mut wbuf, "42601", &msg)?,
+                    Err(msg) => {
+                        send_error(&mut wbuf, "42601", &msg)?;
+                        ext_error = true;
+                    }
                 }
             }
             // Describe (D): describe statement ('S') or portal ('P').
@@ -2440,6 +2474,7 @@ fn run_pg_session(
                     &conn_state,
                 ) {
                     send_error(&mut wbuf, sqlstate, &msg)?;
+                    ext_error = true;
                 }
             }
             // Close (C): drop the named statement or portal. Reply
@@ -3721,7 +3756,14 @@ fn handle_parse(
         .map_err(|_| ("XX000", "Parse: engine lock poisoned".to_string()))?;
     let ast = eng
         .prepare_cached(&sql)
-        .map_err(|e| ("42601", format!("Parse: {e}")))?;
+        // 8.0.2 — the parser's own sentence, not a stage label in front
+        // of it. PostgreSQL answers `syntax error at or near "$1"`; SPG
+        // answered `Parse: syntax error at end of input`, and the
+        // prefix names an internal step of ours that means nothing to a
+        // client. The wording after it is still narrower than PG's —
+        // that is the same gap as the missing error POSITION and needs
+        // the parser to carry spans, which is not a patch.
+        .map_err(|e| ("42601", format!("{e}")))?;
     // v7.37 (SPGS small-query bar) — describe at Parse time and
     // cache the wire-format RowDescription body. For repeated
     // executions of the same prepared statement (the sqlx hot
