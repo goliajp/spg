@@ -661,7 +661,7 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
     // collation change the COST CLASS of an ordinary query. The script's
     // own control leg and its refusal to call an unresolved difference
     // both apply unchanged, because it is the same script.
-    let locale_out = (|| -> Result<String, String> {
+    let run_locale_panels = || -> Result<String, String> {
         let tmp2 = crate::proclib::run_tmp_dir(&format!("{runid}-sweep-locale"));
         let _ = std::fs::remove_dir_all(&tmp2);
         let mut roster2 = Roster::new();
@@ -821,7 +821,40 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
         Ok(format!(
             "{locale_text}\n===SHIPPED-DEFAULT===\n{shipped_text}"
         ))
-    })();
+    };
+    // 8.0.1 — a panel that could not READ is not a panel that FOUND
+    // something, and this step had been reporting the first as the
+    // second.
+    //
+    // `control_false_differences` counts cells where the same binary
+    // separated from ITSELF; `withdrawn` counts cells whose verdict the
+    // sweep took back for that reason. `locale_panel_passes`'s own
+    // comment has said since v7.38.19 that such a run "says nothing
+    // about collations either way" — but it returns one bool, and the
+    // caller turned every false into "a declared collation changed the
+    // cost class". So the 8.0.1 train was blocked by a run reading
+    // `losses=0` on all nineteen of its cells, under a message naming a
+    // regression that had not happened.
+    //
+    // Same tree, same command, twice:
+    //
+    //   inside the full tier, load 7.52 -> 10.60   control_false_differences=1
+    //   alone on an idle box,  load 3.77 -> 2.28   control_false_differences=0
+    //
+    // The rule this repository applies by hand — a cell that loses once
+    // is the machine, a cell that loses TWICE is a finding — is applied
+    // here by the instrument instead. Only an unreadable SECOND run
+    // stops a release, and a cost-class regression is never retried
+    // away: `locale_unreadable` requires `sort_over_ceiling=0` before it
+    // will call a run unreadable.
+    let mut locale_out = run_locale_panels();
+    if locale_unreadable(&locale_out) {
+        eprintln!(
+            "perf-sweep: the locale panel's control leg separated from ITSELF, so \
+             that run graded nothing — running it once more before believing it."
+        );
+        locale_out = run_locale_panels();
+    }
     // D20 — the sweep leg's peak RSS goes into the account, and the
     // manifest ceiling has teeth at reap.
     let ceiling = std::fs::read_to_string(root.join("xtests/suite.toml"))
@@ -949,6 +982,16 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
     // shapes half is held to the same bar, and `sort_over_ceiling`
     // stays part of the verdict rather than being folded away.
     if !locale_panel_passes(&locale_verdict) {
+        // 8.0.1 — say which of the two things happened. A run whose
+        // control leg fired found nothing; saying it "changed the cost
+        // class" sends the reader after a regression that is not there.
+        let reason = if locale_verdict.contains("sort_over_ceiling=0") {
+            "the control leg separated from ITSELF on two runs, so neither \
+             graded anything — the box moved. No cell reported a loss"
+        } else {
+            "a declared collation changed the cost class against the same \
+             binary under `C`"
+        };
         // v7.38.23 — carry the other panel into the failure.
         //
         // The shipped-default sweep has already RUN by this point — ten
@@ -957,8 +1000,7 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
         // number the run produced, and the second panel is the one that
         // measures the configuration a customer runs.
         return Err(format!(
-            "locale-collation panel: {locale_verdict} — a declared collation \
-             changed the cost class against the same binary under `C`; \
+            "locale-collation panel: {locale_verdict} — {reason}; \
              shipped-default panel said: {}; panels: {panels}",
             verdict_or_first_line(shipped_text.as_deref())
         ));
@@ -1053,6 +1095,37 @@ fn verdict_line(text: &str) -> Option<String> {
 /// 'click'` costing twenty-six times more under a locale than under
 /// `C`, shipped in v7.38.18 and found by hand. Its sort half says that
 /// out loud with a 3.0x ceiling.
+/// Did this locale-panel run fail to READ, rather than find something?
+///
+/// True when the panel is otherwise clean — its sort half inside the
+/// cost-class ceiling — and its control leg fired: cells where the same
+/// binary separated from ITSELF (`control_false_differences`), or cells
+/// whose verdict the sweep withdrew for that reason (`withdrawn`).
+///
+/// `sort_over_ceiling=0` is required FIRST and deliberately: a
+/// cost-class regression is a finding, and a finding must never be
+/// retried away because the box was also busy.
+fn locale_unreadable(out: &Result<String, String>) -> bool {
+    let text = match out {
+        Ok(t) | Err(t) => t,
+    };
+    // The locale panel's own half. The shipped-default panel is appended
+    // to the same string and has its own counters; grading the wrong
+    // one is the mistake v7.38.22 fixed for `verdict_line`.
+    let locale_text = match text.split_once("===SHIPPED-DEFAULT===") {
+        Some((a, _)) => a,
+        None => text.as_str(),
+    };
+    let Some(v) = verdict_line(locale_text) else {
+        // No verdict line at all means the script never got far enough
+        // to have one, which is a different failure and is graded as
+        // such by the caller. Re-running it would only hide the reason.
+        return false;
+    };
+    v.contains("sort_over_ceiling=0")
+        && (!v.contains("control_false_differences=0") || !v.contains("withdrawn=0"))
+}
+
 fn locale_panel_passes(verdict: &str) -> bool {
     // One LINE, not a haystack. Handed a whole error text — which
     // carries the script's own output, which carries this summary — a
@@ -1071,6 +1144,73 @@ fn locale_panel_passes(verdict: &str) -> bool {
         && verdict.contains("sort_over_ceiling=0")
         && verdict.contains("control_false_differences=0")
         && verdict.contains("withdrawn=0")
+}
+
+#[cfg(test)]
+mod locale_unreadable_tests {
+    use super::locale_unreadable;
+
+    /// The two real verdict lines from the 8.0.1 train: the same tree
+    /// and the same command, once inside the full tier on a box at load
+    /// 7.52 and once alone on an idle one.
+    const BOX_MOVED: &str = "cells=19 losses=0 control_false_differences=1 withdrawn=0 below_resolution=2 cross_process_differences=0 sort_worst=1.03x sort_over_ceiling=0";
+    const IDLE: &str = "cells=19 losses=0 control_false_differences=0 withdrawn=0 below_resolution=4 cross_process_differences=2 sort_worst=1.01x sort_over_ceiling=0";
+
+    fn ok(v: &str) -> Result<String, String> {
+        Ok(format!(
+            "table\n{v}\n===SHIPPED-DEFAULT===\ncells=19 losses=0 control_false_differences=2 withdrawn=2 sort_over_ceiling=0"
+        ))
+    }
+
+    #[test]
+    fn a_control_leg_that_fired_means_the_run_read_nothing() {
+        assert!(locale_unreadable(&ok(BOX_MOVED)));
+    }
+
+    #[test]
+    fn a_clean_run_is_readable() {
+        assert!(!locale_unreadable(&ok(IDLE)));
+    }
+
+    /// The shipped-default panel is appended to the same string and
+    /// carries its OWN counters — both non-zero in the fixtures above.
+    /// Grading the wrong half is the mistake v7.38.22 fixed for
+    /// `verdict_line`, and it would make every clean run look
+    /// unreadable.
+    #[test]
+    fn the_other_panels_counters_are_not_read() {
+        let text = ok(IDLE).unwrap();
+        assert!(text.contains("control_false_differences=2"));
+        assert!(!locale_unreadable(&Ok(text)));
+    }
+
+    /// A cost-class regression is a FINDING. A busy box may fire the
+    /// control leg at the same time, and if that were enough to call the
+    /// run unreadable the finding would be retried away.
+    #[test]
+    fn a_regression_is_never_retried_away() {
+        let both = "cells=19 losses=4 control_false_differences=1 withdrawn=0 sort_worst=3.4x sort_over_ceiling=2";
+        assert!(!locale_unreadable(&ok(both)));
+    }
+
+    /// `sh` puts a failed script's own output into the error, and the
+    /// locale panel exits 1 whenever it has losses — which it is allowed
+    /// to have. So the Err arm carries verdicts too.
+    #[test]
+    fn the_error_arm_carries_a_verdict_too() {
+        let e = ok(BOX_MOVED).unwrap();
+        assert!(locale_unreadable(&Err(e)));
+    }
+
+    /// No verdict line means the script never got far enough to have
+    /// one. That is a different failure with its own message; re-running
+    /// it would only hide the reason.
+    #[test]
+    fn no_verdict_line_is_not_an_unreadable_run() {
+        assert!(!locale_unreadable(&Err(
+            "locale leg not answering".to_string()
+        )));
+    }
 }
 
 #[cfg(test)]
