@@ -27,6 +27,45 @@ and needs almost nothing in the startup packet; the acceptance panel
 now runs a driver that asks for binary, and that panel is the one that
 gates the publish.
 
+### Fixed — a view whose definition names the clock was unusable
+
+sentori's §3.6 named `INSERT … SELECT now()`. The shape is wider: four
+sites carry a SELECT that never went through `preprocess`, which is
+where the clock family is folded to a literal, so the raw `now()`
+reached an evaluator that has no such function.
+
+```text
+  CREATE VIEW v AS SELECT now() FROM t   accepted
+  SELECT * FROM v                        ERROR: function now() does not exist
+```
+
+Created, then unusable — and the stored definition was right the whole
+time: `pg_get_viewdef` reads back `SELECT now() AS t FROM sv`. Any view
+whose definition names `now()`, `current_timestamp` or their siblings
+was in that state.
+
+```text
+  CREATE VIEW v AS SELECT now()            ERROR   (no FROM: a different route)
+  CREATE TABLE t AS SELECT now() FROM s    ERROR
+  CREATE MATERIALIZED VIEW m AS SELECT …   ERROR
+  CREATE TABLE t AS SELECT gen_random_uuid() FROM s   works
+  CREATE TABLE t AS SELECT upper('a') FROM s          works
+```
+
+Also zero-argument, also fine — so arity was never the axis, as the
+reporter had already established. It is which route the statement took.
+
+`preprocess` says of itself: "One function, both callers. A pass added
+here reaches every route by construction rather than by remembering."
+The view body is parsed at read time and the column probe at create
+time, both after that function has run, so neither route reached it.
+They do now.
+
+Folding at read time does not freeze the view: the fold happens per
+statement that reads it, with that statement's own `now`. Checked —
+two reads of the same view two seconds apart differ by two seconds,
+and a `CREATE TABLE AS` materialises once and stays put.
+
 ### Fixed — a text parameter's type was read off the look of its text
 
 sentori's §3.24. The binary Bind arm dispatches on the declared type

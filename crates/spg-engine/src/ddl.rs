@@ -5662,7 +5662,21 @@ impl Engine {
         body: &spg_sql::ast::SelectStatement,
         overrides: &[String],
     ) -> Result<alloc::vec::Vec<(String, spg_storage::DataType)>, EngineError> {
-        let mut probe = body.clone();
+        // 8.0.2 — the probe is a statement, and it gets the passes every
+        // other statement gets. Same missing pass as the view-expansion
+        // site in `select.rs`: this one runs the body to LEARN its
+        // columns, and an unfolded `now()` failed the CREATE:
+        //
+        //   CREATE VIEW v AS SELECT now()   ERROR: function now() does not exist
+        //   CREATE VIEW v AS SELECT now() FROM t   accepted
+        //
+        // Nothing about a FROM clause decides whether the clock exists;
+        // the difference was which route the probe took.
+        let mut probe_stmt = spg_sql::ast::Statement::Select(body.clone());
+        self.preprocess(&mut probe_stmt);
+        let spg_sql::ast::Statement::Select(mut probe) = probe_stmt else {
+            unreachable!("preprocess does not change the statement kind")
+        };
         probe.limit = Some(spg_sql::ast::LimitExpr::Literal(0));
         let QueryResult::Rows { mut columns, .. } =
             self.exec_select_cancel(&probe, crate::CancelToken::none())?
