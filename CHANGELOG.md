@@ -24,6 +24,47 @@ same code as 8.0.0, and `cargo-semver-checks --workspace
 --baseline-version 8.0.0` exits 0 with every library crate reporting
 `no semver update required`.
 
+### Fixed — a panel that could not READ was reported as a panel that FOUND something
+
+The locale-collation panel compares one binary against itself under two
+collations. It counts, separately, cells where the same binary separated
+from ITSELF (`control_false_differences`) and cells whose verdict it
+withdrew for that reason (`withdrawn`) — the box moving, not the
+collation costing.
+
+`locale_panel_passes` returns one bool for three different questions,
+and the caller turned every `false` into one sentence:
+
+```text
+  locale-collation panel: cells=19 losses=0 control_false_differences=1
+  withdrawn=0 below_resolution=2 cross_process_differences=0
+  sort_worst=1.03x sort_over_ceiling=0
+    — a declared collation changed the cost class
+```
+
+`losses=0` on all nineteen cells and `sort_over_ceiling=0`: nothing
+changed cost class. That message blocked this release, and it sends a
+reader after a regression that is not there. The function's own comment
+has said since v7.38.19 that such a run "says nothing about collations
+either way" — the comment was right and the code did something else.
+
+Two things now. The message says which of the two happened. And the
+rule this repository applies by hand — a cell that loses once is the
+machine, a cell that loses twice is a finding — is applied by the
+instrument: an unreadable panel is run again, and only an unreadable
+SECOND run stops a release. Measured, same tree, same command:
+
+```text
+  inside the full tier, load 7.52 -> 10.60   control_false_differences=1
+  alone on an idle box,  load 3.77 ->  2.28  control_false_differences=0
+```
+
+A cost-class regression is never retried away: `locale_unreadable`
+requires `sort_over_ceiling=0` before it will call a run unreadable, and
+reads the locale panel's own half of the output rather than the
+shipped-default panel appended to it. Both halves of that are pinned,
+and both pins were shown to fail when the guard they name is removed.
+
 ### Fixed — the panel that gated the publish covered less than the panel that reports on it
 
 `release.sh` runs `dropin-acceptance.sh` twice: once against the
