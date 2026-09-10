@@ -20245,6 +20245,74 @@ fn oid_arg(v: Option<&Value>) -> Option<i64> {
     }
 }
 
+/// 8.0.2 — the void-returning family, in ONE place.
+///
+/// `Value::Void` is produced by a dozen match arms spread across this
+/// file, so `pg_typeof(pg_sleep(0.001))` answered `void` from the
+/// value at runtime while `describe.rs` — which builds the
+/// RowDescription — knew nothing and reported `text` (OID 25) where
+/// PostgreSQL reports `void` (2278). Measured through psycopg with
+/// binary results:
+///
+/// ```text
+///   SELECT pg_advisory_lock(1)   PG 18.6  oid=2278   SPG 8.0.1  oid=25
+///   SELECT pg_sleep(0.001)       PG 18.6  oid=2278   SPG 8.0.1  oid=25
+/// ```
+///
+/// Writing a second list in `describe.rs` is how this repository's own
+/// "one capability, two lists that drift" defects have started, so
+/// there is one list and Describe asks it. The names were taken from
+/// the arms that answer `Value::Void`, by ARM BOUNDARY rather than by
+/// proximity — a window-based grep pulled in neighbours like
+/// `pg_try_advisory_lock`, which returns bool, and `ts_rank`, which
+/// does not go near this.
+pub(crate) fn returns_void(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "binary_upgrade_create_empty_extension"
+            | "binary_upgrade_set_missing_value"
+            | "binary_upgrade_set_next_array_pg_type_oid"
+            | "binary_upgrade_set_next_heap_pg_class_oid"
+            | "binary_upgrade_set_next_index_pg_class_oid"
+            | "binary_upgrade_set_next_pg_authid_oid"
+            | "binary_upgrade_set_next_pg_enum_oid"
+            | "binary_upgrade_set_next_pg_type_oid"
+            | "binary_upgrade_set_next_toast_pg_class_oid"
+            | "binary_upgrade_set_record_init_privs"
+            | "brin_desummarize_range"
+            | "pg_advisory_lock"
+            | "pg_advisory_lock_shared"
+            | "pg_advisory_unlock_all"
+            | "pg_advisory_xact_lock"
+            | "pg_advisory_xact_lock_shared"
+            | "pg_extension_config_dump"
+            | "pg_notify"
+            | "pg_replication_origin_advance"
+            | "pg_replication_origin_drop"
+            | "pg_replication_origin_session_reset"
+            | "pg_replication_origin_session_setup"
+            | "pg_replication_origin_xact_reset"
+            | "pg_replication_origin_xact_setup"
+            | "pg_sleep"
+            | "pg_sleep_for"
+            | "pg_sleep_until"
+            | "pg_stat_clear_snapshot"
+            | "pg_stat_force_next_flush"
+            | "pg_stat_reset"
+            | "pg_stat_reset_replication_slot"
+            | "pg_stat_reset_shared"
+            | "pg_stat_reset_single_function_counters"
+            | "pg_stat_reset_single_table_counters"
+            | "pg_stat_reset_slru"
+            | "pg_stat_reset_subscription_stats"
+            | "pg_wal_replay_pause"
+            | "pg_wal_replay_resume"
+            | "pg_xlog_replay_pause"
+            | "pg_xlog_replay_resume"
+            | "setseed"
+    )
+}
+
 #[cfg(test)]
 mod arity_table_generator {
     /// v7.39.2 — the candidate names, taken from the dispatch's own match
