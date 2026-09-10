@@ -1215,7 +1215,7 @@ fn handle_pg_simple_query(
             {
                 "ROLLBACK".to_string()
             } else {
-                command_tag(sql, affected)
+                command_tag_with_execute_verb(sql, affected, execute_verb_for(state, sql))
             };
             send_command_complete(wbuf, &tag)?;
             // Sync tx state from engine after writes.
@@ -1480,7 +1480,7 @@ fn handle_pg_simple_query_one_into_wbuf(
             send_command_complete(wbuf, &command_tag_for_rows_sql(sql, rows.len()))?;
         }
         Ok(QueryResult::CommandOk { affected, .. }) => {
-            let tag = command_tag(sql, affected);
+            let tag = command_tag_with_execute_verb(sql, affected, execute_verb_for(state, sql));
             send_command_complete(wbuf, &tag)?;
             *tx_state = if state
                 .engine
@@ -3000,13 +3000,68 @@ pub(crate) fn persist_wire_write(
     Ok(())
 }
 
+/// 8.0.2 — the prepared statement an `EXECUTE` names, asked of the
+/// engine so its tag can be the one PostgreSQL would send.
+///
+/// `EXECUTE p1 (1, 'x')` and `EXECUTE p1` both name `p1`; the argument
+/// list is cut at the first `(` and the trailing `;` goes with the
+/// trim. A name this connection has not prepared answers `None`, and
+/// the tag falls back to what it was.
+fn execute_verb_for(state: &ServerState, sql: &str) -> Option<&'static str> {
+    let mut words = sql.trim_start().split_ascii_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("execute") {
+        return None;
+    }
+    let name = words
+        .next()?
+        .split('(')
+        .next()?
+        .trim_end_matches(';')
+        .trim_matches('"');
+    if name.is_empty() {
+        return None;
+    }
+    state
+        .engine
+        .read()
+        .ok()
+        .and_then(|e| e.prepared_statement_verb(name))
+}
+
 fn command_tag(sql: &str, affected: usize) -> String {
-    let first = sql
+    command_tag_with_execute_verb(sql, affected, None)
+}
+
+/// 8.0.2 — the same, told what an `EXECUTE`'s prepared statement is.
+///
+/// The tag came from the first word of the SQL TEXT, so `EXECUTE p`
+/// answered `EXECUTE`. PostgreSQL answers with the PREPARED statement's
+/// own tag, and that tag is where a driver reads its row count. Measured
+/// with a raw protocol client against PG 18.6:
+///
+/// ```text
+///   EXECUTE <prepared INSERT>   PG `INSERT 0 1`   SPG `EXECUTE`
+///   EXECUTE <prepared SELECT>   PG `SELECT 1`     SPG `SELECT 1`
+/// ```
+///
+/// SELECT was already right, because a row-returning result is tagged
+/// from its ROWS. The gap was the DML shapes — exactly the ones whose
+/// tag carries a count, so `cursor.rowcount` was unavailable for every
+/// prepared INSERT / UPDATE / DELETE. sentori's §3.25.
+///
+/// `None` keeps the old behaviour, which is what the unit tests below
+/// and every non-EXECUTE caller want.
+fn command_tag_with_execute_verb(sql: &str, affected: usize, execute_verb: Option<&str>) -> String {
+    let raw_first = sql
         .trim_start()
         .split_ascii_whitespace()
         .next()
         .unwrap_or("")
         .to_ascii_uppercase();
+    let first = match (raw_first.as_str(), execute_verb) {
+        ("EXECUTE", Some(v)) => v.to_ascii_uppercase(),
+        _ => raw_first,
+    };
     match first.as_str() {
         "INSERT" => format!("INSERT 0 {affected}"),
         "UPDATE" => format!("UPDATE {affected}"),
@@ -3830,7 +3885,25 @@ fn handle_bind(
         }
         let s = std::str::from_utf8(&body[cur..cur + len])
             .map_err(|_| "Bind: text parameter not valid UTF-8".to_string())?;
-        params.push(text_param_to_value(s));
+        // 8.0.2 — the parameter's DECLARED type, which this path had.
+        //
+        // The binary arm above dispatches on `param_type_oids`; the text
+        // arm read the value's LOOK instead, so `'1'` bound into a text
+        // column arrived as an integer:
+        //
+        //   INSERT INTO t(txt) VALUES ($1)   with '1'
+        //     PG 18.6    stored '1', pg_typeof text
+        //     SPG 8.0.1  ERROR: type mismatch in column "txt": expected TEXT, got INT
+        //   SELECT * FROM t WHERE txt = $1   with '1'
+        //     SPG 8.0.1  ERROR: operator does not exist: text = integer
+        //
+        // And the OID was RIGHT the whole time — Describe answered 25
+        // for that statement on both engines. Only the decoder did not
+        // ask. sentori's §3.24. Text format is what every driver sends
+        // for a string unless it is told otherwise, so this is the
+        // ordinary road.
+        let oid = stmt.param_type_oids.get(i).copied().unwrap_or(0);
+        params.push(text_param_to_value_typed(s, oid));
         cur += len;
     }
     // v7.39 (binary results) — trailing result-format codes: count
@@ -3865,6 +3938,27 @@ fn handle_bind(
 /// explicit cast). The narrowing is conservative: only inputs
 /// that round-trip cleanly to text get the typed treatment.
 fn text_param_to_value(s: &str) -> spg_storage::Value<'static> {
+    text_param_to_value_typed(s, 0)
+}
+
+/// 8.0.2 — the same, told what the parameter was DECLARED as.
+///
+/// The sniff below is right for an undeclared parameter and wrong for a
+/// declared one: a text column's `$1` carrying `'1'` is the string
+/// `'1'`, whatever it looks like. Only the TEXT FAMILY is decided here
+/// — for every other declared type the sniff already lands on something
+/// the engine coerces (a digit string into a numeric column reads as an
+/// integer and widens; a date string reads as text and parses), and a
+/// wider rewrite of this decoder is not what a patch release is for.
+///
+/// `oid == 0` is PostgreSQL's `unknown`, which is what a client that
+/// declares nothing sends: the sniff stays, because that is the only
+/// information there is.
+fn text_param_to_value_typed(s: &str, oid: u32) -> spg_storage::Value<'static> {
+    // text / varchar / bpchar / name — the types whose value IS its text.
+    if matches!(oid, 25 | 1043 | 1042 | 19) {
+        return spg_storage::Value::text(s);
+    }
     let trimmed = s.trim();
     if trimmed.eq_ignore_ascii_case("true") {
         return spg_storage::Value::Bool(true);

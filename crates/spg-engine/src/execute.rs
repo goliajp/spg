@@ -1475,6 +1475,43 @@ impl Engine {
     /// constants and splice into the body's `$N` placeholders through
     /// the same `execute_prepared_with_cancel` the extended-query path
     /// uses, so a SQL EXECUTE and a wire Bind take the identical route.
+    /// 8.0.2 — the tag verb the statement prepared under `name` would
+    /// answer with, for the wire's `CommandComplete`.
+    ///
+    /// `EXECUTE p` was tagged from the first word of the SQL TEXT, so
+    /// it answered `EXECUTE`. PostgreSQL answers with the PREPARED
+    /// statement's own tag, which is where a driver reads its row
+    /// count from. Measured on PG 18.6 with a raw protocol client:
+    ///
+    /// ```text
+    ///   EXECUTE <prepared INSERT>   PG `INSERT 0 1`   SPG `EXECUTE`
+    ///   EXECUTE <prepared UPDATE>   PG `UPDATE 1`     SPG `EXECUTE`
+    ///   EXECUTE <prepared DELETE>   PG `DELETE 1`     SPG `EXECUTE`
+    ///   EXECUTE <prepared SELECT>   PG `SELECT 1`     SPG `SELECT 1`
+    /// ```
+    ///
+    /// SELECT was already right because a row-returning result is
+    /// tagged from its ROWS rather than from the text. So the gap was
+    /// exactly the DML shapes, and exactly the ones whose tag carries a
+    /// count: `cursor.rowcount` was unavailable for every prepared
+    /// INSERT / UPDATE / DELETE. Reported by sentori as §3.25.
+    ///
+    /// Returns the VERB, not the whole tag: the count belongs to the
+    /// caller, which is the only side that knows it.
+    #[must_use]
+    pub fn prepared_statement_verb(&self, name: &str) -> Option<&'static str> {
+        use spg_sql::ast::Statement as S;
+        let entry = self.prepared_statements.get(name)?;
+        Some(match &entry.body {
+            S::Insert(_) => "INSERT",
+            S::Update(_) => "UPDATE",
+            S::Delete(_) => "DELETE",
+            S::Merge(_) => "MERGE",
+            S::Select(_) => "SELECT",
+            _ => return None,
+        })
+    }
+
     fn exec_execute(
         &mut self,
         name: &str,
