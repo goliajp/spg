@@ -27,6 +27,47 @@ and needs almost nothing in the startup packet; the acceptance panel
 now runs a driver that asks for binary, and that panel is the one that
 gates the publish.
 
+### Fixed — a text parameter's type was read off the look of its text
+
+sentori's §3.24. The binary Bind arm dispatches on the declared type
+OID; the text arm did not look at it, and decided from the value's
+shape instead.
+
+```text
+  INSERT INTO t(txt) VALUES ($1)   with '1'
+    PG 18.6    stored '1', pg_typeof text
+    SPG 8.0.1  ERROR: type mismatch in column "txt": expected TEXT, got INT
+  SELECT * FROM t WHERE txt = $1   with '1'
+    SPG 8.0.1  ERROR: operator does not exist: text = integer
+```
+
+The OID was right the whole time — Describe answered 25 for that
+statement on both engines. Only the decoder did not ask. Text format is
+what every driver sends for a string unless told otherwise, so this is
+the ordinary road, not a corner.
+
+Decided for the text family only. For every other declared type the
+sniff already lands on something the engine coerces, and `oid == 0` —
+PostgreSQL's `unknown`, what a client that declares nothing sends —
+keeps it, because there the shape is the only information there is.
+
+### Fixed — `EXECUTE` of a prepared DML answered the tag `EXECUTE`
+
+sentori's §3.25. The tag came from the first word of the SQL text.
+Measured with a raw protocol client against PG 18.6:
+
+```text
+  EXECUTE <prepared INSERT>   PG `INSERT 0 1`   SPG `EXECUTE`
+  EXECUTE <prepared UPDATE>   PG `UPDATE 1`     SPG `EXECUTE`
+  EXECUTE <prepared DELETE>   PG `DELETE 1`     SPG `EXECUTE`
+  EXECUTE <prepared SELECT>   PG `SELECT 1`     SPG `SELECT 1`
+```
+
+SELECT was already right because a row-returning result is tagged from
+its ROWS rather than from the text — so the gap was exactly the shapes
+whose tag carries a COUNT, which is where a driver reads `rowcount`.
+The tag now comes from the prepared statement the name resolves to.
+
 ### Fixed — a capturing group holding an alternation did not backtrack
 
 Reported from kevy, which carries a fork of this engine, with the root
