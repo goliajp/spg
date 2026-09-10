@@ -856,6 +856,40 @@ pub(crate) fn describe_expr_in(
     cat: Option<&Catalog>,
 ) -> Option<ExprShape> {
     match e {
+        // 8.0.2 — a scalar subquery, wherever it appears.
+        //
+        // `describe_select_items` has typed one since r1053, and that is
+        // the path Describe takes. `build_projection` — the EXECUTION
+        // path, which is what the simple query protocol's
+        // RowDescription comes from — calls this function instead, and
+        // it had no arm, so the column fell back to text. Measured with
+        // a raw protocol client, one row, `occurred_at timestamptz`:
+        //
+        //   SELECT (SELECT max(occurred_at) FROM ev) FROM iss i
+        //     extended protocol  oid=1184  '2026-01-01 00:00:00+00'
+        //     simple protocol    oid=25    '2026-01-01 00:00:00'
+        //     PG 18.6, both      oid=1184  '2026-01-01 00:00:00+00'
+        //
+        // Two protocols, one query, two answers — and the value follows
+        // the type, so the naive rendering was a WRONG ANSWER on the
+        // road every psycopg connection without parameters takes.
+        // Without an outer FROM both were right, which is what kept it
+        // out of sight.
+        Expr::ScalarSubquery(inner) => {
+            let cat = cat?;
+            let cols = describe_select_columns(inner, cat, &[], 0);
+            // More than one column is an invalid statement, not an
+            // unknown one — the same split `describe_select_items`
+            // makes, for the same reason.
+            if cols.len() > 1 {
+                return None;
+            }
+            cols.first().map(|c| ExprShape {
+                name: c.name.clone(),
+                ty: c.ty,
+                nullable: true,
+            })
+        }
         Expr::Column(c) => {
             // Mirror resolve_projection_column's lookup: bare name first,
             // then qualified-prefix match.

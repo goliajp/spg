@@ -10,6 +10,82 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a `timestamptz` reaching a libpq driver crashed it
+
+Not reported by anyone, found while measuring something else, and
+present in every published build we tested including 8.0.1.
+
+```text
+  SELECT occurred_at FROM ev        -- occurred_at timestamptz
+    psql          2026-01-01 00:00:00+00
+    psycopg 3     Segmentation fault
+```
+
+`SELECT max(id)` is fine and `SELECT occurred_at::text` is fine; any
+`timestamptz` reaching a libpq-based driver is not. The wire RESPONSE
+was byte-identical to PostgreSQL's under both the simple and the
+extended protocol — RowDescription, DataRow, CommandComplete — verified
+with a raw protocol client that speaks neither. What differed was what
+the connection had been told about itself before the query ran.
+
+PostgreSQL 18.6 sends fifteen `ParameterStatus` messages at startup and
+SPG sent five. `TimeZone` was one of the ten missing. A driver that
+builds a timezone-aware datetime needs the session's zone and can only
+learn it there; psycopg takes it at connect and builds a `zoneinfo`
+from it. With the key absent its loader does not raise — the process
+dies.
+
+The comment on that list read "keep the set minimal but include the
+ones psql / driver libraries check first". It was an assumption about
+drivers, and psql is not one. All fifteen now, with the session's own
+answer wherever the value is a session's to give.
+
+### Fixed — a scalar subquery's type depended on which protocol asked
+
+sentori's §3.9, which our v8.0.1 note wrongly reported closed. Their
+measurement was the correct one.
+
+```text
+  SELECT (SELECT max(e.at) FROM ev e WHERE e.id = i.id) FROM iss i
+    PG 18.6    2026-01-01 00:00:00+00   timestamp with time zone
+    SPG 8.0.1  2026-01-01 00:00:00      timestamp WITHOUT time zone
+```
+
+Three separate defects wore one face.
+
+**The correlated substitution was untyped.** A scalar subquery
+materialises back into the host expression through a literal, and
+`Value::Timestamp` is what both `timestamp` and `timestamptz` hold.
+v7.39.12 taught the UNCORRELATED path to carry the declared type — for
+an earlier report of theirs — and could not reach the correlated one,
+whose answers come from a batch map built once and consumed per outer
+row with nothing in between that knows the shape. The map carries the
+type now. Narrower than reported: the discriminator is CORRELATION, not
+the aggregate.
+
+**The execution path could not type a scalar subquery at all.**
+`describe_select_items` has typed one since r1053 — that is the path
+Describe takes — while `build_projection`, which is where the SIMPLE
+protocol's RowDescription comes from, called a describer with no such
+arm. Measured with a raw client, one query, two protocols:
+
+```text
+  extended protocol  oid=1184  '2026-01-01 00:00:00+00'
+  simple protocol    oid=25    '2026-01-01 00:00:00'
+```
+
+The value follows the type, so the naive rendering was a wrong ANSWER
+on the road psycopg takes for a query with no parameters. Without an
+outer FROM both were right, which is what kept it out of sight.
+
+**And the first of the three hid the other two**: every attempt to read
+the column's OID from a driver segfaulted until the `ParameterStatus`
+set above was fixed.
+
+Ten shapes now agree with PG 18.6 through a real driver — correlated,
+uncorrelated, aggregate, non-aggregate, and the direct column — in both
+protocols.
+
 ### Fixed — what the wire looks like to a driver that is not psql
 
 Four defects lived in one gap, and 8.0.0 put the worst of them there.

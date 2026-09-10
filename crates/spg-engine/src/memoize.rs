@@ -117,10 +117,21 @@ pub struct CacheKey {
 /// aggregate kind at probe time. Storing the empty-default on the
 /// GroupMap captures that information at try_batch_correlated_scalar
 /// construction time, where the original inner is still in hand.
+/// 8.0.2 — and the DECLARED type of the value the map holds.
+///
+/// A scalar subquery's answer materialises back into the host
+/// expression through a literal, and `Value::Timestamp` is what both
+/// `timestamp` and `timestamptz` hold — so a batched correlated
+/// subquery over a `timestamptz` column came back naive. v7.39.12
+/// taught the UNCORRELATED path to carry the declared type and could
+/// not reach this one, because the batch map is built once and
+/// consumed per outer row, with nothing between the two that knows the
+/// shape. Now the map carries it.
 pub type GroupMap = (
     spg_sql::ast::ColumnName,
     alloc::collections::BTreeMap<String, Value<'static>>,
     Value<'static>,
+    Option<spg_storage::DataType>,
 );
 
 /// v7.29 (3c) - per-expression resolution plan: for the i-th scalar
