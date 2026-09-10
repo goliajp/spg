@@ -102,6 +102,30 @@ pub(crate) fn rewrite_clock_calls(
     };
     match stmt {
         Statement::Select(s) => rewrite_select_clock(s, now, mysql, tz_offset),
+        // 8.0.2 — the statements that MATERIALISE a SELECT.
+        //
+        // `CREATE TABLE … AS SELECT` parses to this same node with
+        // `as_plain_table`, so both it and `CREATE MATERIALIZED VIEW`
+        // arrived here and fell to the `_ => {}` below. The raw
+        // `now()` then reached the evaluator, which has no such
+        // function because the clock family is folded before it:
+        //
+        //   CREATE TABLE t AS SELECT now() FROM s
+        //     PG 18.6    CREATE TABLE AS
+        //     SPG 8.0.1  ERROR: function now() does not exist
+        //   CREATE TABLE t AS SELECT gen_random_uuid() FROM s   works
+        //   CREATE TABLE t AS SELECT upper('a') FROM s          works
+        //
+        // So it was the time family in that one position, which is the
+        // narrowing sentori wrote for §3.6 — theirs named `CREATE
+        // VIEW` too, and that one is right and must stay right: a view
+        // stores its text and resolves at READ time, so folding the
+        // clock into it would freeze the timestamp. Only a node that
+        // materialises may fold, and this node is the only one that
+        // does.
+        Statement::CreateMaterializedView(v) => {
+            rewrite_select_clock(&mut v.body, now, mysql, tz_offset);
+        }
         Statement::Insert(ins) => {
             for row in &mut ins.rows {
                 for e in row {

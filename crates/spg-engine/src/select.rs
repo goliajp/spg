@@ -13745,9 +13745,33 @@ impl Engine {
                     "view {name:?} disappeared mid-expansion"
                 )))
             })?;
-            let parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
+            let mut parsed = spg_sql::parser::parse_statement(&view.body).map_err(|e| {
                 EngineError::Unsupported(alloc::format!("view {name:?} body re-parse failed: {e}"))
             })?;
+            // 8.0.2 — a view body is a statement, and it gets the passes
+            // every other statement gets.
+            //
+            // `preprocess` says of itself: "One function, both callers.
+            // A pass added here reaches every route by construction
+            // rather than by remembering." This body is parsed HERE,
+            // after the outer statement went through it, so it reached
+            // none of them — and the clock fold is one of them:
+            //
+            //   CREATE VIEW v AS SELECT now() FROM t   accepted
+            //   SELECT * FROM v                        ERROR: function now() does not exist
+            //
+            // The view was created and then unusable, and the stored
+            // definition was right the whole time
+            // (`pg_get_viewdef` reads `SELECT now() AS t FROM sv`). Any
+            // view whose definition names the clock family was in that
+            // state. Reported by sentori as §3.6 for the INSERT…SELECT
+            // position; this is the same missing pass at a fourth site.
+            //
+            // Folding here does NOT freeze the view: the fold happens
+            // per statement that READS it, with that statement's own
+            // `now`, which is what makes `now()` constant within a
+            // statement and different between two.
+            self.preprocess(&mut parsed);
             let Statement::Select(body) = parsed else {
                 return Err(EngineError::Unsupported(alloc::format!(
                     "view {name:?} body is not a SELECT (catalog corruption)"
