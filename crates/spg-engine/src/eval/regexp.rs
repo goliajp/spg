@@ -1066,6 +1066,26 @@ fn re_match_at(
 /// Matches `items` in order starting at `pos`; greedy quantifiers
 /// try their longest expansion first and shrink until the rest of
 /// the sequence matches. Alternations retry the tail per branch.
+/// 8.0.2 — the body of `re_match_seq`'s capturing-group-over-an-Alt arm.
+///
+/// See that arm for what it fixes. It lives here because `re_match_seq`
+/// recurses and an arm's locals cost a frame on every level, taken or
+/// not.
+#[inline(never)]
+fn seq_group_alt(
+    inner: &ReNode,
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<usize>, EvalError> {
+    let mut combined: alloc::vec::Vec<ReNode> = alloc::vec::Vec::with_capacity(1 + rest.len());
+    combined.push(inner.clone());
+    combined.extend(rest.iter().cloned());
+    re_match_seq(&combined, s, pos, d, steps)
+}
+
 fn re_match_seq(
     items: &[ReNode],
     s: &[char],
@@ -1165,6 +1185,46 @@ fn re_match_seq(
             combined.extend(nested.iter().cloned());
             combined.extend(rest.iter().cloned());
             re_match_seq(&combined, s, pos, d, steps)
+        }
+        // 8.0.2 — a capturing group holding an alternation must
+        // backtrack for its TAIL, exactly as a bare alternation does.
+        //
+        // The `Alt` arm above is reached only when the alternation sits
+        // DIRECTLY in the sequence. Wrapped in capturing parentheses it
+        // is a `Group`, which had no arm and fell to the catch-all
+        // below — and that path asks `re_match_at`, which returns the
+        // FIRST branch that succeeds and never comes back. So the tail
+        // faced whatever that branch left and failed:
+        //
+        //   regexp_matches('abc', '(a|ab)c')   PG {ab}   SPG (no row)
+        //   regexp_matches('abc', '(ab|a)c')   PG {ab}   SPG {ab}
+        //
+        // Same pattern, same input, opposite answers, and the only
+        // difference is which branch is written first — which is not a
+        // difference a regular expression is allowed to have.
+        //
+        // `(?:a|ab)c` was unaffected: `re_parse_atom` returns the inner
+        // node directly for a non-capturing group, so no `Group` is
+        // built and the `Alt` arm runs. Only capturing parentheses.
+        //
+        // On this path the group's SPAN is not wanted, so flattening is
+        // enough: parentheses only group here.
+        //
+        // Reported from kevy, which carries a fork of this engine, and
+        // reproduced here against PostgreSQL 18.6 before anything was
+        // changed. It reached `regexp_matches`, `regexp_replace`,
+        // `regexp_split_to_array` and `~` — six of eight differential
+        // cases, one of them a WRONG capture rather than a miss:
+        // `(a|aa)ab` on `aaab` gave `{a}` where PG gives `{aa}`.
+        //
+        // OUT OF LINE, and deliberately: `re_match_seq` recurses, and
+        // this arm's `Vec` would sit in EVERY frame of that recursion
+        // whether or not the arm is taken. Written inline it overflowed
+        // the debug stack in this crate's own unit tests — the frame
+        // cliff this repository has met before. The helper's frame is
+        // entered only for the arm that needs it.
+        ReNode::Group { inner, .. } if matches!(**inner, ReNode::Alt(_)) => {
+            seq_group_alt(inner, rest, s, pos, d, steps)
         }
         other => match re_match_at(other, s, pos, d, steps)? {
             Some(p) => re_match_seq(rest, s, p, d, steps),
@@ -1394,6 +1454,39 @@ fn re_match_at_caps(
     }
 }
 
+/// 8.0.2 — the body of `re_match_seq_caps`'s capturing-group-over-an-Alt
+/// arm. Cannot flatten: the group's SPAN is the answer `regexp_matches`
+/// returns, so the branches are retried in place and the journal undoes
+/// the record when the tail does not follow.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn seq_group_alt_caps(
+    idx: usize,
+    inner: &ReNode,
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    d: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<Option<usize>, EvalError> {
+    let ReNode::Alt(branches) = inner else {
+        unreachable!("guarded by the caller's own matches!")
+    };
+    for b in branches {
+        let mark = journal.len();
+        if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
+            cap_set(caps, journal, idx, (pos, p));
+            if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)? {
+                return Ok(Some(e));
+            }
+        }
+        cap_undo(caps, journal, mark);
+    }
+    Ok(None)
+}
+
 fn re_match_seq_caps(
     items: &[ReNode],
     s: &[char],
@@ -1423,6 +1516,21 @@ fn re_match_seq_caps(
         // a backtrack point when a following backref constrains it: enumerate the
         // inner quant's reachable ends, record caps[idx] at each rep count, and
         // try the tail (so `^(a*)\1$` on `aaaa` gives back to group = `aa`).
+        // 8.0.2 — the capturing twin of the flattening arm in
+        // `re_match_seq`. It cannot flatten: doing so would lose the
+        // group's span, and the span is the answer `regexp_matches`
+        // returns. So the branches are retried IN PLACE, the group is
+        // recorded at whichever one lets the tail through, and the
+        // journal undoes the record when it does not.
+        //
+        // Placed above the quantified-group arm so `(a|ab)` reaches it;
+        // a quantified group keeps enumerating its own reachable ends
+        // there.
+        //
+        // Out of line for the same reason as its capture-free twin.
+        ReNode::Group { idx, inner } if matches!(**inner, ReNode::Alt(_)) => {
+            seq_group_alt_caps(*idx, inner, rest, s, pos, d, steps, caps, journal)
+        }
         ReNode::Group { idx, inner } if matches!(**inner, ReNode::Quant { .. }) => {
             let ReNode::Quant {
                 inner: qinner,
@@ -3241,5 +3349,93 @@ mod pg18_differential_tests {
         //  `e2e_regex_backref.rs` (T7-br). `'abab' ~ '(ab)\1'` is now true,
         //  matching PG. No longer deferred.)
         assert!(like("abab", r"(ab)\1", false));
+    }
+}
+
+/// 8.0.2 — a TABLE of expected answers, not a differential.
+///
+/// The defect this pins was reported from kevy alongside a differential
+/// test that compares this engine's two descents — capture-free against
+/// capture-aware — on the same pattern and input. `(a|ab)c` was in that
+/// table and it PASSED, before the fix and after disabling it, because
+/// BOTH descents were wrong in the same way.
+///
+/// A differential test asks whether two implementations agree, not
+/// whether the answer is right. A defect they share is outside what it
+/// can be asked. What found this was writing the expected answer down,
+/// and the expected answers here are PostgreSQL 18.6's, measured.
+#[cfg(test)]
+mod alternation_in_a_capturing_group_backtracks {
+    use super::{max_group, re_compile, re_find, re_find_caps};
+
+    /// The whole match, on the capture-free descent.
+    fn span(pat: &str, hay: &str) -> Option<alloc::string::String> {
+        let node = re_compile(pat).expect("compiles");
+        let cs: alloc::vec::Vec<char> = hay.chars().collect();
+        re_find(&node, &cs, 0)
+            .expect("no error")
+            .map(|(a, b)| cs[a..b].iter().collect())
+    }
+
+    /// Group 1's captured text, on the capture-aware descent — which is
+    /// what `regexp_matches` returns and where a WRONG answer can look
+    /// like a right one.
+    fn group1(pat: &str, hay: &str) -> Option<alloc::string::String> {
+        let node = re_compile(pat).expect("compiles");
+        let cs: alloc::vec::Vec<char> = hay.chars().collect();
+        let (_, caps) = re_find_caps(&node, &cs, 0, max_group(&node)).expect("no error")?;
+        caps.get(1)
+            .and_then(|c| *c)
+            .map(|(a, b)| cs[a..b].iter().collect())
+    }
+
+    #[test]
+    fn the_branch_order_does_not_decide_the_answer() {
+        // The pair that names the defect: one pattern is the other with
+        // its branches swapped, and a regular expression may not answer
+        // them differently.
+        assert_eq!(span("(a|ab)c", "abc").as_deref(), Some("abc"));
+        assert_eq!(span("(ab|a)c", "abc").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_non_capturing_group_was_already_right_and_stays_right() {
+        // `re_parse_atom` returns the inner node directly for `(?:`, so
+        // no `Group` is built and the `Alt` arm always ran. This is the
+        // control: it must not move.
+        assert_eq!(span("(?:a|ab)c", "abc").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn the_captured_text_is_the_branch_the_tail_needed() {
+        // Not a miss but a WRONG capture, which is the shape that hides:
+        // PG 18.6 answers {aa}, and the old code answered {a} — a value
+        // of the right type, in the right place, that no arity or
+        // nullability check can question.
+        assert_eq!(group1("(a|aa)ab", "aaab").as_deref(), Some("aa"));
+        assert_eq!(group1("(a|ab)c", "abc").as_deref(), Some("ab"));
+        assert_eq!(group1("(ab|a)c", "abc").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn it_still_finds_a_match_that_does_not_start_at_zero() {
+        assert_eq!(span("(a|ab)c", "xabcy").as_deref(), Some("abc"));
+        assert_eq!(group1("(a|ab)c", "xabcy").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn a_branch_that_cannot_be_followed_still_fails() {
+        // The arm retries branches; it must not invent a match.
+        assert_eq!(span("(a|ab)z", "abc"), None);
+        assert_eq!(span("(x|y)c", "abc"), None);
+    }
+
+    #[test]
+    fn a_quantified_capturing_group_keeps_its_own_arm() {
+        // The new arm is placed above the quantified-group arm and
+        // guarded on `Alt`, so `(a*)` still enumerates reachable ends
+        // for a following backref.
+        assert_eq!(span(r"^(a*)\1$", "aaaa").as_deref(), Some("aaaa"));
+        assert_eq!(group1(r"^(a*)\1$", "aaaa").as_deref(), Some("aa"));
     }
 }

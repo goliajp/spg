@@ -10,6 +10,83 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a capturing group holding an alternation did not backtrack
+
+Reported from kevy, which carries a fork of this engine, with the root
+cause and a fix that had passed there. Reproduced here against
+PostgreSQL 18.6 before anything was changed, and it is wider on this
+side than the report described.
+
+```text
+  regexp_matches('abc', '(a|ab)c')   PG {ab}   SPG (no row)
+  regexp_matches('abc', '(ab|a)c')   PG {ab}   SPG {ab}
+```
+
+Same pattern, same input, opposite answers, and the only difference is
+which branch is written first — which is not a difference a regular
+expression is allowed to have.
+
+`re_match_seq` has an arm that tries each branch of an alternation
+against the TAIL, and it is reached only when the `Alt` sits directly in
+the sequence. Wrapped in capturing parentheses it is a `Group`, which
+had no arm and fell to a catch-all that asks for the FIRST branch that
+matches and never comes back. `(?:a|ab)c` was unaffected because the
+parser returns the inner node directly for a non-capturing group, so no
+`Group` is built. Only capturing parentheses.
+
+Eight differential cases, six of which diverged:
+
+```text
+              PG 18.6      SPG 8.0.1
+  regexp_matches           {ab}         (no row)
+  regexp_replace           X            abc          nothing replaced
+  the ~ operator           true         false
+  regexp_split_to_array    {"",""}      {abc}
+  (a|aa)ab on 'aaab'       {aa}         {a}          a WRONG capture
+```
+
+The last is the shape that hides: not a missing row but a value of the
+right type in the right place, which no arity or nullability check can
+question.
+
+Two arms, because the two descents need different things. The
+capture-free one flattens — parentheses only group on that path. The
+capture-aware one cannot, because the group's span is the answer
+`regexp_matches` returns, so it retries the branches in place and the
+journal undoes the record when the tail does not follow. Both bodies
+live out of line: written inline, the arm's locals cost a frame on every
+level of a recursive matcher and overflowed the debug stack in this
+crate's own unit tests.
+
+The pins are a TABLE of expected answers, PostgreSQL's, measured — not a
+differential between the two descents. kevy's report is explicit about
+why: their differential test had `(a|ab)c` in it and it passed, before
+the fix and with the fix disabled, because both descents were wrong the
+same way. A differential asks whether two implementations agree, not
+whether the answer is right.
+
+Nothing here had encoded the old answers: 418 unit tests and 3,896
+corpus cases green.
+
+### Fixed — `--work-mem=64MB` exited 1
+
+sentori's §3.14, still open after the 7.40.11 fix, and our v8.0.1 note's
+claim that "all three of PostgreSQL's spellings are accepted" was wrong.
+
+The setting name was taken verbatim, so `--work-mem=64MB` asked for a
+GUC called `work-mem` and the container died. Measured on PG 18.6, one
+container per row, reading `work_mem` back after boot:
+
+```text
+  --work-mem=64MB    started, work_mem=64MB
+  --work_mem=64MB    started, work_mem=64MB
+  -c work-mem=64MB   started, work_mem=64MB
+```
+
+So the conversion is not a property of the long form — PostgreSQL takes
+either separator in either spelling. All four now do here too. The VALUE
+is untouched: `--search_path=a-b` names a schema, not a GUC.
+
 ### Fixed — a `timestamptz` reaching a libpq driver crashed it
 
 Not reported by anyone, found while measuring something else, and

@@ -851,7 +851,25 @@ fn split_boot_settings(raw: Vec<String>) -> (Vec<(String, String)>, Vec<String>)
 
 fn push_boot_setting(pair: &str, into: &mut Vec<(String, String)>) {
     match pair.split_once('=') {
-        Some((k, v)) if !k.is_empty() => into.push((k.to_string(), v.to_string())),
+        // 8.0.2 — a hyphen in the NAME is an underscore.
+        //
+        // The name was taken verbatim, so `--work-mem=64MB` asked for a
+        // GUC called `work-mem`, which does not exist, and the container
+        // exited 1. Reported by sentori as §3.14 still open after the
+        // 7.40.11 fix, and our v8.0.1 note's claim that "all three of
+        // PostgreSQL's spellings are accepted" was wrong.
+        //
+        // Measured on PG 18.6, one container per row, `SHOW work_mem`
+        // read back after boot:
+        //
+        //   --work-mem=64MB     started, work_mem=64MB
+        //   --work_mem=64MB     started, work_mem=64MB
+        //   -c work-mem=64MB    started, work_mem=64MB
+        //
+        // So the conversion is not a property of the long form: PG takes
+        // either separator in either spelling. The VALUE is untouched —
+        // `--search_path=a-b` names a schema, not a GUC.
+        Some((k, v)) if !k.is_empty() => into.push((k.replace('-', "_"), v.to_string())),
         _ => {
             eprintln!("spg-server: fatal: expected name=value, got {pair:?}");
             std::process::exit(1);
