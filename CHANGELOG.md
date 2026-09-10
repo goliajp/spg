@@ -10,6 +10,23 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [8.0.2] — 2026-09-11
+
+A patch release for an outage 8.0.0 caused. `sqlx` applications could
+not start on 8.0.0 or 8.0.1: the change that made `void` a type taught
+the TEXT result encoder and not the BINARY one, and every PostgreSQL
+driver asks for binary. Reported by sentori, whose 87-step suite ran
+zero steps on 8.0.1.
+
+Six more came out of measuring it, four of them found here rather than
+reported — including one that crashed the client outright, and one
+wrong ANSWER in the regular-expression engine. Every instrument on both
+sides of that report spoke through `psql`, which asks for text results
+and needs almost nothing in the startup packet; the acceptance panel
+now runs a driver that asks for binary, and that panel is the one that
+gates the publish.
+
 ### Fixed — a capturing group holding an alternation did not backtrack
 
 Reported from kevy, which carries a fork of this engine, with the root
