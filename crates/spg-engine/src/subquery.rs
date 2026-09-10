@@ -489,7 +489,7 @@ impl Engine {
                     if let Some(m) = memo.as_deref_mut()
                         && let Some(Some(gm)) = m.group_maps_by_ptr.get(&ptr_key)
                     {
-                        let (outer_col, map, empty_default) = gm.as_ref();
+                        let (outer_col, map, empty_default, out_ty) = gm.as_ref();
                         let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                             .map_err(EngineError::Eval)?;
                         // v7.37.x — scalar subquery empty-set semantics:
@@ -511,7 +511,10 @@ impl Engine {
                             .get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
                             .cloned()
                             .unwrap_or_else(|| empty_default.clone());
-                        *e = value_to_literal_expr(v)?;
+                        // 8.0.2 — typed, for the reason `GroupMap`
+                        // carries the type at all: this is the
+                        // correlated twin of the path v7.39.12 fixed.
+                        *e = crate::substitute::value_to_literal_expr_typed(v, *out_ty)?;
                         return Ok(());
                     }
                 }
@@ -563,7 +566,35 @@ impl Engine {
                 if let (Some(cache), Some(k)) = (memo.as_deref_mut(), cache_key) {
                     cache.insert(k, value.clone());
                 }
-                *e = value_to_literal_expr(value)?;
+                // 8.0.2 — the CORRELATED path, told what the subquery
+                // declared, which v7.39.12 taught the uncorrelated one
+                // and stopped there.
+                //
+                // A scalar subquery materialises through a literal
+                // expression, and `Value::Timestamp` is what both
+                // `timestamp` and `timestamptz` hold — so a value that
+                // went round through the untyped conversion came back
+                // as a naive timestamp. Measured against PG 18.6:
+                //
+                //   SELECT (SELECT max(e.at) FROM ev e WHERE e.id = i.id) FROM iss i
+                //     PG 18.6    2026-01-01 00:00:00+00   timestamp with time zone
+                //     SPG 8.0.1  2026-01-01 00:00:00      timestamp WITHOUT time zone
+                //
+                // The uncorrelated form of the same query has been
+                // right since 7.39.12, which is what made this look
+                // closed from the outside — and is why sentori's ledger
+                // still carried it open while ours said closed. Their
+                // measurement was the correct one.
+                //
+                // Narrower than they reported: the discriminator is
+                // CORRELATION, not the aggregate. `(SELECT e.at FROM ev
+                // e WHERE e.id = i.id LIMIT 1)` loses the zone too.
+                //
+                // `columns` is the inner SELECT's own answer about its
+                // shape, taken from the result that just came back
+                // rather than inferred a second time.
+                let declared = columns.first().map(|c| c.ty);
+                *e = crate::substitute::value_to_literal_expr_typed(value, declared)?;
             }
             Expr::Exists { subquery, negated } => {
                 // v7.34 (mailrs conn-pool P0) — semi/anti-join batch path
@@ -1562,7 +1593,16 @@ impl Engine {
         // splice path doesn't have to re-introspect a possibly-hollowed
         // inner template.
         let empty_default = scalar_subquery_empty_default(inner);
-        Ok(Some((outer_col, map, empty_default)))
+        // 8.0.2 — the declared type of the value this map holds, asked
+        // of the ORIGINAL inner SELECT rather than threaded through the
+        // four branches that can produce `rows`. The map is built once
+        // per query, so one describe here costs nothing per outer row.
+        let out_ty = self
+            .describe_prepared(&spg_sql::ast::Statement::Select(inner.clone()))
+            .1
+            .first()
+            .map(|c| c.ty);
+        Ok(Some((outer_col, map, empty_default, out_ty)))
     }
 }
 
@@ -4592,7 +4632,7 @@ fn splice_planned_subqueries(
             // template-rewrite step, so re-introspecting it for the
             // aggregate kind doesn't work — the construction-time
             // value on the GroupMap is the source of truth.
-            let (outer_col, map, empty_default) = gm.as_ref();
+            let (outer_col, map, empty_default, out_ty) = gm.as_ref();
             let key_v = eval::eval_expr(&Expr::Column(outer_col.clone()), row, ctx)
                 .map_err(EngineError::Eval)?;
             // v7.39 (round 620) — a NULL correlation key gives an EMPTY result
@@ -4612,7 +4652,8 @@ fn splice_planned_subqueries(
                 .get(&aggregate::encode_key(core::slice::from_ref(&key_v)))
                 .cloned()
                 .unwrap_or_else(|| empty_default.clone());
-            *e = value_to_literal_expr(v)?;
+            // 8.0.2 — typed, like its twin above.
+            *e = crate::substitute::value_to_literal_expr_typed(v, *out_ty)?;
             Ok(true)
         }
         Expr::Exists { .. }

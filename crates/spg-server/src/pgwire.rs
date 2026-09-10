@@ -2083,13 +2083,78 @@ fn run_pg_session(
 
     // AuthenticationOk
     send_msg(stream, b'R', &0u32.to_be_bytes())?;
-    // ParameterStatus pairs — keep the set minimal but include the
-    // ones psql / driver libraries check first.
+    // ParameterStatus pairs.
+    //
+    // 8.0.2 — the set PostgreSQL sends, because "keep the set minimal
+    // but include the ones psql / driver libraries check first" — what
+    // this comment said until now — was an assumption about drivers,
+    // and psql is not one.
+    //
+    // A driver that builds a tz-aware datetime needs the SESSION's zone,
+    // and it can only learn it here: there is no other channel. psycopg
+    // takes `TimeZone` from ParameterStatus at connect and builds a
+    // `zoneinfo` from it. With the key absent its loader has no zone to
+    // use, and the process does not raise — it SEGFAULTS:
+    //
+    //   SELECT occurred_at FROM ev      -- occurred_at timestamptz
+    //     psql            2026-01-01 00:00:00+00
+    //     psycopg 3       Segmentation fault
+    //
+    // Measured against the published 8.0.1 as well, so this is not new
+    // in 8.0.2 — it is as old as the list. `SELECT max(id)` and
+    // `SELECT occurred_at::text` are fine; any timestamptz reaching a
+    // libpq-based driver is not. Neither we nor the reporter had found
+    // it, because every instrument on both sides was psql, which
+    // formats server-side and needs none of this.
+    //
+    // The wire response itself was byte-identical to PostgreSQL's under
+    // both the simple and the extended protocol — RowDescription,
+    // DataRow, CommandComplete — which is why nothing that read the
+    // ANSWER could see it. What differed was what the connection had
+    // been told about itself before the query ran.
+    //
+    // Measured, PostgreSQL 18.6 sends sixteen and SPG sent five. These
+    // are the sixteen, with the session's own answer wherever the value
+    // is a session's to give.
     send_parameter_status(stream, "server_version", spg_engine::PG_SERVER_VERSION)?;
+    send_parameter_status(stream, "server_encoding", "UTF8")?;
     send_parameter_status(stream, "client_encoding", "UTF8")?;
     send_parameter_status(stream, "DateStyle", "ISO, MDY")?;
+    send_parameter_status(stream, "IntervalStyle", "postgres")?;
     send_parameter_status(stream, "integer_datetimes", "on")?;
     send_parameter_status(stream, "standard_conforming_strings", "on")?;
+    send_parameter_status(stream, "in_hot_standby", "off")?;
+    send_parameter_status(stream, "default_transaction_read_only", "off")?;
+    send_parameter_status(stream, "scram_iterations", "4096")?;
+    {
+        // The session's own values, read once under one lock rather than
+        // five times under five.
+        let (tz, search_path, app_name) = state.engine.read().map_or_else(
+            |_| {
+                (
+                    "UTC".to_string(),
+                    "\"$user\", public".to_string(),
+                    String::new(),
+                )
+            },
+            |e| {
+                (
+                    e.session_param("timezone").unwrap_or("UTC").to_string(),
+                    e.session_param("search_path")
+                        .unwrap_or("\"$user\", public")
+                        .to_string(),
+                    e.session_param("application_name")
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            },
+        );
+        send_parameter_status(stream, "TimeZone", &tz)?;
+        send_parameter_status(stream, "search_path", &search_path)?;
+        send_parameter_status(stream, "application_name", &app_name)?;
+    }
+    send_parameter_status(stream, "session_authorization", &user)?;
+    send_parameter_status(stream, "is_superuser", if has_users { "off" } else { "on" })?;
     // v7.39 (query cancel) — BackendKeyData carries the REAL
     // (pid, secret) pair; a CancelRequest connection echoing them
     // trips this session's cancel flag mid-statement.
