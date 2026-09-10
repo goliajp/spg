@@ -92,6 +92,21 @@ fn ascending_with_no_nulls_clause() {
 fn the_adjacent_shapes_that_already_answered_still_do() {
     // sentori's own narrowing, kept as the control: if one of these
     // ever breaks, the fix reached further than the defect.
+    //
+    // 8.0.2 — and one of them broke, because the behaviour it was
+    // holding still was itself the defect. This assertion carried
+    // `2026-01-01 00:00:00` with no offset: a correlated scalar
+    // subquery over a `timestamptz` came back naive, and the expected
+    // value was written from what the engine answered rather than from
+    // what PostgreSQL answers. Measured on PG 18.6 with this file's own
+    // seed:
+    //
+    //   2026-01-01 00:00:00+00,2026-03-01 00:00:00+00,NULL
+    //
+    // Which is what SPG answers now. The control did its job in the
+    // end — it just took a report from sentori (their §3.9, which our
+    // own v8.0.1 note had wrongly called closed) to say which side of
+    // it was wrong.
     let mut e = seeded();
     // The same correlated subquery in the SELECT list.
     assert_eq!(
@@ -99,7 +114,7 @@ fn the_adjacent_shapes_that_already_answered_still_do() {
             &mut e,
             &format!("SELECT {CORR}::text FROM issues i ORDER BY i.id")
         ),
-        "2026-01-01 00:00:00,2026-03-01 00:00:00,NULL"
+        "2026-01-01 00:00:00+00,2026-03-01 00:00:00+00,NULL"
     );
     // An uncorrelated subquery in ORDER BY.
     assert_eq!(
