@@ -10,6 +10,110 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — what the wire looks like to a driver that is not psql
+
+Four defects lived in one gap, and 8.0.0 put the worst of them there.
+
+**A `void` result in binary format was not implemented.** 8.0.0 made
+`void` a type and taught the TEXT encoder about it. Every PostgreSQL
+driver asks for BINARY results, and `Value::Void` fell to the
+not-implemented arm:
+
+```text
+  SELECT pg_advisory_lock(1), binary results
+    PG 18.6     b''            (a value of length 0, not NULL)
+    SPG 8.0.1   ERROR: binary result format not implemented for Some(Void)
+```
+
+`sqlx`'s migrator takes that advisory lock before it applies anything,
+so it is the first statement a sqlx application sends: the application
+could not start, and the container restarted in a loop. Reported by
+sentori, whose 87-step suite did not run a single step on 8.0.1.
+
+**A void column's type was `text` in the RowDescription.** `Value::Void`
+is produced by a dozen match arms in the evaluator, so `pg_typeof`
+answered `void` from the value at runtime while Describe — which builds
+the RowDescription a driver reads — reported OID 25:
+
+```text
+  SELECT pg_advisory_lock(1)   PG 18.6 oid=2278   SPG 8.0.1 oid=25
+```
+
+The forty-one names now live in one `returns_void`, which Describe
+asks. A second list in `describe.rs` is how this repository's own
+"one capability, two lists" defects have started. The names were taken
+by ARM BOUNDARY: a window-based grep pulled in neighbours like
+`pg_try_advisory_lock`, which returns bool.
+
+**The RowDescription's format code said `text` while the DataRow carried
+binary.** It was hardcoded to 0 for every column on every path, so a
+client that believes the field — which is the field's whole purpose —
+decodes binary bytes with a text loader. Describe on a PORTAL now
+carries the formats its Bind settled; Describe on a STATEMENT stays
+all-text, as PostgreSQL does, because there they do not exist yet.
+
+**A startup value that arrived quoted refused the connection.**
+Introduced in 7.40.11 by the fix that made the startup packet's
+settings apply at all. The value was pasted into a synthesised `SET`
+and reparsed, so asyncpg — which writes `client_encoding` as `'utf-8'`,
+quotes included, in every startup packet it opens — got
+`syntax error at or near "utf"` and could not connect to any build
+since.
+
+Stripping the quotes would have fixed that spelling and left the
+construction, and the construction is the defect: a startup value
+carrying a quote, a semicolon or a newline is a statement of the
+client's choosing, run before the connection is handed over. Both
+channels — the startup packet and the server's own `-c` — now build a
+`SetParameter` AST, so the value is data and never meets the parser.
+The reporter asked for exactly this and asked us not to strip quotes.
+
+That left the semantic question, which was answered by measurement
+rather than assumption. PostgreSQL does NOT unwrap startup values in
+general — measured through asyncpg, `application_name = 'hello'` reads
+back as `'hello'`, quotes and all, and `a;b` reads back verbatim. The
+leniency belongs to encoding NAMES: PG cleans them by keeping the
+alphanumerics and comparing case-insensitively.
+
+```text
+  'utf-8'   -> UTF8      u t f 8  -> UTF8
+  utf-8     -> UTF8      utf@8    -> UTF8
+  'UNICODE' -> UTF8      'latin1' -> LATIN1
+```
+
+SPG's filter dropped only `-` and `_`. It now does what PG does, and
+stores the canonical spelling — `SET client_encoding = 'utf-8'` read
+back as `utf-8` where PostgreSQL reads back `UTF8`, so a client that
+sets an encoding and reads it back to check could not tell "applied"
+from "silently ignored".
+
+### Added — the acceptance panel runs a driver that asks for binary
+
+Every instrument in this repository spoke through `psql`, and psql asks
+for TEXT. So did every instrument the reporter had. That is why a
+release which broke every sqlx and asyncpg application was green on
+both sides.
+
+It is the shape the MySQL surface was in before v7.40.11 — a documented
+client nothing ever ran — and it has the same answer: run the client.
+Five cases now boot a live PostgreSQL beside the candidate and take
+PostgreSQL's answer as the expectation, rather than a frozen list that
+goes stale in the direction of whatever was true when it was typed.
+
+Verified by running the new panel against the PUBLISHED 8.0.1 image:
+
+```text
+  binary.void-result-in-binary          FAIL  PG b'' oid 2278 / SPG raised
+  binary.void-sleep-in-binary           FAIL  PG b'' oid 2278 / SPG raised
+  binary.rowdescription-format-code     FAIL  PG binary / SPG text
+  binary.quoted-startup-value           FAIL  PG connected / SPG syntax error
+  binary.client-encoding-canonicalised  FAIL  PG UTF8 / SPG utf-8
+```
+
+Five of five red on the build that shipped them, five of five green on
+the candidate. The panel is the one that GATES the publish, so this
+cannot ship again without a binary-reading driver having seen it.
+
 
 ## [8.0.1] — 2026-09-08
 

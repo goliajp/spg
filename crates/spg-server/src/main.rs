@@ -2171,8 +2171,19 @@ fn run(
     // says which one: accepting a setting and discarding it is the
     // worst of the three available behaviours, and that is exactly what
     // the startup packet was doing (sentori §3.13).
+    // 8.0.2 — as an AST, for the reason the startup-packet path in
+    // `pgwire.rs` says at length: a value pasted into a `SET` and
+    // reparsed is a value that can carry a quote, a semicolon or a
+    // newline. `-c client_encoding='utf-8'` is the same shape asyncpg
+    // sends, and it broke the same way. One construction, both
+    // channels.
     for (k, v) in &boot_gucs {
-        if let Err(e) = engine.execute(&format!("SET {k} = '{v}'")) {
+        let stmt = spg_sql::ast::Statement::SetParameter {
+            name: k.clone(),
+            value: spg_sql::ast::SetValue::String(v.clone()),
+            local: false,
+        };
+        if let Err(e) = engine.execute_prepared(stmt, &[]) {
             eprintln!("spg-server: fatal: -c {k}={v}: {e}");
             std::process::exit(1);
         }

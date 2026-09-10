@@ -694,6 +694,161 @@ EOF
 fi
 rm -rf "$JDBC_DIR"
 
+echo ""
+echo "=== Binary-driver panel ==="
+
+# 8.0.2 — what the wire looks like to a driver that is not psql.
+#
+# Every instrument in this repository, and every instrument the
+# reporter had, spoke to the server through `psql`. psql asks for TEXT
+# results. sqlx, asyncpg, psycopg and PgJDBC all ask for BINARY, and
+# four defects lived in that gap — including one that 8.0.0 INTRODUCED
+# with the change that made `void` a type:
+#
+#   SELECT pg_advisory_lock(1), binary results
+#     PG 18.6     b''
+#     SPG 8.0.1   ERROR: binary result format not implemented for Some(Void)
+#
+# sqlx's migrator takes that advisory lock before it applies anything,
+# so it was the first statement a sqlx application sent and the
+# application could not start. `pg_typeof(pg_sleep(0.001))` answered
+# `void` correctly through psql on the same build, on the other side of
+# the same wire — which is exactly why a psql-only panel could not see
+# it, and why the release that shipped it was green here.
+#
+# The shape is the one the MySQL surface was in before v7.40.11: a
+# documented client nothing ever ran. The answer is the same answer —
+# run the client.
+#
+# PostgreSQL is the EXPECTATION, live, not a frozen list: a panel whose
+# expectations are typed in goes stale in the direction of whatever was
+# true when someone typed them. This is the reporter's own probe shape,
+# adopted rather than reinvented.
+PG_ORACLE_IMAGE="${PG_ORACLE_IMAGE:-postgres:18}"
+BIN_PORT="$((PORT + 2000))"
+BIN_PY_IMAGE="${BIN_PY_IMAGE:-python:3.13-slim}"
+BIN_DIR="$(mktemp -d)"
+
+cat > "$BIN_DIR/probe.py" <<'PYPROBE'
+import sys, psycopg
+
+ORACLE, CAND = int(sys.argv[1]), int(sys.argv[2])
+
+def conn(port, **kw):
+    # Both legs answer as `spg`/`spg` with trust, which is how the rest
+    # of this panel reaches the candidate.
+    return psycopg.connect(host="127.0.0.1", port=port, user="spg",
+                           dbname="spg", **kw)
+
+def case(name, fn):
+    """The oracle's answer is the expectation. A probe that cannot ask
+    the oracle prints a harness failure rather than a passing case."""
+    try:
+        want = fn(ORACLE)
+    except Exception as e:
+        print(f"binary.{name}|FAIL|the ORACLE could not answer: {type(e).__name__}: {str(e).splitlines()[0]}")
+        return
+    try:
+        got = fn(CAND)
+    except Exception as e:
+        got = f"raised {type(e).__name__}: {str(e).splitlines()[0]}"
+    if got == want:
+        print(f"binary.{name}|PASS|")
+    else:
+        print(f"binary.{name}|FAIL|PG: {want} / SPG: {got}")
+
+def void_binary(port):
+    with conn(port) as c, c.cursor(binary=True) as cur:
+        cur.execute("SELECT pg_advisory_lock(1)")
+        r = cur.pgresult
+        return f"value {cur.fetchone()!r} oid {r.ftype(0)}"
+
+def sleep_void_binary(port):
+    with conn(port) as c, c.cursor(binary=True) as cur:
+        cur.execute("SELECT pg_sleep(0)")
+        r = cur.pgresult
+        return f"value {cur.fetchone()!r} oid {r.ftype(0)}"
+
+def rowdesc_format(port):
+    with conn(port) as c, c.cursor(binary=True) as cur:
+        cur.execute("SELECT 1")
+        r = cur.pgresult
+        return f"RowDescription says {'binary' if r.fformat(0) else 'text'}, bytes {r.get_value(0,0)!r}"
+
+def quoted_startup(port):
+    with conn(port, client_encoding="'utf-8'") as c:
+        return f"connected, client_encoding={c.execute('show client_encoding').fetchone()[0]}"
+
+def canonical_encoding(port):
+    with conn(port, client_encoding="utf-8") as c:
+        return f"reads back as {c.execute('show client_encoding').fetchone()[0]}"
+
+case("void-result-in-binary", void_binary)
+case("void-sleep-in-binary", sleep_void_binary)
+case("rowdescription-format-code", rowdesc_format)
+case("quoted-startup-value", quoted_startup)
+case("client-encoding-canonicalised", canonical_encoding)
+PYPROBE
+
+# A client or an oracle we could not obtain is a HARNESS problem; a wire
+# that refuses one is a PRODUCT problem. Same split as the JDBC panel.
+if ! docker image inspect "$PG_ORACLE_IMAGE" >/dev/null 2>&1 \
+   && ! docker pull -q "$PG_ORACLE_IMAGE" >/dev/null 2>&1; then
+  echo "[binary] FAIL harness could not obtain $PG_ORACLE_IMAGE"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("binary.oracle-image|FAIL|could not pull $PG_ORACLE_IMAGE")
+elif ! docker image inspect "$BIN_PY_IMAGE" >/dev/null 2>&1 \
+     && ! docker pull -q "$BIN_PY_IMAGE" >/dev/null 2>&1; then
+  echo "[binary] FAIL harness could not obtain $BIN_PY_IMAGE"
+  FAIL_COUNT=$((FAIL_COUNT+1))
+  CASES+=("binary.client-image|FAIL|could not pull $BIN_PY_IMAGE")
+else
+  docker rm -f spg-dropin-pgoracle >/dev/null 2>&1
+  docker run -d --name spg-dropin-pgoracle -p "$BIN_PORT":5432 \
+    -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_USER=spg \
+    -e POSTGRES_DB=spg "$PG_ORACLE_IMAGE" >/dev/null 2>&1
+  oracle_up=0
+  for _ in $(seq 1 90); do
+    if docker exec spg-dropin-pgoracle pg_isready -q -U spg >/dev/null 2>&1; then oracle_up=1; break; fi
+    sleep 1
+  done
+  if [ "$oracle_up" -eq 0 ]; then
+    echo "[binary] FAIL harness: the PostgreSQL oracle never answered"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+    CASES+=("binary.oracle-up|FAIL|$PG_ORACLE_IMAGE never answered on :$BIN_PORT")
+  else
+    bin_out=$(docker run --rm --network host -v "$BIN_DIR:/w" -w /w "$BIN_PY_IMAGE" \
+      sh -c "pip install --quiet 'psycopg[binary]' >/dev/null 2>&1 || exit 3;
+             python probe.py $BIN_PORT $PORT" 2>&1)
+    if ! printf '%s\n' "$bin_out" | grep -q '^binary\.'; then
+      echo "[binary] FAIL probe produced no cases"
+      printf '%s\n' "$bin_out" | head -5
+      FAIL_COUNT=$((FAIL_COUNT+1))
+      first_line=$(printf '%s\n' "$bin_out" | head -1 | tr -d '\r' | tr '|' '/')
+      CASES+=("binary.probe|FAIL|no cases; first line: $first_line")
+    else
+      while IFS= read -r line; do
+        case "$line" in
+          binary.*\|PASS\|*)
+            echo "[binary] ok   ${line%%|*}"
+            PASS_COUNT=$((PASS_COUNT+1))
+            CASES+=("$line")
+            ;;
+          binary.*\|FAIL\|*)
+            echo "[binary] FAIL $line"
+            FAIL_COUNT=$((FAIL_COUNT+1))
+            CASES+=("$line")
+            ;;
+        esac
+      done <<EOF
+$bin_out
+EOF
+    fi
+  fi
+  docker rm -f spg-dropin-pgoracle >/dev/null 2>&1
+fi
+rm -rf "$BIN_DIR"
+
 FIXTURE_REPORT=""
 if [ "${#FIXTURES[@]}" -eq 0 ]; then
   # Say so. The panel is optional, and an optional panel that is silent

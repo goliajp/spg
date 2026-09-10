@@ -3039,11 +3039,32 @@ impl Engine {
                         spg_sql::ast::SetValue::Default => "UTF8",
                         spg_sql::ast::SetValue::Null => "NULL",
                     };
+                    // 8.0.2 — PostgreSQL's own encoding-name cleaning:
+                    // keep the ALPHANUMERICS, drop everything else,
+                    // compare case-insensitively. This filter kept
+                    // only `-` and `_`, so a value arriving wrapped in
+                    // quotes did not match and the connection was
+                    // refused — which is every asyncpg connection, as
+                    // it writes `client_encoding` as `'utf-8'` with
+                    // the quotes inside the value.
+                    //
+                    // Measured against PG 18.6 through asyncpg, one
+                    // connection per row:
+                    //
+                    //   'utf-8'     UTF8      u t f 8   UTF8
+                    //   utf-8       UTF8      utf@8     UTF8
+                    //   'UNICODE'   UTF8      'latin1'  LATIN1
+                    //
+                    // Not a general unwrap of startup values: measured
+                    // the same way, `application_name = 'hello'` reads
+                    // back as `'hello'` on PG, quotes and all, and
+                    // `a;b` reads back verbatim. The leniency belongs
+                    // to encoding NAMES, and only there.
                     let norm: alloc::string::String = v
                         .trim()
-                        .to_ascii_uppercase()
                         .chars()
-                        .filter(|c| *c != '-' && *c != '_')
+                        .filter(char::is_ascii_alphanumeric)
+                        .map(|c| c.to_ascii_uppercase())
                         .collect();
                     if !matches!(norm.as_str(), "UTF8" | "UNICODE") {
                         return Err(EngineError::Unsupported(alloc::format!(
@@ -3051,6 +3072,27 @@ impl Engine {
                              (SPG serves UTF8 only)"
                         )));
                     }
+                    // 8.0.2 — store the CANONICAL spelling, as PG does
+                    // and as `timezone` below already did.
+                    //
+                    // The value was validated and then stored verbatim,
+                    // so `SET client_encoding = 'utf-8'` read back as
+                    // `utf-8` where PostgreSQL 18.6 reads back `UTF8`.
+                    // A client that sets an encoding and reads it back
+                    // to check — which is the only way to tell
+                    // "applied" from "silently ignored" — cannot tell
+                    // those two apart when the readback is the string
+                    // it sent.
+                    let canon = spg_sql::ast::SetValue::String("UTF8".into());
+                    if local {
+                        self.set_local_param("client_encoding".into(), canon);
+                    } else {
+                        self.set_session_param("client_encoding".into(), canon);
+                    }
+                    return Ok(QueryResult::CommandOk {
+                        affected: 0,
+                        modified_catalog: false,
+                    });
                 }
                 // v7.38 (read01 P3.17) — reject a clearly-invalid value for
                 // a handful of well-known typed GUCs (`SET work_mem =

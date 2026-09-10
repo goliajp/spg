@@ -1873,8 +1873,31 @@ fn run_pg_session(
         // the same two in the same order.
         e.apply_server_defaults(&state.boot_gucs, &startup_db, &user);
         // And this connection's own request, on top of both.
+        //
+        // 8.0.2 — as an AST, NOT as text pasted into a `SET`.
+        //
+        // `format!("SET {k} = '{v}'")` was reparsed, so the VALUE was
+        // read as SQL. asyncpg writes `client_encoding` as `'utf-8'`
+        // — quotes included — in every startup packet it opens
+        // (`protocol/coreproto.pyx`, `"'{}'".format(encoding)`), which
+        // became `SET client_encoding = ''utf-8''` and answered
+        // `syntax error at or near "utf"`. Every asyncpg connection to
+        // every build since 7.40.11 was refused, and there is nothing
+        // an operator can set to avoid it.
+        //
+        // Stripping the quotes would fix that spelling and leave the
+        // construction, and the construction is the defect: a startup
+        // value carrying a quote, a semicolon or a newline is a
+        // statement of the client's choosing, run before the
+        // connection is handed over. The value is data here and never
+        // meets the parser.
         for (k, v) in &requested_settings {
-            if let Err(err) = e.execute(&format!("SET {k} = '{v}'")) {
+            let stmt = spg_sql::ast::Statement::SetParameter {
+                name: k.clone(),
+                value: spg_sql::ast::SetValue::String(v.clone()),
+                local: false,
+            };
+            if let Err(err) = e.execute_prepared(stmt, &[]) {
                 startup_setting_error = Some(engine_error_to_wire(&err));
                 break;
             }
@@ -2256,6 +2279,8 @@ fn run_pg_session(
                 if !body.is_empty() {
                     let kind = body[0];
                     let name = cstring_at(body, 1).unwrap_or_default();
+                    // 8.0.2 — the Bind result formats, for a portal.
+                    let mut desc_formats: Vec<i16> = Vec::new();
                     // v6.3.3 — real Describe. Statement (S) returns
                     // ParameterDescription + RowDescription | NoData.
                     // Portal (P) returns RowDescription | NoData
@@ -2294,7 +2319,14 @@ fn run_pg_session(
                             (Vec::new(), Vec::new())
                         }
                     } else if kind == b'P' {
+                        // 8.0.2 — a portal's Bind has already settled
+                        // the result formats, so this RowDescription
+                        // is the one that can and must say which they
+                        // are. Describe on a STATEMENT below keeps
+                        // all-text, as PostgreSQL does, because there
+                        // the formats do not exist yet.
                         let cols = if let Some(portal) = portals.get(&name) {
+                            desc_formats = portal.result_formats.clone();
                             if let Some(stmt) = prepared.get(&portal.stmt_name) {
                                 let eng = state
                                     .engine
@@ -2325,7 +2357,7 @@ fn run_pg_session(
                     if columns.is_empty() {
                         send_msg(&mut wbuf, b'n', &[])?; // NoData
                     } else {
-                        send_row_description(&mut wbuf, &columns)?;
+                        send_row_description_with_formats(&mut wbuf, &columns, &desc_formats)?;
                     }
                 }
             }
@@ -3588,7 +3620,7 @@ fn handle_parse(
     let row_desc_body: Option<Vec<u8>> = if columns.is_empty() {
         None
     } else {
-        Some(encode_row_description_body(&columns))
+        Some(encode_row_description_body(&columns, &[]))
     };
     // r1058 — a PREPARE statement's `$n` belong to the INNER
     // statement, not to this Parse message: live PG18 accepts
@@ -8209,7 +8241,18 @@ fn send_error_pos(
 }
 
 fn send_row_description(stream: &mut dyn Write, cols: &[ColumnSchema]) -> std::io::Result<()> {
-    let body = encode_row_description_body(cols);
+    send_row_description_with_formats(stream, cols, &[])
+}
+
+/// The same, for a caller that knows what Bind asked for — Describe
+/// on a PORTAL, which is the only place the formats are settled and
+/// the RowDescription has not been sent yet.
+fn send_row_description_with_formats(
+    stream: &mut dyn Write,
+    cols: &[ColumnSchema],
+    formats: &[i16],
+) -> std::io::Result<()> {
+    let body = encode_row_description_body(cols, formats);
     send_msg(stream, b'T', &body)
 }
 
@@ -8221,11 +8264,29 @@ fn send_row_description_cached(out: &mut Vec<u8>, body: &[u8]) -> std::io::Resul
     send_msg(out, b'T', body)
 }
 
-fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
+/// 8.0.2 — `formats` are the Bind message's result-format codes, and
+/// the per-column format field has to carry what they say.
+///
+/// It was hardcoded to 0 (text) for every column on every path. A
+/// binary Bind therefore got a RowDescription announcing text and a
+/// DataRow carrying binary, and a client that believes the field —
+/// which is the field's entire purpose — decodes binary bytes with a
+/// text loader. Measured through psycopg against PG 18.6:
+///
+/// ```text
+///   asked binary   PG 18.6   RowDescription says binary, bytes b'\x00\x00\x00\x01'
+///                  SPG 8.0.1 RowDescription says text,   bytes b'\x00\x00\x00\x01'
+/// ```
+///
+/// Same bytes, contradictory label. Pass `&[]` where all columns are
+/// text — the simple query protocol, and Describe on a prepared
+/// STATEMENT, which PostgreSQL also answers all-text because the
+/// formats are not known until Bind.
+fn encode_row_description_body(cols: &[ColumnSchema], formats: &[i16]) -> Vec<u8> {
     let n = u16::try_from(cols.len()).unwrap_or(u16::MAX);
     let mut body = Vec::with_capacity(2 + cols.len() * 24);
     body.extend_from_slice(&n.to_be_bytes());
-    for c in cols {
+    for (i, c) in cols.iter().enumerate() {
         body.extend_from_slice(c.name.as_bytes());
         body.push(0);
         body.extend_from_slice(&0u32.to_be_bytes()); // table OID (unknown)
@@ -8233,7 +8294,7 @@ fn encode_row_description_body(cols: &[ColumnSchema]) -> Vec<u8> {
         body.extend_from_slice(&pg_type_oid(c.ty).to_be_bytes()); // type OID
         body.extend_from_slice(&pg_type_len(c.ty).to_be_bytes()); // type len (i16)
         body.extend_from_slice(&(-1i32).to_be_bytes()); // type modifier
-        body.extend_from_slice(&0u16.to_be_bytes()); // format = text
+        body.extend_from_slice(&u16::from(col_is_binary(formats, i)).to_be_bytes());
     }
     body
 }
@@ -8255,6 +8316,26 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
     };
     match v {
         Value::Null => out.extend_from_slice(&(-1i32).to_be_bytes()),
+        // 8.0.2 — `void` in binary is a value of ZERO length, not NULL.
+        //
+        // 8.0.0 made `void` a type and taught the TEXT encoder about
+        // it; every PostgreSQL driver asks for BINARY results, and
+        // this arm did not exist, so `Value::Void` fell to the error
+        // arm below. sqlx's migrator opens with
+        // `SELECT pg_advisory_lock($1)`, so the first statement a
+        // sqlx application sends got
+        // `binary result format not implemented for Some(Void)` and
+        // the application could not start at all.
+        //
+        // Measured against PG 18.6 through psycopg with
+        // `binary=True`: `pg_advisory_lock(1)` -> `(b'',)`. Length 0,
+        // not length -1 — a NULL here would be the 7.40.x defect
+        // wearing a different encoding.
+        //
+        // psql asks for TEXT, which is why every instrument on both
+        // sides of this — ours and the customer's — was green while
+        // this was broken.
+        Value::Void => put(&[]),
         Value::Bool(b) => put(&[u8::from(*b)]),
         Value::SmallInt(n) => put(&n.to_be_bytes()),
         Value::Int(n) => put(&n.to_be_bytes()),

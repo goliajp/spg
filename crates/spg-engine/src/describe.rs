@@ -1337,6 +1337,24 @@ fn function_return_shape(
     schema_cols: &[ColumnSchema],
 ) -> Option<ExprShape> {
     let lc = name.to_ascii_lowercase();
+    // 8.0.2 — the void-returning family, asked rather than re-listed.
+    //
+    // Describe reported `text` (OID 25) for every one of them where
+    // PostgreSQL reports `void` (2278), because the knowledge lived in
+    // the evaluator's match arms and nothing static could see it.
+    // `pg_typeof` was right the whole time — it reads the VALUE — so
+    // every psql-based instrument on both sides of this agreed while
+    // the RowDescription a driver reads did not.
+    //
+    // A void column is never NULL: PostgreSQL sends a zero-length
+    // value, which is a different thing and was the 7.40.x defect.
+    if crate::eval::functions::returns_void(&lc) {
+        return Some(ExprShape {
+            name: lc,
+            ty: DataType::Void,
+            nullable: false,
+        });
+    }
     let (ty, nullable) = match lc.as_str() {
         // Time-of-now → engine clock literals.
         "now"
