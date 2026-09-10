@@ -416,6 +416,39 @@ fn on_conflict_key_exists(
     // Only when a unique index on this column exists but could not be
     // probed — an unindexed column has no arbiter and no conflict, and
     // must keep answering false.
+    // 8.0.2 — a PRIMARY KEY and a UNIQUE constraint are uniqueness
+    // rules too, and their index does not carry `is_unique`.
+    //
+    // Both install an implicit B-tree on the leading column
+    // (`ddl.rs`, the two `add_index` sites) and record the rule as a
+    // `UniquenessConstraint`; only `CREATE UNIQUE INDEX` sets the flag
+    // on the index itself. So this test found nothing for the two ways
+    // a schema usually declares uniqueness, the fallback below never
+    // ran, the arbiter answered "no such key", and the row went on to
+    // be refused by the uniqueness check — the exact failure v7.40.11
+    // wrote this fallback to stop, still open for `PRIMARY KEY` and
+    // `UNIQUE`.
+    //
+    // Measured on the candidate image under `en_US.utf8`, one row
+    // present, `INSERT … ON CONFLICT (k) DO NOTHING`:
+    //
+    //   k text PRIMARY KEY        ERROR: duplicate key value …
+    //   k text UNIQUE             ERROR: duplicate key value …
+    //   CREATE UNIQUE INDEX (k)   INSERT 0 0
+    //
+    // Three spellings of one rule, and only the third worked. PG
+    // answers `INSERT 0 0` to all three. Reported by sentori as §3.22
+    // at a fifth site; this is what made that site different from the
+    // four v8.0.1 taught.
+    let collated_btree_on_col = |pos: usize| {
+        table.indices().iter().any(|idx| {
+            idx.column_position == pos
+                && idx.extra_column_positions.is_empty()
+                && idx.partial_predicate.is_none()
+                && idx.expression.is_none()
+                && table.index_collation(idx).is_some()
+        })
+    };
     let has_unprobable_unique = table.indices().iter().any(|idx| {
         idx.is_unique
             && idx.column_position == column_pos
@@ -423,7 +456,11 @@ fn on_conflict_key_exists(
             && idx.partial_predicate.is_none()
             && idx.expression.is_none()
             && table.index_collation(idx).is_some()
-    });
+    }) || table
+        .schema()
+        .uniqueness_constraints
+        .iter()
+        .any(|uc| uc.columns.as_slice() == [column_pos] && collated_btree_on_col(column_pos));
     if !has_unprobable_unique {
         return false;
     }
@@ -2391,7 +2428,7 @@ pub(crate) fn enforce_unique_updates(
             }
             Ok(Some(aggregate::encode_key(&key)))
         };
-        let on_conflict = |_pos: usize| -> EngineError {
+        let on_conflict = |pos: usize| -> EngineError {
             // v7.39 (SQLSTATE fidelity) — PG's 23505 phrasing (see the
             // INSERT-path twin above).
             let conname = if uc.is_primary_key {
@@ -2405,10 +2442,40 @@ pub(crate) fn enforce_unique_updates(
                     .join("_");
                 alloc::format!("{table_name}_{cols}_key")
             };
-            // v7.40.0 — the UPDATE twin. It has no key DETAIL to give,
-            // so MySQL's sentence names the key with an empty value
-            // list, which is what the shared helper produces from one.
-            unique_violation(&conname, table_name, &[], &[], uc.is_primary_key, mysql)
+            // 8.0.2 — it DOES have a key DETAIL to give.
+            //
+            // `pos` is the row being updated and `planned` carries its
+            // new values, so both halves of PostgreSQL's sentence are
+            // in scope here. They were passed as two empty slices, and
+            // the shared helper renders that as:
+            //
+            //   PG 18.6    DETAIL:  Key (k)=(a) already exists.
+            //   SPG 8.0.1  DETAIL:  Key ()=() already exists.
+            //
+            // Which names neither the column that collided nor the
+            // value that collided with it. Found by diffing an
+            // UPDATE-onto-an-existing-key case against PG 18.6 while
+            // sweeping for sentori's §3.22 siblings; they did not
+            // report it.
+            //
+            // The RAW new values, not the collation-folded ones: PG
+            // reports what the statement asked to store.
+            let names: Vec<String> = uc
+                .columns
+                .iter()
+                .filter_map(|&i| schema.columns.get(i).map(|c| c.name.clone()))
+                .collect();
+            let key: Vec<Value<'static>> = planned
+                .iter()
+                .find(|(p, _)| *p == pos)
+                .map(|(_, v)| {
+                    uc.columns
+                        .iter()
+                        .map(|&i| v.get(i).cloned().unwrap_or(Value::Null))
+                        .collect()
+                })
+                .unwrap_or_default();
+            unique_violation(&conname, table_name, &names, &key, uc.is_primary_key, mysql)
         };
         // v7.39 (round 166, attack A3) — probe path first.
         // r1018 — same chooser as the insert path: the probe descends on
