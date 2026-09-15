@@ -486,6 +486,51 @@ back as `utf-8` where PostgreSQL reads back `UTF8`, so a client that
 sets an encoding and reads it back to check could not tell "applied"
 from "silently ignored".
 
+### Added — the perf panel can be pointed at somebody else's schema
+
+sentori asked for this harness by name in their §10.5 and said what it
+has to do: compare against the PostgreSQL image their compose ships, on
+the same box, interleaved, medians of several runs, and on Sentori's
+shapes rather than pgbench's — "if the harness is parameterisable we
+will point it at those, and if it is not we will say plainly that we
+measured yours and not ours."
+
+It was not. Every cell in `perf-endpoint-sweep.sh` is OUR shape on OUR
+fixture, which answers whether SPG moved between two of our versions
+and cannot answer whether SPG is fast enough for a single-row insert
+into a table carrying a GIN index on `jsonb` and a BRIN on a timestamp,
+because no cell here has either.
+
+Two inputs now. `FIXTURE_SQL` is applied once to every leg; `SHAPES_FILE`
+holds `name|SQL` lines, one per cell. The panel keeps every rule the
+built-in one has — both legs through `psql`, three legs so the SPG one
+is timed twice, a verdict that has to clear the span the same binary
+showed against itself in the same window, `ANALYZE` on every leg before
+anything is timed — and adds one the built-in panel gets for free by
+construction: the two engines' ANSWERS are compared before their times
+are, because two engines returning different rows are not doing the
+same work and the faster one has not won anything.
+
+What it refuses, each shown refusing:
+
+```text
+  SHAPES_FILE unreadable                        exit 2
+  SHAPES_FILE holds no cells (only comments)    exit 2
+  a line that is not `name|SQL`                 exit 2
+  FIXTURE_SQL set with no SHAPES_FILE           exit 2
+  a shape that raised on either leg             exit 2
+  the two legs answered differently             exit 2
+  a cell LOSES beyond its own resolution        exit 1
+```
+
+The file checks run before the built-in sweep rather than after it — a
+typo in a path is not worth finding forty minutes in. Verified both
+ways on one machine, same shapes, same fixture: a release build reads
+one win and one cell withheld for want of resolution and exits 0, and a
+debug build of the same tree reads a LOSS and exits 1. With neither
+input set the panel's output and summary line are unchanged, which is
+what the release gate runs.
+
 ### Added — the acceptance panel runs a driver that asks for binary
 
 Every instrument in this repository spoke through `psql`, and psql asks
