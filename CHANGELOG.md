@@ -11,7 +11,7 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
-## [8.0.2] — 2026-09-11
+## [8.0.2] — 2026-09-16
 
 A patch release for an outage 8.0.0 caused. `sqlx` applications could
 not start on 8.0.0 or 8.0.1: the change that made `void` a type taught
