@@ -27,6 +27,35 @@ and needs almost nothing in the startup packet; the acceptance panel
 now runs a driver that asks for binary, and that panel is the one that
 gates the publish.
 
+### Fixed — a sweep leg started on last run's data and grew past its own deadline
+
+`deep-tier` failed twice running, on two different trees and two
+different ports:
+
+```text
+  FAIL: locale-collation panel: no verdict line — it never got far
+  enough to have one: sweep-leg-baseline-1: port 25479 not answering
+  after 20s
+```
+
+Twice is this repository's own line between a flake and a finding, and
+the leg's own log tail said what it was doing: `db file … does not
+exist yet — starting fresh` beside an audit log of 78 entries. A
+directory with history and no checkpoint — so startup was replaying a
+WAL, in a debug build.
+
+The panel starts three legs. Two of them remove their directory first
+and the third did not, and the standalone-step path names its runid
+`step-debug`, a FIXED string. So every `deep-tier` run reused
+`/tmp/spg-tests/spg-suite-step-debug-sweep-baseline-{n}` and inherited
+the previous run's 400,000-row load, replaying it before it could
+listen. It got slower every run until it crossed twenty seconds.
+
+Measured on the testbed: the same debug binary on an EMPTY directory
+answers in 0.01–0.14 s, and the release one in 0.14 s. Nothing about
+the binary was slow; it was being asked to read a pile that grew by one
+run every time.
+
 ### Fixed — the extended protocol had no error state
 
 sentori's §3.15, reported as the shape their client saw: psql refusing
