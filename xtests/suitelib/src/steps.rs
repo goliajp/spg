@@ -710,10 +710,37 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
         let mut roster3 = Roster::new();
         let mut baseline_uris = Vec::new();
         for n in 1..=2 {
+            // 8.0.2 — start on a CLEAN directory, as the other two legs
+            // above already do.
+            //
+            // Two of the three cleaned theirs and this one did not, and
+            // the standalone-step path names its runid `step-debug` — a
+            // FIXED string — so every `deep-tier` run reused
+            // `/tmp/spg-tests/spg-suite-step-debug-sweep-baseline-{n}`
+            // and inherited the last run's WAL. The panel loads 400,000
+            // rows into these legs and nothing ever checkpoints them, so
+            // each run's startup replayed every previous run's load, in a
+            // DEBUG build. It got slower every time until it crossed the
+            // 20-second deadline:
+            //
+            //   FAIL: locale-collation panel: no verdict line — it never
+            //   got far enough to have one: sweep-leg-baseline-1: port
+            //   25479 not answering after 20s
+            //
+            // Twice in a row, on two different trees and two different
+            // ports, which is this repository's own rule for when a
+            // flake becomes a finding. The leg's own log tail said what
+            // it was doing — `db file … does not exist yet — starting
+            // fresh` beside an audit log of 78 entries, which is a
+            // directory with history and no checkpoint. Measured on the
+            // testbed, the same debug binary on an EMPTY directory
+            // answers in 0.01–0.14 s.
+            let leg_tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sweep-baseline-{n}"));
+            let _ = std::fs::remove_dir_all(&leg_tmp);
             let port = roster3.spawn_server_env(
                 &format!("sweep-leg-baseline-{n}"),
                 &bin,
-                &crate::proclib::run_tmp_dir(&format!("{runid}-sweep-baseline-{n}")),
+                &leg_tmp,
                 Duration::from_secs(20),
                 bind,
                 &[("SPG_LC_COLLATE", "C")],
