@@ -19,13 +19,26 @@ the TEXT result encoder and not the BINARY one, and every PostgreSQL
 driver asks for binary. Reported by sentori, whose 87-step suite ran
 zero steps on 8.0.1.
 
-Six more came out of measuring it, four of them found here rather than
-reported — including one that crashed the client outright, and one
-wrong ANSWER in the regular-expression engine. Every instrument on both
-sides of that report spoke through `psql`, which asks for text results
-and needs almost nothing in the startup packet; the acceptance panel
-now runs a driver that asks for binary, and that panel is the one that
-gates the publish.
+Eleven of sentori's items close here — §3.6, §3.9, §3.14, §3.15,
+§3.20, §3.21, §3.22, §3.23, §3.24, §3.25 and §3.26 — plus a report from
+kevy, which carries a fork of this engine, of a wrong ANSWER in the
+regular-expression engine. Seven more were found while measuring those
+and nobody had reported them: one that crashed a libpq driver outright,
+a void column typed `text` in the RowDescription, a scalar subquery
+typed one way by each protocol, `ON CONFLICT` blind to the two
+commonest spellings of uniqueness, a violation DETAIL that named
+neither the column nor the value, and two defects in this repository's
+own harness.
+
+Two things are NAMED here rather than fixed: an error's `Position`
+field (§3.27) and the two shapes of §3.22 whose arbiter is an
+expression rather than a column. Both need a change to what a structure
+IS, and neither is a gate to relax.
+
+Every instrument on both sides of that report spoke through `psql`,
+which asks for text results and needs almost nothing in the startup
+packet; the acceptance panel now runs a driver that asks for binary,
+and that panel is the one that gates the publish.
 
 ### Fixed — a sweep leg started on last run's data and grew past its own deadline
 
@@ -325,6 +338,77 @@ Ten shapes now agree with PG 18.6 through a real driver — correlated,
 uncorrelated, aggregate, non-aggregate, and the direct column — in both
 protocols.
 
+One of this repository's own control fixtures was holding the defect
+still. `the_adjacent_shapes_that_already_answered_still_do` asserted
+`2026-01-01 00:00:00` for that column — no offset — and its own comment
+reads "kept as the control: if one of these ever breaks, the fix
+reached further than the defect". It broke because the behaviour it was
+holding still WAS the defect: the expected value had been written from
+what this engine answered rather than from what PostgreSQL answers,
+measured on PG 18.6 with that file's own seed. One of 7,077 e2e cases;
+the other 7,076 were unmoved, which is the answer the control was
+actually asked for.
+
+### Fixed — `ON CONFLICT` could not see a `PRIMARY KEY` or a `UNIQUE` constraint
+
+sentori's §3.22, plus one they did not report — found by sweeping for
+the siblings they asked us to NAME rather than for the case they filed.
+
+`on_conflict_key_exists` probes a B-tree, and since v7.40.11 falls back
+to a row scan when the index it would have probed is locale-collated,
+because such a tree holds ICU sort keys and a raw probe answers "no
+locators" whatever is stored. That fallback was gated on
+`idx.is_unique`.
+
+A `PRIMARY KEY` and a `UNIQUE` constraint do not set it. Both install
+an implicit B-tree on the leading column and record the rule as a
+`UniquenessConstraint`; only `CREATE UNIQUE INDEX` marks the index. So
+the fallback never ran for the two ways a schema usually declares
+uniqueness, the arbiter answered "no such key", and the row went on to
+be refused by the uniqueness check — the exact failure v7.40.11 wrote
+that fallback to stop, still open for the two commonest spellings.
+
+Measured on the candidate under `en_US.utf8`, one row present,
+`INSERT … ON CONFLICT (k) DO NOTHING`:
+
+```text
+  k text PRIMARY KEY        ERROR: duplicate key value …
+  k text UNIQUE             ERROR: duplicate key value …
+  CREATE UNIQUE INDEX (k)   INSERT 0 0
+```
+
+Three spellings of one rule and only the third worked; PostgreSQL
+answers `INSERT 0 0` to all three. Fixed for `DO NOTHING`, `DO UPDATE`
+and the untargeted form, and for `varchar` as well as `text`.
+
+The UPDATE path's uniqueness violation also named nothing. It passed
+two empty slices to the shared message helper:
+
+```text
+  PG 18.6    DETAIL:  Key (k)=(a) already exists.
+  SPG 8.0.1  DETAIL:  Key ()=() already exists.
+```
+
+Neither the column that collided nor the value it collided with. The
+comment said the closure "has no key DETAIL to give"; the row position
+and the planned new values are both in scope there. Byte-identical to
+PostgreSQL now.
+
+The sweep is one differential file run against PG 18.6 and the
+candidate — fifteen shapes across int / text / varchar / composite /
+expression / FK / read paths. Two divergences remain, NAMED rather than
+fixed, because the arbiter model here is a list of COLUMN positions and
+neither of these is a column:
+
+```text
+  ON CONFLICT (LOWER(email))    syntax error — an expression conflict
+                                target is not parsed
+  expression index, untargeted  `on_conflict_arbiters` excludes
+                                `idx.expression.is_some()`
+```
+
+Both are the `UNIQUE INDEX over LOWER(email)` row of their §3.22 table.
+Closing them is a change to what an arbiter IS, not a gate to relax.
 ### Fixed — what the wire looks like to a driver that is not psql
 
 Four defects lived in one gap, and 8.0.0 put the worst of them there.
