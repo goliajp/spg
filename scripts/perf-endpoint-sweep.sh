@@ -71,6 +71,15 @@
 #   N           — timings per side per cell (default 5; rule 4 wants >= 3,
 #                 and 3 has proved too few to separate 10% at this size)
 #   SIZES       — row counts for the built-in shapes (default "1000 10000 50000 400000")
+#   FIXTURE_SQL — optional. A file applied once to EVERY leg before the
+#                 operator panel runs: the schema and the data to measure
+#                 on. Omit it when the legs already carry the data.
+#   SHAPES_FILE — optional. A file of `name|SQL` lines, one per cell,
+#                 measured on whatever FIXTURE_SQL (or the operator) put
+#                 there. Every built-in cell above is OUR shape on OUR
+#                 fixture, which answers whether SPG moved and not
+#                 whether SPG is fast enough for somebody else's schema.
+#                 See `operator panel` below for what it refuses to do.
 #
 #   N           — see above; a cell's control leg costs a third of the
 #                 run's timings and is not optional.
@@ -96,6 +105,37 @@ N="${N:-5}"
 SELF_COMPARISON="${SELF_COMPARISON:-0}"
 SIZES="${SIZES:-1000 10000 50000 400000}"
 PSQL="${PSQL:-psql}"
+# v8.0.2 — the operator's own schema and the operator's own shapes.
+# Checked HERE rather than at the panel, which is forty minutes in: a
+# typo in a path is not worth finding after the built-in sweep has run.
+FIXTURE_SQL="${FIXTURE_SQL:-}"
+SHAPES_FILE="${SHAPES_FILE:-}"
+[[ -z "${FIXTURE_SQL}" || -r "${FIXTURE_SQL}" ]] \
+  || { echo "fatal: FIXTURE_SQL ${FIXTURE_SQL} is not readable" >&2; exit 2; }
+[[ -z "${SHAPES_FILE}" || -r "${SHAPES_FILE}" ]] \
+  || { echo "fatal: SHAPES_FILE ${SHAPES_FILE} is not readable" >&2; exit 2; }
+[[ -z "${FIXTURE_SQL}" || -n "${SHAPES_FILE}" ]] \
+  || { echo "fatal: FIXTURE_SQL is set and SHAPES_FILE is not — the fixture \
+would be applied to every leg and then measured by nothing" >&2; exit 2; }
+# Parsed HERE, for the same reason the paths are checked here: the panel
+# it feeds runs last, and a file that turns out to hold no cells is worth
+# knowing before the built-in sweep spends forty minutes.
+OP_SHAPES=()
+if [[ -n "${SHAPES_FILE}" ]]; then
+  while IFS= read -r _line || [[ -n "${_line}" ]]; do
+    case "${_line}" in
+      ''|'#'*) continue ;;
+      *'|'*) OP_SHAPES+=("${_line}") ;;
+      *) echo "fatal: SHAPES_FILE line is not \`name|SQL\`: ${_line}" >&2; exit 2 ;;
+    esac
+  done < "${SHAPES_FILE}"
+  if (( ${#OP_SHAPES[@]} == 0 )); then
+    echo "fatal: SHAPES_FILE ${SHAPES_FILE} holds no cells. A panel that \
+reports on nothing must fail rather than pass — this run would have measured \
+no shape of yours." >&2
+    exit 2
+  fi
+fi
 
 [[ -n "${PG_URI}" ]]  || { echo "fatal: PG_URI must be set" >&2; exit 2; }
 [[ -n "${SPG_URI}" ]] || { echo "fatal: SPG_URI must be set (both legs run psql — rule 1)" >&2; exit 2; }
@@ -955,11 +995,154 @@ for entry in "${SORT_SHAPES[@]}"; do
     "$( (( over )) && echo '  <- OVER CEILING' )"
 done
 
+# ── The operator panel: their schema, their shapes, this panel's rules.
+#
+# v8.0.2. sentori asked for this harness by name and said what it has to
+# do: compare against the PostgreSQL image their compose ships, on the
+# same box, interleaved, medians of several runs, on Sentori's shapes
+# rather than pgbench's — "if the harness is parameterisable we will
+# point it at those, and if it is not we will say plainly that we
+# measured yours and not ours."
+#
+# Every cell above is OUR shape on OUR fixture. That answers whether SPG
+# moved between two of our versions. It cannot answer whether SPG is
+# fast enough for a single-row insert into a table carrying a GIN index
+# on `jsonb` and a BRIN on a timestamp, because no cell here has either.
+#
+# What this panel does NOT relax, because they are the reasons a number
+# from it means anything:
+#
+#   * Both legs run `psql`. A wall clock that reaches the two engines
+#     through different clients measures the clients.
+#   * Three legs, not two: the SPG leg is timed TWICE, and a verdict has
+#     to clear the span the same binary showed against itself in the
+#     same window. A cell the machine cannot read reports `unresolved`.
+#   * ANALYZE on every leg before anything is timed. Without it the
+#     verdict depends on whether autovacuum happened to run.
+#   * The answer is compared before the time is. Two engines returning
+#     different rows are not doing the same work, and the faster one has
+#     not won anything.
+#
+# What it refuses to do:
+#
+#   * Run with a SHAPES_FILE that holds no cells. An instrument that
+#     reports on nothing must fail, not pass.
+#   * Time a shape that raised on either leg. The error goes to stderr,
+#     the timing comes back empty, and an empty timing reads as a fast
+#     one.
+#
+# One thing it cannot check for you: a shape that WRITES changes the
+# data underneath its own repetitions, so the second timing is not the
+# first one's question. Their ingest shape is a single-row insert, which
+# is exactly that. Time it against a fixture that makes each repetition
+# equivalent — or read the spread, which will say so.
+OPERATOR_CELLS=0
+OPERATOR_LOSSES=0
+if [[ -n "${SHAPES_FILE}" ]]; then
+  op_legs=("${SPG_URI}" "${PG_URI}")
+  if [[ -n "${BASELINE_URI}" ]]; then
+    IFS=, read -r -a _bases <<< "${BASELINE_URI}"
+    for _bu in "${_bases[@]}"; do op_legs+=("${_bu}"); done
+  fi
+
+  if [[ -n "${FIXTURE_SQL}" ]]; then
+    for _leg in "${op_legs[@]}"; do
+      if ! "${PSQL}" --no-psqlrc -X -q -v ON_ERROR_STOP=1 "${_leg}" \
+             -f "${FIXTURE_SQL}" >/dev/null 2>/tmp/spg-op-fixture.err; then
+        echo "SETUP FAILED: ${FIXTURE_SQL} on ${_leg}" >&2
+        sed 's/^/  /' /tmp/spg-op-fixture.err >&2
+        exit 2
+      fi
+    done
+  fi
+  # Bare ANALYZE: the table names are the operator's and this panel does
+  # not know them.
+  for _leg in "${op_legs[@]}"; do
+    "${PSQL}" --no-psqlrc -X -q "${_leg}" -c 'ANALYZE' >/dev/null 2>&1 \
+      || { echo "SETUP FAILED: ANALYZE on ${_leg}" >&2; exit 2; }
+  done
+
+  # The answer, sorted, so a shape with no ORDER BY still compares. Exits
+  # 2 rather than returning an empty string, which is what a raise looks
+  # like to a timing.
+  op_answer() { # $1=uri $2=sql
+    local out rc
+    out="$("${PSQL}" --no-psqlrc -X -q -t -A -v ON_ERROR_STOP=1 "$1" -c "$2" 2>&1)"
+    rc=$?
+    if (( rc != 0 )); then
+      echo "REFUSING TO TIME — the shape did not run on $1:" >&2
+      echo "  ${2}" >&2
+      printf '%s\n' "${out}" | sed 's/^/  /' >&2
+      exit 2
+    fi
+    printf '%s' "${out}" | LC_ALL=C sort
+  }
+
+  echo
+  echo "operator panel — ${#OP_SHAPES[@]} shape(s) from ${SHAPES_FILE}, N=${N} per leg:"
+  printf '  %-34s %-16s %-16s %-9s %-9s %s\n' \
+    SHAPE 'SPG(min-max)' 'PG(min-max)' 'SRV-SPG' 'SRV-PG' VERDICT
+  for entry in "${OP_SHAPES[@]}"; do
+    name="${entry%%|*}"; sql="${entry#*|}"
+    a_spg="$(op_answer "${SPG_URI}" "${sql}")"
+    a_pg="$(op_answer "${PG_URI}"  "${sql}")"
+    if [[ "${a_spg}" != "${a_pg}" ]]; then
+      echo "REFUSING TO TIME — the two engines answered differently, so they are" >&2
+      echo "  not doing the same work and neither one can win the cell:" >&2
+      echo "  ${name}: ${sql}" >&2
+      # `|| true`: diff exits 1 when it finds differences, which is the
+      # case this branch exists for, and under `set -e` with `pipefail`
+      # that killed the script at status 1 before it reached the `exit 2`
+      # below. The refusal printed and the exit code said something else.
+      { diff <(printf '%s\n' "${a_spg}") <(printf '%s\n' "${a_pg}") \
+          | head -20 | sed 's/^/    /' >&2; } || true
+      exit 2
+    fi
+    s=(); g=(); c=()
+    for ((i = 0; i < N; i++)); do
+      case $(( i % 3 )) in
+        0) s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+           g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+           c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")") ;;
+        1) g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")")
+           c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+           s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")") ;;
+        *) c+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+           s+=("$(time_one "${SPG_URI}" "${sql}" "${SPG_WM}")")
+           g+=("$(time_one "${PG_URI}"  "${sql}" "${PG_WM}")") ;;
+      esac
+    done
+    ssrv="$(server_one "${SPG_URI}" "${sql}" "${SPG_WM}" 1)"
+    gsrv="$(server_one "${PG_URI}"  "${sql}" "${PG_WM}"  0)"
+    smin="$(lo "${s[@]}")"; smax="$(hi "${s[@]}")"
+    gmin="$(lo "${g[@]}")"; gmax="$(hi "${g[@]}")"
+    cmin="$(lo "${c[@]}")"; cmax="$(hi "${c[@]}")"
+    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}")"
+    raw="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
+    v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}" "${res}")"
+    cv="$(verdict "${smin}" "${smax}" "${cmin}" "${cmax}")"
+    note=""
+    if [[ "${raw}" != unresolved && "${v}" == unresolved ]]; then
+      note="  <- would have said ${raw}; the gap is inside this cell's own resolution (${res})"
+    fi
+    if [[ "${cv}" != unresolved && "${v}" != unresolved ]]; then
+      note="  <- withdrawn: the same binary separated from itself too (${cmin}-${cmax})"
+      v="unresolved"
+    fi
+    [[ "${v}" == LOSS ]] && OPERATOR_LOSSES=$((OPERATOR_LOSSES + 1))
+    OPERATOR_CELLS=$((OPERATOR_CELLS + 1))
+    printf '  %-34s %-16s %-16s %-9s %-9s %s%s\n' \
+      "${name}" "${smin}-${smax}" "${gmin}-${gmax}" "${ssrv}" "${gsrv}" "${v}" "${note}"
+  done
+fi
+
 echo
 echo "load after: $(uptime)"
 cross_note=""
 [[ -n "${BASELINE_URI}" ]] && cross_note=" cross_process_differences=${CROSS_DIFFS}"
-echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} below_resolution=${BELOW_RES}${cross_note} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}"
+op_note=""
+[[ -n "${SHAPES_FILE}" ]] && op_note=" operator_cells=${OPERATOR_CELLS} operator_losses=${OPERATOR_LOSSES}"
+echo "cells=${CELLS} losses=${LOSSES} control_false_differences=${CONTROL_DIFFS} withdrawn=${DEMOTED} below_resolution=${BELOW_RES}${cross_note} sort_worst=${SORT_WORST}x sort_over_ceiling=${SORT_OVER}${op_note}"
 if (( CONTROL_DIFFS > 0 )); then
   echo "NOTE: on ${CONTROL_DIFFS} cell(s) the binary separated from ITSELF in the same"
   echo "      window. ${DEMOTED} verdict(s) were withdrawn on that ground and report"
@@ -973,6 +1156,13 @@ if (( BELOW_RES > 0 )); then
   echo "      verdict it cannot support. Each such line says what it WOULD have"
   echo "      claimed, so a withheld LOSS is visible and not just a smaller number."
   echo "      Raise N to certify a smaller difference."
+fi
+if (( OPERATOR_LOSSES > 0 )); then
+  echo "OPERATOR PANEL: ${OPERATOR_LOSSES} of ${OPERATOR_CELLS} cell(s) LOSE against"
+  echo "                PostgreSQL beyond what this machine's own noise can explain."
+  echo "                These are YOUR shapes; nothing in this repository's gates"
+  echo "                covers them, which is why they are worth sending back."
+  exit 1
 fi
 (( LOSSES == 0 )) || exit 1
 if (( SORT_OVER > 0 )); then
