@@ -826,6 +826,10 @@ struct TxState {
     serializable: bool,
     /// The engine's commit sequence when this tx began.
     begin_commit_seq: u64,
+    /// 8.0.3 — the clock at BEGIN. `now()`, `current_timestamp` and
+    /// `transaction_timestamp()` read this for the whole transaction, as
+    /// PG's do; see `clock::ClockAt`.
+    xact_start_micros: Option<i64>,
     /// v7.39 (round 494) — has anything asked for this shadow catalog
     /// MUTABLY since BEGIN?
     ///

@@ -100,6 +100,43 @@ pub(crate) fn rewrite_clock_calls(
     let Some(now) = now_micros else {
         return;
     };
+    rewrite_clock_calls_at(
+        stmt,
+        ClockAt {
+            xact: now,
+            stmt: now,
+            wall: now,
+        },
+        mysql,
+        tz_offset,
+    );
+}
+
+/// 8.0.3 — the three clocks PostgreSQL keeps, as of this statement.
+///
+/// SPG folded every clock function in a statement to one reading taken
+/// when the statement was prepared, so `now()` moved from statement to
+/// statement inside a transaction and equalled `statement_timestamp()`.
+/// Measured on PG 18.6: `now()`, `current_timestamp`,
+/// `transaction_timestamp()` and the local-clock family read the moment
+/// the transaction BEGAN (the BEGIN, not its first query — `BEGIN`, wait
+/// a second, and `statement_timestamp() - now()` reads 1.0) and stay put
+/// for the whole transaction; `statement_timestamp()` reads the start of
+/// the statement; `clock_timestamp()` reads the clock. Outside a
+/// transaction the first two are the same instant.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClockAt {
+    pub(crate) xact: i64,
+    pub(crate) stmt: i64,
+    pub(crate) wall: i64,
+}
+
+pub(crate) fn rewrite_clock_calls_at(
+    stmt: &mut Statement,
+    now: ClockAt,
+    mysql: bool,
+    tz_offset: i64,
+) {
     match stmt {
         Statement::Select(s) => rewrite_select_clock(s, now, mysql, tz_offset),
         // 8.0.2 — the statements that MATERIALISE a SELECT.
@@ -187,7 +224,7 @@ pub(crate) fn rewrite_clock_calls(
     }
 }
 
-fn rewrite_select_clock(s: &mut SelectStatement, now: i64, mysql: bool, tz_offset: i64) {
+fn rewrite_select_clock(s: &mut SelectStatement, now: ClockAt, mysql: bool, tz_offset: i64) {
     // v7.38.7 — pin the name BEFORE the rewrite takes it away.
     //
     // Folding `now()` to a literal is what makes the clock stable across
@@ -232,7 +269,7 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: i64, mysql: bool, tz_offse
 /// functions, and bare `CURRENT_TIMESTAMP` / `CURRENT_DATE` column
 /// refs) sit on their own arms with match guards so the fall-through
 /// to the recursive arms is unambiguous.
-fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool, tz_offset: i64) {
+fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
     // Fast-path test on the no-recursion shapes first. We can't fold
     // them into the big match below because they need to *replace* `e`
     // outright; the recursive arms below match on its sub-fields.
@@ -316,7 +353,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool, tz_offset: i64) {
                     )
             });
             if args.len() == 1 && name.eq_ignore_ascii_case("age") && !takes_no_clock {
-                let midnight = now.div_euclid(86_400_000_000) * 86_400_000_000;
+                let midnight = now.xact.div_euclid(86_400_000_000) * 86_400_000_000;
                 let today = Expr::Cast {
                     expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(midnight))),
                     target: spg_sql::ast::CastTarget::Timestamp,
@@ -425,7 +462,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: i64, mysql: bool, tz_offset: i64) {
 /// `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`) and bare-identifier forms
 /// (`CURRENT_TIMESTAMP` / `CURRENT_DATE` as unqualified column refs,
 /// which is how PG accepts them without parens).
-fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Option<Expr> {
+fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> Option<Expr> {
     // v7.39 (round 349, M6) — the fractional-seconds precision argument:
     // `NOW(3)`, `CURRENT_TIMESTAMP(3)`, `CURTIME(3)`. MariaDB 11 renders
     // `NOW(3)` as `2026-07-22 12:46:41.541` and `NOW(6)` with six digits;
@@ -548,6 +585,13 @@ fn clock_replacement_for(e: &Expr, now: i64, mysql: bool, tz_offset: i64) -> Opt
         _ => None,
     };
     let shape = shape?;
+    let now = if kind == ClockSite::Fn && name.eq_ignore_ascii_case("statement_timestamp") {
+        at.stmt
+    } else if kind == ClockSite::Fn && name.eq_ignore_ascii_case("clock_timestamp") {
+        at.wall
+    } else {
+        at.xact
+    };
     // A precision of `p` keeps p fractional digits; 0 keeps none. Both
     // oracles truncate rather than round (measured).
     let now = match precision {

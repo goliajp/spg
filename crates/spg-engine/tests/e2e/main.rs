@@ -651,6 +651,7 @@ mod e2e_normalize_form;
 mod e2e_not_null_detail_round117;
 mod e2e_not_valid_round652;
 mod e2e_notices_round46;
+mod e2e_now_is_the_transactions_start;
 mod e2e_null_cast_target_round509;
 mod e2e_nulls_first_walk_v73911;
 mod e2e_nulls_not_distinct_catalog_round473;

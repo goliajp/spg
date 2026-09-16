@@ -20,7 +20,7 @@ use spg_storage::{ColumnSchema, Value};
 use crate::describe;
 use crate::{
     CancelToken, Engine, EngineError, IMPLICIT_TX, QueryResult, TxId, expand_group_by_all,
-    plan_cache, reorder, resolve_order_by_position, rewrite_clock_calls, substitute_placeholders,
+    plan_cache, reorder, resolve_order_by_position, substitute_placeholders,
 };
 
 /// v7.38 Epic P — turn a caught panic payload into an
@@ -457,6 +457,23 @@ impl Engine {
         Ok(stmt)
     }
 
+    /// 8.0.3 — the three clock readings for the statement being prepared:
+    /// the transaction's BEGIN when this slot has one open, the statement's
+    /// own start otherwise, and the wall clock. See `clock::ClockAt`.
+    pub(crate) fn clock_at(&self) -> Option<crate::clock::ClockAt> {
+        let wall = self.clock.map(|f| f())?;
+        let xact = self
+            .current_tx
+            .and_then(|tx| self.tx_catalogs.get(&tx))
+            .and_then(|st| st.xact_start_micros)
+            .unwrap_or(wall);
+        Some(crate::clock::ClockAt {
+            xact,
+            stmt: wall,
+            wall,
+        })
+    }
+
     /// r1043 — every pre-pass a parsed statement gets before execution,
     /// in one place.
     ///
@@ -475,13 +492,14 @@ impl Engine {
     /// One function, both callers. A pass added here reaches every route
     /// by construction rather than by remembering.
     pub(crate) fn preprocess(&self, stmt: &mut Statement) {
-        let now_micros = self.clock.map(|f| f());
-        rewrite_clock_calls(
-            stmt,
-            now_micros,
-            self.speaks_mysql,
-            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
-        );
+        if let Some(at) = self.clock_at() {
+            crate::clock::rewrite_clock_calls_at(
+                stmt,
+                at,
+                self.speaks_mysql,
+                self.session_tz_offset_at(at.xact),
+            );
+        }
         // r1042 — evaluate the constant parts of every predicate once,
         // here, instead of once per row. A cast on a literal is the
         // common case and it was costing an index seek: `WHERE id = 7`
