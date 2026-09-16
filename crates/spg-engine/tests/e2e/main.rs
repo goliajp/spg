@@ -1115,6 +1115,7 @@ mod e2e_explain_costs_off;
 mod e2e_explain_options;
 mod e2e_explain_suggest_composite;
 mod e2e_expression_index;
+mod e2e_expression_index_impersonating_a_column;
 mod e2e_extract_fields;
 mod e2e_fetch_with_ties;
 mod e2e_filter_clause;
