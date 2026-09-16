@@ -339,6 +339,16 @@ pub(crate) fn on_conflict_arbiters(
     // declared constraint) has always run on — zero-customer-change
     // outranks the alignment here, and the laxness only ACCEPTS more: a
     // PG-valid program never issues the shape PG rejects.
+    //
+    // 8.0.2 — that last clause is LOAD-BEARING and it was false for one
+    // release. With a unique index on `LOWER(a)` and nothing on `a`, the
+    // existence probe below reached the expression index and reported a
+    // conflict, so `ON CONFLICT (a) DO NOTHING` answered `INSERT 0 0`
+    // and the row was gone: not "accepts more", but accepts and then
+    // discards. The probe asks about the expression now, and
+    // `e2e_expression_index_impersonating_a_column` fails if it stops.
+    // A justification for a divergence is a claim about behaviour; this
+    // one now has a pin under it.
     let _ = from_constraint_name;
     let nnd = matched_uc.is_some_and(|uc| uc.nulls_not_distinct);
     // An EXPLICIT target names its own predicate in the clause
