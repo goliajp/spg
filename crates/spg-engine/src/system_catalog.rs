@@ -3152,6 +3152,30 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("subpublications", DataType::Text, false),
         ColumnSchema::new("subbinary", DataType::Bool, false),
         ColumnSchema::new("substream", DataType::Bool, false),
+        // 8.0.2 — the eight PostgreSQL 18.6 also has, because pg_dump
+        // asks for seven of them BY NAME.
+        //
+        // It asks only when it believes the connected role is a
+        // superuser, and it learns that from the `is_superuser`
+        // ParameterStatus — one of the ten this release added to the
+        // startup packet for the timezone crash. So a dump that had
+        // never issued this query began issuing it, and
+        // `column s.subsynccommit does not exist` took `pg_dump` to
+        // exit 1 against a server it had dumped a release earlier.
+        //
+        // Nothing here is a subscription feature: this catalog is a
+        // stub with a row per `CREATE SUBSCRIPTION` and the defaults
+        // below are PostgreSQL's own for a freshly created one. What
+        // was missing was the SHAPE, and a tool reading a catalog reads
+        // the shape whether or not there are rows in it.
+        ColumnSchema::new("subskiplsn", DataType::Text, false),
+        ColumnSchema::new("subtwophasestate", DataType::Text, false),
+        ColumnSchema::new("subdisableonerr", DataType::Bool, false),
+        ColumnSchema::new("subpasswordrequired", DataType::Bool, false),
+        ColumnSchema::new("subrunasowner", DataType::Bool, false),
+        ColumnSchema::new("subfailover", DataType::Bool, false),
+        ColumnSchema::new("subsynccommit", DataType::Text, false),
+        ColumnSchema::new("suborigin", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Subscription OID band starts at 80_000 (publications live
@@ -3172,6 +3196,15 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
             Value::text(pubs),
             Value::Bool(false), // subbinary
             Value::Bool(false), // substream
+            // PostgreSQL's defaults for a subscription just created.
+            Value::text("0/0"), // subskiplsn
+            Value::text("d"),   // subtwophasestate — disabled
+            Value::Bool(false), // subdisableonerr
+            Value::Bool(true),  // subpasswordrequired
+            Value::Bool(false), // subrunasowner
+            Value::Bool(false), // subfailover
+            Value::text("off"), // subsynccommit
+            Value::text("any"), // suborigin
         ]));
     }
     (schema, rows)

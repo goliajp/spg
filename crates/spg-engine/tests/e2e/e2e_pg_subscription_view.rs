@@ -34,6 +34,24 @@ fn pg_subscription_has_pg_canonical_columns() {
         "subpublications",
         "subbinary",
         "substream",
+        // 8.0.2 — the seven pg_dump asks for BY NAME, plus subskiplsn.
+        //
+        // It asks only when it believes the role is a superuser, which
+        // it reads from the `is_superuser` ParameterStatus — one of the
+        // ten this release added to the startup packet. So a dump that
+        // had never issued the subscription query began issuing it, and
+        // `column s.subsynccommit does not exist` took `pg_dump` to exit
+        // 1 against a server it had dumped a release earlier. The list
+        // above was "PG-canonical columns (subset)" and a subset is what
+        // a tool reading a catalog does not get to have.
+        "subskiplsn",
+        "subtwophasestate",
+        "subdisableonerr",
+        "subpasswordrequired",
+        "subrunasowner",
+        "subfailover",
+        "subsynccommit",
+        "suborigin",
     ] {
         assert!(
             names.contains(&must),
