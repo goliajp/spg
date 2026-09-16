@@ -120,11 +120,32 @@ impl Engine {
         // statements were already substitute-walked for NEW/OLD/
         // locals (those evaluate to engine literals before they
         // land here) so dispatch is plain execute_stmt_with_cancel.
+        // 8.0.3 — a DO is ONE statement, and a statement that fails leaves
+        // nothing behind.
+        //
+        // Each embedded write used to land as it ran, so a body whose second
+        // INSERT failed kept its first one — visible to every later
+        // statement, and absent from the WAL, because redo is drained for
+        // the whole DO and a failed statement's redo is discarded. Measured,
+        // one row (1) present, `DO $$ BEGIN INSERT (2); INSERT (1); END $$`:
+        //
+        //   SPG, before a restart   1,2
+        //   SPG, after kill -9      1
+        //   PG 18.6                 1
+        //
+        // The catalog is a persistent structure, so the snapshot is O(1) —
+        // the same model `ROLLBACK TO SAVEPOINT` already uses — and putting
+        // it back also puts back the tables' redo buffers, so memory and WAL
+        // agree on what the failed statement did: nothing.
+        let before = self.active_catalog().clone();
         for stmt in collected {
             // v7.16.2 — preserve current_tx wrap so an outer
             // BEGIN/COMMIT around a DO block keeps the
             // EmbeddedSql writes inside that same tx slot.
-            self.execute_stmt_with_cancel(stmt, CancelToken::none())?;
+            if let Err(e) = self.execute_stmt_with_cancel(stmt, CancelToken::none()) {
+                *self.active_catalog_mut() = before;
+                return Err(e);
+            }
         }
         Ok(QueryResult::CommandOk {
             affected: 0,

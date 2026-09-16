@@ -10,6 +10,30 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a failed DO block kept the writes that came before its failure
+
+Found while measuring sentori's report that an `EXCEPTION` handler does
+not catch a unique violation. A DO is one statement, but its body's
+writes landed one at a time, so a body whose second write failed kept
+its first — visible to every later statement, and absent from the WAL,
+which records a statement only when it succeeds:
+
+```text
+  one row (1) present;  DO $$ BEGIN INSERT (2); INSERT (1); END $$
+    SPG, before a restart   1,2
+    SPG, after kill -9      1
+    PG 18.6                 1
+```
+
+Memory and the log disagreed about what a failed statement did, and a
+restart was the thing that settled it. The active catalog is snapshotted
+before the body's writes run and put back if any of them fails — an O(1)
+clone of a persistent structure, the model `ROLLBACK TO SAVEPOINT`
+already uses — and the tables' redo buffers go back with it. Measured
+afterwards: the failed DO leaves `1`, a successful one keeps every write,
+a failure inside an explicit transaction still aborts it, and the rows
+are the same after a kill -9.
+
 ### Fixed — two arbiter shapes answered "no such key" and let the row be refused
 
 **An explicit target covered only by a partial unique index.** sentori's
