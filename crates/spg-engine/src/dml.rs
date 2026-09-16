@@ -5163,6 +5163,10 @@ impl Engine {
         //   - `DO UPDATE SET …` ALSO filters, but for each
         //     conflicting row it queues an UPDATE on the existing
         //     row using the incoming row's values as `EXCLUDED.*`.
+        // 8.0.3 — before arbitrating, wait out any other transaction that
+        // holds one of these keys uncommitted. PG gives a key to its first
+        // writer; see `unique_wait`.
+        self.wait_for_uncommitted_unique_keys(&stmt.table, &all_values)?;
         let (pending_updates, skipped_count) = match &stmt.on_conflict {
             Some(clause) => {
                 let (kept, pending, skipped) = self.resolve_insert_on_conflict(

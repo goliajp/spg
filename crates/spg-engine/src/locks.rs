@@ -214,6 +214,38 @@ impl LockTable {
         }
     }
 
+    /// 8.0.3 — park `waiter` behind whole transactions rather than a
+    /// row: the ones holding an uncommitted key it wants to write.
+    ///
+    /// PG makes a writer that meets another transaction's in-progress
+    /// unique key wait for that transaction to end, and the wait is a
+    /// wait-for edge like any other — two transactions each inserting
+    /// the key the other already holds is a deadlock, and PG names a
+    /// victim. The same graph, so the same detector sees both kinds of
+    /// cycle, including one that mixes a row lock with a key.
+    pub fn wait_on_versions(&mut self, waiter: u64, blockers: &[u64]) -> LockOutcome {
+        let edges = self.wait_for.entry(waiter).or_default();
+        for &b in blockers {
+            if b != waiter {
+                edges.insert(b);
+            }
+        }
+        if let Some(cycle) = self.find_cycle(waiter) {
+            let victim = cycle.into_iter().max().unwrap_or(waiter);
+            return LockOutcome::Deadlock { victim };
+        }
+        LockOutcome::WouldBlock {
+            on: blockers.to_vec(),
+        }
+    }
+
+    /// 8.0.3 — `waiter` is no longer blocked: drop its wait-for edges.
+    /// A stale edge would let a later, unrelated wait close a cycle that
+    /// no longer exists and abort a transaction that was never at fault.
+    pub fn clear_wait(&mut self, waiter: u64) {
+        self.wait_for.remove(&waiter);
+    }
+
     /// Number of rows with at least one holder or waiter. For
     /// `pg_locks` enumeration (Phase C.4) and tests.
     #[must_use]
