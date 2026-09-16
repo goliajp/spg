@@ -1929,6 +1929,17 @@ impl Engine {
                 self.enforce_view_check(check, &new_rows, &cols, &stmt.table)?;
             }
         }
+        // 8.0.3 — an UPDATE that moves a row onto a key another
+        // transaction holds uncommitted waits for it, as an INSERT does.
+        // Measured with two sessions, A inserting (2, 20) and holding,
+        // B running `UPDATE uw SET k = 20 WHERE id = 1`:
+        //   PG 18.6   B waits 1.1 s, then 23505; both rows survive
+        //   SPG       B updates at once, A's COMMIT fails with 40001
+        {
+            let new_rows: Vec<Vec<Value<'static>>> =
+                planned.iter().map(|(_, v)| v.clone()).collect();
+            self.wait_for_uncommitted_unique_keys(&stmt.table, &new_rows)?;
+        }
         // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
         // enforcement on UPDATE. The pre-image of each updated row is
         // excluded from the existing-key set (see enforce_unique_updates),

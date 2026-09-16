@@ -187,3 +187,27 @@ fn nothing_waits_when_no_other_transaction_holds_the_key() {
         "a transaction never waits on itself, got {r:?}"
     );
 }
+
+/// An UPDATE that moves a row onto a key another transaction holds
+/// uncommitted waits too. PG 18.6, two sessions: B waits, then 23505, and
+/// both rows survive; SPG used to update at once and fail A's COMMIT.
+#[test]
+fn an_update_onto_a_held_key_waits_then_fails() {
+    let mut e = engine("CREATE TABLE uw (id int, k int UNIQUE)");
+    e.execute("INSERT INTO uw VALUES (1, 10)").unwrap();
+    let a = holder(&mut e, "INSERT INTO uw VALUES (2, 20)");
+    waits(
+        e.execute_in("UPDATE uw SET k = 20 WHERE id = 1", IMPLICIT_TX),
+        "UPDATE onto a held key",
+    );
+    e.execute_in("COMMIT", a)
+        .expect("the first writer keeps its key");
+    assert!(
+        e.execute_in("UPDATE uw SET k = 20 WHERE id = 1", IMPLICIT_TX)
+            .is_err()
+    );
+    assert_eq!(
+        cell(&mut e, "SELECT id, k FROM uw ORDER BY id"),
+        "1:10,2:20"
+    );
+}
