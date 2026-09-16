@@ -74,6 +74,48 @@ answers in 0.01–0.14 s, and the release one in 0.14 s. Nothing about
 the binary was slow; it was being asked to read a pile that grew by one
 run every time.
 
+### Fixed — restarting a tier left the previous one running beside it
+
+`suite.sh --on-mini` ends the two shell scripts before it starts a new
+run. It did not end `suite-run`, which is the binary that does the
+work, nor the servers that binary had started. Four tier runs on
+2026-09-16, started within fifteen minutes of each other while the
+previous one was still going:
+
+```text
+  3d944c1   p:e2e p:gates f:biz
+  c94c7aa   f:e2e f:gates f:biz
+  2aee123   f:e2e f:gates f:biz
+  e1488a8   f:e2e f:gates f:biz
+```
+
+against `p:e2e p:gates p:biz` on the run before them, on a tree whose
+only changes since were a CHANGELOG date and a bash script. The
+failures read `Connection reset by peer`, `expected to read 5 bytes,
+got 0 bytes at EOF` and `pool timed out while waiting for an open
+connection` — a box carrying another tier, not a defect in the tree.
+Clearing the leftovers by hand and running once more passed all three
+steps on the same commit.
+
+Four `spg-server` processes were still up after the kills, all of them
+sweep legs under `/tmp/spg-tests/`, one nineteen minutes old. They are
+spawned with a RELATIVE `argv[0]`, so a pattern written against the
+checkout path does not match them; the data directory is what
+identifies them, and `/tmp/spg-tests/` is this suite's own scratch root.
+
+Then a check, because a cleanup that silently leaves something behind
+is the failure it was written to stop — and the box is refused rather
+than measured, since the run that follows cannot tell a slow step from
+somebody else's load.
+
+The check's pattern is ANCHORED at the start of the command, and that
+is not cosmetic. `[s]uite-run` stops grep finding itself; it does not
+stop `ps` showing the SHELL `ssh` runs the check in, whose own argv
+carries the pattern text. Unanchored, it counted 2 against one planted
+process and would have counted 1 on a clean box — a guard that can
+never read zero refuses every run. Anchored it reads 1 with the planted
+process and 0 once it is gone, both measured.
+
 ### Fixed — the extended protocol had no error state
 
 sentori's §3.15, reported as the shape their client saw: psql refusing
