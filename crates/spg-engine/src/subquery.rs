@@ -514,7 +514,10 @@ impl Engine {
                         // 8.0.2 — typed, for the reason `GroupMap`
                         // carries the type at all: this is the
                         // correlated twin of the path v7.39.12 fixed.
-                        *e = crate::substitute::value_to_literal_expr_typed(v, *out_ty)?;
+                        *e = crate::substitute::value_to_literal_expr_typed(
+                            v,
+                            crate::substitute::correlated_declared_type(*out_ty),
+                        )?;
                         return Ok(());
                     }
                 }
@@ -594,7 +597,10 @@ impl Engine {
                 // shape, taken from the result that just came back
                 // rather than inferred a second time.
                 let declared = columns.first().map(|c| c.ty);
-                *e = crate::substitute::value_to_literal_expr_typed(value, declared)?;
+                *e = crate::substitute::value_to_literal_expr_typed(
+                    value,
+                    crate::substitute::correlated_declared_type(declared),
+                )?;
             }
             Expr::Exists { subquery, negated } => {
                 // v7.34 (mailrs conn-pool P0) — semi/anti-join batch path
@@ -4653,7 +4659,10 @@ fn splice_planned_subqueries(
                 .cloned()
                 .unwrap_or_else(|| empty_default.clone());
             // 8.0.2 — typed, like its twin above.
-            *e = crate::substitute::value_to_literal_expr_typed(v, *out_ty)?;
+            *e = crate::substitute::value_to_literal_expr_typed(
+                v,
+                crate::substitute::correlated_declared_type(*out_ty),
+            )?;
             Ok(true)
         }
         Expr::Exists { .. }
