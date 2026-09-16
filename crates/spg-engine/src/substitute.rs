@@ -57,6 +57,50 @@ pub(crate) fn value_to_literal_expr(v: Value) -> Result<Expr, EngineError> {
 /// column's declared type, not in the value — so the value alone cannot
 /// preserve it. The declared type is what this parameter is for, and it
 /// is used only where the value is genuinely ambiguous.
+/// 8.0.2 — the declared type a CORRELATED scalar subquery hands to
+/// [`value_to_literal_expr_typed`], which is every type except `text`.
+///
+/// §3.9 asked for the zone: `Value::Timestamp` is what both `timestamp`
+/// and `timestamptz` hold, so without the declaration a correlated
+/// subquery rendered `2026-01-01 00:00:00` and the re-parse read it as
+/// a wall clock. `Value::Json` and the integer arrays are ambiguous the
+/// same way. Those arms change what is RENDERED, and the correlated
+/// path needs every one of them.
+///
+/// The `text` arm does not. A text value in a text column renders the
+/// same either way; all `::text` adds is a static type CLAIM that
+/// `check_branch_types` then reads. Passing it here widened a defect
+/// that has nothing to do with subqueries:
+///
+/// ```text
+///   CASE WHEN typrelid = 0 THEN ' '::"char"
+///        ELSE (SELECT relkind FROM pg_class WHERE oid = typrelid) END
+/// ```
+///
+/// which is pg_dump's, and which SPG answers
+/// `CASE types text and "char" cannot be matched` — PostgreSQL's own
+/// wording, correctly raised, about a type only SPG believes. PG's
+/// `pg_class.relkind` is `"char"`; SPG's catalog declares it `text`,
+/// along with 33 more columns PostgreSQL declares `"char"`. 8.0.1 had
+/// that defect on the uncorrelated path and `pgdump-roundtrip` was
+/// green because pg_dump's query is correlated.
+///
+/// Fixing the catalog is the real answer and it is three gaps deep, all
+/// of them measured: `pg_type_oid` has no `Char1` arm, the type's name
+/// is spelled two ways in this crate, and the parser drops the quotes
+/// that separate PostgreSQL's `"char"` from `char` (which is
+/// `bpchar(1)`). That is a minor's worth of work, not a patch's, and it
+/// is filed with those measurements. What belongs in a patch is not
+/// carrying a claim onto a second path while the claim is still wrong.
+///
+/// So `text` here keeps 8.0.1's behaviour exactly, and every arm §3.9
+/// measured keeps the fix.
+pub(crate) fn correlated_declared_type(
+    declared: Option<spg_storage::DataType>,
+) -> Option<spg_storage::DataType> {
+    declared.filter(|d| !matches!(d, spg_storage::DataType::Text))
+}
+
 pub(crate) fn value_to_literal_expr_typed(
     v: Value,
     declared: Option<spg_storage::DataType>,

@@ -396,6 +396,72 @@ measured on PG 18.6 with that file's own seed. One of 7,077 e2e cases;
 the other 7,076 were unmoved, which is the answer the control was
 actually asked for.
 
+### Fixed — pg_dump stopped working, from the fix two sections below
+
+`pgdump-roundtrip` went red on this release and the cause is the §3.9
+fix. Teaching the CORRELATED scalar-subquery path to carry its column's
+declared type also made it CLAIM that type, and pg_dump asks every
+server it dumps:
+
+```text
+  CASE WHEN typrelid = 0 THEN ' '::"char"
+       ELSE (SELECT relkind FROM pg_class WHERE oid = typrelid) END
+  FROM pg_type
+```
+
+```text
+  PG 18.6     answers
+  SPG 8.0.1   answers
+  SPG 8.0.2   ERROR: CASE types text and "char" cannot be matched
+              -> pg_dump: error: query failed, exit 1
+```
+
+PostgreSQL raises that same sentence for a genuine `text`/`"char"` mix,
+so the check is right and the claim was wrong: PostgreSQL's
+`pg_class.relkind` is `"char"` and ours is declared `text`.
+
+**It sat unseen for five tier runs.** `pgdump-roundtrip` runs after
+`deep-tier`, and every run since 8.0.1 stopped before reaching it — the
+shape this repository already has a name for, a gate that exits early
+hiding the stages behind it. The last run that actually executed this
+step was v8.0.1's own.
+
+The `text` arm is the only one of these that tells the VALUE nothing.
+`Value::Timestamp` is what both `timestamp` and `timestamptz` hold,
+`Value::Json` holds both spellings, a small-int array rebuilds as
+`integer[]` — those change what is RENDERED and the correlated path
+needs every one of them, which is what §3.9 measured. A text value in a
+text column renders the same either way; all `::text` adds is a static
+claim. So `text` keeps 8.0.1's behaviour on that path and every arm
+§3.9 measured keeps the fix, verified together: pg_dump's CASE answers,
+and the correlated `timestamptz` still reads `2026-01-01 00:00:00+00`
+beside PostgreSQL's.
+
+**What is NOT fixed, and is filed with its measurements.** The catalog
+declares 34 columns `text` that PostgreSQL declares `"char"` —
+`relkind`, `relpersistence`, `typtype`, `prokind`, `contype` and the
+rest. 8.0.1 has that defect too, on the UNCORRELATED path, where the
+same CASE with an uncorrelated subquery raises on both builds. Closing
+it is three gaps deep, each one measured while trying:
+
+```text
+  pg_type_oid has no Char1 arm            -> pg_typeof(relkind) reads
+                                             `unknown`, PG reads `"char"`
+  the type's name is spelled two ways     -> "\"char\"" and "char" in
+                                             one crate
+  the parser drops the quotes             -> `"char"` and `char` become
+                                             one name, and `char` is
+                                             `bpchar(1)`
+```
+
+and then 34 columns across several row builders per catalog. That is a
+minor's work, not a patch's, and this patch exists to end an outage.
+
+Four pins, on PostgreSQL's own answers for the same shape, and the
+guard shown to be load-bearing: put the claim back and the two that
+watch the CASE fail with the exact sentence above, while the one that
+watches §3.9's zone keeps passing.
+
 ### Fixed — an expression index answered questions about its column
 
 Found by sweeping the shapes around §3.22 rather than the shape they
