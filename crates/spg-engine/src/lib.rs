@@ -103,6 +103,7 @@ mod sequence;
 mod session;
 mod show;
 mod spg_admin;
+pub mod sqlstate;
 pub mod statistics;
 pub mod subquery;
 pub mod subscriptions;
@@ -487,6 +488,15 @@ pub enum EngineError {
     /// in dev/test (`panic = "unwind"`) — and in production once a
     /// later slice flips the release profile to unwind.
     Internal(String),
+    /// 8.0.3 — an error a PL/pgSQL block raised and no handler caught,
+    /// with the SQLSTATE PG gives it: `P0001` for `RAISE EXCEPTION`, or the
+    /// code of whatever the block's statement failed with. It used to reach
+    /// clients as `42000` and `DO: trigger function "DO": RAISE EXCEPTION
+    /// "boom"`, where PG sends `P0001` and `boom`.
+    Raised {
+        sqlstate: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for EngineError {
@@ -542,6 +552,7 @@ impl fmt::Display for EngineError {
             Self::UnknownThreadId(id) => write!(f, "Unknown thread id: {id}"),
             Self::ConnectionKilled => f.write_str("Connection was killed"),
             Self::Internal(s) => write!(f, "internal error: {s}"),
+            Self::Raised { message, .. } => f.write_str(message),
         }
     }
 }

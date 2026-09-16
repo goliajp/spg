@@ -110,6 +110,15 @@ pub enum TriggerError {
     /// message via PG-style `%` substitution and surfaces the
     /// resolved text up to the caller.
     RaiseException { function: String, message: String },
+    /// 8.0.3 — an embedded SQL statement failed while the block ran. Carries
+    /// the SQLSTATE the wire would send, so an `EXCEPTION WHEN
+    /// unique_violation` handler can match it, and the client-facing
+    /// message `SQLERRM` reads.
+    Sql {
+        function: String,
+        sqlstate: &'static str,
+        message: String,
+    },
 }
 
 impl fmt::Display for TriggerError {
@@ -157,6 +166,7 @@ impl fmt::Display for TriggerError {
                     "trigger function {function:?}: expression eval failed: {cause}"
                 )
             }
+            Self::Sql { message, .. } => f.write_str(message),
             Self::RaiseException { function, message } => {
                 write!(
                     f,
@@ -286,6 +296,7 @@ pub fn fire_row_trigger(
         for_query_resolver: None,
         // A trigger function is not set-returning.
         set_sink: None,
+        write_resolver: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -359,6 +370,24 @@ struct BodyCtx<'a> {
     /// their rows. `None` outside a SETOF function, which makes either statement
     /// an error there — as in PG.
     set_sink: Option<&'a core::cell::RefCell<Vec<Vec<Value<'static>>>>>,
+    /// 8.0.3 — runs an embedded write against the engine as the walker
+    /// reaches it. Present only for a DO block; a trigger fires inside a
+    /// row-write borrow of the catalog and still defers.
+    write_resolver: Option<&'a WriteResolver<'a>>,
+}
+
+/// 8.0.3 — callback a DO block registers so its writes run in place.
+/// Running them after the walk put every write outside the block's
+/// `EXCEPTION` clause, which could therefore catch nothing a write raised.
+pub type WriteResolver<'a> = dyn Fn(&spg_sql::ast::Statement) -> Result<(), TriggerError> + 'a;
+
+/// 8.0.3 — what a protected block asks of its savepoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockSavepoint {
+    /// Entering a block that has handlers.
+    Take,
+    /// A handler matched: undo what the block wrote before the error.
+    RollBack,
 }
 
 /// v7.16.2 — callback shape the DO-block executor registers
@@ -1023,10 +1052,16 @@ fn execute_stmts(
                         detail: alloc::format!("EXECUTE {sql_text:?}: parse failed: {}", e.message),
                     }
                 })?;
-                deferred.push(DeferredEmbeddedStmt {
-                    function: ctx.function.into(),
-                    stmt: parsed,
-                });
+                if let Some(write) = ctx.write_resolver {
+                    // 8.0.3 — dynamic SQL runs in place too, inside the
+                    // block's EXCEPTION clause, like every embedded statement.
+                    write(&parsed)?;
+                } else {
+                    deferred.push(DeferredEmbeddedStmt {
+                        function: ctx.function.into(),
+                        stmt: parsed,
+                    });
+                }
             }
             PlPgSqlStmt::Continue { when } => {
                 // v7.37.20 (20.2) — CONTINUE [WHEN <cond>]. Same shape
@@ -1147,8 +1182,14 @@ fn execute_stmts(
                     } else {
                         alloc::string::String::from("assertion failed")
                     };
-                    return Err(TriggerError::RaiseException {
+                    // 8.0.3 — P0004 ASSERT_FAILURE, not P0001: PG gives a
+                    // failed ASSERT its own code, and deliberately keeps
+                    // `EXCEPTION WHEN OTHERS` from catching it — an assert
+                    // is a statement about the program, not a runtime
+                    // condition to recover from.
+                    return Err(TriggerError::Sql {
                         function: ctx.function.into(),
+                        sqlstate: "P0004",
                         message: msg_text,
                     });
                 }
@@ -1173,14 +1214,365 @@ fn execute_stmts(
                     function: ctx.function.into(),
                     cause,
                 })?;
-                deferred.push(DeferredEmbeddedStmt {
-                    function: ctx.function.into(),
-                    stmt: substituted,
-                });
+                if let Some(write) = ctx.write_resolver {
+                    write(&substituted)?;
+                } else {
+                    deferred.push(DeferredEmbeddedStmt {
+                        function: ctx.function.into(),
+                        stmt: substituted,
+                    });
+                }
             }
         }
     }
     Ok(BodyOutcome::FellThrough)
+}
+
+/// 8.0.3 — the SQLSTATE and the `SQLERRM` text of an error a PL/pgSQL
+/// block raised, from the same classification the wire uses.
+pub(crate) fn error_state(err: &TriggerError) -> (&'static str, String) {
+    match err {
+        TriggerError::RaiseException { message, .. } => ("P0001", message.clone()),
+        TriggerError::Sql {
+            sqlstate, message, ..
+        } => (sqlstate, message.clone()),
+        TriggerError::EvalFailed { cause, .. } => {
+            crate::sqlstate::error_to_wire(&crate::EngineError::Eval(cause.clone()))
+        }
+        other => crate::sqlstate::error_to_wire(&crate::EngineError::Unsupported(alloc::format!(
+            "{other}"
+        ))),
+    }
+}
+
+/// 8.0.3 — PG refuses a block naming a condition it does not know, before
+/// any of the block runs: `unrecognized exception condition "foo"`, 42704.
+/// SPG used to accept any word and match it against the RAISE message by
+/// substring, so a misspelt handler silently never fired.
+pub(crate) fn check_exception_conditions(
+    function: &str,
+    block: &spg_sql::ast::PlPgSqlBlock,
+) -> Result<(), TriggerError> {
+    for h in &block.exception_handlers {
+        for c in &h.conditions {
+            let known = c.eq_ignore_ascii_case("others")
+                || c.starts_with("sqlstate:")
+                || condition_code(c).is_some();
+            if !known {
+                return Err(TriggerError::Sql {
+                    function: function.into(),
+                    sqlstate: "42704",
+                    message: alloc::format!("unrecognized exception condition \"{c}\""),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 8.0.3 — the code an embedded write reports when it has to WAIT for
+/// another transaction. Not a PostgreSQL error at all but the engine's
+/// signal to the host to retry the statement, so no handler — `OTHERS`
+/// included — may swallow it; swallowing it would turn a wait into a
+/// write that silently did not happen.
+pub(crate) const INTERNAL_WAIT_SQLSTATE: &str = "SPGWT";
+
+/// 8.0.3 — does an `EXCEPTION WHEN <condition>` arm catch `sqlstate`?
+///
+/// The names are PostgreSQL's documented condition names (its manual's
+/// error-code appendix), each standing for a code; a name whose code ends
+/// in `000` names the whole class, so `integrity_constraint_violation`
+/// catches a `23505`. `SQLSTATE 'xxxxx'` names one code directly. `OTHERS`
+/// catches everything except a cancel and a failed `ASSERT`, which PG
+/// deliberately lets escape.
+///
+/// This used to match a condition against the RAISE message by substring,
+/// and only for a RAISE — so no error a statement or an expression raised
+/// could be caught at all, `OTHERS` included.
+pub(crate) fn condition_matches(condition: &str, sqlstate: &str) -> bool {
+    if let Some(code) = condition.strip_prefix("sqlstate:") {
+        return code.eq_ignore_ascii_case(sqlstate);
+    }
+    if sqlstate == INTERNAL_WAIT_SQLSTATE {
+        return false;
+    }
+    if condition.eq_ignore_ascii_case("others") {
+        return sqlstate != "57014" && sqlstate != "P0004";
+    }
+    let Some(code) = condition_code(condition) else {
+        return false;
+    };
+    if let Some(class) = code.strip_suffix("000") {
+        return sqlstate.starts_with(class);
+    }
+    code == sqlstate
+}
+
+fn condition_code(name: &str) -> Option<&'static str> {
+    // Every condition name PostgreSQL 18.6 accepts, with the code it
+    // stands for — 247 of them. Not transcribed: each pair was
+    // MEASURED, by `RAISE <name>` inside a block whose handler reports
+    // `SQLSTATE`. A partial list would refuse a name PG accepts, which is
+    // why the unrecognized-name check below needs the whole of it.
+    const NAMES: &[(&str, &str)] = &[
+        ("active_sql_transaction", "25001"),
+        ("admin_shutdown", "57P01"),
+        ("ambiguous_alias", "42P09"),
+        ("ambiguous_column", "42702"),
+        ("ambiguous_function", "42725"),
+        ("ambiguous_parameter", "42P08"),
+        ("array_subscript_error", "2202E"),
+        ("assert_failure", "P0004"),
+        ("bad_copy_file_format", "22P04"),
+        ("branch_transaction_already_active", "25002"),
+        ("cannot_coerce", "42846"),
+        ("cannot_connect_now", "57P03"),
+        ("cant_change_runtime_param", "55P02"),
+        ("cardinality_violation", "21000"),
+        ("case_not_found", "20000"),
+        ("character_not_in_repertoire", "22021"),
+        ("check_violation", "23514"),
+        ("collation_mismatch", "42P21"),
+        ("config_file_error", "F0000"),
+        ("configuration_limit_exceeded", "53400"),
+        ("connection_does_not_exist", "08003"),
+        ("connection_exception", "08000"),
+        ("connection_failure", "08006"),
+        ("containing_sql_not_permitted", "38001"),
+        ("crash_shutdown", "57P02"),
+        ("data_corrupted", "XX001"),
+        ("data_exception", "22000"),
+        ("database_dropped", "57P04"),
+        ("datatype_mismatch", "42804"),
+        ("datetime_field_overflow", "22008"),
+        ("deadlock_detected", "40P01"),
+        ("dependent_objects_still_exist", "2BP01"),
+        ("dependent_privilege_descriptors_still_exist", "2B000"),
+        ("diagnostics_exception", "0Z000"),
+        ("disk_full", "53100"),
+        ("division_by_zero", "22012"),
+        ("duplicate_alias", "42712"),
+        ("duplicate_column", "42701"),
+        ("duplicate_cursor", "42P03"),
+        ("duplicate_database", "42P04"),
+        ("duplicate_file", "58P02"),
+        ("duplicate_function", "42723"),
+        ("duplicate_json_object_key_value", "22030"),
+        ("duplicate_object", "42710"),
+        ("duplicate_prepared_statement", "42P05"),
+        ("duplicate_schema", "42P06"),
+        ("duplicate_table", "42P07"),
+        ("error_in_assignment", "22005"),
+        ("escape_character_conflict", "2200B"),
+        ("event_trigger_protocol_violated", "39P03"),
+        ("exclusion_violation", "23P01"),
+        ("external_routine_exception", "38000"),
+        ("external_routine_invocation_exception", "39000"),
+        ("fdw_column_name_not_found", "HV005"),
+        ("fdw_dynamic_parameter_value_needed", "HV002"),
+        ("fdw_error", "HV000"),
+        ("fdw_function_sequence_error", "HV010"),
+        ("fdw_inconsistent_descriptor_information", "HV021"),
+        ("fdw_invalid_attribute_value", "HV024"),
+        ("fdw_invalid_column_name", "HV007"),
+        ("fdw_invalid_column_number", "HV008"),
+        ("fdw_invalid_data_type", "HV004"),
+        ("fdw_invalid_data_type_descriptors", "HV006"),
+        ("fdw_invalid_descriptor_field_identifier", "HV091"),
+        ("fdw_invalid_handle", "HV00B"),
+        ("fdw_invalid_option_index", "HV00C"),
+        ("fdw_invalid_option_name", "HV00D"),
+        ("fdw_invalid_string_format", "HV00A"),
+        ("fdw_invalid_string_length_or_buffer_length", "HV090"),
+        ("fdw_invalid_use_of_null_pointer", "HV009"),
+        ("fdw_no_schemas", "HV00P"),
+        ("fdw_option_name_not_found", "HV00J"),
+        ("fdw_out_of_memory", "HV001"),
+        ("fdw_reply_handle", "HV00K"),
+        ("fdw_schema_not_found", "HV00Q"),
+        ("fdw_table_not_found", "HV00R"),
+        ("fdw_too_many_handles", "HV014"),
+        ("fdw_unable_to_create_execution", "HV00L"),
+        ("fdw_unable_to_create_reply", "HV00M"),
+        ("fdw_unable_to_establish_connection", "HV00N"),
+        ("feature_not_supported", "0A000"),
+        ("file_name_too_long", "58P03"),
+        ("floating_point_exception", "22P01"),
+        ("foreign_key_violation", "23503"),
+        ("function_executed_no_return_statement", "2F005"),
+        ("generated_always", "428C9"),
+        ("grouping_error", "42803"),
+        ("held_cursor_requires_same_isolation_level", "25008"),
+        ("idle_in_transaction_session_timeout", "25P03"),
+        ("idle_session_timeout", "57P05"),
+        ("in_failed_sql_transaction", "25P02"),
+        ("inappropriate_access_mode_for_branch_transaction", "25003"),
+        (
+            "inappropriate_isolation_level_for_branch_transaction",
+            "25004",
+        ),
+        ("indeterminate_collation", "42P22"),
+        ("indeterminate_datatype", "42P18"),
+        ("index_corrupted", "XX002"),
+        ("indicator_overflow", "22022"),
+        ("insufficient_privilege", "42501"),
+        ("insufficient_resources", "53000"),
+        ("integrity_constraint_violation", "23000"),
+        ("internal_error", "XX000"),
+        ("interval_field_overflow", "22015"),
+        ("invalid_argument_for_logarithm", "2201E"),
+        ("invalid_argument_for_nth_value_function", "22016"),
+        ("invalid_argument_for_ntile_function", "22014"),
+        ("invalid_argument_for_power_function", "2201F"),
+        ("invalid_argument_for_sql_json_datetime_function", "22031"),
+        ("invalid_argument_for_width_bucket_function", "2201G"),
+        ("invalid_argument_for_xquery", "10608"),
+        ("invalid_authorization_specification", "28000"),
+        ("invalid_binary_representation", "22P03"),
+        ("invalid_catalog_name", "3D000"),
+        ("invalid_character_value_for_cast", "22018"),
+        ("invalid_column_definition", "42611"),
+        ("invalid_column_reference", "42P10"),
+        ("invalid_cursor_definition", "42P11"),
+        ("invalid_cursor_name", "34000"),
+        ("invalid_cursor_state", "24000"),
+        ("invalid_database_definition", "42P12"),
+        ("invalid_datetime_format", "22007"),
+        ("invalid_escape_character", "22019"),
+        ("invalid_escape_octet", "2200D"),
+        ("invalid_escape_sequence", "22025"),
+        ("invalid_foreign_key", "42830"),
+        ("invalid_function_definition", "42P13"),
+        ("invalid_grant_operation", "0LP01"),
+        ("invalid_grantor", "0L000"),
+        ("invalid_indicator_parameter_value", "22010"),
+        ("invalid_json_text", "22032"),
+        ("invalid_locator_specification", "0F001"),
+        ("invalid_name", "42602"),
+        ("invalid_object_definition", "42P17"),
+        ("invalid_parameter_value", "22023"),
+        ("invalid_password", "28P01"),
+        ("invalid_preceding_or_following_size", "22013"),
+        ("invalid_prepared_statement_definition", "42P14"),
+        ("invalid_recursion", "42P19"),
+        ("invalid_regular_expression", "2201B"),
+        ("invalid_role_specification", "0P000"),
+        ("invalid_row_count_in_limit_clause", "2201W"),
+        ("invalid_row_count_in_result_offset_clause", "2201X"),
+        ("invalid_savepoint_specification", "3B001"),
+        ("invalid_schema_definition", "42P15"),
+        ("invalid_schema_name", "3F000"),
+        ("invalid_sql_json_subscript", "22033"),
+        ("invalid_sql_statement_name", "26000"),
+        ("invalid_sqlstate_returned", "39001"),
+        ("invalid_table_definition", "42P16"),
+        ("invalid_tablesample_argument", "2202H"),
+        ("invalid_tablesample_repeat", "2202G"),
+        ("invalid_text_representation", "22P02"),
+        ("invalid_time_zone_displacement_value", "22009"),
+        ("invalid_transaction_initiation", "0B000"),
+        ("invalid_transaction_state", "25000"),
+        ("invalid_transaction_termination", "2D000"),
+        ("invalid_use_of_escape_character", "2200C"),
+        ("invalid_xml_comment", "2200S"),
+        ("invalid_xml_content", "2200N"),
+        ("invalid_xml_document", "2200M"),
+        ("invalid_xml_processing_instruction", "2200T"),
+        ("io_error", "58030"),
+        ("locator_exception", "0F000"),
+        ("lock_file_exists", "F0001"),
+        ("lock_not_available", "55P03"),
+        ("modifying_sql_data_not_permitted", "2F002"),
+        ("more_than_one_sql_json_item", "22034"),
+        ("most_specific_type_mismatch", "2200G"),
+        ("name_too_long", "42622"),
+        ("no_active_sql_transaction", "25P01"),
+        ("no_active_sql_transaction_for_branch_transaction", "25005"),
+        ("no_data_found", "P0002"),
+        ("no_sql_json_item", "22035"),
+        ("non_numeric_sql_json_item", "22036"),
+        ("non_unique_keys_in_a_json_object", "22037"),
+        ("nonstandard_use_of_escape_character", "22P06"),
+        ("not_an_xml_document", "2200L"),
+        ("not_null_violation", "23502"),
+        ("null_value_no_indicator_parameter", "22002"),
+        ("null_value_not_allowed", "22004"),
+        ("numeric_value_out_of_range", "22003"),
+        ("object_in_use", "55006"),
+        ("object_not_in_prerequisite_state", "55000"),
+        ("operator_intervention", "57000"),
+        ("out_of_memory", "53200"),
+        ("plpgsql_error", "P0000"),
+        ("program_limit_exceeded", "54000"),
+        ("prohibited_sql_statement_attempted", "2F003"),
+        ("protocol_violation", "08P01"),
+        ("query_canceled", "57014"),
+        ("raise_exception", "P0001"),
+        ("read_only_sql_transaction", "25006"),
+        ("reading_sql_data_not_permitted", "2F004"),
+        ("reserved_name", "42939"),
+        ("restrict_violation", "23001"),
+        ("savepoint_exception", "3B000"),
+        ("schema_and_data_statement_mixing_not_supported", "25007"),
+        ("sequence_generator_limit_exceeded", "2200H"),
+        ("serialization_failure", "40001"),
+        ("singleton_sql_json_item_required", "22038"),
+        ("sql_json_array_not_found", "22039"),
+        ("sql_json_item_cannot_be_cast_to_target_type", "2203G"),
+        ("sql_json_member_not_found", "2203A"),
+        ("sql_json_number_not_found", "2203B"),
+        ("sql_json_object_not_found", "2203C"),
+        ("sql_json_scalar_required", "2203F"),
+        ("sql_routine_exception", "2F000"),
+        ("sql_statement_not_yet_complete", "03000"),
+        ("sqlclient_unable_to_establish_sqlconnection", "08001"),
+        ("sqlserver_rejected_establishment_of_sqlconnection", "08004"),
+        ("srf_protocol_violated", "39P02"),
+        (
+            "stacked_diagnostics_accessed_without_active_handler",
+            "0Z002",
+        ),
+        ("statement_completion_unknown", "40003"),
+        ("statement_too_complex", "54001"),
+        ("string_data_length_mismatch", "22026"),
+        ("string_data_right_truncation", "22001"),
+        ("substring_error", "22011"),
+        ("syntax_error", "42601"),
+        ("syntax_error_or_access_rule_violation", "42000"),
+        ("system_error", "58000"),
+        ("too_many_arguments", "54023"),
+        ("too_many_columns", "54011"),
+        ("too_many_connections", "53300"),
+        ("too_many_json_array_elements", "2203D"),
+        ("too_many_json_object_members", "2203E"),
+        ("too_many_rows", "P0003"),
+        ("transaction_integrity_constraint_violation", "40002"),
+        ("transaction_resolution_unknown", "08007"),
+        ("transaction_rollback", "40000"),
+        ("transaction_timeout", "25P04"),
+        ("trigger_protocol_violated", "39P01"),
+        ("triggered_action_exception", "09000"),
+        ("triggered_data_change_violation", "27000"),
+        ("trim_error", "22027"),
+        ("undefined_column", "42703"),
+        ("undefined_file", "58P01"),
+        ("undefined_function", "42883"),
+        ("undefined_object", "42704"),
+        ("undefined_parameter", "42P02"),
+        ("undefined_table", "42P01"),
+        ("unique_violation", "23505"),
+        ("unsafe_new_enum_value_usage", "55P04"),
+        ("unterminated_c_string", "22024"),
+        ("untranslatable_character", "22P05"),
+        ("windowing_error", "42P20"),
+        ("with_check_option_violation", "44000"),
+        ("wrong_object_type", "42809"),
+        ("zero_length_character_string", "2200F"),
+    ];
+    NAMES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, c)| *c)
 }
 
 /// v7.16.2 — execute a DO block's PlPgSqlBlock at top level.
@@ -1210,8 +1602,54 @@ pub fn execute_do_block_top_level<'a>(
     for_query_resolver: Option<&'a ForQueryResolver<'a>>,
     notice_sink: Option<&'a NoticeSink>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
+    do_block(
+        block,
+        default_text_search_config,
+        select_into_resolver,
+        for_query_resolver,
+        notice_sink,
+        None,
+        None,
+    )
+}
+
+/// 8.0.3 — a DO block whose writes run in place, inside a savepoint when
+/// the block has an `EXCEPTION` clause. What the engine uses; the public
+/// function above keeps its signature and its deferring behaviour.
+pub(crate) fn execute_do_block_live<'a>(
+    block: &spg_sql::ast::PlPgSqlBlock,
+    default_text_search_config: Option<&'a str>,
+    select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+    notice_sink: Option<&'a NoticeSink>,
+    write_resolver: &'a WriteResolver<'a>,
+    savepoint: &'a dyn Fn(BlockSavepoint),
+) -> Result<(), TriggerError> {
+    do_block(
+        block,
+        default_text_search_config,
+        select_into_resolver,
+        for_query_resolver,
+        notice_sink,
+        Some(write_resolver),
+        Some(savepoint),
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_block<'a>(
+    block: &spg_sql::ast::PlPgSqlBlock,
+    default_text_search_config: Option<&'a str>,
+    select_into_resolver: Option<&'a SelectIntoResolver<'a>>,
+    for_query_resolver: Option<&'a ForQueryResolver<'a>>,
+    notice_sink: Option<&'a NoticeSink>,
+    write_resolver: Option<&'a WriteResolver<'a>>,
+    savepoint: Option<&'a dyn Fn(BlockSavepoint)>,
+) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
     // A DO block returns nothing, so RETURN NEXT / RETURN QUERY have nowhere to
     // go — PG rejects them there too.
+    check_exception_conditions("DO", block)?;
     let set_sink: Option<&core::cell::RefCell<Vec<Vec<Value<'static>>>>> = None;
     let mut locals: BTreeMap<String, Value<'static>> = BTreeMap::new();
     let empty_cols: &[ColumnSchema] = &[];
@@ -1238,21 +1676,16 @@ pub fn execute_do_block_top_level<'a>(
         notice_sink,
         for_query_resolver,
         set_sink,
+        write_resolver,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
-    // execute_stmts returns BodyOutcome — for DO top-level we
-    // ignore the return target (RETURN inside DO is a no-op
-    // by PG semantics: the block's outer scope has no return
-    // contract).
-    //
-    // v7.37.20 (20.10) — EXCEPTION handlers wrap the body walk.
-    // A TriggerError::RaiseException that matches an
-    // `EXCEPTION WHEN ...` arm redirects to that arm's body
-    // and swallows the error. `OTHERS` matches everything;
-    // named conditions must match the RAISE'd message prefix
-    // (SPG's simple substring model until a v7.40 error-code
-    // table lands).
+    let protected = !block.exception_handlers.is_empty();
+    if protected && let Some(sp) = savepoint {
+        sp(BlockSavepoint::Take);
+    }
+    // RETURN inside a DO is a no-op by PG semantics: the block's outer
+    // scope has no return contract.
     let body_result = execute_stmts(
         &block.statements,
         &mut current_new,
@@ -1262,48 +1695,35 @@ pub fn execute_do_block_top_level<'a>(
         &mut deferred,
     );
     if let Err(err) = body_result {
-        if !block.exception_handlers.is_empty() {
-            if let TriggerError::RaiseException { message, .. } = &err {
-                for handler in &block.exception_handlers {
-                    let matches = handler.conditions.iter().any(|c| {
-                        c.eq_ignore_ascii_case("others")
-                            || message
-                                .to_ascii_lowercase()
-                                .contains(&c.to_ascii_lowercase())
-                    });
-                    if matches {
-                        // v7.37.20 (20.16) — GET STACKED DIAGNOSTICS
-                        // groundwork: expose the caught exception's
-                        // message as the `sqlerrm` local variable so
-                        // the handler body (and any `GET STACKED
-                        // DIAGNOSTICS var := SQLERRM` follow-up)
-                        // can read it. `sqlstate` gets a placeholder
-                        // 'P0001' — SPG's unspecified user-defined
-                        // error code (matches PG's default for
-                        // RAISE EXCEPTION without ERRCODE) until a
-                        // v7.40 error-code table lands.
-                        locals.insert("sqlerrm".into(), Value::text(message.clone()));
-                        locals.insert(
-                            "sqlstate".into(),
-                            Value::text(alloc::string::String::from("P0001")),
-                        );
-                        // Run the handler body; ignore its outcome
-                        // (an exception handler that itself raises
-                        // propagates as the new error).
-                        let _ = execute_stmts(
-                            &handler.body,
-                            &mut current_new,
-                            None,
-                            &mut locals,
-                            &ctx,
-                            &mut deferred,
-                        )?;
-                        return Ok(deferred.into_iter().map(|d| d.stmt).collect());
-                    }
-                }
-            }
+        // 8.0.3 — any error the block raised, matched by SQLSTATE. PG
+        // rolls the block back to where it began before the handler runs,
+        // and keeps the variables as they stood at the error.
+        let (sqlstate, message) = error_state(&err);
+        let handler = block
+            .exception_handlers
+            .iter()
+            .find(|h| h.conditions.iter().any(|c| condition_matches(c, sqlstate)));
+        let Some(handler) = handler else {
+            return Err(err);
+        };
+        if let Some(sp) = savepoint {
+            sp(BlockSavepoint::RollBack);
         }
-        return Err(err);
+        deferred.clear();
+        locals.insert("sqlerrm".into(), Value::text(message));
+        locals.insert(
+            "sqlstate".into(),
+            Value::text(alloc::string::String::from(sqlstate)),
+        );
+        // A handler that itself raises propagates as the new error.
+        execute_stmts(
+            &handler.body,
+            &mut current_new,
+            None,
+            &mut locals,
+            &ctx,
+            &mut deferred,
+        )?;
     }
     Ok(deferred.into_iter().map(|d| d.stmt).collect())
 }
@@ -1335,6 +1755,7 @@ pub fn call_plpgsql_scalar<'a>(
     // caller passes `None` (immutable engine borrow; B3 residual).
     notice_sink: Option<&'a NoticeSink>,
 ) -> Result<Option<Value<'static>>, TriggerError> {
+    check_exception_conditions(function, block)?;
     let mut locals: BTreeMap<String, Value<'static>> = args;
     let empty_cols: &[ColumnSchema] = &[];
     // The DECLARE block runs AFTER the arguments are bound, so an initialiser
@@ -1362,6 +1783,7 @@ pub fn call_plpgsql_scalar<'a>(
         notice_sink,
         for_query_resolver,
         set_sink,
+        write_resolver: None,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
@@ -1376,21 +1798,18 @@ pub fn call_plpgsql_scalar<'a>(
     // An EXCEPTION handler catches a RAISE, exactly as in a DO block.
     if let Err(err) = outcome {
         let mut handled = None;
-        if !block.exception_handlers.is_empty()
-            && let TriggerError::RaiseException { message, .. } = &err
-        {
+        if !block.exception_handlers.is_empty() {
+            let (sqlstate, message) = error_state(&err);
             for handler in &block.exception_handlers {
-                let matches = handler.conditions.iter().any(|c| {
-                    c.eq_ignore_ascii_case("others")
-                        || message
-                            .to_ascii_lowercase()
-                            .contains(&c.to_ascii_lowercase())
-                });
+                let matches = handler
+                    .conditions
+                    .iter()
+                    .any(|c| condition_matches(c, sqlstate));
                 if matches {
                     locals.insert("sqlerrm".into(), Value::text(message.clone()));
                     locals.insert(
                         "sqlstate".into(),
-                        Value::text(alloc::string::String::from("P0001")),
+                        Value::text(alloc::string::String::from(sqlstate)),
                     );
                     handled = Some(execute_stmts(
                         &handler.body,
