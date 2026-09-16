@@ -48,6 +48,91 @@ pub(crate) fn exists_for_access_method(name: &str, am: Option<&str>) -> bool {
     list.contains(&name)
 }
 
+/// 8.0.3 — whether PG marks an operator class of this name as a default
+/// (`pg_opclass.opcdefault`), which `pg_get_indexdef` then leaves out.
+/// Measured on 18.6: the names that are default for some type and never
+/// not. `inet_ops` is both (default for gist, not for spgist) and is
+/// printed.
+pub(crate) fn is_default(name: &str) -> bool {
+    DEFAULTS.contains(&name)
+}
+
+const DEFAULTS: &[&str] = &[
+    "aclitem_ops",
+    "array_ops",
+    "bit_minmax_ops",
+    "bit_ops",
+    "bool_ops",
+    "box_inclusion_ops",
+    "box_ops",
+    "bpchar_minmax_ops",
+    "bpchar_ops",
+    "bytea_minmax_ops",
+    "bytea_ops",
+    "char_minmax_ops",
+    "char_ops",
+    "cid_ops",
+    "circle_ops",
+    "date_minmax_ops",
+    "date_ops",
+    "enum_ops",
+    "float4_minmax_ops",
+    "float4_ops",
+    "float8_minmax_ops",
+    "float8_ops",
+    "inet_inclusion_ops",
+    "int2_minmax_ops",
+    "int2_ops",
+    "int4_minmax_ops",
+    "int4_ops",
+    "int8_minmax_ops",
+    "int8_ops",
+    "interval_minmax_ops",
+    "interval_ops",
+    "jsonb_ops",
+    "macaddr8_minmax_ops",
+    "macaddr8_ops",
+    "macaddr_minmax_ops",
+    "macaddr_ops",
+    "money_ops",
+    "multirange_ops",
+    "name_minmax_ops",
+    "name_ops",
+    "numeric_minmax_ops",
+    "numeric_ops",
+    "oid_minmax_ops",
+    "oid_ops",
+    "oidvector_ops",
+    "pg_lsn_minmax_ops",
+    "pg_lsn_ops",
+    "point_ops",
+    "poly_ops",
+    "quad_point_ops",
+    "range_inclusion_ops",
+    "range_ops",
+    "record_ops",
+    "text_minmax_ops",
+    "text_ops",
+    "tid_minmax_ops",
+    "tid_ops",
+    "time_minmax_ops",
+    "time_ops",
+    "timestamp_minmax_ops",
+    "timestamp_ops",
+    "timestamptz_minmax_ops",
+    "timestamptz_ops",
+    "timetz_minmax_ops",
+    "timetz_ops",
+    "tsquery_ops",
+    "tsvector_ops",
+    "uuid_minmax_ops",
+    "uuid_ops",
+    "varbit_minmax_ops",
+    "varbit_ops",
+    "xid8_ops",
+    "xid_ops",
+];
+
 /// pg_opclass ∩ btree on PG18.4.
 const BTREE: &[&str] = &[
     "array_ops",

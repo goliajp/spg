@@ -4120,6 +4120,15 @@ impl Table {
             descending: bool,
             nulls_first: Option<bool>,
             collation: Option<String>,
+            // 8.0.3 — the four this list had not caught up with. Losing
+            // the two constraint flags turned a primary key's own index
+            // into a plain one and published SPG's internal probe indexes
+            // as user indexes, after any DROP COLUMN or VACUUM; `pg_dump`
+            // then wrote them all out as CREATE INDEX.
+            constraint_internal: bool,
+            constraint_backing: bool,
+            extra_orders: Vec<crate::KeyOrder>,
+            prefix_len: Option<u32>,
         }
         let descriptors: Vec<RebuildDesc> = self
             .indices
@@ -4135,19 +4144,44 @@ impl Table {
                     IndexKind::GinFulltext(_) => RebuildKind::GinFulltext,
                     IndexKind::GinJsonb(_) => RebuildKind::GinJsonb,
                 };
+                // Named field by field, with no `..`: a field added to
+                // `Index` does not compile here until the rebuild says
+                // what happens to it.
+                let Index {
+                    name,
+                    column_position,
+                    kind: _,
+                    included_columns,
+                    constraint_internal,
+                    constraint_backing,
+                    partial_predicate,
+                    expression,
+                    nulls_not_distinct,
+                    descending,
+                    nulls_first,
+                    collation,
+                    is_unique,
+                    extra_column_positions,
+                    extra_orders,
+                    prefix_len,
+                } = idx;
                 RebuildDesc {
-                    name: idx.name.clone(),
-                    column_position: idx.column_position,
+                    name: name.clone(),
+                    column_position: *column_position,
                     kind,
-                    is_unique: idx.is_unique,
-                    extra_column_positions: idx.extra_column_positions.clone(),
-                    partial_predicate: idx.partial_predicate.clone(),
-                    expression: idx.expression.clone(),
-                    included_columns: idx.included_columns.clone(),
-                    nulls_not_distinct: idx.nulls_not_distinct,
-                    descending: idx.descending,
-                    nulls_first: idx.nulls_first,
-                    collation: idx.collation.clone(),
+                    is_unique: *is_unique,
+                    extra_column_positions: extra_column_positions.clone(),
+                    partial_predicate: partial_predicate.clone(),
+                    expression: expression.clone(),
+                    included_columns: included_columns.clone(),
+                    nulls_not_distinct: *nulls_not_distinct,
+                    descending: *descending,
+                    nulls_first: *nulls_first,
+                    collation: collation.clone(),
+                    constraint_internal: *constraint_internal,
+                    constraint_backing: *constraint_backing,
+                    extra_orders: extra_orders.clone(),
+                    prefix_len: *prefix_len,
                 }
             })
             .collect();
@@ -4166,6 +4200,10 @@ impl Table {
                 descending,
                 nulls_first,
                 collation,
+                constraint_internal,
+                constraint_backing,
+                extra_orders,
+                prefix_len,
             } = desc;
             let pre_len = self.indices.len();
             match rebuild_kind {
@@ -4368,6 +4406,10 @@ impl Table {
                 idx.descending = descending;
                 idx.nulls_first = nulls_first;
                 idx.collation = collation;
+                idx.constraint_internal = constraint_internal;
+                idx.constraint_backing = constraint_backing;
+                idx.extra_orders = extra_orders;
+                idx.prefix_len = prefix_len;
             }
         }
 

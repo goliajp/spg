@@ -800,6 +800,15 @@ fn mysql_column_collation(col: &ColumnSchema) -> Value<'static> {
     }
 }
 
+/// 8.0.3 — an auto-increment column reported the SERIAL way: a
+/// `nextval` default and an owned sequence. See `synth_pg_attribute`.
+///
+/// A column whose default NAMES a sequence (`DEFAULT nextval('s')`) is not
+/// one: its default is that text, and the sequence is its own object.
+pub(crate) fn is_serial(col: &ColumnSchema) -> bool {
+    col.auto_increment && !col.identity_always && col.default_text.is_none()
+}
+
 fn info_column_row(
     rel: &str,
     ordinal: i32,
@@ -813,7 +822,7 @@ fn info_column_row(
     // spelling, else NULL.
     let default_text: Value<'static> = if let Some(txt) = &col.default_text {
         Value::text(txt.clone())
-    } else if col.auto_increment {
+    } else if is_serial(col) {
         Value::text(alloc::format!(
             "nextval('{rel}_{}_seq'::regclass)",
             col.name
@@ -1879,7 +1888,129 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
             push_edges(body, self_oid, &mut rows);
         }
     }
+    // 8.0.3 — a sequence OWNED BY a column depends on that column:
+    // automatically ('a') for a SERIAL column, internally ('i') for an
+    // identity one. Measured on PG 18.6. `pg_dump` reads exactly these
+    // edges to write `ALTER SEQUENCE … OWNED BY` or the identity clause;
+    // with none, a serial column's sequence restored unattached.
+    for (stored, def) in crate::sequence::catalog_sequences(cat) {
+        let Some((table, column)) = &def.owned_by else {
+            continue;
+        };
+        let (Some(name), Some(t)) = (cat.listed_name(&stored), cat.get(table)) else {
+            continue;
+        };
+        let Some(pos) = t.schema().columns.iter().position(|c| c.name == *column) else {
+            continue;
+        };
+        let (Some(seq_oid), Some(table_oid)) = (relation_oid(cat, name), relation_oid(cat, table))
+        else {
+            continue;
+        };
+        let attnum = i32::try_from(pos + 1).unwrap_or(i32::MAX);
+        let deptype = if t.schema().columns[pos].identity_always {
+            "i"
+        } else {
+            "a"
+        };
+        rows.push(dep_row(
+            (1259, seq_oid, 0),
+            (1259, table_oid, attnum),
+            deptype,
+        ));
+    }
+    // 8.0.3 — every default belongs to its column ('a'), and a partition to
+    // its parent ('a'), as PG 18.6 records both. The partition edge is what
+    // orders the parent's CREATE TABLE ahead of its partitions in a dump.
+    for (row_oid, table_oid, attnum, text) in attrdef_rows(cat) {
+        rows.push(dep_row((2604, row_oid, 0), (1259, table_oid, attnum), "a"));
+        // A default that names a sequence depends on it, whatever made
+        // the sequence — which is what orders `CREATE SEQUENCE` ahead of
+        // the table in a dump.
+        if let Some(seq_oid) = nextval_target(&text).and_then(|s| relation_oid(cat, &s)) {
+            rows.push(dep_row((2604, row_oid, 0), (1259, seq_oid, 0), "n"));
+        }
+    }
+    for tname in cat.visible_table_names() {
+        let Some(t) = cat.get(&tname) else { continue };
+        use spg_storage::PartitionRole as R;
+        let parent = match t.schema().partition_role.as_ref() {
+            Some(
+                R::Range { parent_name, .. }
+                | R::List { parent_name, .. }
+                | R::Hash { parent_name, .. }
+                | R::Default { parent_name, .. },
+            ) => parent_name,
+            _ => continue,
+        };
+        if let (Some(child), Some(parent)) = (relation_oid(cat, &tname), relation_oid(cat, parent))
+        {
+            rows.push(dep_row((1259, child, 0), (1259, parent, 0), "a"));
+        }
+    }
     (schema, rows)
+}
+
+/// One pg_depend row: `(classid, objid, objsubid)` depends on
+/// `(refclassid, refobjid, refobjsubid)`.
+fn dep_row(
+    obj: (i64, i64, i32),
+    referenced: (i64, i64, i32),
+    deptype: &'static str,
+) -> Row<'static> {
+    Row::new(alloc::vec![
+        Value::BigInt(obj.0),
+        Value::BigInt(obj.1),
+        Value::Int(obj.2),
+        Value::BigInt(referenced.0),
+        Value::BigInt(referenced.1),
+        Value::Int(referenced.2),
+        Value::text(deptype),
+    ])
+}
+
+/// The oid `pg_attrdef` gives a column's default.
+fn attrdef_oid(table_oid: i64, attnum: i32) -> i64 {
+    table_oid
+        .saturating_mul(1000)
+        .saturating_add(i64::from(attnum))
+}
+
+/// `(attrdef oid, table oid, attnum, default text)` for every column
+/// default, in the numbering `synth_pg_attrdef` publishes.
+fn attrdef_rows(cat: &Catalog) -> Vec<(i64, i64, i32, String)> {
+    let (_, rows) = synth_pg_attrdef(cat);
+    rows.iter()
+        .filter_map(
+            |r| match (&r.values[0], &r.values[1], &r.values[2], &r.values[3]) {
+                (Value::BigInt(o), Value::BigInt(t), Value::SmallInt(n), Value::Text(x)) => {
+                    Some((*o, *t, i32::from(*n), x.to_string()))
+                }
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// The sequence a `nextval('s')` default reads, schema prefix dropped.
+fn nextval_target(default_text: &str) -> Option<String> {
+    let Ok(spg_sql::ast::Expr::FunctionCall { name, args }) =
+        spg_sql::parser::parse_expression(default_text)
+    else {
+        return None;
+    };
+    if !name.eq_ignore_ascii_case("nextval") {
+        return None;
+    }
+    let lit = match args.first()? {
+        spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::String(s)) => s,
+        spg_sql::ast::Expr::Cast { expr, .. } => match expr.as_ref() {
+            spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::String(s)) => s,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(String::from(lit.strip_prefix("public.").unwrap_or(lit)))
 }
 
 /// v7.38 (read01) — synthesise `pg_catalog.pg_attrdef`, the column-default
@@ -1902,23 +2033,32 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("adbin", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    let mut table_oid: i64 = 16384;
     for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else {
-            table_oid = table_oid.saturating_add(1);
+        // 8.0.3 — pg_class's oid for the table. A running count over the
+        // visible names drifted from it past any other session's
+        // temporary table, which pg_class still numbers.
+        let (Some(t), Some(table_oid)) = (cat.get(&tname), relation_oid(cat, &tname)) else {
             continue;
         };
         for (i, col) in t.schema().columns.iter().enumerate() {
-            let Some(txt) = &col.default_text else {
-                continue;
+            // 8.0.3 — a SERIAL column's default is its sequence's nextval,
+            // as PG stores it; it had no row, so `pg_dump` never wrote the
+            // `SET DEFAULT` and the column restored without one.
+            let serial_default;
+            let txt = match &col.default_text {
+                Some(txt) => txt,
+                None if is_serial(col) => {
+                    serial_default =
+                        alloc::format!("nextval('{tname}_{}_seq'::regclass)", col.name);
+                    &serial_default
+                }
+                None => continue,
             };
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
             let adnum = (i + 1) as i16;
             // Synthetic row OID: table OID × 1000 + column position. Distinct
             // per default, in a band that won't collide with table OIDs.
-            let row_oid = table_oid
-                .saturating_mul(1000)
-                .saturating_add(i64::from(adnum));
+            let row_oid = attrdef_oid(table_oid, i32::from(adnum));
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(row_oid),
                 Value::BigInt(table_oid),
@@ -1926,7 +2066,6 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
                 Value::text(txt.clone()),
             ]));
         }
-        table_oid = table_oid.saturating_add(1);
     }
     (schema, rows)
 }
@@ -3687,6 +3826,12 @@ pub(crate) struct CatalogIndex {
     /// storage, and the difference matters to anything that asks the
     /// index for statistics.
     pub is_storage: bool,
+    /// 8.0.3 — the position, in its table's uniqueness constraints, of the
+    /// constraint this index backs. `pg_constraint.conindid` reads it; it
+    /// was 0, and `pg_dump` joins on that column to tell a constraint's
+    /// index from a bare one — so every primary key and UNIQUE constraint
+    /// dumped as `CREATE UNIQUE INDEX`, and restored as one.
+    pub backs_constraint: Option<usize>,
 }
 
 /// PostgreSQL's own name for a constraint's index.
@@ -3782,6 +3927,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 expression: idx.expression.clone(),
                 nulls_not_distinct: idx.nulls_not_distinct,
                 is_storage: true,
+                backs_constraint: exact,
             });
         }
         // The constraints no storage index covers exactly. PostgreSQL
@@ -3811,6 +3957,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 expression: None,
                 nulls_not_distinct: uc.nulls_not_distinct,
                 is_storage: false,
+                backs_constraint: Some(i),
             });
         }
     }
@@ -3832,6 +3979,8 @@ pub(crate) const OID_SEQ_BASE: i64 = 300_000;
 pub(crate) const OID_FUNC_BASE: i64 = 400_000;
 /// v7.39 (round 542) — pg_trigger row oids.
 pub(crate) const OID_TRIGGER_BASE: i64 = 600_000;
+/// 8.0.3 — domain constraints' own band (see `synth_pg_constraint`).
+pub(crate) const OID_DOMAIN_CONSTRAINT_BASE: i64 = 800_000;
 
 /// Resolve a function NAME to the oid `pg_proc` gives it. `None` when no
 /// function has that name, or when the name is overloaded — an overload
@@ -3924,8 +4073,8 @@ pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
-    for name in cat.sequences_all().keys() {
-        let Some(name) = cat.listed_name(name) else {
+    for (name, _) in crate::sequence::catalog_sequences(cat) {
+        let Some(name) = cat.listed_name(&name) else {
             continue;
         };
         seq_oid += 1;
@@ -3962,8 +4111,8 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
-    for name in cat.sequences_all().keys() {
-        let Some(name) = cat.listed_name(name) else {
+    for (name, _) in crate::sequence::catalog_sequences(cat) {
+        let Some(name) = cat.listed_name(&name) else {
             continue;
         };
         seq_oid += 1;
@@ -4071,6 +4220,7 @@ fn pg_class_schema() -> Vec<ColumnSchema> {
 pub(crate) fn synth_pg_class(
     cat: &Catalog,
     frozen_xid: i64,
+    roles: &crate::role_directory::RoleDirectory,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
     let schema = pg_class_schema();
@@ -4166,13 +4316,16 @@ pub(crate) fn synth_pg_class(
             Value::text(tname.clone()),
             // v7.38.14 — `pg_temp_N` for a session's temporary relation.
             Value::BigInt(namespace_oid_for_relname(&stored)),
-            Value::BigInt(0),  // reltype (composite type OID; SPG no composite)
-            Value::BigInt(0),  // reloftype
-            Value::BigInt(10), // relowner — PG postgres superuser OID
-            Value::BigInt(0),  // relam (table AM; 0 == default heap)
+            Value::BigInt(0), // reltype (composite type OID; SPG no composite)
+            Value::BigInt(0), // reloftype
+            Value::BigInt(roles.owner_oid(schema_ref.owner.as_deref())),
+            // 8.0.3 — heap (2) for a table and a materialized view, as PG
+            // reports; a partitioned parent stores nothing and has none.
+            // pg_dump reads it to emit `SET default_table_access_method`.
+            Value::BigInt(if relkind == "p" { 0 } else { 2 }),
             Value::BigInt(this_oid), // relfilenode shares oid in SPG (no separate fork)
-            Value::BigInt(0),  // reltablespace (0 == default)
-            Value::Int(relpages), // hot_bytes in 8 KiB PG-page units
+            Value::BigInt(0),        // reltablespace (0 == default)
+            Value::Int(relpages),    // hot_bytes in 8 KiB PG-page units
             Value::Float(reltuples),
             Value::Int(0),    // relallvisible — visibility map lands in 15.17
             Value::BigInt(0), // reltoastrelid (SPG no TOAST)
@@ -4253,11 +4406,13 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(view_oid),
             Value::text(vname.to_string()),
             Value::BigInt(namespace_oid_for_relname(stored)),
-            Value::BigInt(0),  // reltype
-            Value::BigInt(0),  // reloftype
-            Value::BigInt(10), // relowner
-            Value::BigInt(0),  // relam — a view has no access method
-            Value::BigInt(0),  // relfilenode — nor any storage
+            Value::BigInt(0), // reltype
+            Value::BigInt(0), // reloftype
+            Value::BigInt(
+                roles.owner_oid(cat.object_owner(spg_storage::NonTableKind::View, stored))
+            ),
+            Value::BigInt(0), // relam — a view has no access method
+            Value::BigInt(0), // relfilenode — nor any storage
             Value::BigInt(0),
             Value::Int(0),      // relpages
             Value::Float(-1.0), // reltuples — -1 = never analysed
@@ -4296,9 +4451,11 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(namespace_oid_for_relname(cname)),
             Value::BigInt(54_001 + ci as i64), // reltype — the pg_type row
             Value::BigInt(0),                  // reloftype
-            Value::BigInt(10),                 // relowner
-            Value::BigInt(0),                  // relam
-            Value::BigInt(0),                  // relfilenode
+            Value::BigInt(
+                roles.owner_oid(cat.object_owner(spg_storage::NonTableKind::CompositeType, cname),)
+            ),
+            Value::BigInt(0), // relam
+            Value::BigInt(0), // relfilenode
             Value::BigInt(0),
             Value::Int(0),      // relpages
             Value::Float(-1.0), // reltuples
@@ -4337,9 +4494,12 @@ pub(crate) fn synth_pg_class(
                 Value::BigInt(idx_oid),
                 Value::text(ci.name.clone()),
                 Value::BigInt(namespace_oid_for_relname(&ci.name)),
-                Value::BigInt(0),         // reltype (indexes have none)
-                Value::BigInt(0),         // reloftype
-                Value::BigInt(10),        // relowner
+                Value::BigInt(0), // reltype (indexes have none)
+                Value::BigInt(0), // reloftype
+                // An index belongs to its table's owner, as in PG.
+                Value::BigInt(
+                    roles.owner_oid(cat.get(&ci.table).and_then(|t| t.schema().owner.as_deref()),)
+                ),
                 Value::BigInt(ci.am_oid), // relam — the real AM
                 Value::BigInt(idx_oid),
                 Value::BigInt(0),
@@ -4369,7 +4529,8 @@ pub(crate) fn synth_pg_class(
     // were missing from pg_class entirely, so `SELECT relacl FROM pg_class WHERE
     // relname = '<seq>'` — the canonical way to read a sequence's privileges —
     // came back empty.
-    for (stored, def) in cat.sequences_all() {
+    for (stored, def) in crate::sequence::catalog_sequences(cat) {
+        let (stored, def) = (stored.as_str(), def.as_ref());
         let Some(name) = cat.listed_name(stored) else {
             continue;
         };
@@ -4384,8 +4545,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(namespace_oid_for_relname(stored)),
             Value::BigInt(0),
             Value::BigInt(0),
-            Value::BigInt(10), // relowner
-            Value::BigInt(0),  // relam — a sequence has no access method
+            Value::BigInt(roles.owner_oid(sequence_owner(cat, def))),
+            Value::BigInt(0), // relam — a sequence has no access method
             Value::BigInt(seq_oid),
             Value::BigInt(0),
             Value::Int(1),     // relpages — a sequence is one page
@@ -4591,7 +4752,7 @@ fn splice_pg_class_v18_row(
     row.values.push(
         cat.get(&relname)
             .and_then(|t| t.schema().partition_role.as_ref())
-            .and_then(relpartbound_text)
+            .and_then(|role| relpartbound_text(cat, role))
             .map_or(Value::Null, Value::text),
     );
     row.values
@@ -4724,7 +4885,12 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             #[allow(clippy::cast_possible_wrap)]
             let attnum = (i + 1) as i16;
             // PG: typlen — fixed-width width in bytes; -1 for var-length.
-            let typlen: i16 = pg_type_len(col.ty);
+            // 8.0.3 — the length of the column's catalogued TYPE, a user
+            // type's included: an enum column stored as text read
+            // `attstorage 'x'` against its type's `'p'`, and `pg_dump` wrote
+            // `SET STORAGE EXTENDED` for it.
+            let atttypid = attr_type_oid(cat, col);
+            let typlen: i16 = type_len_of_oid(cat, atttypid);
             // attndims — number of array dimensions. Most array
             // types are 1-D in SPG; jagged / 2-D arrays report 2.
             //
@@ -4751,10 +4917,24 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 4 => "i",
                 _ => "d",
             };
-            let has_default = col.default.is_some() || col.runtime_default.is_some();
+            let has_default =
+                col.default.is_some() || col.runtime_default.is_some() || is_serial(col);
             // attidentity — '' (none), 'a' ALWAYS, 'd' BY DEFAULT.
-            // SPG treats auto_increment as identity-default.
-            let attidentity = if col.auto_increment { "d" } else { "" };
+            //
+            // 8.0.3 — SPG records one auto-increment flag for SERIAL and
+            // for `GENERATED BY DEFAULT AS IDENTITY` alike, and cannot tell
+            // them apart (a field that could is a breaking change to
+            // ColumnSchema). It reported every one as BY DEFAULT identity,
+            // with no sequence edge, so `pg_dump` wrote neither the
+            // identity nor a default and the column restored as a plain
+            // integer. It is reported as SERIAL now — a default and an
+            // owned sequence, the spelling every schema this project's
+            // corpora carry uses — and ALWAYS, which is recorded, as 'a'.
+            let attidentity = if col.auto_increment && col.identity_always {
+                "a"
+            } else {
+                ""
+            };
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(attrelid),
                 Value::text(col.name.clone()),
@@ -4780,10 +4960,15 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal — true (not inherited)
                 Value::Int(0),      // attinhcount
-                Value::BigInt(pg_attr_collation_named(
-                    col.ty,
-                    col.collation_name.as_deref()
-                )), // attcollation
+                // 8.0.3 — the TYPE's collation unless one was declared: an
+                // enum column is not collatable, and reporting text's 100
+                // made `pg_dump` write `COLLATE pg_catalog."default"` on it,
+                // which PostgreSQL refuses (`collations are not supported
+                // by type`).
+                Value::BigInt(match col.collation_name.as_deref() {
+                    Some(declared) => pg_attr_collation_named(col.ty, Some(declared)),
+                    None => type_collation_of_oid(cat, atttypid),
+                }), // attcollation
                 crate::acl::render_acl_list(&col.acl).map_or(Value::Null, Value::text),
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,
@@ -4968,15 +5153,142 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 
 /// v7.39 (round 338) — PG's typlen for a type: the fixed width in bytes,
 /// -1 for a var-length one. Shared by the table and view attribute rows.
-const fn pg_type_len(ty: DataType) -> i16 {
-    match ty {
-        DataType::Bool => 1,
-        DataType::SmallInt => 2,
-        DataType::Int | DataType::Date => 4,
-        DataType::BigInt | DataType::Float | DataType::Timestamp | DataType::Timestamptz => 8,
-        _ => -1,
-    }
+/// 8.0.3 — a column's `attlen`: its type's `typlen`, from the one table
+/// `pg_type` publishes. This was a second, shorter table that knew seven
+/// types, so a `uuid` column read `attlen -1` and `attstorage 'x'` while
+/// its type read 16 and `'p'`, and `pg_dump` wrote
+/// `ALTER COLUMN … SET STORAGE EXTENDED` for every uuid column.
+fn pg_type_len(ty: DataType) -> i16 {
+    let oid = pg_type_oid(ty);
+    PG_SCALAR_TYPES
+        .iter()
+        .find(|t| t.0 == oid)
+        .map_or(-1, |t| t.2)
 }
+
+/// `(oid, name, len, type, cat, elem, array_oid)` of the built-in scalar
+/// types. PG OID numbers come straight from `pg_type.dat`.
+const PG_SCALAR_TYPES: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
+    // bool
+    (16, "bool", 1, "b", "B", 0, 1000),
+    (17, "bytea", -1, "b", "U", 0, 1001),
+    // v7.39 (pg_type reconcile) — "char" is category Z (internal);
+    // name's element type is "char" (oid 18), per PG18.
+    (18, "char", 1, "b", "Z", 0, 1002),
+    (19, "name", 64, "b", "S", 18, 1003),
+    (20, "int8", 8, "b", "N", 0, 1016),
+    (21, "int2", 2, "b", "N", 0, 1005),
+    (23, "int4", 4, "b", "N", 0, 1007),
+    (24, "regproc", 4, "b", "N", 0, 1008),
+    (25, "text", -1, "b", "S", 0, 1009),
+    (26, "oid", 4, "b", "N", 0, 1028),
+    // v7.39 (round 640) — the four types the row header is made of.
+    // `pg_attribute` has described `ctid` / `xmin` / `cmin` / `xmax`
+    // / `cmax` since round 623 and typed them 27 / 28 / 29, but
+    // `pg_type` listed none of the three: 120 of SPG's own catalog
+    // rows pointed at types nothing carried, and PG has exactly one
+    // such row (a dropped column, atttypid 0). xid8 joins them
+    // because `NULL::xid8` now resolves to a type of its own.
+    // Measured off PG18; typarray is 0 rather than PG's 1010 / 1011
+    // / 1012 / 271 — see the typarray note in `build_row`.
+    (27, "tid", 6, "b", "U", 0, 0),
+    (28, "xid", 4, "b", "U", 0, 0),
+    (29, "cid", 4, "b", "U", 0, 0),
+    (5069, "xid8", 8, "b", "U", 0, 0),
+    // v7.39.11 — PG's catalog vectors. `pg_index.indkey` and kin are
+    // typed as these now, and a column whose `atttypid` names a type
+    // `pg_type` does not carry is exactly the defect round 640
+    // closed for `xid`: `format_type` answers `???` and every
+    // `pg_attribute JOIN pg_type` loses the row. Measured off PG18;
+    // typarray is 0 rather than PG's 1006 / 1013, as the note in
+    // `build_row` explains for the rows above.
+    (22, "int2vector", -1, "b", "A", 21, 0),
+    (30, "oidvector", -1, "b", "A", 26, 0),
+    (114, "json", -1, "b", "U", 0, 199),
+    (142, "xml", -1, "b", "U", 0, 143),
+    (700, "float4", 4, "b", "N", 0, 1021),
+    (701, "float8", 8, "b", "N", 0, 1022),
+    (650, "cidr", -1, "b", "I", 0, 651),
+    (869, "inet", -1, "b", "I", 0, 1041),
+    // v7.39 (round 635) — the bit-string types. SPG has had the VALUES
+    // since the bit family shipped; pg_type never listed the TYPES, so
+    // the canonical `pg_cast JOIN pg_type` lost its eight bit rows to
+    // the join even though the cast table carried them. Read off PG18:
+    // category V, variable length, array oids 1561 / 1563.
+    // v7.39 (round 638) — the types pg_proc's rows point at. Publishing
+    // 283 more functions left 18 of them orphaned by
+    // `pg_proc JOIN pg_type`, and four of those orphans predate this
+    // round: array_agg, lag, lead, first_value and last_value have
+    // always returned anyelement / anyarray and pg_type never listed
+    // either. Read off PG18; the pseudo-types are typtype 'p' and the
+    // multiranges 'm', which is how a client tells them apart.
+    (2206, "regtype", 4, "b", "N", 0, 0),
+    (2249, "record", -1, "p", "P", 0, 0),
+    (2277, "anyarray", -1, "p", "P", 0, 0),
+    (2283, "anyelement", 4, "p", "P", 0, 0),
+    (4451, "int4multirange", -1, "m", "R", 0, 0),
+    (4532, "nummultirange", -1, "m", "R", 0, 0),
+    (4533, "tsmultirange", -1, "m", "R", 0, 0),
+    (4534, "tstzmultirange", -1, "m", "R", 0, 0),
+    (4535, "datemultirange", -1, "m", "R", 0, 0),
+    (4536, "int8multirange", -1, "m", "R", 0, 0),
+    (1560, "bit", -1, "b", "V", 0, 0),
+    (1562, "varbit", -1, "b", "V", 0, 0),
+    (829, "macaddr", 6, "b", "U", 0, 1040),
+    (1042, "bpchar", -1, "b", "S", 0, 1014),
+    (1043, "varchar", -1, "b", "S", 0, 1015),
+    (1082, "date", 4, "b", "D", 0, 1182),
+    (1083, "time", 8, "b", "D", 0, 1183),
+    (1114, "timestamp", 8, "b", "D", 0, 1115),
+    (1184, "timestamptz", 8, "b", "D", 0, 1185),
+    (1186, "interval", 16, "b", "T", 0, 1187),
+    (1266, "timetz", 12, "b", "D", 0, 1270),
+    (1700, "numeric", -1, "b", "N", 0, 1231),
+    (790, "money", 8, "b", "N", 0, 791),
+    (2950, "uuid", 16, "b", "U", 0, 2951),
+    (3802, "jsonb", -1, "b", "U", 0, 3807),
+    (3614, "tsvector", -1, "b", "U", 0, 3643),
+    (3615, "tsquery", -1, "b", "U", 0, 3645),
+    // hstore + range types — typcategory 'U' (user) / 'R' (range).
+    // v7.39 (pg_type reconcile) — these two were transposed; PG18:
+    // 3908 = tsrange, 3910 = tstzrange (the wire layer already
+    // encoded them correctly, so only the catalog disagreed).
+    (3908, "tsrange", -1, "r", "R", 0, 0),
+    (3910, "tstzrange", -1, "r", "R", 0, 0),
+    (3904, "int4range", -1, "r", "R", 0, 0),
+    (3926, "int8range", -1, "r", "R", 0, 0),
+    (3906, "numrange", -1, "r", "R", 0, 0),
+    (3912, "daterange", -1, "r", "R", 0, 0),
+    // v7.39 (round 653) — F20 side-effect, and a good one. Adding the
+    // 235 missing pg_proc rows made an existing pin go red: 19 of them
+    // named a return type `pg_type` did not carry, so the catalog join
+    // dropped them. The pin was right to refuse.
+    //
+    // Every one of these is a type the engine really produces —
+    // measured, not assumed: `point(1,2)` -> `(1,2)`,
+    // `'pg_class'::regclass` -> `pg_class`, `acldefault('r',10)` ->
+    // `{postgres=arwdDxtm/postgres}`, `range_merge` -> `[1,7)`,
+    // `setseed(0.5)` -> void. `regclass` is the sharpest of them: the
+    // cast has worked for rounds and the type was never listed.
+    // Metadata is PG18's own (oid, typlen, typtype, typcategory,
+    // typelem, typarray) — except that `typarray` is ZEROED for the four
+    // whose array type SPG does not carry (`_point`, `_macaddr8`,
+    // `_regclass`, `_pg_lsn`), which is the convention round 640
+    // established for exactly this and which its pin re-enforced the
+    // moment these rows landed. `_aclitem` is carried, so `aclitem`
+    // keeps its real 1034.
+    (600, "point", 16, "b", "G", 701, 0),
+    (774, "macaddr8", 8, "b", "U", 0, 0),
+    (1033, "aclitem", 16, "b", "U", 0, 1034),
+    (1034, "_aclitem", -1, "b", "A", 1033, 0),
+    (2205, "regclass", 4, "b", "N", 0, 0),
+    (2278, "void", 4, "p", "P", 0, 0),
+    (2279, "trigger", 4, "p", "P", 0, 0),
+    (3220, "pg_lsn", 8, "b", "U", 0, 0),
+    (3831, "anyrange", -1, "p", "P", 0, 0),
+    (4537, "anymultirange", -1, "p", "P", 0, 0),
+    (5078, "anycompatiblearray", -1, "p", "P", 0, 0),
+];
 
 /// PG type OID lookup for the SPG DataType set. Used by
 /// `synth_pg_attribute`'s `atttypid` column.
@@ -5549,7 +5861,10 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 /// Other pg_type columns (typowner, typinput/typoutput, etc.)
 /// land in follow-up work — sqlx encoders don't query them at
 /// connect time.
-pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_type(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.37.24 (24.7) — widened from 8 to 16 PG-canonical columns.
     // ORMs / monitoring tools query typbyval / typispreferred /
     // typdelim / typisdefined to decide encoding strategies; the
@@ -5597,129 +5912,7 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         ColumnSchema::new("typdefault", DataType::Text, true),
         ColumnSchema::new("typacl", DataType::Text, true),
     ];
-    // (oid, name, len, type, cat, elem, array_oid). PG OID
-    // numbers come straight from `pg_type.dat`.
-    let scalars: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
-        // bool
-        (16, "bool", 1, "b", "B", 0, 1000),
-        (17, "bytea", -1, "b", "U", 0, 1001),
-        // v7.39 (pg_type reconcile) — "char" is category Z (internal);
-        // name's element type is "char" (oid 18), per PG18.
-        (18, "char", 1, "b", "Z", 0, 1002),
-        (19, "name", 64, "b", "S", 18, 1003),
-        (20, "int8", 8, "b", "N", 0, 1016),
-        (21, "int2", 2, "b", "N", 0, 1005),
-        (23, "int4", 4, "b", "N", 0, 1007),
-        (24, "regproc", 4, "b", "N", 0, 1008),
-        (25, "text", -1, "b", "S", 0, 1009),
-        (26, "oid", 4, "b", "N", 0, 1028),
-        // v7.39 (round 640) — the four types the row header is made of.
-        // `pg_attribute` has described `ctid` / `xmin` / `cmin` / `xmax`
-        // / `cmax` since round 623 and typed them 27 / 28 / 29, but
-        // `pg_type` listed none of the three: 120 of SPG's own catalog
-        // rows pointed at types nothing carried, and PG has exactly one
-        // such row (a dropped column, atttypid 0). xid8 joins them
-        // because `NULL::xid8` now resolves to a type of its own.
-        // Measured off PG18; typarray is 0 rather than PG's 1010 / 1011
-        // / 1012 / 271 — see the typarray note in `build_row`.
-        (27, "tid", 6, "b", "U", 0, 0),
-        (28, "xid", 4, "b", "U", 0, 0),
-        (29, "cid", 4, "b", "U", 0, 0),
-        (5069, "xid8", 8, "b", "U", 0, 0),
-        // v7.39.11 — PG's catalog vectors. `pg_index.indkey` and kin are
-        // typed as these now, and a column whose `atttypid` names a type
-        // `pg_type` does not carry is exactly the defect round 640
-        // closed for `xid`: `format_type` answers `???` and every
-        // `pg_attribute JOIN pg_type` loses the row. Measured off PG18;
-        // typarray is 0 rather than PG's 1006 / 1013, as the note in
-        // `build_row` explains for the rows above.
-        (22, "int2vector", -1, "b", "A", 21, 0),
-        (30, "oidvector", -1, "b", "A", 26, 0),
-        (114, "json", -1, "b", "U", 0, 199),
-        (142, "xml", -1, "b", "U", 0, 143),
-        (700, "float4", 4, "b", "N", 0, 1021),
-        (701, "float8", 8, "b", "N", 0, 1022),
-        (650, "cidr", -1, "b", "I", 0, 651),
-        (869, "inet", -1, "b", "I", 0, 1041),
-        // v7.39 (round 635) — the bit-string types. SPG has had the VALUES
-        // since the bit family shipped; pg_type never listed the TYPES, so
-        // the canonical `pg_cast JOIN pg_type` lost its eight bit rows to
-        // the join even though the cast table carried them. Read off PG18:
-        // category V, variable length, array oids 1561 / 1563.
-        // v7.39 (round 638) — the types pg_proc's rows point at. Publishing
-        // 283 more functions left 18 of them orphaned by
-        // `pg_proc JOIN pg_type`, and four of those orphans predate this
-        // round: array_agg, lag, lead, first_value and last_value have
-        // always returned anyelement / anyarray and pg_type never listed
-        // either. Read off PG18; the pseudo-types are typtype 'p' and the
-        // multiranges 'm', which is how a client tells them apart.
-        (2206, "regtype", 4, "b", "N", 0, 0),
-        (2249, "record", -1, "p", "P", 0, 0),
-        (2277, "anyarray", -1, "p", "P", 0, 0),
-        (2283, "anyelement", 4, "p", "P", 0, 0),
-        (4451, "int4multirange", -1, "m", "R", 0, 0),
-        (4532, "nummultirange", -1, "m", "R", 0, 0),
-        (4533, "tsmultirange", -1, "m", "R", 0, 0),
-        (4534, "tstzmultirange", -1, "m", "R", 0, 0),
-        (4535, "datemultirange", -1, "m", "R", 0, 0),
-        (4536, "int8multirange", -1, "m", "R", 0, 0),
-        (1560, "bit", -1, "b", "V", 0, 0),
-        (1562, "varbit", -1, "b", "V", 0, 0),
-        (829, "macaddr", 6, "b", "U", 0, 1040),
-        (1042, "bpchar", -1, "b", "S", 0, 1014),
-        (1043, "varchar", -1, "b", "S", 0, 1015),
-        (1082, "date", 4, "b", "D", 0, 1182),
-        (1083, "time", 8, "b", "D", 0, 1183),
-        (1114, "timestamp", 8, "b", "D", 0, 1115),
-        (1184, "timestamptz", 8, "b", "D", 0, 1185),
-        (1186, "interval", 16, "b", "T", 0, 1187),
-        (1266, "timetz", 12, "b", "D", 0, 1270),
-        (1700, "numeric", -1, "b", "N", 0, 1231),
-        (790, "money", 8, "b", "N", 0, 791),
-        (2950, "uuid", 16, "b", "U", 0, 2951),
-        (3802, "jsonb", -1, "b", "U", 0, 3807),
-        (3614, "tsvector", -1, "b", "U", 0, 3643),
-        (3615, "tsquery", -1, "b", "U", 0, 3645),
-        // hstore + range types — typcategory 'U' (user) / 'R' (range).
-        // v7.39 (pg_type reconcile) — these two were transposed; PG18:
-        // 3908 = tsrange, 3910 = tstzrange (the wire layer already
-        // encoded them correctly, so only the catalog disagreed).
-        (3908, "tsrange", -1, "r", "R", 0, 0),
-        (3910, "tstzrange", -1, "r", "R", 0, 0),
-        (3904, "int4range", -1, "r", "R", 0, 0),
-        (3926, "int8range", -1, "r", "R", 0, 0),
-        (3906, "numrange", -1, "r", "R", 0, 0),
-        (3912, "daterange", -1, "r", "R", 0, 0),
-        // v7.39 (round 653) — F20 side-effect, and a good one. Adding the
-        // 235 missing pg_proc rows made an existing pin go red: 19 of them
-        // named a return type `pg_type` did not carry, so the catalog join
-        // dropped them. The pin was right to refuse.
-        //
-        // Every one of these is a type the engine really produces —
-        // measured, not assumed: `point(1,2)` -> `(1,2)`,
-        // `'pg_class'::regclass` -> `pg_class`, `acldefault('r',10)` ->
-        // `{postgres=arwdDxtm/postgres}`, `range_merge` -> `[1,7)`,
-        // `setseed(0.5)` -> void. `regclass` is the sharpest of them: the
-        // cast has worked for rounds and the type was never listed.
-        // Metadata is PG18's own (oid, typlen, typtype, typcategory,
-        // typelem, typarray) — except that `typarray` is ZEROED for the four
-        // whose array type SPG does not carry (`_point`, `_macaddr8`,
-        // `_regclass`, `_pg_lsn`), which is the convention round 640
-        // established for exactly this and which its pin re-enforced the
-        // moment these rows landed. `_aclitem` is carried, so `aclitem`
-        // keeps its real 1034.
-        (600, "point", 16, "b", "G", 701, 0),
-        (774, "macaddr8", 8, "b", "U", 0, 0),
-        (1033, "aclitem", 16, "b", "U", 0, 1034),
-        (1034, "_aclitem", -1, "b", "A", 1033, 0),
-        (2205, "regclass", 4, "b", "N", 0, 0),
-        (2278, "void", 4, "p", "P", 0, 0),
-        (2279, "trigger", 4, "p", "P", 0, 0),
-        (3220, "pg_lsn", 8, "b", "U", 0, 0),
-        (3831, "anyrange", -1, "p", "P", 0, 0),
-        (4537, "anymultirange", -1, "p", "P", 0, 0),
-        (5078, "anycompatiblearray", -1, "p", "P", 0, 0),
-    ];
+    let scalars = PG_SCALAR_TYPES;
     // Array companion types share the typelem / typcategory='A'.
     // We emit just the array OIDs the scalars reference.
     let arrays: &[(i64, &str, i64)] = ARRAY_TYPE_OIDS;
@@ -5804,10 +5997,10 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::BigInt(0),   // typbasetype (DOMAIN base; 0 for base types)
             Value::Int(-1),     // typtypmod
             Value::Int(0),      // typndims
-            Value::BigInt(0),   // typcollation — 0 (default)
-            Value::Null,        // typdefaultbin
-            Value::Null,        // typdefault
-            Value::Null,        // typacl — PG's default: no explicit grant
+            Value::BigInt(type_collation(oid)),
+            Value::Null, // typdefaultbin
+            Value::Null, // typdefault
+            Value::Null, // typacl — PG's default: no explicit grant
         ])
     };
     for &(oid, name, len, ty, cat, elem, arr) in scalars {
@@ -5872,11 +6065,18 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         r.values[2] = Value::BigInt(2200);
         r
     };
+    // 8.0.3 — and belong to whoever created them.
+    let owned = |mut r: Row<'static>, kind: spg_storage::NonTableKind, name: &str| {
+        r.values[3] = Value::BigInt(roles.owner_oid(cat.object_owner(kind, name)));
+        r
+    };
     for (name, oid) in enum_oids {
-        rows.push(into_public(build_row(oid, &name, 4, "e", "E", 0, 0, "-")));
+        let r = into_public(build_row(oid, &name, 4, "e", "E", 0, 0, "-"));
+        rows.push(owned(r, spg_storage::NonTableKind::EnumType, &name));
     }
     for (ci, (name, oid)) in composite_oids.into_iter().enumerate() {
-        let mut r = into_public(build_row(oid, &name, -1, "c", "C", 0, 0, "-"));
+        let r = into_public(build_row(oid, &name, -1, "c", "C", 0, 0, "-"));
+        let mut r = owned(r, spg_storage::NonTableKind::CompositeType, &name);
         // 7.38.1 S5.2 — typrelid points at the relkind-'c' pg_class
         // row (56_001+ band) whose pg_attribute rows carry the fields;
         // pg_dump reads `CREATE TYPE x AS (…)` from exactly that join.
@@ -5889,7 +6089,15 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             .get(&name)
             .and_then(|d| pg_type_oid_for_domain_base(d))
             .unwrap_or(0);
-        let mut r = build_row(oid, &name, -1, "d", "N", 0, 0, "-");
+        // 8.0.3 — a domain is as long as its base type (PG: `posint` over
+        // integer is 4, storage plain).
+        let mut r = build_row(oid, &name, type_len_of_oid(cat, base), "d", "N", 0, 0, "-");
+        // A domain collates as its base type does.
+        if let Some(i) = schema.iter().position(|c| c.name == "typcollation")
+            && let Some(slot) = r.values.get_mut(i)
+        {
+            *slot = Value::BigInt(type_collation(base));
+        }
         // Found by NAME, not by a counted index: the first cut wrote to
         // position 20 and landed on `typmodout`, so the domain reported a base
         // of 0 and the test said so.
@@ -5898,10 +6106,62 @@ pub(crate) fn synth_pg_type(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         {
             *slot = Value::BigInt(base);
         }
-        rows.push(into_public(r));
+        rows.push(owned(
+            into_public(r),
+            spg_storage::NonTableKind::DomainType,
+            &name,
+        ));
     }
 
     (schema, rows)
+}
+
+/// 8.0.3 — the length of a catalogued type by oid: a built-in's own, an
+/// enum's 4, a domain's base type's, and -1 for a composite or anything
+/// variable.
+fn type_len_of_oid(cat: &Catalog, oid: i64) -> i16 {
+    let (enums, _, domains) = user_type_oids(cat);
+    if enums.iter().any(|(_, o)| *o == oid) {
+        return 4;
+    }
+    if let Some((name, _)) = domains.iter().find(|(_, o)| *o == oid) {
+        return cat
+            .domain_types()
+            .get(name)
+            .and_then(pg_type_oid_for_domain_base)
+            .map_or(-1, |base| type_len_of_oid(cat, base));
+    }
+    PG_SCALAR_TYPES
+        .iter()
+        .find(|t| t.0 == oid)
+        .map_or(-1, |t| t.2)
+}
+
+/// 8.0.3 — a catalogued type's collation by oid; a domain collates as its
+/// base type does.
+fn type_collation_of_oid(cat: &Catalog, oid: i64) -> i64 {
+    let (_, _, domains) = user_type_oids(cat);
+    if let Some((name, _)) = domains.iter().find(|(_, o)| *o == oid) {
+        return cat
+            .domain_types()
+            .get(name)
+            .and_then(pg_type_oid_for_domain_base)
+            .map_or(0, type_collation);
+    }
+    type_collation(oid)
+}
+
+/// 8.0.3 — `pg_type.typcollation`: the default collation (100) for the
+/// collatable types, `C` (950) for `name`, 0 for the rest. Measured on
+/// PG 18.6 over pg_catalog. It read 0 for every type, so each text column's
+/// `attcollation` (100) differed from its type's and `pg_dump` wrote
+/// `COLLATE pg_catalog."default"` on every one.
+fn type_collation(oid: i64) -> i64 {
+    match oid {
+        19 | 1003 => 950,
+        25 | 194 | 1009 | 1014 | 1015 | 1042 | 1043 | 3361 | 3402 | 4600 | 4601 | 5017 => 100,
+        _ => 0,
+    }
 }
 
 /// v7.39 (round 330, V48) — OID base for the synthesised
@@ -6014,7 +6274,10 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_proc(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.37.24 (24.6) — widened from 6 to 20 PG-canonical columns
     // covering the function metadata that ORMs (Diesel, sea-orm)
     // and pgAdmin's function browser query: prolang for language
@@ -6031,7 +6294,11 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
         ColumnSchema::new("prorows", DataType::Float, false),
         ColumnSchema::new("provariadic", DataType::BigInt, false),
         // v7.39 (round 543) — a planner-support function; SPG has none.
-        ColumnSchema::new("prosupport", DataType::BigInt, false),
+        // 8.0.3 — a `regproc`, which prints `-` for "none" (measured on
+        // 18.6). It read the number 0, and `pg_dump` — which tests the text
+        // against "-" — wrote `SUPPORT 0` into every CREATE FUNCTION, a
+        // syntax error on restore into PostgreSQL and into SPG alike.
+        ColumnSchema::new("prosupport", DataType::Text, false),
         ColumnSchema::new("prokind", DataType::Text, false),
         ColumnSchema::new("prosecdef", DataType::Bool, false),
         ColumnSchema::new("proleakproof", DataType::Bool, false),
@@ -6117,7 +6384,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::Float(1.0), // procost
             Value::Float(prorows),
             Value::BigInt(0), // provariadic
-            Value::BigInt(0), // prosupport
+            Value::text("-"), // prosupport
             Value::text::<String>(kind.into()),
             Value::Bool(false),       // prosecdef
             Value::Bool(false),       // proleakproof
@@ -6155,10 +6422,13 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::BigInt(user_oid),
             Value::text(def.name.clone()),
             Value::BigInt(2200), // pronamespace — public
-            Value::BigInt(10),   // proowner
-            // prolang: 14 = sql, 13 = plpgsql (PG's oids).
+            Value::BigInt(roles.owner_oid(def.owner.as_deref())),
+            // prolang: 14 = sql, 13647 = plpgsql — `pg_language`'s own oids
+            // (measured on 18.6). It said 13, which is `c`, and matched no
+            // `pg_language` row, so `pg_dump`'s function query joined to
+            // nothing and stopped: `query returned 0 rows instead of one`.
             Value::BigInt(if def.language.eq_ignore_ascii_case("plpgsql") {
-                13
+                13647
             } else {
                 14
             }),
@@ -6169,7 +6439,7 @@ pub(crate) fn synth_pg_proc(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             Value::Float(def.cost.unwrap_or(100.0)),
             Value::Float(def.rows.unwrap_or(0.0)),
             Value::BigInt(0),
-            Value::BigInt(0), // prosupport
+            Value::text("-"), // prosupport
             Value::text("f"), // prokind — a normal function
             Value::Bool(def.security_definer),
             Value::Bool(def.leakproof),
@@ -7561,8 +7831,8 @@ pub(crate) fn synth_info_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("cycle_option", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for (name, def) in cat.sequences_all() {
-        let Some(name) = cat.listed_name(name) else {
+    for (name, def) in crate::sequence::catalog_sequences(cat) {
+        let Some(name) = cat.listed_name(&name) else {
             continue;
         };
         let dt = match def.data_type {
@@ -7940,8 +8210,8 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     // 32768 while pg_class numbered them from 300_000, which broke PG's
     // canonical `pg_class JOIN pg_sequence ON oid = seqrelid` outright —
     // and 32768 was the view band, so the two kinds collided besides.
-    for (name, def) in cat.sequences_all() {
-        let Some(name) = cat.listed_name(name) else {
+    for (name, def) in crate::sequence::catalog_sequences(cat) {
+        let Some(name) = cat.listed_name(&name) else {
             continue;
         };
         let Some(seq_oid) = relation_oid(cat, name) else {
@@ -8010,6 +8280,10 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("conbin", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
+    let constraint_index: alloc::collections::BTreeMap<(String, usize), i64> = catalog_indexes(cat)
+        .into_iter()
+        .filter_map(|ix| Some(((ix.table, ix.backs_constraint?), ix.oid)))
+        .collect();
     // Build the same name → oid map pg_class uses (start at 16384).
     let names = cat.visible_table_names();
     let mut by_table: alloc::collections::BTreeMap<String, i64> =
@@ -8045,8 +8319,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             Value::SmallIntArray(positions.iter().map(|p| Some(*p as i16 + 1)).collect())
         };
         // Uniqueness constraints.
-        for uc in t.schema().uniqueness_constraints.iter() {
+        for (ui, uc) in t.schema().uniqueness_constraints.iter().enumerate() {
             let kind = if uc.is_primary_key { "p" } else { "u" };
+            let conindid = constraint_index
+                .get(&(tname.clone(), ui))
+                .copied()
+                .unwrap_or(0);
             let conname = pg_unique_conname(t, uc, tname);
             let conkey_display = conkey_vec(&uc.columns);
             rows.push(Row::new(alloc::vec![
@@ -8060,8 +8338,8 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::Bool(true),                  // conenforced
                 Value::Bool(true),                  // convalidated
                 Value::BigInt(conrelid),
-                Value::BigInt(0),  // contypid
-                Value::BigInt(0),  // conindid — pending UC↔index plumb-through
+                Value::BigInt(0), // contypid
+                Value::BigInt(conindid),
                 Value::BigInt(0),  // conparentid
                 Value::BigInt(0),  // confrelid (not an FK)
                 Value::text(" "),  // confupdtype
@@ -8277,6 +8555,67 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             ]));
         }
     }
+    // 8.0.3 — a domain's constraints: its CHECKs ('c') and its NOT NULL
+    // ('n', named `<domain>_not_null`), with `contypid` naming the domain
+    // and no relation (measured on 18.6). There were none, and `pg_dump`
+    // reads a domain's constraints from exactly these rows: every domain
+    // dumped without its CHECK, and restored accepting what it had refused.
+    //
+    // Numbered in a band of their own. Following on from the table
+    // constraints made their oids depend on how many tables the catalog
+    // holds, and `pg_get_constraintdef` runs against a catalog that also
+    // holds the materialised system views — so it resolved the domain's
+    // CHECK to some table's NOT NULL (`NOT NULL oid`).
+    let (_, _, domains) = user_type_oids(cat);
+    let mut domain_con_oid = OID_DOMAIN_CONSTRAINT_BASE;
+    for (name, typid) in domains {
+        let Some(d) = cat.domain_types().get(&name) else {
+            continue;
+        };
+        let mut cons: Vec<(String, &'static str, Option<String>)> = d
+            .checks
+            .iter()
+            .map(|c| (c.name.clone(), "c", Some(c.expr.clone())))
+            .collect();
+        if !d.nullable {
+            cons.push((alloc::format!("{name}_not_null"), "n", None));
+        }
+        for (conname, kind, bin) in cons {
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt({
+                    domain_con_oid += 1;
+                    domain_con_oid
+                }),
+                Value::text(conname),
+                Value::BigInt(2200),
+                Value::text(kind),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::Bool(true), /* conenforced */
+                Value::Bool(true), /* convalidated */
+                Value::BigInt(0),  /* conrelid — no relation */
+                Value::BigInt(typid),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::text(" "),
+                Value::text(" "),
+                Value::text(" "),
+                Value::Bool(true),
+                Value::Int(0),
+                Value::Bool(false),
+                Value::Bool(false), /* conperiod */
+                Value::SmallIntArray(alloc::vec::Vec::new()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                bin.map_or(Value::Null, Value::text),
+            ]));
+        }
+    }
     (schema, rows)
 }
 
@@ -8421,50 +8760,24 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("rolconfig", DataType::TextArray, true),
         ColumnSchema::new("oid", DataType::BigInt, false),
     ];
-    let mut rows: Vec<Row<'static>> = Vec::new();
-    let oid: i64 = 10;
-    // v7.39 (read01 round 58) — the three attributes are REAL now. They used to
+    // 8.0.3 — every role, numbered once (see `role_directory`). The
+    // bootstrap superuser is oid 10 and PostgreSQL's predefined roles carry
+    // their own oids; `postgres` is listed only when it IS the bootstrap
+    // role, as in PostgreSQL started with another POSTGRES_USER.
+    //
+    // v7.39 (read01 round 58) — the three attributes are REAL. They used to
     // be hard-coded (`false, true, true`) because SPG had no role attributes;
     // a `CREATE ROLE devs NOLOGIN` would still have reported rolcanlogin=true.
-    for (i, (name, rec)) in engine.effective_users().iter().enumerate() {
-        rows.push(pg_roles_row(
-            oid + (i as i64) + 1,
-            name,
-            rec.superuser,
-            rec.inherit,
-            rec.can_login,
-        ));
-    }
-    // Always include `postgres` as the bootstrap superuser if not
-    // already present — admin tools probe for it.
-    if !rows
-        .iter()
-        .any(|r| matches!(&r.values[0], Value::Text(s) if s == "postgres"))
-    {
-        rows.insert(0, pg_roles_row(10, "postgres", true, true, true));
-    }
-    // v7.39 (round 696) — and the SESSION's own identity, which is the
-    // same class of gap round 652 closed for `postgres` and missed here.
     //
-    // A pg-wire client authenticates as some user, `current_user` reports
-    // that name, and yet `pg_roles` did not list it, `'bench'::regrole`
-    // said it did not exist, and `SET ROLE bench` refused the role the
-    // session was ALREADY running as. Nothing surfaced it because nothing
-    // asked — round 696's `DROP OWNED BY <role>` check asked, and was
-    // refused for the connected user.
-    let me = engine.session_user();
-    if !rows
+    // v7.39 (round 696) — and the SESSION's own identity is listed: a
+    // pg-wire client authenticates as some user, `current_user` reports
+    // that name, and `pg_roles` has to list it for `'bench'::regrole` and
+    // `SET ROLE bench` to agree.
+    let rows = crate::role_directory::RoleDirectory::of(engine)
+        .entries()
         .iter()
-        .any(|r| matches!(&r.values[0], Value::Text(s) if s == me))
-    {
-        rows.push(pg_roles_row(
-            oid + rows.len() as i64 + 1,
-            me,
-            true,
-            true,
-            true,
-        ));
-    }
+        .map(|r| pg_roles_row(r.oid, &r.name, r.superuser, r.inherit, r.can_login))
+        .collect();
     (schema, rows)
 }
 
@@ -8555,13 +8868,12 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
         ColumnSchema::new("inherit_option", DataType::Bool, false),
         ColumnSchema::new("set_option", DataType::Bool, false),
     ];
-    // Same oid assignment as synth_pg_roles: 11, 12, … in name order.
+    // The oid assignment synth_pg_roles publishes.
+    let roles = crate::role_directory::RoleDirectory::of(engine);
     let oid_of = |name: &str| -> i64 {
-        engine
-            .users
-            .iter()
-            .position(|(n, _)| n == name)
-            .map_or(10, |i| 10 + (i as i64) + 1)
+        roles
+            .oid_of(name)
+            .unwrap_or(crate::role_directory::BOOTSTRAP_OID)
     };
     let mut rows: Vec<Row<'static>> = Vec::new();
     for (i, (member, role)) in engine.users.all_memberships().enumerate() {
@@ -9159,7 +9471,10 @@ pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 ///
 /// Measured on PG18 for `CREATE SEQUENCE s`: last_value is NULL until
 /// the sequence has been called.
-pub(crate) fn synth_pg_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_sequences(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("sequencename", DataType::Text, false),
@@ -9174,18 +9489,15 @@ pub(crate) fn synth_pg_sequences(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("last_value", DataType::BigInt, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for (stored, def) in cat.sequences_all() {
-        let Some(name) = cat.listed_name(stored) else {
+    for (stored, def) in crate::sequence::catalog_sequences(cat) {
+        let def = def.as_ref();
+        let Some(name) = cat.listed_name(&stored) else {
             continue;
         };
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(alloc::string::String::from(name)),
-            Value::text(
-                def.owner
-                    .clone()
-                    .unwrap_or_else(|| alloc::string::String::from(CATALOG_OWNER)),
-            ),
+            Value::text(String::from(roles.owner_name(sequence_owner(cat, def)))),
             Value::text("bigint"),
             Value::BigInt(def.start),
             Value::BigInt(def.min_value),
@@ -9554,7 +9866,8 @@ pub(crate) const INSTALLED_EXTENSIONS: &[(&str, &str)] = &[
     ("plpgsql", "1.0"),
     ("vector", "0.8.0"),
     ("pg_trgm", "1.6"),
-    ("pgcrypto", "1.3"),
+    // 8.0.3 — 1.4 is what PG 18.6 installs, measured.
+    ("pgcrypto", "1.4"),
     // v7.39 (round 780, F31-D1) — hstore's type, codec and both text
     // conversions are first-class since v7.17.0; once the type-NAME
     // map listed it (same round) every hstore spelling works, so the
@@ -9566,7 +9879,7 @@ pub(crate) const INSTALLED_EXTENSIONS: &[(&str, &str)] = &[
 /// the table lists those as installed — `SELECT … FROM pg_extension
 /// WHERE extname = 'vector'` probes from PG clients (mailrs embed
 /// round-12) answer truthfully about capability presence.
-pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_extension(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     // v7.39 (round 539) — PG18's full eight columns, in its order.
     //
     // Four were missing and `extnamespace` was the schema's NAME where
@@ -9590,25 +9903,81 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("extconfig", DataType::TextArray, true),
         ColumnSchema::new("extcondition", DataType::TextArray, true),
     ];
-    let exts = INSTALLED_EXTENSIONS;
-    let rows = exts
-        .iter()
-        .enumerate()
-        .map(|(i, (name, ver))| {
-            Row::new(alloc::vec![
-                Value::BigInt(16384 + i as i64),
-                Value::text::<String>((*name).into()),
-                Value::BigInt(10),
-                Value::BigInt(11),
-                Value::Bool(false),
-                Value::text::<String>((*ver).into()),
-                Value::Null,
-                Value::Null,
-            ])
-        })
-        .collect();
+    // 8.0.3 — what this database INSTALLED, not what the build provides:
+    // `plpgsql`, which every PostgreSQL database has (oid 13643, in
+    // pg_catalog, not relocatable — measured on 18.6, and below 16384, so
+    // `pg_dump` treats it as built in), and each `CREATE EXTENSION`, in
+    // the schema it named. The ones SPG provides are relocatable, as
+    // PostgreSQL's are.
+    let version_of = |name: &str| {
+        INSTALLED_EXTENSIONS
+            .iter()
+            .find(|(e, _)| e.eq_ignore_ascii_case(name))
+            .map_or("", |(_, v)| v)
+    };
+    let row = |oid: i64, name: &str, namespace: i64, relocatable: bool| {
+        Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text(String::from(name)),
+            Value::BigInt(crate::role_directory::BOOTSTRAP_OID),
+            Value::BigInt(namespace),
+            Value::Bool(relocatable),
+            Value::text(String::from(version_of(name))),
+            Value::Null,
+            Value::Null,
+        ])
+    };
+    let mut rows: Vec<Row<'static>> =
+        alloc::vec![row(13643, crate::extension::ALWAYS_INSTALLED, 11, false)];
+    for (i, (name, schema)) in cat.extensions().iter().enumerate() {
+        let namespace = match schema.as_str() {
+            "pg_catalog" => 11,
+            "information_schema" => 13000,
+            _ => 2200,
+        };
+        rows.push(row(OID_EXTENSION_BASE + i as i64, name, namespace, true));
+    }
     (schema, rows)
 }
+
+/// 8.0.3 — `(oid, name)` of every installed extension, in `pg_extension`'s
+/// numbering.
+fn extension_oids(cat: &Catalog) -> Vec<(i64, String)> {
+    let mut out = alloc::vec![(13643, String::from(crate::extension::ALWAYS_INSTALLED))];
+    out.extend(
+        cat.extensions()
+            .keys()
+            .enumerate()
+            .map(|(i, name)| (OID_EXTENSION_BASE + i as i64, name.clone())),
+    );
+    out
+}
+
+/// 8.0.3 — the comment each extension's control file gives it, measured on
+/// PG 18.6 (`pg_available_extensions.comment`). An extension not listed
+/// here gets no comment rather than an invented one.
+const EXTENSION_COMMENTS: &[(&str, &str)] = &[
+    ("citext", "data type for case-insensitive character strings"),
+    ("hstore", "data type for storing sets of (key, value) pairs"),
+    (
+        "pg_stat_statements",
+        "track planning and execution statistics of all SQL statements executed",
+    ),
+    (
+        "pg_trgm",
+        "text similarity measurement and index searching based on trigrams",
+    ),
+    ("pgcrypto", "cryptographic functions"),
+    ("plpgsql", "PL/pgSQL procedural language"),
+    (
+        "uuid-ossp",
+        "generate universally unique identifiers (UUIDs)",
+    ),
+];
+
+/// 8.0.3 — the oids of installed extensions, a band of their own above
+/// FirstNormalObjectId (16384), so `pg_dump` dumps them.
+const OID_EXTENSION_BASE: i64 = 700_000;
 
 /// v7.39 (round 312, V33) — `pg_get_functiondef`'s output: a complete,
 /// re-runnable CREATE statement.
@@ -9628,8 +9997,8 @@ pub(crate) fn synth_pg_extension() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 /// (`int` → `integer`), because that is what PG prints regardless of how
 /// the function was declared.
 pub(crate) fn render_function_def(f: &spg_storage::FunctionDef) -> alloc::string::String {
-    let args = canonical_arg_list(&f.args_repr);
-    let returns = canonical_type_word(f.returns.trim());
+    let args = function_argument_list(f);
+    let returns = function_result_type(f);
     // v7.39 (round 322, V46) — the attribute line, when anything was
     // declared away from PG's defaults. Measured on PG 18.4, the order is
     // volatility, PARALLEL, STRICT, SECURITY DEFINER, LEAKPROOF, COST,
@@ -9647,6 +10016,97 @@ pub(crate) fn render_function_def(f: &spg_storage::FunctionDef) -> alloc::string
         f.language,
         f.body,
     )
+}
+
+/// 8.0.3 — `pg_get_constraintdef` of a domain constraint: `NOT NULL`, or
+/// `CHECK (<predicate>)` in catalog form with `VALUE` typed as the domain's
+/// base type (`CHECK ((VALUE <> ''::text))`, measured on 18.6).
+pub(crate) fn domain_constraint_def(
+    cat: &Catalog,
+    typid: i64,
+    conname: &str,
+    qualify: bool,
+) -> Option<alloc::string::String> {
+    let (_, _, domains) = user_type_oids(cat);
+    let (name, _) = domains.into_iter().find(|(_, o)| *o == typid)?;
+    let d = cat.domain_types().get(&name)?;
+    if conname == alloc::format!("{name}_not_null") && !d.nullable {
+        return Some(alloc::string::String::from("NOT NULL"));
+    }
+    let check = d.checks.iter().find(|c| c.name == conname)?;
+    let body =
+        crate::catalog_deparse::domain_check_text(&check.expr, d.base_type, qualify.then_some(cat))
+            .unwrap_or_else(|| alloc::format!("({})", check.expr));
+    Some(alloc::format!("CHECK ({body})"))
+}
+
+/// 8.0.3 — `pg_get_triggerdef`: the CREATE TRIGGER PG prints, measured on
+/// 18.6. Events in PG's fixed order (INSERT, DELETE, UPDATE, TRUNCATE)
+/// whatever order they were written in; the table always schema-qualified;
+/// the function qualified when the search path leaves `public` out; the
+/// WHEN predicate in catalog form, doubly parenthesised.
+pub(crate) fn trigger_def(cat: &Catalog, oid: i64, qualify: bool) -> Option<alloc::string::String> {
+    let index = usize::try_from(oid.checked_sub(OID_TRIGGER_BASE + 1)?).ok()?;
+    let t = cat.triggers().get(index)?;
+    let has = |ev: &str| t.events.iter().any(|e| e.eq_ignore_ascii_case(ev));
+    let mut events: Vec<alloc::string::String> = Vec::new();
+    for ev in ["INSERT", "DELETE", "UPDATE", "TRUNCATE"] {
+        if !has(ev) {
+            continue;
+        }
+        if ev == "UPDATE" && !t.update_columns.is_empty() {
+            events.push(alloc::format!("UPDATE OF {}", t.update_columns.join(", ")));
+        } else {
+            events.push(alloc::string::String::from(ev));
+        }
+    }
+    let level = if t.for_each.eq_ignore_ascii_case("ROW") {
+        "ROW"
+    } else {
+        "STATEMENT"
+    };
+    let when = if t.when_condition.trim().is_empty() {
+        alloc::string::String::new()
+    } else {
+        let cols = cat
+            .get(&t.table)
+            .map(|tb| tb.schema().columns.clone())
+            .unwrap_or_default();
+        let pred = crate::catalog_deparse::predicate_text(
+            &t.when_condition,
+            &cols,
+            qualify.then_some(cat),
+        )
+        .unwrap_or_else(|| t.when_condition.clone());
+        alloc::format!(" WHEN ({pred})")
+    };
+    Some(alloc::format!(
+        "CREATE TRIGGER {} {} {} ON public.{} FOR EACH {level}{when} EXECUTE FUNCTION {}()",
+        t.name,
+        t.timing.to_ascii_uppercase(),
+        events.join(" OR "),
+        t.table,
+        crate::qualify::user_object_name(&t.function, qualify),
+    ))
+}
+
+/// 8.0.3 — a user function's argument list as PG prints it
+/// (`pg_get_function_arguments`).
+pub(crate) fn function_argument_list(f: &spg_storage::FunctionDef) -> alloc::string::String {
+    canonical_arg_list(&f.args_repr)
+}
+
+/// 8.0.3 — a user function's result type as PG prints it
+/// (`pg_get_function_result`).
+pub(crate) fn function_result_type(f: &spg_storage::FunctionDef) -> alloc::string::String {
+    canonical_type_word(f.returns.trim())
+}
+
+/// 8.0.3 — the user function behind a `pg_proc` oid, in the numbering
+/// `synth_pg_proc` publishes: `OID_FUNC_BASE + 1` for the first.
+pub(crate) fn user_function_for_oid(cat: &Catalog, oid: i64) -> Option<&spg_storage::FunctionDef> {
+    let index = usize::try_from(oid.checked_sub(OID_FUNC_BASE + 1)?).ok()?;
+    cat.functions().values().nth(index)
 }
 
 /// v7.39 (round 322, V46) — the declared attribute words in PG's print
@@ -10038,7 +10498,10 @@ pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_views(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("viewname", DataType::Text, false),
@@ -10047,24 +10510,32 @@ pub(crate) fn synth_pg_views(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
         ColumnSchema::new("definition", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for (name, def) in cat.views_all() {
-        let Some(name) = cat.listed_name(name) else {
+    for (stored, def) in cat.views_all() {
+        let Some(name) = cat.listed_name(stored) else {
             continue;
         };
+        let owner = cat.object_owner(spg_storage::NonTableKind::View, stored);
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(name.to_string()),
-            Value::text(CATALOG_OWNER),
+            Value::text(String::from(roles.owner_name(owner))),
             Value::text(def.body.clone()),
         ]));
     }
     (schema, rows)
 }
 
-/// The name behind the owner oid every catalog synth reports (10).
-/// One constant, so pg_views.viewowner, pg_matviews.matviewowner and
-/// pg_class.relowner cannot name different people.
-pub(crate) const CATALOG_OWNER: &str = "postgres";
+/// 8.0.3 — a sequence's owner. One made for a serial column records none
+/// and belongs to its table's owner, which is who ran the CREATE TABLE that
+/// made it.
+fn sequence_owner<'a>(cat: &'a Catalog, def: &'a spg_storage::SequenceDef) -> Option<&'a str> {
+    def.owner.as_deref().or_else(|| {
+        def.owned_by
+            .as_ref()
+            .and_then(|(table, _)| cat.get(table))
+            .and_then(|t| t.schema().owner.as_deref())
+    })
+}
 
 /// v7.39 (round 542) — `pg_catalog.pg_matviews`, with rows.
 ///
@@ -10073,7 +10544,10 @@ pub(crate) const CATALOG_OWNER: &str = "postgres";
 /// round 338, when pg_class began reporting relkind 'm' — so a tool
 /// listing materialized views the canonical way found none of them, and
 /// its column was `viewname` where PG's is `matviewname`.
-pub(crate) fn synth_pg_matviews(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_matviews(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("matviewname", DataType::Text, false),
@@ -10095,7 +10569,7 @@ pub(crate) fn synth_pg_matviews(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(name.clone()),
-            Value::text(CATALOG_OWNER),
+            Value::text(String::from(roles.owner_name(t.schema().owner.as_deref()))),
             Value::Null,
             Value::Bool(!t.indices().is_empty()),
             Value::Bool(true),
@@ -10731,7 +11205,10 @@ fn infer_guc_vartype(v: &str) -> &'static str {
 /// v7.39 — `pg_catalog.pg_tables` (the convenience view PG ships).
 /// One row per user table; replaces the pgwire canned response so
 /// projections / WHERE / JOINs work like any relation.
-pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_tables(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("tablename", DataType::Text, false),
@@ -10749,7 +11226,7 @@ pub(crate) fn synth_pg_tables(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         rows.push(Row::new(alloc::vec![
             Value::text("public"),
             Value::text(tname.clone()),
-            Value::text("admin"),
+            Value::text(String::from(roles.owner_name(t.schema().owner.as_deref()))),
             Value::Null,
             Value::Bool(has_indexes),
             Value::Bool(false),
@@ -10941,7 +11418,30 @@ pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         } else {
             0
         };
-        let classoid = if is_relation { 1259 } else { 0 };
+        // 8.0.3 — a function's comment belongs to its pg_proc row (1255)
+        // and a type's to its pg_type row (1247). Both read (0, 0), which
+        // matches no object, so `pg_dump` dropped every one of them.
+        let function_oid = || {
+            cat.functions()
+                .values()
+                .position(|f| f.name == relname)
+                .and_then(|i| i32::try_from(OID_FUNC_BASE + 1 + i as i64).ok())
+        };
+        let type_oid = || {
+            let (e, c, d) = user_type_oids(cat);
+            e.into_iter()
+                .chain(c)
+                .chain(d)
+                .find(|(n, _)| n == relname)
+                .and_then(|(_, o)| i32::try_from(o).ok())
+        };
+        let (objoid, classoid) = match (kind, builtin_schema_oid(relname)) {
+            ("schema", Some(nsp)) => (nsp, 2615),
+            ("function", _) => (function_oid().unwrap_or(0), 1255),
+            ("type", _) => (type_oid().unwrap_or(0), 1247),
+            _ if is_relation => (objoid, 1259),
+            _ => (objoid, 0),
+        };
         rows.push(Row::new(alloc::vec![
             Value::Int(objoid),
             Value::Int(classoid),
@@ -10949,7 +11449,49 @@ pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
             Value::text(text.clone()),
         ]));
     }
+    // 8.0.3 — an extension's comment, which PG takes from its control file
+    // and `pg_dump` writes back (`COMMENT ON EXTENSION`).
+    for (oid, name) in extension_oids(cat) {
+        if let Some((_, text)) = EXTENSION_COMMENTS.iter().find(|(n, _)| *n == name) {
+            rows.push(Row::new(alloc::vec![
+                Value::Int(i32::try_from(oid).unwrap_or(0)),
+                Value::Int(3079),
+                Value::Int(0),
+                Value::text(*text),
+            ]));
+        }
+    }
+    // 8.0.3 — the two schema comments every PostgreSQL database starts
+    // with (measured on 18.6), unless a COMMENT ON SCHEMA replaced one.
+    // Without them `pg_dump` saw `public` as having had its comment
+    // removed and wrote `COMMENT ON SCHEMA public IS ''` into every dump.
+    for (nsp, name, text) in [
+        (11, "pg_catalog", "system catalog schema"),
+        (2200, "public", "standard public schema"),
+    ] {
+        if !cat
+            .comments()
+            .contains_key(&alloc::format!("schema:{name}"))
+        {
+            rows.push(Row::new(alloc::vec![
+                Value::Int(nsp),
+                Value::Int(2615),
+                Value::Int(0),
+                Value::text(text),
+            ]));
+        }
+    }
     (cols, rows)
+}
+
+/// The oids of the schemas every SPG database has.
+fn builtin_schema_oid(name: &str) -> Option<i32> {
+    match name {
+        "pg_catalog" => Some(11),
+        "public" => Some(2200),
+        "information_schema" => Some(13000),
+        _ => None,
+    }
 }
 
 /// v7.39 (read01 round 83) — the ONE `CREATE [UNIQUE] INDEX …` renderer, PG's
@@ -10988,11 +11530,20 @@ fn render_constraint_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> allo
 /// `catalog_indexes`' counting rule over a different table list, so it
 /// answered a neighbouring table's index. Both now enumerate once and
 /// render from the entry.
-pub(crate) fn catalog_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> alloc::string::String {
+///
+/// 8.0.3 — `qualify_in` is the catalog when the reader's search path leaves
+/// `public` out, so user functions and types in the key or predicate are
+/// written qualified (see `qualify`).
+pub(crate) fn catalog_indexdef(
+    cat: &Catalog,
+    t: &spg_storage::Table,
+    ci: &CatalogIndex,
+    qualify_in: Option<&Catalog>,
+) -> alloc::string::String {
     if ci.is_storage
         && let Some(idx) = t.indices().iter().find(|i| i.name == ci.name)
     {
-        return render_indexdef(t, idx, &ci.table);
+        return render_indexdef(t, idx, &ci.table, cat, qualify_in.is_some());
     }
     render_constraint_indexdef(t, ci)
 }
@@ -11001,7 +11552,10 @@ pub(crate) fn render_indexdef(
     t: &spg_storage::Table,
     idx: &spg_storage::Index,
     tname: &str,
+    cat: &Catalog,
+    qualify: bool,
 ) -> alloc::string::String {
+    let qualify_in = qualify.then_some(cat);
     let col_at = |pos: usize| -> alloc::string::String {
         t.schema()
             .columns
@@ -11025,12 +11579,20 @@ pub(crate) fn render_indexdef(
     // collation — and `ColumnSchema` keeps a collation ENUM, not the
     // name it was declared under, so SPG cannot tell that case apart.
     // Recorded rather than guessed: the rarer spelling over-prints.
-    let collate_prefix = idx
+    let mut collate_prefix = idx
         .collation
         .as_ref()
         .map_or_else(alloc::string::String::new, |c| {
             alloc::format!(" COLLATE \"{c}\"")
         });
+    // 8.0.3 — the declared operator class follows, unless it is the
+    // default one PG leaves out (`jsonb_ops`, `text_ops`, …; measured).
+    if let Some(op) = cat.index_opclass(&idx.name)
+        && !crate::opclass::is_default(op)
+    {
+        collate_prefix.push(' ');
+        collate_prefix.push_str(op);
+    }
     // v7.39.11 — one renderer for every key column, not just the
     // leading one.
     //
@@ -11128,7 +11690,14 @@ pub(crate) fn render_indexdef(
     // SPG stores a binary/unary expression's Display form already wrapped in one
     // pair (`(a + b)`), so add the outer pair exactly when the stored form opens
     // with `(` — which a function call never does.
-    let key = match &idx.expression {
+    // 8.0.3 — the key expression in catalog form (a varchar argument's
+    // implicit cast, a typed literal), with a user function qualified when
+    // asked; see `catalog_deparse`.
+    let qualified_expr = idx.expression.as_deref().map(|expr| {
+        crate::catalog_deparse::predicate_text(expr, &t.schema().columns, qualify_in)
+            .unwrap_or_else(|| alloc::string::String::from(expr))
+    });
+    let key = match &qualified_expr {
         Some(expr) if expr.starts_with('(') => key_list(alloc::format!(
             "({expr}){collate_prefix}{}",
             order_suffix(idx.descending, idx.nulls_first)
@@ -11170,12 +11739,18 @@ pub(crate) fn render_indexdef(
     };
     match &idx.partial_predicate {
         Some(pred) => {
-            let p = pred.trim();
-            let wrapped = if p.starts_with('(') && p.ends_with(')') {
-                alloc::string::String::from(p)
-            } else {
-                alloc::format!("({p})")
-            };
+            // 8.0.3 — PG's catalog form (see `catalog_deparse`): a bare
+            // boolean column is not parenthesised, a literal is typed.
+            let wrapped =
+                crate::catalog_deparse::predicate_text(pred, &t.schema().columns, qualify_in)
+                    .unwrap_or_else(|| {
+                        let p = pred.trim();
+                        if p.starts_with('(') && p.ends_with(')') {
+                            alloc::string::String::from(p)
+                        } else {
+                            alloc::format!("({p})")
+                        }
+                    });
             alloc::format!(
                 "CREATE {unique_kw}INDEX {} ON public.{tname} USING {am} ({key}){nnd} WHERE {wrapped}",
                 idx.name,
@@ -11209,7 +11784,7 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         };
         {
             let tname = ci.table.clone();
-            let indexdef = catalog_indexdef(t, &ci);
+            let indexdef = catalog_indexdef(cat, t, &ci, None);
             rows.push(Row::new(alloc::vec![
                 Value::text("public"),
                 Value::text(tname.clone()),
@@ -11356,6 +11931,11 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 /// `public` (user-facing), `pg_catalog` (built-in), and
 /// `information_schema` (PG meta).
 pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // 8.0.3 — `public` belongs to `pg_database_owner` (6171), as in every
+    // PostgreSQL since 15; the other schemas to the bootstrap superuser.
+    // It read 10, so `pg_dump` wrote `ALTER SCHEMA public OWNER TO
+    // postgres` and a GRANT/REVOKE block for an owner PostgreSQL does not
+    // have.
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("nspname", DataType::Text, false),
@@ -11398,7 +11978,7 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         Row::new(alloc::vec![
             Value::BigInt(2200),
             Value::text("public"),
-            Value::BigInt(10),
+            Value::BigInt(crate::role_directory::DATABASE_OWNER_OID),
             Value::text(public_acl),
         ]),
         Row::new(alloc::vec![
@@ -11658,6 +12238,75 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
 /// catalogs are listed — PG's `pg_stat_*` / `pg_tables` / `pg_policies` are
 /// VIEWS created by initdb, and their oids sit in the 12000s and vary by
 /// build, so there is nothing there to match.
+/// 8.0.3 — `pg_class.oid` of every PG 18.6 system catalog, measured with
+/// `SELECT relname, oid FROM pg_class WHERE relnamespace = 11 AND relkind = 'r'`.
+const PG_CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
+    ("pg_aggregate", 2600),
+    ("pg_am", 2601),
+    ("pg_amop", 2602),
+    ("pg_amproc", 2603),
+    ("pg_attrdef", 2604),
+    ("pg_attribute", 1249),
+    ("pg_auth_members", 1261),
+    ("pg_authid", 1260),
+    ("pg_cast", 2605),
+    ("pg_class", 1259),
+    ("pg_collation", 3456),
+    ("pg_constraint", 2606),
+    ("pg_conversion", 2607),
+    ("pg_database", 1262),
+    ("pg_db_role_setting", 2964),
+    ("pg_default_acl", 826),
+    ("pg_depend", 2608),
+    ("pg_description", 2609),
+    ("pg_enum", 3501),
+    ("pg_event_trigger", 3466),
+    ("pg_extension", 3079),
+    ("pg_foreign_data_wrapper", 2328),
+    ("pg_foreign_server", 1417),
+    ("pg_foreign_table", 3118),
+    ("pg_index", 2610),
+    ("pg_inherits", 2611),
+    ("pg_init_privs", 3394),
+    ("pg_language", 2612),
+    ("pg_largeobject", 2613),
+    ("pg_largeobject_metadata", 2995),
+    ("pg_namespace", 2615),
+    ("pg_opclass", 2616),
+    ("pg_operator", 2617),
+    ("pg_opfamily", 2753),
+    ("pg_parameter_acl", 6243),
+    ("pg_partitioned_table", 3350),
+    ("pg_policy", 3256),
+    ("pg_proc", 1255),
+    ("pg_publication", 6104),
+    ("pg_publication_namespace", 6237),
+    ("pg_publication_rel", 6106),
+    ("pg_range", 3541),
+    ("pg_replication_origin", 6000),
+    ("pg_rewrite", 2618),
+    ("pg_seclabel", 3596),
+    ("pg_sequence", 2224),
+    ("pg_shdepend", 1214),
+    ("pg_shdescription", 2396),
+    ("pg_shseclabel", 3592),
+    ("pg_statistic", 2619),
+    ("pg_statistic_ext", 3381),
+    ("pg_statistic_ext_data", 3429),
+    ("pg_subscription", 6100),
+    ("pg_subscription_rel", 6102),
+    ("pg_tablespace", 1213),
+    ("pg_transform", 3576),
+    ("pg_trigger", 2620),
+    ("pg_ts_config", 3602),
+    ("pg_ts_config_map", 3603),
+    ("pg_ts_dict", 3600),
+    ("pg_ts_parser", 3601),
+    ("pg_ts_template", 3764),
+    ("pg_type", 1247),
+    ("pg_user_mapping", 1418),
+];
+
 pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
     ("pg_am", 2601),
     ("pg_amop", 2602),
@@ -11734,7 +12383,7 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_constraint" => synth_pg_constraint(cat).0,
         "pg_depend" => synth_pg_depend(cat).0,
         "pg_enum" => synth_pg_enum(cat).0,
-        "pg_extension" => synth_pg_extension().0,
+        "pg_extension" => synth_pg_extension(cat).0,
         "pg_index" => synth_pg_index_raw(cat).0,
         "pg_inherits" => synth_pg_inherits(cat).0,
         "pg_ts_config" => synth_pg_ts_config(cat).0,
@@ -11749,13 +12398,13 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_opfamily" => synth_pg_opfamily(cat).0,
         "pg_operator" => synth_pg_operator(cat).0,
         "pg_policy" => synth_pg_policy(cat).0,
-        "pg_proc" => synth_pg_proc(cat).0,
+        "pg_proc" => synth_pg_proc(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0,
         "pg_statistic" => synth_pg_statistic(cat, &crate::statistics::Statistics::new()).0,
         "pg_stats" => synth_pg_stats(cat, &crate::statistics::Statistics::new()).0,
         "pg_statistic_ext" => synth_pg_statistic_ext(cat).0,
         "pg_tablespace" => synth_pg_tablespace(cat).0,
         "pg_trigger" => synth_pg_trigger(cat).0,
-        "pg_type" => synth_pg_type(cat).0,
+        "pg_type" => synth_pg_type(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0,
         _ => return None,
     })
 }
@@ -11769,20 +12418,19 @@ fn relation_oid_for_meta_view(name: &str) -> i64 {
                 .map(alloc::string::String::from)
         })
         .unwrap_or_else(|| alloc::string::String::from(name));
-    // The well-known oids PG assigns its catalogs; anything else — an
+    // The oids PG assigns its catalogs; anything else — an
     // information_schema view, a pg_stat_* view — has no fixed oid and
     // reports 0, which is what a relation with no entry reports.
-    match bare.as_str() {
-        "pg_type" => 1247,
-        "pg_attribute" => 1249,
-        "pg_proc" => 1255,
-        "pg_class" => 1259,
-        "pg_database" => 1262,
-        "pg_constraint" => 2606,
-        "pg_index" => 2610,
-        "pg_namespace" => 2615,
-        _ => 0,
-    }
+    //
+    // 8.0.3 — every one of them. The list named eight, so `tableoid` read 0
+    // on `pg_attrdef`, `pg_depend`, `pg_extension` and the rest, and
+    // `pg_dump`, which identifies each catalog object by
+    // `(tableoid, oid)`, could not match a dependency to the object it was
+    // about: a serial column's default went inline, ahead of its sequence.
+    PG_CATALOG_TABLE_OIDS
+        .iter()
+        .find(|(n, _)| *n == bare.as_str())
+        .map_or(0, |(_, oid)| *oid)
 }
 
 pub(crate) fn materialise_meta_view(
@@ -11993,12 +12641,31 @@ pub(crate) fn collect_meta_view_names(
 
 /// 7.38.1 S5.2 — a partition bound in PG's SQL literal form (what
 /// `pg_get_expr(relpartbound, oid)` prints and pg_dump replays).
-pub(crate) fn partition_bound_sql(b: &spg_storage::PartitionBound) -> String {
+///
+/// 8.0.3 — every temporal bound is held as an instant, so the key column's
+/// type decides the spelling: PG 18.6 prints `'2026-01-01'` for a `date`
+/// key and `'2026-06-01 12:30:00'` for a `timestamp` one. Both used to come
+/// out as timestamptz text, `'2026-01-01 00:00:00+00'`.
+pub(crate) fn partition_bound_sql(
+    b: &spg_storage::PartitionBound,
+    key: Option<DataType>,
+) -> String {
     use spg_storage::PartitionBound as B;
     match b {
         B::MinValue => String::from("MINVALUE"),
         B::MaxValue => String::from("MAXVALUE"),
-        B::TimestampTz(us) => alloc::format!("'{}'", crate::eval::format_timestamptz(*us)),
+        B::TimestampTz(us) => match key {
+            Some(DataType::Date) => alloc::format!(
+                "'{}'",
+                crate::eval::format_date(
+                    i32::try_from(us.div_euclid(86_400_000_000)).unwrap_or(i32::MAX)
+                )
+            ),
+            Some(DataType::Timestamp) => {
+                alloc::format!("'{}'", crate::eval::format_timestamp(*us))
+            }
+            _ => alloc::format!("'{}'", crate::eval::format_timestamptz(*us)),
+        },
         B::BigInt(n) => alloc::format!("'{n}'"),
         B::Int(n) => alloc::format!("'{n}'"),
         B::SmallInt(n) => alloc::format!("'{n}'"),
@@ -12009,17 +12676,46 @@ pub(crate) fn partition_bound_sql(b: &spg_storage::PartitionBound) -> String {
 
 /// 7.38.1 S5.2 — `pg_class.relpartbound` deparse for a partition
 /// child, PG's exact clause shape. `None` for parents / plain tables.
-pub(crate) fn relpartbound_text(role: &spg_storage::PartitionRole) -> Option<String> {
+pub(crate) fn relpartbound_text(
+    cat: &Catalog,
+    role: &spg_storage::PartitionRole,
+) -> Option<String> {
     use spg_storage::PartitionRole as R;
+    // The parent's first key column's type.
+    let key_type = |parent: &str| -> Option<DataType> {
+        let t = cat.get(parent)?;
+        let R::Parent {
+            key_column_positions,
+            ..
+        } = t.schema().partition_role.as_ref()?
+        else {
+            return None;
+        };
+        let pos = *key_column_positions.first()?;
+        t.schema().columns.get(pos).map(|c| c.ty)
+    };
     Some(match role {
         R::Parent { .. } => return None,
-        R::Range { lower, upper, .. } => alloc::format!(
-            "FOR VALUES FROM ({}) TO ({})",
-            partition_bound_sql(lower),
-            partition_bound_sql(upper)
-        ),
-        R::List { values, .. } => {
-            let items: Vec<String> = values.iter().map(partition_bound_sql).collect();
+        R::Range {
+            parent_name,
+            lower,
+            upper,
+            ..
+        } => {
+            let key = key_type(parent_name);
+            alloc::format!(
+                "FOR VALUES FROM ({}) TO ({})",
+                partition_bound_sql(lower, key),
+                partition_bound_sql(upper, key)
+            )
+        }
+        R::List {
+            parent_name,
+            values,
+            ..
+        } => {
+            let key = key_type(parent_name);
+            let items: Vec<String> = values.iter().map(|v| partition_bound_sql(v, key)).collect();
             alloc::format!("FOR VALUES IN ({})", items.join(", "))
         }
         R::Hash {

@@ -1026,6 +1026,7 @@ impl Engine {
                     let (schema, rows) = synth_pg_class(
                         self.active_catalog(),
                         i64::try_from(self.vacuum_oldest_active()).unwrap_or(i64::MAX),
+                        &crate::role_directory::RoleDirectory::of(self),
                     );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
@@ -1036,7 +1037,10 @@ impl Engine {
                 // v7.17.0 Phase 3.P0-50 — pg_catalog.pg_type for
                 // sqlx / SQLAlchemy / Diesel / pgAdmin lookups.
                 "__spg_pg_type" => {
-                    let (schema, rows) = synth_pg_type(self.active_catalog());
+                    let (schema, rows) = synth_pg_type(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.39 (round 621) — pg_catalog.pg_operator, which did not
@@ -1048,7 +1052,10 @@ impl Engine {
                 // v7.17.0 Phase 3.P0-51 — pg_catalog.pg_proc for
                 // function-name introspection (ORM / pgAdmin).
                 "__spg_pg_proc" => {
-                    let (schema, rows) = synth_pg_proc(self.active_catalog());
+                    let (schema, rows) = synth_pg_proc(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.24 (round-16 D) — pg_catalog.pg_trigger. The
@@ -1070,8 +1077,10 @@ impl Engine {
                 // v7.39 — pg_tables convenience view (was a pgwire
                 // canned response that ignored projections).
                 "__spg_pg_tables" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_tables(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_tables(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.37.24 (24.1) — pg_catalog.pg_enum (label list
@@ -1404,7 +1413,10 @@ impl Engine {
                 // pg_views surfaces every CREATE VIEW result; SPG
                 // ships one row per declared view from the catalog.
                 "__spg_pg_views" => {
-                    let (schema, rows) = synth_pg_views(self.active_catalog());
+                    let (schema, rows) = synth_pg_views(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.39 (round 143) — pg_catalog.pg_rules: one row per
@@ -1424,8 +1436,10 @@ impl Engine {
                 // v7.39 (round 542) — pg_catalog.pg_matviews, with rows
                 // and PG's own column names.
                 "__spg_pg_matviews" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_matviews(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_matviews(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // pg_catalog.pg_extension — native capability list
@@ -1441,8 +1455,10 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_sequences" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_sequences(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_sequences(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_range" => {
@@ -1478,7 +1494,7 @@ impl Engine {
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_extension" => {
-                    let (schema, rows) = synth_pg_extension();
+                    let (schema, rows) = synth_pg_extension(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.39 (round 502) — the timezone catalogues.
@@ -5387,8 +5403,8 @@ impl Engine {
                 };
                 let cat = self.active_catalog();
                 let mut rows: alloc::vec::Vec<Row<'static>> = alloc::vec::Vec::new();
-                for (name, def) in cat.sequences_all() {
-                    if crate::system_catalog::relation_oid(cat, name) == Some(want) {
+                for (name, def) in crate::sequence::catalog_sequences(cat) {
+                    if crate::system_catalog::relation_oid(cat, &name) == Some(want) {
                         rows.push(Row::new(alloc::vec![
                             Value::BigInt(def.last_value),
                             Value::Bool(def.is_called),

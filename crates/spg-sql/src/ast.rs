@@ -148,6 +148,12 @@ pub enum ValidateOnlyKind {
     SecurityLabel,
     /// v7.39 (round 697) — `CREATE EXTENSION <e>`: the extension must be
     /// AVAILABLE (PG: `extension "x" is not available`).
+    ///
+    /// 8.0.3 — and it is installed. `names` is `[e]` or `[e, schema]` for
+    /// `SCHEMA <s>`, preceded by an EMPTY name for `IF NOT EXISTS`. An empty
+    /// name marks the flag because no identifier can be empty (PG refuses a
+    /// zero-length delimited identifier) and this enum cannot grow a field
+    /// or a variant without a breaking change.
     ExtensionAvailable,
     /// v7.39 (round 708) — `ALTER TYPE <t> <any no-op form>`: the TYPE must
     /// exist (PG: `type "x" does not exist`); the action itself stays a
@@ -189,6 +195,9 @@ pub enum ValidateOnlyKind {
     ForeignInfra,
     /// v7.39 (round 697) — `DROP EXTENSION <e>`: it must be installed
     /// (PG: `extension "x" does not exist`).
+    ///
+    /// 8.0.3 — `names` is preceded by an EMPTY name for `IF EXISTS`; see
+    /// [`ValidateOnlyKind::ExtensionAvailable`] for why.
     ExtensionInstalled,
     /// v7.40.12 — `SET SESSION AUTHORIZATION <r>`. APPENDED, not
     /// inserted: putting it beside `RoleName` where it belongs read
@@ -4011,8 +4020,24 @@ impl Expr {
         &mut self,
         f: &mut impl FnMut(&mut SelectStatement) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.for_each_node_mut(&mut |_| Ok(()), f)
+    }
+
+    /// 8.0.3 — [`Self::for_each_subquery_mut`], also handing every
+    /// expression node — this one included — to `on_node` before its
+    /// children are visited. The same walk, so the two cannot disagree
+    /// about which nodes an expression has.
+    ///
+    /// # Errors
+    /// Whatever either callback returns.
+    pub fn for_each_node_mut<E>(
+        &mut self,
+        on_node: &mut impl FnMut(&mut Self) -> Result<(), E>,
+        f: &mut impl FnMut(&mut SelectStatement) -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut stack: Vec<&mut Self> = alloc::vec![self];
         while let Some(e) = stack.pop() {
+            on_node(e)?;
             match e {
                 Self::Literal(_) | Self::Column(_) | Self::Placeholder(_) => {}
                 Self::NamedArg { expr, .. }
@@ -6176,7 +6201,14 @@ impl fmt::Display for Statement {
                 }
                 ValidateOnlyKind::SecurityLabel => f.write_str("SECURITY LABEL"),
                 ValidateOnlyKind::ExtensionAvailable => {
-                    write!(f, "CREATE EXTENSION {}", names.join(", "))
+                    let (flag, rest) = match names.split_first() {
+                        Some((first, rest)) if first.is_empty() => ("IF NOT EXISTS ", rest),
+                        _ => ("", names.as_slice()),
+                    };
+                    match rest {
+                        [e, schema] => write!(f, "CREATE EXTENSION {flag}{e} SCHEMA {schema}"),
+                        _ => write!(f, "CREATE EXTENSION {flag}{}", rest.join(", ")),
+                    }
                 }
                 ValidateOnlyKind::ForeignInfra => f.write_str("CREATE SERVER"),
                 ValidateOnlyKind::CollationName => {
@@ -6204,9 +6236,12 @@ impl fmt::Display for Statement {
                 ValidateOnlyKind::LanguageName => {
                     write!(f, "DROP LANGUAGE {}", names.join(", "))
                 }
-                ValidateOnlyKind::ExtensionInstalled => {
-                    write!(f, "DROP EXTENSION {}", names.join(", "))
-                }
+                ValidateOnlyKind::ExtensionInstalled => match names.split_first() {
+                    Some((first, rest)) if first.is_empty() => {
+                        write!(f, "DROP EXTENSION IF EXISTS {}", rest.join(", "))
+                    }
+                    _ => write!(f, "DROP EXTENSION {}", names.join(", ")),
+                },
             },
             Self::AlterSystem { parameter } => match parameter {
                 Some(p) => write!(f, "ALTER SYSTEM RESET {p}"),
@@ -8777,7 +8812,17 @@ impl fmt::Display for TableRef {
             }
             return Ok(());
         }
-        write!(f, "{}", quote_ident(&self.name))?;
+        // 8.0.3 — a schema-qualified name. The parser strips the schema
+        // from every relation it reads, so a name carrying one was put
+        // there by a deparse that has to spell it out (a view body under
+        // an empty search_path, as pg_dump reads it); quoting the whole
+        // string would name a relation called "public.t".
+        match self.name.split_once('.') {
+            Some((schema @ ("public" | "pg_catalog" | "information_schema"), rest)) => {
+                write!(f, "{schema}.{}", quote_ident(rest))?;
+            }
+            _ => write!(f, "{}", quote_ident(&self.name))?,
+        }
         if let Some(seg) = self.as_of_segment {
             write!(f, " AS OF SEGMENT {seg}")?;
         }

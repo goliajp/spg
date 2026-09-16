@@ -2326,19 +2326,21 @@ impl Engine {
                     // today into one that needs editing. Saying nothing was
                     // the actual defect: `CREATE EXTENSION hstore` reported
                     // success and nothing hstore-shaped worked afterwards.
-                    K::ExtensionAvailable | K::ExtensionInstalled => {
-                        for n in names {
-                            if !crate::system_catalog::INSTALLED_EXTENSIONS
-                                .iter()
-                                .any(|(e, _)| e.eq_ignore_ascii_case(n.as_str()))
-                            {
-                                self.warning(alloc::format!(
-                                    "extension \"{n}\" is not provided by this build; SPG \
-                                     accepts the statement so a dump restores, but nothing \
-                                     that extension supplies will be available"
-                                ));
-                            }
-                        }
+                    // 8.0.3 — and the two now install and remove; see
+                    // `extension`.
+                    K::ExtensionAvailable => {
+                        let modified_catalog = self.exec_create_extension(&names)?;
+                        return Ok(QueryResult::CommandOk {
+                            affected: 0,
+                            modified_catalog,
+                        });
+                    }
+                    K::ExtensionInstalled => {
+                        let modified_catalog = self.exec_drop_extension(&names)?;
+                        return Ok(QueryResult::CommandOk {
+                            affected: 0,
+                            modified_catalog,
+                        });
                     }
                     // v7.39 (round 708) — ALTER TYPE's no-op forms validate
                     // the name against the three user-type catalogs.

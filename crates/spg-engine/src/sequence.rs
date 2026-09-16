@@ -696,42 +696,11 @@ impl Engine {
         if self.active_catalog().has_sequence(seq_name) {
             return;
         }
-        let Some(rest) = seq_name.strip_suffix("_seq") else {
+        let Some(def) = implicit_sequences(self.active_catalog())
+            .into_iter()
+            .find(|d| d.name == seq_name)
+        else {
             return;
-        };
-        let mut found: Option<(String, String, i64)> = None;
-        for tname in self.active_catalog().table_names() {
-            let Some(table) = self.active_catalog().get(&tname) else {
-                continue;
-            };
-            for (i, col) in table.schema().columns.iter().enumerate() {
-                if col.auto_increment && alloc::format!("{tname}_{}", col.name) == rest {
-                    let next = table.next_auto_value(i).unwrap_or(1);
-                    found = Some((tname.clone(), col.name.clone(), next - 1));
-                    break;
-                }
-            }
-            if found.is_some() {
-                break;
-            }
-        }
-        let Some((tname, cname, last)) = found else {
-            return;
-        };
-        let def = spg_storage::SequenceDef {
-            name: seq_name.to_string(),
-            data_type: spg_storage::SequenceDataType::BigInt,
-            start: 1,
-            increment: 1,
-            min_value: 1,
-            max_value: i64::MAX,
-            cache: 1,
-            cycle: false,
-            owned_by: Some((tname, cname)),
-            last_value: last.max(0),
-            is_called: last > 0,
-            owner: None,
-            acl: alloc::vec::Vec::new(),
         };
         let _ = self.active_catalog_mut().create_sequence(def, true);
     }
@@ -1325,4 +1294,69 @@ impl Engine {
             EngineError::Unsupported(alloc::format!("invalid large-object descriptor: {fd}"))
         })
     }
+}
+
+/// 8.0.3 — the backing sequence of every auto-increment column that no
+/// statement has addressed yet, as `ensure_implicit_sequence` would create
+/// it: named `<table>_<column>_seq`, owned by the column, standing at the
+/// table's own counter.
+///
+/// Such a sequence exists in PostgreSQL from the CREATE TABLE on. Here it
+/// was created only when something named it, so until then no catalog
+/// listed it, and `pg_dump` wrote a column default naming a sequence the
+/// dump never created — the restore stopped on it.
+pub(crate) fn implicit_sequences(
+    cat: &spg_storage::Catalog,
+) -> alloc::vec::Vec<spg_storage::SequenceDef> {
+    let mut out = alloc::vec::Vec::new();
+    for tname in cat.table_names() {
+        let Some(table) = cat.get(&tname) else {
+            continue;
+        };
+        for (i, col) in table.schema().columns.iter().enumerate() {
+            // A default that names its own sequence has no implicit one.
+            if !col.auto_increment || col.default_text.is_some() {
+                continue;
+            }
+            let name = alloc::format!("{tname}_{}_seq", col.name);
+            if cat.has_sequence(&name) {
+                continue;
+            }
+            let last = table.next_auto_value(i).unwrap_or(1) - 1;
+            out.push(spg_storage::SequenceDef {
+                name,
+                data_type: spg_storage::SequenceDataType::BigInt,
+                start: 1,
+                increment: 1,
+                min_value: 1,
+                max_value: i64::MAX,
+                cache: 1,
+                cycle: false,
+                owned_by: Some((tname.clone(), col.name.clone())),
+                last_value: last.max(0),
+                is_called: last > 0,
+                owner: None,
+                acl: alloc::vec::Vec::new(),
+            });
+        }
+    }
+    out
+}
+
+/// 8.0.3 — every sequence a catalog lists, in the order oids are assigned:
+/// the created ones, then the implicit ones.
+pub(crate) fn catalog_sequences(
+    cat: &spg_storage::Catalog,
+) -> alloc::vec::Vec<(String, alloc::borrow::Cow<'_, spg_storage::SequenceDef>)> {
+    let mut out: alloc::vec::Vec<(String, alloc::borrow::Cow<'_, spg_storage::SequenceDef>)> = cat
+        .sequences_all()
+        .iter()
+        .map(|(k, v)| (k.clone(), alloc::borrow::Cow::Borrowed(v)))
+        .collect();
+    out.extend(
+        implicit_sequences(cat)
+            .into_iter()
+            .map(|d| (d.name.clone(), alloc::borrow::Cow::Owned(d))),
+    );
+    out
 }

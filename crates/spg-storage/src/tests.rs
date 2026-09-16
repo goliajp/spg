@@ -932,9 +932,14 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         // appended last; absent is a single zero tag. FOURTEENTH, and it
         // caught this one on the first run too.
         const EMPTY_DB_COLLATION_TAG: usize = 1;
+        // 8.0.3 — object owners, installed extensions and index operator
+        // classes (FILE_VERSION 100), appended last: three zero u32 counts.
+        // FIFTEENTH.
+        const EMPTY_OWNERS_EXTENSIONS_OPCLASSES: usize = 12;
         full.truncate(
             full.len()
                 - 4
+                - EMPTY_OWNERS_EXTENSIONS_OPCLASSES
                 - EMPTY_DB_COLLATION_TAG
                 - EMPTY_COMMENT_BLOCK
                 - EMPTY_NONTABLE_ACL_BLOCK
@@ -1027,6 +1032,9 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // v7.39.3 — the FLOAT/DOUBLE (m,d) appendix (FILE_VERSION 94+): a
     // `u16` count of 0 when no column declares the pair. THIRTEENTH.
     const EMPTY_MYSQL_FLOAT_MD_APPENDIX: usize = 2;
+    // 8.0.3 — the identity-ALWAYS appendix (FILE_VERSION 100): a `u16`
+    // count of 0 when no column is GENERATED ALWAYS. FOURTEENTH.
+    const EMPTY_IDENTITY_ALWAYS_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
@@ -1039,7 +1047,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_COLLATION_APPENDIX
         + EMPTY_UNIQUE_TIMING_APPENDIX
         + EMPTY_MYSQL_DECLARED_TS_APPENDIX
-        + EMPTY_MYSQL_FLOAT_MD_APPENDIX;
+        + EMPTY_MYSQL_FLOAT_MD_APPENDIX
+        + EMPTY_IDENTITY_ALWAYS_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
@@ -2769,7 +2778,7 @@ fn deserialize_rejects_bad_magic() {
 #[test]
 fn deserialize_rejects_unsupported_version() {
     let mut buf = FILE_MAGIC.to_vec();
-    buf.push(100); // future version
+    buf.push(FILE_VERSION + 1); // future version
     buf.extend_from_slice(&0u32.to_le_bytes());
     let err = Catalog::deserialize(&buf).unwrap_err();
     assert!(matches!(err, StorageError::Corrupt(ref s) if s.contains("version")));

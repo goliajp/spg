@@ -174,7 +174,9 @@ fn the_catalog_text_matches_postgresql() {
         ),
         ["nextval('zs'::regclass)"]
     );
-    // The untyped spelling stays untyped, as PostgreSQL leaves it.
+    // 8.0.3 — the untyped spelling is typed too. This read `nextval('zs')`
+    // under "as PostgreSQL leaves it"; measured on 18.6, PostgreSQL stores
+    // the constant as the function's `regclass` argument either way.
     let mut e2 = Engine::new();
     e2.execute("CREATE SEQUENCE zs").unwrap();
     e2.execute("CREATE TABLE z (id bigint DEFAULT nextval('zs'), k text)")
@@ -185,7 +187,7 @@ fn the_catalog_text_matches_postgresql() {
             "SELECT column_default FROM information_schema.columns \
              WHERE table_name = 'z' AND column_name = 'id'"
         ),
-        ["nextval('zs')"]
+        ["nextval('zs'::regclass)"]
     );
 }
 

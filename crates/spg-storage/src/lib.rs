@@ -1770,9 +1770,9 @@ pub struct ColumnSchema {
     /// flavours set `auto_increment`; this additionally marks the ALWAYS
     /// flavour, whose explicit INSERT value PG rejects ("cannot insert a
     /// non-DEFAULT value into column …") unless `OVERRIDING SYSTEM VALUE`.
-    /// `false` (serial / `BY DEFAULT`) keeps the permissive path. In-memory
-    /// only for now — not yet in the catalog appendix, so a reloaded table
-    /// deserialises as `false` (the pre-existing permissive behaviour).
+    /// `false` (serial / `BY DEFAULT`) keeps the permissive path. Persisted
+    /// from FILE_VERSION 100 (8.0.3); an older image read it back as
+    /// `false`.
     pub identity_always: bool,
     /// v7.38 (read01) — the DEFAULT expression's source text, deparsed to
     /// PG-compatible form at CREATE TABLE time (e.g. `0`, `(3 + 4)`,
@@ -5426,6 +5426,10 @@ pub enum NonTableKind {
     EnumType,
     DomainType,
     CompositeType,
+    /// 8.0.3 — an extension `CREATE EXTENSION` installed.
+    Extension,
+    /// 8.0.3 — the operator class an index was declared with.
+    IndexOpclass,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -5640,6 +5644,28 @@ pub struct Catalog {
     /// FILE_VERSION 31+; older catalogs deserialise with just
     /// the built-ins.
     schemas: alloc::collections::BTreeSet<String>,
+    /// 8.0.3 — the role that created each view and user-defined type
+    /// (PG `pg_class.relowner` / `pg_type.typowner`). Tables, sequences and
+    /// functions record theirs on the definition; these four families'
+    /// definitions are public structs with no room for one, so it rides
+    /// here, keyed the way the dirty window keys them. Persisted from
+    /// FILE_VERSION 100; an older image reads back with none recorded.
+    object_owners: BTreeMap<(NonTableKind, String), String>,
+    /// 8.0.3 — the extensions `CREATE EXTENSION` installed, name → the
+    /// schema it was installed into. `pg_extension` lists these (and
+    /// `plpgsql`, which every database has); it used to list every
+    /// extension the BUILD provides, so a dump of a database that created
+    /// none of them re-created five in PostgreSQL. Persisted from
+    /// FILE_VERSION 100.
+    extensions: BTreeMap<String, String>,
+    /// 8.0.3 — the operator class each index's key was declared with, by
+    /// index name. `Index` is a public struct with no room for it; the
+    /// class is not used to build the index (SPG picks its structure from
+    /// the method and the column), but it is part of the definition —
+    /// `pg_get_indexdef` prints it and a dump restores it. `USING gin
+    /// (doc jsonb_path_ops)` read back as `(doc)`, which restores in
+    /// PostgreSQL as a different index. Persisted from FILE_VERSION 100.
+    index_opclasses: BTreeMap<String, String>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -6290,7 +6316,81 @@ impl Catalog {
             created_databases: alloc::collections::BTreeSet::new(),
             composite_types: BTreeMap::new(),
             schemas: alloc::collections::BTreeSet::new(),
+            object_owners: BTreeMap::new(),
+            extensions: BTreeMap::new(),
+            index_opclasses: BTreeMap::new(),
         }
+    }
+
+    /// 8.0.3 — the operator class an index was declared with, if one was.
+    #[must_use]
+    pub fn index_opclass(&self, index: &str) -> Option<&str> {
+        self.index_opclasses.get(index).map(String::as_str)
+    }
+
+    /// 8.0.3 — record (or, with `None`, forget) an index's operator class.
+    pub fn set_index_opclass(&mut self, index: &str, opclass: Option<&str>) {
+        self.mark_nontable_dirty(NonTableKind::IndexOpclass, index);
+        match opclass {
+            Some(o) => {
+                self.index_opclasses
+                    .insert(String::from(index), String::from(o));
+            }
+            None => {
+                self.index_opclasses.remove(index);
+            }
+        }
+    }
+
+    /// 8.0.3 — the role that created a view or a user-defined type, when
+    /// one was recorded. `None` for an object created before 8.0.3.
+    #[must_use]
+    pub fn object_owner(&self, kind: NonTableKind, name: &str) -> Option<&str> {
+        self.object_owners
+            .get(&(kind, String::from(name)))
+            .map(String::as_str)
+    }
+
+    /// 8.0.3 — every role recorded as a view's or a type's owner.
+    pub fn object_owner_names(&self) -> impl Iterator<Item = &str> {
+        self.object_owners.values().map(String::as_str)
+    }
+
+    /// 8.0.3 — record `owner` as the role that owns a view or a type.
+    pub fn set_object_owner(&mut self, kind: NonTableKind, name: &str, owner: &str) {
+        self.mark_nontable_dirty(kind, name);
+        self.object_owners
+            .insert((kind, String::from(name)), String::from(owner));
+    }
+
+    /// 8.0.3 — forget the owner of an object that no longer exists, so a
+    /// later object of the same name does not inherit it.
+    pub fn clear_object_owner(&mut self, kind: NonTableKind, name: &str) {
+        self.mark_nontable_dirty(kind, name);
+        self.object_owners.remove(&(kind, String::from(name)));
+    }
+
+    /// 8.0.3 — the installed extensions, name → schema.
+    #[must_use]
+    pub const fn extensions(&self) -> &BTreeMap<String, String> {
+        &self.extensions
+    }
+
+    /// 8.0.3 — record an installed extension; `false` when it already was.
+    pub fn install_extension(&mut self, name: &str, schema: &str) -> bool {
+        if self.extensions.contains_key(name) {
+            return false;
+        }
+        self.mark_nontable_dirty(NonTableKind::Extension, name);
+        self.extensions
+            .insert(String::from(name), String::from(schema));
+        true
+    }
+
+    /// 8.0.3 — remove an installed extension; `false` when it was not.
+    pub fn uninstall_extension(&mut self, name: &str) -> bool {
+        self.mark_nontable_dirty(NonTableKind::Extension, name);
+        self.extensions.remove(name).is_some()
     }
 
     /// v7.12.4 — read-only view of catalogued user-defined
@@ -7610,6 +7710,34 @@ impl Catalog {
             &mut self.composite_types,
             &base.composite_types,
         );
+        merge_map(K::Extension, &dirty, &mut self.extensions, &base.extensions);
+        merge_map(
+            K::IndexOpclass,
+            &dirty,
+            &mut self.index_opclasses,
+            &base.index_opclasses,
+        );
+        // An owner belongs to its object's window: the entry this
+        // transaction did not touch is base's, present or absent.
+        let keys: alloc::vec::Vec<(NonTableKind, String)> = self
+            .object_owners
+            .keys()
+            .chain(base.object_owners.keys())
+            .cloned()
+            .collect();
+        for key in keys {
+            if dirty.contains(&key) {
+                continue;
+            }
+            match base.object_owners.get(&key) {
+                Some(o) => {
+                    self.object_owners.insert(key, o.clone());
+                }
+                None => {
+                    self.object_owners.remove(&key);
+                }
+            }
+        }
     }
 
     /// v7.39 (round 496) — put `table` in at `name`, replacing any table
@@ -8157,6 +8285,14 @@ impl Catalog {
             for i in &mut t.indices {
                 if i.name == old {
                     i.name = new.to_string();
+                    // 8.0.3 — the operator class follows the index.
+                    if let Some(op) = self.index_opclasses.remove(old) {
+                        self.index_opclasses.insert(new.to_string(), op);
+                        self.dirty_nontable
+                            .insert((NonTableKind::IndexOpclass, old.to_string()));
+                        self.dirty_nontable
+                            .insert((NonTableKind::IndexOpclass, new.to_string()));
+                    }
                     return Ok(());
                 }
             }
@@ -9865,7 +10001,42 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// per-index block, after the two constraint flags v96 added. A v98
 /// reader stops before it and reads every index as un-prefixed, which
 /// is what a v98 snapshot recorded: the parser dropped the length.
-const FILE_VERSION: u8 = 99;
+/// 8.0.3 — v100 appends the owners of views and user-defined types and
+/// the installed extensions, after the database collation. A v99 binary
+/// refuses a v100 image by its version, as every step before this.
+const FILE_VERSION: u8 = 100;
+
+/// 8.0.3 — the byte a [`NonTableKind`] is written as.
+const fn non_table_kind_tag(kind: NonTableKind) -> u8 {
+    match kind {
+        NonTableKind::Sequence => 0,
+        NonTableKind::View => 1,
+        NonTableKind::MaterializedView => 2,
+        NonTableKind::EnumType => 3,
+        NonTableKind::DomainType => 4,
+        NonTableKind::CompositeType => 5,
+        NonTableKind::Extension => 6,
+        NonTableKind::IndexOpclass => 7,
+    }
+}
+
+fn non_table_kind_from_tag(tag: u8) -> Result<NonTableKind, StorageError> {
+    Ok(match tag {
+        0 => NonTableKind::Sequence,
+        1 => NonTableKind::View,
+        2 => NonTableKind::MaterializedView,
+        3 => NonTableKind::EnumType,
+        4 => NonTableKind::DomainType,
+        5 => NonTableKind::CompositeType,
+        6 => NonTableKind::Extension,
+        7 => NonTableKind::IndexOpclass,
+        other => {
+            return Err(StorageError::Corrupt(format!(
+                "object owner kind: unknown byte {other}"
+            )));
+        }
+    })
+}
 
 /// v7.37 (round 833) — the codec version to decode a row that
 /// [`encode_row_body_dense`] has just produced.
@@ -10924,6 +11095,27 @@ impl Catalog {
             for uc in &t.schema.uniqueness_constraints {
                 out.push(u8::from(uc.deferrable) | (u8::from(uc.initially_deferred) << 1));
             }
+            // 8.0.3 — `GENERATED ALWAYS AS IDENTITY` columns (FILE_VERSION
+            // 100+). Sparse, by column position: `[u16 count]([u16 col]) ×
+            // count`. The flag lived only in memory, so after a reload an
+            // ALWAYS column accepted an explicit value and the catalog
+            // reported it as the other kind.
+            if version >= 100 {
+                let always: Vec<usize> = t
+                    .schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| c.identity_always.then_some(i))
+                    .collect();
+                write_u16(
+                    &mut out,
+                    u16::try_from(always.len()).expect("≤ 65k columns/table"),
+                );
+                for idx in always {
+                    write_u16(&mut out, u16::try_from(idx).expect("≤ 65k columns/table"));
+                }
+            }
         }
         // v7.12.4 — catalog-wide appendix: user-defined functions
         // then triggers. FILE_VERSION 22+ only. v21 and earlier
@@ -11333,6 +11525,38 @@ impl Catalog {
             Some(c) => {
                 out.push(1);
                 write_str(&mut out, c);
+            }
+        }
+        // 8.0.3 — object owners and installed extensions (FILE_VERSION
+        // 100+), written last so a v99 layout ends where it always did.
+        // Layout: [u32 n]([u8 kind][str name][str owner] × n)
+        // [u32 m]([str extension][str schema] × m)
+        // [u32 k]([str index][str operator class] × k).
+        if version >= 100 {
+            write_u32(
+                &mut out,
+                u32::try_from(self.object_owners.len()).expect("≤ 4G owners"),
+            );
+            for ((kind, name), owner) in &self.object_owners {
+                out.push(non_table_kind_tag(*kind));
+                write_str(&mut out, name);
+                write_str(&mut out, owner);
+            }
+            write_u32(
+                &mut out,
+                u32::try_from(self.extensions.len()).expect("≤ 4G extensions"),
+            );
+            for (name, schema) in &self.extensions {
+                write_str(&mut out, name);
+                write_str(&mut out, schema);
+            }
+            write_u32(
+                &mut out,
+                u32::try_from(self.index_opclasses.len()).expect("≤ 4G indexes"),
+            );
+            for (index, opclass) in &self.index_opclasses {
+                write_str(&mut out, index);
+                write_str(&mut out, opclass);
             }
         }
         let crc = spg_crypto::crc32c::crc32c(&out);
@@ -11916,6 +12140,27 @@ impl Catalog {
             return Err(StorageError::Corrupt(format!(
                 "database collation is recorded as {c:?}, which names nothing"
             )));
+        }
+        if version >= 100 {
+            let owners = cur.read_u32()? as usize;
+            for _ in 0..owners {
+                let kind = non_table_kind_from_tag(cur.read_u8()?)?;
+                let name = cur.read_str()?;
+                let owner = cur.read_str()?;
+                cat.object_owners.insert((kind, name), owner);
+            }
+            let extensions = cur.read_u32()? as usize;
+            for _ in 0..extensions {
+                let name = cur.read_str()?;
+                let schema = cur.read_str()?;
+                cat.extensions.insert(name, schema);
+            }
+            let opclasses = cur.read_u32()? as usize;
+            for _ in 0..opclasses {
+                let index = cur.read_str()?;
+                let opclass = cur.read_str()?;
+                cat.index_opclasses.insert(index, opclass);
+            }
         }
         // v7.38.18 (S2) — and every table read back learns it, because a
         // table decides for itself which of its indexes key under a

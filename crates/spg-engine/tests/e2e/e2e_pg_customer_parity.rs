@@ -156,8 +156,10 @@ fn hnsw_with_storage_params_accepted() {
 #[test]
 fn create_extension_vector_no_op() {
     let mut e = eng();
-    ok(&mut e, "CREATE EXTENSION IF NOT EXISTS vector");
+    // 8.0.3 — the bare form first: a second bare CREATE of an installed
+    // extension is PG's `extension "vector" already exists`.
     ok(&mut e, "CREATE EXTENSION vector");
+    ok(&mut e, "CREATE EXTENSION IF NOT EXISTS vector");
     ok(
         &mut e,
         "CREATE EXTENSION IF NOT EXISTS pgvector WITH SCHEMA public",
