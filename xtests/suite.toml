@@ -273,13 +273,32 @@ cmd = "scripts/gate.sh all --full"
 budget_s = 1430
 
 [[step]]
-tier = "full"
+tier = "prerelease"
+name = "write-arbitration"
+impl = "internal"
+budget_s = 900
+group = "after-build"
+# 8.0.3 — sentori's §8.3: gate any release that changes how a write is
+# arbitrated on two sessions with one holding its transaction open. Three
+# instruments against PostgreSQL 18: the held-transaction panel, the
+# 132-shape ON CONFLICT sweep and the 189-expression Describe sweep. See
+# `steps::write_arbitration`. Budget is a first guess, to be replaced by
+# the measured time with room once it has run.
+
+[[step]]
+tier = "prerelease"
 name = "pgdump-roundtrip"
 impl = "internal"
 budget_s = 600
+group = "after-build"
 # 7.38.1 S5.2 (D6) — official PG18 pg_dump against live SPG must exit
 # 0 and the dump must restore into fresh SPG + fresh PG18 with
 # identical canary counts (three-way reconciliation).
+# 8.0.3 — promoted to the tier that gates a release, the PG restore now
+# stops on its first error, and SPG's dump must equal PG18's dump of the
+# same schema. sentori's §4.4: the PG leg discarded its errors, so a
+# restore failing on every OWNER TO passed on row counts, in a tier
+# nothing runs before a release.
 
 [[step]]
 tier = "full"

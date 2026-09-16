@@ -1,6 +1,16 @@
-import itertools, subprocess, sys, json, re
-PG  = "postgres://bench:bench@127.0.0.1:25432/bench"
-SPG = "postgres://spg@127.0.0.1:25951/spg"
+# ON CONFLICT arbitration, every shape against PostgreSQL.
+#
+#   sweep.py <pg-uri> <spg-uri>        exit 0 = no case differs, 1 = one does
+#
+# 8.0.3 — a release gate (`write-arbitration`). The axes it varies: arbiter
+# column type, arity, constraint vs unique index, full vs PARTIAL index,
+# target spelling, DO NOTHING vs DO UPDATE, and an update arm that collides
+# with ANOTHER unique key. What it holds still: one session, autocommit —
+# the held-transaction panel beside it covers a second session holding
+# the row.
+import itertools, os, subprocess, sys, json, re
+PG, SPG = sys.argv[1], sys.argv[2]
+PSQL = os.environ.get("PSQL", "psql")
 types = {"int": ("int", ["1","2"]), "text": ("text", ["'a'","'b'"]), "textC": ('text COLLATE "C"', ["'a'","'b'"])}
 cases = []
 n = 0
@@ -37,7 +47,7 @@ for ty, arity, source, partial, target, action, second in itertools.product(
 
 def run(uri, t, ddl, stmt, check):
     sql = f"DROP TABLE IF EXISTS {t};\n" + ";\n".join(ddl) + ";\n" + "\\echo ---STMT\n" + stmt + ";\n\\echo ---ROWS\n" + check + ";\n"
-    r = subprocess.run(["psql", uri, "--no-psqlrc", "-X", "-tA", "-v", "VERBOSITY=terse"], input=sql, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([PSQL, uri, "--no-psqlrc", "-X", "-tA", "-v", "VERBOSITY=terse"], input=sql, capture_output=True, text=True, timeout=60)
     out = r.stdout + r.stderr
     part = out.split("---STMT",1)[1] if "---STMT" in out else "SETUP:" + out
     part = re.sub(r"psql:<stdin>:\d+: ", "", part)
@@ -50,3 +60,8 @@ for name, t, ddl, stmt, check in cases:
         diffs += 1
         print(f"DIFF {name}\n   PG : {a}\n   SPG: {b}")
 print(f"cases={len(cases)} diffs={diffs}")
+# A sweep that ran nothing is not a green one.
+if len(cases) < 100:
+    print(f"only {len(cases)} cases built; the sweep is broken")
+    sys.exit(2)
+sys.exit(1 if diffs else 0)
