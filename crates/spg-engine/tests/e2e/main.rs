@@ -320,6 +320,7 @@ mod e2e_extract_fields_round253;
 mod e2e_extract_from_time;
 mod e2e_extract_subsecond;
 mod e2e_factorial_width_bucket;
+mod e2e_failed_do_block_leaves_nothing;
 mod e2e_fast_predicate_round482;
 mod e2e_fk_match_full;
 mod e2e_float8_range;
