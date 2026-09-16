@@ -1010,6 +1010,7 @@ mod e2e_udf_query_round63;
 mod e2e_udf_round61;
 mod e2e_udf_tail_round68;
 mod e2e_unary_plus_round507;
+mod e2e_uncommitted_unique_key_wait;
 mod e2e_unconstrained_numeric;
 mod e2e_unicode_encoding_probes;
 mod e2e_unicode_string;

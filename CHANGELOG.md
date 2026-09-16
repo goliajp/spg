@@ -10,6 +10,69 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a transaction that wrote a unique key first lost it at COMMIT
+
+Reported by sentori as a 500 on ingest whenever a new fault fired on
+many devices at once: two transactions writing the same unique key, and
+the one that wrote FIRST — already told `INSERT 0 1` — refused at COMMIT
+with 40001, taking every other write in its transaction with it.
+
+PostgreSQL gives a key to its first writer. A later writer's uniqueness
+check sees the in-progress row and waits for its transaction to end,
+then fails with 23505 if it committed or proceeds if it rolled back;
+`ON CONFLICT DO NOTHING` and `DO UPDATE` wait the same way and then see
+the committed row. SPG wrote each transaction into its own shadow, where
+no other session could see the key, and re-checked uniqueness only at
+COMMIT — so the later writer went through and the first one lost.
+
+Measured with two sessions, A holding its transaction by the client
+pausing rather than by `pg_sleep`:
+
+```text
+  B's statement           PG 18.6                    SPG 8.0.2
+  plain INSERT            B waits 1.5 s, 23505       B inserts, A 40001
+  ON CONFLICT DO NOTHING  B waits, 0 rows            B inserts, A 40001
+  ON CONFLICT DO UPDATE   B waits, updates A's row   B inserts, A 40001
+  … and A rolls back      B waits, inserts           (agrees)
+```
+
+**It is not a regression**, though it was reported as one against 8.0.0.
+The same client-held transaction behaves identically on 7.40.11. What
+8.0.0 changed is that `pg_sleep` began to sleep: the report's probe held
+its transaction with `pg_sleep(2)`, which on 7.40.11 returns in 0.4 ms,
+so there A had committed before B arrived. The probe was right about
+8.0.2 and could not see 7.40.11.
+
+Before an INSERT arbitrates, the engine now asks whether any OTHER live
+transaction holds an uncommitted row whose key, under any unique
+constraint or unique index of the table, is one the statement is about
+to write. If so the statement returns `LockWouldBlock` and the server
+retries it with the engine lock released — the wait a row lock already
+takes. A waiter inside a transaction records a wait-for edge on the
+holder, so two transactions each holding the other's key are a
+deadlock and one is named the victim, as PG does. The keys come from
+the same functions the uniqueness check uses — the index keyer is now
+one implementation shared by both, not a second copy — so a collated,
+expression or partial key agrees with the check that runs after the
+wait. A table no other transaction has touched pays nothing.
+
+All four of the report's cases, the extended protocol through psycopg,
+a deadlock, and a waiter inside its own transaction agree with PG 18.6
+afterwards, B's wait time included.
+
+Three pins in `e2e_isolation_levels` had been holding the defect:
+`rr_commit_unique_conflict_raises_serialization_failure` and
+`rc_insert_insert_unique_collision_raises_40001` asserted that the
+second writer succeeds and the first gets 40001, and
+`on_conflict_vs_concurrent_on_conflict_stays_single_row` recorded
+"PG applies both (n = 110); SPG keeps the winner (n = 100)" as a known
+delta. Measured again on PG 18.6 all three are the first writer keeping
+its key, and 110 — which is what SPG now answers. They are rewritten to
+PostgreSQL's answers and renamed to say what they hold. Eight new pins;
+removing the wait fails seven of them, and the eighth is the control
+that nothing waits when no other transaction holds the key.
+
+
 
 ## [8.0.2] — 2026-09-16
 

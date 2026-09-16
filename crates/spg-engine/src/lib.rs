@@ -112,6 +112,7 @@ mod table_access;
 pub mod tempstore;
 pub mod testkit;
 mod transaction;
+mod unique_wait;
 pub(crate) use transaction::{TxStmtClass, classify_stmt_for_tx};
 pub mod triggers;
 pub mod users;

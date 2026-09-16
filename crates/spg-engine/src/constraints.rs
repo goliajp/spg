@@ -1118,15 +1118,8 @@ pub(crate) fn enforce_uniqueness_inserts(
     // collated_key_cell before encoding, NULL-bearing keys skip the
     // set unless nulls_not_distinct.
     for uc in constraints {
-        let fold_key = |values: &[Value<'static>]| -> Vec<Value<'static>> {
-            uc.columns
-                .iter()
-                .map(|&i| {
-                    let v = values.get(i).cloned().unwrap_or(Value::Null);
-                    collated_key_cell(&v, i, schema, mysql)
-                })
-                .collect()
-        };
+        let fold_key =
+            |values: &[Value<'static>]| uniqueness_constraint_fold(uc, schema, mysql, values);
         // v7.39 (round 166, attack A1) — btree probe instead of the
         // per-statement O(table) fold when the constraint qualifies.
         // The implicit PK/UNIQUE leading-column btree (create-table
@@ -2014,86 +2007,16 @@ pub(crate) fn enforce_unique_index_inserts(
         if !idx.is_unique {
             continue;
         }
-        // Re-parse the predicate once per index per batch.
-        let predicate_expr = match idx.partial_predicate.as_deref() {
-            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} predicate {s:?} failed to re-parse: {e:?}",
-                    idx.name
-                ))
-            })?),
-            None => None,
-        };
-        // v7.38 (read01 U1) — an expression index (`CREATE UNIQUE INDEX ON
-        // t (lower(email))`) carries its key as a parseable expression, not
-        // a column position. Re-parse once per batch and evaluate per row so
-        // the key reflects the expression; without this the uniqueness was
-        // silently not enforced (duplicate `lower(email)` values slipped in).
-        let expr_key = match idx.expression.as_deref() {
-            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
-                    idx.name
-                ))
-            })?),
-            None => None,
-        };
-        let key_positions = unique_key_positions(idx);
-        // v7.39 (round 473) — the key's column names, for the 23505 DETAIL.
-        // An expression index reports the expression, as PG does.
-        let key_col_names: alloc::vec::Vec<alloc::string::String> = match &expr_key {
-            Some(_) => alloc::vec![idx.expression.clone().unwrap_or_else(|| idx.name.clone())],
-            None => key_positions
-                .iter()
-                .map(|&p| {
-                    schema
-                        .columns
-                        .get(p)
-                        .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
-                })
-                .collect(),
-        };
-        let key_of = |values: &[spg_storage::Value<'static>]| -> Result<alloc::vec::Vec<spg_storage::Value<'static>>, EngineError> {
-            if let Some(expr) = &expr_key {
-                let tmp_row = spg_storage::Row {
-                    values: values.to_vec(),
-                };
-                let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
-                    EngineError::Unsupported(alloc::format!(
-                        "UNIQUE INDEX {:?} expression eval: {e:?}",
-                        idx.name
-                    ))
-                })?;
-                return Ok(alloc::vec![v]);
-            }
-            Ok(key_positions
-                .iter()
-                .map(|&p| {
-                    let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
-                    collated_key_cell(&v, p, schema, mysql)
-                })
-                .collect())
-        };
-        let participates = |values: &[spg_storage::Value<'static>]| -> Result<bool, EngineError> {
-            let Some(expr) = &predicate_expr else {
-                return Ok(true);
-            };
-            let tmp_row = spg_storage::Row {
-                values: values.to_vec(),
-            };
-            let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} predicate eval: {e:?}",
-                    idx.name
-                ))
-            })?;
-            Ok(predicate_truthy(&v))
-        };
+        let keyer = UniqueIndexKeyer::new(idx, schema, mysql)?;
+        let expr_key = keyer.expr_key.as_ref();
+        let key_col_names = keyer.key_col_names();
+        let key_of = |values: &[spg_storage::Value<'static>]| keyer.key_of(values);
+        let participates = |values: &[spg_storage::Value<'static>]| keyer.participates(values);
         // v7.38.16 — and so is an expression index, now that its B-tree
         // holds the expression's own values. Same trade as the plain
         // case below: one descent per batch row instead of one pass over
         // the table per batch row.
-        if let Some(expr) = &expr_key
+        if let Some(expr) = expr_key
             && idx.partial_predicate.is_none()
             && !idx.nulls_not_distinct
             && !mysql
@@ -2284,6 +2207,185 @@ pub(crate) fn enforce_unique_index_inserts(
         }
     }
     Ok(())
+}
+
+/// 8.0.3 — how one unique INDEX turns a row into its key, and whether the
+/// row is in the index at all. One implementation, two callers: the
+/// statement- and commit-time uniqueness check below, and
+/// `unique_wait`, which asks the same question about ANOTHER
+/// transaction's uncommitted rows. A second copy of this is how a
+/// collated or expression key would come to agree in one place and not
+/// the other.
+pub(crate) struct UniqueIndexKeyer<'a> {
+    idx: &'a spg_storage::Index,
+    schema: &'a spg_storage::TableSchema,
+    mysql: bool,
+    ctx: eval::EvalContext<'a>,
+    pub(crate) expr_key: Option<spg_sql::ast::Expr>,
+    predicate: Option<spg_sql::ast::Expr>,
+    positions: alloc::vec::Vec<usize>,
+}
+
+impl<'a> UniqueIndexKeyer<'a> {
+    pub(crate) fn new(
+        idx: &'a spg_storage::Index,
+        schema: &'a spg_storage::TableSchema,
+        mysql: bool,
+    ) -> Result<Self, EngineError> {
+        // Re-parse the predicate once per index per batch.
+        let predicate = match idx.partial_predicate.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} predicate {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
+        // v7.38 (read01 U1) — an expression index (`CREATE UNIQUE INDEX ON
+        // t (lower(email))`) carries its key as a parseable expression, not
+        // a column position. Re-parse once per batch and evaluate per row so
+        // the key reflects the expression; without this the uniqueness was
+        // silently not enforced (duplicate `lower(email)` values slipped in).
+        let expr_key = match idx.expression.as_deref() {
+            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
+                    idx.name
+                ))
+            })?),
+            None => None,
+        };
+        Ok(Self {
+            idx,
+            schema,
+            mysql,
+            ctx: eval::EvalContext::new(&schema.columns, None),
+            expr_key,
+            predicate,
+            positions: unique_key_positions(idx),
+        })
+    }
+
+    /// v7.39 (round 473) — the key's column names, for the 23505 DETAIL.
+    /// An expression index reports the expression, as PG does.
+    pub(crate) fn key_col_names(&self) -> alloc::vec::Vec<alloc::string::String> {
+        match &self.expr_key {
+            Some(_) => alloc::vec![
+                self.idx
+                    .expression
+                    .clone()
+                    .unwrap_or_else(|| self.idx.name.clone())
+            ],
+            None => self
+                .positions
+                .iter()
+                .map(|&p| {
+                    self.schema
+                        .columns
+                        .get(p)
+                        .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
+                })
+                .collect(),
+        }
+    }
+
+    pub(crate) fn key_of(
+        &self,
+        values: &[spg_storage::Value<'static>],
+    ) -> Result<alloc::vec::Vec<spg_storage::Value<'static>>, EngineError> {
+        if let Some(expr) = &self.expr_key {
+            let tmp_row = spg_storage::Row {
+                values: values.to_vec(),
+            };
+            let v = eval::eval_expr(expr, &tmp_row, &self.ctx).map_err(|e| {
+                EngineError::Unsupported(alloc::format!(
+                    "UNIQUE INDEX {:?} expression eval: {e:?}",
+                    self.idx.name
+                ))
+            })?;
+            return Ok(alloc::vec![v]);
+        }
+        Ok(self
+            .positions
+            .iter()
+            .map(|&p| {
+                let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
+                collated_key_cell(&v, p, self.schema, self.mysql)
+            })
+            .collect())
+    }
+
+    pub(crate) fn participates(
+        &self,
+        values: &[spg_storage::Value<'static>],
+    ) -> Result<bool, EngineError> {
+        let Some(expr) = &self.predicate else {
+            return Ok(true);
+        };
+        let tmp_row = spg_storage::Row {
+            values: values.to_vec(),
+        };
+        let v = eval::eval_expr(expr, &tmp_row, &self.ctx).map_err(|e| {
+            EngineError::Unsupported(alloc::format!(
+                "UNIQUE INDEX {:?} predicate eval: {e:?}",
+                self.idx.name
+            ))
+        })?;
+        Ok(predicate_truthy(&v))
+    }
+
+    /// The encoded key this row claims in the index, or `None` when the
+    /// row is outside the index or its key sits out of the uniqueness
+    /// rule (a NULL under the default NULLS DISTINCT).
+    pub(crate) fn claimed_key(
+        &self,
+        values: &[spg_storage::Value<'static>],
+    ) -> Result<Option<alloc::string::String>, EngineError> {
+        if !self.participates(values)? {
+            return Ok(None);
+        }
+        let key = self.key_of(values)?;
+        if !self.idx.nulls_not_distinct && key.iter().any(|v| matches!(v, spg_storage::Value::Null))
+        {
+            return Ok(None);
+        }
+        Ok(Some(aggregate::encode_key(&key)))
+    }
+}
+
+/// A row's key under a UNIQUE / PRIMARY KEY constraint, each cell folded
+/// through the column's collation. The one fold both the uniqueness check
+/// and `unique_wait` use.
+pub(crate) fn uniqueness_constraint_fold(
+    uc: &spg_storage::UniquenessConstraint,
+    schema: &spg_storage::TableSchema,
+    mysql: bool,
+    values: &[Value<'static>],
+) -> Vec<Value<'static>> {
+    uc.columns
+        .iter()
+        .map(|&i| {
+            let v = values.get(i).cloned().unwrap_or(Value::Null);
+            collated_key_cell(&v, i, schema, mysql)
+        })
+        .collect()
+}
+
+/// 8.0.3 — the encoded key a row claims under a UNIQUE / PRIMARY KEY
+/// constraint, folded the way `enforce_uniqueness_inserts` folds it, or
+/// `None` when a NULL takes the row out of the rule.
+pub(crate) fn uniqueness_constraint_claimed_key(
+    uc: &spg_storage::UniquenessConstraint,
+    schema: &spg_storage::TableSchema,
+    mysql: bool,
+    values: &[Value<'static>],
+) -> Option<alloc::string::String> {
+    let key = uniqueness_constraint_fold(uc, schema, mysql, values);
+    if key.iter().any(|v| matches!(v, Value::Null)) && !uc.nulls_not_distinct {
+        return None;
+    }
+    Some(aggregate::encode_key(&key))
 }
 
 /// v7.38 (read01 U1) — UPDATE-time uniqueness enforcement. INSERT has

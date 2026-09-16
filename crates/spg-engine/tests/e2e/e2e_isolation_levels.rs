@@ -180,7 +180,12 @@ fn rr_commit_conflict_raises_serialization_failure() {
 }
 
 #[test]
-fn rr_commit_unique_conflict_raises_serialization_failure() {
+fn rr_insert_of_a_held_key_waits_for_the_first_writer() {
+    // 8.0.3 — this pin used to hold the defect sentori reported: the
+    // SECOND writer's autocommit insert succeeded and the FIRST writer,
+    // already told INSERT 0 1, was refused at COMMIT with 40001. Measured
+    // on PG 18.6 with two sessions, the second writer waits, the first
+    // commits, and the second then fails with a unique violation.
     if !Engine::new().mvcc_inplace() {
         return;
     }
@@ -191,14 +196,16 @@ fn rr_commit_unique_conflict_raises_serialization_failure() {
     e.execute_in("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ", tx)
         .unwrap();
     e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
-    // Concurrent committed insert takes the key first.
-    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
-        .unwrap();
-    let err = e.execute_in("COMMIT", tx).unwrap_err();
-    assert!(
-        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
-        "expected 40001 on duplicate-key merge, got {err:?}"
-    );
+    assert!(matches!(
+        e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX),
+        Err(spg_engine::EngineError::LockWouldBlock)
+    ));
+    e.execute_in("COMMIT", tx)
+        .expect("the first writer keeps its key");
+    let err = e
+        .execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("duplicate key"), "got {err:?}");
 }
 
 #[test]
@@ -437,7 +444,11 @@ fn delete_then_reinsert_same_pk_survives_concurrent_delete() {
 // ── v7.37.17 Phase E4 round 3 — unique-key collisions under rebase ──
 
 #[test]
-fn rc_insert_insert_unique_collision_raises_40001() {
+fn rc_insert_insert_unique_collision_waits_then_takes_a_freed_key() {
+    // 8.0.3 — was `…_raises_40001`, pinning the second writer winning
+    // and the first writer's transaction failing. PG 18.6, two sessions:
+    // the second writer waits; when the first rolls back, the key is
+    // free and the second writer's row lands.
     if !Engine::new().mvcc_inplace() {
         return;
     }
@@ -446,24 +457,27 @@ fn rc_insert_insert_unique_collision_raises_40001() {
     let tx = e.alloc_tx_id();
     e.execute_in("BEGIN", tx).unwrap();
     e.execute_in("INSERT INTO u VALUES (7)", tx).unwrap();
-    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
-        .unwrap();
-    // The next tx statement rebases and hits the taken key.
-    let err = e.execute_in("SELECT count(*) FROM u", tx).unwrap_err();
-    assert!(
-        matches!(err, spg_engine::EngineError::SerializationFailure(_)),
-        "insert-insert collision -> 40001, got {err:?}"
-    );
+    assert!(matches!(
+        e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX),
+        Err(spg_engine::EngineError::LockWouldBlock)
+    ));
     e.execute_in("ROLLBACK", tx).unwrap();
+    e.execute_in("INSERT INTO u VALUES (7)", IMPLICIT_TX)
+        .expect("a rolled-back key is free");
     let QueryResult::Rows { rows, .. } = e.execute_in("SELECT x FROM u", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
-    assert_eq!(rows.len(), 1, "exactly one 7 — no duplicate installed");
+    assert_eq!(rows.len(), 1, "exactly one 7");
 }
 
 #[test]
-fn on_conflict_vs_concurrent_on_conflict_stays_single_row() {
+fn on_conflict_vs_concurrent_on_conflict_applies_both_updates() {
+    // 8.0.3 — this pin recorded a delta: "PG waits on the row lock and
+    // applies both (n = 110); SPG keeps the winner (n = 100)". Measured
+    // again on PG 18.6 with two sessions it is 110, and with the
+    // uncommitted-key wait SPG is 110 too: the second upsert waits for
+    // the first transaction, then updates the row it committed.
     if !Engine::new().mvcc_inplace() {
         return;
     }
@@ -478,24 +492,19 @@ fn on_conflict_vs_concurrent_on_conflict_stays_single_row() {
         tx,
     )
     .unwrap();
-    e.execute_in(
-        "INSERT INTO u VALUES (1, 0) ON CONFLICT (x) DO UPDATE SET n = u.n + 100",
-        IMPLICIT_TX,
-    )
-    .unwrap();
-    // With update-pair atomicity the tx's ON CONFLICT (which is an
-    // UPDATE against the old version) loses silently under RC —
-    // first-committer-wins, exactly like plain update-update. PG
-    // waits on the row lock and applies both (n = 110); SPG keeps
-    // the winner (n = 100) — recorded delta, retry converges.
-    e.execute_in("COMMIT", tx)
-        .expect("RC on-conflict loser commits cleanly (its update skipped)");
+    let second = "INSERT INTO u VALUES (1, 0) ON CONFLICT (x) DO UPDATE SET n = u.n + 100";
+    assert!(matches!(
+        e.execute_in(second, IMPLICIT_TX),
+        Err(spg_engine::EngineError::LockWouldBlock)
+    ));
+    e.execute_in("COMMIT", tx).unwrap();
+    e.execute_in(second, IMPLICIT_TX).unwrap();
     let QueryResult::Rows { rows, .. } = e.execute_in("SELECT x, n FROM u", IMPLICIT_TX).unwrap()
     else {
         panic!("rows")
     };
     assert_eq!(rows.len(), 1, "exactly one row — no duplicate");
-    assert_eq!(rows[0].values[1], spg_storage::Value::Int(100));
+    assert_eq!(rows[0].values[1], spg_storage::Value::Int(110));
 }
 
 #[test]
