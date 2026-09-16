@@ -36,13 +36,24 @@ use alloc::vec::Vec;
 use spg_sql::ast::{Expr, Literal, SelectItem, SelectStatement, Statement, UnOp};
 use spg_storage::{Catalog, ColumnSchema, DataType, Value};
 
+pub(crate) use crate::describe_sample::{Dialect, Typing};
+
 /// One-shot describe of a prepared `Statement`.
 ///
 /// Returns `(parameter_oids, output_columns)`. Empty `output_columns`
 /// means "no row description available" → pgwire sends NoData.
 pub fn describe_prepared(stmt: &Statement, catalog: &Catalog) -> (Vec<u32>, Vec<ColumnSchema>) {
+    describe_prepared_in(stmt, catalog, Dialect::Postgres)
+}
+
+/// [`describe_prepared`] for a statement that will run in `dialect`.
+pub(crate) fn describe_prepared_in(
+    stmt: &Statement,
+    catalog: &Catalog,
+    dialect: Dialect,
+) -> (Vec<u32>, Vec<ColumnSchema>) {
     let params = collect_parameter_oids(stmt, catalog);
-    let columns = describe_output_columns(stmt, catalog);
+    let columns = describe_output_columns(stmt, catalog, Typing::Evaluated(dialect));
     (params, columns)
 }
 
@@ -50,14 +61,18 @@ pub fn describe_prepared(stmt: &Statement, catalog: &Catalog) -> (Vec<u32>, Vec<
 /// a cycle the catalog should not contain; stop rather than recurse.
 const MAX_DESCRIBE_DEPTH: usize = 16;
 
-fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSchema> {
+fn describe_output_columns(
+    stmt: &Statement,
+    catalog: &Catalog,
+    typing: Typing,
+) -> Vec<ColumnSchema> {
     // r1049 — DML with RETURNING produces a result set, and a driver
     // sizes its rows by THIS answer. Describing it as NoData made
     // `INSERT … RETURNING id` through sqlx come back as a zero-column
     // row (ColumnIndexOutOfBounds), a defect the sqlx suite had pinned
     // since v7.9 — in a test that had never run.
     let (table, items) = match stmt {
-        Statement::Select(s) => return describe_select_columns(s, catalog, &[], 0),
+        Statement::Select(s) => return describe_select_columns(s, catalog, typing, &[], 0),
         Statement::Insert(i) => (&i.table, i.returning.as_ref()),
         Statement::Update(u) => (&u.table, u.returning.as_ref()),
         Statement::Delete(d) => (&d.table, d.returning.as_ref()),
@@ -76,7 +91,7 @@ fn describe_output_columns(stmt: &Statement, catalog: &Catalog) -> Vec<ColumnSch
     let Some(items) = items else {
         return Vec::new();
     };
-    dml_returning_columns(table, items, catalog)
+    dml_returning_columns(table, items, catalog, typing)
 }
 
 /// The output columns of a DML statement's RETURNING list, resolved
@@ -87,11 +102,12 @@ fn dml_returning_columns(
     table: &str,
     items: &[SelectItem],
     catalog: &Catalog,
+    typing: Typing,
 ) -> Vec<ColumnSchema> {
     let Some(t) = catalog.get(table) else {
         return Vec::new();
     };
-    describe_select_items(items, &t.schema().columns, catalog)
+    describe_select_items(items, &t.schema().columns, catalog, typing)
 }
 
 /// Output columns of one SELECT, resolved against `catalog` plus any
@@ -99,6 +115,7 @@ fn dml_returning_columns(
 pub(crate) fn describe_select_columns(
     s: &SelectStatement,
     catalog: &Catalog,
+    typing: Typing,
     outer_ctes: &[&spg_sql::ast::Cte],
     depth: usize,
 ) -> Vec<ColumnSchema> {
@@ -115,11 +132,12 @@ pub(crate) fn describe_select_columns(
     let ns = match &s.from {
         None => Vec::new(),
         Some(from) => {
-            let Some(mut ns) = relation_columns(&from.primary, catalog, &ctes, depth) else {
+            let Some(mut ns) = relation_columns(&from.primary, catalog, typing, &ctes, depth)
+            else {
                 return Vec::new();
             };
             for j in &from.joins {
-                let Some(cols) = relation_columns(&j.table, catalog, &ctes, depth) else {
+                let Some(cols) = relation_columns(&j.table, catalog, typing, &ctes, depth) else {
                     return Vec::new();
                 };
                 ns.extend(cols);
@@ -138,7 +156,7 @@ pub(crate) fn describe_select_columns(
     {
         return Vec::new();
     }
-    let out = describe_select_items(&s.items, &ns, catalog);
+    let out = describe_select_items(&s.items, &ns, catalog, typing);
     if out.is_empty() {
         return out;
     }
@@ -147,7 +165,7 @@ pub(crate) fn describe_select_columns(
     // A width disagreement means the query will fail at execution;
     // describing it as if it succeeded would be worse than NoData.
     for (_, arm) in &s.unions {
-        if describe_select_columns(arm, catalog, &ctes, depth + 1).len() != out.len() {
+        if describe_select_columns(arm, catalog, typing, &ctes, depth + 1).len() != out.len() {
             return Vec::new();
         }
     }
@@ -160,13 +178,14 @@ pub(crate) fn describe_select_columns(
 fn relation_columns(
     t: &spg_sql::ast::TableRef,
     catalog: &Catalog,
+    typing: Typing,
     ctes: &[&spg_sql::ast::Cte],
     depth: usize,
 ) -> Option<Vec<ColumnSchema>> {
     // A derived table (`FROM (SELECT …) x`, LATERAL or not) rides the
     // lateral_subquery channel.
     if let Some(sub) = &t.lateral_subquery {
-        let cols = describe_select_columns(sub, catalog, &[], depth + 1);
+        let cols = describe_select_columns(sub, catalog, typing, &[], depth + 1);
         return (!cols.is_empty()).then_some(cols);
     }
     if let Some(table) = catalog.get(&t.name) {
@@ -182,16 +201,16 @@ fn relation_columns(
         // r1049 defect, one level of nesting deeper.
         let mut cols = match &cte.body {
             spg_sql::ast::CteBody::Select(body) => {
-                describe_select_columns(body, catalog, &[], depth + 1)
+                describe_select_columns(body, catalog, typing, &[], depth + 1)
             }
             spg_sql::ast::CteBody::Insert(i) => {
-                dml_returning_columns(&i.table, i.returning.as_ref()?, catalog)
+                dml_returning_columns(&i.table, i.returning.as_ref()?, catalog, typing)
             }
             spg_sql::ast::CteBody::Update(u) => {
-                dml_returning_columns(&u.table, u.returning.as_ref()?, catalog)
+                dml_returning_columns(&u.table, u.returning.as_ref()?, catalog, typing)
             }
             spg_sql::ast::CteBody::Delete(d) => {
-                dml_returning_columns(&d.table, d.returning.as_ref()?, catalog)
+                dml_returning_columns(&d.table, d.returning.as_ref()?, catalog, typing)
             }
             // MERGE RETURNING may project merge_action() and both
             // aliases; that shape has no describe path yet, and a
@@ -481,6 +500,7 @@ fn describe_select_items(
     items: &[SelectItem],
     schema_cols: &[ColumnSchema],
     cat: &Catalog,
+    typing: Typing,
 ) -> Vec<ColumnSchema> {
     let mut out: Vec<ColumnSchema> = Vec::with_capacity(items.len());
     for item in items {
@@ -515,7 +535,7 @@ fn describe_select_items(
                         nullable: true,
                     }),
                     Expr::ScalarSubquery(inner) => {
-                        let cols = describe_select_columns(inner, cat, &[], 0);
+                        let cols = describe_select_columns(inner, cat, typing, &[], 0);
                         // v7.38.7 — two different Nones live here, and the
                         // fallback below must only catch one of them.
                         //
@@ -537,7 +557,7 @@ fn describe_select_items(
                             nullable: true,
                         })
                     }
-                    _ => describe_expr_in(expr, schema_cols, Some(cat)),
+                    _ => describe_output_expr(expr, schema_cols, Some(cat), typing),
                 };
                 // v7.38.7 — an item we cannot TYPE still contributes a
                 // COLUMN.
@@ -635,8 +655,10 @@ fn describe_view_columns_depth(
     };
     // v7.39 (round 462) — the body resolves through the same namespace
     // walk a top-level SELECT uses, so a view over a join, a derived
-    // table or a CTE describes exactly as that query would.
-    let mut out = describe_select_columns(&select, catalog, &[], depth);
+    // table or a CTE describes exactly as that query would. The body was
+    // parsed as PostgreSQL just above, so that is the dialect it types in.
+    let typing = Typing::Evaluated(Dialect::Postgres);
+    let mut out = describe_select_columns(&select, catalog, typing, &[], depth);
     // A rename list overrides the body's own names, positionally.
     if !view.columns.is_empty() && view.columns.len() == out.len() {
         for (slot, name) in out.iter_mut().zip(view.columns.iter()) {
@@ -837,6 +859,74 @@ pub(crate) fn describe_expr(e: &Expr, schema_cols: &[ColumnSchema]) -> Option<Ex
     describe_expr_in(e, schema_cols, None)
 }
 
+/// 8.0.3 — the shape of an expression that IS an output column: the
+/// static walk, with a computed expression's TYPE taken from evaluating it
+/// on representative values. The value the wire carries is the
+/// evaluator's, so the type a result announces has to be too. The name,
+/// and every other kind of expression, keep the static answer. See
+/// `describe_sample`.
+///
+/// Called only where a result's columns are decided — Describe and the
+/// executor's projection — and never from `describe_expr_in`, which the
+/// evaluator calls per row.
+pub(crate) fn describe_output_expr(
+    e: &Expr,
+    schema_cols: &[ColumnSchema],
+    cat: Option<&Catalog>,
+    typing: Typing,
+) -> Option<ExprShape> {
+    let Typing::Evaluated(dialect) = typing else {
+        return describe_expr_in(e, schema_cols, cat);
+    };
+    if let (Expr::ScalarSubquery(inner), Some(cat)) = (e, cat) {
+        let cols = describe_select_columns(inner, cat, typing, &[], 0);
+        if cols.len() > 1 {
+            return None;
+        }
+        return cols.first().map(|c| ExprShape {
+            name: c.name.clone(),
+            ty: c.ty,
+            nullable: true,
+        });
+    }
+    let described = describe_expr_in(e, schema_cols, cat);
+    if matches!(
+        e,
+        Expr::Column(_)
+            | Expr::Literal(_)
+            | Expr::Cast { .. }
+            | Expr::Case { .. }
+            | Expr::ScalarSubquery(_)
+            | Expr::Exists { .. }
+            | Expr::InSubquery { .. }
+            | Expr::WindowFunction { .. }
+            | Expr::AggregateOrdered { .. }
+            | Expr::Placeholder(_)
+    ) {
+        return described;
+    }
+    let Some(ty) = crate::describe_sample::sampled_type(e, schema_cols, dialect) else {
+        return described;
+    };
+    match described {
+        // The static answer stands when it names a type the value's own
+        // encoding also serves: several types share one value
+        // representation (`timestamp` / `timestamptz`, `json` / `jsonb`,
+        // `bit` / `varbit`), and there the value cannot tell them apart but
+        // the static rules can.
+        Some(sh) if crate::describe_sample::same_encoding(&sh.ty, &ty) => Some(sh),
+        Some(mut sh) => {
+            sh.ty = ty;
+            Some(sh)
+        }
+        None => Some(ExprShape {
+            name: pg_select_item_name(e, schema_cols),
+            ty,
+            nullable: true,
+        }),
+    }
+}
+
 /// v7.38.7 — the type walker, with the catalog when the caller has one.
 ///
 /// `describe_expr` below is the same walk without a catalog, kept for the
@@ -877,7 +967,7 @@ pub(crate) fn describe_expr_in(
         // out of sight.
         Expr::ScalarSubquery(inner) => {
             let cat = cat?;
-            let cols = describe_select_columns(inner, cat, &[], 0);
+            let cols = describe_select_columns(inner, cat, Typing::Static, &[], 0);
             // More than one column is an invalid statement, not an
             // unknown one — the same split `describe_select_items`
             // makes, for the same reason.
@@ -1445,16 +1535,16 @@ fn function_return_shape(
         | "network"
         | "version"
         | "database"
-        | "current_database"
-        | "current_schema"
-        | "current_user"
-        | "session_user"
-        | "user"
         | "pg_get_serial_sequence"
         | "pg_get_constraintdef"
         | "pg_get_indexdef"
         | "date_format"
         | "pg_typeof" => (DataType::Text, true),
+        // 8.0.3 — PG's identifier type, measured on 18.6; the value is text
+        // and `name` encodes as text, so the OID is the only change.
+        "current_database" | "current_schema" | "current_user" | "session_user" | "user" => {
+            (DataType::Name, false)
+        }
         // Bytes-returning.
         "decode" | "hex" => (DataType::Bytes, true),
         // Integer-returning length / position helpers.
@@ -1490,20 +1580,21 @@ fn function_return_shape(
         | "array_append"
         | "array_cat" => (DataType::TextArray, true),
         // JSON.
-        "to_json"
-        | "to_jsonb"
-        | "json_build_object"
+        "to_json" | "json_build_object" | "json_build_array" | "json_object" | "json_path_query" => {
+            (DataType::Json, true)
+        }
+        // 8.0.3 — the jsonb family is jsonb, not json (measured on 18.6).
+        // The binary encoder writes jsonb's version byte from the declared
+        // type, so this is also what a binary client needs to decode.
+        "to_jsonb"
         | "jsonb_build_object"
-        | "json_build_array"
         | "jsonb_build_array"
-        | "json_object"
         | "jsonb_object"
         | "jsonb_set"
         | "jsonb_insert"
         | "jsonb_path_query"
         | "jsonb_path_query_first"
-        | "jsonb_path_query_array"
-        | "json_path_query" => (DataType::Json, true),
+        | "jsonb_path_query_array" => (DataType::Jsonb, true),
         // FTS types.
         "to_tsvector" => (DataType::TsVector, true),
         "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery" | "websearch_to_tsquery" => {
@@ -1653,6 +1744,40 @@ fn function_return_shape(
             return Some(ExprShape {
                 name: "?column?".to_string(),
                 ty,
+                nullable: true,
+            });
+        }
+        // 8.0.3 — the statistical aggregates, and the JSON ones. Their
+        // shape comes from the aggregate path, not the per-row evaluator,
+        // so it has to be stated. Measured on PG 18.6 and against SPG's own
+        // values: an integer or numeric argument gives numeric, a float one
+        // double precision; json_agg is json and jsonb_agg jsonb.
+        "stddev" | "stddev_samp" | "stddev_pop" | "variance" | "var_samp" | "var_pop" => {
+            let inner = describe_expr(args.first()?, schema_cols)?;
+            let ty = match inner.ty {
+                DataType::Float | DataType::Real => DataType::Float,
+                _ => DataType::Numeric {
+                    precision: 0,
+                    scale: 0,
+                },
+            };
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty,
+                nullable: true,
+            });
+        }
+        "json_agg" | "json_agg_strict" | "json_object_agg" => {
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: DataType::Json,
+                nullable: true,
+            });
+        }
+        "jsonb_agg" | "jsonb_agg_strict" | "jsonb_object_agg" => {
+            return Some(ExprShape {
+                name: "?column?".to_string(),
+                ty: DataType::Jsonb,
                 nullable: true,
             });
         }

@@ -12638,7 +12638,12 @@ pub(crate) fn build_projection_hiding_tail(
                         fold_exempt: matches!(sch.collation, spg_storage::Collation::Binary),
                         pads: crate::collate::pads_space(sch.collation_name.as_deref()),
                     });
-                } else if let Some(shape) = describe::describe_expr_in(expr, schema_cols, cat) {
+                } else if let Some(shape) = describe::describe_output_expr(
+                    expr,
+                    schema_cols,
+                    cat,
+                    describe::Typing::Evaluated(describe::Dialect::of_engine(mysql)),
+                ) {
                     let output_name = alias
                         .clone()
                         .unwrap_or_else(|| default_output_name(expr, mysql));

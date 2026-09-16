@@ -10,6 +10,42 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a computed column announced one type and carried another
+
+A driver decodes a column by the type Describe and RowDescription
+announce. For a computed expression SPG announced a type from its own
+rules — a binary operator took its LEFT operand's type, a function the
+table did not know became `text` — while the value came from the
+evaluator. In binary format every disagreement was a wrong answer,
+silently; in text format, a decode error. Measured with psycopg 3:
+
+```text
+                              PostgreSQL 18.6        SPG 8.0.2 (binary)
+  SELECT 1 + 1.5              Decimal 2.5            int 131072
+  SELECT date - date          int 1                  date 2000-01-02
+  SELECT 1 IS DISTINCT FROM 2 bool True              int 16777217
+  SELECT sqrt(2)              float 1.414…           int 1073127582
+```
+
+A sweep of 189 common expressions through `\gdesc` found 57 whose type
+differed from PostgreSQL's. The type of a computed output column now
+comes from evaluating the expression once, on representative values of
+the columns' declared types, in the session's dialect — so it is, by
+construction, the type of the value that will be sent. Where several
+types share one value representation (`timestamp`/`timestamptz`,
+`json`/`jsonb`, `bit`/`varbit`) the static rules keep deciding, and the
+statistical and JSON aggregates, `current_user` and friends (`name`) and
+the `jsonb_*` builders are stated in the rules. The evaluation happens
+only where a result's columns are decided, never in the per-row
+evaluator. `regexp_count` returns `integer`, as in PostgreSQL.
+
+The same sweep now differs in 9 of 189: two call extension functions
+PostgreSQL does not have installed, and seven are named and not changed —
+`pg_typeof` (`regtype`), `inet_client_addr` (`inet`), `point`, `box`,
+`int4range`, a `B'…'` literal (`bit`) and `xmin` (`xid`), each a type
+SPG's value model does not carry. psycopg's text and binary decoding of
+every shape in the table above now matches PostgreSQL.
+
 ### Fixed — an `EXCEPTION` clause caught nothing but a RAISE
 
 Reported by sentori as a unique violation escaping

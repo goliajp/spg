@@ -52,6 +52,7 @@ pub mod copy;
 mod cursor;
 mod ddl;
 pub mod describe;
+mod describe_sample;
 mod distinct;
 mod dml;
 mod dump;

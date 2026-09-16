@@ -7105,7 +7105,13 @@ fn source_temporal_type(
     match e {
         Expr::ScalarSubquery(inner) => {
             let cat = catalog?;
-            let described = crate::describe::describe_select_columns(inner, cat, &[], 0);
+            let described = crate::describe::describe_select_columns(
+                inner,
+                cat,
+                crate::describe::Typing::Static,
+                &[],
+                0,
+            );
             match described.as_slice() {
                 [only] => Some(only.ty),
                 _ => None,

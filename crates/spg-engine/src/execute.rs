@@ -697,18 +697,22 @@ impl Engine {
         Ok(self.describe_prepared(stmt))
     }
 
+    fn describe_dialect(&self) -> describe::Dialect {
+        describe::Dialect::of_engine(self.speaks_mysql)
+    }
+
     pub fn describe_prepared(&self, stmt: &Statement) -> (Vec<u32>, Vec<ColumnSchema>) {
         if let Statement::Select(s) = stmt {
             if crate::system_catalog::select_references_meta_view(s)
                 && let Ok(catalog) = self.meta_view_catalog(s)
             {
-                return describe::describe_prepared(stmt, &catalog);
+                return describe::describe_prepared_in(stmt, &catalog, self.describe_dialect());
             }
             if let Some(catalog) = self.admin_view_catalog(s) {
-                return describe::describe_prepared(stmt, &catalog);
+                return describe::describe_prepared_in(stmt, &catalog, self.describe_dialect());
             }
         }
-        describe::describe_prepared(stmt, self.active_catalog())
+        describe::describe_prepared_in(stmt, self.active_catalog(), self.describe_dialect())
     }
 
     /// v6.1.1 — execute a [`Statement`] previously returned by
