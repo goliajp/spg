@@ -132,10 +132,23 @@ async fn returning_carries_column_type() {
     assert_eq!(id, 2);
 }
 
-/// Gap 5 — `pg_extension` catalog probe (bare and qualified).
+/// Gap 5 — `pg_extension` catalog probe (bare and qualified). mailrs
+/// probes after applying `init-schema.sql`, which creates `vector`; a
+/// database that created nothing answers false, as PG does (8.0.3 — the
+/// listing no longer invents extensions a dump would then create).
 #[tokio::test]
 async fn pg_extension_lists_native_capabilities() {
     let p = pool().await;
+    let before: (bool,) =
+        sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+    assert!(!before.0);
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(&p)
+        .await
+        .unwrap();
     let bare: (bool,) =
         sqlx::query_as("SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')")
             .fetch_one(&p)
