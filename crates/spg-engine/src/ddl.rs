@@ -6756,6 +6756,12 @@ impl Engine {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
                     alloc::format!("materialized view {name:?} does not exist"),
                 )));
+            } else {
+                // 8.0.3 — PG's IF EXISTS skip NOTICE, the one member of the
+                // DROP family still silent (sentori §5.2).
+                self.notice(alloc::format!(
+                    "materialized view {name:?} does not exist, skipping"
+                ));
             }
         }
         Ok(QueryResult::CommandOk {

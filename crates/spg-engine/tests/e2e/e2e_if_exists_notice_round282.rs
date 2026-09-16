@@ -131,3 +131,15 @@ fn a_successful_drop_is_silent() {
     e.execute("DROP TABLE IF EXISTS tgt").unwrap();
     assert!(e.take_notices().is_empty());
 }
+
+/// 8.0.3 — sentori §5.2: `DROP MATERIALIZED VIEW IF EXISTS` was the one
+/// member of the family that stayed silent. PG 18.6:
+/// `materialized view "nosuch_mv" does not exist, skipping`.
+#[test]
+fn a_missing_materialized_view_raises_the_notice() {
+    let mut e = Engine::new();
+    assert_eq!(
+        notices(&mut e, "DROP MATERIALIZED VIEW IF EXISTS nosuch_mv"),
+        vec!["materialized view \"nosuch_mv\" does not exist, skipping"],
+    );
+}

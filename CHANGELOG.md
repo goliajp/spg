@@ -10,6 +10,12 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `DROP MATERIALIZED VIEW IF EXISTS` said nothing
+
+Reported by sentori (§5.2): PostgreSQL 18.6 raises `materialized view
+"x" does not exist, skipping`, as every other `DROP … IF EXISTS` in SPG
+already did. It does now.
+
 ### Fixed — a dump of SPG did not restore into PostgreSQL
 
 Reported by sentori (their §4.4): `pg_dump` of 8.0.2 exited 0, and the
