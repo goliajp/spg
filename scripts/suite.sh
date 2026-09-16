@@ -196,9 +196,69 @@ if [[ "${1:-}" == "--on-mini" ]]; then
     # An instrument that says "done" about a run still in progress is the
     # same failure as one that says "dead" about a run still alive, which
     # this file also had until this release.
+    # 8.0.2 — and the processes those two SPAWNED.
+    #
+    # The two pkills above end the shell scripts. They do not end
+    # `suite-run`, which is the binary that does the work, and they do
+    # not end the servers IT started. Measured on 2026-09-16, three
+    # tier runs started within fifteen minutes of each other:
+    #
+    #   3d944c1  p:e2e p:gates f:biz
+    #   c94c7aa  f:e2e f:gates f:biz
+    #   2aee123  f:e2e f:gates f:biz
+    #   e1488a8  f:e2e f:gates f:biz
+    #
+    # against `p:e2e p:gates p:biz` on the run before them. The failures
+    # were `Connection reset by peer`, `expected to read 5 bytes, got 0
+    # bytes at EOF` and `pool timed out while waiting for an open
+    # connection` -- the signature of a box with another tier still on
+    # it, not of a defect in the tree. Killing the leftovers by hand and
+    # running once more passed all three steps on the same commit.
+    #
+    # Four `spg-server` processes were still up after the pkills, all of
+    # them sweep legs under `/tmp/spg-tests/`, one of them nineteen
+    # minutes old. They are spawned with a RELATIVE argv[0]
+    # (`./target/release/spg-server`), so a pattern written against the
+    # checkout path does not match them; the data directory is what
+    # identifies them, and `/tmp/spg-tests/` is this suite's own scratch
+    # root and nothing else's.
+    #
+    # Then CHECK, because a cleanup that silently leaves something
+    # behind is the failure it was written to stop. A contaminated box
+    # is refused rather than measured: the run that would follow cannot
+    # tell a slow step from somebody else's load, and today it spent
+    # three runs proving that.
     ssh "$HOST" "pkill -f 'mini-suite-runner\\.sh' 2>/dev/null; \
-                 pkill -f 'scripts/suite\\.sh' 2>/dev/null; sleep 1; \
+                 pkill -f 'scripts/suite\\.sh' 2>/dev/null; \
+                 pkill -f 'target/[a-z]*/suite-run' 2>/dev/null; sleep 2; \
+                 pkill -f 'spg-server .*/tmp/spg-tests/' 2>/dev/null; sleep 2; \
                  rm -f /tmp/spg-suite.done; true"
+    # The pattern is ANCHORED at the start of the command, and both
+    # halves of that matter.
+    #
+    # `[s]uite-run` only stops grep from finding ITSELF. It does not
+    # stop `ps` from showing the SHELL ssh runs this in, whose own argv
+    # carries the pattern text -- so the unanchored form counted 2 with
+    # one planted process on the box, and would have counted 1 on a
+    # clean one. A guard that can never read zero refuses every run,
+    # which is the same defect as one that can never read more.
+    #
+    # Anchoring fixes it because that shell's command begins `zsh -c`
+    # while a leg's begins with its own path. Measured both ways: one
+    # planted process reads 1, and reads 0 once it is gone.
+    #
+    # `; true` because `grep -c` exits 1 when the count is 0 and the
+    # count is still on stdout -- an `|| echo 0` here would append a
+    # SECOND line, and the comparison below would be reading "0\n0".
+    leftover=$(ssh -n "$HOST" "ps -ax -o command= | grep -c '^[^ ]*suite-run \|^[^ ]*spg-server .*/tmp/spg-tests/'; true" 2>/dev/null)
+    leftover=${leftover:-0}
+    if [[ "$leftover" -gt 0 ]]; then
+        echo "suite.sh: $HOST still carries $leftover process(es) from an earlier run" >&2
+        ssh -n "$HOST" "ps -ax -o pid,etime,command | grep '[s]uite-run \|[s]pg-server .*/tmp/spg-tests/'; true" >&2 || true
+        echo "suite.sh: refusing to start — a tier measured beside another one reports its \
+neighbour's contention as this tree's failure. End them and run again." >&2
+        exit 2
+    fi
     ssh "$HOST" "cd '$RDIR' && nohup bash scripts/mini-suite-runner.sh $TIER > /dev/null 2>&1 &"
     echo "suite $TIER started on $HOST — read it with: scripts/suite.sh --result"
     exit 0
