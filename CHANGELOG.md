@@ -10,6 +10,50 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — two arbiter shapes answered "no such key" and let the row be refused
+
+**An explicit target covered only by a partial unique index.** sentori's
+`notifier/service.rs:112`, identical on every build back to 7.38.6:
+
+```text
+  CREATE UNIQUE INDEX d ON t (k) WHERE k IS NOT NULL;   one row k = 1
+  INSERT … (1) ON CONFLICT (k) WHERE k IS NOT NULL DO NOTHING
+    PG 18.6   INSERT 0 0
+    SPG       ERROR: duplicate key value violates unique constraint "d"
+```
+
+`on_conflict_arbiters` carried no predicate for an explicit target, on
+the reasoning that the clause names its own. The consumer, though,
+decides existence with `on_conflict_keys_exist_where`, which without a
+predicate goes to the single-column B-tree probe — and that probe only
+consults an index with no predicate. So over a partial index it said
+"no such key" every time. A composite target took a row scan instead,
+which is why only the single-column form failed. The explicit path now
+carries the covering partial index's predicate, as the untargeted path
+already did; a full unique rule over the same columns still wins.
+
+**An untargeted `ON CONFLICT` over a full composite unique index.** Not
+reported. The untargeted path took each unique index's LEADING column as
+if it were the whole key, and only `BTree` indexes at all, so
+`CREATE UNIQUE INDEX ON t (k1, k2)` either went unseen or became an
+arbiter on `k1` — which the single-column probe then could not answer.
+
+The second was found by doing what the report asked: a sweep that
+crosses every axis the arbiter varies along, rather than the ones the
+earlier sweep happened to vary. Target spelling (named / untargeted /
+`ON CONSTRAINT`) × arity × constraint or index × full or partial ×
+`int` / `text` / `text COLLATE "C"` × `DO NOTHING` / `DO UPDATE` × the
+update arm writing another row's unique key: 132 cases, each in its own
+table, PG 18.6 and the candidate compared on the statement's answer and
+the rows afterwards. Before these fixes 3 diverged; after, 0. The sweep
+is `xtests/arbiter-sweep/sweep.py`.
+
+What it held still, said plainly because the last sweep did not: one
+session (the two-session shapes are the uncommitted-key section above),
+autocommit, a single-row `VALUES`, a pre-existing conflicting row, and
+no expression arbiter — `ON CONFLICT (LOWER(email))` still needs a new
+field on a published struct.
+
 ### Fixed — `ON CONFLICT … DO UPDATE` wrote a duplicate into another unique key
 
 Reported by sentori; identical on every build back to 7.38.6. A plain
