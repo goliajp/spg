@@ -237,6 +237,13 @@ All four of the report's cases, the extended protocol through psycopg,
 a deadlock, and a waiter inside its own transaction agree with PG 18.6
 afterwards, B's wait time included.
 
+The same wait covers an UPDATE that moves a row onto a key another
+transaction holds uncommitted. Measured with A inserting `(2, 20)` and
+holding, B running `UPDATE uw SET k = 20 WHERE id = 1`: PG 18.6 makes B
+wait 1.1 s and then refuses it with 23505, both rows surviving; SPG
+updated at once and A's COMMIT failed with 40001. Identical to PG
+afterwards.
+
 Three pins in `e2e_isolation_levels` had been holding the defect:
 `rr_commit_unique_conflict_raises_serialization_failure` and
 `rc_insert_insert_unique_collision_raises_40001` asserted that the
