@@ -5180,6 +5180,56 @@ impl Engine {
             }
             None => (Vec::new(), 0usize),
         };
+        // 8.0.3 — the upsert's UPDATE arm is an UPDATE, and it is held to
+        // the table's unique rules like one.
+        //
+        // A plain `UPDATE` runs `enforce_unique_updates` and this arm did
+        // not, so `ON CONFLICT (id) DO UPDATE SET k = 10` wrote a value
+        // another row's UNIQUE `k` already held and the table ended up
+        // violating its own constraint. Reported by sentori; identical on
+        // every build back to 7.38.6, measured against PG 18.6:
+        //
+        //   CREATE TABLE t (id int PRIMARY KEY, k int UNIQUE);
+        //   INSERT INTO t VALUES (1, 10), (2, 20);
+        //   INSERT INTO t VALUES (2, 0) ON CONFLICT (id) DO UPDATE SET k = 10;
+        //     PG 18.6   ERROR: duplicate key … "t_k_key", rows unchanged
+        //     SPG       INSERT 0 1, rows (1,10) (2,10)
+        //
+        // Same check, same exclusion of each row's own pre-image, same
+        // restriction to the columns that changed — one rule for both
+        // spellings of an update.
+        if !pending_updates.is_empty() {
+            let mut changed_cols: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+            for (_pos, new_vals, old_vals) in &pending_updates {
+                for (i, (o, n)) in old_vals.iter().zip(new_vals.iter()).enumerate() {
+                    if o != n {
+                        changed_cols.insert(i);
+                    }
+                }
+            }
+            let planned: Vec<(usize, Vec<Value<'static>>)> = pending_updates
+                .iter()
+                .map(|(pos, new_vals, _)| (*pos, new_vals.clone()))
+                .collect();
+            enforce_unique_updates(
+                self.active_catalog(),
+                &stmt.table,
+                &planned,
+                &changed_cols,
+                self.speaks_mysql,
+            )?;
+            let exclusions = self
+                .active_catalog()
+                .get(&stmt.table)
+                .map(|t| t.schema().exclusion_constraints.clone())
+                .unwrap_or_default();
+            crate::constraints::enforce_exclusion_updates(
+                self.active_catalog(),
+                &stmt.table,
+                &exclusions,
+                &planned,
+            )?;
+        }
         // v7.9.19 — composite UNIQUE / PRIMARY KEY enforcement.
         // v7.9.29 — CREATE UNIQUE INDEX [WHERE pred] enforcement.
         // Both run on the post-ON-CONFLICT row set: conflicting rows

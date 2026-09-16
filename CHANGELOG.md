@@ -10,6 +10,46 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `ON CONFLICT … DO UPDATE` wrote a duplicate into another unique key
+
+Reported by sentori; identical on every build back to 7.38.6. A plain
+`UPDATE` checked every unique constraint and unique index of its table.
+The upsert's UPDATE arm checked only its arbiter, so the row it updated
+could take a value another row's unique key already held, and the table
+ended up violating its own constraint:
+
+```text
+  CREATE TABLE t (id int PRIMARY KEY, k int UNIQUE);
+  INSERT INTO t VALUES (1, 10), (2, 20);
+  INSERT INTO t VALUES (2, 0) ON CONFLICT (id) DO UPDATE SET k = 10;
+
+    PG 18.6   ERROR: duplicate key … "t_k_key", rows (1,10) (2,20)
+    SPG       INSERT 0 1,                        rows (1,10) (2,10)
+```
+
+The same for `text`, and for a partial unique index as the other key —
+which is their `device_tokens.install_id`. The arm now runs the check a
+plain `UPDATE` runs, with each row's own pre-image excluded and only the
+changed columns considered, and the exclusion-constraint check beside
+it. Their four-case file matches PostgreSQL 18.6 line for line,
+DETAIL included.
+
+### Fixed — an UPDATE into a unique index answered in no one's words, and let a second NULL in
+
+Also from their report. A plain `UPDATE` onto a `CREATE UNIQUE INDEX`
+key answered `UNIQUE INDEX "ux_k" violation on "ux": UPDATE of row #1
+duplicates an existing key` — a row number no client can use, and
+neither the key nor its value. It is PostgreSQL's 23505 with its DETAIL
+now.
+
+The reason was a third copy of the unique-index key logic inside
+`enforce_unique_updates`, and the copy disagreed with the other two: it
+treated a NULL-bearing key as outside the index even under
+`NULLS NOT DISTINCT`, so `UPDATE un SET k = NULL` onto an index already
+holding a NULL went through where PG refuses. The index keyer is one
+implementation now, used by the insert check, the update check and the
+uncommitted-key wait.
+
 ### Fixed — a transaction that wrote a unique key first lost it at COMMIT
 
 Reported by sentori as a 500 on ingest whenever a new fault fired on
