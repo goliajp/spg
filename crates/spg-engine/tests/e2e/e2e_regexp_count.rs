@@ -12,10 +12,13 @@ fn first(e: &mut Engine, sql: &str) -> spg_storage::Value<'static> {
     rows[0].values[0].clone()
 }
 
-fn as_bigint(v: &spg_storage::Value<'_>) -> i64 {
+/// 8.0.3 — `integer`, measured on PostgreSQL 18.6
+/// (`pg_typeof(regexp_count('aaa', 'a'))`). This read BigInt, which is the
+/// type SPG returned and a binary-format client then mis-decoded.
+fn as_int(v: &spg_storage::Value<'_>) -> i32 {
     match v {
-        spg_storage::Value::BigInt(n) => *n,
-        other => panic!("expected BigInt, got {other:?}"),
+        spg_storage::Value::Int(n) => *n,
+        other => panic!("expected Int, got {other:?}"),
     }
 }
 
@@ -23,17 +26,11 @@ fn as_bigint(v: &spg_storage::Value<'_>) -> i64 {
 fn regexp_count_basic() {
     let mut e = Engine::new();
     assert_eq!(
-        as_bigint(&first(&mut e, "SELECT regexp_count('hello world', 'l')")),
+        as_int(&first(&mut e, "SELECT regexp_count('hello world', 'l')")),
         3
     );
-    assert_eq!(
-        as_bigint(&first(&mut e, "SELECT regexp_count('aaa', 'a')")),
-        3
-    );
-    assert_eq!(
-        as_bigint(&first(&mut e, "SELECT regexp_count('abc', 'z')")),
-        0
-    );
+    assert_eq!(as_int(&first(&mut e, "SELECT regexp_count('aaa', 'a')")), 3);
+    assert_eq!(as_int(&first(&mut e, "SELECT regexp_count('abc', 'z')")), 0);
 }
 
 #[test]
@@ -43,7 +40,7 @@ fn regexp_count_with_start_position() {
     // 'l' in "hello" (positions 3,4) and hits the 'l' in "world"
     // at position 10.
     assert_eq!(
-        as_bigint(&first(&mut e, "SELECT regexp_count('hello world', 'l', 7)")),
+        as_int(&first(&mut e, "SELECT regexp_count('hello world', 'l', 7)")),
         1
     );
 }
@@ -53,7 +50,7 @@ fn regexp_count_regex_metacharacter() {
     let mut e = Engine::new();
     // Match 3-letter words separated by space.
     assert_eq!(
-        as_bigint(&first(
+        as_int(&first(
             &mut e,
             "SELECT regexp_count('abc def ghi jklm', '[a-z][a-z][a-z]')"
         )),

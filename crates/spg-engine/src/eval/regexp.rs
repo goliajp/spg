@@ -2760,7 +2760,9 @@ pub(super) fn regexp_count(args: &[Value<'_>]) -> Result<Value<'static>, EvalErr
             break;
         }
     }
-    Ok(Value::BigInt(count))
+    // 8.0.3 — PG's regexp_count returns integer, not bigint (measured on
+    // 18.6); Describe now reports what this value is, so it has to be int.
+    Ok(Value::Int(i32::try_from(count).unwrap_or(i32::MAX)))
 }
 
 // ─── v7.37.16 Epic Rx P0 — ReDoS-safety cap tests ─────────────────────

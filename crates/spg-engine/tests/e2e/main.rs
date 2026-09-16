@@ -260,6 +260,7 @@ mod e2e_describe_matches_execute_round462;
 mod e2e_describe_mysql_shape_v7392;
 mod e2e_describe_predicates_v7383;
 mod e2e_describe_select_subquery_r1053;
+mod e2e_describe_type_is_the_values_type;
 mod e2e_describe_types_v7383;
 mod e2e_describe_validates_v7411;
 mod e2e_difference;
