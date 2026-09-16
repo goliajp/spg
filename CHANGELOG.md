@@ -22,13 +22,15 @@ zero steps on 8.0.1.
 Eleven of sentori's items close here — §3.6, §3.9, §3.14, §3.15,
 §3.20, §3.21, §3.22, §3.23, §3.24, §3.25 and §3.26 — plus a report from
 kevy, which carries a fork of this engine, of a wrong ANSWER in the
-regular-expression engine. Seven more were found while measuring those
+regular-expression engine. Eight more were found while measuring those
 and nobody had reported them: one that crashed a libpq driver outright,
-a void column typed `text` in the RowDescription, a scalar subquery
-typed one way by each protocol, `ON CONFLICT` blind to the two
-commonest spellings of uniqueness, a violation DETAIL that named
-neither the column nor the value, and two defects in this repository's
-own harness.
+an expression index answering questions about its COLUMN — which
+inverted a foreign key and silently dropped a row from an upsert — a
+void column typed `text` in the RowDescription, a scalar subquery typed
+one way by each protocol, `ON CONFLICT` blind to the two commonest
+spellings of uniqueness, a violation DETAIL that named neither the
+column nor the value, and two defects in this repository's own
+harness.
 
 Two things are NAMED here rather than fixed: an error's `Position`
 field (§3.27) and the two shapes of §3.22 whose arbiter is an
@@ -348,6 +350,62 @@ what this engine answered rather than from what PostgreSQL answers,
 measured on PG 18.6 with that file's own seed. One of 7,077 e2e cases;
 the other 7,076 were unmoved, which is the answer the control was
 actually asked for.
+
+### Fixed — an expression index answered questions about its column
+
+Found by sweeping the shapes around §3.22 rather than the shape they
+filed. `CREATE UNIQUE INDEX ON t (LOWER(a))` records `column_position` =
+a's position AND an `expression`. Two index-selection filters on write
+paths matched the position and never asked about the expression, so a
+tree keyed by `lower(a)` answered questions about `a`, probed with the
+raw value. Every other filter in that file excludes such an index;
+these two did not.
+
+**The foreign key is inverted, not merely wrong.** Measured against PG
+18.6, parent holding `'A'`, the expression index created before the
+plain unique one so that it comes first in the index list:
+
+```text
+                 PG 18.6     SPG 8.0.2
+  child 'A'      accepted    REFUSED   Key (k)=(A) is not present
+  child 'a'      refused     ACCEPTED
+```
+
+A legitimate child rejected and an orphan admitted. Both tables end
+with one row, so a count agrees while the surviving row is the wrong
+one — which is why nothing here had caught it.
+
+**The arbiter drops the row.** Same cause, one row present (`'X'`):
+
+```text
+  INSERT ('x') ON CONFLICT (a) DO NOTHING
+    PG 18.6   ERROR: there is no unique or exclusion constraint
+              matching the ON CONFLICT specification
+    SPG       INSERT 0 0        -- and the row is gone
+```
+
+`SELECT count(*) FROM t WHERE a = 'x'` is 0 on both engines, so nothing
+in the data said those two rows should collide. `on_conflict_arbiters`
+has a recorded, deliberate divergence — PostgreSQL refuses a target no
+unique constraint enforces and SPG accepts it, because a shipped
+customer upsert depends on the lax form — and its justification reads
+"the laxness only ACCEPTS more: a PG-valid program never issues the
+shape PG rejects". That sentence was true of the intent and false of
+the code: here it accepted the statement and then silently discarded
+the row.
+
+Both sites now ask. The foreign key is byte-identical to PostgreSQL
+afterwards, including the DETAIL. The arbiter raises the unique
+violation the expression index really does have rather than reporting
+success — a different message from PostgreSQL's, which refuses at plan
+time, and the pin says so rather than claiming agreement it does not
+have.
+
+Five pins, and each guard was shown to be load-bearing: removing the
+arbiter's guard fails exactly the row-loss pin, with the message "the
+statement reported success and the row is not in the table"; removing
+the foreign key's fails the three that watch the inversion, and neither
+control touches the other's tests. 7,082 e2e cases green with both in.
 
 ### Fixed — `ON CONFLICT` could not see a `PRIMARY KEY` or a `UNIQUE` constraint
 

@@ -381,6 +381,27 @@ fn on_conflict_key_exists(
         matches!(idx.kind, spg_storage::IndexKind::BTree(_))
             && idx.column_position == column_pos
             && idx.partial_predicate.is_none()
+            // 8.0.3 — and not an EXPRESSION index on this column.
+            //
+            // `CREATE UNIQUE INDEX ON t (LOWER(a))` records
+            // `column_position` = a's position and an `expression`. Every
+            // other filter in this file excludes it; this one did not, so
+            // a tree keyed by `lower(a)` answered a question about `a`.
+            // Probed with the RAW value it hits whenever the value is
+            // already lower-case:
+            //
+            //   one row ('X'), INSERT ('x') ON CONFLICT (a) DO NOTHING
+            //     PG 18.6   ERROR: there is no unique or exclusion
+            //               constraint matching the ON CONFLICT
+            //               specification
+            //     SPG       INSERT 0 0        -- the row is GONE
+            //
+            // `SELECT count(*) FROM t WHERE a = 'x'` is 0 on both
+            // engines, so nothing about the data said they should
+            // collide. The recorded divergence above says SPG's laxness
+            // "only ACCEPTS more"; here it accepted the statement and
+            // then silently dropped the row, which is the opposite.
+            && idx.expression.is_none()
             // v7.40.11 — not a locale-collated index. Its tree is keyed
             // by ICU sort keys, so `lookup_eq` of a RAW value answers
             // "no locators" whatever is stored, and this reads that as
@@ -3071,6 +3092,22 @@ pub(crate) fn enforce_fk_inserts(
                             matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                                 && idx.column_position == parent_col
                                 && idx.partial_predicate.is_none()
+                                // 8.0.3 — the same omission as the ON
+                                // CONFLICT probe, and here it INVERTS the
+                                // constraint. An expression index on the
+                                // parent column is picked when it comes
+                                // first in the index list, and then the
+                                // probe asks a `lower(k)` tree about `k`:
+                                //
+                                //   parent holds 'A'
+                                //   child 'A'   PG accepts   SPG REFUSES
+                                //   child 'a'   PG refuses   SPG ACCEPTS
+                                //
+                                // A legitimate child is rejected and an
+                                // orphan is let in. Both tables end with
+                                // one row, so a count agrees while the
+                                // surviving row is the wrong one.
+                                && idx.expression.is_none()
                         })
                         .find_map(|idx| {
                             crate::index_access::probe_space(parent, idx, col, mysql)
