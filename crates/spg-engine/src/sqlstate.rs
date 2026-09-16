@@ -372,6 +372,8 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
             // wire's SHOW shortcut, which used to answer this name with
             // an empty row and never reached the error at all.
             || msg.contains("unrecognized configuration parameter \"")
+            // 8.0.3 — `DROP EXTENSION nosuch`, measured 42704 on 18.6.
+            || (msg.starts_with("extension \"") && msg.ends_with("\" does not exist"))
         {
             "42704"
         // v7.39 (read01 round 89) — a column named twice in an INSERT target
@@ -441,6 +443,9 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if msg.contains("constraint \"") && msg.contains("does not exist") {
             "42704"
         } else if msg.contains("type \"") && msg.contains("already exists") {
+            "42710"
+        // 8.0.3 — `CREATE EXTENSION` of an installed one, 42710 on 18.6.
+        } else if msg.starts_with("extension \"") && msg.ends_with("\" already exists") {
             "42710"
         // v7.39 (read01 round 49) — ALTER TYPE ADD VALUE / RENAME VALUE.
         } else if msg.contains("enum label \"") && msg.contains("already exists") {

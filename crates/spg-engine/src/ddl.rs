@@ -233,14 +233,20 @@ impl Engine {
             // v7.39 (round 652) — SPG is single-owner and has no
             // clustered storage, so both of these remain no-ops once the
             // name checks out. What was missing was the check.
+            // 8.0.3 — and the owner is recorded. It was a no-op, so a dump
+            // restored into SPG kept the restoring role as every table's
+            // owner, and the next dump said so.
             T::OwnerTo { role } => {
-                if self.role_exists(&role) {
-                    Ok(())
-                } else {
-                    Err(EngineError::Unsupported(alloc::format!(
+                if !self.role_exists(&role) {
+                    return Err(EngineError::Unsupported(alloc::format!(
                         "role \"{role}\" does not exist"
-                    )))
+                    )));
                 }
+                let t = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+                    EngineError::Unsupported(alloc::format!("relation \"{tbl}\" does not exist"))
+                })?;
+                t.schema_mut().owner = Some(role);
+                Ok(())
             }
             // v7.39 (round 710) — same shape as OwnerTo/ClusterOn above:
             // the ACTION no-ops, the NAME check is what was missing.
@@ -2268,8 +2274,10 @@ impl Engine {
         // Validate existence for the kinds SPG catalogues. PG's wording for a
         // missing relation is "relation \"x\" does not exist" (42P01).
         match kind {
+            // 8.0.3 — a view is not in the table list; `COMMENT ON VIEW`
+            // was refused for every view, and a dump carrying one stopped.
             "table" | "view" => {
-                if cat.get(name).is_none() {
+                if cat.get(name).is_none() && !(kind == "view" && cat.has_view(name)) {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "relation {name:?} does not exist"
                     )));
@@ -2680,6 +2688,20 @@ impl Engine {
             } else {
                 alloc::vec::Vec::new()
             };
+        // The index being created is not on the table yet; its own
+        // expression is the one that may call a user function.
+        let functions = crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.table))
+            .or_else(|| {
+                let names_user_function = stmt.expression.as_ref().is_some_and(|e| {
+                    let src = alloc::format!("{e}");
+                    self.active_catalog()
+                        .functions()
+                        .values()
+                        .any(|f| src.contains(&alloc::format!("{}(", f.name)))
+                });
+                names_user_function
+                    .then(|| crate::expr_index::function_scope_all(self.active_catalog()))
+            });
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -2978,7 +3000,7 @@ impl Engine {
             // lookup of `lower(s) = …` could ever match. `refresh` is a
             // no-op for a GIN full-text index, whose expression names a
             // source column that its own maintenance path already reads.
-            crate::expr_index::refresh(table)?;
+            crate::expr_index::refresh(table, functions.as_ref())?;
         }
         // v7.38.18 (S0) — and a locale-collated column index, for the
         // same reason: `Table::add_index` deliberately leaves its tree
@@ -2986,7 +3008,7 @@ impl Engine {
         // without this the index would exist, be skipped by every seek
         // (`Table::index_on` declines an incomplete one), and cost
         // maintenance for nothing.
-        crate::expr_index::refresh(table)?;
+        crate::expr_index::refresh(table, functions.as_ref())?;
         // v7.9.29 — persist `is_unique` flag on the storage Index.
         // Combined with `partial_predicate`, INSERT enforcement
         // checks that no other row whose predicate evaluates true
@@ -3088,6 +3110,10 @@ impl Engine {
                 return Err(e);
             }
         }
+        // 8.0.3 — the declared operator class, for the definition to print.
+        let opclass = stmt.opclass.clone();
+        self.active_catalog_mut()
+            .set_index_opclass(&stmt.name, opclass.as_deref());
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.
         self.plan_cache.evict_referencing(&table_name);
@@ -4256,6 +4282,16 @@ impl Engine {
             };
             let cat = self.active_catalog();
             if cat.enum_types().contains_key(&name) {
+                // 8.0.3 — a string default on an enum column is a constant
+                // of the ENUM (PG 18.6: `'ok'::mood`). It was deparsed
+                // before the column's type was known, as the text
+                // placeholder's `'ok'::text`, and a dump restored that.
+                if let Some(text) = &col.default_text
+                    && text.starts_with('\'')
+                    && let Some(literal) = text.strip_suffix("::text")
+                {
+                    col.default_text = Some(alloc::format!("{literal}::{name}"));
+                }
                 col.user_enum_type = Some(name);
                 continue;
             }
@@ -4706,7 +4742,7 @@ impl Engine {
                     }
                     // The tree still holds the column's own values until
                     // the expression is evaluated over the rows.
-                    crate::expr_index::refresh(table)?;
+                    crate::expr_index::refresh(table, None)?;
                     continue;
                 }
                 spg_sql::ast::TableConstraint::Unique { columns, .. } => ("key", columns, None),
@@ -5644,9 +5680,11 @@ impl Engine {
             body: body_repr,
             check_option,
         };
+        let stored = def.name.clone();
         self.active_catalog_mut()
             .create_view(def, or_replace, if_not_exists)
             .map_err(EngineError::Storage)?;
+        self.record_creator(spg_storage::NonTableKind::View, &stored);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: self.catalog_change_is_committed(),
@@ -5811,6 +5849,7 @@ impl Engine {
                 self.active_catalog_mut()
                     .create_enum_type(def)
                     .map_err(EngineError::Storage)?;
+                self.record_creator(spg_storage::NonTableKind::EnumType, &s.name);
             }
             spg_sql::ast::TypeKind::Composite {
                 fields,
@@ -5852,6 +5891,7 @@ impl Engine {
                 self.active_catalog_mut()
                     .create_composite_type(def)
                     .map_err(EngineError::Storage)?;
+                self.record_creator(spg_storage::NonTableKind::CompositeType, &s.name);
             }
         }
         Ok(QueryResult::CommandOk {
@@ -6022,6 +6062,17 @@ impl Engine {
                 self.active_catalog_mut()
                     .create_domain_type(def)
                     .map_err(EngineError::Storage)?;
+                // A rename keeps the owner.
+                let kind = spg_storage::NonTableKind::DomainType;
+                if let Some(owner) = self
+                    .active_catalog()
+                    .object_owner(kind, name)
+                    .map(alloc::string::String::from)
+                {
+                    let cat = self.active_catalog_mut();
+                    cat.clear_object_owner(kind, name);
+                    cat.set_object_owner(kind, &new_name, &owner);
+                }
             }
         }
         Ok(QueryResult::CommandOk {
@@ -6110,6 +6161,7 @@ impl Engine {
         self.active_catalog_mut()
             .create_domain_type(def)
             .map_err(EngineError::Storage)?;
+        self.record_creator(spg_storage::NonTableKind::DomainType, &s.name);
         Ok(QueryResult::CommandOk {
             affected: 0,
             modified_catalog: self.catalog_change_is_committed(),
@@ -6126,6 +6178,8 @@ impl Engine {
         for name in names {
             let was_present = self.active_catalog_mut().drop_domain_type(name);
             if was_present {
+                self.active_catalog_mut()
+                    .clear_object_owner(spg_storage::NonTableKind::DomainType, name);
                 removed += 1;
             } else if !if_exists {
                 return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
@@ -6211,6 +6265,12 @@ impl Engine {
             let cat = self.active_catalog_mut();
             let was_enum = cat.drop_enum_type(name);
             let was_composite = cat.drop_composite_type(name);
+            if was_enum {
+                cat.clear_object_owner(spg_storage::NonTableKind::EnumType, name);
+            }
+            if was_composite {
+                cat.clear_object_owner(spg_storage::NonTableKind::CompositeType, name);
+            }
             if was_enum || was_composite {
                 removed += 1;
             } else if !if_exists {
@@ -6318,6 +6378,14 @@ impl Engine {
         // Promote any synthetic-Text projections to their actual
         // observed types so the backing table accepts the rows.
         cols = infer_column_types(&cols, &rows);
+        // 8.0.3 — a result column's nullability is a fact about the query,
+        // not a constraint on the table made from it: PG gives a
+        // materialized view's columns and a CTAS table's none (measured on
+        // 18.6: `count(*) AS n` is attnotnull f). SPG copied `count(*)`'s
+        // non-nullness into a NOT NULL, which `pg_constraint` then reported.
+        for c in &mut cols {
+            c.nullable = true;
+        }
         // v7.39.2 — `CREATE TABLE t AS SELECT 1 AS a, 2 AS a` built a
         // table with two columns named `a`, where both engines refuse.
         // Checked on the RESOLVED names rather than the AST, because
@@ -6332,7 +6400,11 @@ impl Engine {
                 self.speaks_mysql,
             )));
         }
-        let schema = spg_storage::TableSchema::new(s.name.clone(), cols);
+        let mut schema = spg_storage::TableSchema::new(s.name.clone(), cols);
+        // 8.0.3 — whoever runs it owns it, as CREATE TABLE records. A
+        // materialized view and a CTAS table recorded no owner, so both
+        // reported the bootstrap superuser.
+        schema.owner = Some(alloc::string::String::from(self.current_role()));
         let cat = self.active_catalog_mut();
         cat.create_table(schema).map_err(EngineError::Storage)?;
         // v7.38.19 — the materialised row count is the statement's
@@ -6705,6 +6777,10 @@ impl Engine {
             // a temporary table.
             let key = self.active_catalog().view_key(name);
             let was_present = self.active_catalog_mut().drop_view(&key);
+            if was_present {
+                self.active_catalog_mut()
+                    .clear_object_owner(spg_storage::NonTableKind::View, &key);
+            }
             if was_present && key != *name {
                 self.temp_views.remove(name);
                 self.refresh_temp_prefix();
@@ -6984,6 +7060,18 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
         // the parser lowers to a zero-argument `current_date` whose
         // Display prints the keyword — this arm printed the lowering.
         // The existing default-text test caught it in the same minute.
+        // 8.0.3 — a sequence function's argument is a `regclass`, and PG
+        // stores the constant as one: `nextval('s')` reads back
+        // `nextval('s'::regclass)` (measured on 18.6).
+        Expr::FunctionCall { name, args }
+            if matches!(name.to_ascii_lowercase().as_str(), "nextval" | "currval")
+                && matches!(args.as_slice(), [Expr::Literal(Literal::String(_))]) =>
+        {
+            let [Expr::Literal(Literal::String(seq))] = args.as_slice() else {
+                unreachable!("guarded by matches!")
+            };
+            alloc::format!("{name}('{}'::regclass)", seq.replace('\'', "''"))
+        }
         Expr::FunctionCall { name, args }
             if args.iter().any(|a| {
                 matches!(a, Expr::Cast { expr: inner, .. }
@@ -6992,18 +7080,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
         {
             let rendered: Vec<alloc::string::String> = args
                 .iter()
-                .map(|a| match a {
-                    Expr::Cast {
-                        expr: inner,
-                        target,
-                    } if matches!(inner.as_ref(), Expr::Literal(Literal::String(_))) => {
-                        let Expr::Literal(Literal::String(lit)) = inner.as_ref() else {
-                            unreachable!("guarded by matches!")
-                        };
-                        alloc::format!("'{}'::{target}", lit.replace('\'', "''"))
-                    }
-                    other => alloc::format!("{other}"),
-                })
+                .map(crate::qualify::render_call_argument)
                 .collect();
             alloc::format!("{name}({})", rendered.join(", "))
         }
@@ -7348,6 +7425,19 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
             let display = alloc::format!("{default_expr}");
             schema = schema.with_runtime_default(display);
         } else {
+            // 8.0.3 — `DEFAULT 'ok'::mood` on a column OF that user type is
+            // the constant `'ok'`: the cast names the column's own type,
+            // which this function cannot resolve (it has no catalog) and
+            // the binding below coerces to anyway. Every dump writes enum
+            // defaults this way, and CREATE TABLE refused them — `type
+            // "mood" does not exist` — so no such dump restored.
+            let default_expr = match default_expr {
+                Expr::Cast {
+                    expr,
+                    target: spg_sql::ast::CastTarget::Named(n),
+                } if schema.user_enum_type.as_deref() == Some(n.as_str()) => *expr,
+                other => other,
+            };
             let raw = literal_expr_to_value(default_expr)?;
             // v7.39 (round 259) — a column whose type is a user type is
             // still typed with the parser's Text placeholder here; the

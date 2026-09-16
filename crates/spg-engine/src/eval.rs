@@ -2718,6 +2718,25 @@ fn eval_cast_arm(
             return Ok(Value::text(name));
         }
     }
+    // 8.0.3 — `'mood'::regtype` names a USER type too: enums, composites
+    // and domains are in pg_type, at the oids `user_type_oids` gives them.
+    // The cast has no catalog, so it answered `type "mood" does not exist`
+    // and `WHERE contypid = 'posint'::regtype` — how a tool reads a domain's
+    // constraints — could not be written.
+    if matches!(target, CastTarget::RegType)
+        && let (Some(cat), Value::Text(name)) = (ctx.catalog, &v)
+    {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        let (enums, composites, domains) = crate::system_catalog::user_type_oids(cat);
+        if let Some((n, oid)) = enums
+            .into_iter()
+            .chain(composites)
+            .chain(domains)
+            .find(|(n, _)| n == bare)
+        {
+            return Ok(Value::RegType(oid, n.into_boxed_str()));
+        }
+    }
     // v7.38 (read01 P6.40) — a cast to a user DOMAIN (`x::posint`)
     // enforces the domain's NOT NULL + CHECK constraints, matching PG.
     // The base-type coercion already happened when `v` was produced

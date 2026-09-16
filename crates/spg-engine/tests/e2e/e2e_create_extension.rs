@@ -37,16 +37,17 @@ fn create_extension_with_cascade() {
 }
 
 #[test]
-fn create_extension_does_not_modify_catalog() {
-    // No-op should not bump the WAL — `modified_catalog: false`
-    // signals to the snapshot driver that nothing changed.
+fn create_extension_records_the_extension() {
+    // 8.0.3 — was `create_extension_does_not_modify_catalog`. The statement
+    // installs now: `pg_extension` lists it and a dump re-creates it, so it
+    // is a catalog change the WAL has to carry.
     let mut eng = Engine::new();
     let r = eng.execute("CREATE EXTENSION vector").unwrap();
     match r {
         QueryResult::CommandOk {
             modified_catalog, ..
         } => {
-            assert!(!modified_catalog);
+            assert!(modified_catalog);
         }
         _ => panic!("expected CommandOk"),
     }

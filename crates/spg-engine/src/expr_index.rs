@@ -147,7 +147,60 @@ fn collated_key(
 /// Called where a statement is about to depend on one. Cheap to call when
 /// there is nothing to do: the common table reports no stale index and
 /// this returns without touching a row.
-pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
+/// 8.0.3 — a catalog holding only `cat`'s user functions, for evaluating
+/// index expressions while the table is borrowed mutably out of `cat`.
+///
+/// An index over a user function (`CREATE INDEX … (norm_name(name))`)
+/// was keyed by an evaluator with no catalog, so the call named a
+/// function that "does not exist" and every INSERT into the table failed.
+/// `None` unless one of `table`'s index expressions names a user function
+/// (every table, `None` for all of them), so an ordinary INSERT pays for
+/// one scan of its own index list and nothing else.
+pub(crate) fn function_scope(
+    cat: &spg_storage::Catalog,
+    table: Option<&str>,
+) -> Option<spg_storage::Catalog> {
+    if cat.functions().is_empty() {
+        return None;
+    }
+    let calls_user_function = |t: &Table| {
+        t.indices()
+            .iter()
+            .filter_map(|i| i.expression.as_deref())
+            .any(|src| {
+                cat.functions()
+                    .values()
+                    .any(|f| src.contains(&alloc::format!("{}(", f.name)))
+            })
+    };
+    match table {
+        Some(name) if !cat.get(name).is_some_and(calls_user_function) => return None,
+        None if !cat
+            .table_names()
+            .iter()
+            .any(|n| cat.get(n).is_some_and(calls_user_function)) =>
+        {
+            return None;
+        }
+        _ => {}
+    }
+    Some(function_scope_all(cat))
+}
+
+/// Every user function of `cat`, in a catalog of their own.
+pub(crate) fn function_scope_all(cat: &spg_storage::Catalog) -> spg_storage::Catalog {
+    let mut scope = spg_storage::Catalog::new();
+    for def in cat.functions().values() {
+        // A signature the source catalog already holds once cannot collide.
+        let _ = scope.create_function(def.clone(), true);
+    }
+    scope
+}
+
+pub(crate) fn refresh(
+    table: &mut Table,
+    functions: Option<&spg_storage::Catalog>,
+) -> Result<(), EngineError> {
     // v7.38.18 (S0) — the collated column indexes first: they are the
     // same mechanism, and `add_index` deliberately leaves theirs empty
     // because this crate is the only one that can encode their keys.
@@ -172,7 +225,8 @@ pub(crate) fn refresh(table: &mut Table) -> Result<(), EngineError> {
         return Ok(());
     }
     let schema = table.schema().clone();
-    let ctx = eval::EvalContext::new(&schema.columns, None);
+    let mut ctx = eval::EvalContext::new(&schema.columns, None);
+    ctx.catalog = functions;
     for (name, src) in stale {
         let expr = spg_sql::parser::parse_expression(&src).map_err(|e| {
             EngineError::Unsupported(alloc::format!(
@@ -229,6 +283,7 @@ pub(crate) fn refresh_named(
     engine_catalog: &mut spg_storage::Catalog,
     name: &str,
 ) -> Result<(), EngineError> {
+    let functions = function_scope(engine_catalog, Some(name));
     let Some(table) = engine_catalog.get_mut(name) else {
         return Ok(());
     };
@@ -238,7 +293,7 @@ pub(crate) fn refresh_named(
     if table.stale_expression_indices().is_empty() && table.stale_collated_indices().is_empty() {
         return Ok(());
     }
-    refresh(table)
+    refresh(table, functions.as_ref())
 }
 
 /// Refill every expression index in a catalog just read off disk.
@@ -268,9 +323,10 @@ pub(crate) fn rebuild_all(cat: &mut spg_storage::Catalog) {
             })
         })
         .collect();
+    let functions = function_scope(cat, None);
     for name in names {
         if let Some(table) = cat.get_mut(&name) {
-            let _ = refresh(table);
+            let _ = refresh(table, functions.as_ref());
         }
     }
 }

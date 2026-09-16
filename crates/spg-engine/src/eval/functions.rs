@@ -96,6 +96,13 @@ fn current_role_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
 
 /// v7.39 (read01 round 51) — the login identity the connection authenticated
 /// as. Absent (embedded engine) = the Admin default.
+/// 8.0.3 — whether the session's search path leaves `public` out, so a
+/// deparse has to qualify a user object's name. See `qualify`.
+fn public_hidden_in(ctx: &EvalContext<'_>) -> bool {
+    let path = ctx.session_gucs.and_then(|g| g.get("search_path"));
+    crate::qualify::public_hidden(path.map(String::as_str), &session_user_from_ctx(ctx))
+}
+
 fn session_user_from_ctx(ctx: &EvalContext<'_>) -> alloc::string::String {
     ctx.session_gucs
         .and_then(|g| g.get(crate::session::SESSION_USER_KEY))
@@ -194,8 +201,39 @@ fn array_lower_bound(v: &Value) -> i32 {
 }
 
 pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
-    let Ok(spg_sql::ast::Statement::Select(stmt)) = spg_sql::parser::parse_statement(body) else {
-        return body.to_string();
+    pg_viewdef_render_in(body, pretty, None)
+}
+
+/// 8.0.3 — a body this renderer does not lay out, in the frame PG's
+/// deparse always has: a leading space and a closing `;`. It came back
+/// bare, and `pg_dump` — which drops the definition's last character,
+/// taking it to be that `;` — cut the closing parenthesis off every view
+/// over a join, a CTE or a set operation, so the dump did not restore.
+fn viewdef_fallback(body: &str) -> String {
+    alloc::format!(" {};", body.trim().trim_end_matches(';'))
+}
+
+/// 8.0.3 — [`pg_viewdef_render`], with every user object the body names
+/// qualified when `qualify_in` is given; see `qualify`. Applied to the
+/// parsed statement, because the parser drops a relation's schema and a
+/// qualified text would come back bare.
+pub(crate) fn pg_viewdef_render_in(
+    body: &str,
+    pretty: bool,
+    qualify_in: Option<&spg_storage::Catalog>,
+) -> String {
+    let Ok(spg_sql::ast::Statement::Select(mut stmt)) = spg_sql::parser::parse_statement(body)
+    else {
+        return viewdef_fallback(body);
+    };
+    let qualified_body;
+    let body = match qualify_in {
+        Some(cat) => {
+            crate::qualify::qualify_select(&mut stmt, cat, &[]);
+            qualified_body = alloc::format!("{}", spg_sql::ast::Statement::Select(stmt.clone()));
+            qualified_body.as_str()
+        }
+        None => body,
     };
     // v7.39 (round 336, V58) — GROUP BY / HAVING / ORDER BY are laid out
     // now, each on its own line at PG's own indent (measured on 18.4:
@@ -207,7 +245,7 @@ pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         && stmt.offset.is_none()
         && !stmt.distinct;
     let Some(from) = &stmt.from else {
-        return body.to_string();
+        return viewdef_fallback(body);
     };
     if !simple
         || !from.joins.is_empty()
@@ -215,7 +253,7 @@ pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
         || from.primary.unnest_expr.is_some()
         || from.primary.generate_series_args.is_some()
     {
-        return body.to_string();
+        return viewdef_fallback(body);
     }
     let mut out = String::from(" SELECT ");
     let items: Vec<String> = stmt.items.iter().map(|i| viewdef_item_text(i)).collect();
@@ -15625,7 +15663,12 @@ fn apply_function_dispatch(
                     .get((col_no - 1) as usize)
                     .map_or(Value::Null, |c| Value::text(c.clone())));
             }
-            Ok(Value::text(crate::system_catalog::catalog_indexdef(t, &ci)))
+            Ok(Value::text(crate::system_catalog::catalog_indexdef(
+                cat,
+                t,
+                &ci,
+                public_hidden_in(ctx).then_some(cat),
+            )))
         }
         // pg_get_constraintdef(conname [, pretty]) — REAL for
         // PK / UNIQUE / FK: rebuilt from live catalog state using
@@ -15664,6 +15707,19 @@ fn apply_function_dispatch(
                     else {
                         return Ok(Value::Null);
                     };
+                    // 8.0.3 — a domain's constraint (`contypid` set).
+                    if let (Some(Value::BigInt(typid)), Some(Value::Text(conname))) =
+                        (row.values.get(9), row.values.get(1))
+                        && *typid != 0
+                    {
+                        return Ok(crate::system_catalog::domain_constraint_def(
+                            cat,
+                            *typid,
+                            conname,
+                            public_hidden_in(ctx),
+                        )
+                        .map_or(Value::Null, Value::text));
+                    }
                     match row.values.get(1) {
                         Some(Value::Text(s)) => resolved = s.to_string(),
                         _ => return Ok(Value::Null),
@@ -15743,7 +15799,7 @@ fn apply_function_dispatch(
                     let mut def = alloc::format!(
                         "FOREIGN KEY ({}) REFERENCES {}({})",
                         local.join(", "),
-                        fk.parent_table,
+                        crate::qualify::user_object_name(&fk.parent_table, public_hidden_in(ctx)),
                         parent_names.join(", ")
                     );
                     use spg_storage::FkAction;
@@ -15800,11 +15856,16 @@ fn apply_function_dispatch(
                             )));
                         }
                     }
-                    let body = if inner.starts_with('(') && inner.ends_with(')') {
-                        inner.to_string()
-                    } else {
-                        alloc::format!("({inner})")
-                    };
+                    // 8.0.3 — in PG's catalog form; see `catalog_deparse`.
+                    let qualify_in = ctx.catalog.filter(|_| public_hidden_in(ctx));
+                    let body = crate::catalog_deparse::predicate_text(inner, &t.schema().columns, qualify_in)
+                        .unwrap_or_else(|| {
+                            if inner.starts_with('(') && inner.ends_with(')') {
+                                inner.to_string()
+                            } else {
+                                alloc::format!("({inner})")
+                            }
+                        });
                     return Ok(Value::text(alloc::format!("CHECK ({body}){suffix}")));
                 }
                 // v7.39 (round 210, EXCLUDE Phase 1) — exclusion constraints.
@@ -15954,14 +16015,18 @@ fn apply_function_dispatch(
                 .unwrap_or(&name_arg)
                 .trim_matches('"');
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
+            // 8.0.3 — names qualified as the session's search path needs.
+            let render = |body: &str| {
+                pg_viewdef_render_in(body, pretty, public_hidden_in(ctx).then_some(cat))
+            };
             if let Some(def) = cat.view(bare) {
-                return Ok(Value::text(pg_viewdef_render(&def.body, pretty)));
+                return Ok(Value::text(render(&def.body)));
             }
             // 7.38.1 S5.1 — materialized views answer too: pg_dump
             // reads BOTH through pg_get_viewdef, and an empty answer
             // made the dumped matview "appear to be empty".
             if let Some(body) = cat.materialized_views().get(bare) {
-                return Ok(Value::text(pg_viewdef_render(body, pretty)));
+                return Ok(Value::text(render(body)));
             }
             Ok(Value::Null)
         }
@@ -15971,7 +16036,18 @@ fn apply_function_dispatch(
         // canonical `pg_get_expr(adbin, adrelid) FROM pg_attrdef` form just
         // returns the first argument. A NULL / non-text first arg → NULL.
         "pg_get_expr" => match args.first() {
-            Some(Value::Text(s)) => Ok(Value::text(s.clone())),
+            // 8.0.3 — with the names in it qualified as the session's search
+            // path needs (a serial default's `'t_id_seq'::regclass`, a user
+            // function); re-rendered only when one was.
+            Some(Value::Text(s)) => {
+                if let (true, Some(cat)) = (public_hidden_in(ctx), ctx.catalog)
+                    && let Ok(mut e) = spg_sql::parser::parse_expression(s)
+                    && crate::qualify::qualify_expr(&mut e, cat, &[])
+                {
+                    return Ok(Value::text(crate::qualify::render_qualified_expr(&e)));
+                }
+                Ok(Value::text(s.clone()))
+            }
             _ => Ok(Value::Null),
         },
         // v7.39 (round 312, V33) — the function and rule deparses. Both
@@ -16001,7 +16077,11 @@ fn apply_function_dispatch(
             let Some(oid) = oid_arg(args.first()) else {
                 return Ok(Value::Null);
             };
-            let (_, rows) = crate::system_catalog::synth_pg_proc(cat);
+            // Only the oid → name mapping is read here, never an owner.
+            let (_, rows) = crate::system_catalog::synth_pg_proc(
+                cat,
+                &crate::role_directory::RoleDirectory::for_shape_only(),
+            );
             // Resolve against the synth view's own oid assignment, the
             // way pg_get_constraintdef does — the forward and reverse
             // directions then cannot drift apart.
@@ -16021,6 +16101,31 @@ fn apply_function_dispatch(
             };
             Ok(Value::text(crate::system_catalog::render_function_def(def)))
         }
+        // 8.0.3 — the three pieces `pg_dump` builds a CREATE FUNCTION
+        // from, and the SQL-standard body it reads beside them. None
+        // existed, so `pg_dump` stopped on the first user function in a
+        // database: `function pg_get_function_arguments(bigint) does not
+        // exist`. Spelled as `pg_get_functiondef` spells the same parts.
+        // PG 18.6 keeps an OUT argument in the identity list (measured);
+        // SPG's function surface has no argument defaults to drop.
+        "pg_get_function_arguments" | "pg_get_function_identity_arguments" => {
+            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+                return Ok(Value::Null);
+            };
+            Ok(crate::system_catalog::user_function_for_oid(cat, oid).map_or(Value::Null, |f| {
+                Value::text(crate::system_catalog::function_argument_list(f))
+            }))
+        }
+        "pg_get_function_result" => {
+            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+                return Ok(Value::Null);
+            };
+            Ok(crate::system_catalog::user_function_for_oid(cat, oid).map_or(Value::Null, |f| {
+                Value::text(crate::system_catalog::function_result_type(f))
+            }))
+        }
+        // NULL unless the body is `BEGIN ATOMIC`, which SPG does not parse.
+        "pg_get_function_sqlbody" => Ok(Value::Null),
         "pg_get_ruledef" => {
             let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
                 return Ok(Value::Null);
@@ -16038,7 +16143,17 @@ fn apply_function_dispatch(
                 Some(cat),
             )))
         }
-        "pg_get_triggerdef" | "pg_get_statisticsobjdef" => Ok(Value::Null),
+        // 8.0.3 — a trigger's definition. It answered NULL, so `pg_dump`
+        // wrote a bare `;` where the CREATE TRIGGER belonged and every
+        // trigger was lost on restore, silently.
+        "pg_get_triggerdef" => {
+            let (Some(cat), Some(oid)) = (ctx.catalog, oid_arg(args.first())) else {
+                return Ok(Value::Null);
+            };
+            let qualify = public_hidden_in(ctx);
+            Ok(crate::system_catalog::trigger_def(cat, oid, qualify).map_or(Value::Null, Value::text))
+        }
+        "pg_get_statisticsobjdef" => Ok(Value::Null),
         // 7.38.1 S5.2 — the partition-key deparse: pg_dump composes
         // `PARTITION BY <this>` from it, and NULL printed
         // `PARTITION BY ;` — unrestorable anywhere.
@@ -16913,12 +17028,30 @@ fn apply_function_dispatch(
                     });
                 }
             };
+            // 8.0.3 — the path the session SET, its existing schemas only,
+            // as `current_schema` already reads it. It answered `{public}`
+            // whatever the path was, and `pg_dump` copies this array into
+            // its output's `set_config('search_path', …)`.
+            let path = ctx
+                .session_gucs
+                .and_then(|g| g.get("search_path"))
+                .map_or("\"$user\", public", String::as_str);
+            let me = session_user_from_ctx(ctx);
             let mut schemas: alloc::vec::Vec<Option<alloc::string::String>> =
                 alloc::vec::Vec::new();
             if include_implicit {
                 schemas.push(Some("pg_catalog".into()));
             }
-            schemas.push(Some("public".into()));
+            for raw in path.split(',') {
+                let name = raw.trim().trim_matches('"');
+                let name = if name == "$user" { me.as_str() } else { name };
+                if name.is_empty() || (include_implicit && name == "pg_catalog") {
+                    continue;
+                }
+                if ctx.catalog.is_none_or(|cat| cat.schema_exists(name)) {
+                    schemas.push(Some(alloc::string::String::from(name)));
+                }
+            }
             Ok(Value::TextArray(schemas))
         }
         // pg_trigger_depth() — nesting level of trigger execution.
@@ -17145,7 +17278,11 @@ fn apply_function_dispatch(
                             .chain(c)
                             .chain(d)
                             .find(|(_, o)| *o == oid)
-                            .map(|(n, _)| n)
+                            // 8.0.3 — qualified when the search path
+                            // would not find it bare; see `qualify`.
+                            .map(|(n, _)| {
+                                crate::qualify::user_object_name(&n, public_hidden_in(ctx))
+                            })
                     })
                 })
             else {
@@ -17205,6 +17342,21 @@ fn apply_function_dispatch(
             let Some(first) = args.first() else {
                 return Err(EvalError::WrongArity { name: alloc::string::String::from("obj_description"), types: arg_type_list(args) });
             };
+            // 8.0.3 — an object that is not a relation, named by oid and
+            // catalog (`obj_description(2200, 'pg_namespace')`), answers from
+            // `pg_description`, where schema, function, type and extension
+            // comments live. Only relations were looked up, by name.
+            if let (Some(oid), Some(Value::Text(class))) = (oid_arg(Some(first)), args.get(1))
+                && !class.eq_ignore_ascii_case("pg_class")
+                && let Some(classoid) = crate::eval::regclass_name_to_oid(cat, class)
+            {
+                let (_, rows) = crate::system_catalog::synth_pg_description(cat);
+                let found = rows.iter().find(|r| {
+                    matches!((&r.values[0], &r.values[1]),
+                        (Value::Int(o), Value::Int(c)) if i64::from(*o) == oid && i64::from(*c) == classoid)
+                });
+                return Ok(found.map_or(Value::Null, |r| r.values[3].clone()));
+            }
             let Some(name) = regclass_name_of(first) else {
                 return Ok(Value::Null);
             };

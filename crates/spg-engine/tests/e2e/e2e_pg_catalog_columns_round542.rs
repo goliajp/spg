@@ -175,7 +175,9 @@ fn round542_pg_matviews_has_rows_and_pgs_columns() {
             "SELECT schemaname, matviewname, matviewowner, tablespace, \
              hasindexes, ispopulated FROM pg_matviews"
         ),
-        vec!["public|mv|postgres|NULL|false|true"]
+        // 8.0.3 — the role that created it (the embedded engine's own
+        // identity), where this read the constant `postgres`.
+        vec!["public|mv|admin|NULL|false|true"]
     );
     // An ordinary view is not one.
     assert_eq!(
@@ -206,7 +208,7 @@ fn round542_view_and_index_listings_are_complete() {
             &mut e,
             "SELECT schemaname, viewname, viewowner FROM pg_views WHERE viewname = 'v'"
         ),
-        vec!["public|v|postgres"]
+        vec!["public|v|admin"]
     );
     assert_eq!(
         columns(&mut e, "SELECT * FROM pg_indexes"),

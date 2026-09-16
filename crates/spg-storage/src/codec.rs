@@ -671,6 +671,22 @@ pub(crate) fn deserialize_table(
             uc.initially_deferred = b & 2 != 0;
         }
     }
+    // 8.0.3 — `GENERATED ALWAYS AS IDENTITY` columns (FILE_VERSION 100+).
+    if version >= 100 {
+        let n = cur.read_u16()? as usize;
+        for _ in 0..n {
+            let idx = cur.read_u16()? as usize;
+            let cols = &mut t.schema_mut().columns;
+            let len = cols.len();
+            let Some(c) = cols.get_mut(idx) else {
+                return Err(StorageError::Corrupt(format!(
+                    "identity-always appendix: index {idx} past {len} columns \
+                     for table {table_name:?}"
+                )));
+            };
+            c.identity_always = true;
+        }
+    }
     let _ = table_name;
     Ok(())
 }

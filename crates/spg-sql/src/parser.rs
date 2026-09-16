@@ -1141,6 +1141,10 @@ impl Parser {
         let kind = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
             Token::Table => "table".into(),
+            // 8.0.3 — INDEX is a keyword token, not an identifier, so
+            // `COMMENT ON INDEX` fell to the arm below and became a no-op
+            // that reported success. A dump carries every index comment.
+            Token::Index => "index".into(),
             _ => {
                 self.consume_until_statement_boundary();
                 return Ok(Statement::Empty);
@@ -3649,10 +3653,14 @@ impl Parser {
                     {
                         self.advance();
                         let if_exists = self.consume_if_exists();
-                        let names = self.take_comma_separated_names();
+                        let mut names = self.take_comma_separated_names();
                         self.consume_until_statement_boundary();
+                        // 8.0.3 — `IF EXISTS` still drops what IS installed;
+                        // it used to become a no-op statement, so the
+                        // extension stayed listed. Marked as the variant's
+                        // doc describes.
                         if if_exists {
-                            return Ok(Statement::Empty);
+                            names.insert(0, String::new());
                         }
                         Ok(Statement::ValidateOnly {
                             kind: crate::ast::ValidateOnlyKind::ExtensionInstalled,
@@ -5375,10 +5383,12 @@ impl Parser {
     /// the syntax lets dual-target schemas keep the line.
     fn parse_create_extension_after_keyword(&mut self) -> Result<Statement, ParseError> {
         // Optional `IF NOT EXISTS`.
-        self.consume_if_not_exists();
+        let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident_like()?;
-        // Drain optional WITH SCHEMA <ident> / VERSION '<v>' /
-        // CASCADE / FROM '<v>' clauses; we don't model them.
+        let mut schema: Option<String> = None;
+        // Drain optional VERSION '<v>' / CASCADE / FROM '<v>' clauses;
+        // 8.0.3 — `[WITH] SCHEMA <s>` is kept: it is where the extension is
+        // installed, which `pg_extension` reports and a dump restores.
         loop {
             match self.peek() {
                 Token::Ident(s) if s.eq_ignore_ascii_case("with") => {
@@ -5387,7 +5397,7 @@ impl Parser {
                 }
                 Token::Ident(s) if s.eq_ignore_ascii_case("schema") => {
                     self.advance();
-                    let _ = self.expect_ident_like()?;
+                    schema = Some(self.expect_ident_like()?);
                     continue;
                 }
                 Token::Ident(s) if s.eq_ignore_ascii_case("version") => {
@@ -5411,9 +5421,15 @@ impl Parser {
         // v7.39 (round 697) — the NAME is checked now. `CREATE EXTENSION
         // nosuch` reported success and `pg_extension` then did not list it,
         // which is the accept-and-do-nothing shape F31 exists to find.
+        let mut names = alloc::vec::Vec::new();
+        if if_not_exists {
+            names.push(String::new());
+        }
+        names.push(name);
+        names.extend(schema);
         Ok(Statement::ValidateOnly {
             kind: crate::ast::ValidateOnlyKind::ExtensionAvailable,
-            names: alloc::vec![name],
+            names,
         })
     }
 
@@ -6365,6 +6381,23 @@ impl Parser {
                 )));
             }
         };
+        // 8.0.3 — `OWNER TO <role>`, which `pg_dump` writes for every
+        // domain; it was refused as an unsupported action, so such a dump
+        // did not restore. The role must exist; the owner is not recorded,
+        // as for SPG's other `ALTER … OWNER TO` forms.
+        if kw == "owner" {
+            self.advance();
+            if matches!(self.peek(), Token::To) {
+                self.advance();
+            } else {
+                self.expect_keyword_ident("to")?;
+            }
+            let role = self.expect_ident_like()?;
+            return Ok(Statement::ValidateOnly {
+                kind: crate::ast::ValidateOnlyKind::RoleName,
+                names: alloc::vec![role],
+            });
+        }
         let action = match kw.as_str() {
             "add" => {
                 self.advance();
@@ -6475,6 +6508,23 @@ impl Parser {
     fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_exists = self.parse_if_exists();
         let name = self.expect_ident_like()?;
+        // 8.0.3 — `OWNER TO <role>`, which every `pg_dump` of a table with a
+        // serial column writes. It was a syntax error, so such a dump did
+        // not restore. The role must exist; the owner itself is not
+        // recorded, as for the other `ALTER … OWNER TO` forms SPG accepts.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("owner")) {
+            self.advance();
+            if matches!(self.peek(), Token::To) {
+                self.advance();
+            } else {
+                self.expect_keyword_ident("to")?;
+            }
+            let role = self.expect_ident_like()?;
+            return Ok(Statement::ValidateOnly {
+                kind: crate::ast::ValidateOnlyKind::RoleName,
+                names: alloc::vec![role],
+            });
+        }
         // v7.39 (read01 round 49) — `RENAME TO new`; mutually exclusive with
         // the option list (PG allows only one or the other).
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rename")) {
@@ -23285,7 +23335,12 @@ impl Parser {
         // schema-qualifies every cast target, and `pg_catalog.X` names
         // exactly the builtin type X. Consume the qualifier and let
         // the ordinary target parse decide.
-        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("pg_catalog"))
+        // 8.0.3 — and `public.X` names the user type X, which is how every
+        // dump writes a cast to an enum or domain (`'ok'::public.mood`).
+        // It was read as a type named `public`. SPG keeps user types in the
+        // one schema, as it keeps tables, so the qualifier is dropped the
+        // way a table's is.
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("pg_catalog") || s.eq_ignore_ascii_case("public"))
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
         {
             self.advance();

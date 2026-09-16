@@ -5306,6 +5306,7 @@ impl Engine {
         } else {
             0
         };
+        let functions = crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.table));
         let table = self
             .active_catalog_mut()
             .get_mut(&stmt.table)
@@ -5321,6 +5322,7 @@ impl Engine {
         let (returning_rows, deferred_embedded, affected, oc_pairs, oc_old_images, oc_xmax) =
             insert_parsed_rows(
                 table,
+                functions.as_ref(),
                 xmin_for_stmt,
                 // v7.39 (round 427) — MySQL's upsert row accounting. REPLACE
                 // and ON DUPLICATE KEY UPDATE both lower onto the same
@@ -7792,6 +7794,9 @@ pub(crate) enum MysqlUpsertCount {
 
 fn insert_parsed_rows(
     table: &mut spg_storage::Table,
+    // 8.0.3 — the user functions an expression index may call; see
+    // `expr_index::function_scope`.
+    functions: Option<&spg_storage::Catalog>,
     xmin: u64,
     // v7.39 (round 427) — MySQL's per-row upsert accounting; None keeps
     // PG's "one per affected row".
@@ -7851,7 +7856,7 @@ fn insert_parsed_rows(
     // storage has no evaluator, so an insert that does not carry the keys
     // leaves the index unusable until something rebuilds it. Parse once
     // per statement; `None` for the ordinary table, which pays nothing.
-    crate::expr_index::refresh(table)?;
+    crate::expr_index::refresh(table, functions)?;
     let expr_plan = crate::expr_index::ExprKeyPlan::for_table(table)?;
     let mut affected = 0usize;
     let mut oc_pairs: Vec<(
@@ -7935,7 +7940,8 @@ fn insert_parsed_rows(
         let expr_keys = match &expr_plan {
             Some(plan) => {
                 let schema = table.schema().clone();
-                let ctx = crate::eval::EvalContext::new(&schema.columns, None);
+                let mut ctx = crate::eval::EvalContext::new(&schema.columns, None);
+                ctx.catalog = functions;
                 Some(plan.keys_for(&row.values, &ctx)?)
             }
             None => None,

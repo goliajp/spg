@@ -234,6 +234,26 @@ fn round546_role_views_agree_and_mask() {
         vec![
             "postgres|true|true|-1|********",
             "admin|true|true|-1|********",
+            // 8.0.3 — and PostgreSQL's predefined roles, at their own oids,
+            // as pg_authid lists them on 18.6. `public` is owned by
+            // `pg_database_owner`, and a catalog naming an owner no role
+            // view lists is what `pg_dump` warned about.
+            "pg_monitor|false|false|-1|********",
+            "pg_read_all_settings|false|false|-1|********",
+            "pg_read_all_stats|false|false|-1|********",
+            "pg_stat_scan_tables|false|false|-1|********",
+            "pg_signal_backend|false|false|-1|********",
+            "pg_checkpoint|false|false|-1|********",
+            "pg_use_reserved_connections|false|false|-1|********",
+            "pg_read_server_files|false|false|-1|********",
+            "pg_write_server_files|false|false|-1|********",
+            "pg_execute_server_program|false|false|-1|********",
+            "pg_database_owner|false|false|-1|********",
+            "pg_read_all_data|false|false|-1|********",
+            "pg_write_all_data|false|false|-1|********",
+            "pg_create_subscription|false|false|-1|********",
+            "pg_maintain|false|false|-1|********",
+            "pg_signal_autovacuum_worker|false|false|-1|********",
         ]
     );
     assert_eq!(
@@ -257,7 +277,27 @@ fn round546_role_views_agree_and_mask() {
         // of what this assertion is for: the session identity added this
         // round carries the same oid in every view, so a tool that joins
         // them does not lose it.
-        vec!["postgres", "admin"]
+        // 8.0.3 — and every predefined role, which both views list.
+        vec![
+            "postgres",
+            "admin",
+            "pg_monitor",
+            "pg_read_all_settings",
+            "pg_read_all_stats",
+            "pg_stat_scan_tables",
+            "pg_signal_backend",
+            "pg_checkpoint",
+            "pg_use_reserved_connections",
+            "pg_read_server_files",
+            "pg_write_server_files",
+            "pg_execute_server_program",
+            "pg_database_owner",
+            "pg_read_all_data",
+            "pg_write_all_data",
+            "pg_create_subscription",
+            "pg_maintain",
+            "pg_signal_autovacuum_worker",
+        ]
     );
 }
 

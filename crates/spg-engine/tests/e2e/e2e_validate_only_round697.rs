@@ -85,11 +85,17 @@ fn round697_an_unprovided_extension_warns_rather_than_refusing() {
     for sql in [
         "CREATE EXTENSION vector",
         "CREATE EXTENSION IF NOT EXISTS pg_trgm",
-        "CREATE EXTENSION plpgsql WITH SCHEMA public",
         "CREATE EXTENSION pgcrypto",
     ] {
         ok(&mut e, sql);
     }
+    // 8.0.3 — every database has PL/pgSQL, so PG refuses to create it
+    // again (measured on 18.6). This passed while CREATE EXTENSION
+    // recorded nothing.
+    assert!(
+        err_of(&mut e, "CREATE EXTENSION plpgsql WITH SCHEMA public")
+            .contains("extension \"plpgsql\" already exists")
+    );
 }
 
 /// `pgcrypto` is on the provided list because SPG really answers it. The
@@ -118,7 +124,12 @@ fn round697_the_provided_list_is_a_claim_that_holds() {
 fn round697_drop_extension_takes_the_forms_a_dump_emits() {
     let mut e = Engine::new();
     ok(&mut e, "DROP EXTENSION IF EXISTS nosuch697");
+    // 8.0.3 — an extension is dropped only if it was created; PG refuses a
+    // missing one (`extension "vector" does not exist`, 42704).
+    assert!(err_of(&mut e, "DROP EXTENSION vector").contains("does not exist"));
+    ok(&mut e, "CREATE EXTENSION vector");
     ok(&mut e, "DROP EXTENSION vector");
+    ok(&mut e, "CREATE EXTENSION pg_trgm");
     ok(&mut e, "DROP EXTENSION pg_trgm, plpgsql CASCADE");
 }
 
@@ -135,10 +146,24 @@ fn round697_the_extension_list_and_the_catalog_agree() {
         other => panic!("{other:?}"),
     };
     assert!(!listed.is_empty());
+    // 8.0.3 — what `pg_extension` lists is what is installed, so creating
+    // one of them again is a no-op only with IF NOT EXISTS.
     for name in &listed {
-        ok(&mut e, &format!("CREATE EXTENSION {name}"));
-        ok(&mut e, &format!("DROP EXTENSION {name}"));
+        ok(&mut e, &format!("CREATE EXTENSION IF NOT EXISTS {name}"));
     }
+    ok(&mut e, "CREATE EXTENSION pg_trgm");
+    let after = match e
+        .execute("SELECT extname FROM pg_extension ORDER BY extname")
+        .unwrap()
+    {
+        QueryResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| spg_engine::eval::value_to_text(&r.values[0]))
+            .collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(after, ["pg_trgm", "plpgsql"]);
+    ok(&mut e, "DROP EXTENSION pg_trgm");
 }
 
 /// Residuals pinned as differences so the day one changes, someone sees it

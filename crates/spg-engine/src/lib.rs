@@ -41,6 +41,7 @@ mod baregroup;
 pub mod brin;
 mod bytebudget;
 mod cancel;
+mod catalog_deparse;
 mod clock;
 mod collate;
 mod collate_derive;
@@ -62,6 +63,7 @@ mod execute;
 mod explain;
 mod expr_analysis;
 mod expr_index;
+mod extension;
 pub(crate) mod extsort;
 pub mod fts;
 mod fts_de;
@@ -91,11 +93,13 @@ pub(crate) mod partition_walks;
 pub mod plan_cache;
 mod plpgsql;
 pub mod publications;
+mod qualify;
 mod qualorder;
 pub mod query_stats;
 mod readonly;
 pub mod reorder;
 mod rls;
+mod role_directory;
 mod rules;
 pub mod scalarsq_streaming;
 mod select;
@@ -2099,22 +2103,15 @@ impl Engine {
     }
 
     /// v7.39 (round 520) — the role an oid names, as `pg_get_userbyid`
-    /// reports it. The numbering is `synth_pg_roles`': base 10, one per
-    /// user in catalog order.
+    /// reports it.
     #[must_use]
     pub fn role_name_for_oid(&self, oid: i64) -> Option<String> {
-        // Oid 10 is the bootstrap superuser, which `synth_pg_roles` always
-        // publishes as `postgres`. Following the catalogue rather than the
-        // session is the point: a join on `relowner = pg_roles.oid` and
-        // `pg_get_userbyid(relowner)` have to name the same role.
-        if oid == 10 {
-            return Some(alloc::string::String::from("postgres"));
-        }
-        let idx = usize::try_from(oid - 11).ok()?;
-        self.users
-            .iter()
-            .nth(idx)
-            .map(|(n, _)| alloc::string::String::from(n))
+        // 8.0.3 — the numbering `pg_roles` publishes, so a join on
+        // `relowner = pg_roles.oid` and `pg_get_userbyid(relowner)` name the
+        // same role.
+        crate::role_directory::RoleDirectory::of(self)
+            .name_of(oid)
+            .map(String::from)
     }
 
     /// v7.37.15 (Phase B / C / E) — current per-row visibility
