@@ -2655,71 +2655,24 @@ pub(crate) fn enforce_unique_updates(
         if !is_expr_or_partial && !key_positions.iter().any(|c| changed_cols.contains(c)) {
             continue;
         }
-        let predicate_expr = match idx.partial_predicate.as_deref() {
-            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} predicate {s:?} failed to re-parse: {e:?}",
-                    idx.name
-                ))
-            })?),
-            None => None,
-        };
-        let expr_key = match idx.expression.as_deref() {
-            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
-                    idx.name
-                ))
-            })?),
-            None => None,
-        };
-        let key_str = |values: &[Value<'static>]| -> Result<Option<String>, EngineError> {
-            // Partial index: rows failing the predicate are not indexed.
-            if let Some(pred) = &predicate_expr {
-                let tmp_row = spg_storage::Row {
-                    values: values.to_vec(),
-                };
-                let v = eval::eval_expr(pred, &tmp_row, &ctx).map_err(|e| {
-                    EngineError::Unsupported(alloc::format!(
-                        "UNIQUE INDEX {:?} predicate eval: {e:?}",
-                        idx.name
-                    ))
-                })?;
-                if !predicate_truthy(&v) {
-                    return Ok(None);
-                }
-            }
-            let key: Vec<Value<'static>> = if let Some(expr) = &expr_key {
-                let tmp_row = spg_storage::Row {
-                    values: values.to_vec(),
-                };
-                let v = eval::eval_expr(expr, &tmp_row, &ctx).map_err(|e| {
-                    EngineError::Unsupported(alloc::format!(
-                        "UNIQUE INDEX {:?} expression eval: {e:?}",
-                        idx.name
-                    ))
-                })?;
-                alloc::vec![v]
-            } else {
-                key_positions
-                    .iter()
-                    .map(|&p| {
-                        let v = values.get(p).cloned().unwrap_or(Value::Null);
-                        collated_key_cell(&v, p, schema, mysql)
-                    })
-                    .collect()
-            };
-            if key.iter().any(|v| matches!(v, Value::Null)) {
-                return Ok(None);
-            }
-            Ok(Some(aggregate::encode_key(&key)))
-        };
+        // 8.0.3 — the shared keyer, not a third copy of it. The copy that
+        // stood here also dropped a NULL-bearing key under NULLS NOT
+        // DISTINCT, which the insert path does not.
+        let keyer = UniqueIndexKeyer::new(idx, schema, mysql)?;
+        let key_str = |values: &[Value<'static>]| keyer.claimed_key(values);
+        // 8.0.3 — PostgreSQL's 23505 for a unique INDEX, as the insert path
+        // and the constraint section above already give. This read
+        // `UNIQUE INDEX "i" violation on "t": UPDATE of row #1 duplicates
+        // an existing key`, which named a row number no client can use and
+        // neither the key nor its value.
+        let key_names = keyer.key_col_names();
         let on_conflict = |pos: usize| -> EngineError {
-            EngineError::Unsupported(alloc::format!(
-                "UNIQUE INDEX {:?} violation on {table_name:?}: \
-                 UPDATE of row #{pos} duplicates an existing key",
-                idx.name
-            ))
+            let key = planned
+                .iter()
+                .find(|(p, _)| *p == pos)
+                .and_then(|(_, v)| keyer.key_of(v).ok())
+                .unwrap_or_default();
+            unique_violation(&idx.name, table_name, &key_names, &key, false, mysql)
         };
         // v7.39 (round 166, attack A3) — a plain unique index probes its
         // own btree (expression / partial / NULLS-NOT-DISTINCT / collated

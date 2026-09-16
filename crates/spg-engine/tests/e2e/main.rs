@@ -1026,6 +1026,7 @@ mod e2e_unsigned_cast_round527;
 mod e2e_updatability_probes;
 mod e2e_update_from_alias_round241;
 mod e2e_update_from_unqualified_round533;
+mod e2e_upsert_update_arm_unique;
 mod e2e_use_database_v7392;
 mod e2e_user_types_in_pg_type_round621;
 mod e2e_using_values_sources_round778;
