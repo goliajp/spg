@@ -2060,10 +2060,25 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
          CREATE TABLE part_parent (id INT, ts DATE) PARTITION BY RANGE (ts); \
          CREATE TABLE part_a PARTITION OF part_parent FOR VALUES FROM ('2026-01-01') TO ('2026-06-01'); \
          CREATE INDEX rich1_gin ON rich1 USING gin (payload); \
-         INSERT INTO rich1 (tag, amt, payload, blob) VALUES ('{a,b}', 12.345, '{\"k\":1}', '\\xdeadbeef'); \
+         INSERT INTO rich1 (tag, amt, payload, blob, created) VALUES ('{a,b}', 12.345, '{\"k\":1}', \
+         '\\xdeadbeef', '2026-01-01 00:00:00+00'); \
          INSERT INTO rich2 VALUES (1, 1, 'x'); \
          INSERT INTO rich3 VALUES (1, ROW('main st', 12345), 'ok'); \
-         INSERT INTO part_parent VALUES (1, '2026-02-01');";
+         INSERT INTO part_parent VALUES (1, '2026-02-01'); \
+         CREATE FUNCTION version_key(v text) RETURNS bigint[] LANGUAGE sql IMMUTABLE PARALLEL SAFE \
+         AS $$ SELECT ARRAY[length(v)]::bigint[] $$; \
+         COMMENT ON FUNCTION version_key(text) IS 'comparable form'; \
+         CREATE TABLE dev (id uuid PRIMARY KEY, project uuid NOT NULL, \
+         provider text NOT NULL CHECK (provider IN ('apns', 'fcm')), token text NOT NULL, fp bytea, \
+         traits jsonb NOT NULL DEFAULT '{}', status text NOT NULL DEFAULT 'queued', \
+         active boolean NOT NULL DEFAULT true, UNIQUE (project, provider, token)); \
+         ALTER TABLE dev DROP COLUMN fp; \
+         CREATE INDEX dev_pending ON dev (project) WHERE status = 'queued'; \
+         CREATE UNIQUE INDEX dev_active ON dev (project, provider) WHERE active; \
+         CREATE INDEX dev_traits ON dev USING gin (traits jsonb_path_ops); \
+         COMMENT ON INDEX dev_pending IS 'queue scan'; \
+         INSERT INTO dev VALUES ('00000000-0000-0000-0000-00000000000a', \
+         '00000000-0000-0000-0000-00000000000b', 'apns', 't1', '{\"a\":1}', 'queued', true);";
     const CANARY: &str = "SELECT (SELECT count(*) FROM rich1) || '|' || \
          (SELECT count(*) FROM rich2) || '|' || (SELECT count(*) FROM rich3) || '|' || \
          (SELECT count(*) FROM part_parent) || '|' || (SELECT (home).zip FROM rich3)";
@@ -2082,6 +2097,12 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
         &format!("{pg_dump} '{src_uri}' > {}", dump_file.display()),
     )
     .map_err(|e| format!("pg_dump must exit 0 against SPG: {e}"))?;
+    // 8.0.3 — the second half of the fixture is the shapes sentori's own
+    // schema carries that did not survive a dump (their §4.4, run against
+    // their seventeen migrations): a SQL function and its comment, a CHECK
+    // over an IN list, a composite UNIQUE on a table that later dropped a
+    // column, partial-index predicates, a non-default operator class, an
+    // index comment. Each of them failed this leg or the PG leg before.
     // Leg 1 — fresh SPG. Any ERROR line is a red.
     let restore = sh(
         root,
@@ -2111,9 +2132,28 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
             dst_counts.trim()
         ));
     }
-    // Leg 2 — fresh PG18 in the oracle container (skipped, loudly,
-    // when no oracle container is reachable — the LOCAL box drives
-    // its docker PG through the same 25432 bench container).
+    // 8.0.3 — and the restored database dumps to the same text: a dump of
+    // SPG restored into SPG is a fixed point.
+    let redump_file = tmp.join("rich-redump.sql");
+    sh(
+        root,
+        &format!("{pg_dump} '{dst_uri}' > {}", redump_file.display()),
+    )
+    .map_err(|e| format!("pg_dump of the restored SPG: {e}"))?;
+    let redump_diff = dump_text_diff(&dump_file, &redump_file, &tmp)?;
+    if !redump_diff.is_empty() {
+        return Err(format!(
+            "SPG's dump restored into SPG dumps differently (< first, > restored):\n{redump_diff}"
+        ));
+    }
+    // Leg 2 — fresh PG18 in the oracle container.
+    //
+    // 8.0.3 — the restore stops on its first error. It used to send the
+    // restore's output to /dev/null and compare row counts afterwards, so
+    // a dump whose every `ALTER … OWNER TO postgres` failed, and which
+    // re-created five extensions the schema never installed, passed:
+    // the rows still arrived. sentori measured exactly that restore
+    // failing (their §4.4). An operator leaving SPG runs this restore.
     let pg_admin = format!("postgres://bench:bench@{host}:25432/postgres");
     let pg_rt = format!("postgres://bench:bench@{host}:25432/spgdumprt");
     let pg_leg = sh(
@@ -2121,7 +2161,7 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
         &format!(
             "{psql} --no-psqlrc -X -q -tA '{pg_admin}' -c 'DROP DATABASE IF EXISTS spgdumprt' \
              -c 'CREATE DATABASE spgdumprt' && \
-             {psql} --no-psqlrc -X -q '{pg_rt}' -f - < {} >/dev/null 2>&1; \
+             {psql} --no-psqlrc -X -q -v ON_ERROR_STOP=1 '{pg_rt}' -f - < {} >/dev/null && \
              {psql} --no-psqlrc -X -q -tA '{pg_rt}' -c \"{CANARY}\"",
             dump_file.display()
         ),
@@ -2139,9 +2179,147 @@ pub fn pgdump_roundtrip(root: &Path, runid: &str) -> Result<String, String> {
         }
         Err(e) => return Err(format!("PG18 leg failed: {e}")),
     };
+    // Leg 3 — the same schema built on PostgreSQL itself, dumped by the
+    // same pg_dump, must dump to the same text. Counts agreeing says the
+    // rows survived; this says the SCHEMA did — owners, extensions,
+    // constraints, defaults, sequence ownership, qualified names.
+    let pg_ref = format!("postgres://bench:bench@{host}:25432/spgdumpref");
+    let ref_file = tmp.join("pg-dump.sql");
+    sh(
+        root,
+        &format!(
+            "{psql} --no-psqlrc -X -q -tA '{pg_admin}' -c 'DROP DATABASE IF EXISTS spgdumpref' \
+             -c 'CREATE DATABASE spgdumpref' && \
+             {psql} --no-psqlrc -X -q -v ON_ERROR_STOP=1 '{pg_ref}' -f - < {} >/dev/null && \
+             {pg_dump} '{pg_ref}' > {}",
+            schema_file.display(),
+            ref_file.display()
+        ),
+    )
+    .map_err(|e| format!("PG18 reference leg failed: {e}"))?;
+    let dump_diff = dump_text_diff(&ref_file, &dump_file, &tmp)?;
+    if !dump_diff.is_empty() {
+        return Err(format!(
+            "SPG's dump differs from PG18's dump of the same schema (< PG, > SPG):\n{dump_diff}"
+        ));
+    }
+    let verdict = format!("{verdict}; dump text identical to PG18's");
     roster.reap_all();
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(verdict)
+}
+
+/// prerelease `write-arbitration` (8.0.3) — how a write is arbitrated,
+/// against PostgreSQL 18, on a freshly built server.
+///
+/// Three instruments, each with PostgreSQL as the oracle rather than a
+/// frozen expectation, each refusing to pass if it measured nothing:
+///
+/// - `xtests/arbiter-sweep/held.sh` — a second session writing a unique key
+///   the first holds uncommitted. sentori's §2: 8.0.0 to 8.0.2 let B write
+///   and failed A at COMMIT, and no gate could see it, because every other
+///   writer commits the statement it races.
+/// - `xtests/arbiter-sweep/sweep.py` — 132 ON CONFLICT shapes, partial
+///   single-column arbiters and the update arm's other unique keys among
+///   them (sentori's §3 and §4.1). 8.0.2 differs in 45.
+/// - `xtests/describe-sweep/sweep.py` — the type Describe announces for 189
+///   expressions; nine recorded divergences are allowed and named.
+pub fn write_arbitration(root: &Path, runid: &str) -> Result<String, String> {
+    ensure_bench_pg(root)?;
+    let bin = root.join("target/release/spg-server");
+    if !bin.exists() {
+        sh(
+            root,
+            "cargo build --release -q --workspace --exclude spg-bench-competitor \
+             --locked --bin spg-server",
+        )?;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let wrapper = Path::new(&home).join("spgbench/bin/psql");
+    let (psql, host, bind) = if wrapper.exists() {
+        (
+            wrapper.display().to_string(),
+            "host.docker.internal",
+            "0.0.0.0",
+        )
+    } else {
+        ("psql".to_string(), "127.0.0.1", "127.0.0.1")
+    };
+    let tmp = crate::proclib::run_tmp_dir(&format!("{runid}-arbitration"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut roster = Roster::new();
+    let port = roster.spawn_server_on(
+        "arbitration",
+        &bin,
+        &tmp.join("srv"),
+        Duration::from_secs(30),
+        bind,
+    )?;
+    let spg_uri = format!("postgres://bench:bench@{host}:{port}/bench");
+    let pg_uri = format!("postgres://bench:bench@{host}:25432/bench");
+    let mut verdicts: Vec<String> = Vec::new();
+    for (name, cmd) in [
+        (
+            "held",
+            format!("PSQL='{psql}' xtests/arbiter-sweep/held.sh '{pg_uri}' '{spg_uri}'"),
+        ),
+        (
+            "arbiter",
+            format!("PSQL='{psql}' python3 xtests/arbiter-sweep/sweep.py '{pg_uri}' '{spg_uri}'"),
+        ),
+        (
+            "describe",
+            format!("PSQL='{psql}' python3 xtests/describe-sweep/sweep.py '{pg_uri}' '{spg_uri}'"),
+        ),
+    ] {
+        let out = sh(root, &cmd).map_err(|e| format!("{name}: {e}"))?;
+        verdicts.push(
+            out.lines()
+                .last()
+                .map_or_else(|| format!("{name}: no verdict line"), str::to_string),
+        );
+    }
+    roster.reap_all();
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(verdicts.join("; "))
+}
+
+/// The two dumps with what legitimately differs between two servers
+/// removed: comment lines, blank lines, and the per-dump `\restrict` key.
+/// Empty when they agree; otherwise `diff`'s own report.
+fn dump_text_diff(pg: &Path, spg: &Path, tmp: &Path) -> Result<String, String> {
+    let normalise = |src: &Path, name: &str| -> Result<std::path::PathBuf, String> {
+        let text =
+            std::fs::read_to_string(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| {
+                !l.is_empty()
+                    && !l.starts_with("--")
+                    && !l.starts_with("\\restrict")
+                    && !l.starts_with("\\unrestrict")
+            })
+            .collect();
+        let out = tmp.join(name);
+        std::fs::write(&out, kept.join("\n"))
+            .map_err(|e| format!("write {}: {e}", out.display()))?;
+        Ok(out)
+    };
+    let a = normalise(pg, "pg-dump.norm")?;
+    let b = normalise(spg, "spg-dump.norm")?;
+    let out = Command::new("diff")
+        .arg(&a)
+        .arg(&b)
+        .output()
+        .map_err(|e| format!("spawn diff: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(String::new()),
+        Some(1) => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        _ => Err(format!(
+            "diff failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )),
+    }
 }
 
 #[cfg(test)]

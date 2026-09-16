@@ -30,6 +30,7 @@ fn main() {
                 "perf-sweep" => suitelib::steps::perf_sweep(root, &runid, true),
                 "perm-matrix" => suitelib::steps::perm_matrix(root),
                 "pgdump-roundtrip" => suitelib::steps::pgdump_roundtrip(root, &runid),
+                "write-arbitration" => suitelib::steps::write_arbitration(root, &runid),
                 "oracle-three" => suitelib::steps::oracle_three(root),
                 "sql2016" => suitelib::steps::sql2016(root),
                 "pgbench" => suitelib::steps::pgbench(root, &runid),
@@ -990,6 +991,7 @@ fn run_internal(
         // full tier (CP3) — the two 元机制 carriers.
         "perm-matrix" => suitelib::steps::perm_matrix(root),
         "pgdump-roundtrip" => suitelib::steps::pgdump_roundtrip(root, runid),
+        "write-arbitration" => suitelib::steps::write_arbitration(root, runid),
         "oracle-three" => suitelib::steps::oracle_three(root),
         // S4.1 — isolation battery.
         "isolation" => {
