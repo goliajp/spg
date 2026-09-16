@@ -250,16 +250,29 @@ pub(crate) fn on_conflict_arbiters(
         })
     })?;
     let schema = table.schema();
-    let unique_btree_cols: Vec<usize> = table
+    // 8.0.3 — each unique index's WHOLE key, not its leading column.
+    //
+    // This took `idx.column_position` and only `BTree` indexes, so a
+    // composite `CREATE UNIQUE INDEX ON t (k1, k2)` was either skipped
+    // (its kind is `BTreeMulti`) or treated as an arbiter on `k1` alone —
+    // and the single-column probe that then ran does not consult a
+    // composite tree. An untargeted `ON CONFLICT DO NOTHING` over such an
+    // index answered "no such key" and the row was refused by the index
+    // it should have been arbitrated by. Found by crossing every arbiter
+    // axis against PG 18.6 (132 cases); it was the only shape left.
+    let unique_btree_keys: Vec<(Vec<usize>, bool)> = table
         .indices()
         .iter()
         .filter(|idx| {
             idx.is_unique
-                && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                && matches!(
+                    idx.kind,
+                    spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+                )
                 && idx.partial_predicate.is_none()
                 && idx.expression.is_none()
         })
-        .map(|idx| idx.column_position)
+        .map(|idx| (unique_key_positions(idx), idx.nulls_not_distinct))
         .collect();
     if target.is_empty() {
         let mut out: Vec<Arbiter> = schema
@@ -267,13 +280,13 @@ pub(crate) fn on_conflict_arbiters(
             .iter()
             .map(|uc| (uc.columns.clone(), uc.nulls_not_distinct, None))
             .collect();
-        for &pos in &unique_btree_cols {
-            if !out.iter().any(|(cols, _, _)| cols == &alloc::vec![pos]) {
-                out.push((alloc::vec![pos], false, None));
+        for (cols, nnd) in &unique_btree_keys {
+            if !out.iter().any(|(c, _, _)| c == cols) {
+                out.push((cols.clone(), *nnd, None));
             }
         }
         // v7.38.5 (sentori r8) — a PARTIAL unique index arbitrates too.
-        // It was excluded from `unique_btree_cols` above (that filter
+        // It was excluded from `unique_btree_keys` above (that filter
         // wants indexes whose every row is covered), so an untargeted
         // `ON CONFLICT DO NOTHING` could not see it and the conflict
         // escaped to the duplicate-key check as an error. PG absorbs it:
@@ -351,10 +364,55 @@ pub(crate) fn on_conflict_arbiters(
     // one now has a pin under it.
     let _ = from_constraint_name;
     let nnd = matched_uc.is_some_and(|uc| uc.nulls_not_distinct);
-    // An EXPLICIT target names its own predicate in the clause
-    // (`ON CONFLICT (k, t) WHERE t IS NOT NULL`) and the caller already
-    // resolved the columns from it, so nothing is carried here.
-    Ok(alloc::vec![(positions, nnd, None)])
+    // 8.0.3 — an explicit target that only a PARTIAL unique index covers
+    // carries that index's predicate, as the untargeted form above does.
+    //
+    // This said "nothing is carried here" because the clause names its own
+    // predicate. The consumer, though, decides existence with
+    // `on_conflict_keys_exist_where`, and without a predicate that goes to
+    // the single-column B-tree probe, which only consults an index with no
+    // predicate — so over a partial index it answered "no such key" every
+    // time, and the row went on to be refused by the index it should have
+    // been arbitrated by. A composite target took a row scan instead, which
+    // is why only the single-column form failed. sentori's
+    // `notifier/service.rs:112`, measured against PG 18.6:
+    //
+    //   CREATE UNIQUE INDEX d ON t (k) WHERE k IS NOT NULL;   one row k = 1
+    //   INSERT … (1) ON CONFLICT (k) WHERE k IS NOT NULL DO NOTHING
+    //     PG 18.6   INSERT 0 0
+    //     SPG       ERROR: duplicate key value violates unique constraint "d"
+    //
+    // A full unique rule over the same columns wins when there is one: it
+    // covers every row, and the predicate would only narrow it.
+    let partial_pred = if matched_uc.is_some() {
+        None
+    } else {
+        let covering = |idx: &&spg_storage::Index| {
+            idx.is_unique
+                && idx.expression.is_none()
+                && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                && {
+                    let mut k = unique_key_positions(idx);
+                    k.sort_unstable();
+                    k == sorted
+                }
+        };
+        let full = table
+            .indices()
+            .iter()
+            .filter(covering)
+            .any(|idx| idx.partial_predicate.is_none());
+        if full {
+            None
+        } else {
+            table
+                .indices()
+                .iter()
+                .filter(covering)
+                .find_map(|idx| idx.partial_predicate.clone())
+        }
+    };
+    Ok(alloc::vec![(positions, nnd, partial_pred)])
 }
 
 /// v7.37.15 (Phase C.3) — does this BTree index locator point at a

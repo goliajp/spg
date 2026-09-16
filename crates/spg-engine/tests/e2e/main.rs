@@ -687,6 +687,7 @@ mod e2e_numnode_tsquery;
 mod e2e_oid_type_round667;
 mod e2e_on_conflict_cardinality;
 mod e2e_on_conflict_constraint;
+mod e2e_on_conflict_partial_and_composite_index_arbiters;
 mod e2e_on_conflict_partial_index_v7385;
 mod e2e_on_conflict_returning_old_round129;
 mod e2e_on_conflict_round240;
