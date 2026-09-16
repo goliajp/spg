@@ -32,13 +32,16 @@ spellings of uniqueness, a violation DETAIL that named neither the
 column nor the value, and two defects in this repository's own
 harness.
 
-Two things are NAMED here rather than fixed, for one measured reason:
-an error's `Position` field (§3.27) and the two shapes of §3.22 whose
-arbiter is an expression rather than a column. Both need a new field on
-a published struct that has no private field — `OnConflictClause` and
-`ColumnName` — and `cargo-semver-checks` against 8.0.1 answers
-`semver requires new major version` when one is added. This release is
-a patch that exists to end an outage, so they go in the next minor.
+Three things are NAMED here rather than fixed, each with a measurement
+behind it. An error's `Position` field (§3.27) and the two shapes of
+§3.22 whose arbiter is an expression rather than a column both need a
+new field on a published struct that has no private field —
+`OnConflictClause` and `ColumnName` — and `cargo-semver-checks` against
+8.0.1 answers `semver requires new major version` when one is added.
+The third is 34 catalog columns declared `text` here that PostgreSQL
+declares `"char"`, which is three gaps deep and reaches the parser.
+This release is a patch that exists to end an outage, so all three go
+in the next minor.
 
 Every instrument on both sides of that report spoke through `psql`,
 which asks for text results and needs almost nothing in the startup
