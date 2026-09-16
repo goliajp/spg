@@ -399,6 +399,39 @@ measured on PG 18.6 with that file's own seed. One of 7,077 e2e cases;
 the other 7,076 were unmoved, which is the answer the control was
 actually asked for.
 
+### Fixed — and then pg_dump asked a question it had never asked
+
+With the CASE above answered, `pg_dump` got further and stopped again:
+
+```text
+  pg_dump: error: query failed:
+    ERROR:  column s.subsynccommit does not exist
+```
+
+Nothing about `pg_subscription` changed in this release, and 8.0.1 is
+missing the same eight columns — measured on the published image, both
+builds answer `column "subsynccommit" does not exist`. What changed is
+that pg_dump began ASKING.
+
+It dumps subscriptions only when it believes the connected role is a
+superuser, and it learns that from the `is_superuser` ParameterStatus —
+one of the ten this release added to the startup packet for the
+timezone crash. A fresh SPG has no users, sends `is_superuser=on`, and
+PostgreSQL's own fresh cluster says the same and answers the query. So
+the value is right and the catalog was short.
+
+`synth_pg_subscription` carried ten columns under a comment reading
+"PG-canonical columns (subset)". PostgreSQL 18.6 has eighteen. A subset
+is what a tool reading a catalog does not get to have: the eight are
+there now, with PostgreSQL's own defaults for a subscription just
+created (`subtwophasestate` `d`, `subsynccommit` `off`, `suborigin`
+`any`, `subpasswordrequired` true, the rest false).
+
+`pg_dump` exits 0 against the candidate afterwards, on this step's own
+rich schema — composite type, materialised view, partition, GIN index,
+array and jsonb columns — and the pin that lists the catalog's columns
+lists all eighteen rather than the ten someone stopped at.
+
 ### Fixed — pg_dump stopped working, from the fix two sections below
 
 `pgdump-roundtrip` went red on this release and the cause is the §3.9
