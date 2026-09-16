@@ -10,6 +10,75 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — an `EXCEPTION` clause caught nothing but a RAISE
+
+Reported by sentori as a unique violation escaping
+`EXCEPTION WHEN OTHERS`. Wider than that, measured against PG 18.6:
+nothing a block's statements or expressions raised could be caught at
+all — not a unique violation, not `division_by_zero`, not a NOT NULL —
+by any handler, `OTHERS` included.
+
+Two reasons, one on each side of the clause. A DO block's writes did
+not run while the block ran: they were collected and executed after the
+walk, so every error a write raised happened outside the clause. And a
+condition was matched against the RAISE MESSAGE by substring, so
+`WHEN unique_violation` could only have fired on a RAISE whose text
+happened to contain those words.
+
+A write now runs where it is written, through the engine the block's
+reads already used. A condition is matched by SQLSTATE: a name stands
+for its code, a name whose code ends in `000` for its whole class,
+`SQLSTATE '23505'` for one code, and `OTHERS` for everything but a
+cancel and a failed `ASSERT` — PG deliberately lets those escape. A
+handled error rolls the block back to where it began (an O(1) catalog
+snapshot, the model `ROLLBACK TO SAVEPOINT` uses) before the handler
+runs, and the variables keep the values they had at the error.
+`SQLSTATE` and `SQLERRM` are the error's own, where they were `P0001`
+and the RAISE text whatever happened.
+
+The condition table is every name PG 18.6 accepts — 247 of them — and
+none of it is transcribed: each name's code was MEASURED, by
+`RAISE <name>` inside a block whose handler reports `SQLSTATE`. It has
+to be complete, because a block naming a condition PG does not know is
+refused before any of it runs (`unrecognized exception condition "foo"`,
+42704), where SPG used to accept any word; a partial table would refuse
+names PG accepts.
+
+The classification PL/pgSQL needs is the one the wire uses, so the
+625-line SQLSTATE classifier moved from `spg-server` into the engine,
+unchanged, as `spg_engine::sqlstate::error_to_wire`; the server calls
+it. So did the split of a message into its primary text, DETAIL and
+HINT, which `SQLERRM` needs too.
+
+Found on the way, each measured against PG 18.6 and fixed:
+
+```text
+                                         PG 18.6                SPG 8.0.2
+  uncaught RAISE EXCEPTION 'boom %', 1   P0001  boom 1          42000  DO: trigger function
+                                                                       "DO": RAISE EXCEPTION "boom 1"
+  a failed ASSERT                        P0004, OTHERS does     P0001, OTHERS caught it
+                                         not catch it
+  NULL;  (the PL/pgSQL no-op)            accepted               syntax error
+  EXECUTE of dynamic SQL in a block      runs in place          ran after the block
+```
+
+`NULL;` is the body of the commonest handler there is. It parses to an
+IF with no branches, because a new statement variant would be a breaking
+change to `PlPgSqlStmt`, which is not `#[non_exhaustive]`. For the same
+reason `RAISE SQLSTATE '…'` and `RAISE <condition>` still do not parse,
+and are named for the next minor. So is the `CONTEXT` field PG attaches
+to an error inside a block (`PL/pgSQL function inline_code_block line 1
+at SQL statement`): it needs source positions the parser does not carry,
+which is §3.27's gap.
+
+Two pins had been holding SPG's own inventions and are rewritten to
+PostgreSQL's answers: `exception_or_conditions_share_body` caught
+`RAISE 'divergent'` with `WHEN foo OR divergent OR bar` (PG refuses the
+block), and `exception_others_catches_assertion_failure` asserted the
+opposite of PG. Seven new pins; routing the writes back to after the
+walk fails six, and removing the block rollback fails exactly the
+rollback pin.
+
 ### Fixed — a failed DO block kept the writes that came before its failure
 
 Found while measuring sentori's report that an `EXCEPTION` handler does

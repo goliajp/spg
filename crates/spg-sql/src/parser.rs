@@ -7317,6 +7317,21 @@ impl Parser {
         })
     }
 
+    /// 8.0.3 — one `EXCEPTION WHEN` condition: a condition name, or
+    /// `SQLSTATE '<code>'`, which PG accepts for any five-character code.
+    /// The code form is carried as `sqlstate:<code>` so the matcher can
+    /// tell it from a name.
+    fn parse_plpgsql_exception_condition(&mut self) -> Result<String, ParseError> {
+        let name = self.expect_ident_like()?;
+        if name.eq_ignore_ascii_case("sqlstate")
+            && let Token::String(code) = self.peek().clone()
+        {
+            self.advance();
+            return Ok(alloc::format!("sqlstate:{code}"));
+        }
+        Ok(name)
+    }
+
     /// v7.37.20 (20.10) — parse EXCEPTION handlers `WHEN <cond>
     /// [OR <cond>]* THEN <body>` sequence up to the trailing END.
     fn parse_plpgsql_exception_handlers(
@@ -7342,10 +7357,10 @@ impl Parser {
             }
             self.advance();
             let mut conditions: Vec<String> = Vec::new();
-            conditions.push(self.expect_ident_like()?);
+            conditions.push(self.parse_plpgsql_exception_condition()?);
             while matches!(self.peek(), Token::Or) {
                 self.advance();
-                conditions.push(self.expect_ident_like()?);
+                conditions.push(self.parse_plpgsql_exception_condition()?);
             }
             let then_kw = self.expect_ident_like()?;
             if !then_kw.eq_ignore_ascii_case("then") {
@@ -7483,6 +7498,19 @@ impl Parser {
     }
 
     fn parse_plpgsql_stmt(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        // 8.0.3 — `NULL;`, PL/pgSQL's no-op, and the body of the commonest
+        // handler there is: `EXCEPTION WHEN others THEN NULL;`. It was a
+        // syntax error. Represented as an IF with no branches, which runs
+        // nothing and renders back as `NULL`.
+        if matches!(self.peek(), Token::Null)
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Semicolon))
+        {
+            self.advance();
+            return Ok(PlPgSqlStmt::If {
+                branches: Vec::new(),
+                else_branch: Vec::new(),
+            });
+        }
         // RETURN keyword?
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("return"))
         {

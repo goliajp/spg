@@ -102,50 +102,92 @@ impl Engine {
             }
         };
         let raise_sink = triggers::NoticeSink::default();
-        let collected = triggers::execute_do_block_top_level(
+        // 8.0.3 — writes run in place, so an `EXCEPTION` clause can catch
+        // what they raise; see `triggers::execute_do_block_live`.
+        //
+        // The engine error a write failed with is kept beside the walk:
+        // an error no handler caught leaves the DO with the SQLSTATE and
+        // message the statement itself would have had, and a wait
+        // (`LockWouldBlock`) reaches the host as a wait.
+        let failed_with: core::cell::RefCell<Option<EngineError>> = core::cell::RefCell::new(None);
+        let write_fn = |stmt: &spg_sql::ast::Statement| -> Result<(), triggers::TriggerError> {
+            let mut eng = engine_cell.borrow_mut();
+            match eng.execute_stmt_with_cancel(stmt.clone(), CancelToken::none()) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let (sqlstate, message) = match &e {
+                        EngineError::LockWouldBlock | EngineError::Cancelled => {
+                            (triggers::INTERNAL_WAIT_SQLSTATE, alloc::format!("{e}"))
+                        }
+                        other => {
+                            // SQLERRM is the primary message alone, as PG's is.
+                            let (code, full) = crate::sqlstate::error_to_wire(other);
+                            let (main, _, _) = crate::sqlstate::split_detail_and_hint(&full);
+                            let main = crate::sqlstate::without_table_suffix(code, main);
+                            (code, alloc::string::String::from(main))
+                        }
+                    };
+                    *failed_with.borrow_mut() = Some(e);
+                    Err(triggers::TriggerError::Sql {
+                        function: "DO".into(),
+                        sqlstate,
+                        message,
+                    })
+                }
+            }
+        };
+        // The block savepoint. The catalog is persistent, so the snapshot is
+        // O(1), and putting it back puts the tables' redo buffers back with
+        // it — the model `ROLLBACK TO SAVEPOINT` uses.
+        let block_saved: core::cell::RefCell<Option<spg_storage::Catalog>> =
+            core::cell::RefCell::new(None);
+        let savepoint_fn = |step: triggers::BlockSavepoint| {
+            let mut eng = engine_cell.borrow_mut();
+            match step {
+                triggers::BlockSavepoint::Take => {
+                    *block_saved.borrow_mut() = Some(eng.active_catalog().clone());
+                }
+                triggers::BlockSavepoint::RollBack => {
+                    if let Some(c) = block_saved.borrow_mut().take() {
+                        *eng.active_catalog_mut() = c;
+                    }
+                    *failed_with.borrow_mut() = None;
+                }
+            }
+        };
+        // 8.0.3 — a DO is ONE statement, and a statement that fails leaves
+        // nothing behind. See the CHANGELOG for the measurement: a body whose
+        // second INSERT failed kept its first, in memory and not in the WAL.
+        let before = engine_cell.borrow().active_catalog().clone();
+        let outcome = triggers::execute_do_block_live(
             &body,
             dts.as_deref(),
             Some(&resolver_fn),
             Some(&for_query_fn),
             Some(&raise_sink),
+            &write_fn,
+            &savepoint_fn,
         );
         // v7.39 (round 757, F31-B3) — deliver the body's RAISE messages
         // even when it errored afterwards (PG sends the notices raised
         // before the failure, then the error).
         engine_cell.borrow_mut().drain_raise_sink(raise_sink);
-        let collected = collected
-            .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {e}"))))?;
-        // engine_cell goes out of scope here, releasing the &mut self borrow
-        // Run each embedded statement against the engine. The
-        // statements were already substitute-walked for NEW/OLD/
-        // locals (those evaluate to engine literals before they
-        // land here) so dispatch is plain execute_stmt_with_cancel.
-        // 8.0.3 — a DO is ONE statement, and a statement that fails leaves
-        // nothing behind.
-        //
-        // Each embedded write used to land as it ran, so a body whose second
-        // INSERT failed kept its first one — visible to every later
-        // statement, and absent from the WAL, because redo is drained for
-        // the whole DO and a failed statement's redo is discarded. Measured,
-        // one row (1) present, `DO $$ BEGIN INSERT (2); INSERT (1); END $$`:
-        //
-        //   SPG, before a restart   1,2
-        //   SPG, after kill -9      1
-        //   PG 18.6                 1
-        //
-        // The catalog is a persistent structure, so the snapshot is O(1) —
-        // the same model `ROLLBACK TO SAVEPOINT` already uses — and putting
-        // it back also puts back the tables' redo buffers, so memory and WAL
-        // agree on what the failed statement did: nothing.
-        let before = self.active_catalog().clone();
-        for stmt in collected {
-            // v7.16.2 — preserve current_tx wrap so an outer
-            // BEGIN/COMMIT around a DO block keeps the
-            // EmbeddedSql writes inside that same tx slot.
-            if let Err(e) = self.execute_stmt_with_cancel(stmt, CancelToken::none()) {
-                *self.active_catalog_mut() = before;
-                return Err(e);
+        if let Err(e) = outcome {
+            *engine_cell.borrow_mut().active_catalog_mut() = before;
+            if let Some(engine_err) = failed_with.into_inner() {
+                return Err(engine_err);
             }
+            return Err(match e {
+                triggers::TriggerError::RaiseException { message, .. } => EngineError::Raised {
+                    sqlstate: "P0001",
+                    message,
+                },
+                triggers::TriggerError::Sql {
+                    sqlstate, message, ..
+                } => EngineError::Raised { sqlstate, message },
+                triggers::TriggerError::EvalFailed { cause, .. } => EngineError::Eval(cause),
+                other => EngineError::Storage(StorageError::Corrupt(alloc::format!("DO: {other}"))),
+            });
         }
         Ok(QueryResult::CommandOk {
             affected: 0,

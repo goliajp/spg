@@ -7350,6 +7350,12 @@ impl fmt::Display for PlPgSqlStmt {
                 branches,
                 else_branch,
             } => {
+                // 8.0.3 — `NULL;`, the PL/pgSQL no-op, parses to an IF with
+                // no branches at all (a new statement variant would be a
+                // breaking change to this enum). It renders back as itself.
+                if branches.is_empty() && else_branch.is_empty() {
+                    return f.write_str("NULL");
+                }
                 for (i, (cond, body)) in branches.iter().enumerate() {
                     if i == 0 {
                         write!(f, "IF {cond} THEN ")?;
