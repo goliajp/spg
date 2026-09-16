@@ -644,6 +644,7 @@ impl Engine {
                 serializable: self.current_isolation_level
                     == spg_sql::ast::IsolationLevel::Serializable,
                 begin_commit_seq: self.commit_seq,
+                xact_start_micros: self.clock.map(|f| f()),
                 shadow_dirty: false,
                 aborted: false,
                 constraints_deferred: None,

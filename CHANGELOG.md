@@ -187,6 +187,43 @@ holding a NULL went through where PG refuses. The index keyer is one
 implementation now, used by the insert check, the update check and the
 uncommitted-key wait.
 
+### Fixed — `now()` moved inside a transaction
+
+Reported by sentori; identical on every SPG build back to 7.38.6. Every
+clock function in a statement was folded to one reading taken when the
+statement was prepared, so inside a transaction `now()` changed from
+statement to statement and equalled `statement_timestamp()`:
+
+```text
+                                                        PG 18.6   SPG 8.0.2
+  now() in two statements of one transaction, same?     t         f
+  now() = statement_timestamp() inside a transaction    f         t
+```
+
+PostgreSQL keeps three clocks, measured: `now()`, `current_timestamp`,
+`transaction_timestamp()` and the local-clock family read the moment
+the transaction BEGAN — the BEGIN itself, not its first query: BEGIN,
+wait a second, and `statement_timestamp() - now()` reads `1.0` —
+and stay put for the whole transaction; `statement_timestamp()` reads
+the start of the statement; `clock_timestamp()` reads the clock.
+Outside a transaction the first two are the same instant.
+
+A transaction now records the clock at BEGIN, and a statement folds each
+function to the clock it names. Their file agrees with PG 18.6 on the
+first two rows and the control; so do the BEGIN-then-wait measurement
+and two autocommit statements a second apart (both move by `1.0`).
+
+**Named, not fixed:** their third row. In AUTOCOMMIT, a view whose
+definition reads `now()` is expanded when the statement reads it, which
+is microseconds after the statement's own `now()` was folded — so
+`(SELECT t FROM v) = now()` is false where PG says true. Inside a
+transaction both read the BEGIN and agree. Making them agree outside one
+means carrying one clock reading from the wire's `prepare` step to the
+end of execution, and any path that prepares without executing would
+then leave the reading behind for the NEXT statement — freezing `now()`,
+which is worse than the microseconds. That needs the statement boundary
+to be one place in the server, and it is not yet.
+
 ### Fixed — a transaction that wrote a unique key first lost it at COMMIT
 
 Reported by sentori as a 500 on ingest whenever a new fault fired on

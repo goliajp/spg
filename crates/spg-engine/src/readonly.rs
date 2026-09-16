@@ -218,18 +218,17 @@ impl Engine {
     /// (cache-friendly: the cached AST's embedded clock literal gets
     /// re-pointed to current time without re-parsing).
     pub fn refresh_clock(&self, s: &mut spg_sql::ast::SelectStatement) {
-        let now_micros = self.clock.map(|f| f());
-        if now_micros.is_none() {
+        let Some(at) = self.clock_at() else {
             return;
-        }
+        };
         // Wrap as Statement::Select temporarily to reuse the public
         // walker; cheap (one enum tag manipulation).
         let mut stmt = Statement::Select(core::mem::take(s));
-        rewrite_clock_calls(
+        crate::clock::rewrite_clock_calls_at(
             &mut stmt,
-            now_micros,
+            at,
             self.speaks_mysql,
-            now_micros.map_or(0, |n| self.session_tz_offset_at(n)),
+            self.session_tz_offset_at(at.xact),
         );
         if let Statement::Select(rewritten) = stmt {
             *s = rewritten;
