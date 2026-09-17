@@ -10,6 +10,32 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+
+## [8.0.3] — 2026-09-17
+
+A patch release for the defect that kept sentori off SPG: when two
+transactions wrote the same unique key, the one that wrote FIRST was
+refused at COMMIT with 40001, taking the rest of its transaction with
+it. PostgreSQL gives the key to its first writer and makes the later one
+wait; SPG now does too.
+
+The rest of the release answers the other asks in the same report,
+each measured against PostgreSQL 18.6: two `ON CONFLICT` shapes that
+raised where the row should have been skipped, an upsert's update arm
+that wrote a duplicate into another unique key, `now()` moving inside a
+transaction, `EXCEPTION` handlers that caught nothing but a RAISE, and a
+dump of SPG that did not restore into PostgreSQL — the path an operator
+leaving SPG takes. Found on the way: computed columns announcing a type
+other than their value's (psycopg read `SELECT 1 + 1.5` as 131072), and
+a failed DO block keeping its earlier writes until a restart.
+
+The prerelease tier, which gates the publish, gains a
+`write-arbitration` step — two sessions with one holding its transaction
+open, a 132-case arbiter sweep that says which axes it held still, and a
+189-expression Describe sweep — and `pgdump-roundtrip` moves into it,
+now judging a dump by its text against PostgreSQL's own dump of the same
+schema.
+
 ### Fixed — `DROP MATERIALIZED VIEW IF EXISTS` said nothing
 
 Reported by sentori (§5.2): PostgreSQL 18.6 raises `materialized view
