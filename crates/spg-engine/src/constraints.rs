@@ -236,13 +236,101 @@ fn pick_pk_index_column(
 /// columns, whether its NULLs compare equal, and the partial index's
 /// predicate when it has one (rows the predicate rejects are not in
 /// the index and so cannot conflict on it).
-pub(crate) type Arbiter = (Vec<usize>, bool, Option<alloc::string::String>);
+pub(crate) struct Arbiter {
+    pub(crate) key: ArbiterKey,
+    /// Whether NULLs in the key compare equal (`NULLS NOT DISTINCT`).
+    pub(crate) nnd: bool,
+    /// A partial index's predicate: rows it rejects are not in the index
+    /// and so cannot conflict on it.
+    pub(crate) predicate: Option<alloc::string::String>,
+}
 
+/// 9.0.0 — what an arbiter's key is made of.
+pub(crate) enum ArbiterKey {
+    /// A set of columns: a UNIQUE / PRIMARY KEY constraint, a unique index
+    /// whose every part is a column, or a target nothing declares.
+    Columns(Vec<usize>),
+    /// A unique index with at least one expression part, by name. Its key
+    /// is read through [`UniqueIndexKeyer`], the reader the uniqueness
+    /// check itself uses.
+    Index(alloc::string::String),
+}
+
+impl Arbiter {
+    fn columns(cols: Vec<usize>, nnd: bool, predicate: Option<alloc::string::String>) -> Self {
+        Self {
+            key: ArbiterKey::Columns(cols),
+            nnd,
+            predicate,
+        }
+    }
+}
+
+/// 9.0.0 — one target element, resolved against the table.
+enum InferPart {
+    Column(usize),
+    Expression(alloc::string::String),
+}
+
+/// 9.0.0 — does target element `elem` (resolved to `part`) name key part
+/// `i` of `idx`? The part must be the same column or the same expression,
+/// and a COLLATE or operator class written on the element must be the
+/// index part's own (measured on PG 18.6: `(lower(email) COLLATE "C")`
+/// matches no index declared without it; `(lower(email) text_ops)`
+/// matches one declared without a class, `text_ops` being the default).
+fn infer_part_matches(
+    cat: &Catalog,
+    idx: &spg_storage::Index,
+    i: usize,
+    part: &InferPart,
+    elem: &spg_sql::ast::ConflictTargetElem,
+) -> bool {
+    let same_key = match (part, crate::index_def::key_parts(idx).swap_remove(i)) {
+        (InferPart::Column(a), crate::index_def::KeyPart::Column(b)) => *a == b,
+        (InferPart::Expression(a), crate::index_def::KeyPart::Expression(b)) => a == b,
+        _ => false,
+    };
+    if !same_key {
+        return false;
+    }
+    let part_collation = if i == 0 {
+        idx.collation.as_deref()
+    } else {
+        idx.extra_collations.get(i - 1).and_then(Option::as_deref)
+    };
+    if let Some(c) = &elem.collation
+        && !part_collation.is_some_and(|p| p.eq_ignore_ascii_case(c))
+    {
+        return false;
+    }
+    if let Some(op) = &elem.opclass {
+        let declared = cat.index_opclasses(&idx.name).get(i).cloned().flatten();
+        let ok = match declared {
+            Some(d) => d.eq_ignore_ascii_case(op),
+            None => crate::opclass::is_default(op),
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// The arbiters an `ON CONFLICT` clause watches.
+///
+///   * no target: every UNIQUE / PRIMARY KEY constraint and every unique
+///     index — partial ones and, 9.0.0, expression ones included;
+///   * a target: every unique constraint or unique index it INFERS, as PG
+///     does — the same set of key parts in any order, with any COLLATE or
+///     operator class written on an element matching the part's own, and a
+///     partial index only when the clause's `WHERE` is its predicate. None
+///     inferred is 42P10.
 pub(crate) fn on_conflict_arbiters(
     catalog: &Catalog,
     table_name: &str,
-    target: &[String],
-    from_constraint_name: bool,
+    target: &[spg_sql::ast::ConflictTargetElem],
+    index_where: Option<&spg_sql::ast::Expr>,
+    constraint_columns: Option<Vec<usize>>,
 ) -> Result<Vec<Arbiter>, EngineError> {
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
@@ -250,169 +338,282 @@ pub(crate) fn on_conflict_arbiters(
         })
     })?;
     let schema = table.schema();
-    // 8.0.3 — each unique index's WHOLE key, not its leading column.
-    //
-    // This took `idx.column_position` and only `BTree` indexes, so a
-    // composite `CREATE UNIQUE INDEX ON t (k1, k2)` was either skipped
-    // (its kind is `BTreeMulti`) or treated as an arbiter on `k1` alone —
-    // and the single-column probe that then ran does not consult a
-    // composite tree. An untargeted `ON CONFLICT DO NOTHING` over such an
-    // index answered "no such key" and the row was refused by the index
-    // it should have been arbitrated by. Found by crossing every arbiter
-    // axis against PG 18.6 (132 cases); it was the only shape left.
-    let unique_btree_keys: Vec<(Vec<usize>, bool)> = table
-        .indices()
-        .iter()
-        .filter(|idx| {
-            idx.is_unique
-                && matches!(
-                    idx.kind,
-                    spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
-                )
-                && idx.partial_predicate.is_none()
-                && idx.expression.is_none()
-        })
-        .map(|idx| (unique_key_positions(idx), idx.nulls_not_distinct))
-        .collect();
+    let unique_btree = |idx: &spg_storage::Index| {
+        idx.is_unique
+            && matches!(
+                idx.kind,
+                spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+            )
+    };
+    // `ON CONFLICT ON CONSTRAINT <name>` — the constraint's columns, and
+    // nothing to infer.
+    if let Some(cols) = constraint_columns {
+        let nnd = schema
+            .uniqueness_constraints
+            .iter()
+            .any(|uc| uc.columns == cols && uc.nulls_not_distinct);
+        return Ok(alloc::vec![Arbiter::columns(cols, nnd, None)]);
+    }
     if target.is_empty() {
         let mut out: Vec<Arbiter> = schema
             .uniqueness_constraints
             .iter()
-            .map(|uc| (uc.columns.clone(), uc.nulls_not_distinct, None))
+            .map(|uc| Arbiter::columns(uc.columns.clone(), uc.nulls_not_distinct, None))
             .collect();
-        for (cols, nnd) in &unique_btree_keys {
-            if !out.iter().any(|(c, _, _)| c == cols) {
-                out.push((cols.clone(), *nnd, None));
+        for idx in table.indices().iter().filter(|i| unique_btree(i)) {
+            let predicate = idx.partial_predicate.clone();
+            if idx.has_expression_part() {
+                // 9.0.0 — an expression unique index is an arbiter too. It
+                // was skipped, so `INSERT … ON CONFLICT DO NOTHING` over
+                // `UNIQUE (lower(email))` escaped to the uniqueness check
+                // and raised where PG 18.6 answers `INSERT 0 0`.
+                out.push(Arbiter {
+                    key: ArbiterKey::Index(idx.name.clone()),
+                    nnd: idx.nulls_not_distinct,
+                    predicate,
+                });
+                continue;
             }
-        }
-        // v7.38.5 (sentori r8) — a PARTIAL unique index arbitrates too.
-        // It was excluded from `unique_btree_keys` above (that filter
-        // wants indexes whose every row is covered), so an untargeted
-        // `ON CONFLICT DO NOTHING` could not see it and the conflict
-        // escaped to the duplicate-key check as an error. PG absorbs it:
-        // the bare form arbitrates on EVERY unique index, partial ones
-        // included, with the predicate deciding which rows are in play.
-        // Their idempotency key is one of these, so pressing send twice
-        // was a 500 where PG says INSERT 0 0.
-        for idx in table.indices() {
-            if idx.is_unique
-                && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                && idx.expression.is_none()
-                && let Some(pred) = idx.partial_predicate.as_deref()
-            {
-                let cols = unique_key_positions(idx);
-                if !out.iter().any(|(c, _, _)| c == &cols) {
-                    out.push((cols, false, Some(alloc::string::String::from(pred))));
-                }
+            let cols = unique_key_positions(idx);
+            // v7.38.5 (sentori r8) — a PARTIAL unique index arbitrates too,
+            // its predicate deciding which rows are in play.
+            if !out.iter().any(|a| {
+                matches!(&a.key, ArbiterKey::Columns(c) if *c == cols) && a.predicate == predicate
+            }) {
+                out.push(Arbiter::columns(cols, idx.nulls_not_distinct, predicate));
             }
         }
         // Legacy fallback, kept deliberately: schemas from before SPG
         // tracked index uniqueness spell their arbiter as a plain
         // `CREATE INDEX`, and the bare clause has always deduped on it.
-        // Only engaged when nothing declared-unique exists, so PG-shaped
-        // schemas get PG's every-unique-constraint semantics above.
+        // Only engaged when nothing declared-unique exists.
         if out.is_empty() {
             for idx in table.indices() {
                 if matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                     && idx.partial_predicate.is_none()
-                    && idx.expression.is_none()
+                    && !idx.has_expression_part()
                     && idx.included_columns.is_empty()
                 {
-                    out.push((alloc::vec![idx.column_position], false, None));
+                    out.push(Arbiter::columns(
+                        alloc::vec![idx.column_position],
+                        false,
+                        None,
+                    ));
                 }
             }
         }
         return Ok(out);
     }
-    let mut positions = Vec::with_capacity(target.len());
-    for name in target {
-        let pos = schema
-            .columns
-            .iter()
-            .position(|c| c.name == *name)
-            .ok_or_else(|| {
-                EngineError::Unsupported(alloc::format!(
-                    "ON CONFLICT target column {name:?} not found on {table_name:?}"
-                ))
-            })?;
-        positions.push(pos);
+    // Resolve each element to a column or an expression's canonical text.
+    let mut parts: Vec<InferPart> = Vec::with_capacity(target.len());
+    for elem in target {
+        parts.push(match &elem.expr {
+            spg_sql::ast::Expr::Column(c) if c.qualifier.is_none() => {
+                let pos = schema
+                    .columns
+                    .iter()
+                    .position(|col| col.name == c.name)
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "column \"{}\" does not exist",
+                            c.name
+                        ))
+                    })?;
+                InferPart::Column(pos)
+            }
+            other => InferPart::Expression(other.to_string()),
+        });
     }
+    let where_text = index_where.map(alloc::string::ToString::to_string);
+    let mut out: Vec<Arbiter> = Vec::new();
+    // A constraint's index keys on its columns under their own collation
+    // and default operator class, so only bare column elements infer it.
+    let bare_columns: Option<Vec<usize>> = parts
+        .iter()
+        .zip(target)
+        .map(|(p, e)| match p {
+            InferPart::Column(c)
+                if e.collation.is_none()
+                    && e.opclass.as_deref().is_none_or(crate::opclass::is_default) =>
+            {
+                Some(*c)
+            }
+            _ => None,
+        })
+        .collect();
+    if let Some(cols) = &bare_columns {
+        let mut sorted = cols.clone();
+        sorted.sort_unstable();
+        for uc in &schema.uniqueness_constraints {
+            let mut u = uc.columns.clone();
+            u.sort_unstable();
+            if u == sorted {
+                out.push(Arbiter::columns(
+                    uc.columns.clone(),
+                    uc.nulls_not_distinct,
+                    None,
+                ));
+            }
+        }
+    }
+    for idx in table.indices().iter().filter(|i| unique_btree(i)) {
+        let n = 1 + idx.extra_column_positions.len();
+        if n != parts.len() {
+            continue;
+        }
+        // Order-insensitive: each element claims one distinct key part.
+        let mut claimed = alloc::vec![false; n];
+        let all = parts.iter().zip(target).all(|(p, e)| {
+            (0..n).any(|i| {
+                if !claimed[i] && infer_part_matches(catalog, idx, i, p, e) {
+                    claimed[i] = true;
+                    true
+                } else {
+                    false
+                }
+            })
+        });
+        if !all {
+            continue;
+        }
+        // A partial index is inferred only by a clause whose WHERE is its
+        // predicate; a full one regardless of the clause's WHERE.
+        if let Some(pred) = &idx.partial_predicate
+            && where_text.as_deref() != Some(pred.as_str())
+        {
+            continue;
+        }
+        let key = if idx.has_expression_part() {
+            ArbiterKey::Index(idx.name.clone())
+        } else {
+            ArbiterKey::Columns(unique_key_positions(idx))
+        };
+        let duplicate = out.iter().any(|a| match (&a.key, &key) {
+            (ArbiterKey::Columns(x), ArbiterKey::Columns(y)) => {
+                let (mut x, mut y) = (x.clone(), y.clone());
+                x.sort_unstable();
+                y.sort_unstable();
+                x == y && a.predicate == idx.partial_predicate
+            }
+            (ArbiterKey::Index(x), ArbiterKey::Index(y)) => x == y,
+            _ => false,
+        });
+        if !duplicate {
+            out.push(Arbiter {
+                key,
+                nnd: idx.nulls_not_distinct,
+                predicate: idx.partial_predicate.clone(),
+            });
+        }
+    }
+    if !out.is_empty() {
+        return Ok(out);
+    }
+    let Some(positions) = bare_columns else {
+        return Err(EngineError::Unsupported(
+            "there is no unique or exclusion constraint matching the ON CONFLICT specification"
+                .into(),
+        ));
+    };
+    // DELIBERATE divergence, recorded and awaiting the owner's decision
+    // (see `.claude/state/nodefer-train-checklist.md`, A2-mailrs): PG
+    // refuses a column target that nothing it can infer enforces (42P10);
+    // SPG arbitrates on the columns, and on a partial unique index over
+    // exactly them when the clause's WHERE does not name its predicate.
+    // mailrs's caldav upserts still issue that shape.
+    //
+    // 8.0.2 — accepting must not DISCARD: with a unique index on `LOWER(a)`
+    // and nothing on `a`, the existence probe asks about `a` itself, and
+    // `e2e_expression_index_impersonating_a_column` fails if it stops.
     let mut sorted = positions.clone();
     sorted.sort_unstable();
-    let matched_uc = schema.uniqueness_constraints.iter().find(|uc| {
-        let mut u = uc.columns.clone();
-        u.sort_unstable();
-        u == sorted
-    });
-    // DELIBERATE divergence, recorded: PG refuses a target no unique
-    // constraint enforces (42P10 "there is no unique or exclusion
-    // constraint matching the ON CONFLICT specification"); SPG accepts any
-    // column list and arbitrates on it. The lax form is what mailrs's
-    // caldav upsert model (`ON CONFLICT (uid, calendar_id)` with no
-    // declared constraint) has always run on — zero-customer-change
-    // outranks the alignment here, and the laxness only ACCEPTS more: a
-    // PG-valid program never issues the shape PG rejects.
-    //
-    // 8.0.2 — that last clause is LOAD-BEARING and it was false for one
-    // release. With a unique index on `LOWER(a)` and nothing on `a`, the
-    // existence probe below reached the expression index and reported a
-    // conflict, so `ON CONFLICT (a) DO NOTHING` answered `INSERT 0 0`
-    // and the row was gone: not "accepts more", but accepts and then
-    // discards. The probe asks about the expression now, and
-    // `e2e_expression_index_impersonating_a_column` fails if it stops.
-    // A justification for a divergence is a claim about behaviour; this
-    // one now has a pin under it.
-    let _ = from_constraint_name;
-    let nnd = matched_uc.is_some_and(|uc| uc.nulls_not_distinct);
-    // 8.0.3 — an explicit target that only a PARTIAL unique index covers
-    // carries that index's predicate, as the untargeted form above does.
-    //
-    // This said "nothing is carried here" because the clause names its own
-    // predicate. The consumer, though, decides existence with
-    // `on_conflict_keys_exist_where`, and without a predicate that goes to
-    // the single-column B-tree probe, which only consults an index with no
-    // predicate — so over a partial index it answered "no such key" every
-    // time, and the row went on to be refused by the index it should have
-    // been arbitrated by. A composite target took a row scan instead, which
-    // is why only the single-column form failed. sentori's
-    // `notifier/service.rs:112`, measured against PG 18.6:
-    //
-    //   CREATE UNIQUE INDEX d ON t (k) WHERE k IS NOT NULL;   one row k = 1
-    //   INSERT … (1) ON CONFLICT (k) WHERE k IS NOT NULL DO NOTHING
-    //     PG 18.6   INSERT 0 0
-    //     SPG       ERROR: duplicate key value violates unique constraint "d"
-    //
-    // A full unique rule over the same columns wins when there is one: it
-    // covers every row, and the predicate would only narrow it.
-    let partial_pred = if matched_uc.is_some() {
-        None
-    } else {
-        let covering = |idx: &&spg_storage::Index| {
+    let covering: Vec<&spg_storage::Index> = table
+        .indices()
+        .iter()
+        .filter(|idx| {
             idx.is_unique
-                && idx.expression.is_none()
+                && !idx.has_expression_part()
                 && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
                 && {
                     let mut k = unique_key_positions(idx);
                     k.sort_unstable();
                     k == sorted
                 }
-        };
-        let full = table
-            .indices()
-            .iter()
-            .filter(covering)
-            .any(|idx| idx.partial_predicate.is_none());
-        if full {
-            None
-        } else {
-            table
-                .indices()
-                .iter()
-                .filter(covering)
-                .find_map(|idx| idx.partial_predicate.clone())
-        }
+        })
+        .collect();
+    let partial_pred = if covering.iter().any(|i| i.partial_predicate.is_none()) {
+        None
+    } else {
+        covering.iter().find_map(|i| i.partial_predicate.clone())
     };
-    Ok(alloc::vec![(positions, nnd, partial_pred)])
+    Ok(alloc::vec![Arbiter::columns(
+        positions,
+        false,
+        partial_pred
+    )])
+}
+
+/// 9.0.0 — where an expression-index arbiter found its conflict.
+pub(crate) enum ArbiterHit {
+    None,
+    Hot(usize),
+    /// In a cold segment: it conflicts, and it cannot be updated in place.
+    Cold,
+}
+
+/// 9.0.0 — the live row an expression-index arbiter conflicts with.
+///
+/// Descends the index on the key's leading part when its B-tree can
+/// answer that, and otherwise reads the rows; either way every candidate's
+/// whole key is compared through `keyer`, and a row the index predicate
+/// rejects is not in the index.
+pub(crate) fn index_arbiter_hit(
+    catalog: &Catalog,
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    keyer: &UniqueIndexKeyer<'_>,
+    key: &[Value<'static>],
+    mysql: bool,
+) -> Result<ArbiterHit, EngineError> {
+    let encoded = aggregate::encode_key(key);
+    let candidate = |values: &[Value<'static>]| -> Result<bool, EngineError> {
+        Ok(keyer.participates(values)? && aggregate::encode_key(&keyer.key_of(values)?) == encoded)
+    };
+    let probeable = matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+        && !mysql
+        && (idx.expression.is_none() || table.expr_index_is_complete(&idx.name))
+        && table.index_collation(idx).is_none()
+        && table.cold_row_count() == 0;
+    if probeable && let Some(lead) = spg_storage::IndexKey::from_value(&key[0]) {
+        for loc in idx.lookup_eq(&lead) {
+            let spg_storage::RowLocator::Hot(ri) = loc else {
+                continue;
+            };
+            if table.headers().get(*ri).is_some_and(|h| h.is_deleted()) {
+                continue;
+            }
+            if let Some(row) = table.rows().get(*ri)
+                && candidate(&row.values)?
+            {
+                return Ok(ArbiterHit::Hot(*ri));
+            }
+        }
+        return Ok(ArbiterHit::None);
+    }
+    for (ri, row) in table.rows().iter().enumerate() {
+        if table.headers().get(ri).is_some_and(|h| h.is_deleted()) {
+            continue;
+        }
+        if candidate(&row.values)? {
+            return Ok(ArbiterHit::Hot(ri));
+        }
+    }
+    for row in iter_cold_rows_of_parent(catalog, table) {
+        if candidate(&row.values)? {
+            return Ok(ArbiterHit::Cold);
+        }
+    }
+    Ok(ArbiterHit::None)
 }
 
 /// v7.37.15 (Phase C.3) — does this BTree index locator point at a
@@ -1118,6 +1319,35 @@ fn probe_expr_key_conflict(
         }
     }
     None
+}
+
+/// 9.0.0 — the live row whose WHOLE key equals `encoded`, found by
+/// descending the index on its leading part (`lead`) and comparing each
+/// candidate's key through `keyer`. For an index whose B-tree keys on the
+/// leading part of a key that has more parts, at least one of them an
+/// expression.
+pub(crate) fn probe_parts_conflict(
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    keyer: &UniqueIndexKeyer<'_>,
+    lead: &spg_storage::IndexKey,
+    encoded: &str,
+) -> Result<Option<usize>, EngineError> {
+    for loc in idx.lookup_eq(lead) {
+        let spg_storage::RowLocator::Hot(ri) = loc else {
+            continue;
+        };
+        if table.headers().get(*ri).is_some_and(|h| h.is_deleted()) {
+            continue;
+        }
+        let Some(row) = table.rows().get(*ri) else {
+            continue;
+        };
+        if aggregate::encode_key(&keyer.key_of(&row.values)?) == encoded {
+            return Ok(Some(*ri));
+        }
+    }
+    Ok(None)
 }
 
 fn probe_key_conflict(
@@ -2149,7 +2379,7 @@ pub(crate) fn enforce_unique_index_inserts(
         //
         // Declining sends this index down the O(table) fold below, which
         // goes through `collated_key_cell` and is answerable.
-        if idx.expression.is_none()
+        if !idx.has_expression_part()
             && idx.partial_predicate.is_none()
             && !idx.nulls_not_distinct
             && table.index_collation(idx).is_none()
@@ -2212,6 +2442,51 @@ pub(crate) fn enforce_unique_index_inserts(
                 if probe_ok {
                     continue;
                 }
+            }
+        }
+        // 9.0.0 — a key that mixes columns and expressions (`(p, lower(e))`,
+        // `(lower(a), b)`). Its B-tree is keyed by the LEADING part only,
+        // which makes it a candidate filter: descend on the leading part's
+        // value, then compare each live candidate's whole key through the
+        // keyer. Without this such an index took the whole-table fold below
+        // on every statement.
+        if idx.has_expression_part()
+            && keyer.expr_key.is_none()
+            && idx.partial_predicate.is_none()
+            && !idx.nulls_not_distinct
+            && !mysql
+            && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && (idx.expression.is_none() || table.expr_index_is_complete(&idx.name))
+            && table.index_collation(idx).is_none()
+        {
+            let mut batch_seen: hashbrown::HashSet<alloc::string::String> =
+                hashbrown::HashSet::with_capacity(rows.len());
+            let mut probe_ok = true;
+            for row_values in rows.iter() {
+                let key = key_of(row_values)?;
+                if key.iter().any(|v| matches!(v, spg_storage::Value::Null)) {
+                    continue;
+                }
+                let Some(lead) = spg_storage::IndexKey::from_value(&key[0]) else {
+                    probe_ok = false;
+                    break;
+                };
+                let encoded = aggregate::encode_key(&key);
+                if !batch_seen.insert(encoded.clone())
+                    || probe_parts_conflict(table, idx, &keyer, &lead, &encoded)?.is_some()
+                {
+                    return Err(unique_violation(
+                        &idx.name,
+                        table_name,
+                        &key_col_names,
+                        &key,
+                        false,
+                        mysql,
+                    ));
+                }
+            }
+            if probe_ok {
+                continue;
             }
         }
         // v7.29 (mailrs round-23b) — set-based: one O(table) pass
@@ -2279,9 +2554,18 @@ pub(crate) struct UniqueIndexKeyer<'a> {
     schema: &'a spg_storage::TableSchema,
     mysql: bool,
     ctx: eval::EvalContext<'a>,
+    /// The key when it is exactly ONE expression — the shape whose B-tree
+    /// holds the whole key and can answer a probe by itself.
     pub(crate) expr_key: Option<spg_sql::ast::Expr>,
     predicate: Option<spg_sql::ast::Expr>,
-    positions: alloc::vec::Vec<usize>,
+    /// 9.0.0 — every key part, leading first.
+    parts: alloc::vec::Vec<KeyerPart>,
+}
+
+/// 9.0.0 — how one key part is read off a row.
+enum KeyerPart {
+    Column(usize),
+    Expression(spg_sql::ast::Expr, alloc::string::String),
 }
 
 impl<'a> UniqueIndexKeyer<'a> {
@@ -2300,19 +2584,32 @@ impl<'a> UniqueIndexKeyer<'a> {
             })?),
             None => None,
         };
-        // v7.38 (read01 U1) — an expression index (`CREATE UNIQUE INDEX ON
-        // t (lower(email))`) carries its key as a parseable expression, not
-        // a column position. Re-parse once per batch and evaluate per row so
-        // the key reflects the expression; without this the uniqueness was
-        // silently not enforced (duplicate `lower(email)` values slipped in).
-        let expr_key = match idx.expression.as_deref() {
-            Some(s) => Some(spg_sql::parser::parse_expression(s).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} expression {s:?} failed to re-parse: {e:?}",
-                    idx.name
-                ))
-            })?),
-            None => None,
+        // v7.38 (read01 U1) — an expression part carries its key as a
+        // parseable expression, not a column position; re-parse once per
+        // batch and evaluate per row.
+        //
+        // 9.0.0 — for EVERY part. Only the leading one was read, so
+        // `UNIQUE (lower(a), b)` keyed on `lower(a)` alone: after `('A', 1)`
+        // PostgreSQL 18.6 accepts `('a', 2)` and SPG refused it, naming
+        // `Key (lower(a))=(a)`.
+        let mut parts = alloc::vec::Vec::with_capacity(1 + idx.extra_column_positions.len());
+        for part in crate::index_def::key_parts(idx) {
+            parts.push(match part {
+                crate::index_def::KeyPart::Column(p) => KeyerPart::Column(p),
+                crate::index_def::KeyPart::Expression(src) => KeyerPart::Expression(
+                    spg_sql::parser::parse_expression(src).map_err(|e| {
+                        EngineError::Unsupported(alloc::format!(
+                            "UNIQUE INDEX {:?} expression {src:?} failed to re-parse: {e:?}",
+                            idx.name
+                        ))
+                    })?,
+                    alloc::string::String::from(src),
+                ),
+            });
+        }
+        let expr_key = match parts.as_slice() {
+            [KeyerPart::Expression(e, _)] => Some(e.clone()),
+            _ => None,
         };
         Ok(Self {
             idx,
@@ -2321,57 +2618,53 @@ impl<'a> UniqueIndexKeyer<'a> {
             ctx: eval::EvalContext::new(&schema.columns, None),
             expr_key,
             predicate,
-            positions: unique_key_positions(idx),
+            parts,
         })
     }
 
-    /// v7.39 (round 473) — the key's column names, for the 23505 DETAIL.
-    /// An expression index reports the expression, as PG does.
+    /// v7.39 (round 473) — the key's part names, for the 23505 DETAIL. An
+    /// expression part reports the expression, as PG does:
+    /// `Key (lower(a), b)=(a, 1)`.
     pub(crate) fn key_col_names(&self) -> alloc::vec::Vec<alloc::string::String> {
-        match &self.expr_key {
-            Some(_) => alloc::vec![
-                self.idx
-                    .expression
-                    .clone()
-                    .unwrap_or_else(|| self.idx.name.clone())
-            ],
-            None => self
-                .positions
-                .iter()
-                .map(|&p| {
-                    self.schema
-                        .columns
-                        .get(p)
-                        .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone())
-                })
-                .collect(),
-        }
+        self.parts
+            .iter()
+            .map(|part| match part {
+                KeyerPart::Column(p) => self
+                    .schema
+                    .columns
+                    .get(*p)
+                    .map_or_else(|| alloc::format!("col{p}"), |c| c.name.clone()),
+                KeyerPart::Expression(_, src) => src.clone(),
+            })
+            .collect()
     }
 
     pub(crate) fn key_of(
         &self,
         values: &[spg_storage::Value<'static>],
     ) -> Result<alloc::vec::Vec<spg_storage::Value<'static>>, EngineError> {
-        if let Some(expr) = &self.expr_key {
-            let tmp_row = spg_storage::Row {
-                values: values.to_vec(),
-            };
-            let v = eval::eval_expr(expr, &tmp_row, &self.ctx).map_err(|e| {
-                EngineError::Unsupported(alloc::format!(
-                    "UNIQUE INDEX {:?} expression eval: {e:?}",
-                    self.idx.name
-                ))
-            })?;
-            return Ok(alloc::vec![v]);
+        let mut row: Option<spg_storage::Row<'static>> = None;
+        let mut out = alloc::vec::Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            out.push(match part {
+                KeyerPart::Column(p) => {
+                    let v = values.get(*p).cloned().unwrap_or(spg_storage::Value::Null);
+                    collated_key_cell(&v, *p, self.schema, self.mysql)
+                }
+                KeyerPart::Expression(expr, _) => {
+                    let r = row.get_or_insert_with(|| spg_storage::Row {
+                        values: values.to_vec(),
+                    });
+                    eval::eval_expr(expr, r, &self.ctx).map_err(|e| {
+                        EngineError::Unsupported(alloc::format!(
+                            "UNIQUE INDEX {:?} expression eval: {e:?}",
+                            self.idx.name
+                        ))
+                    })?
+                }
+            });
         }
-        Ok(self
-            .positions
-            .iter()
-            .map(|&p| {
-                let v = values.get(p).cloned().unwrap_or(spg_storage::Value::Null);
-                collated_key_cell(&v, p, self.schema, self.mysql)
-            })
-            .collect())
+        Ok(out)
     }
 
     pub(crate) fn participates(

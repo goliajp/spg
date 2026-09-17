@@ -15658,9 +15658,28 @@ fn apply_function_dispatch(
                         .get(pos)
                         .map_or_else(|| String::from("?"), |c| c.name.clone())
                 };
+                let n = (col_no - 1) as usize;
+                // 9.0.0 — an expression part is its expression, rendered as
+                // the whole definition renders it; this answered the first
+                // column the expression reads (`a` for `lower(a || b)`).
+                if ci.is_storage
+                    && let Some(idx) = t.indices().iter().find(|i| i.name == ci.name)
+                {
+                    if n > idx.extra_column_positions.len() {
+                        return Ok(Value::Null);
+                    }
+                    return Ok(Value::text(crate::system_catalog::render_index_part(
+                        t,
+                        idx,
+                        cat,
+                        public_hidden_in(ctx).then_some(cat),
+                        n,
+                        true,
+                    )));
+                }
                 let col_names: Vec<String> = ci.columns.iter().map(|&p| col_at(p)).collect();
                 return Ok(col_names
-                    .get((col_no - 1) as usize)
+                    .get(n)
                     .map_or(Value::Null, |c| Value::text(c.clone())));
             }
             Ok(Value::text(crate::system_catalog::catalog_indexdef(

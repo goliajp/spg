@@ -1139,6 +1139,30 @@ fn deserialize_indices(
                         last.prefix_len = prefix;
                     }
                 }
+                // 9.0.0 — each extra key part's expression and collation
+                // (FILE_VERSION 101+). Older snapshots leave both vecs
+                // empty: every extra part a column, with no COLLATE.
+                if version >= 101 {
+                    let n = cur.read_u16()? as usize;
+                    let mut exprs = Vec::with_capacity(n);
+                    let mut colls = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        exprs.push(if cur.read_u8()? == 0 {
+                            None
+                        } else {
+                            Some(cur.read_str()?)
+                        });
+                        colls.push(if cur.read_u8()? == 0 {
+                            None
+                        } else {
+                            Some(cur.read_str()?)
+                        });
+                    }
+                    if let Some(last) = t.indices.last_mut() {
+                        last.extra_expressions = exprs;
+                        last.extra_collations = colls;
+                    }
+                }
             }
         }
     }

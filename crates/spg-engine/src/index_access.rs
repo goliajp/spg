@@ -222,7 +222,7 @@ pub(crate) fn try_pk_walk_top_n<'a>(
             table.indices().iter().find(|i| {
                 matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
                     && i.column_position == col_pos
-                    && i.expression.is_none()
+                    && !i.has_expression_part()
                     && i.partial_predicate.is_none()
             })
         })?;
@@ -600,7 +600,7 @@ pub(crate) fn try_index_seek_positions(
         for idx in table.indices() {
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
-                || idx.expression.is_some()
+                || idx.has_expression_part()
             {
                 continue;
             }
@@ -918,7 +918,7 @@ fn try_leading_composite_prefix(
         if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
             || idx.column_position != col_pos
             || idx.partial_predicate.is_some()
-            || idx.expression.is_some()
+            || idx.has_expression_part()
         {
             continue;
         }
@@ -956,7 +956,7 @@ fn try_leading_composite_range(
         if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
             || idx.column_position != col_pos
             || idx.partial_predicate.is_some()
-            || idx.expression.is_some()
+            || idx.has_expression_part()
         {
             continue;
         }
@@ -1813,7 +1813,7 @@ pub(crate) fn try_index_seek<'a>(
         for idx in table.indices() {
             if !matches!(idx.kind, spg_storage::IndexKind::BTreeMulti(_))
                 || idx.partial_predicate.is_some()
-                || idx.expression.is_some()
+                || idx.has_expression_part()
             {
                 continue;
             }
@@ -2430,7 +2430,7 @@ pub(crate) fn try_gin_seek<'a>(
             table.indices().iter().find(|i| {
                 i.column_position == col_pos
                     && (i.is_gin() || i.is_gin_fulltext())
-                    && i.expression.is_none()
+                    && !i.has_expression_part()
             })
         })?;
     let candidates = gin_query_candidates(idx, &query)?;

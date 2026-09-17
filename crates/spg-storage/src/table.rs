@@ -2010,6 +2010,8 @@ impl Table {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         });
         Ok(())
     }
@@ -2381,7 +2383,7 @@ impl Table {
         {
             let idx = &self.indices[pos];
             if idx.extra_column_positions.is_empty()
-                || idx.expression.is_some()
+                || idx.has_expression_part()
                 || idx.partial_predicate.is_some()
             {
                 return Ok(false);
@@ -3188,6 +3190,13 @@ impl Table {
 
     /// v7.39.9 — rename an index in place. `false` when this table has
     /// no index of that name, which is the caller's error to report.
+    /// 9.0.0 — drop this table's indexes of the given names. The caller
+    /// decides which: storage cannot read an expression to know whether it
+    /// mentions a column.
+    pub fn drop_indices_named(&mut self, names: &[String]) {
+        self.indices.retain(|i| !names.contains(&i.name));
+    }
+
     pub fn rename_index(&mut self, old: &str, new: &str) -> bool {
         let Some(idx) = self
             .indices
@@ -4129,6 +4138,8 @@ impl Table {
             constraint_backing: bool,
             extra_orders: Vec<crate::KeyOrder>,
             prefix_len: Option<u32>,
+            extra_expressions: Vec<Option<String>>,
+            extra_collations: Vec<Option<String>>,
         }
         let descriptors: Vec<RebuildDesc> = self
             .indices
@@ -4164,6 +4175,8 @@ impl Table {
                     extra_column_positions,
                     extra_orders,
                     prefix_len,
+                    extra_expressions,
+                    extra_collations,
                 } = idx;
                 RebuildDesc {
                     name: name.clone(),
@@ -4182,6 +4195,8 @@ impl Table {
                     constraint_backing: *constraint_backing,
                     extra_orders: extra_orders.clone(),
                     prefix_len: *prefix_len,
+                    extra_expressions: extra_expressions.clone(),
+                    extra_collations: extra_collations.clone(),
                 }
             })
             .collect();
@@ -4204,6 +4219,8 @@ impl Table {
                 constraint_backing,
                 extra_orders,
                 prefix_len,
+                extra_expressions,
+                extra_collations,
             } = desc;
             let pre_len = self.indices.len();
             match rebuild_kind {
@@ -4410,6 +4427,8 @@ impl Table {
                 idx.constraint_backing = constraint_backing;
                 idx.extra_orders = extra_orders;
                 idx.prefix_len = prefix_len;
+                idx.extra_expressions = extra_expressions;
+                idx.extra_collations = extra_collations;
             }
         }
 
@@ -4482,6 +4501,8 @@ impl Table {
                 extra_column_positions: Vec::new(),
                 extra_orders: Vec::new(),
                 prefix_len: None,
+                extra_expressions: Vec::new(),
+                extra_collations: Vec::new(),
             });
             return Ok(());
         }

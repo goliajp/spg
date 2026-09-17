@@ -452,6 +452,15 @@ impl Parser {
     }
 }
 
+/// 9.0.0 — one parsed index key part; see `Parser::parse_index_elem`.
+struct IndexElem {
+    column: String,
+    expression: Option<Expr>,
+    collation: Option<String>,
+    opclass: Option<String>,
+    order: crate::ast::IndexColumnOrder,
+}
+
 fn is_vector_opclass_name(name: &str) -> bool {
     let lc = name.to_ascii_lowercase();
     matches!(
@@ -16625,6 +16634,84 @@ impl Parser {
         order
     }
 
+    /// 9.0.0 — one index key part: `column | expr | (expr)`, then an
+    /// optional `COLLATE name`, an optional operator class (possibly
+    /// schema-qualified, which is how `pg_dump` writes pgvector's), then
+    /// `ASC | DESC` and `NULLS FIRST | LAST`.
+    ///
+    /// An operator class is recognised by POSITION (r1038): whatever
+    /// identifier follows the key is one, because nothing else may stand
+    /// there.
+    fn parse_index_elem(&mut self) -> Result<IndexElem, ParseError> {
+        let saved_key_ctx = self.in_order_by_key;
+        let saved_coll = self.order_key_collation.take();
+        self.in_order_by_key = true;
+        let parsed = self.parse_expr(0);
+        self.in_order_by_key = saved_key_ctx;
+        let collation = core::mem::replace(&mut self.order_key_collation, saved_coll);
+        let key_expr = parsed?;
+        // v7.39.2 — a key can only CARRY the byte-order spellings (and
+        // MySQL's folding ones on that wire); any other name is refused
+        // here rather than accepted and not honoured.
+        if let Some(name) = &collation {
+            let lc = name.to_ascii_lowercase();
+            let byte_order = matches!(
+                lc.as_str(),
+                "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
+            );
+            let mysql_ok = self.mysql_dialect
+                && (lc.ends_with("_ci")
+                    || lc.ends_with("_bin")
+                    || lc == "binary"
+                    || matches!(lc.as_str(), "case_insensitive" | "nocase"));
+            if !byte_order && !mysql_ok {
+                return Err(self.err(alloc::format!(
+                    "COLLATE {name:?} is not supported in this position: an index \
+                     key carries the byte-order spellings only. Declare it on the \
+                     column (`x text COLLATE {name:?}`) instead"
+                )));
+            }
+        }
+        let opclass = match self.peek().clone() {
+            Token::Ident(first) | Token::QuotedIdent(first)
+                if !first.eq_ignore_ascii_case("nulls") =>
+            {
+                self.advance();
+                if matches!(self.peek(), Token::Dot) {
+                    self.advance();
+                    match self.advance() {
+                        Token::Ident(op) | Token::QuotedIdent(op) => Some(op.to_ascii_lowercase()),
+                        other => {
+                            return Err(self.err(alloc::format!(
+                                "expected operator class name after {first:?}., got {other:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    Some(first.to_ascii_lowercase())
+                }
+            }
+            _ => None,
+        };
+        let order = self.consume_optional_index_column_qualifiers();
+        let (column, expression) = match key_expr {
+            Expr::Column(ref c) if c.qualifier.is_none() => (c.name.clone(), None),
+            other => {
+                let primary = extract_first_column(&other).ok_or_else(|| {
+                    self.err("expression index key must reference at least one column".into())
+                })?;
+                (primary, Some(other))
+            }
+        };
+        Ok(IndexElem {
+            column,
+            expression,
+            collation,
+            opclass,
+            order,
+        })
+    }
+
     fn parse_create_index_stmt_after_create(
         &mut self,
         is_unique: bool,
@@ -16725,186 +16812,32 @@ impl Parser {
         // (`advance()` uses `mem::replace` to nil out the current
         // slot, so we can't save+rewind cleanly — peek-ahead via
         // direct index avoids the mutation.)
-        let mut opclass: Option<String> = None;
-        let mut key_collation: Option<String> = None;
-        let (column, expression): (String, Option<Expr>) = match self.peek().clone() {
-            // Single column with `)` immediately after — fast path.
-            // v7.9.29 — also: bare column followed by `,` (the
-            // multi-column form `(a, b, c)`). Without this branch
-            // the leading ident gets pulled into `parse_expr`
-            // which then sets `expression = Some(Column(a))` and
-            // breaks Display round-trip on the multi-column shape.
-            Token::Ident(s) | Token::QuotedIdent(s)
-                if matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::RParen | Token::Comma)
-                ) =>
-            {
-                self.advance();
-                (s, None)
-            }
-            // v7.9.22 — single column followed by a pgvector
-            // opclass ident: `(col vector_cosine_ops)`. mailrs G5.
-            // v7.15.0 — capture the opclass instead of discarding
-            // it so the engine can dispatch (e.g. `gin_trgm_ops`
-            // → real trigram-shingle GIN over a TEXT column).
-            // Vector/HNSW opclasses still take their distance
-            // metric from the query operator (`<->` / `<#>` /
-            // `<=>`), so for those callers the opclass stays
-            // informational.
-            // v7.22 (mailrs round-13 gap 7) — pg_dump qualifies the
-            // opclass: `(embedding public.vector_cosine_ops)`. Strip
-            // the schema and dispatch on the bare opclass, the same
-            // treatment table/type names get.
-            Token::Ident(s) | Token::QuotedIdent(s)
-                if matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::Ident(_) | Token::QuotedIdent(_))
-                ) && matches!(self.tokens.get(self.pos + 2), Some(Token::Dot))
-                    && matches!(
-                        self.tokens.get(self.pos + 3),
-                        Some(Token::Ident(op) | Token::QuotedIdent(op))
-                            if is_vector_opclass_name(op)
-                    ) =>
-            {
-                self.advance(); // column name
-                self.advance(); // schema qualifier
-                self.advance(); // dot
-                let op_tok = self.advance();
-                if let Token::Ident(op) | Token::QuotedIdent(op) = op_tok {
-                    opclass = Some(op.to_ascii_lowercase());
-                }
-                (s, None)
-            }
-            // r1038 — an operator class is recognised by its POSITION, not
-            // by a list of names. It used to be `is_vector_opclass_name`,
-            // so `USING gin (doc jsonb_path_ops)` — ordinary PG, and what
-            // sentori's migration wrote — was a syntax error while
-            // `USING gin (doc)` parsed. Anything sitting between a column
-            // name and a `,` `)` ASC DESC NULLS COLLATE is an opclass;
-            // two bare identifiers in a row are not valid there otherwise.
-            Token::Ident(s) | Token::QuotedIdent(s)
-                if matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::Ident(op) | Token::QuotedIdent(op))
-                        if is_vector_opclass_name(op) || Self::opclass_position_follows(
-                            self.tokens.get(self.pos + 2)
-                        )
-                ) =>
-            {
-                self.advance(); // column name
-                // Capture the opclass token, lower-cased for
-                // case-insensitive engine dispatch.
-                let op_tok = self.advance();
-                if let Token::Ident(op) | Token::QuotedIdent(op) = op_tok {
-                    opclass = Some(op.to_ascii_lowercase());
-                }
-                (s, None)
-            }
-            Token::Ident(_) | Token::QuotedIdent(_) => {
-                // v7.39 (round 538) — an explicit COLLATE on the key,
-                // read by LOOKAHEAD because `parse_expr` absorbs the
-                // clause as a no-op (SPG orders text by bytes, which is
-                // the C collation, so it changes nothing to honour). PG
-                // still PRINTS it: an explicitly written `"C"` and the
-                // collation a column inherits are different collation
-                // OBJECTS even where they sort identically, which is why
-                // `(a COLLATE "C")` shows on a C-collation database too.
-                if matches!(
-                    self.tokens.get(self.pos + 1),
-                    Some(Token::Ident(w)) if w.eq_ignore_ascii_case("collate")
-                ) {
-                    key_collation = match self.tokens.get(self.pos + 2) {
-                        Some(Token::Ident(n) | Token::QuotedIdent(n) | Token::String(n)) => {
-                            Some(n.clone())
-                        }
-                        _ => None,
-                    };
-                }
-                // v7.39.2 — the clause is read by the LOOKAHEAD above and
-                // belongs to the KEY, not to the expression. Since
-                // `COLLATE` became a node, letting `parse_expr` build one
-                // here put the collation in twice and the key deparsed as
-                // `(c COLLATE "C" COLLATE "C")`. The ORDER-BY-key channel
-                // is the same idea and already exists, so this borrows it:
-                // absorb into the side channel, and the key's own
-                // lookahead is what carries it.
-                // v7.39.2 — and the key can only CARRY the byte-order
-                // spellings. Absorbing into the side channel accepts any
-                // name, so suppressing the node here without this check
-                // silently accepted `(name COLLATE "en_US")`, which SPG's
-                // index cannot honour — a refusal that was doing real
-                // work, removed by the suppression and put back here.
-                if let Some(name) = &key_collation {
-                    let lc = name.to_ascii_lowercase();
-                    let byte_order = matches!(
-                        lc.as_str(),
-                        "c" | "posix" | "default" | "ucs_basic" | "pg_c_utf8"
-                    );
-                    let mysql_ok = self.mysql_dialect
-                        && (lc.ends_with("_ci")
-                            || lc.ends_with("_bin")
-                            || lc == "binary"
-                            || matches!(lc.as_str(), "case_insensitive" | "nocase"));
-                    if !byte_order && !mysql_ok {
-                        return Err(self.err(alloc::format!(
-                            "COLLATE {name:?} is not supported in this position: an index \
-                             key carries the byte-order spellings only. Declare it on the \
-                             column (`x text COLLATE {name:?}`) instead"
-                        )));
-                    }
-                }
-                let saved_key_ctx = self.in_order_by_key;
-                self.in_order_by_key = true;
-                let key_expr = self.parse_expr(0);
-                self.in_order_by_key = saved_key_ctx;
-                let key_expr = key_expr?;
-                let primary = extract_first_column(&key_expr).ok_or_else(|| {
-                    self.err("expression index key must reference at least one column".into())
-                })?;
-                (primary, Some(key_expr))
-            }
-            // v7.37.43-T4 — parenthesised expression index key
-            // `CREATE INDEX … ON t ((payload->'bundle'->>'id'))`.
-            // PG's CREATE INDEX requires the expression to be in
-            // its own parens to disambiguate function calls from
-            // column lists, so this `LParen` is the inner open-paren
-            // of an expression key. parse_expr handles the recursive
-            // descent and consumes the matching `RParen`.
-            Token::LParen => {
-                let key_expr = self.parse_expr(0)?;
-                let primary = extract_first_column(&key_expr).ok_or_else(|| {
-                    self.err("expression index key must reference at least one column".into())
-                })?;
-                (primary, Some(key_expr))
-            }
-            other => {
-                return Err(self.err(format!(
-                    "expected column ident or expression, got {other:?}"
-                )));
-            }
-        };
-        // v7.9.14 — accept extra comma-separated columns inside
-        // the index key parens (`CREATE INDEX … (a, b, c)`).
-        // mailrs F2.
-        //
-        // v7.39.11 — each extra column's `ASC` / `DESC` / `NULLS FIRST`
-        // / `NULLS LAST` is KEPT. It used to be parsed and dropped on
-        // the floor, so `CREATE INDEX i ON t (a, b DESC)` read back from
-        // `pg_get_indexdef` as `(a, b)`: a dump lost the clause and a
-        // schema diff saw drift on every run. Reported by sentori
-        // against 7.39.10, and the same defect round 537 fixed for the
-        // LEADING column, in the loop right beside it.
+        // 9.0.0 — every key part is parsed the same way: a column or an
+        // expression, then COLLATE, operator class and order. Only the
+        // LEADING part used to be allowed an expression, a collation or an
+        // operator class; the rest had to be bare column names, so
+        // `(p, lower(email))` — ordinary PostgreSQL — was a syntax error.
+        let lead = self.parse_index_elem()?;
+        let IndexElem {
+            column,
+            expression,
+            collation: key_collation,
+            opclass,
+            order: key_order,
+        } = lead;
         let mut extra_columns: Vec<String> = Vec::new();
         let mut extra_orders: Vec<crate::ast::IndexColumnOrder> = Vec::new();
-        // The leading column may also have ASC/DESC after it — and that
-        // one is the column SPG indexes, so its clause is kept.
-        let key_order = self.consume_optional_index_column_qualifiers();
+        let mut extra_expressions: Vec<Option<Expr>> = Vec::new();
+        let mut extra_collations: Vec<Option<String>> = Vec::new();
+        let mut extra_opclasses: Vec<Option<String>> = Vec::new();
         while matches!(self.peek(), Token::Comma) {
             self.advance();
-            let extra = self.expect_ident_like()?;
-            extra_orders.push(self.consume_optional_index_column_qualifiers());
-            extra_columns.push(extra);
+            let part = self.parse_index_elem()?;
+            extra_columns.push(part.column);
+            extra_expressions.push(part.expression);
+            extra_collations.push(part.collation);
+            extra_opclasses.push(part.opclass);
+            extra_orders.push(part.order);
         }
         if !matches!(self.peek(), Token::RParen) {
             return Err(self.err(format!(
@@ -17020,8 +16953,8 @@ impl Parser {
             )));
         }
         Ok(Statement::CreateIndex(CreateIndexStatement {
-            concurrently,
             name,
+            concurrently,
             key_order,
             key_collation,
             table,
@@ -17031,9 +16964,12 @@ impl Parser {
             if_not_exists,
             included_columns,
             partial_predicate,
-            extra_columns: extra_columns.clone(),
-            extra_orders: extra_orders.clone(),
             expression,
+            extra_columns,
+            extra_orders,
+            extra_expressions,
+            extra_collations,
+            extra_opclasses,
             is_unique,
             opclass,
             method_name,
@@ -18745,7 +18681,7 @@ impl Parser {
             // `ON CONFLICT DO UPDATE SET` over every column; the engine
             // reads an empty assignment list as "take the incoming row".
             return Ok(Some(crate::ast::OnConflictClause {
-                target_columns: Vec::new(),
+                target: Vec::new(),
                 index_where: None,
                 constraint_name: None,
                 mysql_lowered: true,
@@ -18810,7 +18746,7 @@ impl Parser {
             break;
         }
         Ok(Some(crate::ast::OnConflictClause {
-            target_columns: Vec::new(),
+            target: Vec::new(),
             index_where: None,
             constraint_name: None,
             mysql_lowered: true,
@@ -18823,7 +18759,7 @@ impl Parser {
 
     fn insert_ignore_clause() -> crate::ast::OnConflictClause {
         crate::ast::OnConflictClause {
-            target_columns: Vec::new(),
+            target: Vec::new(),
             index_where: None,
             constraint_name: None,
             mysql_lowered: true,
@@ -19251,12 +19187,31 @@ impl Parser {
             }
             constraint_name = Some(self.expect_ident_like()?);
         }
-        // Optional `(col [, col]*)` target list.
-        let mut target_columns: Vec<String> = Vec::new();
+        // Optional `(elem [, elem]*)` target list. 9.0.0 — each element is
+        // an index element, as in PG: a column or an expression, with an
+        // optional COLLATE and operator class. Only column names were
+        // accepted, so `ON CONFLICT (lower(email))` was a syntax error.
+        let mut target: Vec<crate::ast::ConflictTargetElem> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             loop {
-                target_columns.push(self.expect_ident_like()?);
+                let elem = self.parse_index_elem()?;
+                // PG's grammar reads a full index element here and then
+                // refuses the ordering clauses; measured on 18.6.
+                if elem.order.descending || elem.order.nulls_first.is_some() {
+                    return Err(self.err("ASC/DESC is not allowed in ON CONFLICT clause".into()));
+                }
+                target.push(crate::ast::ConflictTargetElem {
+                    expr: match elem.expression {
+                        Some(e) => e,
+                        None => Expr::Column(crate::ast::ColumnName {
+                            qualifier: None,
+                            name: elem.column,
+                        }),
+                    },
+                    collation: elem.collation,
+                    opclass: elem.opclass,
+                });
                 match self.peek() {
                     Token::Comma => {
                         self.advance();
@@ -19278,7 +19233,7 @@ impl Parser {
         // PARTIAL unique index; SPG's arbiters are full indexes, which
         // satisfy any predicate, so it is parsed and carried but not
         // consulted (recorded residual: partial-unique-index arbiters).
-        let index_where = if !target_columns.is_empty() && matches!(self.peek(), Token::Where) {
+        let index_where = if !target.is_empty() && matches!(self.peek(), Token::Where) {
             self.advance();
             Some(self.parse_expr(0)?)
         } else {
@@ -19308,7 +19263,7 @@ impl Parser {
             }
         };
         Ok(Some(crate::ast::OnConflictClause {
-            target_columns,
+            target,
             index_where,
             constraint_name,
             mysql_lowered: false,
