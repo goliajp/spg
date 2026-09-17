@@ -50,6 +50,24 @@ impl SpawnAttempt {
     }
 }
 
+/// Ports chosen for a spawn whose child has not bound them yet, across
+/// every roster in this process — see [`Roster::claim_free_port`].
+static STARTING: std::sync::Mutex<std::collections::BTreeSet<u16>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One entry in [`STARTING`], released when the spawn attempt that
+/// took it returns, whichever way it returns.
+struct PortClaim(u16);
+
+impl Drop for PortClaim {
+    fn drop(&mut self) {
+        STARTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
 /// All processes this run owns. Dropping the roster reaps.
 #[derive(Default)]
 pub struct Roster {
@@ -145,6 +163,44 @@ impl Roster {
     /// `held` is the port this same spawn has already claimed but not
     /// yet bound; nothing else knows about it, so it has to be passed.
     pub fn free_port_excluding(&self, held: Option<u16>) -> Result<u16, String> {
+        let claims = STARTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.scan_for_free_port(held, &claims)
+    }
+
+    /// 8.0.3 — a port handed to a spawn stays claimed, process-wide,
+    /// until that spawn's child has bound it or given up.
+    ///
+    /// The prerelease tier runs its `after-build` group on threads of ONE
+    /// process, and each step brings its own roster, so "already ours"
+    /// above sees only that step's servers. Two threads probed 25477 as
+    /// free in the same instant: one server was told to serve pgwire
+    /// there, the other its native protocol, and `pgdump-roundtrip`'s
+    /// psql read
+    ///
+    /// ```text
+    /// received invalid response to SSL negotiation: -
+    /// ```
+    ///
+    /// — the symptom v7.38.19 removed for two probes inside ONE roster.
+    /// The bind probe cannot reserve; the claim does, for exactly the
+    /// window between choosing a port and a child holding it, after
+    /// which the bind probe sees the holder by itself.
+    fn claim_free_port(&self, held: Option<u16>) -> Result<PortClaim, String> {
+        let mut claims = STARTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let p = self.scan_for_free_port(held, &claims)?;
+        claims.insert(p);
+        Ok(PortClaim(p))
+    }
+
+    fn scan_for_free_port(
+        &self,
+        held: Option<u16>,
+        claims: &std::collections::BTreeSet<u16>,
+    ) -> Result<u16, String> {
         // Rotate the scan start by pid so concurrent test PROCESSES
         // spread across the range instead of all courting the first
         // port — full runs saw three suites claim 25460 at once.
@@ -152,7 +208,7 @@ impl Roster {
         let off = (std::process::id() as u16) % len;
         for i in 0..len {
             let p = PORT_RANGE.start + (off + i) % len;
-            if Some(p) == held || self.procs.iter().any(|x| x.port == p) {
+            if Some(p) == held || claims.contains(&p) || self.procs.iter().any(|x| x.port == p) {
                 continue;
             }
             if !port_is_free(p) {
@@ -256,13 +312,15 @@ impl Roster {
         envs: &[(&str, &str)],
     ) -> Result<u16, SpawnAttempt> {
         let fatal = SpawnAttempt::fatal;
-        let pg_port = self.free_port().map_err(SpawnAttempt::Fatal)?;
+        let pg_claim = self.claim_free_port(None).map_err(SpawnAttempt::Fatal)?;
+        let pg_port = pg_claim.0;
         // The native listener's port comes from the SAME probe as the
         // pgwire one, excluding it. It used to come from a second copy
         // of that loop — see `free_port_excluding`.
-        let native_port = self
-            .free_port_excluding(Some(pg_port))
+        let native_claim = self
+            .claim_free_port(Some(pg_port))
             .map_err(SpawnAttempt::Fatal)?;
+        let native_port = native_claim.0;
         std::fs::create_dir_all(data_dir)
             .map_err(|e| fatal(format!("{name}: mkdir data dir: {e}")))?;
         let log = data_dir.join("server.log");
@@ -585,6 +643,22 @@ mod tests {
         let r = Roster::new();
         let p = r.free_port().expect("a free port");
         assert!(PORT_RANGE.contains(&p), "{p}");
+    }
+
+    /// 8.0.3 — a port one roster chose for a spawn is not handed to
+    /// another roster in the same process before that spawn is done.
+    /// Nothing is bound in between, so the bind probe alone would hand
+    /// both rosters the same port, which is what the parallel group did.
+    #[test]
+    fn a_port_claimed_by_one_roster_is_not_handed_to_another() {
+        let _g = server_test_guard();
+        let (a, b) = (Roster::new(), Roster::new());
+        let claim = a.claim_free_port(None).expect("a free port");
+        let other = b.free_port().expect("a free port");
+        assert_ne!(claim.0, other, "both rosters were handed {other}");
+        let claimed = claim.0;
+        drop(claim);
+        assert_eq!(b.free_port().expect("a free port"), claimed);
     }
 
     /// v7.38.19 — a port ANOTHER process is serving on the wildcard
