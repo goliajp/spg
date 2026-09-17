@@ -10,6 +10,68 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — an index key could not mix columns and expressions, and `ON CONFLICT` could not name an expression
+
+Reported by sentori (their §3, `cli/import.rs:36`); measured wider against
+PostgreSQL 18.6 before changing anything:
+
+```text
+                                                        PG 18.6         SPG 8.0.4
+  CREATE UNIQUE INDEX … (lower(a), b); ('A',1) then ('a',2)   INSERT 0 1      ERROR duplicate key
+                                                                              Key (lower(a))=(a)
+  CREATE UNIQUE INDEX … (p, lower(email))                     accepted        syntax error
+  INSERT … ON CONFLICT (lower(email)) DO NOTHING              INSERT 0 0      syntax error
+  INSERT … ON CONFLICT DO NOTHING   (only an expression       INSERT 0 0      ERROR duplicate key
+    unique index covers the key)
+  CREATE TABLE b (LIKE a INCLUDING INDEXES)                   whole index     leading column only
+  ALTER TABLE … DROP COLUMN b   (b read only inside           index dropped   index kept; every
+    a key expression)                                                         INSERT then fails
+  ALTER TABLE … RENAME COLUMN b TO bb                         expression      expression still
+                                                              rewritten       reads b
+```
+
+The first is a wrong answer that shipped: a unique index whose leading
+part is an expression enforced uniqueness on that part alone and refused
+rows PostgreSQL accepts.
+
+An index key is now a list of parts, each a column or an expression with
+its own COLLATE, operator class and order, in any position. Uniqueness
+reads every part through the one keyer the INSERT check, the UPDATE check
+and the uncommitted-key wait share; a key whose leading part has a B-tree
+descends it for candidates and compares the whole key.
+
+`ON CONFLICT (…)` takes index elements, and a target is inferred the way
+PostgreSQL infers it: the same set of key parts in any order, a COLLATE or
+operator class written on an element must be the part's own (`text_ops`
+matches a part declared without one; `COLLATE "C"` does not), a partial
+index only by a clause whose WHERE is its predicate, and every index that
+matches is an arbiter. A target nothing infers is 42P10. An untargeted
+clause arbitrates on expression unique indexes too.
+
+Found on the way and fixed, each measured against 18.6: `pg_index.indkey`
+reported an expression part as a column (it is 0), `indexprs` listed only
+the leading expression, `indnkeyatts` counted INCLUDE columns, `indoption`
+and `indcollation` were all zeros (DESC is 1, NULLS FIRST 2; 100 for a part
+that collates), `pg_get_indexdef(oid, n)` answered the column an expression
+reads instead of the expression, and the generated name of `(p, lower(e))`
+was `…_p_e_idx` where PostgreSQL says `…_p_lower_idx`. The operator class of
+every key part is recorded, not only the leading one's.
+
+The release gate's arbiter sweep crosses a new axis — no expression, a
+leading expression, a second-part expression — and runs 204 cases: 0 differ
+here, 72 differ on the 8.0.4 image.
+
+The on-disk format moves to FILE_VERSION 101 (each key part's expression,
+collation and operator class). `OnConflictClause::target_columns` is
+replaced by `target: Vec<ConflictTargetElem>`; `CreateIndexStatement` and
+`spg_storage::Index` gain per-part fields.
+
+Still different, recorded: a column target that no unique rule infers is
+arbitrated on its columns rather than refused (PostgreSQL: 42P10), because
+two shipped statements of another customer depend on it; the constant
+inside a key expression prints without its type (`(a || 'x')` where
+PostgreSQL prints `(a || 'x'::text)`), and pretty mode is not implemented.
+
 
 ## [8.0.4] — 2026-09-17
 

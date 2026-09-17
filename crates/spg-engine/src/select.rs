@@ -8588,7 +8588,7 @@ impl Engine {
         let where_ = stmt.where_.as_ref()?;
         for index in table.indices() {
             if !matches!(index.kind, spg_storage::IndexKind::BTreeMulti(_))
-                || index.expression.is_some()
+                || index.has_expression_part()
                 || index.partial_predicate.is_some()
             {
                 continue;
@@ -8877,7 +8877,7 @@ impl Engine {
                         && i.column_position == order_pos
                 })
             })?;
-        if index.expression.is_some() || index.partial_predicate.is_some() {
+        if index.has_expression_part() || index.partial_predicate.is_some() {
             return None;
         }
         // v7.39.11 — more than one ORDER BY term walks when the index
@@ -8990,7 +8990,7 @@ impl Engine {
             table.indices().iter().find(|i| {
                 matches!(i.kind, spg_storage::IndexKind::BTreeMulti(_))
                     && i.extra_column_positions.first() == Some(&order_pos)
-                    && i.expression.is_none()
+                    && !i.has_expression_part()
                     && i.partial_predicate.is_none()
             })
         } else {

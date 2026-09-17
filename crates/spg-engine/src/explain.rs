@@ -78,7 +78,7 @@ pub(crate) fn build_index_suggestions(stmt: &SelectStatement, engine: &Engine) -
                 i.kind,
                 spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
             ) && i.column_position == col_pos
-                && i.expression.is_none()
+                && !i.has_expression_part()
                 && i.partial_predicate.is_none()
         });
         if already_indexed {

@@ -2143,6 +2143,39 @@ impl Engine {
             );
             !involves
         });
+        // 9.0.0 — and every index whose key EXPRESSION or predicate reads
+        // the column, as PG does (measured on 18.6: `(p, lower(a || b))`
+        // goes with `b`). Storage drops an index by the positions it keys
+        // on, which never includes a column only an expression names, so
+        // the index stayed and every later INSERT failed on the ghost
+        // column.
+        let reads_dropped = |src: &str| {
+            spg_sql::parser::parse_expression(src).is_ok_and(|expr| {
+                let mut involves = false;
+                crate::visit_expr_columns_and_subqueries(
+                    &expr,
+                    &mut |c: &spg_sql::ast::ColumnName| {
+                        if c.name.eq_ignore_ascii_case(&dropped) {
+                            involves = true;
+                        }
+                    },
+                    &mut |_| {},
+                );
+                involves
+            })
+        };
+        let doomed: Vec<String> = table
+            .indices()
+            .iter()
+            .filter(|idx| {
+                (0..=idx.extra_column_positions.len())
+                    .filter_map(|i| idx.part_expression(i))
+                    .chain(idx.partial_predicate.as_deref())
+                    .any(reads_dropped)
+            })
+            .map(|idx| idx.name.clone())
+            .collect();
+        table.drop_indices_named(&doomed);
         // Drop the column. New helper on Table does the
         // row + schema + index shift atomically.
         table.drop_column(col_pos);
@@ -2481,6 +2514,19 @@ impl Engine {
             });
         }
         table.schema_mut().checks = new_checks;
+        // 9.0.0 — and every index key expression, in any position. Only the
+        // predicate was rewritten, so `(p, lower(a || b))` still read `b`
+        // after `RENAME COLUMN b TO bb`, and the index could not evaluate.
+        for idx in table.indices_mut() {
+            if let Some(src) = idx.expression.clone() {
+                idx.expression = Some(rewrite_column_in_source(&src, &old, &new)?);
+            }
+            for part in &mut idx.extra_expressions {
+                if let Some(src) = part.clone() {
+                    *part = Some(rewrite_column_in_source(&src, &old, &new)?);
+                }
+            }
+        }
         // Rewrite per-index partial_predicate sources.
         let n_idx = table.indices().len();
         for i in 0..n_idx {
@@ -2623,13 +2669,21 @@ impl Engine {
     /// too. On a name clash within the relation an integer counter is
     /// appended (`_idx`, `_idx1`, `_idx2`, …).
     fn choose_auto_index_name(&self, stmt: &CreateIndexStatement) -> String {
-        let mut labels: Vec<String> = Vec::new();
-        match &stmt.expression {
-            Some(Expr::FunctionCall { name, .. }) => labels.push(name.to_ascii_lowercase()),
-            Some(_) => labels.push("expr".to_string()),
-            None => labels.push(stmt.column.clone()),
+        // 9.0.0 — every key part is labelled the same way, whichever
+        // position it holds: `(p, lower(email))` is `…_p_lower_idx` on PG
+        // 18.6 (measured), where the extras were always labelled by column.
+        let label = |expression: Option<&Expr>, column: &str| match expression {
+            Some(Expr::FunctionCall { name, .. }) => name.to_ascii_lowercase(),
+            Some(_) => "expr".to_string(),
+            None => column.to_string(),
+        };
+        let mut labels: Vec<String> = alloc::vec![label(stmt.expression.as_ref(), &stmt.column)];
+        for (i, column) in stmt.extra_columns.iter().enumerate() {
+            labels.push(label(
+                stmt.extra_expressions.get(i).and_then(Option::as_ref),
+                column,
+            ));
         }
-        labels.extend(stmt.extra_columns.iter().cloned());
         labels.extend(stmt.included_columns.iter().cloned());
         let mut base = alloc::format!("{}_{}_idx", stmt.table, labels.join("_"));
         // PG truncates the generated name to NAMEDATALEN-1 (63) bytes.
@@ -3038,6 +3092,15 @@ impl Engine {
             }
             if let Some(idx) = table.indices_mut().iter_mut().find(|i| i.name == stmt.name) {
                 idx.extra_column_positions = extra_positions;
+                // 9.0.0 — each extra part's expression and collation. The
+                // expression is stored in its canonical Display form, as the
+                // leading part's is.
+                idx.extra_expressions = stmt
+                    .extra_expressions
+                    .iter()
+                    .map(|e| e.as_ref().map(alloc::string::ToString::to_string))
+                    .collect();
+                idx.extra_collations.clone_from(&stmt.extra_collations);
                 // v7.39.11 — and each extra's ordering clause, which the
                 // parser used to drop. See `Index::extra_orders`.
                 idx.extra_orders = stmt
@@ -3110,10 +3173,13 @@ impl Engine {
                 return Err(e);
             }
         }
-        // 8.0.3 — the declared operator class, for the definition to print.
-        let opclass = stmt.opclass.clone();
+        // 9.0.0 — every key part's declared operator class, for the
+        // definition to print and for a copy to carry.
+        let opclasses: Vec<Option<String>> = core::iter::once(stmt.opclass.clone())
+            .chain(stmt.extra_opclasses.iter().cloned())
+            .collect();
         self.active_catalog_mut()
-            .set_index_opclass(&stmt.name, opclass.as_deref());
+            .set_index_opclasses(&stmt.name, opclasses);
         // v6.3.1 — adding an index can change the optimal plan for
         // any cached query that references this table.
         self.plan_cache.evict_referencing(&table_name);
@@ -4064,6 +4130,16 @@ impl Engine {
                 })
             })?;
             let src_schema = src.schema();
+            let src_opclasses: alloc::collections::BTreeMap<String, Vec<Option<String>>> = src
+                .indices()
+                .iter()
+                .map(|i| {
+                    (
+                        i.name.clone(),
+                        self.active_catalog().index_opclasses(&i.name).to_vec(),
+                    )
+                })
+                .collect();
             let o = spec.options;
             let mut copied: Vec<spg_storage::ColumnSchema> = Vec::new();
             for c in &src_schema.columns {
@@ -4140,32 +4216,21 @@ impl Engine {
                     {
                         continue;
                     }
-                    let Some(col) = src_schema.columns.get(idx.column_position) else {
-                        continue;
-                    };
-                    out_indexes.push(CreateIndexStatement {
-                        concurrently: false,
-                        name: if spec.keep_index_names {
-                            idx.name.clone()
-                        } else {
-                            String::new()
-                        },
-                        key_order: spg_sql::ast::IndexColumnOrder::default(),
-                        key_collation: None,
-                        table: String::new(),
-                        column: col.name.clone(),
-                        nulls_not_distinct: idx.nulls_not_distinct,
-                        method: spg_sql::ast::IndexMethod::BTree,
-                        if_not_exists: false,
-                        included_columns: Vec::new(),
-                        partial_predicate: None,
-                        expression: None,
-                        extra_columns: Vec::new(),
-                        extra_orders: Vec::new(),
-                        is_unique: idx.is_unique,
-                        opclass: None,
-                        method_name: None,
-                    });
+                    // 9.0.0 — the WHOLE definition. This rebuilt an index
+                    // from its leading column alone, so the copy of
+                    // `(lower(a), b) WHERE b > 0 USING gin (doc jsonb_path_ops)`
+                    // was a plain B-tree on `a`: a different index, and a
+                    // different uniqueness rule when it was unique.
+                    let mut stmt = crate::index_def::create_index_statement_of(
+                        idx,
+                        src_schema,
+                        src_opclasses.get(&idx.name).map(Vec::as_slice),
+                    )?;
+                    if !spec.keep_index_names {
+                        stmt.name = String::new();
+                    }
+                    stmt.table = String::new();
+                    out_indexes.push(stmt);
                 }
             }
         }

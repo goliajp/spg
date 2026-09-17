@@ -73,6 +73,7 @@ mod fts_stop;
 mod guc_catalog;
 mod immutable_fn;
 mod index_access;
+mod index_def;
 mod join;
 mod join_using;
 mod joinfold;

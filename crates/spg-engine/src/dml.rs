@@ -5432,43 +5432,35 @@ impl Engine {
         // the same synthetic naming convention pg_constraint
         // synthesises ({t}_pkey for the primary key, {t}_uniq{i}
         // for the i-th non-PK unique).
-        let named_columns: Vec<String> = if let Some(cname) = &clause.constraint_name {
+        let named_columns: Option<Vec<usize>> = if let Some(cname) = &clause.constraint_name {
             let table = self.active_catalog().get(table_name).ok_or_else(|| {
                 spg_storage::StorageError::TableNotFound {
                     name: alloc::string::String::from(table_name),
                 }
             })?;
             let schema = table.schema();
-            let mut found: Option<Vec<String>> = None;
-            for uc in &schema.uniqueness_constraints {
-                let synth = crate::system_catalog::pg_unique_conname(table, uc, table_name);
-                if synth.eq_ignore_ascii_case(cname) {
-                    found = Some(
-                        uc.columns
-                            .iter()
-                            .filter_map(|&pos| schema.columns.get(pos).map(|c| c.name.clone()))
-                            .collect(),
-                    );
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
-                EngineError::Unsupported(alloc::format!(
-                    "ON CONFLICT ON CONSTRAINT: no unique or primary key \
-                     constraint named {cname:?} on table {table_name:?}"
-                ))
-            })?
+            let found = schema.uniqueness_constraints.iter().find(|uc| {
+                crate::system_catalog::pg_unique_conname(table, uc, table_name)
+                    .eq_ignore_ascii_case(cname)
+            });
+            Some(
+                found
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "ON CONFLICT ON CONSTRAINT: no unique or primary key \
+                             constraint named {cname:?} on table {table_name:?}"
+                        ))
+                    })?
+                    .columns
+                    .clone(),
+            )
         } else {
-            Vec::new()
-        };
-        let target_cols: &[String] = if named_columns.is_empty() {
-            clause.target_columns.as_slice()
-        } else {
-            named_columns.as_slice()
+            None
         };
         // v7.39 (round 240) — DO UPDATE has one row to find, so PG requires
         // an explicit conflict target for it (42601).
-        if target_cols.is_empty()
+        if clause.target.is_empty()
+            && named_columns.is_none()
             && !clause.mysql_lowered
             && matches!(clause.action, spg_sql::ast::OnConflictAction::Update { .. })
         {
@@ -5476,98 +5468,149 @@ impl Engine {
                 "ON CONFLICT DO UPDATE requires inference specification or constraint name".into(),
             ));
         }
-        // The arbiter column sets this clause watches: exactly one for an
-        // explicit target (validated against the table's unique
-        // constraints), every unique constraint and index for the bare
-        // form — which used to pick ONE, so a DO NOTHING let a conflict on
-        // any other constraint escalate to a duplicate-key error.
+        let catalog = self.active_catalog();
         let arbiters = crate::constraints::on_conflict_arbiters(
-            self.active_catalog(),
+            catalog,
             table_name,
-            target_cols,
-            clause.constraint_name.is_some(),
+            &clause.target,
+            clause.index_where.as_ref(),
+            named_columns,
         )?;
+        let table =
+            catalog
+                .get(table_name)
+                .ok_or_else(|| spg_storage::StorageError::TableNotFound {
+                    name: alloc::string::String::from(table_name),
+                })?;
+        let mysql = self.in_mysql_dialect();
+        // 9.0.0 — an expression-index arbiter reads its key through the
+        // uniqueness check's own keyer, parsed once per statement.
+        let mut keyers: Vec<
+            Option<(
+                &spg_storage::Index,
+                crate::constraints::UniqueIndexKeyer<'_>,
+            )>,
+        > = Vec::with_capacity(arbiters.len());
+        for a in &arbiters {
+            keyers.push(match &a.key {
+                crate::constraints::ArbiterKey::Index(name) => {
+                    let idx = table
+                        .indices()
+                        .iter()
+                        .find(|i| &i.name == name)
+                        .ok_or_else(|| {
+                            EngineError::Unsupported(alloc::format!(
+                                "ON CONFLICT arbiter index {name:?} disappeared"
+                            ))
+                        })?;
+                    Some((
+                        idx,
+                        crate::constraints::UniqueIndexKeyer::new(idx, table.schema(), mysql)?,
+                    ))
+                }
+                crate::constraints::ArbiterKey::Columns(_) => None,
+            });
+        }
+        let key_of =
+            |ai: usize, values: &[Value<'static>]| -> Result<Vec<Value<'static>>, EngineError> {
+                match (&arbiters[ai].key, &keyers[ai]) {
+                    (crate::constraints::ArbiterKey::Columns(cols), _) => {
+                        Ok(cols.iter().map(|&c| values[c].clone()).collect())
+                    }
+                    (crate::constraints::ArbiterKey::Index(_), Some((_, keyer))) => {
+                        keyer.key_of(values)
+                    }
+                    (crate::constraints::ArbiterKey::Index(name), None) => {
+                        Err(EngineError::Unsupported(alloc::format!(
+                            "ON CONFLICT arbiter index {name:?} has no keyer"
+                        )))
+                    }
+                }
+            };
+        // Is the incoming row in arbiter `ai`'s index at all?
+        let in_index = |ai: usize, values: &[Value<'static>]| -> Result<bool, EngineError> {
+            if let Some((_, keyer)) = &keyers[ai] {
+                return keyer.participates(values);
+            }
+            Ok(match &arbiters[ai].predicate {
+                Some(pred) => crate::constraints::row_satisfies_index_predicate(
+                    catalog,
+                    table_name,
+                    pred,
+                    &Row::new(values.to_vec()),
+                ),
+                None => true,
+            })
+        };
         let mut kept: Vec<Vec<Value<'static>>> = Vec::with_capacity(all_values.len());
         // Per-arbiter batch-local keys (a bare clause tracks several sets).
         let mut seen_keys: Vec<Vec<Vec<Value<'static>>>> = alloc::vec![Vec::new(); arbiters.len()];
         for values in all_values {
-            // SQL spec: NULL in any conflict column means "no conflict
-            // possible" (NULL ≠ NULL for uniqueness) — UNLESS the
-            // constraint says NULLS NOT DISTINCT (v7.29; mailrs
-            // migrate-013 replays its seed row ('super', NULL) under
-            // exactly that declaration).
+            // SQL spec: NULL in any conflict key part means "no conflict
+            // possible" — UNLESS the constraint says NULLS NOT DISTINCT.
             let mut collides_with_table = false;
             let mut collides_with_batch = false;
-            // Which arbiter hit — the DO UPDATE row lookup keys off it (a
-            // MySQL-lowered bare clause can have several).
+            // Which arbiter hit, and the row it hit — the DO UPDATE row
+            // lookup keys off it (a bare clause can have several).
             let mut hit_arbiter = 0usize;
-            for (ai, (cols, nnd, predicate)) in arbiters.iter().enumerate() {
-                let kt: Vec<&Value> = cols.iter().map(|&c| &values[c]).collect();
-                let has_null = !nnd && kt.iter().any(|v| matches!(v, Value::Null));
-                if has_null {
-                    continue;
-                }
-                // v7.38.5 (sentori r8) — a PARTIAL unique index only holds
-                // the rows its predicate accepts, so a row the predicate
-                // rejects cannot conflict on it. Check the INCOMING row
-                // here; the existence probe checks the stored ones.
-                if let Some(pred) = predicate
-                    && !crate::constraints::row_satisfies_index_predicate(
-                        self.active_catalog(),
-                        table_name,
-                        pred,
-                        &Row::new(values.clone()),
-                    )
+            let mut hit_row: Option<usize> = None;
+            let mut keys: Vec<Option<Vec<Value<'static>>>> = Vec::with_capacity(arbiters.len());
+            for (ai, arbiter) in arbiters.iter().enumerate() {
+                let kt = key_of(ai, &values)?;
+                if (!arbiter.nnd && kt.iter().any(|v| matches!(v, Value::Null)))
+                    || !in_index(ai, &values)?
                 {
+                    keys.push(None);
                     continue;
                 }
-                if crate::constraints::on_conflict_keys_exist_where(
-                    self.active_catalog(),
-                    table_name,
-                    cols,
-                    &kt,
-                    predicate.as_deref(),
-                ) {
-                    if !collides_with_table && !collides_with_batch {
-                        hit_arbiter = ai;
+                let first_hit = !collides_with_table && !collides_with_batch;
+                match (&arbiter.key, &keyers[ai]) {
+                    (crate::constraints::ArbiterKey::Columns(cols), _) => {
+                        let refs: Vec<&Value> = kt.iter().collect();
+                        if crate::constraints::on_conflict_keys_exist_where(
+                            catalog,
+                            table_name,
+                            cols,
+                            &refs,
+                            arbiter.predicate.as_deref(),
+                        ) {
+                            if first_hit {
+                                hit_arbiter = ai;
+                            }
+                            collides_with_table = true;
+                        }
                     }
-                    collides_with_table = true;
+                    (crate::constraints::ArbiterKey::Index(_), Some((idx, keyer))) => {
+                        match crate::constraints::index_arbiter_hit(
+                            catalog, table, idx, keyer, &kt, mysql,
+                        )? {
+                            crate::constraints::ArbiterHit::None => {}
+                            hit => {
+                                if first_hit {
+                                    hit_arbiter = ai;
+                                    if let crate::constraints::ArbiterHit::Hot(r) = hit {
+                                        hit_row = Some(r);
+                                    }
+                                }
+                                collides_with_table = true;
+                            }
+                        }
+                    }
+                    (crate::constraints::ArbiterKey::Index(_), None) => {}
                 }
-                let kt_owned: Vec<Value<'static>> = kt.iter().map(|v| (*v).clone()).collect();
-                if seen_keys[ai].iter().any(|k| k == &kt_owned) {
+                if seen_keys[ai].iter().any(|k| k == &kt) {
                     if !collides_with_table && !collides_with_batch {
                         hit_arbiter = ai;
                     }
                     collides_with_batch = true;
                 }
+                keys.push(Some(kt));
             }
-            let conflict_cols = &arbiters
-                .get(hit_arbiter)
-                .map(|(c, _, _)| c.clone())
-                .unwrap_or_default();
-            let key_tuple: Vec<&Value> = conflict_cols.iter().map(|&c| &values[c]).collect();
-            let key_tuple_owned: Vec<Value<'static>> =
-                key_tuple.iter().map(|v| (*v).clone()).collect();
             let collides = collides_with_table || collides_with_batch;
             match (&clause.action, collides) {
                 (_, false) => {
-                    for (ai, (cols, nnd, predicate)) in arbiters.iter().enumerate() {
-                        // Same rule as above: a row the predicate rejects
-                        // never enters this arbiter's index, so it must not
-                        // enter its batch-local key set either.
-                        if let Some(pred) = predicate
-                            && !crate::constraints::row_satisfies_index_predicate(
-                                self.active_catalog(),
-                                table_name,
-                                pred,
-                                &Row::new(values.clone()),
-                            )
-                        {
-                            continue;
-                        }
-                        let kt: Vec<Value<'static>> =
-                            cols.iter().map(|&c| values[c].clone()).collect();
-                        if *nnd || !kt.iter().any(|v| matches!(v, Value::Null)) {
+                    for (ai, key) in keys.into_iter().enumerate() {
+                        if let Some(kt) = key {
                             seen_keys[ai].push(kt);
                         }
                     }
@@ -5584,29 +5627,21 @@ impl Engine {
                     true,
                 ) => {
                     // v7.38 (read01 sweep) — PG refuses to touch a row twice in
-                    // one command: if this conflict key already appeared in the
-                    // batch (either inserted by an earlier row or updated by an
-                    // earlier DO UPDATE), it is a cardinality violation
-                    // ("ON CONFLICT DO UPDATE command cannot affect row a second
-                    // time").
+                    // one command (21000).
                     if collides_with_batch {
-                        // v7.39 (round 240) — PG's own wording (21000); the
-                        // shared CardinalityViolation display is the scalar
-                        // subquery's message and reads as an internal leak
-                        // here.
                         return Err(EngineError::Unsupported(
                             "ON CONFLICT DO UPDATE command cannot affect row a second time".into(),
                         ));
                     }
-                    // Claim this key so a later duplicate in the same batch is
-                    // caught above, on the arbiter that produced the hit.
-                    seen_keys[hit_arbiter].push(key_tuple_owned);
-                    let target_pos = lookup_row_position_by_keys(
-                        self.active_catalog(),
-                        table_name,
-                        conflict_cols,
-                        &key_tuple,
-                    )
+                    let key_tuple_owned = key_of(hit_arbiter, &values)?;
+                    let target_pos = match (&arbiters[hit_arbiter].key, hit_row) {
+                        (crate::constraints::ArbiterKey::Index(_), Some(r)) => Some(r),
+                        (crate::constraints::ArbiterKey::Index(_), None) => None,
+                        (crate::constraints::ArbiterKey::Columns(cols), _) => {
+                            let refs: Vec<&Value> = key_tuple_owned.iter().collect();
+                            lookup_row_position_by_keys(catalog, table_name, cols, &refs)
+                        }
+                    }
                     .ok_or_else(|| {
                         EngineError::Unsupported(
                             "ON CONFLICT DO UPDATE: conflict detected but row \
@@ -5614,19 +5649,22 @@ impl Engine {
                                 .into(),
                         )
                     })?;
+                    // Claim this key so a later duplicate in the same batch is
+                    // caught above, on the arbiter that produced the hit.
+                    seen_keys[hit_arbiter].push(key_tuple_owned);
                     // Snapshot the pre-update row: PG's `RETURNING OLD.*` on a
                     // DO UPDATE returns the conflicting row as it was BEFORE the
                     // update applied.
-                    let old_row_vals: Vec<Value<'static>> = self
-                        .active_catalog()
-                        .get(table_name)
-                        .and_then(|t| t.rows().get(target_pos).map(|r| r.values.clone()))
+                    let old_row_vals: Vec<Value<'static>> = table
+                        .rows()
+                        .get(target_pos)
+                        .map(|r| r.values.clone())
                         .unwrap_or_default();
                     // v7.39 (round 525) — with the session, like every
                     // other write path.
                     let oc_sess = self.dml_session();
                     let updated = apply_on_conflict_assignments(
-                        self.active_catalog(),
+                        catalog,
                         table_name,
                         alias,
                         target_pos,

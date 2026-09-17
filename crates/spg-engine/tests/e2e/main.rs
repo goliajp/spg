@@ -316,6 +316,7 @@ mod e2e_explain_range_rows_r1038;
 mod e2e_explain_split_json_round226;
 mod e2e_explain_xml_yaml_round228;
 mod e2e_expr_errors_round704;
+mod e2e_expression_key_parts_900;
 mod e2e_extension_probes;
 mod e2e_extract_epoch_date_round104;
 mod e2e_extract_fields_round253;

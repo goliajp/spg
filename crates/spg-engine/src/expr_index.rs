@@ -141,6 +141,65 @@ fn collated_key(
         .map(|k| Value::Bytes(alloc::borrow::Cow::Owned(k)))
 }
 
+/// 9.0.0 — a key part stored as an "expression" that is only its own
+/// column becomes the column again.
+///
+/// Before 9.0.0 the parser sent a bare column followed by an ordering
+/// clause or COLLATE through the expression parser, so `CREATE INDEX i ON t
+/// (a DESC)` was recorded as an expression index on `a`. It answered the
+/// same, but `pg_index.indkey` reports an expression part as 0 and
+/// `indexprs` lists it, where PostgreSQL reports the column — and a key
+/// that looks like an expression takes the slower keyed paths. Data
+/// directories written by those versions are read back through this.
+fn unwrap_bare_column_keys(cat: &mut spg_storage::Catalog) {
+    for name in cat.table_names() {
+        let Some(table) = cat.get_mut(&name) else {
+            continue;
+        };
+        let columns: Vec<alloc::string::String> = table
+            .schema()
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let bare = |src: &str, pos: usize| {
+            matches!(
+                spg_sql::parser::parse_expression(src),
+                Ok(spg_sql::ast::Expr::Column(c))
+                    if c.qualifier.is_none() && columns.get(pos).is_some_and(|n| *n == c.name)
+            )
+        };
+        for idx in table.indices_mut() {
+            if !matches!(
+                idx.kind,
+                spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_)
+            ) {
+                continue;
+            }
+            if idx
+                .expression
+                .as_deref()
+                .is_some_and(|s| bare(s, idx.column_position))
+            {
+                idx.expression = None;
+            }
+            for i in 0..idx.extra_expressions.len() {
+                let pos = idx
+                    .extra_column_positions
+                    .get(i)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                if idx.extra_expressions[i]
+                    .as_deref()
+                    .is_some_and(|s| bare(s, pos))
+                {
+                    idx.extra_expressions[i] = None;
+                }
+            }
+        }
+    }
+}
+
 /// Bring every unusable expression index on `table` back into service by
 /// evaluating its expression over every stored row.
 ///
@@ -309,6 +368,7 @@ pub(crate) fn refresh_named(
 /// rather than failing the restore: an unusable index costs a scan, and a
 /// database that will not open costs everything.
 pub(crate) fn rebuild_all(cat: &mut spg_storage::Catalog) {
+    unwrap_bare_column_keys(cat);
     let names: Vec<alloc::string::String> = cat
         .table_names()
         .into_iter()

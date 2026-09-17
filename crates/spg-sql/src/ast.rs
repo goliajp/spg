@@ -2436,6 +2436,18 @@ pub struct CreateIndexStatement {
     /// survived only on the leading column and `pg_get_indexdef`
     /// rendered `(a, b DESC)` back as `(a, b)`.
     pub extra_orders: Vec<IndexColumnOrder>,
+    /// 9.0.0 — each extra key part's expression, aligned with
+    /// `extra_columns` (whose entry is then the first column the
+    /// expression reads); `None` where the part is a plain column. A key
+    /// may mix the two in any position, as PostgreSQL's may:
+    /// `(p, lower(email))`, `(lower(a), b)`.
+    pub extra_expressions: Vec<Option<Expr>>,
+    /// 9.0.0 — each extra key part's explicit `COLLATE`, aligned the same
+    /// way; the leading part's is `key_collation`.
+    pub extra_collations: Vec<Option<String>>,
+    /// 9.0.0 — each extra key part's operator class, lower-cased and
+    /// aligned the same way; the leading part's is `opclass`.
+    pub extra_opclasses: Vec<Option<String>>,
     /// v7.9.29 — `CREATE UNIQUE INDEX …`. When true the engine
     /// enforces uniqueness on the indexed key (combined with the
     /// `partial_predicate` filter — only rows where the predicate
@@ -3646,12 +3658,16 @@ pub enum Overriding {
 /// v7.9.7 — INSERT upsert clause: `ON CONFLICT (target) DO action`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnConflictClause {
-    /// Local columns that identify the conflict (must match a
-    /// UNIQUE / PRIMARY KEY index on the target table). Empty
-    /// list means the user wrote `ON CONFLICT DO …` without a
-    /// target — the engine arbitrates on every unique constraint
-    /// (round 240).
-    pub target_columns: Vec<String>,
+    /// The inference elements that identify the conflict, as written: a
+    /// column or an expression, each with an optional `COLLATE` and
+    /// operator class (PG's `index_elem`). Empty means the user wrote
+    /// `ON CONFLICT DO …` without a target — the engine arbitrates on
+    /// every unique constraint and unique index (round 240).
+    ///
+    /// 9.0.0 — was a list of column names, so `ON CONFLICT (lower(email))`
+    /// could not be written and an expression unique index could not be
+    /// an arbiter.
+    pub target: Vec<ConflictTargetElem>,
     /// v7.39 (round 240) — the index predicate after the target list
     /// (`ON CONFLICT (col) WHERE pred DO …`). PG uses it to infer a
     /// PARTIAL unique index; SPG's conflict arbiters are full indexes,
@@ -3669,6 +3685,37 @@ pub struct OnConflictClause {
     pub mysql_lowered: bool,
     /// The action on conflict.
     pub action: OnConflictAction,
+}
+
+/// 9.0.0 — one inference element of an `ON CONFLICT (…)` target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConflictTargetElem {
+    /// A bare column (`Expr::Column`) or any other expression.
+    pub expr: Expr,
+    /// An explicit `COLLATE`; the inferred index part must carry it.
+    pub collation: Option<String>,
+    /// An operator class, lower-cased; the inferred index part must use it.
+    pub opclass: Option<String>,
+}
+
+impl OnConflictClause {
+    /// The target's column names when every element is a bare column with
+    /// no collation or operator class — the shape a column-set arbiter
+    /// (a UNIQUE / PRIMARY KEY constraint) can answer.
+    #[must_use]
+    pub fn target_column_names(&self) -> Option<Vec<&str>> {
+        self.target
+            .iter()
+            .map(|e| match &e.expr {
+                Expr::Column(c)
+                    if c.qualifier.is_none() && e.collation.is_none() && e.opclass.is_none() =>
+                {
+                    Some(c.name.as_str())
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// v7.9.7 — action on conflict.
@@ -7572,6 +7619,9 @@ impl fmt::Display for CreateIndexStatement {
         } else {
             f.write_str("CREATE INDEX ")?;
         }
+        if self.concurrently {
+            f.write_str("CONCURRENTLY ")?;
+        }
         if self.if_not_exists {
             f.write_str("IF NOT EXISTS ")?;
         }
@@ -7581,34 +7631,63 @@ impl fmt::Display for CreateIndexStatement {
             quote_ident(&self.name),
             quote_ident(&self.table)
         )?;
-        match self.method {
-            IndexMethod::Hnsw => f.write_str("USING hnsw ")?,
-            IndexMethod::Brin => f.write_str("USING brin ")?,
-            IndexMethod::Gin => f.write_str("USING gin ")?,
-            IndexMethod::BTree => {}
+        // 9.0.0 — the method as written, when it was: `gist` / `hash` load
+        // as a B-tree, and rendering the degraded method would re-parse
+        // as a different statement than the one recorded.
+        match (self.method_name.as_deref(), self.method) {
+            (Some(m), _) => write!(f, "USING {m} ")?,
+            (None, IndexMethod::Hnsw) => f.write_str("USING hnsw ")?,
+            (None, IndexMethod::Brin) => f.write_str("USING brin ")?,
+            (None, IndexMethod::Gin) => f.write_str("USING gin ")?,
+            (None, IndexMethod::BTree) => {}
         }
-        if let Some(expr) = &self.expression {
-            write!(f, "({})", expr)?;
-        } else if self.extra_columns.is_empty() {
-            // v7.15.0 — preserve operator class on round-trip
-            // (`(col opclass)`) so WAL replay reconstructs the
-            // engine-routing intent (e.g. `gin_trgm_ops` →
-            // trigram-GIN build path).
-            if let Some(op) = &self.opclass {
-                write!(f, "({} {})", quote_ident(&self.column), op)?;
+        // 9.0.0 — every key part with everything written on it, because
+        // this text is what replay re-parses: a part rendered without its
+        // expression, COLLATE, operator class or order is a different
+        // index after a restart.
+        f.write_str("(")?;
+        let parts = 1 + self.extra_columns.len();
+        for i in 0..parts {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            let (column, expression, collation, opclass, order) = if i == 0 {
+                (
+                    &self.column,
+                    self.expression.as_ref(),
+                    self.key_collation.as_deref(),
+                    self.opclass.as_deref(),
+                    self.key_order,
+                )
             } else {
-                write!(f, "({})", quote_ident(&self.column))?;
+                (
+                    &self.extra_columns[i - 1],
+                    self.extra_expressions.get(i - 1).and_then(Option::as_ref),
+                    self.extra_collations.get(i - 1).and_then(Option::as_deref),
+                    self.extra_opclasses.get(i - 1).and_then(Option::as_deref),
+                    self.extra_orders.get(i - 1).copied().unwrap_or_default(),
+                )
+            };
+            match expression {
+                Some(e) => write!(f, "({e})")?,
+                None => f.write_str(&quote_ident(column))?,
             }
-        } else {
-            // v7.9.14 — multi-column key. Emit each column quoted
-            // so the round-tripped form re-parses to identical AST.
-            f.write_str("(")?;
-            write!(f, "{}", quote_ident(&self.column))?;
-            for c in &self.extra_columns {
-                write!(f, ", {}", quote_ident(c))?;
+            if let Some(c) = collation {
+                write!(f, " COLLATE \"{}\"", c.replace('"', "\"\""))?;
             }
-            f.write_str(")")?;
+            if let Some(op) = opclass {
+                write!(f, " {op}")?;
+            }
+            if order.descending {
+                f.write_str(" DESC")?;
+            }
+            match order.nulls_first {
+                Some(true) => f.write_str(" NULLS FIRST")?,
+                Some(false) => f.write_str(" NULLS LAST")?,
+                None => {}
+            }
         }
+        f.write_str(")")?;
         if !self.included_columns.is_empty() {
             f.write_str(" INCLUDE (")?;
             for (i, c) in self.included_columns.iter().enumerate() {
@@ -7618,6 +7697,9 @@ impl fmt::Display for CreateIndexStatement {
                 write!(f, "{}", quote_ident(c))?;
             }
             f.write_str(")")?;
+        }
+        if self.nulls_not_distinct {
+            f.write_str(" NULLS NOT DISTINCT")?;
         }
         if let Some(pred) = &self.partial_predicate {
             write!(f, " WHERE {}", pred)?;
@@ -8275,13 +8357,24 @@ impl fmt::Display for OnConflictClause {
         if let Some(name) = &self.constraint_name {
             write!(f, " ON CONSTRAINT {name}")?;
         }
-        if !self.target_columns.is_empty() {
+        if !self.target.is_empty() {
             f.write_str(" (")?;
-            for (i, c) in self.target_columns.iter().enumerate() {
+            for (i, e) in self.target.iter().enumerate() {
                 if i > 0 {
                     f.write_str(", ")?;
                 }
-                f.write_str(&quote_ident(c))?;
+                match &e.expr {
+                    Expr::Column(c) if c.qualifier.is_none() => {
+                        f.write_str(&quote_ident(&c.name))?
+                    }
+                    other => write!(f, "({other})")?,
+                }
+                if let Some(c) = &e.collation {
+                    write!(f, " COLLATE \"{}\"", c.replace('"', "\"\""))?;
+                }
+                if let Some(op) = &e.opclass {
+                    write!(f, " {op}")?;
+                }
             }
             f.write_str(")")?;
         }

@@ -3832,6 +3832,13 @@ pub(crate) struct CatalogIndex {
     /// index from a bare one — so every primary key and UNIQUE constraint
     /// dumped as `CREATE UNIQUE INDEX`, and restored as one.
     pub backs_constraint: Option<usize>,
+    /// 9.0.0 — each key part's expression text, aligned with `columns`;
+    /// `None` where the part is the column itself. `indkey` is 0 for an
+    /// expression part and `indexprs` lists them all.
+    pub part_expressions: Vec<Option<alloc::string::String>>,
+    /// 9.0.0 — each key part's `DESC` / `NULLS FIRST`, aligned with
+    /// `columns`, for `indoption`.
+    pub part_orders: Vec<spg_storage::KeyOrder>,
 }
 
 /// PostgreSQL's own name for a constraint's index.
@@ -3928,6 +3935,18 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 nulls_not_distinct: idx.nulls_not_distinct,
                 is_storage: true,
                 backs_constraint: exact,
+                part_expressions: (0..=idx.extra_column_positions.len())
+                    .map(|i| idx.part_expression(i).map(alloc::string::String::from))
+                    .collect(),
+                part_orders: core::iter::once(spg_storage::KeyOrder {
+                    descending: idx.descending,
+                    nulls_first: idx.nulls_first,
+                })
+                .chain(
+                    (0..idx.extra_column_positions.len())
+                        .map(|i| idx.extra_orders.get(i).copied().unwrap_or_default()),
+                )
+                .collect(),
             });
         }
         // The constraints no storage index covers exactly. PostgreSQL
@@ -3958,6 +3977,8 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 nulls_not_distinct: uc.nulls_not_distinct,
                 is_storage: false,
                 backs_constraint: Some(i),
+                part_expressions: alloc::vec![None; uc.columns.len()],
+                part_orders: alloc::vec![spg_storage::KeyOrder::default(); uc.columns.len()],
             });
         }
     }
@@ -11548,6 +11569,90 @@ pub(crate) fn catalog_indexdef(
     render_constraint_indexdef(t, ci)
 }
 
+/// 9.0.0 — one key part of an index as `pg_get_indexdef` prints it: the
+/// column or the expression (catalog form, operator expressions doubly
+/// parenthesised), then COLLATE, a non-default operator class and the
+/// ordering clause. The whole definition and `pg_get_indexdef(oid, n)`
+/// both print through this.
+pub(crate) fn render_index_part(
+    t: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    cat: &Catalog,
+    qualify_in: Option<&Catalog>,
+    i: usize,
+    attrs_only: bool,
+) -> alloc::string::String {
+    let col_at = |pos: usize| -> alloc::string::String {
+        t.schema()
+            .columns
+            .get(pos)
+            .map_or_else(|| "?".into(), |c| c.name.clone())
+    };
+    let opclasses = cat.index_opclasses(&idx.name);
+    // v7.39.11 — PG omits the NULLS word when it matches the default for
+    // the direction: ascending defaults to NULLS LAST and descending to
+    // NULLS FIRST.
+    let order_suffix = |descending: bool, nulls_first: Option<bool>| {
+        let mut sfx = alloc::string::String::new();
+        if descending {
+            sfx.push_str(" DESC");
+        }
+        if let Some(nf) = nulls_first
+            && nf != descending
+        {
+            sfx.push_str(if nf { " NULLS FIRST" } else { " NULLS LAST" });
+        }
+        sfx
+    };
+    let (collation, order) = if i == 0 {
+        (
+            idx.collation.as_deref(),
+            spg_storage::KeyOrder {
+                descending: idx.descending,
+                nulls_first: idx.nulls_first,
+            },
+        )
+    } else {
+        (
+            idx.extra_collations.get(i - 1).and_then(Option::as_deref),
+            idx.extra_orders.get(i - 1).copied().unwrap_or_default(),
+        )
+    };
+    let mut out = match crate::index_def::key_parts(idx).swap_remove(i) {
+        crate::index_def::KeyPart::Column(p) => col_at(p),
+        crate::index_def::KeyPart::Expression(expr) => {
+            let text =
+                crate::catalog_deparse::predicate_text(expr, &t.schema().columns, qualify_in)
+                    .unwrap_or_else(|| alloc::string::String::from(expr));
+            // v7.39 (read01 round 83) — PG double-parenthesises an
+            // operator expression (`((a + b))`) but not a function
+            // call (`lower(name)`); the stored form of the first
+            // already opens with `(`.
+            if text.starts_with('(') {
+                alloc::format!("({text})")
+            } else {
+                text
+            }
+        }
+    };
+    // `pg_get_indexdef(oid, n)` prints the key alone (measured: column 2
+    // of `(… , p DESC)` is `p`).
+    if attrs_only {
+        return out;
+    }
+    if let Some(c) = collation {
+        out.push_str(&alloc::format!(" COLLATE \"{c}\""));
+    }
+    if let Some(Some(op)) = opclasses.get(i)
+        && !crate::opclass::is_default(op)
+    {
+        out.push(' ');
+        out.push_str(op);
+    }
+    out.push_str(&order_suffix(order.descending, order.nulls_first));
+    out
+}
+
 pub(crate) fn render_indexdef(
     t: &spg_storage::Table,
     idx: &spg_storage::Index,
@@ -11579,73 +11684,6 @@ pub(crate) fn render_indexdef(
     // collation — and `ColumnSchema` keeps a collation ENUM, not the
     // name it was declared under, so SPG cannot tell that case apart.
     // Recorded rather than guessed: the rarer spelling over-prints.
-    let mut collate_prefix = idx
-        .collation
-        .as_ref()
-        .map_or_else(alloc::string::String::new, |c| {
-            alloc::format!(" COLLATE \"{c}\"")
-        });
-    // 8.0.3 — the declared operator class follows, unless it is the
-    // default one PG leaves out (`jsonb_ops`, `text_ops`, …; measured).
-    if let Some(op) = cat.index_opclass(&idx.name)
-        && !crate::opclass::is_default(op)
-    {
-        collate_prefix.push(' ');
-        collate_prefix.push_str(op);
-    }
-    // v7.39.11 — one renderer for every key column, not just the
-    // leading one.
-    //
-    // The clause was decorated onto the first column and every extra
-    // printed bare, so `CREATE INDEX i ON t (a, b DESC)` read back as
-    // `(a, b)`: a dump lost the clause and a schema diff saw drift on
-    // every run. Reported by sentori against 7.39.10 alongside the
-    // partial-index `WHERE` and the expression key, both of which
-    // already survived.
-    //
-    // PG omits the word when it matches the default for the direction:
-    // ascending defaults to NULLS LAST and descending to NULLS FIRST.
-    let order_suffix = |descending: bool, nulls_first: Option<bool>| {
-        let mut sfx = alloc::string::String::new();
-        if descending {
-            sfx.push_str(" DESC");
-        }
-        if let Some(nf) = nulls_first
-            && nf != descending
-        {
-            sfx.push_str(if nf { " NULLS FIRST" } else { " NULLS LAST" });
-        }
-        sfx
-    };
-    // v7.39.11 — the key list is built once, from whatever the leading
-    // key renders as.
-    //
-    // It used to be built twice: a `cols` join for a plain column key,
-    // and a separate `format!` for an expression key that appended no
-    // extras at all. A bare column with an ordering clause is STORED as
-    // an expression, so `CREATE INDEX i ON t (a DESC, b)` took the
-    // second branch and read back as `(a DESC)` — the second column
-    // gone from the definition entirely, which is worse than the
-    // dropped clause it sits beside.
-    let key_list = |leading: alloc::string::String| -> alloc::string::String {
-        core::iter::once(leading)
-            .chain(
-                idx.extra_column_positions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &p)| {
-                        let o = idx.extra_orders.get(i).copied().unwrap_or_default();
-                        alloc::format!("{}{}", col_at(p), order_suffix(o.descending, o.nulls_first))
-                    }),
-            )
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let cols = key_list(alloc::format!(
-        "{}{collate_prefix}{}",
-        col_at(idx.column_position),
-        order_suffix(idx.descending, idx.nulls_first)
-    ));
     // v7.39 (read01 round 83) — an index prints UNIQUE only when it is the one
     // that ENFORCES a uniqueness constraint, not merely when its columns happen
     // to match one. PG: `CREATE INDEX idx ON t(a)` over a table that also has
@@ -11693,23 +11731,14 @@ pub(crate) fn render_indexdef(
     // 8.0.3 — the key expression in catalog form (a varchar argument's
     // implicit cast, a typed literal), with a user function qualified when
     // asked; see `catalog_deparse`.
-    let qualified_expr = idx.expression.as_deref().map(|expr| {
-        crate::catalog_deparse::predicate_text(expr, &t.schema().columns, qualify_in)
-            .unwrap_or_else(|| alloc::string::String::from(expr))
-    });
-    let key = match &qualified_expr {
-        Some(expr) if expr.starts_with('(') => key_list(alloc::format!(
-            "({expr}){collate_prefix}{}",
-            order_suffix(idx.descending, idx.nulls_first)
-        )),
-        // A bare column is stored here as an expression too, so this is
-        // the branch a plain `CREATE INDEX i ON t (a DESC)` takes.
-        Some(expr) => key_list(alloc::format!(
-            "{expr}{collate_prefix}{}",
-            order_suffix(idx.descending, idx.nulls_first)
-        )),
-        None => cols,
-    };
+    // 9.0.0 — one renderer for every key part, column or expression, in
+    // any position. The leading part used to be the only one that could
+    // carry an expression, a collation or an operator class, so
+    // `(p, lower(email) text_pattern_ops)` could not even be represented.
+    let key = (0..positions.len())
+        .map(|i| render_index_part(t, idx, cat, qualify_in, i, false))
+        .collect::<Vec<_>>()
+        .join(", ");
     // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and
     // before WHERE, measured on PG18:
     //   CREATE UNIQUE INDEX pix ON public.p USING btree (a)
@@ -11867,7 +11896,6 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         {
             let relid = *by_table.get(&ci.table).unwrap_or(&0);
             let idx_oid = ci.oid;
-            let n_attrs_total = ci.columns.len();
             // PG's `indkey` int2vector — column positions, 1-based.
             // SPG stores positions 0-based; add 1 to align with PG's
             // attnum.
@@ -11879,14 +11907,66 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             // dumper, sqlalchemy and every hand-written schema-diff
             // query ask which columns an index covers — raised
             // "ANY/ALL right-hand side must be an array, got text".
+            // 9.0.0 — an expression part is attribute 0 (measured on PG
+            // 18.6: `(p, lower(a || b))` is `1 0`), then the INCLUDE
+            // columns, which `indnatts` counts and `indnkeyatts` does not.
+            let n_key = ci.columns.len();
+            let n_attrs_total = n_key + ci.included.len();
             let indkey: Vec<i16> = ci
                 .columns
                 .iter()
-                .map(|p| i16::try_from(p + 1).unwrap_or(0))
+                .enumerate()
+                .map(|(i, p)| {
+                    if ci.part_expressions.get(i).is_some_and(Option::is_some) {
+                        0
+                    } else {
+                        i16::try_from(p + 1).unwrap_or(0)
+                    }
+                })
+                .chain(
+                    ci.included
+                        .iter()
+                        .map(|p| i16::try_from(p + 1).unwrap_or(0)),
+                )
                 .collect();
-            let indclass: Vec<u32> = alloc::vec![0; n_attrs_total];
-            let indcollation: Vec<u32> = alloc::vec![0; n_attrs_total];
-            let indoption: Vec<i16> = alloc::vec![0; n_attrs_total];
+            let indclass: Vec<u32> = alloc::vec![0; n_key];
+            // 9.0.0 — 100 (`default`) for a part whose type collates, 0
+            // otherwise; one entry per KEY part.
+            let tschema = cat.get(&ci.table).map(|t| t.schema());
+            let collatable = |ty: spg_storage::DataType| {
+                matches!(
+                    ty,
+                    spg_storage::DataType::Text
+                        | spg_storage::DataType::Varchar(_)
+                        | spg_storage::DataType::Char(_)
+                        | spg_storage::DataType::Name
+                )
+            };
+            let indcollation: Vec<u32> = (0..n_key)
+                .map(|i| {
+                    let Some(schema) = tschema else { return 0 };
+                    let ty = match ci.part_expressions.get(i).and_then(Option::as_deref) {
+                        Some(src) => spg_sql::parser::parse_expression(src)
+                            .ok()
+                            .and_then(|e| {
+                                crate::describe::describe_expr_in(&e, &schema.columns, Some(cat))
+                            })
+                            .map(|shape| shape.ty),
+                        None => schema.columns.get(ci.columns[i]).map(|c| c.ty),
+                    };
+                    if ty.is_some_and(collatable) { 100 } else { 0 }
+                })
+                .collect();
+            // 9.0.0 — PG's per-part option bits: DESC is 1, NULLS FIRST 2
+            // (so a bare `DESC`, whose nulls default to first, is 3).
+            let indoption: Vec<i16> = (0..n_key)
+                .map(|i| {
+                    let o = ci.part_orders.get(i).copied().unwrap_or_default();
+                    let nulls_first = o.nulls_first.unwrap_or(o.descending);
+                    i16::from(o.descending) | (i16::from(nulls_first) << 1)
+                })
+                .collect();
+            let n_attrs_total_key = n_key;
             let is_primary = ci.is_primary;
             let is_unique = ci.is_unique;
             let is_partial = ci.partial_predicate.is_some();
@@ -11896,7 +11976,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::BigInt(idx_oid),
                 Value::BigInt(relid),
                 Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
-                Value::SmallInt(i16::try_from(n_attrs_total).unwrap_or(i16::MAX)),
+                Value::SmallInt(i16::try_from(n_attrs_total_key).unwrap_or(i16::MAX)),
                 Value::Bool(is_unique),
                 // v7.39 (round 473) — the index has carried this since
                 // round 52 and enforces it; only the catalog was still
@@ -11916,7 +11996,20 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::OidVector(indcollation),
                 Value::OidVector(indclass),
                 Value::Int2Vector(indoption),
-                ci.expression.clone().map_or(Value::Null, Value::text), // indexprs
+                {
+                    // indexprs — every expression part, in key order, as
+                    // `pg_get_expr` prints a list.
+                    let exprs: Vec<&str> = ci
+                        .part_expressions
+                        .iter()
+                        .filter_map(Option::as_deref)
+                        .collect();
+                    if exprs.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::text(exprs.join(", "))
+                    }
+                },
                 ci.partial_predicate
                     .clone()
                     .map_or(Value::Null, Value::text), // indpred

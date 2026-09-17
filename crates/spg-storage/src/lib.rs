@@ -3359,6 +3359,38 @@ pub struct Index {
     /// key, where MySQL rejects two rows sharing the prefix; that form
     /// is refused at DDL rather than under-enforced (see `ddl.rs`).
     pub prefix_len: Option<u32>,
+    /// 9.0.0 — each EXTRA key part's expression, positionally aligned
+    /// with `extra_column_positions`; `None` (or a position past the end)
+    /// where that part is a plain column.
+    ///
+    /// The key of `CREATE UNIQUE INDEX … (lower(a), b)` is two parts, and
+    /// before this only the leading one could be an expression: the parser
+    /// refused `(p, lower(email))`, and for `(lower(a), b)` the uniqueness
+    /// check keyed on `lower(a)` alone — so after `('A', 1)` PostgreSQL
+    /// 18.6 accepts `('a', 2)` and SPG refused it. An expression part's
+    /// `extra_column_positions` entry is the first column it reads, as the
+    /// leading `column_position` is for `expression`.
+    pub extra_expressions: Vec<Option<String>>,
+    /// 9.0.0 — each extra key part's explicit `COLLATE`, aligned the same
+    /// way; the leading part's is `collation`.
+    pub extra_collations: Vec<Option<String>>,
+}
+
+impl Index {
+    /// 9.0.0 — does any key part key on an expression rather than a column?
+    #[must_use]
+    pub fn has_expression_part(&self) -> bool {
+        self.expression.is_some() || self.extra_expressions.iter().any(Option::is_some)
+    }
+
+    /// 9.0.0 — the expression of key part `i` (0 = the leading part).
+    #[must_use]
+    pub fn part_expression(&self, i: usize) -> Option<&str> {
+        match i {
+            0 => self.expression.as_deref(),
+            n => self.extra_expressions.get(n - 1).and_then(Option::as_deref),
+        }
+    }
 }
 
 /// v7.39.11 — one index key column's ordering clause, as written.
@@ -3976,6 +4008,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4016,6 +4050,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4043,6 +4079,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4068,6 +4106,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4093,6 +4133,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4119,6 +4161,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -4146,6 +4190,8 @@ impl Index {
             extra_column_positions: Vec::new(),
             extra_orders: Vec::new(),
             prefix_len: None,
+            extra_expressions: Vec::new(),
+            extra_collations: Vec::new(),
         }
     }
 
@@ -5665,7 +5711,9 @@ pub struct Catalog {
     /// `pg_get_indexdef` prints it and a dump restores it. `USING gin
     /// (doc jsonb_path_ops)` read back as `(doc)`, which restores in
     /// PostgreSQL as a different index. Persisted from FILE_VERSION 100.
-    index_opclasses: BTreeMap<String, String>,
+    /// 9.0.0 — one entry per key part (the leading part first), `None`
+    /// where that part named no operator class.
+    index_opclasses: BTreeMap<String, Vec<Option<String>>>,
 }
 
 /// v7.12.4 — catalogued user-defined function. `body` is the raw
@@ -6322,23 +6370,21 @@ impl Catalog {
         }
     }
 
-    /// 8.0.3 — the operator class an index was declared with, if one was.
+    /// 9.0.0 — the operator class each key part of an index was declared
+    /// with, leading part first; empty when none was named anywhere.
     #[must_use]
-    pub fn index_opclass(&self, index: &str) -> Option<&str> {
-        self.index_opclasses.get(index).map(String::as_str)
+    pub fn index_opclasses(&self, index: &str) -> &[Option<String>] {
+        self.index_opclasses.get(index).map_or(&[], Vec::as_slice)
     }
 
-    /// 8.0.3 — record (or, with `None`, forget) an index's operator class.
-    pub fn set_index_opclass(&mut self, index: &str, opclass: Option<&str>) {
+    /// 9.0.0 — record an index's per-part operator classes; a list with no
+    /// class in it forgets the entry.
+    pub fn set_index_opclasses(&mut self, index: &str, opclasses: Vec<Option<String>>) {
         self.mark_nontable_dirty(NonTableKind::IndexOpclass, index);
-        match opclass {
-            Some(o) => {
-                self.index_opclasses
-                    .insert(String::from(index), String::from(o));
-            }
-            None => {
-                self.index_opclasses.remove(index);
-            }
+        if opclasses.iter().any(Option::is_some) {
+            self.index_opclasses.insert(String::from(index), opclasses);
+        } else {
+            self.index_opclasses.remove(index);
         }
     }
 
@@ -10004,7 +10050,10 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// 8.0.3 — v100 appends the owners of views and user-defined types and
 /// the installed extensions, after the database collation. A v99 binary
 /// refuses a v100 image by its version, as every step before this.
-const FILE_VERSION: u8 = 100;
+/// 9.0.0 — v101 appends each extra index key part's expression and
+/// explicit collation, so a key may mix columns and expressions in any
+/// position. A v100 binary refuses a v101 image by its version.
+const FILE_VERSION: u8 = 101;
 
 /// 8.0.3 — the byte a [`NonTableKind`] is written as.
 const fn non_table_kind_tag(kind: NonTableKind) -> u8 {
@@ -10428,6 +10477,32 @@ impl Catalog {
                         Some(n) => {
                             out.push(1);
                             out.extend_from_slice(&n.to_le_bytes());
+                        }
+                    }
+                }
+                // 9.0.0 — each extra key part's expression and explicit
+                // collation (FILE_VERSION 101+), aligned with
+                // `extra_column_positions`. A v100 snapshot has none and
+                // every extra part in it is a column, which is what the
+                // parser of that version allowed.
+                if version >= 101 {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(idx.extra_column_positions.len())
+                            .expect("\u{2264} 65k extra cols / index"),
+                    );
+                    for i in 0..idx.extra_column_positions.len() {
+                        for part in [
+                            idx.extra_expressions.get(i).and_then(Option::as_deref),
+                            idx.extra_collations.get(i).and_then(Option::as_deref),
+                        ] {
+                            match part {
+                                None => out.push(0),
+                                Some(text) => {
+                                    out.push(1);
+                                    write_str(&mut out, text);
+                                }
+                            }
                         }
                     }
                 }
@@ -11554,9 +11629,30 @@ impl Catalog {
                 &mut out,
                 u32::try_from(self.index_opclasses.len()).expect("≤ 4G indexes"),
             );
-            for (index, opclass) in &self.index_opclasses {
+            for (index, parts) in &self.index_opclasses {
                 write_str(&mut out, index);
-                write_str(&mut out, opclass);
+                // 9.0.0 — every part's class (FILE_VERSION 101+); v100
+                // wrote the leading part's alone.
+                if version >= 101 {
+                    write_u16(
+                        &mut out,
+                        u16::try_from(parts.len()).expect("\u{2264} 65k key parts"),
+                    );
+                    for part in parts {
+                        match part {
+                            None => out.push(0),
+                            Some(op) => {
+                                out.push(1);
+                                write_str(&mut out, op);
+                            }
+                        }
+                    }
+                } else {
+                    write_str(
+                        &mut out,
+                        parts.first().and_then(Option::as_deref).unwrap_or(""),
+                    );
+                }
             }
         }
         let crc = spg_crypto::crc32c::crc32c(&out);
@@ -12158,8 +12254,21 @@ impl Catalog {
             let opclasses = cur.read_u32()? as usize;
             for _ in 0..opclasses {
                 let index = cur.read_str()?;
-                let opclass = cur.read_str()?;
-                cat.index_opclasses.insert(index, opclass);
+                let parts = if version >= 101 {
+                    let n = cur.read_u16()? as usize;
+                    let mut parts = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        parts.push(if cur.read_u8()? == 0 {
+                            None
+                        } else {
+                            Some(cur.read_str()?)
+                        });
+                    }
+                    parts
+                } else {
+                    alloc::vec![Some(cur.read_str()?)]
+                };
+                cat.index_opclasses.insert(index, parts);
             }
         }
         // v7.38.18 (S2) — and every table read back learns it, because a
