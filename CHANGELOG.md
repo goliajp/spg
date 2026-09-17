@@ -10,6 +10,31 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the locale panel could call a slower PROCESS a slower collation
+
+The 8.0.4 prerelease read one LOSS on the locale panel (SPG under
+`en_US.utf8` against SPG under `C`, 400,000 rows, the narrow sort). It was
+the instrument.
+
+The panel compares two collations, which on a single-database engine means
+two SERVERS, so it already gives the OTHER side twin processes and folds
+what they differ by into the cell's resolution. The JUDGED side had no
+twin, so a cell where the judged process was simply slower had nothing to
+be measured against. Run on mini with both legs under `C` — nothing for
+the panel to vary — it still called `400000 top-N LIMIT 10` a LOSS:
+9.270-9.532 ms against 6.152-6.473, server-reported 9.203 against 6.068.
+
+The judged leg has a twin now (`SPG_TWIN_URI`), configured identically and
+checked to be, and its window widens the same resolution the baselines
+widen. Four runs on a loaded machine — two with the legs differing in
+collation, two with them identical — report `losses=0` and say how far
+the identical processes drifted (`cross_process_differences=`).
+
+Direct measurement of the cell the panel had named, on the same machine:
+session-timed, connection-timed the way the panel times, and after a
+text-sort workload — the two collations are within 6 % of each other and
+the sign flips between runs.
+
 ### Fixed — the regular expression engine took the first alternative, not the longest
 
 Reported by sentori (§4.3). PostgreSQL's regular expressions are POSIX:
