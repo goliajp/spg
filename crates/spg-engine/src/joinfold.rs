@@ -395,6 +395,7 @@ fn analyse_on_eq(
     let Expr::Column(ColumnName {
         qualifier: _,
         name: inner_col,
+        ..
     }) = inner_side
     else {
         return None;
@@ -807,6 +808,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<Vec<Value<'static>>, EngineError> {
         let primary = spg_sql::ast::TableRef {
+            token: spg_sql::ast::SrcToken::NONE,
             name: table_name.to_string(),
             alias: Some(alias.to_string()),
             only: false,
@@ -824,6 +826,7 @@ impl Engine {
         };
         let where_ = combine_with_and_owned(inner_preds);
         let pk_col_name = ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some(alias.to_string()),
             name: pk_col.to_string(),
         };

@@ -45,6 +45,7 @@ fn rewrite_rule_pred_to_base(expr: &mut Expr, assignments: &[(String, Expr)]) {
                     return;
                 }
                 *expr = Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: None,
                     name: c.name.clone(),
                 });
@@ -52,6 +53,7 @@ fn rewrite_rule_pred_to_base(expr: &mut Expr, assignments: &[(String, Expr)]) {
             }
             if lower == "old" {
                 *expr = Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: None,
                     name: c.name.clone(),
                 });

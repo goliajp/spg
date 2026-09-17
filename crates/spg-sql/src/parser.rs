@@ -667,6 +667,73 @@ fn offending_lexeme<'a>(input: &'a str, offsets: &[usize], token_pos: usize) -> 
     }
 }
 
+/// 9.0.0 — the character position of the token that NAMES a relation in
+/// this statement, for the `Position` PostgreSQL puts on
+/// `relation "x" does not exist`.
+///
+/// A relation's name is the identifier right after `FROM`, `JOIN`,
+/// `INTO`, `UPDATE`, `TABLE`, `ONLY` or a comma inside a FROM list, which
+/// is what this looks for; failing that, the first identifier that spells
+/// the name. The engine raises this error from a hundred places, none of
+/// which holds the statement — so the position is recovered here, on the
+/// error path, from the text the host already has.
+#[must_use]
+pub fn relation_name_position(input: &str, dialect: lexer::Dialect, name: &str) -> Option<usize> {
+    let (tokens, offsets) = lexer::tokenize_with_offsets(input, dialect).ok()?;
+    let names = |t: &Token| match t {
+        Token::Ident(s) | Token::QuotedIdent(s) => s.eq_ignore_ascii_case(name),
+        _ => false,
+    };
+    let introduces = |t: &Token| {
+        matches!(t, Token::From | Token::Join | Token::Into | Token::Comma)
+            || matches!(t, Token::Ident(s) if s.eq_ignore_ascii_case("only")
+                || s.eq_ignore_ascii_case("update"))
+            || matches!(t, Token::Table)
+    };
+    let at = |i: usize| -> Option<usize> {
+        let byte_off = *offsets.get(i)?;
+        if byte_off > input.len() || !input.is_char_boundary(byte_off) {
+            return None;
+        }
+        Some(input[..byte_off].chars().count() + 1)
+    };
+    let after = tokens
+        .iter()
+        .enumerate()
+        .position(|(i, t)| names(t) && i > 0 && introduces(&tokens[i - 1]));
+    match after.or_else(|| tokens.iter().position(names)) {
+        Some(i) => at(i),
+        None => None,
+    }
+}
+
+/// 9.0.0 — the character position of the first token that spells `name`
+/// as an identifier, for an error whose message names an object the
+/// engine raised it about without holding the reference.
+///
+/// A dotted name is looked for as the pair it is written as first
+/// (`t . c`, whose position is the qualifier's, where PostgreSQL's caret
+/// sits); a statement that writes the column bare and only the MESSAGE
+/// qualifies it — `column "t.c" must appear in the GROUP BY clause` — is
+/// found by the column alone, which is where PostgreSQL points there.
+#[must_use]
+pub fn identifier_position(input: &str, dialect: lexer::Dialect, name: &str) -> Option<usize> {
+    let (tokens, offsets) = lexer::tokenize_with_offsets(input, dialect).ok()?;
+    let spells = |t: &Token, name: &str| matches!(t, Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case(name));
+    let i = match name.split_once('.') {
+        Some((qual, col)) => tokens
+            .windows(3)
+            .position(|w| spells(&w[0], qual) && matches!(w[1], Token::Dot) && spells(&w[2], col))
+            .or_else(|| tokens.iter().position(|t| spells(t, col)))?,
+        None => tokens.iter().position(|t| spells(t, name))?,
+    };
+    let byte_off = *offsets.get(i)?;
+    if byte_off > input.len() || !input.is_char_boundary(byte_off) {
+        return None;
+    }
+    Some(input[..byte_off].chars().count() + 1)
+}
+
 /// v7.39 (read01 round 95) — recover PG's 1-based CHARACTER error position for
 /// a [`ParseError::token_pos`]. Kept off the `ParseError` struct (and so off
 /// every recursive `Result` slot) to protect the nesting-budget frame cliff:
@@ -2863,6 +2930,12 @@ impl Parser {
             }
             Token::Show => {
                 self.advance();
+                // 9.0.0 — the token the target starts at, so a target
+                // this parser will not take points AT it. `SHOW $1`
+                // answered `syntax error at end of input` with the caret
+                // on the semicolon, where PG 18.6 says
+                // `syntax error at or near "$1"` (sentori's §3.27).
+                let target_pos = self.pos;
                 // `SHOW TABLES` / `SHOW USERS` / `SHOW COLUMNS FROM <table>`.
                 // v6.1.2 promoted TABLES to a reserved keyword (for
                 // `CREATE PUBLICATION … FOR ALL TABLES`), so it now
@@ -2919,7 +2992,7 @@ impl Parser {
                     }
                     Token::Ident(s) | Token::QuotedIdent(s) => s.to_ascii_lowercase(),
                     other => {
-                        return Err(self.err(format!(
+                        return Err(self.err_at(target_pos, format!(
                             "expected SHOW target, got {other:?}"
                         )));
                     }
@@ -9677,6 +9750,7 @@ impl Parser {
                 let base = match existing {
                     Some(i) => assignments[i].1.clone(),
                     None => Expr::Column(ColumnName {
+                        token: crate::ast::SrcToken::NONE,
                         qualifier: None,
                         name: col.clone(),
                     }),
@@ -13528,6 +13602,7 @@ impl Parser {
         {
             if let Some(k) = grp_exprs.iter().position(|e| e == expr) {
                 *expr = Expr::Column(crate::ast::ColumnName {
+                    token: crate::ast::SrcToken::NONE,
                     qualifier: None,
                     name: alloc::format!("__grp_ord_{k}"),
                 });
@@ -13907,6 +13982,7 @@ impl Parser {
                     items: alloc::vec![SelectItem::Wildcard],
                     from: Some(FromClause {
                         primary: TableRef {
+                            token: crate::ast::SrcToken::NONE,
                             name: "subquery".to_string(),
                             alias: None,
                             only: false,
@@ -14119,6 +14195,7 @@ impl Parser {
                 ));
             }
             let fn_ref = TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name: inner_name.clone(),
                 alias: None,
                 only: false,
@@ -14246,6 +14323,7 @@ impl Parser {
                     found = Some((
                         i,
                         TableRef {
+                            token: crate::ast::SrcToken::NONE,
                             name: colname.clone(),
                             alias: Some(colname.clone()),
                             only: false,
@@ -14273,6 +14351,7 @@ impl Parser {
                 });
                 items[idx] = SelectItem::Expr {
                     expr: Expr::Column(ColumnName {
+                        token: crate::ast::SrcToken::NONE,
                         qualifier: None,
                         name: colname.clone(),
                     }),
@@ -14795,6 +14874,7 @@ impl Parser {
                     for ob in &mut order_keys {
                         if &ob.expr == kexpr {
                             ob.expr = Expr::Column(crate::ast::ColumnName {
+                                token: crate::ast::SrcToken::NONE,
                                 name: colname.clone(),
                                 qualifier: None,
                             });
@@ -19113,6 +19193,7 @@ impl Parser {
                     unreachable!("guarded above");
                 };
                 *e = Expr::Column(crate::ast::ColumnName {
+                    token: crate::ast::SrcToken::NONE,
                     qualifier: Some("EXCLUDED".to_string()),
                     name: c.name.clone(),
                 });
@@ -19205,6 +19286,7 @@ impl Parser {
                     expr: match elem.expression {
                         Some(e) => e,
                         None => Expr::Column(crate::ast::ColumnName {
+                            token: crate::ast::SrcToken::NONE,
                             qualifier: None,
                             name: elem.column,
                         }),
@@ -19643,6 +19725,7 @@ impl Parser {
                 items: alloc::vec![
                     crate::ast::SelectItem::Expr {
                         expr: crate::ast::Expr::Column(crate::ast::ColumnName {
+                            token: crate::ast::SrcToken::NONE,
                             qualifier: Some(srf_alias.clone()),
                             name: "key".to_string(),
                         }),
@@ -19650,6 +19733,7 @@ impl Parser {
                     },
                     crate::ast::SelectItem::Expr {
                         expr: crate::ast::Expr::Column(crate::ast::ColumnName {
+                            token: crate::ast::SrcToken::NONE,
                             qualifier: Some(srf_alias.clone()),
                             name: "value".to_string(),
                         }),
@@ -19658,6 +19742,7 @@ impl Parser {
                 ],
                 from: Some(crate::ast::FromClause {
                     primary: TableRef {
+                        token: crate::ast::SrcToken::NONE,
                         name: srf_alias.clone(),
                         alias: Some(srf_alias.clone()),
                         only: false,
@@ -19687,6 +19772,7 @@ impl Parser {
                 window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name: alias.clone(),
                 alias: Some(alias),
                 only: false,
@@ -19743,6 +19829,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "values".to_string());
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -19811,6 +19898,7 @@ impl Parser {
                 .clone()
                 .unwrap_or_else(|| "subquery".to_string());
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -19854,6 +19942,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -19897,6 +19986,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -19997,6 +20087,7 @@ impl Parser {
                 window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name: table_alias.clone(),
                 alias: Some(table_alias),
                 only: false,
@@ -20096,6 +20187,7 @@ impl Parser {
             };
             let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -20239,6 +20331,7 @@ impl Parser {
                     .iter()
                     .any(|(_, a)| a.iter().any(Self::expr_has_any_column));
                 let tref = TableRef {
+                    token: crate::ast::SrcToken::NONE,
                     name,
                     alias: alias_ident,
                     only: false,
@@ -20270,6 +20363,7 @@ impl Parser {
                 }
             };
             let tref = TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -20328,6 +20422,7 @@ impl Parser {
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
             let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -20462,6 +20557,7 @@ impl Parser {
                 .unwrap_or_else(|| "generate_series".to_string());
             let correlated = args.iter().any(Self::expr_has_any_column);
             let tref = TableRef {
+                token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
                 only: false,
@@ -20491,6 +20587,9 @@ impl Parser {
         // synthetic name (`__spg_info_columns` etc.) so the
         // engine's SELECT-side router can dispatch without
         // clashing with any user-defined `columns` table.
+        // 9.0.0 — the token this relation is named by, for the position
+        // `relation "x" does not exist` carries (see `TableRef::token`).
+        let name_token = crate::ast::SrcToken::at(self.pos);
         let (name, meta_original) = if let Some((synth, orig)) = self.try_peek_meta_qualified() {
             (synth, Some(orig))
         } else if let Some((synth, orig)) = self.try_peek_meta_bare() {
@@ -20635,6 +20734,7 @@ impl Parser {
             });
         }
         Ok(TableRef {
+            token: name_token,
             name,
             alias,
             only,
@@ -20758,6 +20858,7 @@ impl Parser {
             window_check_exprs: Vec::new(),
         };
         TableRef {
+            token: crate::ast::SrcToken::NONE,
             name,
             alias,
             only: false,
@@ -20969,6 +21070,7 @@ impl Parser {
             items: alloc::vec![SelectItem::Wildcard],
             from: Some(FromClause {
                 primary: TableRef {
+                    token: crate::ast::SrcToken::NONE,
                     name: tname,
                     alias: None,
                     only: false,
@@ -21055,6 +21157,7 @@ impl Parser {
             if let Some(base_expr) = base {
                 let alias = alias_opt.unwrap_or_else(|| fn_name.clone());
                 return Ok(TableRef {
+                    token: crate::ast::SrcToken::NONE,
                     name: alias.clone(),
                     alias: Some(alias),
                     only: false,
@@ -21113,6 +21216,7 @@ impl Parser {
             .map(|(col, ty)| {
                 let base = if is_set {
                     Expr::Column(ColumnName {
+                        token: crate::ast::SrcToken::NONE,
                         qualifier: None,
                         name: "value".to_string(),
                     })
@@ -21140,6 +21244,7 @@ impl Parser {
             };
             Some(FromClause {
                 primary: TableRef {
+                    token: crate::ast::SrcToken::NONE,
                     name: "value".to_string(),
                     alias: None,
                     only: false,
@@ -21182,6 +21287,7 @@ impl Parser {
             window_check_exprs: Vec::new(),
         };
         Ok(TableRef {
+            token: crate::ast::SrcToken::NONE,
             name: alias.clone(),
             alias: Some(alias),
             only: false,
@@ -21251,6 +21357,7 @@ impl Parser {
         let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns()?;
         let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
         Ok(TableRef {
+            token: crate::ast::SrcToken::NONE,
             name,
             alias: alias_ident,
             only: false,
@@ -21322,6 +21429,7 @@ impl Parser {
             .clone()
             .unwrap_or_else(|| String::from("json_table"));
         Ok(TableRef {
+            token: crate::ast::SrcToken::NONE,
             name,
             alias: alias_ident,
             only: false,
@@ -21791,11 +21899,13 @@ impl Parser {
                 let right_qual = table.alias.clone().unwrap_or_else(|| table.name.clone());
                 let mut iter = cols.into_iter().map(|c| Expr::Binary {
                     lhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        token: crate::ast::SrcToken::NONE,
                         qualifier: Some(left_qual.clone()),
                         name: c.clone(),
                     })),
                     op: crate::ast::BinOp::Eq,
                     rhs: alloc::boxed::Box::new(Expr::Column(crate::ast::ColumnName {
+                        token: crate::ast::SrcToken::NONE,
                         qualifier: Some(right_qual.clone()),
                         name: c,
                     })),
@@ -23021,12 +23131,14 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Dot))
             && matches!(self.tokens.get(self.pos + 2), Some(Token::Star))
         {
+            let token = crate::ast::SrcToken::at(self.pos);
             self.advance();
             self.advance();
             self.advance();
             return Ok(Expr::Column(ColumnName {
                 qualifier: None,
                 name: q,
+                token,
             }));
         }
         let tok_pos = self.pos;
@@ -23229,7 +23341,7 @@ impl Parser {
             {
                 self.parse_match_against_atom()
             }
-            Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s),
+            Token::Ident(s) | Token::QuotedIdent(s) => self.finish_ident_atom(s, tok_pos),
             // v7.37.43-T4 — PG-unreserved keywords are legal column /
             // alias names in expression context too. `release` appears
             // in sentori `0003_partition_events.sql` as both a column
@@ -23238,7 +23350,7 @@ impl Parser {
             // identifier set.
             other if unreserved_keyword_text(&other).is_some() => {
                 let s = unreserved_keyword_text(&other).unwrap();
-                self.finish_ident_atom(s)
+                self.finish_ident_atom(s, tok_pos)
             }
             // v7.39 (round 331, V50) — `@@var` in an EXPRESSION. It parsed
             // only inside `SET` before, so `SELECT @@autocommit` — which
@@ -24521,6 +24633,7 @@ impl Parser {
         let mut extra_cols: Vec<String> = Vec::new();
         let col_ref = |name: &str| {
             Expr::Column(ColumnName {
+                token: crate::ast::SrcToken::NONE,
                 qualifier: Some(cte_name.clone()),
                 name: name.to_string(),
             })
@@ -25404,6 +25517,7 @@ impl Parser {
             Token::String(s) => Expr::Literal(crate::ast::Literal::String(s)),
             Token::Placeholder(n) => Expr::Placeholder(n),
             Token::Ident(s) | Token::QuotedIdent(s) => Expr::Column(crate::ast::ColumnName {
+                token: crate::ast::SrcToken::NONE,
                 qualifier: None,
                 name: s,
             }),
@@ -25982,6 +26096,7 @@ impl Parser {
             self.advance();
             return Ok((
                 alloc::vec![Expr::Column(crate::ast::ColumnName {
+                    token: crate::ast::SrcToken::NONE,
                     qualifier: Some("__named_window__".to_string()),
                     name,
                 })],
@@ -26105,6 +26220,7 @@ impl Parser {
                 )));
             }
             partition_by = alloc::vec![Expr::Column(crate::ast::ColumnName {
+                token: crate::ast::SrcToken::NONE,
                 qualifier: Some("__named_window_ref__".to_string()),
                 name: base,
             })];
@@ -26308,7 +26424,7 @@ impl Parser {
         Ok(None)
     }
 
-    fn finish_ident_atom(&mut self, first: String) -> Result<Expr, ParseError> {
+    fn finish_ident_atom(&mut self, first: String, token: usize) -> Result<Expr, ParseError> {
         // v7.39.2 — MySQL's charset INTRODUCER: `_utf8mb4'x'`, `N'y'`,
         // `_binary'z'`. All three were `ERROR 1064 syntax error` here
         // and all three answer the literal on MySQL 9.7.2.
@@ -26370,11 +26486,12 @@ impl Parser {
             // is single-namespace: drop the schema prefix and
             // route the dispatch on the bare function name.
             if matches!(self.peek(), Token::LParen) {
-                return self.finish_ident_atom(name);
+                return self.finish_ident_atom(name, token);
             }
             return Ok(Expr::Column(ColumnName {
                 qualifier: Some(first),
                 name,
+                token: crate::ast::SrcToken::at(token),
             }));
         }
         if matches!(self.peek(), Token::LParen) {
@@ -27229,6 +27346,7 @@ impl Parser {
         Ok(Expr::Column(ColumnName {
             qualifier: None,
             name: first,
+            token: crate::ast::SrcToken::at(token),
         }))
     }
 }
@@ -28710,6 +28828,7 @@ mod tests {
 
     fn col(name: &str) -> Expr {
         Expr::Column(ColumnName {
+            token: crate::ast::SrcToken::NONE,
             qualifier: None,
             name: name.into(),
         })
@@ -28877,6 +28996,7 @@ mod tests {
         assert_eq!(
             expr,
             &Expr::Column(ColumnName {
+                token: crate::ast::SrcToken::NONE,
                 qualifier: Some("t".into()),
                 name: "col".into()
             })

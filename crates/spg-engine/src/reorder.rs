@@ -382,7 +382,10 @@ fn estimate_edge_selectivity(
 }
 
 fn column_ref(expr: &Expr) -> Option<(Option<String>, String)> {
-    if let Expr::Column(ColumnName { qualifier, name }) = expr {
+    if let Expr::Column(ColumnName {
+        qualifier, name, ..
+    }) = expr
+    {
         Some((qualifier.clone(), name.clone()))
     } else {
         None

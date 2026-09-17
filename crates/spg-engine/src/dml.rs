@@ -665,6 +665,7 @@ fn rewrite_view_returning_items(
                     for (view_col, base_col) in col_map {
                         out.push(SelectItem::Expr {
                             expr: Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: base_col.clone(),
                             }),
@@ -675,6 +676,7 @@ fn rewrite_view_returning_items(
                     for (view_col, base_col) in view_cols {
                         let expr = match base_col {
                             Some(b) => Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: b.clone(),
                             }),
@@ -1561,7 +1563,10 @@ impl Engine {
                 .iter()
                 .position(|c| c.name == *col)
                 .ok_or_else(|| {
-                    EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                    EngineError::Eval(EvalError::ColumnNotFound {
+                        token: spg_sql::ast::SrcToken::NONE,
+                        name: col.clone(),
+                    })
                 })?;
             targets.push((pos, expr));
         }
@@ -2481,6 +2486,7 @@ impl Engine {
                             for (view_col, base_col) in &vr.col_map {
                                 out.push(spg_sql::ast::SelectItem::Expr {
                                     expr: Expr::Column(spg_sql::ast::ColumnName {
+                                        token: spg_sql::ast::SrcToken::NONE,
                                         qualifier: Some(alias.clone()),
                                         name: base_col.clone(),
                                     }),
@@ -2491,11 +2497,13 @@ impl Engine {
                             for (view_col, base_col) in &vr.view_cols {
                                 let expr = match base_col {
                                     Some(b) => Expr::Column(spg_sql::ast::ColumnName {
+                                        token: spg_sql::ast::SrcToken::NONE,
                                         qualifier: Some(alias.clone()),
                                         name: b.clone(),
                                     }),
                                     None => {
                                         let mut e = Expr::Column(spg_sql::ast::ColumnName {
+                                            token: spg_sql::ast::SrcToken::NONE,
                                             qualifier: None,
                                             name: view_col.clone(),
                                         });
@@ -2556,6 +2564,7 @@ impl Engine {
                                                 // target-qualified.
                                                 let mut sub =
                                                     Expr::Column(spg_sql::ast::ColumnName {
+                                                        token: spg_sql::ast::SrcToken::NONE,
                                                         qualifier: None,
                                                         name: c.name.clone(),
                                                     });
@@ -2862,6 +2871,7 @@ impl Engine {
                                 .position(|c| c.name == *col)
                                 .ok_or_else(|| {
                                     EngineError::Eval(EvalError::ColumnNotFound {
+                                        token: spg_sql::ast::SrcToken::NONE,
                                         name: col.clone(),
                                     })
                                 })?;
@@ -2929,6 +2939,7 @@ impl Engine {
                             let pos = target_cols.iter().position(|c| c.name == *col).ok_or_else(
                                 || {
                                     EngineError::Eval(EvalError::ColumnNotFound {
+                                        token: spg_sql::ast::SrcToken::NONE,
                                         name: col.clone(),
                                     })
                                 },
@@ -3031,6 +3042,7 @@ impl Engine {
                             let pos = target_cols.iter().position(|c| c.name == *col).ok_or_else(
                                 || {
                                     EngineError::Eval(EvalError::ColumnNotFound {
+                                        token: spg_sql::ast::SrcToken::NONE,
                                         name: col.clone(),
                                     })
                                 },
@@ -4249,7 +4261,10 @@ impl Engine {
                             .iter()
                             .position(|c| &c.name == name)
                             .ok_or_else(|| {
-                                EngineError::Eval(EvalError::ColumnNotFound { name: name.clone() })
+                                EngineError::Eval(EvalError::ColumnNotFound {
+                                    token: spg_sql::ast::SrcToken::NONE,
+                                    name: name.clone(),
+                                })
                             })?;
                         new_vals[pos] =
                             self.eval_expr_with_correlated(expr, &empty, &eval_ctx, cancel, None)?;
@@ -4409,7 +4424,10 @@ impl Engine {
                 let mut new_vals = old.values.clone();
                 for (col, expr) in &stmt.assignments {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
-                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                        EngineError::Eval(EvalError::ColumnNotFound {
+                            token: spg_sql::ast::SrcToken::NONE,
+                            name: col.clone(),
+                        })
                     })?;
                     new_vals[pos] =
                         self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
@@ -4444,7 +4462,10 @@ impl Engine {
                 let mut new_vals = old.values.clone();
                 for (col, expr) in &stmt.assignments {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
-                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                        EngineError::Eval(EvalError::ColumnNotFound {
+                            token: spg_sql::ast::SrcToken::NONE,
+                            name: col.clone(),
+                        })
                     })?;
                     new_vals[pos] =
                         self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
@@ -4495,7 +4516,10 @@ impl Engine {
                 let mut new_vals = old.values.clone();
                 for (col, expr) in &stmt.assignments {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
-                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                        EngineError::Eval(EvalError::ColumnNotFound {
+                            token: spg_sql::ast::SrcToken::NONE,
+                            name: col.clone(),
+                        })
                     })?;
                     new_vals[pos] =
                         self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
@@ -4542,7 +4566,10 @@ impl Engine {
                 let mut new_vals = old.values.clone();
                 for (col, expr) in &stmt.assignments {
                     let pos = columns.iter().position(|c| &c.name == col).ok_or_else(|| {
-                        EngineError::Eval(EvalError::ColumnNotFound { name: col.clone() })
+                        EngineError::Eval(EvalError::ColumnNotFound {
+                            token: spg_sql::ast::SrcToken::NONE,
+                            name: col.clone(),
+                        })
                     })?;
                     new_vals[pos] =
                         self.eval_expr_with_correlated(expr, old, &ctx, cancel, None)?;
@@ -6713,6 +6740,7 @@ fn rewrite_merge_action(expr: &mut Expr) {
             if name.eq_ignore_ascii_case("merge_action") && args.is_empty() =>
         {
             *expr = Expr::Column(spg_sql::ast::ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: None,
                 name: String::from("__merge_action"),
             });
@@ -6781,6 +6809,7 @@ fn expand_merge_returning_items(
                     for c in target_cols {
                         out.push(SelectItem::Expr {
                             expr: Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: alloc::format!("{prefix}{}", c.name),
                             }),

@@ -309,6 +309,7 @@ impl Engine {
 /// Build a qualified column reference `qual.name`.
 fn col_ref(qual: &str, name: &str) -> Expr {
     Expr::Column(ColumnName {
+        token: spg_sql::ast::SrcToken::NONE,
         qualifier: Some(qual.to_string()),
         name: name.to_string(),
     })

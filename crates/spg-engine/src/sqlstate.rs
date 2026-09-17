@@ -167,7 +167,7 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
         // v7.39 (round 620) — a cast target that names no type is PG's 42704
         // UNDEFINED_OBJECT. It used to reach the wire as the generic 42000,
         // under SPG's own wording.
-        if msg.contains("does not exist") && msg.starts_with("type \"") {
+        if msg.contains("does not exist") && strip_error_class(&msg).starts_with("type \"") {
             return ("42704", msg);
         }
         // v7.39 (round 244) — sequence-range errors: a setval outside the
@@ -373,7 +373,8 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
             // an empty row and never reached the error at all.
             || msg.contains("unrecognized configuration parameter \"")
             // 8.0.3 — `DROP EXTENSION nosuch`, measured 42704 on 18.6.
-            || (msg.starts_with("extension \"") && msg.ends_with("\" does not exist"))
+            || (strip_error_class(&msg).starts_with("extension \"")
+                && msg.ends_with("\" does not exist"))
         {
             "42704"
         // v7.39 (read01 round 89) — a column named twice in an INSERT target
@@ -423,7 +424,13 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
         // ea.no_such does not exist`. The quoted pattern above cannot
         // see it, and without this the state fell through to the
         // generic one.
-        } else if msg.starts_with("column ") && msg.ends_with(" does not exist") {
+        // 9.0.0 — on the STRIPPED message. The classification runs on the
+        // full Display, which starts with the error's class (`eval: `), so
+        // a rule anchored at the start never fired: a qualified column PG
+        // reports as 42703 reached the wire as the generic 42000.
+        } else if strip_error_class(&msg).starts_with("column ")
+            && msg.ends_with(" does not exist")
+        {
             "42703"
         // v7.39 (read01 round 47) — constraint errors must be classified
         // BEFORE the table/relation patterns below: PG's RENAME CONSTRAINT
@@ -445,7 +452,9 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
         } else if msg.contains("type \"") && msg.contains("already exists") {
             "42710"
         // 8.0.3 — `CREATE EXTENSION` of an installed one, 42710 on 18.6.
-        } else if msg.starts_with("extension \"") && msg.ends_with("\" already exists") {
+        } else if strip_error_class(&msg).starts_with("extension \"")
+            && msg.ends_with("\" already exists")
+        {
             "42710"
         // v7.39 (read01 round 49) — ALTER TYPE ADD VALUE / RENAME VALUE.
         } else if msg.contains("enum label \"") && msg.contains("already exists") {

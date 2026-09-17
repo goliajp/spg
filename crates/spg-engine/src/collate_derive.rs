@@ -160,6 +160,7 @@ mod tests {
 
     fn col(name: &str) -> Expr {
         Expr::Column(spg_sql::ast::ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: name.to_string(),
         })

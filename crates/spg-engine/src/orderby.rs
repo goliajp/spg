@@ -1003,6 +1003,7 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                         if crate::select::expr_contains_builtin_srf(expr) {
                             if let Some(name) = alias.clone() {
                                 order.expr = Expr::Column(ColumnName {
+                                    token: spg_sql::ast::SrcToken::NONE,
                                     qualifier: None,
                                     name,
                                 });
@@ -1028,6 +1029,7 @@ pub(crate) fn resolve_order_by_position(s: &mut SelectStatement) {
                         }
                         order.expr = match (has_unions, alias) {
                             (true, Some(a)) => Expr::Column(ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: a.clone(),
                             }),

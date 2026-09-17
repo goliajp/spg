@@ -239,6 +239,7 @@ pub(crate) fn visit_expr_columns_and_subqueries<'a>(
             // Exotic node (window function etc.): report an
             // unattributable marker so callers disable pruning.
             static BAIL: spg_sql::ast::ColumnName = spg_sql::ast::ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: None,
                 name: String::new(),
             };

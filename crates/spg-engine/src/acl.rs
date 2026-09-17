@@ -1370,6 +1370,7 @@ impl Engine {
 /// column-read walker a SELECT does.
 pub(crate) fn bare_table_ref(name: String) -> TableRef {
     TableRef {
+        token: spg_sql::ast::SrcToken::NONE,
         name,
         alias: None,
         only: false,

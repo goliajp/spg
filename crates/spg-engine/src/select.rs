@@ -3452,6 +3452,7 @@ impl Engine {
                         && idx < columns.len()
                     {
                         o.expr = Expr::Column(spg_sql::ast::ColumnName {
+                            token: spg_sql::ast::SrcToken::NONE,
                             qualifier: None,
                             name: columns[idx].name.clone(),
                         });
@@ -6275,6 +6276,7 @@ impl Engine {
                             && idx < columns.len()
                         {
                             o.expr = Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: columns[idx].name.clone(),
                             });
@@ -6663,6 +6665,7 @@ impl Engine {
         )];
         let rows = alloc::vec![Row::new(alloc::vec![Value::BigInt(count)])];
         let _ = ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: String::new(),
         };
@@ -11122,6 +11125,7 @@ fn replace_agg_exprs(e: &mut Expr, aggs: &[Expr]) {
     if expr_is_aggregate_call(e) {
         if let Some(idx) = aggs.iter().position(|x| x == e) {
             *e = Expr::Column(ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: None,
                 name: alloc::format!("__agg{idx}"),
             });
@@ -11226,6 +11230,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         ..stmt.clone()
     };
     let derived = TableRef {
+        token: spg_sql::ast::SrcToken::NONE,
         name: "__aggwin".into(),
         alias: Some("__aggwin".into()),
         only: false,
@@ -12321,10 +12326,12 @@ pub(crate) fn resolve_projection_column<'a>(
             return Err(EngineError::Eval(EvalError::UnknownQualifier {
                 qualifier: q.clone(),
                 column: c.name.clone(),
+                token: c.token,
             }));
         }
         return Err(EngineError::Eval(EvalError::ColumnNotFound {
             name: c.name.clone(),
+            token: c.token,
         }));
     }
     if let Some(s) = schema_cols.iter().find(|s| same(&s.name, &c.name)) {
@@ -12364,6 +12371,7 @@ pub(crate) fn resolve_projection_column<'a>(
         }
         _ => Err(EngineError::Eval(EvalError::ColumnNotFound {
             name: c.name.clone(),
+            token: c.token,
         })),
     }
 }
@@ -12570,6 +12578,7 @@ pub(crate) fn build_projection_hiding_tail(
                     }
                     out.push(ProjectedItem {
                         expr: Expr::Column(ColumnName {
+                            token: spg_sql::ast::SrcToken::NONE,
                             qualifier: None,
                             name: col.name.clone(),
                         }),
@@ -12608,6 +12617,7 @@ pub(crate) fn build_projection_hiding_tail(
                         .to_string();
                     out.push(ProjectedItem {
                         expr: Expr::Column(ColumnName {
+                            token: spg_sql::ast::SrcToken::NONE,
                             qualifier: None,
                             name: col.name.clone(),
                         }),
@@ -12624,6 +12634,7 @@ pub(crate) fn build_projection_hiding_tail(
                 if matched == 0 {
                     // `q.*` names no column, so the reference IS the star.
                     return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: q.clone(),
                         column: alloc::string::String::from("*"),
                     }));
@@ -15244,6 +15255,7 @@ impl crate::Engine {
                     && !sources.iter().any(|(a, _)| a == q)
                 {
                     return Err(EngineError::Eval(EvalError::UnknownQualifier {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: q.clone(),
                         column: c.name.clone(),
                     }));
@@ -15258,10 +15270,12 @@ impl crate::Engine {
                     return Err(EngineError::Eval(EvalError::QualifiedColumnNotFound {
                         qualifier: q.clone(),
                         column: c.name.clone(),
+                        token: c.token,
                     }));
                 }
                 return Err(EngineError::Eval(EvalError::ColumnNotFound {
                     name: c.name.clone(),
+                    token: c.token,
                 }));
             }
         }
@@ -15591,6 +15605,7 @@ fn build_srf_plan(
             let slot = nodes.len();
             nodes.push(n.clone());
             *n = spg_sql::ast::Expr::Column(spg_sql::ast::ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: None,
                 name: alloc::format!("__srf_{slot}"),
             });
@@ -16425,6 +16440,7 @@ impl Engine {
             for c in cols {
                 items.push(SelectItem::Expr {
                     expr: Expr::Column(spg_sql::ast::ColumnName {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: Some(alias.clone()),
                         name: c,
                     }),
@@ -16549,6 +16565,7 @@ fn value_to_json_value(v: &Value<'_>) -> crate::json::JsonValue {
 
 fn bare_table_ref_named(name: &str) -> TableRef {
     TableRef {
+        token: spg_sql::ast::SrcToken::NONE,
         name: name.to_string(),
         alias: None,
         only: false,

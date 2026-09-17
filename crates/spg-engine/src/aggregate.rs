@@ -78,6 +78,7 @@ impl crate::Engine {
                     for c in &table.schema().columns {
                         items.push(SelectItem::Expr {
                             expr: Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: c.name.clone(),
                             }),
@@ -96,6 +97,7 @@ impl crate::Engine {
                     for c in &table.schema().columns {
                         items.push(SelectItem::Expr {
                             expr: Expr::Column(spg_sql::ast::ColumnName {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 qualifier: None,
                                 name: c.name.clone(),
                             }),
@@ -7307,12 +7309,14 @@ fn substitute_having_aliases(e: Expr, aliases: &[(String, Expr)]) -> Expr {
         Expr::Column(ColumnName {
             qualifier: None,
             name,
+            ..
         }) => aliases
             .iter()
             .find(|(a, _)| a.eq_ignore_ascii_case(&name))
             .map_or_else(
                 || {
                     Expr::Column(ColumnName {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: None,
                         name,
                     })
@@ -7402,6 +7406,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                 && spec.filter == filter_owned
             {
                 return Expr::Column(spg_sql::ast::ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: None,
                     name: format!("__agg_{i}"),
                 });
@@ -7447,6 +7452,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     && spec.direct_arg == direct_arg
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: None,
                         name: format!("__agg_{i}"),
                     });
@@ -7487,6 +7493,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     && spec.order_by.is_empty()
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
+                        token: spg_sql::ast::SrcToken::NONE,
                         qualifier: None,
                         name: format!("__agg_{i}"),
                     });
@@ -7498,6 +7505,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
     for (i, g) in group_exprs.iter().enumerate() {
         if g == e {
             return Expr::Column(spg_sql::ast::ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: None,
                 name: format!("__grp_{i}"),
             });

@@ -5229,12 +5229,47 @@ fn engine_error_to_wire_conn(
 }
 
 fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
-    match e {
-        EngineError::Parse(pe) => {
-            spg_sql::parser::syntax_error_position(sql, spg_sql::lexer::Dialect::PG, pe.token_pos)
-        }
-        _ => None,
-    }
+    // 9.0.0 — a name the engine could not resolve carries the token of the
+    // reference that named it, so it gets a `Position` too. PostgreSQL
+    // reports one for every such error and psql draws its caret there;
+    // sentori's §3.27 is that SPG reported none.
+    let token = match e {
+        EngineError::Parse(pe) => pe.token_pos,
+        other => match other.error_token() {
+            Some(t) => t,
+            // A relation the engine could not find: the error is raised
+            // from a hundred places, none of which holds the statement, so
+            // the name is read back out of the message and located in the
+            // text (`relation_name_position`).
+            None => {
+                if let EngineError::Storage(spg_storage::StorageError::TableNotFound { name }) =
+                    other
+                {
+                    return spg_sql::parser::relation_name_position(
+                        sql,
+                        spg_sql::lexer::Dialect::PG,
+                        name,
+                    );
+                }
+                // Anything else that NAMES what it could not resolve:
+                // `column reference "id" is ambiguous`, `missing
+                // FROM-clause entry for table "x"`, `column "t.c" must
+                // appear in the GROUP BY clause`. The engine raises these
+                // from places that do not hold the reference, so the name
+                // is read out of the message and located in the text. A
+                // qualified name points at its qualifier, which is where
+                // PostgreSQL's caret sits too (measured on 18.6).
+                let (_, msg) = engine_error_to_wire(other);
+                let quoted = msg.split('"').nth(1)?;
+                return spg_sql::parser::identifier_position(
+                    sql,
+                    spg_sql::lexer::Dialect::PG,
+                    quoted,
+                );
+            }
+        },
+    };
+    spg_sql::parser::syntax_error_position(sql, spg_sql::lexer::Dialect::PG, token)
 }
 
 /// The SQLSTATE and message for an engine error. The classification
