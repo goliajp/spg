@@ -691,16 +691,19 @@ pub(crate) fn locate_column(
         if ctx.columns.iter().any(|sc| sc.name.starts_with(&prefix)) {
             return Err(EvalError::ColumnNotFound {
                 name: alloc::format!("{q}.{name}", name = c.name),
+                token: c.token,
             });
         }
         let expected = ctx.table_alias.ok_or_else(|| EvalError::UnknownQualifier {
             qualifier: q.clone(),
             column: c.name.clone(),
+            token: c.token,
         })?;
         if q != expected {
             return Err(EvalError::UnknownQualifier {
                 qualifier: q.clone(),
                 column: c.name.clone(),
+                token: c.token,
             });
         }
     }
@@ -752,6 +755,7 @@ pub(crate) fn locate_column(
             }
             Err(EvalError::ColumnNotFound {
                 name: c.name.clone(),
+                token: c.token,
             })
         }
     }

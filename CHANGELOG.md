@@ -10,6 +10,47 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — an error that names something reports where it is
+
+Reported by sentori (§3.27), whose corpus reads the caret psql draws from
+the `Position` field: `SELECT version FROM _sqlx_migrations` carried none,
+and `SHOW $1` said `syntax error at end of input` with the caret on the
+semicolon. Syntax errors have carried a position since v7.39; the errors
+that name a relation, a column or a qualifier carried nothing.
+
+Measured against PostgreSQL 18.6 — its caret column, per statement:
+
+```text
+  SELECT version FROM _sqlx_migrations …      21   relation does not exist
+  SELECT nosuch FROM pe1                       8   column does not exist
+  SELECT pe1.nosuch FROM pe1                   8   at the QUALIFIER, where PG points
+  SELECT x.id FROM pe1                         8   missing FROM-clause entry
+  SELECT id FROM pe1, pe2                      8   ambiguous column reference
+  UPDATE pe1 SET n = 1 WHERE nosuch = 2       28
+  DELETE FROM pe1 WHERE nosuch = 1            23
+  INSERT INTO nosuchtable VALUES (1)          13
+  SELECT * FROM pe1 ORDER BY nosuch           28
+  SELECT name, count(*) FROM pe1               8   not grouped
+  SHOW $1                                      6   syntax error at or near "$1"
+```
+
+A column reference now carries the index of its first token (`SrcToken`,
+which compares equal to everything and hashes as nothing: a position is
+not part of what a reference refers to, and the engine compares AST nodes
+constantly). The three name-resolution errors carry it through to the
+host, which turns it into PostgreSQL's character offset on the error
+path. A relation is located from the name the error reports — it is
+raised from a hundred places, none of which holds the statement — by the
+identifier that follows `FROM` / `JOIN` / `INTO` / `UPDATE` / `TABLE` /
+`ONLY` / a comma; anything else that names what it could not resolve is
+located by that name.
+
+Found on the way: `column pe1.nosuch does not exist` reached the wire as
+the generic 42000, because the SQLSTATE classifier's anchored rules ran
+against the message with SPG's own class prefix (`eval: `) still on it.
+PostgreSQL says 42703, and so does SPG now; the same fix reaches the
+`type "x" does not exist` and `extension "x" …` rules.
+
 ### Fixed — an index key could not mix columns and expressions, and `ON CONFLICT` could not name an expression
 
 Reported by sentori (their §3, `cli/import.rs:36`); measured wider against

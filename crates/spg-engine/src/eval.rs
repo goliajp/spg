@@ -759,6 +759,8 @@ pub enum EvalError {
     QualifiedColumnNotFound {
         qualifier: String,
         column: String,
+        /// 9.0.0 — as `ColumnNotFound::token`.
+        token: spg_sql::ast::SrcToken,
     },
     /// v7.39.2 — a built-in called with the wrong NUMBER of arguments.
     ///
@@ -775,6 +777,9 @@ pub enum EvalError {
     },
     ColumnNotFound {
         name: String,
+        /// 9.0.0 — where the reference that named it stands; the host
+        /// turns this into the character position PostgreSQL reports.
+        token: spg_sql::ast::SrcToken,
     },
     UnknownQualifier {
         qualifier: String,
@@ -786,6 +791,8 @@ pub enum EvalError {
         /// 1146, which is what a driver reads as "that table is gone".
         /// The name has to travel for the MySQL wire to say it.
         column: String,
+        /// 9.0.0 — as `ColumnNotFound::token`.
+        token: spg_sql::ast::SrcToken,
     },
     DivisionByZero,
     TypeMismatch {
@@ -819,14 +826,16 @@ impl core::fmt::Display for EvalError {
             Self::WrongArity { name, types } => {
                 write!(f, "function {name}({types}) does not exist")
             }
-            Self::ColumnNotFound { name } => write!(f, "column \"{name}\" does not exist"),
+            Self::ColumnNotFound { name, .. } => write!(f, "column \"{name}\" does not exist"),
             // v7.39.2 — a QUALIFIED reference prints unquoted and
             // dotted on PostgreSQL 18.6: `column ea.no_such does not
             // exist`, where the bare form is `column "no_such" does not
             // exist` (both measured). The two shapes are not
             // interchangeable — a caller matching on `ea.no_such` finds
             // nothing in the quoted one.
-            Self::QualifiedColumnNotFound { qualifier, column } => {
+            Self::QualifiedColumnNotFound {
+                qualifier, column, ..
+            } => {
                 write!(f, "column {qualifier}.{column} does not exist")
             }
             // v7.39 (round 241) — PG's wording (and 42P01 trigger): a
@@ -7130,10 +7139,12 @@ mod tests {
         let cs = vec![col("x", DataType::Int), col("y", DataType::Int)];
         let c = ctx(&cs, None);
         let lhs = Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: "x".into(),
         });
         let rhs = Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: "y".into(),
         });
@@ -7173,6 +7184,7 @@ mod tests {
 
     fn col_ref(name: &str) -> Expr {
         Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: name.into(),
         })
@@ -7206,7 +7218,7 @@ mod tests {
         let r = Row::new(vec![Value::Int(0)]);
         let c = ctx(&cs, None);
         let err = eval_expr(&col_ref("ghost"), &r, &c).unwrap_err();
-        assert!(matches!(err, EvalError::ColumnNotFound { ref name } if name == "ghost"));
+        assert!(matches!(err, EvalError::ColumnNotFound { ref name, .. } if name == "ghost"));
     }
 
     #[test]
@@ -7215,6 +7227,7 @@ mod tests {
         let r = Row::new(vec![Value::Int(5)]);
         let c = ctx(&cs, Some("u"));
         let qualified = Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some("u".into()),
             name: "a".into(),
         });
@@ -7227,6 +7240,7 @@ mod tests {
         let r = Row::new(vec![Value::Int(5)]);
         let c = ctx(&cs, Some("u"));
         let wrong = Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some("x".into()),
             name: "a".into(),
         });

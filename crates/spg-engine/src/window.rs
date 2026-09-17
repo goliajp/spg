@@ -155,6 +155,7 @@ pub(crate) fn rewrite_window_to_columns(e: &mut Expr, window_nodes: &[Expr]) {
         && let Some(idx) = window_nodes.iter().position(|w| w == e)
     {
         *e = Expr::Column(spg_sql::ast::ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: None,
             name: alloc::format!("__win_{idx}"),
         });

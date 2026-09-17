@@ -671,7 +671,7 @@ fn select_unknown_column_errors_in_projection() {
     let err = e.execute("SELECT ghost FROM users").unwrap_err();
     assert!(matches!(
         err,
-        EngineError::Eval(EvalError::ColumnNotFound { ref name }) if name == "ghost"
+        EngineError::Eval(EvalError::ColumnNotFound { ref name, .. }) if name == "ghost"
     ));
 }
 

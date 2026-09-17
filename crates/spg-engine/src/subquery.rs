@@ -2322,6 +2322,7 @@ impl Engine {
         //    GROUP BY <inner.k>
         let cte_name = alloc::format!("__cl1_{alias_n}");
         let jk_expr = Expr::Column(ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some(inner_alias.clone()),
             name: inner_key.clone(),
         });
@@ -2387,6 +2388,7 @@ impl Engine {
         let join = FromJoin {
             kind: JoinKind::Left,
             table: TableRef {
+                token: spg_sql::ast::SrcToken::NONE,
                 name: cte_name.clone(),
                 alias: None,
                 only: false,
@@ -2404,6 +2406,7 @@ impl Engine {
             },
             on: Some(Expr::Binary {
                 lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: Some(cte_name.clone()),
                     name: "jk".into(),
                 })),
@@ -2414,6 +2417,7 @@ impl Engine {
             natural: false,
         };
         let repl = ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some(cte_name),
             name: "pj".into(),
         };
@@ -2650,6 +2654,7 @@ impl Engine {
         let fresh = alloc::format!("__plj_{alias_n}");
         let key_eq = Expr::Binary {
             lhs: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: Some(fresh.clone()),
                 name: inner_key,
             })),
@@ -2670,6 +2675,7 @@ impl Engine {
         let join = FromJoin {
             kind: JoinKind::Left,
             table: TableRef {
+                token: spg_sql::ast::SrcToken::NONE,
                 name: inner_table,
                 alias: Some(fresh.clone()),
                 only: false,
@@ -2690,6 +2696,7 @@ impl Engine {
             natural: false,
         };
         let repl = ColumnName {
+            token: spg_sql::ast::SrcToken::NONE,
             qualifier: Some(fresh),
             name: out_col.name.clone(),
         };
@@ -3052,6 +3059,7 @@ impl Engine {
         });
         rewritten.items = alloc::vec![SelectItem::Expr {
             expr: Expr::Column(ColumnName {
+                token: spg_sql::ast::SrcToken::NONE,
                 qualifier: Some(inner_alias),
                 name: inner_key,
             }),
@@ -3308,6 +3316,7 @@ impl Engine {
         let inner_half_expr = |ih: &InnerHalf| -> Expr {
             match ih {
                 InnerHalf::Col(name) => Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: Some(fresh.clone()),
                     name: name.clone(),
                 }),
@@ -3345,6 +3354,7 @@ impl Engine {
                 JoinKind::Semi
             },
             table: TableRef {
+                token: spg_sql::ast::SrcToken::NONE,
                 name: inner_table,
                 alias: Some(fresh.clone()),
                 only: false,
@@ -3382,6 +3392,7 @@ impl Engine {
             };
             Some(Expr::IsNull {
                 expr: alloc::boxed::Box::new(Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
                     qualifier: Some(fresh),
                     name: probe_key,
                 })),

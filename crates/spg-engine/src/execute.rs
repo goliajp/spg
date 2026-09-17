@@ -3592,6 +3592,7 @@ impl Engine {
                         .position(|s| s.name.eq_ignore_ascii_case(c))
                         .ok_or_else(|| {
                             EngineError::Eval(crate::eval::EvalError::ColumnNotFound {
+                                token: spg_sql::ast::SrcToken::NONE,
                                 name: c.clone(),
                             })
                         })

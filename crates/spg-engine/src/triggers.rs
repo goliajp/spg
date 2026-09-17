@@ -2231,6 +2231,7 @@ pub(crate) fn substitute_new_old(
                     .iter()
                     .position(|sc| sc.name.eq_ignore_ascii_case(&c.name))
                     .ok_or_else(|| EvalError::ColumnNotFound {
+                        token: spg_sql::ast::SrcToken::NONE,
                         name: format!("{side}.{}", c.name),
                     })?;
                 let v = match row {

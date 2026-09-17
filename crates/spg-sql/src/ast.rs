@@ -4521,6 +4521,8 @@ pub enum SelectItem {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableRef {
+    /// 9.0.0 — where this relation is named; see [`SrcToken`].
+    pub token: SrcToken,
     pub name: String,
     pub alias: Option<String>,
     /// v7.39 (round 644) — `FROM ONLY t`: do not descend into `t`'s
@@ -4724,6 +4726,7 @@ impl TableRef {
     #[must_use]
     pub fn kind(&self) -> FromItemKind {
         let Self {
+            token: _,
             name: _,
             alias: _,
             only: _,
@@ -4800,6 +4803,7 @@ impl TableRef {
         // it twice.
         let Self {
             // Not expressions — named so the destructure stays total.
+            token: _,
             name: _,
             alias: _,
             only: _,
@@ -4868,6 +4872,7 @@ impl TableRef {
         visit: &mut dyn FnMut(FromSlotRef<'a>) -> Result<(), E>,
     ) -> Result<(), E> {
         let Self {
+            token: _,
             name: _,
             alias: _,
             only: _,
@@ -5643,10 +5648,85 @@ pub enum Literal {
     },
 }
 
+/// 9.0.0 — where a name stands in the statement: the index of its first
+/// token in the token stream, or `NONE` for a reference the engine made
+/// up.
+///
+/// PostgreSQL reports the character position of a name it cannot resolve
+/// and psql draws its caret there; SPG reported none (sentori's §3.27).
+/// The offset is recovered from this index on the error path by
+/// `parser::syntax_error_position` — the parser has the index for free,
+/// and re-tokenizing is affordable only where an error already happened.
+///
+/// **Two references to the same column are the same reference**, wherever
+/// they stand, so this compares equal to everything and hashes as
+/// nothing: the engine compares AST nodes constantly (GROUP BY matching,
+/// ORDER BY lowering, a Display round trip), and a position that took
+/// part in equality would make a re-parsed statement differ from itself.
+#[derive(Debug, Clone, Copy, Eq)]
+pub struct SrcToken(u32);
+
+impl SrcToken {
+    /// A name with no place in any statement.
+    pub const NONE: Self = Self(u32::MAX);
+
+    /// The name that starts at token `index`.
+    #[must_use]
+    pub fn at(index: usize) -> Self {
+        Self(u32::try_from(index).unwrap_or(u32::MAX))
+    }
+
+    /// The token index, or `None` when there is no place to point at.
+    #[must_use]
+    pub fn index(self) -> Option<usize> {
+        (self.0 != u32::MAX).then_some(self.0 as usize)
+    }
+}
+
+impl PartialEq for SrcToken {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl core::hash::Hash for SrcToken {
+    fn hash<H: core::hash::Hasher>(&self, _: &mut H) {}
+}
+
+impl Default for SrcToken {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnName {
     pub qualifier: Option<String>,
     pub name: String,
+    /// 9.0.0 — where this reference stands; see [`SrcToken`].
+    pub token: SrcToken,
+}
+
+impl ColumnName {
+    /// A reference the engine made up, with no place in any statement.
+    #[must_use]
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self {
+            qualifier: None,
+            name: name.into(),
+            token: SrcToken::NONE,
+        }
+    }
+
+    /// The same, qualified.
+    #[must_use]
+    pub fn qualified(qualifier: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            qualifier: Some(qualifier.into()),
+            name: name.into(),
+            token: SrcToken::NONE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9982,6 +10062,7 @@ mod tests {
             items: vec![SelectItem::Wildcard],
             from: Some(FromClause {
                 primary: TableRef {
+                    token: crate::ast::SrcToken::NONE,
                     name: "users".into(),
                     alias: None,
                     only: false,

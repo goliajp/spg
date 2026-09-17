@@ -1328,6 +1328,7 @@ fn mysql_error_parts_inner(
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::UnknownQualifier {
             qualifier,
             column,
+            ..
         }) => {
             if column == "*" {
                 // `zz.*` names no column, and MySQL 9.7.2 calls that a
@@ -1379,7 +1380,9 @@ fn mysql_error_parts_inner(
                 name.to_uppercase()
             ),
         ),
-        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::ColumnNotFound { name }) => (
+        spg_engine::EngineError::Eval(spg_engine::eval::EvalError::ColumnNotFound {
+            name, ..
+        }) => (
             1054,
             "42S22",
             format!("Unknown column '{name}' in 'field list'"),
@@ -1391,6 +1394,7 @@ fn mysql_error_parts_inner(
         spg_engine::EngineError::Eval(spg_engine::eval::EvalError::QualifiedColumnNotFound {
             qualifier,
             column,
+            ..
         }) => (
             1054,
             "42S22",

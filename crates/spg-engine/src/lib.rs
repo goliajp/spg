@@ -505,6 +505,30 @@ pub enum EngineError {
     },
 }
 
+impl EngineError {
+    /// 9.0.0 — the statement token this error points at, when it points at
+    /// one: the reference whose name could not be resolved. `None` for an
+    /// error with no place in the statement, and for one raised about a
+    /// reference the engine synthesised itself.
+    ///
+    /// PostgreSQL reports a character position for every such error and
+    /// psql draws its caret there; SPG reported none (sentori's §3.27).
+    /// The host maps the token to a character offset with
+    /// `spg_sql::parser::syntax_error_position`, which re-tokenizes — a
+    /// cold path, which is why the token and not the offset is carried.
+    #[must_use]
+    pub fn error_token(&self) -> Option<usize> {
+        match self {
+            Self::Eval(
+                eval::EvalError::ColumnNotFound { token, .. }
+                | eval::EvalError::QualifiedColumnNotFound { token, .. }
+                | eval::EvalError::UnknownQualifier { token, .. },
+            ) => token.index(),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

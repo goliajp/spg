@@ -335,6 +335,7 @@ fn wrap_rls_table(tref: &mut TableRef, cat: &Catalog) {
 /// A minimal `TableRef` naming a base table with no alias / modifiers.
 fn bare_table_ref(name: String) -> TableRef {
     TableRef {
+        token: spg_sql::ast::SrcToken::NONE,
         name,
         alias: None,
         only: false,

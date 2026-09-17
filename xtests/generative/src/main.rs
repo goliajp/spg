@@ -71,6 +71,7 @@ const NUM_COLS: &[(&str, &str)] = &[("t1", "a"), ("t1", "b"), ("t2", "x")];
 
 fn col(q: &str, n: &str) -> Expr {
     Expr::Column(ColumnName {
+        token: spg_sql::ast::SrcToken::NONE,
         qualifier: Some(q.to_string()),
         name: n.to_string(),
     })

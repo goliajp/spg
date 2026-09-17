@@ -6,8 +6,11 @@
 //! position, and the wire attaches it as `P`.
 //!
 //! Positions locked against live PG 18.4 (its psql caret column).
-//! Semantic-error positions (column-not-found, type mismatch) still have no
-//! `P` — that needs analyzer/eval plumbing and is deferred.
+//!
+//! 9.0.0 — and the SEMANTIC errors carry one too, which is what sentori
+//! reported as §3.27: `relation "x" does not exist`, an unresolvable
+//! column, an ambiguous one, a missing FROM-clause entry. Every position
+//! below is PostgreSQL 18.6's, read off its psql caret.
 
 use crate::common;
 use std::io::{Read, Write};
@@ -169,4 +172,46 @@ fn valid_statement_has_no_error() {
         msgs.iter().all(|m| m.ty != b'E'),
         "unexpected error for SELECT 1"
     );
+}
+
+/// 9.0.0 — a name the engine could not resolve reports WHERE it is, as
+/// PostgreSQL does. Each expected position is 18.6's caret column.
+#[test]
+fn a_name_that_does_not_resolve_carries_pg_position() {
+    let dir = unique_tmpdir("sem");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    send_query(&mut s, "CREATE TABLE pe1 (id int, name text, n int)");
+    read_until_ready(&mut s);
+    send_query(&mut s, "CREATE TABLE pe2 (id int, pe1_id int)");
+    read_until_ready(&mut s);
+
+    for (sql, code, pos) in [
+        // The statement sentori's corpus stopped on.
+        (
+            "SELECT version FROM _sqlx_migrations ORDER BY version DESC LIMIT 1",
+            "42P01",
+            "21",
+        ),
+        ("SELECT nosuch FROM pe1", "42703", "8"),
+        // A qualified reference points at its qualifier, where PG's caret sits.
+        ("SELECT pe1.nosuch FROM pe1", "42703", "8"),
+        ("SELECT x.id FROM pe1", "42P01", "8"),
+        ("SELECT id FROM pe1, pe2", "42702", "8"),
+        ("UPDATE pe1 SET n = 1 WHERE nosuch = 2", "42703", "28"),
+        ("DELETE FROM pe1 WHERE nosuch = 1", "42703", "23"),
+        ("INSERT INTO nosuchtable VALUES (1)", "42P01", "13"),
+        ("SELECT * FROM pe1 ORDER BY nosuch", "42703", "28"),
+        // A target list that is not grouped: PG points at the column.
+        ("SELECT name, count(*) FROM pe1", "42803", "8"),
+        // SHOW takes no parameter: PG points at the parameter.
+        ("SHOW $1", "42601", "6"),
+    ] {
+        let (c, p) = err_pos(&mut s, sql);
+        assert_eq!(c.as_deref(), Some(code), "{sql}");
+        assert_eq!(p.as_deref(), Some(pos), "{sql}");
+    }
 }

@@ -960,6 +960,7 @@ pub(crate) fn apply_on_conflict_assignments(
             .position(|c| c.name == *col_name)
             .ok_or_else(|| {
                 EngineError::Eval(EvalError::ColumnNotFound {
+                    token: spg_sql::ast::SrcToken::NONE,
                     name: col_name.clone(),
                 })
             })?;
@@ -986,10 +987,11 @@ fn substitute_excluded_refs(
 ) -> Expr {
     use spg_sql::ast::ColumnName;
     match expr {
-        Expr::Column(ColumnName { qualifier, name })
-            if qualifier
-                .as_deref()
-                .is_some_and(|q| q.eq_ignore_ascii_case("excluded")) =>
+        Expr::Column(ColumnName {
+            qualifier, name, ..
+        }) if qualifier
+            .as_deref()
+            .is_some_and(|q| q.eq_ignore_ascii_case("excluded")) =>
         {
             let pos = schema_cols.iter().position(|c| c.name == name);
             match pos {
@@ -998,7 +1000,11 @@ fn substitute_excluded_refs(
                     value_to_literal_expr(v)
                         .unwrap_or_else(|_| Expr::Literal(spg_sql::ast::Literal::Null))
                 }
-                None => Expr::Column(ColumnName { qualifier, name }),
+                None => Expr::Column(ColumnName {
+                    token: spg_sql::ast::SrcToken::NONE,
+                    qualifier,
+                    name,
+                }),
             }
         }
         Expr::Binary { op, lhs, rhs } => Expr::Binary {
