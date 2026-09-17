@@ -827,6 +827,7 @@ mod e2e_regex_compiled_round594;
 mod e2e_regex_dot_newline;
 mod e2e_regex_extended_flag;
 mod e2e_regex_group_capture;
+mod e2e_regex_longest_match_900;
 mod e2e_regex_reversed_range_round772;
 mod e2e_regexp_15plus_family;
 mod e2e_regexp_count;

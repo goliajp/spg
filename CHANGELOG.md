@@ -10,6 +10,49 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the regular expression engine took the first alternative, not the longest
+
+Reported by sentori (§4.3). PostgreSQL's regular expressions are POSIX:
+where more than one alternative can match, the longest wins. SPG's
+matcher took the one written first.
+
+```text
+                                                  PG 18.6        SPG 8.0.4
+  regexp_matches('foobar', '(fo|foo)(bar|obar)')  {foo,bar}      {fo,obar}
+  regexp_matches('xyz', '(x|xy)(z|yz)')           {xy,z}         {x,yz}
+  substring('foobar' from 'fo|foo')               foo            fo
+  regexp_replace('abcd', 'ab|abc', 'X')           Xd             Xcd
+  regexp_replace('aaa', 'a|aa', 'X', 'g')         XX             XXX
+```
+
+Measuring it wider found a second defect underneath: a repetition never
+backtracked over how long each rep was, so a count it could only meet by
+taking shorter reps did not match at all —
+
+```text
+  'aaa' ~ '^(a|aa){3}$'                           true           false
+  'aaaa' ~ '^(aa|a){3}$'                          true           false
+```
+
+Alternation now keeps the branch whose WHOLE match ends furthest (and,
+between equals, the one that makes an earlier group longer, which is
+POSIX's rule for subexpressions). A repetition whose rep can be more than
+one length is searched rather than walked greedily.
+
+Which cut of a repetition PostgreSQL reports is observable, because the
+group keeps the last rep; measured across twenty-two shapes on 18.6, a
+repetition whose minimum is at least one takes as MANY reps as it can and
+one whose minimum is zero as FEW, the earlier reps being the longer:
+
+```text
+  (a|aa)+  over aaaa      {a}      (a|aa)*  over aaaa      {aa}
+  (a|aa){1,3} over aaaa   {a}      (a|aa){1,2} over aaaa   {aa}
+  (a|aa|aaa)* over aaaaaa {aaa}    ((a)|(aa))+ over aaaa   {a,a,NULL}
+```
+
+sentori's `regexp-capture-preference.sql` is now identical to
+PostgreSQL 18.6's output, line for line.
+
 ### Fixed — an error that names something reports where it is
 
 Reported by sentori (§3.27), whose corpus reads the caret psql draws from

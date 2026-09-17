@@ -94,6 +94,15 @@ cd "$(dirname "$0")/.."
 PG_URI="${PG_URI:-}"
 SPG_URI="${SPG_URI:-}"
 BASELINE_URI="${BASELINE_URI:-}"
+# 9.0.0 — the twin of the JUDGED leg: a process configured exactly like
+# `SPG_URI`. `BASELINE_URI` gives the other side of the panel a twin and
+# so measures what two identical processes differ by THERE; the judged
+# side had none, so a cell where the judged PROCESS was simply slower
+# read as a verdict about what the panel varies. Measured on mini with
+# both legs under C — identical configuration, nothing to vary — the
+# panel still called `400000 top-N LIMIT 10` a LOSS: 9.270-9.532 against
+# 6.152-6.473, server-reported 9.203 against 6.068.
+SPG_TWIN_URI="${SPG_TWIN_URI:-}"
 N="${N:-5}"
 # v7.40.11 — this panel compares one binary against ITSELF (the locale
 # panel does: `PG_URI` is the C leg and `SPG_URI` the en_US leg of the
@@ -192,6 +201,19 @@ leg_collation() {
 spg_coll="$(leg_collation "${SPG_URI}")"
 pg_coll="$(leg_collation "${PG_URI}")"
 echo "leg SPGS collation: ${spg_coll:-<unknown>}   leg PG18 collation: ${pg_coll:-<unknown>}"
+# 9.0.0 — the judged leg's twin, checked the same way and against the
+# leg it duplicates.
+if [[ -n "${SPG_TWIN_URI}" ]]; then
+  twin_coll="$(leg_collation "${SPG_TWIN_URI}")"
+  echo "leg SPG-TWIN collation: ${twin_coll:-<unknown>} (must equal SPGS's)"
+  if [[ "${twin_coll}" != "${spg_coll}" ]]; then
+    echo "fatal: the judged leg's twin collates ${twin_coll:-<unknown>} and the leg it" >&2
+    echo "       duplicates collates ${spg_coll:-<unknown>}. It is there to measure what" >&2
+    echo "       two IDENTICAL processes are worth on the JUDGED side." >&2
+    exit 2
+  fi
+fi
+
 # v7.40.11 — "configured identically" is a claim, so it is checked.
 #
 # The baseline leg exists to say what two IDENTICAL processes differ by.
@@ -417,11 +439,18 @@ verdict() { # $1=amin $2=amax $3=bmin $4=bmax [$5=floor]
 # leg, so `g` and `b` differ in nothing the panel claims to vary. Their
 # pooled span is what two identical processes are worth on this cell, in
 # this window, and no verdict is called inside it.
-resolution() { # $1=smin $2=smax $3=cmin $4=cmax $5=gmin $6=gmax [$7=bmin $8=bmax]
+resolution() { # $1=smin $2=smax $3=cmin $4=cmax $5=gmin $6=gmax [$7=bmin $8=bmax] [$9=wmin $10=wmax]
   awk -v s1="$1" -v s2="$2" -v c1="$3" -v c2="$4" -v g1="$5" -v g2="$6" \
-      -v b1="${7:-}" -v b2="${8:-}" \
+      -v b1="${7:-}" -v b2="${8:-}" -v w1="${9:-}" -v w2="${10:-}" \
     'BEGIN {
        lo = (s1 < c1 ? s1 : c1); hi = (s2 > c2 ? s2 : c2);
+       # 9.0.0 — the judged leg TWIN belongs in this window: two processes
+       # configured like the judged one separating is the same fact on
+       # this side that the baselines report on the other.
+       if (w1 != "") {
+         if (w1 < lo) lo = w1;
+         if (w2 > hi) hi = w2;
+       }
        sc = hi - lo;
        glo = g1; ghi = g2;
        if (b1 != "") {
@@ -729,12 +758,14 @@ for rows in ${SIZES}; do
     IFS=, read -r -a _bases <<< "${BASELINE_URI}"
     for _bu in "${_bases[@]}"; do setup_table "${_bu}" "${T}" "${rows}"; done
   fi
+  [[ -n "${SPG_TWIN_URI}" ]] && setup_table "${SPG_TWIN_URI}" "${T}" "${rows}"
   setup_typed_table "${SPG_URI}" "${NT}" "${rows}"
   setup_typed_table "${PG_URI}"  "${NT}" "${rows}"
   if [[ -n "${BASELINE_URI}" ]]; then
     IFS=, read -r -a _bases <<< "${BASELINE_URI}"
     for _bu in "${_bases[@]}"; do setup_typed_table "${_bu}" "${NT}" "${rows}"; done
   fi
+  [[ -n "${SPG_TWIN_URI}" ]] && setup_typed_table "${SPG_TWIN_URI}" "${NT}" "${rows}"
   verify_typed_predicates "${SPG_URI}" "${NT}"
   verify_typed_predicates "${PG_URI}"  "${NT}"
   setup_walk_table "${SPG_URI}" "${WT}" "${rows}"
@@ -743,6 +774,7 @@ for rows in ${SIZES}; do
     IFS=, read -r -a _bases <<< "${BASELINE_URI}"
     for _bu in "${_bases[@]}"; do setup_walk_table "${_bu}" "${WT}" "${rows}"; done
   fi
+  [[ -n "${SPG_TWIN_URI}" ]] && setup_walk_table "${SPG_TWIN_URI}" "${WT}" "${rows}"
 
   for entry in "${SHAPES[@]}" "${TYPED_SHAPES[@]}"; do
     name="${entry%%|*}"; sql="${entry#*|}"; sql="${sql//@T@/${T}}"; sql="${sql//@N@/${NT}}"; sql="${sql//@W@/${WT}}"
@@ -763,7 +795,7 @@ for rows in ${SIZES}; do
     #
     # A separation the same binary produces against ITSELF, in the same
     # window, on the same shape, is not a verdict about SPG.
-    s=(); g=(); c=(); b=()
+    s=(); g=(); c=(); b=(); w=()
     for ((i = 0; i < N; i++)); do
       # Rule 4: alternate, and rotate which leg starts each round, so no
       # leg is systematically last while the machine drifts.
@@ -793,6 +825,10 @@ for rows in ${SIZES}; do
           b+=("$(time_one "${_bu}" "${sql}" "${PG_WM}")")
         done
       fi
+      # 9.0.0 — and the judged leg's twin, in the same round.
+      if [[ -n "${SPG_TWIN_URI}" ]]; then
+        w+=("$(time_one "${SPG_TWIN_URI}" "${sql}" "${SPG_WM}")")
+      fi
     done
     # The transport-free reading, once per leg, AFTER the alternating
     # wall-clock rounds so it cannot disturb them.
@@ -805,10 +841,14 @@ for rows in ${SIZES}; do
     if [[ -n "${BASELINE_URI}" ]]; then
       bmin="$(lo "${b[@]}")"; bmax="$(hi "${b[@]}")"
     fi
+    wmin=""; wmax=""
+    if [[ -n "${SPG_TWIN_URI}" ]]; then
+      wmin="$(lo "${w[@]}")"; wmax="$(hi "${w[@]}")"
+    fi
     # v7.40.11 — the verdict must clear this cell's own resolution, which
     # the control leg measures. `raw` is the pre-floor call, kept only so
     # the withdrawal can be counted and named.
-    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}" "${bmin}" "${bmax}")"
+    res="$(resolution "${smin}" "${smax}" "${cmin}" "${cmax}" "${gmin}" "${gmax}" "${bmin}" "${bmax}" "${wmin}" "${wmax}")"
     raw="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}")"
     v="$(verdict "${smin}" "${smax}" "${gmin}" "${gmax}" "${res}")"
     # The same binary against itself. If THAT separates, this cell has no
@@ -820,6 +860,10 @@ for rows in ${SIZES}; do
     # verdict has to clear before it may name the collation.
     if [[ -n "${BASELINE_URI}" ]] \
        && [[ "$(verdict "${gmin}" "${gmax}" "${bmin}" "${bmax}")" != unresolved ]]; then
+      CROSS_DIFFS=$((CROSS_DIFFS + 1))
+    fi
+    if [[ -n "${SPG_TWIN_URI}" ]] \
+       && [[ "$(verdict "${smin}" "${smax}" "${wmin}" "${wmax}")" != unresolved ]]; then
       CROSS_DIFFS=$((CROSS_DIFFS + 1))
     fi
     note=""

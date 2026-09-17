@@ -174,6 +174,16 @@ enum ReNode {
         min: usize,
         max: Option<usize>,
         greedy: bool,
+        /// 9.0.0 — can one repetition match more than one length?
+        ///
+        /// Such a repetition has to be SEARCHED rather than walked
+        /// greedily: how long each rep is decides whether a count can be
+        /// met (`(a|aa){3}` over `aaa`) and what the captures report.
+        /// Computed here, at compile time, because asking at match time
+        /// widened `re_match_seq`'s frame — it recurses once per concat
+        /// element, and this crate's ReDoS test matches a 6,000-element
+        /// pattern on a 1 MiB stack.
+        variable: bool,
     },
     /// Concatenation of sub-nodes.
     Concat(Vec<ReNode>),
@@ -373,6 +383,7 @@ fn re_parse_concat(
                     // laziness on the node.
                     let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
+                        variable: variable_length(&atom),
                         inner: Box::new(atom),
                         min: 0,
                         max: None,
@@ -383,6 +394,7 @@ fn re_parse_concat(
                     *p += 1;
                     let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
+                        variable: variable_length(&atom),
                         inner: Box::new(atom),
                         min: 1,
                         max: None,
@@ -395,6 +407,7 @@ fn re_parse_concat(
                     // laziness marker, not a literal.
                     let greedy = !consume_lazy_suffix(chars, p);
                     ReNode::Quant {
+                        variable: variable_length(&atom),
                         inner: Box::new(atom),
                         min: 0,
                         max: Some(1),
@@ -414,6 +427,7 @@ fn re_parse_concat(
                             // repetition lazy: `X{m,n}?`.
                             let greedy = !consume_lazy_suffix(chars, p);
                             ReNode::Quant {
+                                variable: variable_length(&atom),
                                 inner: Box::new(atom),
                                 min,
                                 max,
@@ -1002,19 +1016,26 @@ fn re_match_at(
         // when the tail fails ('bar.*que' now matches 'barbeque';
         // the old v7.17 stop-gap was greedy-without-backtracking).
         ReNode::Concat(items) => re_match_seq(items, s, pos, d, steps),
+        // 9.0.0 — POSIX prefers the LONGEST alternative, not the first
+        // one written. `substring('foobar' from 'fo|foo')` is `foo` on PG
+        // 18.6 and was `fo` here (sentori's §4.3).
         ReNode::Alt(branches) => {
+            let mut best: Option<usize> = None;
             for b in branches {
-                if let Some(p) = re_match_at(b, s, pos, d, steps)? {
-                    return Ok(Some(p));
+                if let Some(p) = re_match_at(b, s, pos, d, steps)?
+                    && best.is_none_or(|e| p > e)
+                {
+                    best = Some(p);
                 }
             }
-            Ok(None)
+            Ok(best)
         }
         ReNode::Quant {
             inner,
             min,
             max,
             greedy,
+            variable,
         } => {
             // Standalone quantifier (no tail). Greedy → the LONGEST
             // match (match as many reps as fit). Lazy → the FEWEST
@@ -1022,6 +1043,14 @@ fn re_match_at(
             // handled by re_match_seq; here there is nothing to satisfy
             // beyond the quantifier, so both directions collapse to a
             // single answer.
+            //
+            // 9.0.0 — when a rep can be more than one length, the reps
+            // have to be SEARCHED: taking the longest every time reaches
+            // fewer ends than the repetition has, so `(a|aa){3}` did not
+            // match `aaa` at all, where PG 18.6 matches it.
+            if *variable {
+                return quant_search(node, s, pos, *greedy, d, steps);
+            }
             let mut count = 0usize;
             let mut p = pos;
             loop {
@@ -1116,6 +1145,7 @@ fn re_match_seq(
             min,
             max,
             greedy,
+            variable,
         } => {
             // Enumerate every reachable end position (0, 1, 2, ...
             // repetitions). The reachable set is identical for greedy
@@ -1124,6 +1154,12 @@ fn re_match_seq(
             // give back), lazy tries shortest-first (min reps, take
             // more only when the tail fails). Both honor the same
             // `[min, max]` bound and the same step/depth guards.
+            // 9.0.0 — a rep that can be more than one length reaches ends
+            // the greedy walk below never visits, so they are enumerated;
+            // the order the tail is tried in is unchanged.
+            if *variable {
+                return quant_seq_search(first, rest, s, pos, *greedy, d, steps);
+            }
             let mut ends = alloc::vec![pos];
             let mut p = pos;
             let mut count = 0usize;
@@ -1165,18 +1201,15 @@ fn re_match_seq(
             }
             Ok(None)
         }
-        ReNode::Alt(branches) => {
-            for b in branches {
-                // Each branch may itself contain quantifiers —
-                // match it standalone, then retry the tail.
-                if let Some(p) = re_match_at(b, s, pos, d, steps)? {
-                    if let Some(e) = re_match_seq(rest, s, p, d, steps)? {
-                        return Ok(Some(e));
-                    }
-                }
-            }
-            Ok(None)
-        }
+        // 9.0.0 — every branch is tried and the one whose WHOLE match
+        // ends furthest wins, which is POSIX's rule and PostgreSQL's:
+        // `regexp_replace('abcd', 'ab|abc', 'X')` is `Xd` on 18.6.
+        // 9.0.0 — every branch is tried and the one whose WHOLE match
+        // ends furthest wins, which is POSIX's rule and PostgreSQL's:
+        // `regexp_replace('abcd', 'ab|abc', 'X')` is `Xd` on 18.6. Out of
+        // line: this function recurses once per concat element and its
+        // frame is already at the edge (see `quant_seq_search`).
+        ReNode::Alt(branches) => seq_alt_longest(branches, rest, s, pos, d, steps),
         ReNode::Concat(nested) => {
             // Flatten: nested ++ rest, preserving backtracking
             // across the boundary.
@@ -1317,6 +1350,467 @@ fn cap_undo(caps: &mut Caps, journal: &mut CapJournal, mark: usize) {
     }
 }
 
+/// 9.0.0 — leave behind the captures of the decomposition PostgreSQL
+/// reports (see [`preferred_cut`]), over a span the matcher has proved.
+///
+/// `caps` is rolled back to `mark` and the chosen reps replayed, so the
+/// group's own span and anything nested in it are that cut's.
+fn recut_repetition(
+    inner: &ReNode,
+    s: &[char],
+    from: usize,
+    to: usize,
+    min: usize,
+    max: Option<usize>,
+    d: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+    mark: usize,
+) -> Result<(), EvalError> {
+    if from >= to || !variable_length(inner) {
+        return Ok(());
+    }
+    let Some(path) = preferred_cut(inner, s, from, to, min, max, d, steps)? else {
+        return Ok(());
+    };
+    cap_undo(caps, journal, mark);
+    let mut q = from;
+    for end in path {
+        replay_rep(inner, s, q, end, d, steps, caps, journal)?;
+        q = end;
+    }
+    Ok(())
+}
+
+/// 9.0.0 — match `inner` from `q` so that it ends exactly at `end`, and
+/// record what it captured. The alternatives are tried in turn because
+/// the matcher's own preference may be a different (longer) end.
+fn replay_rep(
+    inner: &ReNode,
+    s: &[char],
+    q: usize,
+    end: usize,
+    d: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<bool, EvalError> {
+    let mark = journal.len();
+    if re_match_at_caps(inner, s, q, d, steps, caps, journal)? == Some(end) {
+        return Ok(true);
+    }
+    cap_undo(caps, journal, mark);
+    let (branches, group_idx): (&[ReNode], Option<usize>) = match inner {
+        ReNode::Alt(b) => (b, None),
+        ReNode::Group { idx, inner } => match &**inner {
+            ReNode::Alt(b) => (b, Some(*idx)),
+            _ => (core::slice::from_ref(&**inner), Some(*idx)),
+        },
+        _ => return Ok(false),
+    };
+    for b in branches {
+        let m = journal.len();
+        if re_match_at_caps(b, s, q, d, steps, caps, journal)? == Some(end) {
+            // The repetition is over a GROUP, whose span is the rep's —
+            // the branch above records only what is nested in it.
+            if let Some(idx) = group_idx {
+                cap_set(caps, journal, idx, (q, end));
+            }
+            return Ok(true);
+        }
+        cap_undo(caps, journal, m);
+    }
+    Ok(false)
+}
+
+/// 9.0.0 — can this node match more than one length?
+///
+/// A repetition over such a node has to be searched: how long each rep is
+/// decides both whether a count constraint can be met at all and, when a
+/// group is inside, what the captures report. Every other repetition —
+/// `a+`, `[0-9]{3}`, `(abc)*` — has one length per rep and the greedy
+/// walk beside this is exact, so it keeps the fast path.
+#[inline(never)]
+fn variable_length(node: &ReNode) -> bool {
+    let (lo, hi) = len_range(node);
+    hi != Some(lo)
+}
+
+/// The shortest and longest text `node` can match; `None` for unbounded.
+#[inline(never)]
+fn len_range(node: &ReNode) -> (usize, Option<usize>) {
+    match node {
+        ReNode::Literal(_) | ReNode::AnyChar | ReNode::Class { .. } => (1, Some(1)),
+        ReNode::Start | ReNode::End | ReNode::WordBoundary(_) | ReNode::Lookahead { .. } => {
+            (0, Some(0))
+        }
+        ReNode::Group { inner, .. } => len_range(inner),
+        ReNode::Quant {
+            inner, min, max, ..
+        } => {
+            let (lo, hi) = len_range(inner);
+            let max_len = match (max, hi) {
+                (Some(n), Some(h)) => Some(n * h),
+                _ => None,
+            };
+            (lo * min, max_len)
+        }
+        ReNode::Concat(items) => items.iter().fold((0, Some(0)), |(lo, hi), it| {
+            let (a, b) = len_range(it);
+            (
+                lo + a,
+                match (hi, b) {
+                    (Some(x), Some(y)) => Some(x + y),
+                    _ => None,
+                },
+            )
+        }),
+        ReNode::Alt(branches) => {
+            let mut lo = usize::MAX;
+            let mut hi = Some(0usize);
+            for b in branches {
+                let (a, c) = len_range(b);
+                lo = lo.min(a);
+                hi = match (hi, c) {
+                    (Some(x), Some(y)) => Some(x.max(y)),
+                    _ => None,
+                };
+            }
+            (if lo == usize::MAX { 0 } else { lo }, hi)
+        }
+        // A backreference's length is whatever it captured; unknown here.
+        ReNode::Backref { .. } => (0, None),
+    }
+}
+
+/// 9.0.0 — every end position `node` can reach from `q`, longest first.
+///
+/// The matcher answers with ONE end, the one it prefers; a repetition
+/// that has to meet a count or let a tail through needs the others too.
+/// Alternatives and repetitions are expanded here; everything else has
+/// the single end the matcher gives.
+#[inline(never)]
+fn reachable_ends(
+    node: &ReNode,
+    s: &[char],
+    q: usize,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Vec<usize>, EvalError> {
+    if d > MATCH_DEPTH_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    *steps += 1;
+    if *steps > MATCH_STEP_LIMIT {
+        return Err(EvalError::TypeMismatch {
+            detail: "invalid regular expression: regular expression is too complex".into(),
+        });
+    }
+    let mut out: Vec<usize> = Vec::new();
+    match node {
+        ReNode::Group { inner, .. } => return reachable_ends(inner, s, q, d + 1, steps),
+        ReNode::Alt(branches) => {
+            for b in branches {
+                for e in reachable_ends(b, s, q, d + 1, steps)? {
+                    if !out.contains(&e) {
+                        out.push(e);
+                    }
+                }
+            }
+        }
+        ReNode::Concat(items) => {
+            let mut heads = alloc::vec![q];
+            for it in items {
+                let mut next: Vec<usize> = Vec::new();
+                for h in heads {
+                    for e in reachable_ends(it, s, h, d + 1, steps)? {
+                        if !next.contains(&e) {
+                            next.push(e);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    return Ok(Vec::new());
+                }
+                heads = next;
+            }
+            out = heads;
+        }
+        ReNode::Quant {
+            inner, min, max, ..
+        } => {
+            let mut frontier = alloc::vec![q];
+            let mut count = 0usize;
+            if *min == 0 {
+                out.push(q);
+            }
+            while max.is_none_or(|m| count < m) && !frontier.is_empty() {
+                let mut next: Vec<usize> = Vec::new();
+                for h in &frontier {
+                    for e in reachable_ends(inner, s, *h, d + 1, steps)? {
+                        if e > *h && !next.contains(&e) {
+                            next.push(e);
+                        }
+                    }
+                }
+                count += 1;
+                if count >= *min {
+                    for e in &next {
+                        if !out.contains(e) {
+                            out.push(*e);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+        }
+        other => {
+            if let Some(e) = re_match_at(other, s, q, d, steps)? {
+                out.push(e);
+            }
+        }
+    }
+    out.sort_unstable_by(|a, b| b.cmp(a));
+    Ok(out)
+}
+
+/// 9.0.0 — cut `[from, to]` into exactly `k` repetitions of `inner`, the
+/// earlier ones as long as they can be, and answer with each rep's end.
+///
+/// Iterative, with its own stack: the recursion this replaces was one
+/// frame per REP, and a repetition runs as long as its subject — the
+/// debug build overflowed on this crate's own unit tests.
+#[inline(never)]
+fn cut_into(
+    inner: &ReNode,
+    s: &[char],
+    from: usize,
+    to: usize,
+    k: usize,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<Vec<usize>>, EvalError> {
+    if k == 0 {
+        return Ok((from == to).then(Vec::new));
+    }
+    // Each frame: the position it starts at, the ends still to try there,
+    // and which one it is on.
+    let mut stack: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+    let mut path: Vec<usize> = Vec::new();
+    stack.push((from, reachable_ends(inner, s, from, d, steps)?, 0));
+    while let Some((pos, ends, next)) = stack.last_mut() {
+        let pos = *pos;
+        let Some(&e) = ends.get(*next) else {
+            stack.pop();
+            path.pop();
+            continue;
+        };
+        *next += 1;
+        if e <= pos || e > to {
+            continue;
+        }
+        path.push(e);
+        if path.len() == k {
+            if e == to {
+                return Ok(Some(path));
+            }
+            path.pop();
+            continue;
+        }
+        stack.push((e, reachable_ends(inner, s, e, d, steps)?, 0));
+    }
+    Ok(None)
+}
+
+/// 9.0.0 — how many repetitions PostgreSQL cuts a span into, measured on
+/// 18.6 over twenty-two shapes: a repetition whose minimum is at least
+/// one takes as MANY as it can, one whose minimum is zero as FEW, and
+/// within that count the earlier reps are the longer ones.
+///
+/// ```text
+///   (a|aa)+  over aaaa        {a}     four reps of `a`
+///   (a|aa)*  over aaaa        {aa}    two reps of `aa`
+///   (a|aa){1,3} over aaaa     {a}     three reps: 2, 1, 1
+///   (a|aa|aaa)* over aaaaaa   {aaa}   two reps of `aaa`
+/// ```
+///
+/// The captures are the only way to see it — the span is the same — but
+/// the COUNT is also what decides whether `(a|aa){3}` matches `aaa` at
+/// all, which SPG answered `false` and PostgreSQL answers `true`.
+fn preferred_cut(
+    inner: &ReNode,
+    s: &[char],
+    from: usize,
+    to: usize,
+    min: usize,
+    max: Option<usize>,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<Vec<usize>>, EvalError> {
+    let ceiling = max
+        .unwrap_or(usize::MAX)
+        .min(to.saturating_sub(from).max(min));
+    if ceiling < min {
+        return Ok(None);
+    }
+    if min == 0 {
+        for k in min..=ceiling {
+            if let Some(path) = cut_into(inner, s, from, to, k, d, steps)? {
+                return Ok(Some(path));
+            }
+        }
+    } else {
+        for k in (min..=ceiling).rev() {
+            if let Some(path) = cut_into(inner, s, from, to, k, d, steps)? {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// 9.0.0 — the branch whose whole match ends furthest. Out of line so its
+/// locals stay off `re_match_seq`'s frame.
+#[inline(never)]
+fn seq_alt_longest(
+    branches: &[ReNode],
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<usize>, EvalError> {
+    let mut best: Option<usize> = None;
+    for b in branches {
+        // Each branch may itself contain quantifiers — match it
+        // standalone, then retry the tail.
+        if let Some(p) = re_match_at(b, s, pos, d, steps)?
+            && let Some(e) = re_match_seq(rest, s, p, d, steps)?
+            && best.is_none_or(|x| e > x)
+        {
+            best = Some(e);
+        }
+    }
+    Ok(best)
+}
+
+/// 9.0.0 — the searched form of a repetition, out of line.
+///
+/// Its locals would otherwise widen `re_match_seq`'s frame, which recurses
+/// once per concat element: this crate's own ReDoS test matches a
+/// 6,000-element pattern on a 1 MiB stack and overflowed when they lived
+/// there. Same discipline as `seq_group_alt`.
+#[inline(never)]
+fn quant_seq_search(
+    quant: &ReNode,
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    greedy: bool,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<usize>, EvalError> {
+    let mut reach = reachable_ends(quant, s, pos, d, steps)?;
+    if !greedy {
+        reach.reverse();
+    }
+    for e in reach {
+        if let Some(end) = re_match_seq(rest, s, e, d, steps)? {
+            return Ok(Some(end));
+        }
+    }
+    Ok(None)
+}
+
+/// The capture-aware twin of [`seq_alt_longest`].
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn seq_alt_longest_caps(
+    branches: &[ReNode],
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    d: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<Option<usize>, EvalError> {
+    let mut best: Option<(usize, usize)> = None;
+    for (i, b) in branches.iter().enumerate() {
+        let mark = journal.len();
+        if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)?
+            && let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)?
+            && best.is_none_or(|(x, _)| e > x)
+        {
+            best = Some((e, i));
+        }
+        cap_undo(caps, journal, mark);
+    }
+    let Some((_, i)) = best else { return Ok(None) };
+    let p = re_match_at_caps(&branches[i], s, pos, d, steps, caps, journal)?
+        .expect("the winning branch matched a moment ago");
+    re_match_seq_caps(rest, s, p, d, steps, caps, journal)
+}
+
+/// The capture-aware twin, out of line for the same reason.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn quant_seq_search_caps(
+    quant: &ReNode,
+    inner: &ReNode,
+    rest: &[ReNode],
+    s: &[char],
+    pos: usize,
+    min: usize,
+    max: Option<usize>,
+    greedy: bool,
+    d: u32,
+    steps: &mut u64,
+    caps: &mut Caps,
+    journal: &mut CapJournal,
+) -> Result<Option<usize>, EvalError> {
+    let quant_mark = journal.len();
+    let mut reach = reachable_ends(quant, s, pos, d, steps)?;
+    if !greedy {
+        reach.reverse();
+    }
+    for e in reach {
+        cap_undo(caps, journal, quant_mark);
+        recut_repetition(
+            inner, s, pos, e, min, max, d, steps, caps, journal, quant_mark,
+        )?;
+        let tail_mark = journal.len();
+        if let Some(end) = re_match_seq_caps(rest, s, e, d, steps, caps, journal)? {
+            return Ok(Some(end));
+        }
+        cap_undo(caps, journal, tail_mark);
+    }
+    cap_undo(caps, journal, quant_mark);
+    Ok(None)
+}
+
+/// The standalone form: the quantifier's own reachable ends, greedy taking
+/// the longest and lazy the shortest. Out of line for the same reason.
+#[inline(never)]
+fn quant_search(
+    quant: &ReNode,
+    s: &[char],
+    pos: usize,
+    greedy: bool,
+    d: u32,
+    steps: &mut u64,
+) -> Result<Option<usize>, EvalError> {
+    let ends = reachable_ends(quant, s, pos, d, steps)?;
+    Ok(if greedy {
+        ends.first().copied()
+    } else {
+        ends.last().copied()
+    })
+}
+
 fn re_match_at_caps(
     node: &ReNode,
     s: &[char],
@@ -1363,25 +1857,46 @@ fn re_match_at_caps(
             Ok(ok.then_some(pos))
         }
         ReNode::Concat(items) => re_match_seq_caps(items, s, pos, d, steps, caps, journal),
+        // 9.0.0 — the longest branch, as POSIX prefers; the winner is
+        // re-run so its captures are the ones left behind.
         ReNode::Alt(branches) => {
-            for b in branches {
+            let mut best: Option<(usize, usize)> = None;
+            for (i, b) in branches.iter().enumerate() {
                 let mark = journal.len();
-                if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
-                    return Ok(Some(p));
+                if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)?
+                    && best.is_none_or(|(e, _)| p > e)
+                {
+                    best = Some((p, i));
                 }
                 cap_undo(caps, journal, mark);
             }
-            Ok(None)
+            match best {
+                Some((_, i)) => re_match_at_caps(&branches[i], s, pos, d, steps, caps, journal),
+                None => Ok(None),
+            }
         }
         ReNode::Quant {
             inner,
             min,
             max,
             greedy,
+            variable,
         } => {
             // Standalone quantifier (no tail): greedy = longest, lazy = fewest.
             // Captures accumulate across reps (PG: `(a)*` keeps the LAST rep);
             // a rep that fails past the minimum leaves the earlier caps intact.
+            let quant_mark = journal.len();
+            // 9.0.0 — a rep with more than one length is searched, and the
+            // captures are the cut PostgreSQL reports; see `preferred_cut`.
+            if *variable {
+                let Some(end) = quant_search(node, s, pos, *greedy, d, steps)? else {
+                    return Ok(None);
+                };
+                recut_repetition(
+                    inner, s, pos, end, *min, *max, d, steps, caps, journal, quant_mark,
+                )?;
+                return Ok(Some(end));
+            }
             let mut count = 0usize;
             let mut p = pos;
             loop {
@@ -1408,6 +1923,12 @@ fn re_match_at_caps(
             if count < *min {
                 return Ok(None);
             }
+            // 9.0.0 — the repetition PostgreSQL's captures report; see
+            // `recut_repetition`. The greedy walk above already is the
+            // answer when the minimum is zero.
+            recut_repetition(
+                inner, s, pos, p, *min, *max, d, steps, caps, journal, quant_mark,
+            )?;
             Ok(Some(p))
         }
         ReNode::Lookahead { negative, inner } => {
@@ -1474,17 +1995,31 @@ fn seq_group_alt_caps(
     let ReNode::Alt(branches) = inner else {
         unreachable!("guarded by the caller's own matches!")
     };
-    for b in branches {
+    // 9.0.0 — POSIX picks the alternative that makes the WHOLE match
+    // longest, and among equals the one that makes THIS group longest
+    // (subexpressions are preferred left to right). Measured on PG 18.6:
+    // `(fo|foo)(bar|obar)` on `foobar` is `{foo,bar}`, where taking the
+    // first branch that fits gives `{fo,obar}` — sentori's §4.3.
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (i, b) in branches.iter().enumerate() {
         let mark = journal.len();
         if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
             cap_set(caps, journal, idx, (pos, p));
-            if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)? {
-                return Ok(Some(e));
+            if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)?
+                && best.is_none_or(|(be, bspan, _)| e > be || (e == be && p - pos > bspan))
+            {
+                best = Some((e, p - pos, i));
             }
         }
         cap_undo(caps, journal, mark);
     }
-    Ok(None)
+    let Some((_, _, i)) = best else {
+        return Ok(None);
+    };
+    let p = re_match_at_caps(&branches[i], s, pos, d, steps, caps, journal)?
+        .expect("the winning branch matched a moment ago");
+    cap_set(caps, journal, idx, (pos, p));
+    re_match_seq_caps(rest, s, p, d, steps, caps, journal)
 }
 
 fn re_match_seq_caps(
@@ -1537,6 +2072,7 @@ fn re_match_seq_caps(
                 min,
                 max,
                 greedy,
+                ..
             } = &**inner
             else {
                 unreachable!()
@@ -1598,10 +2134,19 @@ fn re_match_seq_caps(
             min,
             max,
             greedy,
+            variable,
         } => {
             // Enumerate reachable ends, recording a journal MARK before each
             // rep so trying the tail at `k` reps can undo the captures made by
             // the reps beyond `k` (otherwise a backtrack leaves stale caps).
+            // 9.0.0 — a rep that can be more than one length reaches ends
+            // the greedy walk never visits (`(a|aa){3}` over `aaa`), and
+            // the cut it is made of is what the captures report.
+            if *variable {
+                return quant_seq_search_caps(
+                    first, inner, rest, s, pos, *min, *max, *greedy, d, steps, caps, journal,
+                );
+            }
             let mut ends = alloc::vec![pos];
             let mut marks = alloc::vec![journal.len()];
             let mut p = pos;
@@ -1649,17 +2194,10 @@ fn re_match_seq_caps(
             }
             Ok(None)
         }
+        // 9.0.0 — the branch whose whole match ends furthest, re-run so
+        // its captures stand. Out of line, as in the capture-free twin.
         ReNode::Alt(branches) => {
-            for b in branches {
-                let mark = journal.len();
-                if let Some(p) = re_match_at_caps(b, s, pos, d, steps, caps, journal)? {
-                    if let Some(e) = re_match_seq_caps(rest, s, p, d, steps, caps, journal)? {
-                        return Ok(Some(e));
-                    }
-                }
-                cap_undo(caps, journal, mark);
-            }
-            Ok(None)
+            seq_alt_longest_caps(branches, rest, s, pos, d, steps, caps, journal)
         }
         ReNode::Concat(nested) => {
             let mut combined: alloc::vec::Vec<ReNode> =
@@ -3338,10 +3876,12 @@ mod pg18_differential_tests {
     // or ARCHITECTURAL (backreferences) and need a focused slice each.
     #[test]
     fn pg18_known_deferred_divergences() {
-        // POSIX-longest alternation — the biggest known correctness gap.
-        // PG18: regexp_match('ab','a|ab') = {ab}  (longest overall)
-        // SPG : leftmost-first branch wins → {a}
-        assert_eq!(span("ab", "a|ab"), Some("a".to_string()));
+        // 9.0.0 — POSIX-longest alternation was the biggest known gap and
+        // is closed: `regexp_match('ab','a|ab')` is `{ab}` on PG 18.6, and
+        // the leftmost-FIRST answer this used to pin (`{a}`) was sentori's
+        // §4.3. Kept here, asserting PostgreSQL's answer, so the register
+        // of deferred divergences shows the row closed rather than gone.
+        assert_eq!(span("ab", "a|ab"), Some("ab".to_string()));
 
         // (Lazy / non-greedy quantifiers `*? +? ?? {m,n}?` are now
         //  implemented — see the lazy span cases in

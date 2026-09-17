@@ -754,6 +754,29 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
             baseline_uris.push(uri);
         }
         let baseline_uri = baseline_uris.join(",");
+        // 9.0.0 — the JUDGED leg gets a twin too, for the same reason the
+        // other side has baselines: without one, a cell where the judged
+        // PROCESS was simply slower had nothing to be measured against
+        // and read as a verdict about the collation. Measured on mini
+        // with BOTH legs under `C` — nothing for the panel to vary — it
+        // still called `400000 top-N LIMIT 10` a LOSS, 9.270-9.532
+        // against 6.152-6.473, server-reported 9.203 against 6.068.
+        let twin_tmp = crate::proclib::run_tmp_dir(&format!("{runid}-sweep-locale-twin"));
+        let _ = std::fs::remove_dir_all(&twin_tmp);
+        let twin_port = roster3.spawn_server_env(
+            "sweep-leg-locale-twin",
+            &bin,
+            &twin_tmp,
+            Duration::from_secs(20),
+            bind,
+            &[("SPG_LC_COLLATE", "en_US.utf8")],
+        )?;
+        let twin_uri = format!("postgres://bench:bench@{host}:{twin_port}/bench");
+        sh(
+            root,
+            &format!("{psql} --no-psqlrc -X -q -tA '{twin_uri}' -c 'SELECT 1'"),
+        )
+        .map_err(|e| format!("locale twin leg {twin_uri} not answering: {e}"))?;
         // `SIZES` trimmed to the largest band only: the question is a
         // cost CLASS, which the widest row count answers most clearly,
         // and the whole panel twice would not fit the tier's budget.
@@ -766,7 +789,7 @@ pub fn perf_sweep(root: &Path, runid: &str, with_shipped_panel: bool) -> Result<
                 // processes is not a verdict about collation. See the
                 // note at the withdrawal in `perf-endpoint-sweep.sh`.
                 "PSQL='{psql}' PG_URI='{spg_uri}' SPG_URI='{locale_uri}' \
-                 BASELINE_URI='{baseline_uri}' SIZES=400000 \
+                 BASELINE_URI='{baseline_uri}' SPG_TWIN_URI='{twin_uri}' SIZES=400000 \
                  EXPECT_SPG_COLLATE=en_US.utf8 ALLOW_COLLATION_MISMATCH=1 \
                  SELF_COMPARISON=1 \
                  SORT_CEILING=2.0 \
