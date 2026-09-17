@@ -11,7 +11,17 @@ the current build; this file is a release-organized view.
 ## [Unreleased]
 
 
-## [8.0.3] — 2026-09-17
+## [8.0.4] — 2026-09-17
+
+**8.0.3 was tagged and never published.** Its release gate went red
+twice, on the same step and never on the product: the prerelease tier
+runs one group of steps on threads of a single process, each with its
+own list of servers, and two of them were handed the same port — one
+server serving PostgreSQL's protocol on `0.0.0.0:P`, another its native
+protocol on `127.0.0.1:P`, and the dump round-trip's `psql` reached the
+second (`received invalid response to SSL negotiation: -`). A port is
+now claimed process-wide from the moment it is chosen until the server
+holds it. 8.0.4 carries 8.0.3's changes unchanged, plus that fix.
 
 A patch release for the defect that kept sentori off SPG: when two
 transactions wrote the same unique key, the one that wrote FIRST was
