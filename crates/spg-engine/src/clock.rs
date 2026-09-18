@@ -131,14 +131,44 @@ pub(crate) struct ClockAt {
     pub(crate) wall: i64,
 }
 
+/// 9.0.0 — what one rewrite of one statement needs, and what it found.
+///
+/// `folded` is the answer to "did this statement name the clock", and
+/// the folder is the only thing that can answer it exactly: every name
+/// in the family is decided in one place (`clock_replacement_for`), so
+/// a list kept anywhere else goes stale. One did — the wire's plan
+/// cache carried its own six names against the folder's sixteen, and
+/// `SELECT localtimestamp` answered the same instant for the life of
+/// the process.
+pub(crate) struct ClockFold {
+    at: ClockAt,
+    mysql: bool,
+    tz_offset: i64,
+    folded: core::cell::Cell<bool>,
+}
+
+/// Fold every clock call in `stmt` to `now`. Returns whether it folded
+/// anything — a statement that did may not be cached as it stands,
+/// because what it holds now is an instant.
 pub(crate) fn rewrite_clock_calls_at(
     stmt: &mut Statement,
     now: ClockAt,
     mysql: bool,
     tz_offset: i64,
-) {
+) -> bool {
+    let cx = &ClockFold {
+        at: now,
+        mysql,
+        tz_offset,
+        folded: core::cell::Cell::new(false),
+    };
+    rewrite_stmt_clock(stmt, cx);
+    cx.folded.get()
+}
+
+fn rewrite_stmt_clock(stmt: &mut Statement, cx: &ClockFold) {
     match stmt {
-        Statement::Select(s) => rewrite_select_clock(s, now, mysql, tz_offset),
+        Statement::Select(s) => rewrite_select_clock(s, cx),
         // 8.0.2 — the statements that MATERIALISE a SELECT.
         //
         // `CREATE TABLE … AS SELECT` parses to this same node with
@@ -161,12 +191,12 @@ pub(crate) fn rewrite_clock_calls_at(
         // materialises may fold, and this node is the only one that
         // does.
         Statement::CreateMaterializedView(v) => {
-            rewrite_select_clock(&mut v.body, now, mysql, tz_offset);
+            rewrite_select_clock(&mut v.body, cx);
         }
         Statement::Insert(ins) => {
             for row in &mut ins.rows {
                 for e in row {
-                    rewrite_expr_clock(e, now, mysql, tz_offset);
+                    rewrite_expr_clock(e, cx);
                 }
             }
             // `ON CONFLICT … DO UPDATE SET created_at = NOW()` —
@@ -179,10 +209,10 @@ pub(crate) fn rewrite_clock_calls_at(
                 } = &mut clause.action
             {
                 for (_, e) in assignments.iter_mut() {
-                    rewrite_expr_clock(e, now, mysql, tz_offset);
+                    rewrite_expr_clock(e, cx);
                 }
                 if let Some(w) = where_ {
-                    rewrite_expr_clock(w, now, mysql, tz_offset);
+                    rewrite_expr_clock(w, cx);
                 }
             }
             // v7.40.10 — and the SELECT it inserts FROM.
@@ -201,7 +231,7 @@ pub(crate) fn rewrite_clock_calls_at(
             // field in v7.33 and this walk never did. Reported against
             // 7.40.9; 7.40.7 and 7.40.8 refuse it too.
             if let Some(sel) = &mut ins.select_source {
-                rewrite_select_clock(sel, now, mysql, tz_offset);
+                rewrite_select_clock(sel, cx);
             }
         }
         // `UPDATE … SET seen_at = NOW() WHERE …` / `DELETE … WHERE
@@ -209,22 +239,22 @@ pub(crate) fn rewrite_clock_calls_at(
         // SELECT / INSERT-rows were walked).
         Statement::Update(u) => {
             for (_, e) in &mut u.assignments {
-                rewrite_expr_clock(e, now, mysql, tz_offset);
+                rewrite_expr_clock(e, cx);
             }
             if let Some(w) = &mut u.where_ {
-                rewrite_expr_clock(w, now, mysql, tz_offset);
+                rewrite_expr_clock(w, cx);
             }
         }
         Statement::Delete(d) => {
             if let Some(w) = &mut d.where_ {
-                rewrite_expr_clock(w, now, mysql, tz_offset);
+                rewrite_expr_clock(w, cx);
             }
         }
         _ => {}
     }
 }
 
-fn rewrite_select_clock(s: &mut SelectStatement, now: ClockAt, mysql: bool, tz_offset: i64) {
+fn rewrite_select_clock(s: &mut SelectStatement, cx: &ClockFold) {
     // v7.38.7 — pin the name BEFORE the rewrite takes it away.
     //
     // Folding `now()` to a literal is what makes the clock stable across
@@ -244,7 +274,7 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: ClockAt, mysql: bool, tz_o
         {
             let before = spg_sql::ast::figure_column_name(expr);
             let mut probe = expr.clone();
-            rewrite_expr_clock(&mut probe, now, mysql, tz_offset);
+            rewrite_expr_clock(&mut probe, cx);
             let after = spg_sql::ast::figure_column_name(&probe);
             if before != after && before.is_some() {
                 *alias = before;
@@ -257,7 +287,7 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: ClockAt, mysql: bool, tz_o
     // rewrite (NOW() inside a CTE previously survived to eval as
     // "unknown function `now`").
     let _ = walk_select_exprs_mut(s, &mut |e| {
-        rewrite_expr_clock(e, now, mysql, tz_offset);
+        rewrite_expr_clock(e, cx);
         Ok(())
     });
 }
@@ -269,35 +299,34 @@ fn rewrite_select_clock(s: &mut SelectStatement, now: ClockAt, mysql: bool, tz_o
 /// functions, and bare `CURRENT_TIMESTAMP` / `CURRENT_DATE` column
 /// refs) sit on their own arms with match guards so the fall-through
 /// to the recursive arms is unambiguous.
-fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
+fn rewrite_expr_clock(e: &mut Expr, cx: &ClockFold) {
     // Fast-path test on the no-recursion shapes first. We can't fold
     // them into the big match below because they need to *replace* `e`
     // outright; the recursive arms below match on its sub-fields.
-    if let Some(replacement) = clock_replacement_for(e, now, mysql, tz_offset) {
+    if let Some(replacement) = clock_replacement_for(e, cx) {
         *e = replacement;
+        cx.folded.set(true);
         return;
     }
     match e {
-        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset)
-        }
-        Expr::Variadic(expr) => rewrite_expr_clock(expr, now, mysql, tz_offset),
+        Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => rewrite_expr_clock(expr, cx),
+        Expr::Variadic(expr) => rewrite_expr_clock(expr, cx),
         Expr::AggregateOrdered { call, order_by, .. } => {
-            rewrite_expr_clock(call, now, mysql, tz_offset);
+            rewrite_expr_clock(call, cx);
             for o in order_by.iter_mut() {
-                rewrite_expr_clock(&mut o.expr, now, mysql, tz_offset);
+                rewrite_expr_clock(&mut o.expr, cx);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            rewrite_expr_clock(lhs, now, mysql, tz_offset);
-            rewrite_expr_clock(rhs, now, mysql, tz_offset);
+            rewrite_expr_clock(lhs, cx);
+            rewrite_expr_clock(rhs, cx);
         }
         Expr::Unary { expr, .. }
         | Expr::Cast { expr, .. }
         | Expr::IsNull { expr, .. }
         | Expr::BoolTest { expr, .. }
         | Expr::FieldAccess { base: expr, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset);
+            rewrite_expr_clock(expr, cx);
         }
         Expr::FunctionCall { name, args } => {
             // v7.39 (read01 round 97) — the single-arg `age(t)` form is PG's
@@ -353,7 +382,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
                     )
             });
             if args.len() == 1 && name.eq_ignore_ascii_case("age") && !takes_no_clock {
-                let midnight = now.xact.div_euclid(86_400_000_000) * 86_400_000_000;
+                let midnight = cx.at.xact.div_euclid(86_400_000_000) * 86_400_000_000;
                 let today = Expr::Cast {
                     expr: alloc::boxed::Box::new(Expr::Literal(Literal::Integer(midnight))),
                     target: spg_sql::ast::CastTarget::Timestamp,
@@ -361,34 +390,34 @@ fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
                 args.insert(0, today);
             }
             for a in args {
-                rewrite_expr_clock(a, now, mysql, tz_offset);
+                rewrite_expr_clock(a, cx);
             }
         }
         Expr::Like { expr, pattern, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset);
-            rewrite_expr_clock(pattern, now, mysql, tz_offset);
+            rewrite_expr_clock(expr, cx);
+            rewrite_expr_clock(pattern, cx);
         }
-        Expr::Extract { source, .. } => rewrite_expr_clock(source, now, mysql, tz_offset),
+        Expr::Extract { source, .. } => rewrite_expr_clock(source, cx),
         // v4.10 subquery nodes — recurse into the inner SELECT's
         // expression slots so e.g. SELECT NOW() in a scalar
         // subquery picks up the same instant as the outer query.
-        Expr::ScalarSubquery(s) => rewrite_select_clock(s, now, mysql, tz_offset),
-        Expr::Exists { subquery, .. } => rewrite_select_clock(subquery, now, mysql, tz_offset),
+        Expr::ScalarSubquery(s) => rewrite_select_clock(s, cx),
+        Expr::Exists { subquery, .. } => rewrite_select_clock(subquery, cx),
         Expr::InSubquery { expr, subquery, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset);
-            rewrite_select_clock(subquery, now, mysql, tz_offset);
+            rewrite_expr_clock(expr, cx);
+            rewrite_select_clock(subquery, cx);
         }
         Expr::RowInSubquery { row, subquery, .. } => {
             for el in row {
-                rewrite_expr_clock(el, now, mysql, tz_offset);
+                rewrite_expr_clock(el, cx);
             }
-            rewrite_select_clock(subquery, now, mysql, tz_offset);
+            rewrite_select_clock(subquery, cx);
         }
         Expr::RowCmpSubquery { row, subquery, .. } => {
             for el in row {
-                rewrite_expr_clock(el, now, mysql, tz_offset);
+                rewrite_expr_clock(el, cx);
             }
-            rewrite_select_clock(subquery, now, mysql, tz_offset);
+            rewrite_select_clock(subquery, cx);
         }
         // v4.12 window functions — args + PARTITION BY + ORDER BY
         // may all reference clock literals.
@@ -399,42 +428,42 @@ fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
             ..
         } => {
             for a in args {
-                rewrite_expr_clock(a, now, mysql, tz_offset);
+                rewrite_expr_clock(a, cx);
             }
             for p in partition_by {
-                rewrite_expr_clock(p, now, mysql, tz_offset);
+                rewrite_expr_clock(p, cx);
             }
             for (e, _, _) in order_by {
-                rewrite_expr_clock(e, now, mysql, tz_offset);
+                rewrite_expr_clock(e, cx);
             }
         }
         Expr::Literal(_) | Expr::Placeholder(_) | Expr::Column(_) => {}
         Expr::Array(items) => {
             for elem in items {
-                rewrite_expr_clock(elem, now, mysql, tz_offset);
+                rewrite_expr_clock(elem, cx);
             }
         }
         Expr::ArraySubscript { target, index } => {
-            rewrite_expr_clock(target, now, mysql, tz_offset);
-            rewrite_expr_clock(index, now, mysql, tz_offset);
+            rewrite_expr_clock(target, cx);
+            rewrite_expr_clock(index, cx);
         }
         Expr::ArraySlice { target, lo, hi } => {
-            rewrite_expr_clock(target, now, mysql, tz_offset);
+            rewrite_expr_clock(target, cx);
             if let Some(l) = lo {
-                rewrite_expr_clock(l, now, mysql, tz_offset);
+                rewrite_expr_clock(l, cx);
             }
             if let Some(h) = hi {
-                rewrite_expr_clock(h, now, mysql, tz_offset);
+                rewrite_expr_clock(h, cx);
             }
         }
         Expr::AnyAll { expr, array, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset);
-            rewrite_expr_clock(array, now, mysql, tz_offset);
+            rewrite_expr_clock(expr, cx);
+            rewrite_expr_clock(array, cx);
         }
         Expr::InList { expr, list, .. } => {
-            rewrite_expr_clock(expr, now, mysql, tz_offset);
+            rewrite_expr_clock(expr, cx);
             for item in list {
-                rewrite_expr_clock(item, now, mysql, tz_offset);
+                rewrite_expr_clock(item, cx);
             }
         }
         Expr::Case {
@@ -443,14 +472,14 @@ fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
             else_branch,
         } => {
             if let Some(o) = operand {
-                rewrite_expr_clock(o, now, mysql, tz_offset);
+                rewrite_expr_clock(o, cx);
             }
             for (w, t) in branches {
-                rewrite_expr_clock(w, now, mysql, tz_offset);
-                rewrite_expr_clock(t, now, mysql, tz_offset);
+                rewrite_expr_clock(w, cx);
+                rewrite_expr_clock(t, cx);
             }
             if let Some(e) = else_branch {
-                rewrite_expr_clock(e, now, mysql, tz_offset);
+                rewrite_expr_clock(e, cx);
             }
         }
     }
@@ -462,7 +491,7 @@ fn rewrite_expr_clock(e: &mut Expr, now: ClockAt, mysql: bool, tz_offset: i64) {
 /// `CURRENT_TIMESTAMP()` / `CURRENT_DATE()`) and bare-identifier forms
 /// (`CURRENT_TIMESTAMP` / `CURRENT_DATE` as unqualified column refs,
 /// which is how PG accepts them without parens).
-fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> Option<Expr> {
+fn clock_replacement_for(e: &Expr, cx: &ClockFold) -> Option<Expr> {
     // v7.39 (round 349, M6) — the fractional-seconds precision argument:
     // `NOW(3)`, `CURRENT_TIMESTAMP(3)`, `CURTIME(3)`. MariaDB 11 renders
     // `NOW(3)` as `2026-07-22 12:46:41.541` and `NOW(6)` with six digits;
@@ -473,7 +502,7 @@ fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> 
     // error was right; it stays.)
     let precision = match e {
         Expr::FunctionCall { name, args }
-            if args.len() == 1 && (mysql || !name.eq_ignore_ascii_case("now")) =>
+            if args.len() == 1 && (cx.mysql || !name.eq_ignore_ascii_case("now")) =>
         {
             match args.first() {
                 // Out of range: leave the call alone so the ordinary
@@ -586,11 +615,11 @@ fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> 
     };
     let shape = shape?;
     let now = if kind == ClockSite::Fn && name.eq_ignore_ascii_case("statement_timestamp") {
-        at.stmt
+        cx.at.stmt
     } else if kind == ClockSite::Fn && name.eq_ignore_ascii_case("clock_timestamp") {
-        at.wall
+        cx.at.wall
     } else {
-        at.xact
+        cx.at.xact
     };
     // A precision of `p` keeps p fractional digits; 0 keeps none. Both
     // oracles truncate rather than round (measured).
@@ -606,7 +635,7 @@ fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> 
     // same number in every zone. `current_date` under `SET TimeZone =
     // 'Asia/Tokyo'` named yesterday for the first nine hours of every
     // day, and `localtimestamp` was nine hours off all day.
-    let local = now.saturating_add(tz_offset);
+    let local = now.saturating_add(cx.tz_offset);
     if matches!(shape, ClockShape::TimeText) {
         let day_us = local.rem_euclid(86_400_000_000);
         let day_secs = day_us / 1_000_000;
@@ -640,7 +669,7 @@ fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> 
             day_us % 1_000_000
         );
         let target = if matches!(shape, ClockShape::TimeOfDayTz) {
-            let off_secs = tz_offset.div_euclid(1_000_000);
+            let off_secs = cx.tz_offset.div_euclid(1_000_000);
             let (sign, a) = if off_secs < 0 {
                 ('-', -off_secs)
             } else {
@@ -688,4 +717,99 @@ fn clock_replacement_for(e: &Expr, at: ClockAt, mysql: bool, tz_offset: i64) -> 
 enum ClockSite {
     Fn,
     BareIdent,
+}
+
+// ---------------------------------------------------------------
+// 9.0.0 — the statement's own start, kept per backend.
+// ---------------------------------------------------------------
+
+#[cfg(feature = "std")]
+extern crate std;
+
+/// No statement is running, or the host wired no clock.
+const UNSET: i64 = i64::MIN;
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// The start of the statement this backend is running, or `UNSET`.
+    static STMT_START: core::cell::Cell<i64> = const { core::cell::Cell::new(UNSET) };
+}
+
+/// SPGE is single-threaded, so the embedded build keeps the same
+/// reading in a plain static.
+#[cfg(not(feature = "std"))]
+static STMT_START: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(UNSET);
+
+#[cfg(feature = "std")]
+fn load_stmt_start() -> i64 {
+    STMT_START.with(core::cell::Cell::get)
+}
+
+#[cfg(not(feature = "std"))]
+fn load_stmt_start() -> i64 {
+    STMT_START.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "std")]
+fn store_stmt_start(v: i64) {
+    STMT_START.with(|c| c.set(v));
+}
+
+#[cfg(not(feature = "std"))]
+fn store_stmt_start(v: i64) {
+    STMT_START.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The instant the running statement started, if one is running.
+pub(crate) fn stmt_start_micros() -> Option<i64> {
+    let v = load_stmt_start();
+    (v != UNSET).then_some(v)
+}
+
+/// 9.0.0 — a running statement, for the length of one.
+///
+/// PostgreSQL reads the clock once when a statement starts
+/// (`stmtStartTimestamp`) and every `now()` /
+/// `statement_timestamp()` in it answers from that reading. SPG read
+/// the clock afresh each time it folded a piece of SQL, and a
+/// statement can grow pieces on the way: a view's body is parsed and
+/// folded during execution, tens of microseconds after the statement
+/// that named it, so
+///
+/// ```text
+///   CREATE VIEW v AS SELECT now() AS n;
+///   SELECT (SELECT n FROM v) = now();   PG `t`   SPG `f`
+/// ```
+///
+/// The reading lives per backend rather than on the `Engine` because
+/// the read path runs concurrent statements through `&Engine`; a
+/// backend here is the thread serving the connection.
+///
+/// Beginning a statement while one is already running is a no-op: a
+/// re-entrant execute (a trigger's SQL, a wire handler inside an
+/// engine entry point) belongs to the statement that provoked it and
+/// reads the same instant.
+#[derive(Debug)]
+#[must_use = "the reading is released when the guard drops"]
+pub struct StatementClock {
+    prev: i64,
+}
+
+impl StatementClock {
+    /// Pin `clock`'s reading for the statement about to run.
+    pub(crate) fn begin(clock: Option<crate::ClockFn>) -> Self {
+        let prev = load_stmt_start();
+        if prev == UNSET
+            && let Some(f) = clock
+        {
+            store_stmt_start(f());
+        }
+        Self { prev }
+    }
+}
+
+impl Drop for StatementClock {
+    fn drop(&mut self) {
+        store_stmt_start(self.prev);
+    }
 }

@@ -330,6 +330,13 @@ fn handle_pg_simple_query(
             );
         }
     }
+    // 9.0.0 — the statement starts HERE, and its clock reading with it.
+    // A SELECT is parsed and folded in one engine call
+    // (`prepare_select_streaming`) and executed in another, and a view's
+    // body is folded inside the second; without a reading that spans
+    // both, `(SELECT n FROM v) = now()` compared two instants of the
+    // same statement and answered false where PG 18.6 answers true.
+    let _stmt_clock = state.engine.read().ok().map(|e| e.begin_statement());
     // v7.39 (read01 round 85 follow-up) — abort-firewall at the wire level,
     // placed ahead of EVERY short-circuit (the pure-int `SELECT <n>` fast path,
     // the SHOW / SET / COPY / canned handlers, and the main execute path). In an
@@ -806,26 +813,17 @@ fn handle_pg_simple_query(
         // (`current_timestamp` / `now` / `clock_timestamp`) we
         // bypass the cache so the clock value can't go stale —
         // wire-probe SCALARSQ SQLs don't hit this gate.
-        let sql_b = sql.as_bytes();
-        // v7.37.42-arena Phase 5 fallback — single-pass cache-
-        // eligibility scan. The original 6 × ci_contains scans were
-        // ~6 × O(n × m) over the SQL bytes (one full pass per needle)
-        // and added measurable wire overhead on every probe; the
-        // combined scan walks `sql_b` once and short-circuits on the
-        // first clock-function hit. Net cumulative win ~3-8 µs on
-        // 100-byte SCALARSQ SQL; sub-noise per call, paid back at the
-        // T1-fallback cumulative-attack level.
-        let cache_eligible = !sql_has_clock_function(sql_b);
-        let cached_stmt = if cache_eligible {
-            pgwire_parse_cache_get(sql)
-        } else {
-            None
-        };
-        let prepared_stmt = if let Some(s) = cached_stmt {
+        // 9.0.0 — the folder says whether this statement named the
+        // clock. This scan used to guess it from six names of the
+        // sixteen the folder knows, so `SELECT localtimestamp`,
+        // `SELECT localtime` and `SELECT statement_timestamp()` were
+        // cached with an instant in them and answered that instant for
+        // the life of the connection.
+        let prepared_stmt = if let Some(s) = pgwire_parse_cache_get(sql) {
             Some(s)
-        } else if let Ok(s) = engine_lock.prepare_select_streaming(sql) {
-            let arc = Arc::new(s);
-            if cache_eligible {
+        } else if let Ok(p) = engine_lock.prepare_select_streaming(sql) {
+            let arc = Arc::new(p.stmt);
+            if !p.clock_folded {
                 pgwire_parse_cache_put(sql, Arc::clone(&arc));
             }
             Some(arc)
@@ -2462,6 +2460,10 @@ fn run_pg_session(
             }
             // Execute (E): portal name + max-rows (0 = all).
             b'E' => {
+                // 9.0.0 — the extended protocol's statement starts here;
+                // see the simple protocol's guard for why the reading
+                // has to span the whole handler.
+                let _stmt_clock = state.engine.read().ok().map(|e| e.begin_statement());
                 if let Err((sqlstate, msg)) = handle_execute(
                     body,
                     &mut portals,
@@ -3511,46 +3513,6 @@ fn sql_has_sequence_mutator(b: &[u8]) -> bool {
             if i + n <= b.len() && b[i..i + n].eq_ignore_ascii_case(needle) {
                 return true;
             }
-        }
-    }
-    false
-}
-
-/// v7.37.42-arena Phase 5 fallback — single-pass scan for any of the
-/// clock-function tokens that disqualify a SELECT from the per-thread
-/// parse cache (cached AST has a baked-in clock value that would go
-/// stale across calls). The six original needles all share the same
-/// short ASCII anchor characters; one O(n) pass over `sql_b` checks
-/// for every anchor and confirms the full needle at match candidates,
-/// short-circuiting on the first hit. Replaces 6 × ci_contains
-/// independent passes.
-fn sql_has_clock_function(b: &[u8]) -> bool {
-    // Anchor: first character of each needle is `c`, `t`, or `n`
-    // (`current_*`, `clock_*`, `transaction_*`, `now(`). Walk once,
-    // gate on that anchor, then confirm prefix via eq_ignore_ascii_case.
-    if b.len() < 4 {
-        return false;
-    }
-    let needles: &[&[u8]] = &[
-        b"current_timestamp",
-        b"current_time",
-        b"current_date",
-        b"clock_timestamp",
-        b"transaction_timestamp",
-        b"now(",
-    ];
-    for i in 0..b.len() {
-        let c = b[i] | 0x20; // ASCII to lowercase
-        match c {
-            b'c' | b't' | b'n' => {
-                for needle in needles {
-                    let n = needle.len();
-                    if i + n <= b.len() && b[i..i + n].eq_ignore_ascii_case(needle) {
-                        return true;
-                    }
-                }
-            }
-            _ => {}
         }
     }
     false

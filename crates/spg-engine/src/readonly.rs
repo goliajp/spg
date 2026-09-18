@@ -22,6 +22,20 @@ use crate::{
     resolve_order_by_position, rewrite_clock_calls, substitute_placeholders,
 };
 
+/// 9.0.0 — a SELECT prepared for the streaming read path, and whether
+/// preparing it folded a clock call.
+///
+/// A folded statement holds an instant, so a caller that caches the AST
+/// by SQL text must not cache this one: over the PostgreSQL wire
+/// `SELECT localtimestamp` answered the same microsecond for the life
+/// of the connection, because the cache's own list of clock names was
+/// six of the sixteen the folder knows.
+#[derive(Debug, Clone)]
+pub struct PreparedSelect {
+    pub stmt: spg_sql::ast::SelectStatement,
+    pub clock_folded: bool,
+}
+
 impl Engine {
     /// v7.11.1 — execute a read-only SQL statement against a
     /// `CatalogSnapshot` without touching this engine. Same
@@ -198,20 +212,20 @@ impl Engine {
     /// the post-prepare AST and re-applies `rewrite_clock_calls` per
     /// invocation since the clock value embedded in the AST drifts).
     /// Otherwise identical to the SQL-string entry point.
-    pub fn prepare_select_streaming(
-        &self,
-        sql: &str,
-    ) -> Result<spg_sql::ast::SelectStatement, EngineError> {
+    pub fn prepare_select_streaming(&self, sql: &str) -> Result<PreparedSelect, EngineError> {
         let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the shared pre-pass. This was the third copy of the
         // list; see `Engine::preprocess`.
-        self.preprocess(&mut stmt);
+        let clock_folded = self.preprocess(&mut stmt);
         let Statement::Select(s) = stmt else {
             return Err(EngineError::Unsupported(
                 "prepare_select_streaming: not a SELECT".into(),
             ));
         };
-        Ok(s)
+        Ok(PreparedSelect {
+            stmt: s,
+            clock_folded,
+        })
     }
 
     /// Re-apply `rewrite_clock_calls` to a previously-prepared AST
@@ -252,6 +266,9 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         self.exec_select_cancel(s, cancel)
     }
 
@@ -287,6 +304,9 @@ impl Engine {
         ) -> Result<(), EngineError>,
     {
         cancel.check()?;
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         // v7.39 (read01 round 57) — this path can short-circuit STRAIGHT into
         // the scalarsq streaming executor, below `exec_select_cancel` and its
         // gate. Check here too.
@@ -341,6 +361,9 @@ impl Engine {
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
         cancel.check()?;
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         // v7.39 (read01 round 57) — same story: the joined-streaming shortcut
         // runs below `exec_select_cancel`.
         self.acl_check_select(s)?;
@@ -382,6 +405,9 @@ impl Engine {
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
         cancel.check()?;
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the shared pre-pass. THIS is the route every autocommit
         // SELECT takes over the wire, and it was the copy that mattered:
@@ -431,6 +457,9 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
         cancel.check()?;
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         let mut stmt = parser::parse_statement_with(sql, self.sql_dialect())?;
         // r1043 — the SAME pre-pass `prepare` runs. This path had its own
         // copy of the list, one pass short of it, and every autocommit
