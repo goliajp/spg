@@ -394,6 +394,7 @@ mod e2e_inet_cidr_round262;
 mod e2e_inet_family;
 mod e2e_inet_masking_round103;
 mod e2e_inet_merge;
+mod e2e_infinite_date_arithmetic_900;
 mod e2e_infinity_datetime;
 mod e2e_info_constraints_round266;
 mod e2e_info_schema_ccu;

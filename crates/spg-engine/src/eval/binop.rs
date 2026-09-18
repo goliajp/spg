@@ -1743,6 +1743,16 @@ fn apply_binary_calendar(
     // former with an `int_value(Date) = None` no-op fall-through.
     match (l, r) {
         (Value::Date(a), Value::Date(b)) if op == BinOp::Sub => {
+            // 9.0.0 — an infinite date has no day count. PG 18.6:
+            // `ERROR: cannot subtract infinite dates`, whichever side is
+            // infinite; SPG answered the sentinel's arithmetic
+            // (`'infinity'::date - '2020-01-01'::date` was 2147465385,
+            // and `'infinity' - 'infinity'` was 0).
+            if date_is_infinite(*a) || date_is_infinite(*b) {
+                return Err(EvalError::TypeMismatch {
+                    detail: "cannot subtract infinite dates".into(),
+                });
+            }
             // PG: date - date → integer (int4) day count, not bigint.
             let days = i64::from(*a) - i64::from(*b);
             return i32::try_from(days).map(Value::Int).map(Some).map_err(|_| {
@@ -1753,15 +1763,49 @@ fn apply_binary_calendar(
         }
         (Value::Timestamp(a), Value::Timestamp(b)) if op == BinOp::Sub => {
             // v7.39 (read01 timestamp.c) — like-signed infinities cannot
-            // subtract (PG "interval out of range"); mixed-sign needs an
-            // interval infinity SPG's Interval can't represent yet
-            // (recorded delta RD-2) so it errors the same way.
-            let a_inf = *a == i64::MAX || *a == i64::MIN;
-            let b_inf = *b == i64::MAX || *b == i64::MIN;
-            if a_inf || b_inf {
-                return Err(EvalError::TypeMismatch {
-                    detail: "interval out of range".into(),
-                });
+            // subtract: PG answers `interval out of range`.
+            //
+            // 9.0.0 — and when they differ, the answer is the infinity of
+            // the side that has one, which SPG's `IntervalKind` has
+            // carried since it was added. It was recorded as RD-2 on the
+            // reading that it could not, and that reading was wrong.
+            // Measured on PG 18.6:
+            //
+            //   'infinity' - '-infinity'    infinity
+            //   '-infinity' - 'infinity'    -infinity
+            //   'infinity' - '2020-01-01'   infinity
+            //   '2020-01-01' - 'infinity'   -infinity
+            //   'infinity' - 'infinity'     ERROR: interval out of range
+            let inf_of = |t: i64| match t {
+                i64::MAX => Some(spg_storage::IntervalKind::PosInf),
+                i64::MIN => Some(spg_storage::IntervalKind::NegInf),
+                _ => None,
+            };
+            let (a_inf, b_inf) = (inf_of(*a), inf_of(*b));
+            if a_inf.is_some() || b_inf.is_some() {
+                let kind = match (a_inf, b_inf) {
+                    (Some(x), Some(y)) if x == y => {
+                        return Err(EvalError::TypeMismatch {
+                            detail: "interval out of range".into(),
+                        });
+                    }
+                    (Some(x), _) => x,
+                    // Only the subtrahend is infinite, so the answer is
+                    // the other infinity.
+                    (None, Some(spg_storage::IntervalKind::PosInf)) => {
+                        spg_storage::IntervalKind::NegInf
+                    }
+                    (None, Some(spg_storage::IntervalKind::NegInf)) => {
+                        spg_storage::IntervalKind::PosInf
+                    }
+                    (None, _) => unreachable!("one side was infinite"),
+                };
+                return Ok(Some(Value::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 0,
+                    kind,
+                }));
             }
             // PG: timestamp - timestamp -> interval, justified to hours (every
             // 24h of the microsecond delta becomes one day). 30h -> `1 day
@@ -1814,6 +1858,12 @@ fn apply_binary_calendar(
         }
         (Value::Date(d), other) if op == BinOp::Add => {
             if let Some(n) = int_value(other) {
+                // 9.0.0 — infinity plus a number is infinity, measured on
+                // PG 18.6 (`'infinity'::date + 1` is `infinity`). SPG
+                // read the sentinel as a day count and overflowed.
+                if date_is_infinite(*d) {
+                    return Ok(Some(Value::Date(*d)));
+                }
                 let days = i64::from(*d).saturating_add(n);
                 let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
                     detail: "DATE + integer overflows DATE range".into(),
@@ -1823,6 +1873,9 @@ fn apply_binary_calendar(
         }
         (other, Value::Date(d)) if op == BinOp::Add => {
             if let Some(n) = int_value(other) {
+                if date_is_infinite(*d) {
+                    return Ok(Some(Value::Date(*d)));
+                }
                 let days = i64::from(*d).saturating_add(n);
                 let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
                     detail: "integer + DATE overflows DATE range".into(),
@@ -1832,6 +1885,9 @@ fn apply_binary_calendar(
         }
         (Value::Date(d), other) if op == BinOp::Sub => {
             if let Some(n) = int_value(other) {
+                if date_is_infinite(*d) {
+                    return Ok(Some(Value::Date(*d)));
+                }
                 let days = i64::from(*d).saturating_sub(n);
                 let days32 = i32::try_from(days).map_err(|_| EvalError::TypeMismatch {
                     detail: "DATE - integer overflows DATE range".into(),
@@ -1938,6 +1994,16 @@ pub(crate) fn apply_binary_interval(
             signed_micros,
         )?))),
         Value::Date(d) => {
+            // 9.0.0 — an infinite date stays infinite, as its timestamp:
+            // PG 18.6 answers `infinity` for
+            // `'infinity'::date - '1 day'::interval`.
+            if date_is_infinite(*d) {
+                return Ok(Some(Value::Timestamp(if *d == i32::MAX {
+                    i64::MAX
+                } else {
+                    i64::MIN
+                })));
+            }
             // PG: `date ± interval` ALWAYS yields TIMESTAMP (rendered at
             // midnight when the interval has no sub-day part), because the
             // interval may carry a time component. `date ± integer` stays a
@@ -2202,6 +2268,12 @@ pub(crate) fn add_interval_to_micros(
         });
     }
     Ok(out)
+}
+
+/// 9.0.0 — PostgreSQL's two infinite dates, which SPG carries as the
+/// extremes of the day count.
+fn date_is_infinite(d: i32) -> bool {
+    d == i32::MAX || d == i32::MIN
 }
 
 /// Dispatch for any binary op when at least one operand is NUMERIC.
