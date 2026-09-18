@@ -206,6 +206,18 @@ pub(crate) fn mysql_data_type_text(
     alloc::string::String::from(s)
 }
 
+/// 9.0.0 — a value for one of the catalog columns PostgreSQL declares
+/// as `"char"`, its internal single-byte type.
+///
+/// 28 of them read `text` here, so `pg_typeof(relkind)` answered `text`
+/// where PG 18.6 answers `"char"`, and a client that types its result
+/// columns saw the wrong OID. An empty string is PG's own value for the
+/// columns that carry one (`attidentity` on a plain column), and it is
+/// byte 0 there, which prints as nothing.
+fn char1(s: &str) -> Value<'static> {
+    Value::Char1(s.as_bytes().first().copied().unwrap_or(0))
+}
+
 pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
     // Ranges report their concrete type name (`int4range`, `numrange`,
     // …); multiranges append `multirange` (`int4multirange`).
@@ -1844,7 +1856,7 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("refclassid", DataType::BigInt, false),
         ColumnSchema::new("refobjid", DataType::BigInt, false),
         ColumnSchema::new("refobjsubid", DataType::Int, false),
-        ColumnSchema::new("deptype", DataType::Text, false),
+        ColumnSchema::new("deptype", DataType::Char1, false),
     ];
     // 7.38.1 S5.2 — views and materialized views DEPEND on the
     // relations their body reads, and pg_dump orders its output by
@@ -1870,7 +1882,7 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
                     Value::BigInt(1259),
                     Value::BigInt(ref_oid),
                     Value::Int(0),
-                    Value::text("n"),
+                    char1("n"), // deptype
                 ]));
             }
         }
@@ -1965,7 +1977,7 @@ fn dep_row(
         Value::BigInt(referenced.0),
         Value::BigInt(referenced.1),
         Value::Int(referenced.2),
-        Value::text(deptype),
+        char1(deptype),
     ])
 }
 
@@ -2082,7 +2094,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("polname", DataType::Text, false),
         ColumnSchema::new("polrelid", DataType::BigInt, false),
-        ColumnSchema::new("polcmd", DataType::Text, false),
+        ColumnSchema::new("polcmd", DataType::Char1, false),
         ColumnSchema::new("polpermissive", DataType::Bool, false),
         ColumnSchema::new("polroles", DataType::Text, false),
         ColumnSchema::new("polqual", DataType::Text, true),
@@ -2108,7 +2120,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
                 Value::BigInt(row_oid),
                 Value::text(p.name.clone()),
                 Value::BigInt(table_oid),
-                Value::text(alloc::string::String::from(p.cmd.as_pg_char())),
+                Value::Char1(p.cmd.as_pg_char() as u8), // polcmd
                 Value::Bool(p.permissive),
                 Value::text(roles),
                 p.using_expr.clone().map_or(Value::Null, Value::text),
@@ -2545,7 +2557,7 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("amname", DataType::Text, false),
         ColumnSchema::new("amhandler", DataType::BigInt, false),
-        ColumnSchema::new("amtype", DataType::Text, false), // 't' table / 'i' index
+        ColumnSchema::new("amtype", DataType::Char1, false), // 't' table / 'i' index
     ];
     // v7.39 (read01 round 52/53) — every AM PG ships, at PG's own oids, so a
     // join through pg_class.relam lands on the right name. SPG implements
@@ -2557,43 +2569,43 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
             Value::BigInt(2),
             Value::text("heap"),
             Value::BigInt(0),
-            Value::text("t"),
+            char1("t"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(403),
             Value::text("btree"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(405),
             Value::text("hash"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(783),
             Value::text("gist"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(2742),
             Value::text("gin"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(4000),
             Value::text("spgist"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(3580),
             Value::text("brin"),
             Value::BigInt(0),
-            Value::text("i"),
+            char1("i"), // amtype
         ]),
     ];
     (schema, rows)
@@ -2631,7 +2643,7 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("collname", DataType::Text, false),
         ColumnSchema::new("collnamespace", DataType::BigInt, false),
         ColumnSchema::new("collowner", DataType::BigInt, false),
-        ColumnSchema::new("collprovider", DataType::Text, false), // 'b'/'c'/'i'
+        ColumnSchema::new("collprovider", DataType::Char1, false), // 'b'/'c'/'i'
         ColumnSchema::new("collisdeterministic", DataType::Bool, false),
         ColumnSchema::new("collencoding", DataType::Int, false),
         ColumnSchema::new("collcollate", DataType::Text, true),
@@ -2671,7 +2683,7 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                     Value::text::<String>(name.into()),
                     Value::BigInt(11), // collnamespace — pg_catalog
                     Value::BigInt(10), // collowner
-                    Value::text::<String>(provider.into()),
+                    char1(provider),   // collprovider
                     Value::Bool(deterministic),
                     Value::Int(encoding),
                     text(cc),
@@ -3308,7 +3320,7 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
         // was missing was the SHAPE, and a tool reading a catalog reads
         // the shape whether or not there are rows in it.
         ColumnSchema::new("subskiplsn", DataType::Text, false),
-        ColumnSchema::new("subtwophasestate", DataType::Text, false),
+        ColumnSchema::new("subtwophasestate", DataType::Char1, false),
         ColumnSchema::new("subdisableonerr", DataType::Bool, false),
         ColumnSchema::new("subpasswordrequired", DataType::Bool, false),
         ColumnSchema::new("subrunasowner", DataType::Bool, false),
@@ -3337,7 +3349,7 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
             Value::Bool(false), // substream
             // PostgreSQL's defaults for a subscription just created.
             Value::text("0/0"), // subskiplsn
-            Value::text("d"),   // subtwophasestate — disabled
+            char1("d"),         // subtwophasestate — disabled
             Value::Bool(false), // subdisableonerr
             Value::Bool(true),  // subpasswordrequired
             Value::Bool(false), // subrunasowner
@@ -3378,7 +3390,7 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("pubviaroot", DataType::Bool, false),
         // v7.39 (round 543) — PG18's generated-column mode. Measured on
         // a fresh `CREATE PUBLICATION … FOR ALL TABLES`: 'n' (none).
-        ColumnSchema::new("pubgencols", DataType::Text, false),
+        ColumnSchema::new("pubgencols", DataType::Char1, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Synthetic OID band — pubs land above the table OID band
@@ -3397,7 +3409,7 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
             Value::Bool(true),  // pubdelete
             Value::Bool(true),  // pubtruncate
             Value::Bool(false), // pubviaroot
-            Value::text("n"),   // pubgencols
+            char1("n"),         // pubgencols
         ]));
     }
     (schema, rows)
@@ -4218,8 +4230,8 @@ fn pg_class_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("reltoastrelid", DataType::BigInt, false),
         ColumnSchema::new("relhasindex", DataType::Bool, false),
         ColumnSchema::new("relisshared", DataType::Bool, false),
-        ColumnSchema::new("relpersistence", DataType::Text, false),
-        ColumnSchema::new("relkind", DataType::Text, false),
+        ColumnSchema::new("relpersistence", DataType::Char1, false),
+        ColumnSchema::new("relkind", DataType::Char1, false),
         ColumnSchema::new("relnatts", DataType::SmallInt, false),
         ColumnSchema::new("relchecks", DataType::SmallInt, false),
         ColumnSchema::new("relhasrules", DataType::Bool, false),
@@ -4228,7 +4240,7 @@ fn pg_class_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("relrowsecurity", DataType::Bool, false),
         ColumnSchema::new("relforcerowsecurity", DataType::Bool, false),
         ColumnSchema::new("relispopulated", DataType::Bool, false),
-        ColumnSchema::new("relreplident", DataType::Text, false),
+        ColumnSchema::new("relreplident", DataType::Char1, false),
         ColumnSchema::new("relispartition", DataType::Bool, false),
         // v7.39 (read01 round 57) — PG leaves relacl NULL while only the
         // owner's implicit privileges apply, and materialises the aclitem
@@ -4359,8 +4371,8 @@ pub(crate) fn synth_pg_class(
             // witness is the one the resolver already uses — a temp
             // relation is stored under a session-prefixed name, so its
             // stored and listed names differ.
-            Value::text(if is_temp { "t" } else { "p" }),
-            Value::text(relkind),
+            char1(if is_temp { "t" } else { "p" }), // relpersistence
+            char1(relkind),
             Value::SmallInt(relnatts),
             Value::SmallInt(i16::try_from(has_checks).unwrap_or(i16::MAX)),
             // v7.39 (round 338, V64) — relhasrules for real. It was pinned
@@ -4379,7 +4391,7 @@ pub(crate) fn synth_pg_class(
             Value::Bool(schema_ref.row_security), // relrowsecurity (v7.39 RLS)
             Value::Bool(schema_ref.force_row_security), // relforcerowsecurity
             Value::Bool(true),                    // relispopulated
-            Value::text("d"),                     // relreplident — 'd' default
+            char1("d"),                           // relreplident — 'd' default
             Value::Bool(is_partition),
             // v7.39 (read01 round 57) — relacl for real: NULL while no GRANT
             // has ever run, then the aclitem array PG prints.
@@ -4441,8 +4453,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false),
-            Value::text(if is_temp { "t" } else { "p" }),
-            Value::text("v"), // relkind — view
+            char1(if is_temp { "t" } else { "p" }), // relpersistence
+            char1("v"),                             // relkind — view
             Value::SmallInt(relnatts),
             Value::SmallInt(0),
             Value::Bool(true),  // relhasrules — the _RETURN rule
@@ -4451,7 +4463,7 @@ pub(crate) fn synth_pg_class(
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(true),  // relispopulated
-            Value::text("n"),   // relreplident — 'n' for a view
+            char1("n"),         // relreplident — 'n' for a view
             Value::Bool(false), // relispartition
             Value::Null,        // relacl
         ]));
@@ -4484,8 +4496,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false),
-            Value::text("p"),
-            Value::text("c"), // relkind — composite type
+            char1("p"), // relpersistence
+            char1("c"), // relkind — composite type
             Value::SmallInt(relnatts),
             Value::SmallInt(0),
             Value::Bool(false), // relhasrules
@@ -4493,8 +4505,8 @@ pub(crate) fn synth_pg_class(
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
-            Value::Bool(true), // relispopulated
-            Value::text("n"),
+            Value::Bool(true),  // relispopulated
+            char1("n"),         // relreplident
             Value::Bool(false), // relispartition
             Value::Null,        // relacl
         ]));
@@ -4530,8 +4542,8 @@ pub(crate) fn synth_pg_class(
                 Value::BigInt(0),
                 Value::Bool(false), // relhasindex (an index has none)
                 Value::Bool(false),
-                Value::text("p"),
-                Value::text("i"), // relkind — index
+                char1("p"), // relpersistence
+                char1("i"), // relkind — index
                 Value::SmallInt(relnatts),
                 Value::SmallInt(0),
                 Value::Bool(false),
@@ -4540,7 +4552,7 @@ pub(crate) fn synth_pg_class(
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true),
-                Value::text("n"), // relreplident — 'n' for an index
+                char1("n"), // relreplident — 'n' for an index
                 Value::Bool(false),
                 Value::Null,
             ]));
@@ -4576,8 +4588,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false),
-            Value::text(if is_temp { "t" } else { "p" }),
-            Value::text("S"), // relkind — SEQUENCE
+            char1(if is_temp { "t" } else { "p" }), // relpersistence
+            char1("S"),                             // relkind — SEQUENCE
             Value::SmallInt(3),
             Value::SmallInt(0),
             Value::Bool(false),
@@ -4586,7 +4598,7 @@ pub(crate) fn synth_pg_class(
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(true),
-            Value::text("n"),
+            char1("n"), // relreplident
             Value::Bool(false),
             crate::acl::render_acl_list(&def.acl).map_or(Value::Null, Value::text),
         ]));
@@ -4622,8 +4634,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
             Value::Bool(false), // relisshared
-            Value::text("p"),
-            Value::text("r"), // relkind
+            char1("p"),         // relpersistence
+            char1("r"),         // relkind
             Value::SmallInt(relnatts),
             Value::SmallInt(0),
             Value::Bool(false), // relhasrules
@@ -4631,8 +4643,8 @@ pub(crate) fn synth_pg_class(
             Value::Bool(false),
             Value::Bool(false),
             Value::Bool(false),
-            Value::Bool(true), // relispopulated
-            Value::text("n"),
+            Value::Bool(true),  // relispopulated
+            char1("n"),         // relreplident
             Value::Bool(false), // relispartition
             Value::Null,        // relacl
         ]));
@@ -4833,18 +4845,18 @@ fn push_system_attributes(rows: &mut Vec<Row<'static>>, attrelid: i64) {
             Value::SmallInt(0), // attndims — smallint, as PG declares it
             Value::Int(-1),
             Value::Bool(*byval),
-            Value::text("p"),
-            Value::text((*align).to_string()),
+            char1("p"),         // attstorage
+            char1(align),       // attalign
             Value::Bool(true),  // attnotnull — PG marks all six NOT NULL
             Value::Bool(false), // atthasdef
-            Value::text(""),
-            Value::text(""),
+            char1(""),          // attidentity
+            char1(""),          // attgenerated
             Value::Bool(false), // attisdropped
             Value::Bool(true),  // attislocal
             Value::Int(0),
             Value::BigInt(0),
             Value::Null,
-            Value::text(""),
+            char1(""), // attcompression
             Value::Bool(false),
             Value::Null,
             Value::Null,
@@ -4868,12 +4880,12 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("attndims", DataType::SmallInt, false),
         ColumnSchema::new("atttypmod", DataType::Int, false),
         ColumnSchema::new("attbyval", DataType::Bool, false),
-        ColumnSchema::new("attstorage", DataType::Text, false),
-        ColumnSchema::new("attalign", DataType::Text, false),
+        ColumnSchema::new("attstorage", DataType::Char1, false),
+        ColumnSchema::new("attalign", DataType::Char1, false),
         ColumnSchema::new("attnotnull", DataType::Bool, false),
         ColumnSchema::new("atthasdef", DataType::Bool, false),
-        ColumnSchema::new("attidentity", DataType::Text, false),
-        ColumnSchema::new("attgenerated", DataType::Text, false),
+        ColumnSchema::new("attidentity", DataType::Char1, false),
+        ColumnSchema::new("attgenerated", DataType::Char1, false),
         ColumnSchema::new("attisdropped", DataType::Bool, false),
         ColumnSchema::new("attislocal", DataType::Bool, false),
         ColumnSchema::new("attinhcount", DataType::Int, false),
@@ -4885,7 +4897,7 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         // PG's positions because SPG's pg_attribute order already
         // differs from PG's (attstattarget sits fourth where PG keeps it
         // twenty-first); reordering the whole thing is its own change.
-        ColumnSchema::new("attcompression", DataType::Text, false),
+        ColumnSchema::new("attcompression", DataType::Char1, false),
         ColumnSchema::new("atthasmissing", DataType::Bool, false),
         ColumnSchema::new("attoptions", DataType::Text, true),
         ColumnSchema::new("attfdwoptions", DataType::Text, true),
@@ -4966,14 +4978,14 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(attndims),
                 Value::Int(pg_atttypmod(col.ty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
-                Value::text(attstorage),
-                Value::text(attalign),
+                char1(attstorage),
+                char1(attalign),
                 Value::Bool(!col.nullable),
                 Value::Bool(has_default),
-                Value::text(attidentity),
+                char1(attidentity),
                 // v7.38 (read01 P6.41) — 's' for a STORED generated column
                 // (SPG stores generated columns as STORED), '' otherwise.
-                Value::text(if col.generated_stored_expr.is_some() {
+                char1(if col.generated_stored_expr.is_some() {
                     "s"
                 } else {
                     ""
@@ -4994,7 +5006,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,
                 // the rest NULL.
-                Value::text(""),    // attcompression
+                char1(""),          // attcompression
                 Value::Bool(false), // atthasmissing
                 Value::Null,        // attoptions
                 Value::Null,        // attfdwoptions
@@ -5033,8 +5045,8 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(-1),
                 Value::Bool(typlen > 0 && typlen <= 8),
-                Value::text(if typlen > 0 { "p" } else { "x" }),
-                Value::text(match typlen {
+                char1(if typlen > 0 { "p" } else { "x" }), // attstorage
+                char1(match typlen {
                     1 => "c",
                     2 => "s",
                     4 => "i",
@@ -5044,8 +5056,8 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 // column's constraint — an outer join can null it.
                 Value::Bool(false),
                 Value::Bool(false), // atthasdef
-                Value::text(""),    // attidentity
-                Value::text(""),    // attgenerated
+                char1(""),          // attidentity
+                char1(""),          // attgenerated
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal
                 Value::Int(0),
@@ -5054,7 +5066,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 // v7.39 (round 543) — PG18's tail, measured on a plain
                 // table: attcompression empty, atthasmissing false,
                 // the rest NULL.
-                Value::text(""),    // attcompression
+                char1(""),          // attcompression
                 Value::Bool(false), // atthasmissing
                 Value::Null,        // attoptions
                 Value::Null,        // attfdwoptions
@@ -5097,8 +5109,8 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(pg_atttypmod(*fty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
-                Value::text(if typlen > 0 { "p" } else { "x" }),
-                Value::text(match typlen {
+                char1(if typlen > 0 { "p" } else { "x" }), // attstorage
+                char1(match typlen {
                     1 => "c",
                     2 => "s",
                     4 => "i",
@@ -5106,8 +5118,8 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 }),
                 Value::Bool(false), // attnotnull
                 Value::Bool(false), // atthasdef
-                Value::text(""),    // attidentity
-                Value::text(""),    // attgenerated
+                char1(""),          // attidentity
+                char1(""),          // attgenerated
                 Value::Bool(false), // attisdropped
                 Value::Bool(true),  // attislocal
                 Value::Int(0),      // attinhcount
@@ -5149,18 +5161,18 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::SmallInt(0), // attndims — smallint, as PG declares it
                 Value::Int(pg_atttypmod(col.ty)),
                 Value::Bool(typlen > 0 && typlen <= 8),
-                Value::text(if typlen > 0 { "p" } else { "x" }),
-                Value::text("i"),
+                char1(if typlen > 0 { "p" } else { "x" }), // attstorage
+                char1("i"),                                // attalign
                 Value::Bool(!col.nullable),
                 Value::Bool(false),                       // atthasdef
-                Value::text(""),                          // attidentity
-                Value::text(""),                          // attgenerated
+                char1(""),                                // attidentity
+                char1(""),                                // attgenerated
                 Value::Bool(false),                       // attisdropped
                 Value::Bool(true),                        // attislocal
                 Value::Int(0),                            // attinhcount
                 Value::BigInt(pg_attr_collation(col.ty)), // attcollation
                 Value::Null,                              // attacl
-                Value::text(""),                          // attcompression
+                char1(""),                                // attcompression
                 Value::Bool(false),                       // atthasmissing
                 Value::Null,                              // attoptions
                 Value::Null,                              // attfdwoptions
@@ -5565,7 +5577,7 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("oprname", DataType::Text, false),
         ColumnSchema::new("oprnamespace", DataType::BigInt, false),
         ColumnSchema::new("oprowner", DataType::BigInt, false),
-        ColumnSchema::new("oprkind", DataType::Text, false),
+        ColumnSchema::new("oprkind", DataType::Char1, false),
         ColumnSchema::new("oprcanmerge", DataType::Bool, false),
         ColumnSchema::new("oprcanhash", DataType::Bool, false),
         ColumnSchema::new("oprleft", DataType::BigInt, false),
@@ -5614,7 +5626,7 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             Value::text::<String>(name.into()),
             Value::BigInt(11), // oprnamespace — pg_catalog
             Value::BigInt(10), // oprowner
-            Value::text::<String>(kind.into()),
+            char1(kind),       // oprkind
             Value::Bool(canmerge),
             Value::Bool(canhash),
             Value::BigInt(left),
@@ -5898,11 +5910,11 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typowner", DataType::BigInt, false),
         ColumnSchema::new("typlen", DataType::SmallInt, false),
         ColumnSchema::new("typbyval", DataType::Bool, false),
-        ColumnSchema::new("typtype", DataType::Text, false),
-        ColumnSchema::new("typcategory", DataType::Text, false),
+        ColumnSchema::new("typtype", DataType::Char1, false),
+        ColumnSchema::new("typcategory", DataType::Char1, false),
         ColumnSchema::new("typispreferred", DataType::Bool, false),
         ColumnSchema::new("typisdefined", DataType::Bool, false),
-        ColumnSchema::new("typdelim", DataType::Text, false),
+        ColumnSchema::new("typdelim", DataType::Char1, false),
         ColumnSchema::new("typrelid", DataType::BigInt, false),
         ColumnSchema::new("typsubscript", DataType::Text, false),
         ColumnSchema::new("typelem", DataType::BigInt, false),
@@ -5921,8 +5933,8 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typmodin", DataType::BigInt, false),
         ColumnSchema::new("typmodout", DataType::BigInt, false),
         ColumnSchema::new("typanalyze", DataType::BigInt, false),
-        ColumnSchema::new("typalign", DataType::Text, false),
-        ColumnSchema::new("typstorage", DataType::Text, false),
+        ColumnSchema::new("typalign", DataType::Char1, false),
+        ColumnSchema::new("typstorage", DataType::Char1, false),
         ColumnSchema::new("typnotnull", DataType::Bool, false),
         ColumnSchema::new("typbasetype", DataType::BigInt, false),
         ColumnSchema::new("typtypmod", DataType::Int, false),
@@ -5985,11 +5997,11 @@ pub(crate) fn synth_pg_type(
             Value::BigInt(10), // typowner (postgres superuser OID)
             Value::SmallInt(len),
             Value::Bool(typbyval),
-            Value::text::<String>(ty.into()),
-            Value::text::<String>(cat.into()),
+            char1(ty),  // typtype
+            char1(cat), // typcategory
             Value::Bool(typispreferred),
             Value::Bool(true),                       // typisdefined
-            Value::text::<String>(",".into()),       // typdelim
+            char1(","),                              // typdelim
             Value::BigInt(0),                        // typrelid (composite-type table OID)
             Value::text::<String>(subscript.into()), // typsubscript
             Value::BigInt(elem),
@@ -6012,8 +6024,8 @@ pub(crate) fn synth_pg_type(
             Value::BigInt(0), // typmodin
             Value::BigInt(0), // typmodout
             Value::BigInt(0), // typanalyze
-            Value::text::<String>(typalign.into()),
-            Value::text::<String>(typstorage.into()),
+            char1(typalign),
+            char1(typstorage),
             Value::Bool(false), // typnotnull — base types are nullable
             Value::BigInt(0),   // typbasetype (DOMAIN base; 0 for base types)
             Value::Int(-1),     // typtypmod
@@ -6229,7 +6241,7 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("tgname", DataType::Text, false),
         ColumnSchema::new("tgfoid", DataType::BigInt, false),
         ColumnSchema::new("tgtype", DataType::SmallInt, false),
-        ColumnSchema::new("tgenabled", DataType::Text, false),
+        ColumnSchema::new("tgenabled", DataType::Char1, false),
         ColumnSchema::new("tgisinternal", DataType::Bool, false),
         ColumnSchema::new("tgconstrrelid", DataType::BigInt, false),
         ColumnSchema::new("tgconstrindid", DataType::BigInt, false),
@@ -6276,14 +6288,14 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
                 Value::text(t.name.clone()),
                 Value::BigInt(function_oid(cat, &t.function).unwrap_or(0)),
                 Value::SmallInt(tgtype),
-                Value::text(if t.enabled { "O" } else { "D" }),
-                Value::Bool(false), // tgisinternal
-                Value::BigInt(0),   // tgconstrrelid
-                Value::BigInt(0),   // tgconstrindid
-                Value::BigInt(0),   // tgconstraint
-                Value::Bool(false), // tgdeferrable
-                Value::Bool(false), // tginitdeferred
-                Value::SmallInt(0), // tgnargs — SPG's triggers take none
+                char1(if t.enabled { "O" } else { "D" }), // tgenabled
+                Value::Bool(false),                       // tgisinternal
+                Value::BigInt(0),                         // tgconstrrelid
+                Value::BigInt(0),                         // tgconstrindid
+                Value::BigInt(0),                         // tgconstraint
+                Value::Bool(false),                       // tgdeferrable
+                Value::Bool(false),                       // tginitdeferred
+                Value::SmallInt(0),                       // tgnargs — SPG's triggers take none
                 Value::text(""),    // tgattr — empty int2vector, as PG prints it
                 Value::text("\\x"), // tgargs — empty bytea, as PG prints it
                 Value::Null,        // tgqual — no WHEN clause
@@ -6320,13 +6332,13 @@ pub(crate) fn synth_pg_proc(
         // against "-" — wrote `SUPPORT 0` into every CREATE FUNCTION, a
         // syntax error on restore into PostgreSQL and into SPG alike.
         ColumnSchema::new("prosupport", DataType::Text, false),
-        ColumnSchema::new("prokind", DataType::Text, false),
+        ColumnSchema::new("prokind", DataType::Char1, false),
         ColumnSchema::new("prosecdef", DataType::Bool, false),
         ColumnSchema::new("proleakproof", DataType::Bool, false),
         ColumnSchema::new("proisstrict", DataType::Bool, false),
         ColumnSchema::new("proretset", DataType::Bool, false),
-        ColumnSchema::new("provolatile", DataType::Text, false),
-        ColumnSchema::new("proparallel", DataType::Text, false),
+        ColumnSchema::new("provolatile", DataType::Char1, false),
+        ColumnSchema::new("proparallel", DataType::Char1, false),
         ColumnSchema::new("pronargs", DataType::SmallInt, false),
         ColumnSchema::new("pronargdefaults", DataType::SmallInt, false),
         ColumnSchema::new("prorettype", DataType::BigInt, false),
@@ -6404,15 +6416,15 @@ pub(crate) fn synth_pg_proc(
             Value::BigInt(12), // prolang = internal
             Value::Float(1.0), // procost
             Value::Float(prorows),
-            Value::BigInt(0), // provariadic
-            Value::text("-"), // prosupport
-            Value::text::<String>(kind.into()),
+            Value::BigInt(0),         // provariadic
+            Value::text("-"),         // prosupport
+            char1(kind),              // prokind
             Value::Bool(false),       // prosecdef
             Value::Bool(false),       // proleakproof
             Value::Bool(true),        // proisstrict
             Value::Bool(kind == "w"), // proretset — window funcs return per-row sets
-            Value::text::<String>(provolatile.into()),
-            Value::text::<String>("s".into()), // proparallel = safe
+            char1(provolatile),
+            char1("s"), // proparallel = safe
             Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
             Value::SmallInt(0), // pronargdefaults
             Value::BigInt(rettype),
@@ -6461,7 +6473,7 @@ pub(crate) fn synth_pg_proc(
             Value::Float(def.rows.unwrap_or(0.0)),
             Value::BigInt(0),
             Value::text("-"), // prosupport
-            Value::text("f"), // prokind — a normal function
+            char1("f"),       // prokind — a normal function
             Value::Bool(def.security_definer),
             Value::Bool(def.leakproof),
             Value::Bool(def.strict),
@@ -8263,7 +8275,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("oid", DataType::BigInt, false),
         ColumnSchema::new("conname", DataType::Text, false),
         ColumnSchema::new("connamespace", DataType::BigInt, false),
-        ColumnSchema::new("contype", DataType::Text, false),
+        ColumnSchema::new("contype", DataType::Char1, false),
         ColumnSchema::new("condeferrable", DataType::Bool, false),
         ColumnSchema::new("condeferred", DataType::Bool, false),
         // v7.39 (round 543) — PG18's NOT ENFORCED support. SPG enforces
@@ -8275,9 +8287,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("conindid", DataType::BigInt, false),
         ColumnSchema::new("conparentid", DataType::BigInt, false),
         ColumnSchema::new("confrelid", DataType::BigInt, false),
-        ColumnSchema::new("confupdtype", DataType::Text, false),
-        ColumnSchema::new("confdeltype", DataType::Text, false),
-        ColumnSchema::new("confmatchtype", DataType::Text, false),
+        ColumnSchema::new("confupdtype", DataType::Char1, false),
+        ColumnSchema::new("confdeltype", DataType::Char1, false),
+        ColumnSchema::new("confmatchtype", DataType::Char1, false),
         ColumnSchema::new("conislocal", DataType::Bool, false),
         ColumnSchema::new("coninhcount", DataType::Int, false),
         ColumnSchema::new("connoinherit", DataType::Bool, false),
@@ -8352,7 +8364,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
                 Value::BigInt(2200),
-                Value::text::<String>(kind.into()),
+                char1(kind), // contype
                 // v7.39 (round 711) — real, now that the flags are stored.
                 Value::Bool(uc.deferrable),         // condeferrable
                 Value::Bool(uc.initially_deferred), // condeferred
@@ -8363,9 +8375,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(conindid),
                 Value::BigInt(0),  // conparentid
                 Value::BigInt(0),  // confrelid (not an FK)
-                Value::text(" "),  // confupdtype
-                Value::text(" "),  // confdeltype
-                Value::text(" "),  // confmatchtype
+                char1(" "),        // confupdtype
+                char1(" "),        // confdeltype
+                char1(" "),        // confmatchtype
                 Value::Bool(true), // conislocal
                 Value::Int(0),     // coninhcount
                 Value::Bool(true),
@@ -8414,7 +8426,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
                 Value::BigInt(2200),
-                Value::text("f"),
+                char1("f"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true), /* conenforced */
@@ -8424,9 +8436,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(0),
                 Value::BigInt(0),
                 Value::BigInt(confrelid),
-                Value::text::<String>(upd_action.into()),
-                Value::text::<String>(del_action.into()),
-                Value::text("s"), // confmatchtype: 's' SIMPLE (default)
+                char1(upd_action), // confupdtype
+                char1(del_action), // confdeltype
+                char1("s"),        // confmatchtype: 's' SIMPLE (default)
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
@@ -8449,7 +8461,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
                 Value::BigInt(2200),
-                Value::text("c"),
+                char1("c"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true), /* conenforced */
@@ -8463,9 +8475,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(0),
                 Value::BigInt(0),
                 Value::BigInt(0),
-                Value::text(" "),
-                Value::text(" "),
-                Value::text(" "),
+                char1(" "), // confupdtype
+                char1(" "), // confdeltype
+                char1(" "), // confmatchtype
                 Value::Bool(true),
                 Value::Int(0),
                 // connoinherit: FALSE for CHECK (PG18 differential).
@@ -8496,7 +8508,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(next_con_oid()),
                 Value::text(ex.name.clone()),
                 Value::BigInt(2200),
-                Value::text("x"),
+                char1("x"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true), /* conenforced */
@@ -8506,9 +8518,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(0),
                 Value::BigInt(0),
                 Value::BigInt(0),
-                Value::text(" "),
-                Value::text(" "),
-                Value::text(" "),
+                char1(" "), // confupdtype
+                char1(" "), // confdeltype
+                char1(" "), // confmatchtype
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(true),
@@ -8544,7 +8556,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
                 Value::BigInt(2200),
-                Value::text("n"),
+                char1("n"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true), /* conenforced */
@@ -8554,9 +8566,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(0),
                 Value::BigInt(0),
                 Value::BigInt(0),
-                Value::text(" "),
-                Value::text(" "),
-                Value::text(" "),
+                char1(" "), // confupdtype
+                char1(" "), // confdeltype
+                char1(" "), // confmatchtype
                 Value::Bool(true),
                 Value::Int(0),
                 // connoinherit: FALSE for NOT NULL (PG18 differential:
@@ -8609,7 +8621,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 }),
                 Value::text(conname),
                 Value::BigInt(2200),
-                Value::text(kind),
+                char1(kind), // contype
                 Value::Bool(false),
                 Value::Bool(false),
                 Value::Bool(true), /* conenforced */
@@ -8619,9 +8631,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(0),
                 Value::BigInt(0),
                 Value::BigInt(0),
-                Value::text(" "),
-                Value::text(" "),
-                Value::text(" "),
+                char1(" "), // confupdtype
+                char1(" "), // confdeltype
+                char1(" "), // confmatchtype
                 Value::Bool(true),
                 Value::Int(0),
                 Value::Bool(false),
@@ -8670,7 +8682,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("datname", DataType::Text, false),
         ColumnSchema::new("datdba", DataType::BigInt, false),
         ColumnSchema::new("encoding", DataType::Int, false),
-        ColumnSchema::new("datlocprovider", DataType::Text, false),
+        ColumnSchema::new("datlocprovider", DataType::Char1, false),
         ColumnSchema::new("datistemplate", DataType::Bool, false),
         ColumnSchema::new("datallowconn", DataType::Bool, false),
         ColumnSchema::new("dathasloginevt", DataType::Bool, false),
@@ -8722,7 +8734,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
                 Value::BigInt(10),
                 Value::Int(6), // UTF8
                 // 'c' = libc provider, which is what SPG's C collation is.
-                Value::text("c"),
+                char1("c"),         // datlocprovider — libc
                 Value::Bool(false), // datistemplate
                 Value::Bool(true),  // datallowconn
                 Value::Bool(false), // dathasloginevt
@@ -9144,7 +9156,7 @@ const EMPTY_PG_CATALOGS: &[(&str, &[(&str, DataType)])] = &[
             ("objsubid", DataType::Int),
             ("refclassid", DataType::BigInt),
             ("refobjid", DataType::BigInt),
-            ("deptype", DataType::Text),
+            ("deptype", DataType::Char1),
         ],
     ),
     (
@@ -9674,8 +9686,8 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("castsource", DataType::BigInt, false),
         ColumnSchema::new("casttarget", DataType::BigInt, false),
         ColumnSchema::new("castfunc", DataType::BigInt, false),
-        ColumnSchema::new("castcontext", DataType::Text, false),
-        ColumnSchema::new("castmethod", DataType::Text, false),
+        ColumnSchema::new("castcontext", DataType::Char1, false),
+        ColumnSchema::new("castmethod", DataType::Char1, false),
     ];
     // v7.39 (round 635, F18) — the casts SPG performs, with PG's context
     // and method for each.
@@ -9832,8 +9844,8 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
             Value::BigInt(*src),
             Value::BigInt(*tgt),
             Value::BigInt(0),
-            Value::text((*ctx).to_string()),
-            Value::text((*meth).to_string()),
+            char1(ctx),  // castcontext
+            char1(meth), // castmethod
         ]));
     }
     (schema, rows)

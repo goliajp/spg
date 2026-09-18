@@ -2933,6 +2933,22 @@ fn eval_cast_arm(
                 .unwrap_or(s)
                 .trim_matches('"')
                 .to_string();
+            // 9.0.0 — PostgreSQL's `regclassin` reads an all-digit string
+            // as the OID itself, and the relation need not exist
+            // (`'999999'::regclass` is `999999` on 18.6). SPG looked it
+            // up as a NAME, so `psql \d t` failed outright: its
+            // constraint query ends with
+            // `VALUES ('16384'::pg_catalog.regclass)`.
+            if !bare.is_empty()
+                && bare.bytes().all(|b| b.is_ascii_digit())
+                && let Ok(oid) = bare.parse::<i64>()
+            {
+                let name = (oid >= 16384)
+                    .then(|| cat.table_names().into_iter().nth((oid - 16384) as usize))
+                    .flatten()
+                    .unwrap_or(bare);
+                return Ok(Value::RegClass(oid, name.into()));
+            }
             if let Some(oid) = regclass_name_to_oid(cat, &bare) {
                 return Ok(Value::RegClass(oid, bare.into()));
             }
@@ -5794,6 +5810,8 @@ pub(crate) fn pg_typeof_name_for_datatype(t: spg_storage::DataType) -> Option<&'
         D::Timestamp => "timestamp without time zone",
         D::Timestamptz => "timestamp with time zone",
         D::Name => "name",
+        // 9.0.0 — see `pg_typeof_name`'s arm for the value.
+        D::Char1 => "\"char\"",
         D::Xid => "xid",
         D::Xid8 => "xid8",
         D::Oid => "oid",

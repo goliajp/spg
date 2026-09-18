@@ -852,6 +852,12 @@ pub(super) fn pg_typeof_name(v: &Value) -> &'static str {
         Value::Xml(_) => "xml",
         Value::Hstore(_) => "hstore",
         Value::BpChar(_) => "character",
+        // 9.0.0 — PG's internal single-byte type, which the catalog
+        // declares 45 of its own columns as. It fell to the "unknown"
+        // arm below, and `unknown` is what a value of NO type reads as:
+        // `pg_typeof('r'::"char")` answered `unknown` where PG 18.6
+        // answers `"char"`, quotes included.
+        Value::Char1(_) => "\"char\"",
         // An anonymous `row(...)` / whole-row reference is PG's `record`.
         Value::Composite(_) => "record",
         Value::Point(_) => "point",

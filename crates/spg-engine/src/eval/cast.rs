@@ -698,6 +698,26 @@ pub fn cast_value_ref_in(
                 // the search_path; SPG is single-schema so
                 // dropping is always safe.
                 let bare = s.rsplit('.').next().unwrap_or(&s).to_string();
+                // 9.0.0 — PostgreSQL's `regclassin` / `regtypein` read an
+                // all-digit string as the OID itself, and the object need
+                // not exist: `'999999'::regclass` is `999999` on 18.6.
+                // SPG looked it up as a NAME, which is why `psql \d t`
+                // failed outright — its constraint query ends with
+                // `VALUES ('16384'::pg_catalog.regclass)` and SPG
+                // answered `relation "16384" does not exist`.
+                if !bare.is_empty()
+                    && bare.bytes().all(|b| b.is_ascii_digit())
+                    && let Ok(oid) = bare.parse::<i64>()
+                {
+                    return Ok(if matches!(target, CastTarget::RegType) {
+                        crate::conversions::regtype_oid_to_name_owned(oid).map_or_else(
+                            || Value::RegType(oid, bare.clone().into_boxed_str()),
+                            |name| Value::RegType(oid, name.into_boxed_str()),
+                        )
+                    } else {
+                        Value::RegClass(oid, bare.into_boxed_str())
+                    });
+                }
                 // v7.39 (read01 regproc.c) — regtype canonicalizes the
                 // name ('int4' → 'integer') and rejects unknown types
                 // (PG 42704).
@@ -2407,7 +2427,9 @@ fn cast_numeric_to_int(v: Value) -> Result<Value, EvalError> {
             }),
         Value::Bool(b) => Ok(Value::Int(i32::from(b))),
         // v7.39 (read01 char.c) — ("char")::int is the byte value.
-        Value::Char1(b) => Ok(Value::Int(i32::from(b))),
+        // 9.0.0 — `"char"` is a signed byte: PG 18.6 answers -128 for
+        // `((-128)::int::"char")::int`, where SPG answered 128.
+        Value::Char1(b) => Ok(Value::Int(i32::from(b as i8))),
         // PG `bit`/`varbit` → int is the MSB-first bit value.
         #[allow(clippy::cast_possible_truncation)]
         Value::BitString { nbits, bytes } => Ok(Value::Int(crate::conversions::bit_string_to_i64(
