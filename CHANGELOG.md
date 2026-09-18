@@ -10,6 +10,54 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the MySQL wire's clock family was PostgreSQL's
+
+Both dialects read one table, so three spellings answered PostgreSQL's
+shape over the MySQL wire. Measured against MySQL 9.7.2:
+
+```text
+                       MySQL 9.7.2            SPG 8.0.4
+  NOW()                2026-09-18 16:47:54    …16:47:54.997191
+  CURRENT_TIMESTAMP    2026-09-18 16:47:54    …16:47:54.997191
+  LOCALTIME            2026-09-18 16:47:54    16:47:54
+  CURRENT_TIME         16:47:54               16:47:54.997191+00
+```
+
+MySQL's default fractional-seconds precision is 0 — `NOW(6)` is how you
+ask for six digits — its `LOCALTIME` is a synonym for `NOW()` and so a
+DATETIME rather than a TIME, and its `CURRENT_TIME` is a plain TIME with
+no offset. All fifteen spellings in the family now agree with MySQL, and
+the PostgreSQL answers are byte-for-byte what they were.
+
+### Fixed — two errors that carried neither PostgreSQL's class nor its place
+
+An error's SQLSTATE and its character position are the two fields a
+driver and psql read without looking at the words, and both of these
+answered neither.
+
+```text
+                                          PG 18.6            SPG 8.0.4
+  SELECT * FROM t WHERE id                42804, caret id    42883, no caret
+  SELECT * FROM t WHERE 1                 42804, caret 1     42883, no caret
+  SELECT * FROM t HAVING id               42804, caret id    42883, no caret
+  ALTER … ADD CONSTRAINT c UNIQUE
+        USING INDEX <plain index>         42809, caret       42000, caret on
+                                                 CONSTRAINT         the index
+```
+
+`42883` is UNDEFINED_FUNCTION, which a predicate of the wrong type is
+not; it came from the blanket arm every wrong-type message falls to.
+`42000` is the class code, which carries nothing.
+
+The positions needed the statement, not the message. The host answers
+most positions by reading a quoted name back out of the error and
+finding it in the text, and neither of these can be answered that way:
+`WHERE 1` has no name in it and PostgreSQL still points at the `1`, and
+the constraint refusals name the INDEX while PostgreSQL points at
+`CONSTRAINT`. So the parser records where the predicate starts and where
+the constraint element starts, and a new `EngineError::At` carries a
+token beside an error whose message does not hold one.
+
 ### Fixed — `B'101'` is the fixed-width `bit`, and its column has no name
 
 Found by the describe sweep. The parser routes a bit-string literal

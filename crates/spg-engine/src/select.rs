@@ -11272,6 +11272,8 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         replace_agg_exprs(e, &aggs);
     }
     Some(SelectStatement {
+        where_token: spg_sql::ast::SrcToken::NONE,
+        having_token: spg_sql::ast::SrcToken::NONE,
         locking: None,
         ctes: Vec::new(),
         distinct: stmt.distinct,
@@ -14899,7 +14901,10 @@ impl crate::Engine {
         if self.speaks_mysql {
             return Ok(());
         }
-        for (e, clause) in [(&stmt.where_, "WHERE"), (&stmt.having, "HAVING")] {
+        for (e, clause, token) in [
+            (&stmt.where_, "WHERE", stmt.where_token),
+            (&stmt.having, "HAVING", stmt.having_token),
+        ] {
             let Some(e) = e else { continue };
             // A bare string literal is `unknown` on PostgreSQL and
             // coerces; only a lexeme that fixes a type is refused.
@@ -14909,11 +14914,10 @@ impl crate::Engine {
             if let Some(ty) = certain(e)
                 && ty != spg_storage::DataType::Bool
             {
-                return Err(EngineError::Eval(EvalError::TypeMismatch {
-                    detail: alloc::format!(
-                        "argument of {clause} must be type boolean, not type {}",
-                        crate::conversions::pg_type_name_for_error(ty)
-                    ),
+                return Err(EngineError::Eval(EvalError::NotBoolean {
+                    clause,
+                    type_name: crate::conversions::pg_type_name_for_error(ty),
+                    token,
                 }));
             }
         }

@@ -1520,7 +1520,15 @@ pub enum AlterTableTarget {
     /// installed post-CREATE-TABLE. pg_dump emits PKs as a
     /// separate ALTER TABLE statement, so this surface lets the
     /// dump load straight through.
-    AddTableConstraint(TableConstraint),
+    AddTableConstraint {
+        constraint: TableConstraint,
+        /// 9.0.0 — where the constraint element starts: the `CONSTRAINT`
+        /// keyword, or `PRIMARY` / `UNIQUE` / `CHECK` when the name is
+        /// omitted. PostgreSQL's caret for a refused `USING INDEX` sits
+        /// there and not on the index, so the name in the message cannot
+        /// answer it.
+        token: SrcToken,
+    },
     /// v7.39 (round 652) — `OWNER TO <role>`. SPG is single-owner, so
     /// there is nothing to record; what PG does that SPG did not is
     /// REFUSE a role that does not exist. The name has to reach the
@@ -4029,6 +4037,15 @@ pub struct SelectStatement {
     pub items: Vec<SelectItem>,
     pub from: Option<FromClause>,
     pub where_: Option<Expr>,
+    /// 9.0.0 — where the `WHERE` predicate starts, so a predicate that
+    /// is not boolean can carry the character position PostgreSQL
+    /// reports.
+    ///
+    /// The expression alone cannot answer it: a column reference carries
+    /// its own [`SrcToken`], but `WHERE 1` has no name in it to point at,
+    /// and PostgreSQL's caret sits on the `1`. `NONE` on a statement the
+    /// engine built rather than parsed.
+    pub where_token: SrcToken,
     pub group_by: Option<Vec<Expr>>,
     /// v6.4.1 — `GROUP BY ALL` shortcut: when true, the planner
     /// expands `group_by` to every non-aggregate SELECT-list item
@@ -4040,6 +4057,8 @@ pub struct SelectStatement {
     /// aggregate executor resolves them through the same synthetic
     /// schema used for the SELECT items.
     pub having: Option<Expr>,
+    /// 9.0.0 — as [`SelectStatement::where_token`], for `HAVING`.
+    pub having_token: SrcToken,
     /// UNION / UNION ALL chain. Empty for a plain SELECT. Each peer is
     /// itself a `SelectStatement` with `order_by = None` and `limit =
     /// None` (the parser enforces that — ORDER BY / LIMIT belong to the
@@ -8080,7 +8099,7 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
             }
             Ok(())
         }
-        AlterTableTarget::AddTableConstraint(tc) => {
+        AlterTableTarget::AddTableConstraint { constraint: tc, .. } => {
             write!(f, "ADD {tc}")
         }
         AlterTableTarget::ValidateConstraint { name } => {
@@ -10161,6 +10180,8 @@ mod tests {
     #[test]
     fn select_star_from_table() {
         let s = SelectStatement {
+            where_token: SrcToken::NONE,
+            having_token: SrcToken::NONE,
             locking: None,
             items: vec![SelectItem::Wildcard],
             from: Some(FromClause {

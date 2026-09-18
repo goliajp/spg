@@ -614,6 +614,40 @@ fn clock_replacement_for(e: &Expr, cx: &ClockFold) -> Option<Expr> {
         _ => None,
     };
     let shape = shape?;
+    // 9.0.0 — MySQL's clock family is not PostgreSQL's, and both
+    // dialects were reading this one table. Measured on MySQL 9.7.2
+    // against SPG 8.0.4 over the MySQL wire:
+    //
+    // ```text
+    //                    MySQL 9.7.2            SPG 8.0.4
+    //   NOW()            2026-09-18 16:47:54    …16:47:54.997191
+    //   CURRENT_TIMESTAMP  same                 …16:47:54.997191
+    //   LOCALTIME        2026-09-18 16:47:54    16:47:54
+    //   CURRENT_TIME     16:47:54               16:47:54.997191+00
+    // ```
+    //
+    // MySQL's default fractional-seconds precision is 0 — `NOW(6)` is
+    // how you ask for six digits — its `LOCALTIME` is a synonym for
+    // `NOW()` and so a DATETIME, and its `CURRENT_TIME` is a plain
+    // TIME with no offset. The PostgreSQL answers are unchanged.
+    let shape = if cx.mysql {
+        match shape {
+            ClockShape::TimeOfDay | ClockShape::TimeOfDayTz
+                if name.eq_ignore_ascii_case("localtime") =>
+            {
+                ClockShape::Timestamp
+            }
+            ClockShape::TimeOfDay | ClockShape::TimeOfDayTz => ClockShape::TimeText,
+            other => other,
+        }
+    } else {
+        shape
+    };
+    let precision = if cx.mysql {
+        precision.or(Some(0))
+    } else {
+        precision
+    };
     let now = if kind == ClockSite::Fn && name.eq_ignore_ascii_case("statement_timestamp") {
         cx.at.stmt
     } else if kind == ClockSite::Fn && name.eq_ignore_ascii_case("clock_timestamp") {

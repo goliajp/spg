@@ -775,6 +775,21 @@ pub enum EvalError {
         /// The argument types, PostgreSQL's own names, comma-joined.
         types: String,
     },
+    /// 9.0.0 — a `WHERE` or `HAVING` predicate whose type is certain
+    /// without reading a row, and is not boolean.
+    ///
+    /// Its own variant rather than a `TypeMismatch` string because it is
+    /// PostgreSQL's 42804 DATATYPE_MISMATCH, not the 42883 every other
+    /// wrong-type message answers, and because it carries the token the
+    /// host turns into the character position PostgreSQL reports.
+    NotBoolean {
+        /// `WHERE` or `HAVING`.
+        clause: &'static str,
+        /// PostgreSQL's own name for the type the predicate has.
+        type_name: String,
+        /// Where the predicate starts; see [`spg_sql::ast::SrcToken`].
+        token: spg_sql::ast::SrcToken,
+    },
     ColumnNotFound {
         name: String,
         /// 9.0.0 — where the reference that named it stands; the host
@@ -847,6 +862,15 @@ impl core::fmt::Display for EvalError {
             }
             Self::DivisionByZero => f.write_str("division by zero"),
             Self::TypeMismatch { detail } => write!(f, "type mismatch: {detail}"),
+            // The `type mismatch: ` prefix is the engine's own class
+            // marker, stripped at the wire boundary like every other
+            // one; what a client reads is PostgreSQL's sentence alone.
+            Self::NotBoolean {
+                clause, type_name, ..
+            } => write!(
+                f,
+                "type mismatch: argument of {clause} must be type boolean, not type {type_name}"
+            ),
             Self::PlaceholderOutOfRange { n, bound } => write!(
                 f,
                 "parameter ${n} referenced but only {bound} bound by client"

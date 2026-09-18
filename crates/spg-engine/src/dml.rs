@@ -8504,6 +8504,8 @@ fn resolve_unqualified_source_leaf(
             }
             if source {
                 *e = Expr::ScalarSubquery(alloc::boxed::Box::new(spg_sql::ast::SelectStatement {
+                    where_token: spg_sql::ast::SrcToken::NONE,
+                    having_token: spg_sql::ast::SrcToken::NONE,
                     locking: None,
                     ctes: Vec::new(),
                     distinct: false,

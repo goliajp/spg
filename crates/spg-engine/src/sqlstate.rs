@@ -80,6 +80,11 @@ fn window_sqlstate(msg: &str) -> Option<&'static str> {
 /// errno from the SAME classification: the two protocols disagree only on
 /// the code's spelling, never on which failure it was.
 pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, String) {
+    // 9.0.0 — a positioned error is classified by what it wraps; the
+    // position rides its own wire field.
+    if let EngineError::At { inner, .. } = e {
+        return error_to_wire(inner);
+    }
     // 8.0.3 — a PL/pgSQL error already knows its code.
     if let EngineError::Raised { sqlstate, message } = e {
         return (sqlstate.clone(), message.clone());
@@ -403,6 +408,12 @@ pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, Stri
         // column declaration; both raise the same code, so both map here.
         } else if msg.contains("collations are not supported by type") {
             "42804"
+        // 9.0.0 — an index that cannot back a PRIMARY KEY / UNIQUE
+        // constraint is PostgreSQL's 42809 WRONG_OBJECT_TYPE, measured on
+        // 18.6 for all three refusals of `ADD CONSTRAINT … USING INDEX`.
+        // They reached the client as 42000, the class code.
+        } else if msg.contains("Cannot create a primary key or unique constraint using such an index") {
+            "42809"
         } else if msg.contains("multiple primary keys for table")
             // v7.38.19 — a column declared with a pseudo-type is the same
             // class: the table definition is invalid, not the type
@@ -698,6 +709,14 @@ pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, Stri
         // is PG's own sentence now, so this keys on it.
         } else if msg.contains("column reference") && msg.contains("is ambiguous") {
             "42702"
+        // 9.0.0 — `argument of WHERE must be type boolean` is PostgreSQL's
+        // 42804 DATATYPE_MISMATCH, measured on 18.6. It reached the client
+        // as 42883 UNDEFINED_FUNCTION, from the blanket arm below.
+        } else if matches!(
+            e,
+            EngineError::Eval(crate::eval::EvalError::NotBoolean { .. })
+        ) {
+            "42804"
         } else if matches!(
             e,
             EngineError::Eval(crate::eval::EvalError::TypeMismatch { .. })

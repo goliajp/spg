@@ -228,7 +228,9 @@ impl Engine {
                 using,
                 collation,
             } => self.alter_column_type(tbl, column, new_type, using, collation),
-            T::AddTableConstraint(tc) => self.alter_add_table_constraint(tbl, tc),
+            T::AddTableConstraint { constraint, token } => {
+                self.alter_add_table_constraint(tbl, constraint, token)
+            }
             T::ValidateConstraint { name } => self.alter_validate_constraint(tbl, &name),
             // v7.39 (round 652) — SPG is single-owner and has no
             // clustered storage, so both of these remain no-ops once the
@@ -1744,6 +1746,9 @@ impl Engine {
         &mut self,
         tbl: &str,
         tc: spg_sql::ast::TableConstraint,
+        // Where the constraint element starts; PostgreSQL's caret for a
+        // refused `USING INDEX` sits there.
+        at: spg_sql::ast::SrcToken,
     ) -> Result<(), EngineError> {
         // v7.14.0 — pg_dump emits PKs as a separate
         // ALTER TABLE ADD CONSTRAINT post-CREATE-TABLE.
@@ -1823,20 +1828,25 @@ impl Engine {
         let adopted: Option<(String, Vec<String>)> = match using_index {
             None => None,
             Some(idx_name) => {
-                let cannot = |why: &str| {
-                    EngineError::Unsupported(alloc::format!(
+                // 9.0.0 — PostgreSQL 18.6 answers 42809 WRONG_OBJECT_TYPE
+                // for all three of these and points its caret at the
+                // constraint element, not at the index the message names.
+                let cannot = |why: &str| EngineError::At {
+                    token: at,
+                    inner: alloc::boxed::Box::new(EngineError::Unsupported(alloc::format!(
                         "{why} DETAIL: Cannot create a primary key or unique \
                          constraint using such an index."
-                    ))
+                    ))),
                 };
                 let idx = table
                     .indices()
                     .iter()
                     .find(|i| i.name.eq_ignore_ascii_case(&idx_name))
-                    .ok_or_else(|| {
-                        EngineError::Unsupported(alloc::format!(
+                    .ok_or_else(|| EngineError::At {
+                        token: at,
+                        inner: alloc::boxed::Box::new(EngineError::Unsupported(alloc::format!(
                             "index {idx_name:?} does not exist"
-                        ))
+                        ))),
                     })?;
                 if !idx.is_unique {
                     return Err(cannot(&alloc::format!(
