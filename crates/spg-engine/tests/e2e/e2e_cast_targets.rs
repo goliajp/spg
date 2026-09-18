@@ -140,15 +140,18 @@ fn regclass_passes_unqualified_name_through() {
 }
 
 #[test]
-fn regclass_integer_oid_renders_as_text() {
-    // PG path: `SELECT 16384::regclass` — integer rendered as
-    // textual OID. SPG mirrors the textual contract.
+fn regclass_integer_oid_renders_as_its_number() {
+    // An oid that names no relation RENDERS as the number, and is still
+    // a regclass. 9.0.0 — this pinned it as plain text, which is the
+    // defect: PostgreSQL 18.6 answers `pg_typeof(16384::regclass)` =
+    // `regclass` and casts it back to 16384.
     let mut eng = Engine::new();
     let r = eng.execute("SELECT 16384::REGCLASS").unwrap();
     let spg_engine::QueryResult::Rows { rows, .. } = r else {
         panic!()
     };
-    assert_eq!(rows[0].values[0], Value::text("16384"));
+    assert_eq!(rows[0].values[0], Value::RegClass(16384, "16384".into()));
+    assert_eq!(spg_engine::eval::value_to_text(&rows[0].values[0]), "16384");
 }
 
 #[test]

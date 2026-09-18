@@ -2748,7 +2748,18 @@ fn eval_cast_arm(
         if let Some(oid) = oid
             && let Some(name) = crate::system_catalog::relation_name_for_oid(cat, oid)
         {
-            return Ok(Value::text(name));
+            // 9.0.0 — keep the OID. This answered the NAME as plain text,
+            // so an oid cast to regclass rendered right and was wrong for
+            // everything else: `pg_typeof(16387::regclass)` said `text`
+            // where PG 18.6 says `regclass`, `(oid::regclass)::bigint`
+            // failed with `invalid input syntax for type bigint:
+            // "zz_last"` where PG gives the oid back, and
+            // `ORDER BY oid::regclass` sorted by NAME where PG sorts by
+            // OID (measured: PG `zz_last, aa_first`, SPG `aa_first,
+            // zz_last`). The NAME cast one line down already answers
+            // `Value::RegClass`; this is the same object arriving from
+            // the other side.
+            return Ok(Value::RegClass(oid, name.into_boxed_str()));
         }
     }
     // 8.0.3 — `'mood'::regtype` names a USER type too: enums, composites
@@ -3688,7 +3699,64 @@ fn mysql_coercibility(e: &Expr) -> i32 {
     }
 }
 
+/// 9.0.0 — `pg_typeof` answers a `regtype`, which is an oid.
+///
+/// Every arm that computes it produces the type's NAME, and there are a
+/// dozen of them (enums, domains, bit, timestamptz, …), so the oid is
+/// attached here, once, at the only door they all leave through. It
+/// answered plain text, so the column described as `text` where
+/// PostgreSQL 18.6 describes `regtype`, and a binary client read the
+/// name's bytes where PostgreSQL sends the four-byte oid
+/// (`pg_typeof(1)` → `00000017`, measured).
+///
+/// A name no catalog knows keeps its text form rather than inventing an
+/// oid; the describe sweep's `pg_typeof` probes are what would show one.
+fn pg_typeof_as_regtype(
+    v: Value<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let Value::Text(name) = &v else {
+        return Ok(v);
+    };
+    let oid = crate::conversions::regtype_name_to_oid(name).or_else(|| {
+        let cat = ctx.catalog?;
+        let (e, c, d) = crate::system_catalog::user_type_oids(cat);
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        e.into_iter()
+            .chain(c)
+            .chain(d)
+            .find(|(n, _)| n.eq_ignore_ascii_case(bare))
+            .map(|(_, o)| o)
+    });
+    Ok(match oid {
+        Some(oid) => Value::RegType(oid, name.to_string().into_boxed_str()),
+        None => v,
+    })
+}
+
+/// 9.0.0 — `pg_typeof` is answered in a dozen places inside
+/// [`eval_function_call_inner`]; the oid is attached once, here.
+///
+/// Deliberately NOT a second arm on `eval_expr`'s match: adding one
+/// widened that frame enough that `SELECT 1 = 1 AND …` eighty deep hit
+/// the 768 KiB eval guard in a debug build, which
+/// `e2e_stack_depth_guard` caught. This wrapper's frame is only entered
+/// for a function call, and the guard's own pathological case is
+/// operators.
 fn eval_function_call_arm(
+    name: &str,
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Value<'static>, EvalError> {
+    let v = eval_function_call_inner(name, args, row, ctx)?;
+    if name.eq_ignore_ascii_case("pg_typeof") {
+        return pg_typeof_as_regtype(v, ctx);
+    }
+    Ok(v)
+}
+
+fn eval_function_call_inner(
     name: &str,
     args: &[Expr],
     row: &Row<'static>,

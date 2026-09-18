@@ -30,7 +30,11 @@ fn text(e: &mut Engine, sql: &str) -> String {
             .cloned()
             .map(Value::into_owned)
         {
+            // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
             Some(Value::Text(t)) => t.to_string(),
+            Some(Value::RegClass(_, t) | Value::RegType(_, t) | Value::RegProc(_, t)) => {
+                t.to_string()
+            }
             other => panic!("`{sql}` did not return text: {other:?}"),
         },
         other => panic!("`{sql}` did not return rows: {other:?}"),

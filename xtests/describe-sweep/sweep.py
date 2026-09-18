@@ -203,11 +203,9 @@ EXPRS = [e.strip() for e in EXPRS.strip().splitlines() if e.strip()]
 
 # Recorded, not fixed: two extension functions PostgreSQL's test image does
 # not install, and seven types SPG's value model does not carry.
-RECORDED = {
-    "uuid_generate_v4()", "similarity('abc','abd')",
-    "pg_typeof(1)", "inet_client_addr()", "point(1,2)", "box(point(0,0),point(1,1))",
-    "int4range(1,3)", "B'101'", "xmin",
-}
+# 9.0.0 — empty. Every divergence this sweep recorded is closed; a new
+# entry here is a new defect and needs a CHANGELOG line to go with it.
+RECORDED: set = set()
 
 def per_expr(uri):
     res = []
@@ -228,8 +226,18 @@ def per_expr(uri):
 
 setup = "CREATE SEQUENCE IF NOT EXISTS seq_gd; CREATE TABLE IF NOT EXISTS gd_t (a int);"
 PG, SPG = sys.argv[1], sys.argv[2]
+# 9.0.0 — the setup must SUCCEED, and be seen to. Its output was
+# discarded, so a leg whose `gd_t` was never created reported
+# `xmin  SPG=ERR: relation "gd_t" does not exist` as a recorded
+# divergence — an instrument failure filed as a product finding.
 for u in (PG, SPG):
-    subprocess.run([PSQL, u, "-X", "-q", "-c", setup], capture_output=True)
+    r = subprocess.run([PSQL, u, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-c", setup],
+                       capture_output=True, text=True)
+    probe = subprocess.run([PSQL, u, "-X", "-A", "-t", "-c", "SELECT count(*) FROM gd_t"],
+                           capture_output=True, text=True)
+    if r.returncode != 0 or probe.returncode != 0:
+        print(f"the sweep could not run: setup failed on {u}: {r.stderr.strip() or probe.stderr.strip()}")
+        sys.exit(2)
 a = per_expr(PG)
 b = per_expr(SPG)
 # A sweep whose oracle answered nothing measured nothing.

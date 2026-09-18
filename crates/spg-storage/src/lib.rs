@@ -219,6 +219,26 @@ pub enum DataType {
     /// wraps to 4294967295 as PG does. Only the resulting type was lost,
     /// because `conversions.rs` mapped the target to `BigInt`.
     Oid,
+    /// 9.0.0 — PG's `tid`: a physical row locator, `(block, offset)`.
+    ///
+    /// `Value::Tid` already existed and `ctid` already answered one; what
+    /// was missing was the DECLARED type, so every system column
+    /// described as `text` and a binary client decoded a tid as a string.
+    /// Measured on PostgreSQL 18.6: `SELECT ctid FROM t \gdesc` is `tid`.
+    Tid,
+    /// 9.0.0 — PG's `cid`: a command id within a transaction. As
+    /// [`DataType::Tid`], for `cmin` / `cmax`.
+    Cid,
+    /// 9.0.0 — PG's `regclass` / `regtype` / `regproc`: an oid that
+    /// renders as a name. `Value::RegClass` and friends carried both
+    /// halves already; the DECLARED type did not exist, so
+    /// `pg_typeof(1)`, `'int4'::regtype` and `oid::regclass` all
+    /// described as `text` where PostgreSQL 18.6 describes each as its
+    /// own reg type. Result types only — a column cannot be declared
+    /// with one here.
+    RegClass,
+    RegType,
+    RegProc,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -537,6 +557,11 @@ impl fmt::Display for DataType {
             Self::Int => f.write_str("INT"),
             Self::BigInt => f.write_str("BIGINT"),
             Self::Xid => f.write_str("XID"),
+            Self::Tid => f.write_str("TID"),
+            Self::Cid => f.write_str("CID"),
+            Self::RegClass => f.write_str("REGCLASS"),
+            Self::RegType => f.write_str("REGTYPE"),
+            Self::RegProc => f.write_str("REGPROC"),
             Self::Xid8 => f.write_str("XID8"),
             Self::Oid => f.write_str("OID"),
             Self::OidArray => f.write_str("OID[]"),
@@ -1308,19 +1333,21 @@ impl<'arena> Value<'arena> {
             // v7.38 (read01, T9) — a transient composite/record has no storable
             // column DataType (it flows through row_to_json / to_json).
             Self::Composite(_) => None,
-            // v7.39 (read01 ruleutils.c) — regclass is eval-only (dual
-            // oid+name shape); no column storage type.
             // v7.39 (round 640) — `xid` became a column type, so its value
-            // has a DataType to answer with. `cid` and `tid` are equally
-            // legal column types on PG (measured: `CREATE TABLE t (a cid,
-            // b tid)` is accepted), but SPG's grammar has no keyword for
-            // them yet; they stay eval-only rather than half-declared.
+            // has a DataType to answer with.
+            //
+            // 9.0.0 — and so do the other five. They answered `None`, which
+            // is what made every one of them describe as `text` on the wire
+            // and refuse a binary result. They remain RESULT types — SPG's
+            // grammar still has no keyword to declare a column with one —
+            // but a value that has no declared type cannot be announced,
+            // and PostgreSQL announces all six.
             Self::Xid(_) => Some(DataType::Xid),
-            Self::RegClass(..)
-            | Self::RegProc(..)
-            | Self::RegType(..)
-            | Self::Tid(..)
-            | Self::Cid(_) => None,
+            Self::Tid(..) => Some(DataType::Tid),
+            Self::Cid(_) => Some(DataType::Cid),
+            Self::RegClass(..) => Some(DataType::RegClass),
+            Self::RegType(..) => Some(DataType::RegType),
+            Self::RegProc(..) => Some(DataType::RegProc),
             Self::Null => None,
         }
     }
@@ -3837,7 +3864,13 @@ pub(crate) fn compose_multi_key(
 pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
     match ty {
         // v8.0 — `void` is never a column, so never a key component.
-        DataType::Void => false,
+        // 9.0.0 — nor are `tid` / `cid`: both name a VIRTUAL system column.
+        DataType::Void
+        | DataType::Tid
+        | DataType::Cid
+        | DataType::RegClass
+        | DataType::RegType
+        | DataType::RegProc => false,
         // Integers, and everything whose storage IS an i64 with the
         // same order: dates, both timestamps, times, money, year.
         DataType::SmallInt

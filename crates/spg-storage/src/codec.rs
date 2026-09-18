@@ -1297,6 +1297,12 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         // stores; the tag is what tells a reader which identity the
         // column was declared with.
         DataType::Xid => out.push(73),
+        // 9.0.0 — new tags; no catalog written before this could hold one.
+        DataType::Tid => out.push(84),
+        DataType::Cid => out.push(85),
+        DataType::RegClass => out.push(86),
+        DataType::RegType => out.push(87),
+        DataType::RegProc => out.push(88),
         DataType::Xid8 => out.push(74),
         DataType::Oid => out.push(75),
         // v7.39 (round 694) — tag 76, `oid[]`. Its BODY is a BigIntArray's,
@@ -1504,6 +1510,11 @@ impl Cursor<'_> {
             4 => Ok(DataType::Text),
             72 => Ok(DataType::Name),
             73 => Ok(DataType::Xid),
+            84 => Ok(DataType::Tid),
+            85 => Ok(DataType::Cid),
+            86 => Ok(DataType::RegClass),
+            87 => Ok(DataType::RegType),
+            88 => Ok(DataType::RegProc),
             74 => Ok(DataType::Xid8),
             75 => Ok(DataType::Oid),
             76 => Ok(DataType::OidArray),
@@ -4032,6 +4043,24 @@ impl<'a> Cursor<'a> {
                 Ok(Value::BigInt(self.read_i64()?))
             }
             DataType::Xid => Ok(Value::Xid(self.read_i64()? as u32)),
+            // 9.0.0 — `tid` and `cid` are the types of the VIRTUAL system
+            // columns (`ctid`, `cmin`, `cmax`), which are never stored, so
+            // no on-disk cell has ever had one of these declared types.
+            // They are here because the decoder must answer for every
+            // variant, not because a catalog can reach them.
+            DataType::Tid => Ok(Value::Tid(self.read_i64()? as u32, self.read_i64()? as u32)),
+            DataType::Cid => Ok(Value::Cid(self.read_i64()? as u32)),
+            // Result types only, as above: no stored cell declares one.
+            // The oid is what is written; the name is resolved on read.
+            DataType::RegClass | DataType::RegType | DataType::RegProc => {
+                let oid = self.read_i64()?;
+                let name: alloc::boxed::Box<str> = alloc::format!("{oid}").into_boxed_str();
+                Ok(match ty {
+                    DataType::RegClass => Value::RegClass(oid, name),
+                    DataType::RegType => Value::RegType(oid, name),
+                    _ => Value::RegProc(oid, name),
+                })
+            }
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),

@@ -993,7 +993,18 @@ pub(crate) fn describe_expr_in(
             }
             let suffix = alloc::format!(".{}", c.name);
             let mut matches = schema_cols.iter().filter(|s| s.name.ends_with(&suffix));
-            let first = matches.next()?;
+            let Some(first) = matches.next() else {
+                // 9.0.0 — a system column is on every table and in no
+                // schema, so it reaches here unfound; it has a type of
+                // its own all the same. A user column of the same name
+                // was found above and wins.
+                let ty = crate::select::system_column_type(&c.name)?;
+                return Some(ExprShape {
+                    name: c.name.clone(),
+                    ty,
+                    nullable: false,
+                });
+            };
             if matches.next().is_some() {
                 // ambiguous — bail (describe should not assume an
                 // arbitrary tiebreak)
@@ -1028,11 +1039,10 @@ pub(crate) fn describe_expr_in(
                 CastTarget::Interval => DataType::Interval,
                 CastTarget::Json => DataType::Json,
                 CastTarget::Jsonb => DataType::Jsonb,
-                // regtype / regclass yield text-shape catalog OIDs
-                // on PG; on SPG the engine surfaces Unsupported,
-                // but for describe we still claim Text so prepare
-                // doesn't fail.
-                CastTarget::RegType | CastTarget::RegClass => DataType::Text,
+                // 9.0.0 — the reg types describe as themselves, as on
+                // PG 18.6; they were claimed as text.
+                CastTarget::RegType => DataType::RegType,
+                CastTarget::RegClass => DataType::RegClass,
                 CastTarget::TextArray => DataType::TextArray,
                 CastTarget::IntArray => DataType::IntArray,
                 CastTarget::BigIntArray => DataType::BigIntArray,
@@ -1045,6 +1055,18 @@ pub(crate) fn describe_expr_in(
                 // ident to a `DataType` for prepare-time schema
                 // information; truly-unknown idents bail (describe
                 // returns None so prepare reports an Unsupported).
+                // `regproc` / `regclass` / `regtype` written quoted or
+                // qualified arrive Named; they are result types only, so
+                // they are not in the column-type table.
+                CastTarget::Named(name) if name.eq_ignore_ascii_case("regproc") => {
+                    DataType::RegProc
+                }
+                CastTarget::Named(name) if name.eq_ignore_ascii_case("regclass") => {
+                    DataType::RegClass
+                }
+                CastTarget::Named(name) if name.eq_ignore_ascii_case("regtype") => {
+                    DataType::RegType
+                }
                 CastTarget::Named(name) => crate::conversions::type_name_to_data_type(name)?,
             };
             Some(ExprShape {
@@ -1538,8 +1560,9 @@ fn function_return_shape(
         | "pg_get_serial_sequence"
         | "pg_get_constraintdef"
         | "pg_get_indexdef"
-        | "date_format"
-        | "pg_typeof" => (DataType::Text, true),
+        | "date_format" => (DataType::Text, true),
+        // 9.0.0 — `pg_typeof` is `regtype` on PG 18.6.
+        "pg_typeof" => (DataType::RegType, true),
         // 8.0.3 — PG's identifier type, measured on 18.6; the value is text
         // and `name` encodes as text, so the OID is the only change.
         "current_database" | "current_schema" | "current_user" | "session_user" | "user" => {
@@ -1566,9 +1589,34 @@ fn function_return_shape(
             (DataType::BigInt, true)
         }
         // Float / double-precision returns.
-        "random" | "ts_rank" | "ts_rank_cd" | "similarity" | "ln" | "log" | "log2" | "exp"
-        | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
-        | "pi" => (DataType::Float, true),
+        "random" | "ts_rank" | "ts_rank_cd" | "ln" | "log" | "log2" | "exp" | "sin" | "cos"
+        | "tan" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians" | "pi" => {
+            (DataType::Float, true)
+        }
+        // 9.0.0 — the types the describe sweep recorded as divergent.
+        // A driver decodes a column by the announced type, so in binary
+        // format a wrong one is a wrong answer without a word said.
+        //
+        // ```text
+        //                              PG 18.6      SPG 8.0.4
+        //   similarity('abc','abd')    real         double precision
+        //   point(1,2)                 point        text
+        //   box(point(0,0),point(1,1)) box          text
+        //   int4range(1,3)             int4range    text
+        //   inet_client_addr()         inet         text
+        // ```
+        //
+        // pg_trgm's `similarity` is declared `real` (float4), not float8.
+        "similarity" => (DataType::Real, true),
+        "point" => (DataType::Point, true),
+        "box" => (DataType::PgBox, true),
+        "inet_client_addr" | "inet_server_addr" => (DataType::Inet, true),
+        "int4range" => (DataType::Range(spg_storage::RangeKind::Int4), true),
+        "int8range" => (DataType::Range(spg_storage::RangeKind::Int8), true),
+        "numrange" => (DataType::Range(spg_storage::RangeKind::Num), true),
+        "tsrange" => (DataType::Range(spg_storage::RangeKind::Ts), true),
+        "tstzrange" => (DataType::Range(spg_storage::RangeKind::TsTz), true),
+        "daterange" => (DataType::Range(spg_storage::RangeKind::Date), true),
         // Boolean predicate-returning.
         "starts_with" => (DataType::Bool, true),
         // Arrays.

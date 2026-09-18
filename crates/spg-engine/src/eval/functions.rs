@@ -17289,8 +17289,11 @@ fn apply_function_dispatch(
             // `format_type(t.oid, -1)` over `pg_type` answered `???` for a row
             // `pg_type` had just started returning. Owned, not leaked: this
             // runs once per row of whatever is being described.
-            let Some(base) = crate::conversions::regtype_oid_to_name(oid)
-                .map(alloc::string::String::from)
+            // 9.0.0 — `_owned` resolves the ARRAY oids too, through
+            // `ARRAY_TYPE_OIDS`. The scalar-only lookup made
+            // `format_type(1008, -1)` answer `???` where PostgreSQL 18.6
+            // says `regproc[]`.
+            let Some(base) = crate::conversions::regtype_oid_to_name_owned(oid)
                 .or_else(|| {
                     ctx.catalog.and_then(|cat| {
                         let (e, c, d) = crate::system_catalog::user_type_oids(cat);

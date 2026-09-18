@@ -680,16 +680,23 @@ impl Engine {
         use spg_sql::ast::PartitionOfBoundsAst;
         use spg_storage::{PartitionKind, PartitionRole};
         // Parent gate.
-        let (parent_kind, parent_columns) = {
+        let (parent_kind, parent_columns, parent_uniqueness, index_template_sources) = {
             let parent = self.active_catalog().get(parent_name).ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: parent_name.into(),
                 })
             })?;
             match &parent.schema().partition_role {
-                Some(PartitionRole::Parent { kind, .. }) => {
-                    (*kind, parent.schema().columns.clone())
-                }
+                Some(PartitionRole::Parent {
+                    kind,
+                    index_template_sources,
+                    ..
+                }) => (
+                    *kind,
+                    parent.schema().columns.clone(),
+                    parent.schema().uniqueness_constraints.clone(),
+                    index_template_sources.clone(),
+                ),
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "ALTER TABLE … ATTACH PARTITION: {parent_name:?} is not a partition parent"
@@ -928,12 +935,77 @@ impl Engine {
                 }
             }
         }
+        // 9.0.0 — the parent's keys and indexes, which an attached child
+        // was given none of. The rows live in the children, so a key on
+        // the parent alone was enforced nowhere, and `CREATE INDEX ON
+        // <parent>` reached a child created with `PARTITION OF` and not
+        // one attached. Measured on PostgreSQL 18.6 attaching a clean
+        // child to a parent with `PRIMARY KEY (id)` and `INDEX (v)`:
+        //
+        // ```text
+        //   pg_indexes ON rc1   PG 18.6                       SPG 8.0.4
+        //     CREATE INDEX rc1_v_idx … btree (v)              (0 rows)
+        //     CREATE UNIQUE INDEX rc1_pkey … btree (id)
+        // ```
+        //
+        // and attaching a child that already holds two rows with the same
+        // key is refused, before anything is installed:
+        //
+        // ```text
+        //   PG 18.6    ERROR: could not create unique index "rc2_pkey"
+        //              DETAIL: Key (id)=(105) is duplicated.
+        //   SPG 8.0.4  ALTER TABLE  -- and the duplicate stays
+        // ```
+        //
+        // The scan reads the child's VISIBLE rows, as the bound check
+        // above does, so a tombstone left by a DELETE does not count.
+        if !parent_uniqueness.is_empty() {
+            // The constraints are not on the child yet, so the scan is
+            // asked for explicitly rather than read off its schema.
+            for uc in &parent_uniqueness {
+                // The child names it after ITSELF (`rc2_pkey`), whatever
+                // the parent's constraint is called.
+                let mut uc = uc.clone();
+                uc.name = None;
+                if let Some(dup) = crate::constraints::first_duplicate_key(
+                    self.active_catalog(),
+                    &child_name,
+                    &uc,
+                    self.speaks_mysql,
+                ) {
+                    let cols = dup.columns.join(", ");
+                    let vals = dup
+                        .key
+                        .iter()
+                        .map(crate::eval::value_to_text)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let name = &dup.conname;
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "could not create unique index {name:?} \
+                         DETAIL: Key ({cols})=({vals}) is duplicated."
+                    )));
+                }
+            }
+        }
         // Install role.
         let child = self
             .active_catalog_mut()
             .get_mut(&child_name)
             .expect("child existed above");
         child.schema_mut().partition_role = Some(role);
+        child.schema_mut().uniqueness_constraints = parent_uniqueness
+            .into_iter()
+            .map(|mut uc| {
+                // Synthesised per child (`rc1_pkey`), so two children do
+                // not collide on one constraint name.
+                uc.name = None;
+                uc
+            })
+            .collect();
+        for tmpl in &index_template_sources {
+            self.execute_partition_index_template(&child_name, tmpl)?;
+        }
         Ok(())
     }
 
@@ -3902,7 +3974,7 @@ impl Engine {
         // Lift parent schema bits (columns + partition_role + index
         // template list) so we don't trip the active_catalog_mut()
         // borrow when we splice the child in.
-        let (parent_columns, parent_kind, index_template_sources) = {
+        let (parent_columns, parent_kind, index_template_sources, parent_uniqueness) = {
             let parent = self
                 .active_catalog()
                 .get(&spec.parent_name)
@@ -3920,6 +3992,7 @@ impl Engine {
                     parent.schema().columns.clone(),
                     *kind,
                     index_template_sources.clone(),
+                    parent.schema().uniqueness_constraints.clone(),
                 ),
                 _ => {
                     return Err(EngineError::Unsupported(alloc::format!(
@@ -4145,6 +4218,32 @@ impl Engine {
         let mut schema = TableSchema::new(stmt.name.clone(), parent_columns);
         // v7.39 (read01 round 57) — whoever runs CREATE TABLE owns it.
         schema.owner = Some(alloc::string::String::from(self.current_role()));
+        // 9.0.0 — the parent's PRIMARY KEY / UNIQUE constraints, which the
+        // child is what ENFORCES. The rows live in the children, so a key
+        // declared on the parent alone was enforced nowhere:
+        //
+        // ```text
+        //   CREATE TABLE pt(id int primary key, v text) PARTITION BY RANGE (id);
+        //   CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (100);
+        //   INSERT INTO pt1 VALUES (5,'a'); INSERT INTO pt1 VALUES (5,'b');
+        //     PG 18.6   duplicate key value violates unique constraint "pt1_pkey"
+        //     SPG 8.0.4 INSERT 0 1  -- and count(*) is 2
+        // ```
+        //
+        // PostgreSQL 18.6 shows `pt1_pkey` on the child beside the
+        // parent's `pt_pkey`; SPG showed only the parent's. Same defect
+        // class as the `CREATE TABLE … LIKE` one closed in v7.40.0 —
+        // "the copy of a keyed table had no key" — at the other site.
+        //
+        // The names come out synthesised (`pt1_pkey`), not inherited, so
+        // two children do not collide on one constraint name.
+        schema.uniqueness_constraints = parent_uniqueness
+            .into_iter()
+            .map(|mut uc| {
+                uc.name = None;
+                uc
+            })
+            .collect();
         schema.partition_role = Some(role);
         self.active_catalog_mut().create_table(schema)?;
         // Replay parent's CREATE INDEX templates against the new

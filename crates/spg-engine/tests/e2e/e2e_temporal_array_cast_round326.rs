@@ -36,7 +36,9 @@ fn scalar(e: &mut Engine, sql: &str) -> Value<'static> {
 
 fn text(e: &mut Engine, sql: &str) -> String {
     match scalar(e, sql) {
+        // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
         Value::Text(t) => t.to_string(),
+        Value::RegClass(_, t) | Value::RegType(_, t) | Value::RegProc(_, t) => t.to_string(),
         other => panic!("`{sql}` did not return text: {other:?}"),
     }
 }

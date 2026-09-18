@@ -234,6 +234,11 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::BigInt => "bigint",
         DataType::Xid => "xid",
         DataType::Xid8 => "xid8",
+        DataType::Tid => "tid",
+        DataType::Cid => "cid",
+        DataType::RegClass => "regclass",
+        DataType::RegType => "regtype",
+        DataType::RegProc => "regproc",
         DataType::SmallInt => "smallint",
         DataType::Float => "double precision",
         DataType::Real => "real",
@@ -5392,6 +5397,11 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         // read 0 for an `xid` column and `format_type` answered `???`.
         DataType::Xid => 28,
         DataType::Xid8 => 5069,
+        DataType::Tid => 27,
+        DataType::Cid => 29,
+        DataType::RegClass => 2205,
+        DataType::RegType => 2206,
+        DataType::RegProc => 24,
         // 9.0.0 — PG's internal single-byte type. Without it every
         // catalog column declared `"char"` reported atttypid 0, so 28
         // pg_attribute rows pointed at no pg_type row at all.

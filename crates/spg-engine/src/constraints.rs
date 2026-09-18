@@ -4418,9 +4418,44 @@ pub(crate) fn validate_uniqueness_whole_table(
     uc: &spg_storage::UniquenessConstraint,
     mysql: bool,
 ) -> Result<(), EngineError> {
-    let Some(table) = catalog.get(tname) else {
-        return Ok(());
-    };
+    match first_duplicate_key(catalog, tname, uc, mysql) {
+        None => Ok(()),
+        Some(dup) => Err(unique_violation(
+            &dup.conname,
+            tname,
+            &dup.columns,
+            &dup.key,
+            uc.is_primary_key,
+            mysql,
+        )),
+    }
+}
+
+/// The first key two live rows share, or `None` when they all differ.
+///
+/// 9.0.0 — split out of [`validate_uniqueness_whole_table`] because
+/// `ATTACH PARTITION` asks the same question and PostgreSQL 18.6 answers
+/// it in a different sentence: the COMMIT sweep says `duplicate key value
+/// violates unique constraint …`, and attaching a child that already
+/// holds a duplicate says `could not create unique index "rc2_pkey" /
+/// Key (id)=(105) is duplicated.` One detector, two sentences — a second
+/// scan would be a second place for the NULL rule to drift.
+pub(crate) struct DuplicateKey {
+    /// The RESOLVED constraint name, as `pg_unique_conname` gives it.
+    pub conname: alloc::string::String,
+    /// The constrained column names, in constraint order.
+    pub columns: Vec<alloc::string::String>,
+    /// The shared key, collated as the enforcement path collates it.
+    pub key: Vec<Value<'static>>,
+}
+
+pub(crate) fn first_duplicate_key(
+    catalog: &Catalog,
+    tname: &str,
+    uc: &spg_storage::UniquenessConstraint,
+    mysql: bool,
+) -> Option<DuplicateKey> {
+    let table = catalog.get(tname)?;
     let schema = table.schema();
     let mut seen: hashbrown::HashSet<alloc::string::String> = hashbrown::HashSet::new();
     for (i, row) in table.rows().iter().enumerate() {
@@ -4442,21 +4477,18 @@ pub(crate) fn validate_uniqueness_whole_table(
         }
         let encoded = alloc::format!("{key:?}");
         if !seen.insert(encoded) {
-            let conname = crate::system_catalog::pg_unique_conname(table, uc, tname);
-            return Err(unique_violation(
-                &conname,
-                tname,
-                &uc.columns
+            return Some(DuplicateKey {
+                conname: crate::system_catalog::pg_unique_conname(table, uc, tname),
+                columns: uc
+                    .columns
                     .iter()
                     .map(|&ci| schema.columns[ci].name.clone())
-                    .collect::<Vec<_>>(),
-                &key,
-                uc.is_primary_key,
-                mysql,
-            ));
+                    .collect(),
+                key,
+            });
         }
     }
-    Ok(())
+    None
 }
 
 pub(crate) fn fk_deferred_in(st: &crate::TxState, fk: &spg_storage::ForeignKeyConstraint) -> bool {

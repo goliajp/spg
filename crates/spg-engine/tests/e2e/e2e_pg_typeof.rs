@@ -29,7 +29,11 @@ fn one_text(eng: &mut Engine, sql: &str) -> String {
             assert_eq!(rows.len(), 1, "{sql}");
             let row = rows.into_iter().next().unwrap();
             match row.values.into_iter().next().unwrap() {
+                // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
                 Value::Text(s) => s.into_owned(),
+                Value::RegClass(_, s) | Value::RegType(_, s) | Value::RegProc(_, s) => {
+                    s.to_string()
+                }
                 other => panic!("{sql}: expected Text, got {other:?}"),
             }
         }
