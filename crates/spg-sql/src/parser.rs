@@ -27,8 +27,8 @@ use crate::ast::{
     GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal, MysqlIntWidth,
     NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
     PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
-    Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind, VecEncoding,
-    WindowFrame,
+    SrcToken, Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind,
+    VecEncoding, WindowFrame,
 };
 use crate::lexer::{self, LexError, Token};
 
@@ -10013,6 +10013,8 @@ impl Parser {
                 walk(e, &names)
             };
             let sub_select = |items: Vec<SelectItem>| SelectStatement {
+                where_token: SrcToken::NONE,
+                having_token: SrcToken::NONE,
                 locking: None,
                 ctes: Vec::new(),
                 distinct: false,
@@ -10318,6 +10320,8 @@ impl Parser {
             let sub_fc = fc.clone();
             let make_subq = move |leaf: Expr| -> Expr {
                 Expr::ScalarSubquery(Box::new(SelectStatement {
+                    where_token: SrcToken::NONE,
+                    having_token: SrcToken::NONE,
                     locking: None,
                     ctes: Vec::new(),
                     distinct: false,
@@ -10359,6 +10363,8 @@ impl Parser {
             } else {
                 Some(Expr::Exists {
                     subquery: Box::new(SelectStatement {
+                        where_token: SrcToken::NONE,
+                        having_token: SrcToken::NONE,
                         locking: None,
                         ctes: Vec::new(),
                         distinct: false,
@@ -11675,6 +11681,11 @@ impl Parser {
             }
             Token::Ident(s) if s.eq_ignore_ascii_case("add") => {
                 self.advance();
+                // 9.0.0 — the constraint element starts here, whether it
+                // opens with `CONSTRAINT` or with the bare `PRIMARY` /
+                // `UNIQUE` / `CHECK`. PostgreSQL points its caret at this
+                // token when it refuses a `USING INDEX`.
+                let constraint_token = SrcToken::at(self.pos);
                 // v7.39 (round 431) — MySQL's `ALTER TABLE t ADD [UNIQUE]
                 // {INDEX|KEY} [name] (cols)`, which every ORM migration
                 // emits. The same grammar CREATE TABLE already accepts
@@ -11684,7 +11695,7 @@ impl Parser {
                 if self.peek_mysql_inline_key_start() {
                     return Ok(match self.parse_mysql_inline_key()? {
                         Some(c) => {
-                            alloc::vec![crate::ast::AlterTableTarget::AddTableConstraint(c)]
+                            alloc::vec![crate::ast::AlterTableTarget::AddTableConstraint { constraint: c, token: constraint_token }]
                         }
                         // FULLTEXT / SPATIAL parse and are accepted as a
                         // no-op here exactly as they are inline.
@@ -11724,7 +11735,7 @@ impl Parser {
                             *name = Some(con_name);
                         }
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(pk)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: pk, token: constraint_token }
                         ]);
                     }
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("unique"))
@@ -11742,7 +11753,7 @@ impl Parser {
                             *name = Some(con_name);
                         }
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(uc)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: uc, token: constraint_token }
                         ]);
                     }
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("check"))
@@ -11763,13 +11774,14 @@ impl Parser {
                         }
                         let not_valid = self.parse_not_valid_suffix();
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::Check {
+                            crate::ast::AlterTableTarget::AddTableConstraint {
+                                constraint: crate::ast::TableConstraint::Check {
                                     name: Some(con_name),
                                     expr,
                                     not_valid,
-                                }
-                            )
+                                },
+                                token: constraint_token,
+                            }
                         ]);
                     }
                     // v7.39 (round 211) — ADD CONSTRAINT <name> EXCLUDE
@@ -11784,7 +11796,7 @@ impl Parser {
                             *name = Some(con_name);
                         }
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(ex)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: ex, token: constraint_token }
                         ]);
                     }
                     // Unknown kind — fall through to FK path which
@@ -11806,14 +11818,14 @@ impl Parser {
                         // 9.0.0 — delegate, as the UNIQUE arm does.
                         let pk = self.parse_table_level_primary_key()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(pk)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: pk, token: constraint_token }
                         ]);
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
                         // v7.22 — delegate (NULLS [NOT] DISTINCT).
                         let uc = self.parse_table_level_unique()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(uc)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: uc, token: constraint_token }
                         ]);
                     }
                     // v7.39 (round 652) — bare ADD CHECK (no CONSTRAINT
@@ -11828,20 +11840,21 @@ impl Parser {
                             unreachable!("parse_table_level_check returns Check")
                         };
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::Check {
+                            crate::ast::AlterTableTarget::AddTableConstraint {
+                                constraint: crate::ast::TableConstraint::Check {
                                     name: None,
                                     expr,
                                     not_valid,
-                                }
-                            )
+                                },
+                                token: constraint_token,
+                            }
                         ]);
                     }
                     // v7.39 (round 211) — bare ADD EXCLUDE (no CONSTRAINT prefix).
                     Token::Ident(s) if s.eq_ignore_ascii_case("exclude") => {
                         let ex = self.parse_table_level_exclude()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(ex)
+                            crate::ast::AlterTableTarget::AddTableConstraint { constraint: ex, token: constraint_token }
                         ]);
                     }
                     _ => {}
@@ -14059,6 +14072,8 @@ impl Parser {
             if has_tail {
                 self.parse_select_tail_into(&mut head)?;
                 head = SelectStatement {
+                    where_token: SrcToken::NONE,
+                    having_token: SrcToken::NONE,
                     locking: None,
                     ctes: Vec::new(),
                     distinct: false,
@@ -14449,8 +14464,14 @@ impl Parser {
             }
         }
         let sample_preds = core::mem::take(&mut self.pending_sample_preds);
+        // 9.0.0 — the token the predicate STARTS at, which is where
+        // PostgreSQL draws its caret for a predicate that is not boolean.
+        // The expression cannot supply it on its own: `WHERE 1` has no
+        // name in it, and PostgreSQL still points at the `1`.
+        let mut where_token = SrcToken::NONE;
         let where_ = if matches!(self.peek(), Token::Where) {
             self.advance();
+            where_token = SrcToken::at(self.pos);
             Some(self.parse_expr(0)?)
         } else {
             None
@@ -14603,8 +14624,10 @@ impl Parser {
         } else {
             None
         };
+        let mut having_token = SrcToken::NONE;
         let having = if matches!(self.peek(), Token::Having) {
             self.advance();
+            having_token = SrcToken::at(self.pos);
             Some(self.parse_expr(0)?)
         } else {
             None
@@ -14727,6 +14750,8 @@ impl Parser {
             None => None,
         };
         let mut stmt = SelectStatement {
+            where_token,
+            having_token,
             locking: None,
             ctes: Vec::new(),
             distinct,
@@ -19756,6 +19781,8 @@ impl Parser {
             }
             self.advance(); // )
             row_selects.push(SelectStatement {
+                where_token: SrcToken::NONE,
+                having_token: SrcToken::NONE,
                 locking: None,
                 ctes: Vec::new(),
                 distinct: false,
@@ -19878,6 +19905,8 @@ impl Parser {
                 .cloned()
                 .unwrap_or_else(|| "value".to_string());
             let inner_select = crate::ast::SelectStatement {
+                where_token: SrcToken::NONE,
+                having_token: SrcToken::NONE,
                 locking: None,
                 ctes: Vec::new(),
                 distinct: false,
@@ -20223,6 +20252,8 @@ impl Parser {
                 .or_else(|| alias_ident.clone())
                 .unwrap_or_else(|| "regexp_matches".to_string());
             let inner = crate::ast::SelectStatement {
+                where_token: SrcToken::NONE,
+                having_token: SrcToken::NONE,
                 locking: None,
                 ctes: Vec::new(),
                 distinct: false,
@@ -21006,6 +21037,8 @@ impl Parser {
         let name = srf.name.clone();
         let alias = srf.alias.clone();
         let inner = crate::ast::SelectStatement {
+            where_token: SrcToken::NONE,
+            having_token: SrcToken::NONE,
             locking: None,
             ctes: Vec::new(),
             distinct: false,
@@ -21232,6 +21265,8 @@ impl Parser {
         self.advance(); // TABLE
         let tname = self.expect_ident_like()?;
         Ok(SelectStatement {
+            where_token: SrcToken::NONE,
+            having_token: SrcToken::NONE,
             locking: None,
             ctes: Vec::new(),
             distinct: false,
@@ -21439,6 +21474,8 @@ impl Parser {
             None
         };
         let inner = SelectStatement {
+            where_token: SrcToken::NONE,
+            having_token: SrcToken::NONE,
             locking: None,
             ctes: Vec::new(),
             distinct: false,

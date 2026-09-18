@@ -831,6 +831,8 @@ impl Engine {
             name: pk_col.to_string(),
         };
         let probe = SelectStatement {
+            where_token: spg_sql::ast::SrcToken::NONE,
+            having_token: spg_sql::ast::SrcToken::NONE,
             locking: None,
             ctes: Vec::new(),
             distinct: false,

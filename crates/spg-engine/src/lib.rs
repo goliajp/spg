@@ -415,6 +415,22 @@ pub enum EngineError {
     Eval(EvalError),
     /// Front-end accepted a construct that the v0.x executor doesn't support.
     Unsupported(String),
+    /// 9.0.0 — an error that knows where in the statement it happened.
+    ///
+    /// PostgreSQL reports a character position for errors the engine
+    /// raises from places that hold no reference to the text, and the
+    /// host's fallback — read a quoted name out of the message and find
+    /// it — cannot answer them, because the token PostgreSQL points at is
+    /// not in the message. `ALTER TABLE t ADD CONSTRAINT c UNIQUE USING
+    /// INDEX <not unique>` is the first: measured on 18.6 the caret sits
+    /// on `CONSTRAINT`, and the message names the index.
+    ///
+    /// The SQLSTATE and the wire message are the inner error's; only the
+    /// position is added.
+    At {
+        token: spg_sql::ast::SrcToken,
+        inner: alloc::boxed::Box<EngineError>,
+    },
     /// `BEGIN` while another transaction is already open.
     TransactionAlreadyOpen,
     /// `COMMIT` / `ROLLBACK` with no active transaction.
@@ -528,8 +544,14 @@ impl EngineError {
             Self::Eval(
                 eval::EvalError::ColumnNotFound { token, .. }
                 | eval::EvalError::QualifiedColumnNotFound { token, .. }
-                | eval::EvalError::UnknownQualifier { token, .. },
+                | eval::EvalError::UnknownQualifier { token, .. }
+                // 9.0.0 — a predicate that is not boolean points at where
+                // the predicate starts, which is where PostgreSQL's caret
+                // sits (measured on 18.6 for a column, a qualified column,
+                // a cast and a bare literal).
+                | eval::EvalError::NotBoolean { token, .. },
             ) => token.index(),
+            Self::At { token, inner } => token.index().or_else(|| inner.error_token()),
             _ => None,
         }
     }
@@ -538,6 +560,7 @@ impl EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::At { inner, .. } => inner.fmt(f),
             Self::Parse(e) => write!(f, "parse: {e}"),
             Self::Storage(e) => write!(f, "storage: {e}"),
             Self::Eval(e) => write!(f, "eval: {e}"),

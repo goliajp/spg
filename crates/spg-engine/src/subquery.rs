@@ -2352,6 +2352,8 @@ impl Engine {
             }))
         };
         let body = SelectStatement {
+            where_token: spg_sql::ast::SrcToken::NONE,
+            having_token: spg_sql::ast::SrcToken::NONE,
             locking: None,
             ctes: Vec::new(),
             distinct: false,
