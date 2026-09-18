@@ -872,6 +872,7 @@ mod e2e_ruledef_deparse_round329;
 mod e2e_ruleutils_round29;
 mod e2e_scalar_subquery_null_key_round620;
 mod e2e_scalar_subquery_timestamptz_v7411;
+mod e2e_scalar_subquery_type_900;
 mod e2e_scalar_subquery_type_round189;
 mod e2e_scan_memory_round656;
 mod e2e_security_definer_round334;

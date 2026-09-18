@@ -153,6 +153,46 @@ pub(crate) fn value_to_literal_expr_typed(
                 target: spg_sql::ast::CastTarget::BigIntArray,
             });
         }
+        // 9.0.0 — a NULL carries no type, and the subquery's does not
+        // survive the round-trip through a literal. PostgreSQL's scalar
+        // subquery node keeps the column's type whether or not a row
+        // came back, so it answers `integer` here where SPG answered
+        // `unknown` (sentori §3.9):
+        //
+        //   CREATE TABLE t(id int);
+        //   SELECT pg_typeof((SELECT id FROM t WHERE id = 1));
+        //
+        // Writing the declaration into the expression keeps it, which
+        // is what the arms above do for the types a value cannot carry.
+        (Value::Null, Some(d)) => {
+            // The name `pg_typeof` reports, which is the one the cast
+            // has to reproduce. (`pg_data_type_text` is
+            // information_schema's, where every array reads `ARRAY`.)
+            let Some(name) = crate::eval::pg_typeof_name_for_datatype(d) else {
+                return Ok(Expr::Literal(Literal::Null));
+            };
+            // An array is named `<element>[]` and its cast target is
+            // `<element>_array`, which is the spelling the parser widens
+            // `::integer[]` to.
+            let cast_name = name.strip_suffix("[]").map_or_else(
+                || alloc::string::String::from(name),
+                |base| alloc::format!("{base}_array"),
+            );
+            // Only when the name reads back as the same type. A name the
+            // cast cannot resolve would turn a NULL into an error, and
+            // the comparison is on the NAME so a modifier does not
+            // disqualify it: `numeric(8,2)` writes `numeric`, which is
+            // what `pg_typeof` answers on PG too.
+            let round_trips = crate::conversions::type_name_to_data_type(&cast_name)
+                .and_then(crate::eval::pg_typeof_name_for_datatype)
+                == Some(name);
+            if round_trips {
+                return Ok(Expr::Cast {
+                    expr: alloc::boxed::Box::new(Expr::Literal(Literal::Null)),
+                    target: spg_sql::ast::CastTarget::Named(cast_name),
+                });
+            }
+        }
         _ => {}
     }
     let lit = match v {

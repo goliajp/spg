@@ -10,6 +10,24 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a scalar subquery that answers NULL lost its type
+
+Reported by sentori (§3.9). An uncorrelated scalar subquery is resolved
+once and its value written back into the expression as a literal, and a
+NULL carries no type:
+
+```text
+  CREATE TABLE t(id int);
+  SELECT pg_typeof((SELECT id FROM t WHERE id = 1));
+    PG 18.6   integer      SPG 8.0.4   unknown
+```
+
+PostgreSQL's scalar subquery node keeps the column's type whether or
+not a row came back. The declaration is written into the expression
+now, which is what the neighbouring arms already did for the types a
+VALUE cannot carry (timestamptz, jsonb). Eight column types measured
+against PG 18.6, `integer[]` included.
+
 ### Fixed — arithmetic on an infinite date or timestamp
 
 Recorded delta RD-2 said an interval infinity was not representable
