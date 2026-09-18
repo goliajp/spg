@@ -11619,22 +11619,15 @@ impl Parser {
                         // v7.39 (read01 round 48) — keep the name; the engine
                         // stores it now instead of dropping it on the floor.
                         let con_name = self.expect_ident_like()?;
-                        self.advance(); // PRIMARY
-                        self.expect_keyword_ident("key")?;
-                        let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
-                        // v7.39 (round 711) — the ALTER form carries the
-                        // timing too (pg_dump writes it here).
-                        let (deferrable, initially_deferred) =
-                            self.consume_deferrable_clauses_timed()?;
+                        // 9.0.0 — delegate, the way the UNIQUE arm below
+                        // does: the column list, the timing and now
+                        // `USING INDEX` are all parsed in one place.
+                        let mut pk = self.parse_table_level_primary_key()?;
+                        if let crate::ast::TableConstraint::PrimaryKey { name, .. } = &mut pk {
+                            *name = Some(con_name);
+                        }
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::PrimaryKey {
-                                    name: Some(con_name),
-                                    columns: cols,
-                                    deferrable,
-                                    initially_deferred,
-                                }
-                            )
+                            crate::ast::AlterTableTarget::AddTableConstraint(pk)
                         ]);
                     }
                     if matches!(&kind, Some(Token::Ident(s)) if s.eq_ignore_ascii_case("unique"))
@@ -11713,20 +11706,10 @@ impl Parser {
                 // (no CONSTRAINT prefix) — same dispatch.
                 match self.peek().clone() {
                     Token::Ident(s) if s.eq_ignore_ascii_case("primary") => {
-                        self.advance();
-                        self.expect_keyword_ident("key")?;
-                        let cols = self.parse_paren_ident_list("PRIMARY KEY")?;
-                        let (deferrable, initially_deferred) =
-                            self.consume_deferrable_clauses_timed()?;
+                        // 9.0.0 — delegate, as the UNIQUE arm does.
+                        let pk = self.parse_table_level_primary_key()?;
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::AddTableConstraint(
-                                crate::ast::TableConstraint::PrimaryKey {
-                                    name: None,
-                                    columns: cols,
-                                    deferrable,
-                                    initially_deferred,
-                                }
-                            )
+                            crate::ast::AlterTableTarget::AddTableConstraint(pk)
                         ]);
                     }
                     Token::Ident(s) if s.eq_ignore_ascii_case("unique") => {
@@ -15281,6 +15264,7 @@ impl Parser {
                 // engine path stays uniform.
                 if col.is_unique {
                     table_constraints.push(crate::ast::TableConstraint::Unique {
+                        using_index: None,
                         name: None,
                         columns: alloc::vec![col.name.clone()],
                         nulls_not_distinct: col.unique_nulls_not_distinct,
@@ -15874,6 +15858,7 @@ impl Parser {
             // synthesises the name itself, but Display round-trip
             // benefits from preserving it.
             Ok(Some(crate::ast::TableConstraint::Unique {
+                using_index: None,
                 name: idx_name,
                 columns: cols,
                 nulls_not_distinct: false,
@@ -16086,16 +16071,48 @@ impl Parser {
     fn parse_table_level_primary_key(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
         self.advance(); // PRIMARY
         self.advance(); // KEY
+        // 9.0.0 — `PRIMARY KEY USING INDEX <name>` takes an index that
+        // already exists instead of a column list. `ALTER TABLE … ADD
+        // CONSTRAINT` is the only place PostgreSQL accepts it, and the
+        // engine refuses it anywhere else.
+        if let Some(index) = self.consume_using_index()? {
+            return Ok(crate::ast::TableConstraint::PrimaryKey {
+                name: None,
+                columns: Vec::new(),
+                deferrable: false,
+                initially_deferred: false,
+                using_index: Some(index),
+            });
+        }
         let columns = self.parse_paren_ident_list("PRIMARY KEY")?;
         // v7.39 (round 711) — the trailer's values are CARRIED now; round
         // 621 consumed and dropped them (the storing half of F08).
         let (deferrable, initially_deferred) = self.consume_deferrable_clauses_timed()?;
         Ok(crate::ast::TableConstraint::PrimaryKey {
+            using_index: None,
             name: None,
             columns,
             deferrable,
             initially_deferred,
         })
+    }
+
+    /// 9.0.0 — `USING INDEX <name>`, the tail of an `ADD CONSTRAINT`
+    /// that adopts an existing index. Returns the index's name when the
+    /// clause is there, and consumes nothing when it is not.
+    fn consume_using_index(&mut self) -> Result<Option<String>, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
+            return Ok(None);
+        }
+        // `INDEX` is a keyword token of its own.
+        match self.tokens.get(self.pos + 1) {
+            Some(Token::Index) => {}
+            Some(Token::Ident(next)) if next.eq_ignore_ascii_case("index") => {}
+            _ => return Ok(None),
+        }
+        self.advance(); // USING
+        self.advance(); // INDEX
+        Ok(Some(self.expect_ident_like()?))
     }
 
     fn parse_table_level_unique(&mut self) -> Result<crate::ast::TableConstraint, ParseError> {
@@ -16119,9 +16136,23 @@ impl Parser {
                 self.advance(); // DISTINCT
             }
         }
+        // 9.0.0 — `UNIQUE USING INDEX <name>`; see
+        // `parse_table_level_primary_key`.
+        if let Some(index) = self.consume_using_index()? {
+            return Ok(crate::ast::TableConstraint::Unique {
+                using_index: Some(index),
+                name: None,
+                columns: Vec::new(),
+                nulls_not_distinct,
+                deferrable: false,
+                initially_deferred: false,
+                prefix_lengths: Vec::new(),
+            });
+        }
         let columns = self.parse_paren_ident_list("UNIQUE")?;
         let (deferrable, initially_deferred) = self.consume_deferrable_clauses_timed()?;
         Ok(crate::ast::TableConstraint::Unique {
+            using_index: None,
             name: None,
             columns,
             nulls_not_distinct,
