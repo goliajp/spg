@@ -289,7 +289,11 @@ pub const MYSQL_COMPILE_OS: &str = if cfg!(target_os = "linux") {
 
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
+/// 9.0.0 — see [`Engine::begin_statement`].
+pub use clock::StatementClock;
 pub use execute::{RowCells, StreamItem};
+/// 9.0.0 — see [`Engine::prepare_select_streaming`].
+pub use readonly::PreparedSelect;
 
 use bytebudget::*;
 pub(crate) use clock::{rewrite_clock_calls, value_to_literal};

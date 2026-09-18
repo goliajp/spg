@@ -326,6 +326,11 @@ impl Engine {
         // version into ours, and ours never leaks to the next statement.
         let saved_stmt_wv = self.stmt_writer_version;
         self.stmt_writer_version = None;
+        // 9.0.0 — and the statement's own clock reading, taken before
+        // anything it contains is folded. A re-entrant execute (a
+        // trigger's SQL) inherits the reading of the statement that
+        // provoked it.
+        let _stmt_clock = self.begin_statement();
         // v7.34 (crash-recovery P0 #2) — row-level redo capture. Arm the
         // active catalog before dispatch; on success drain the physical
         // changes into `last_redo` for the embedding layer's WAL, on
@@ -457,21 +462,34 @@ impl Engine {
         Ok(stmt)
     }
 
+    /// 9.0.0 — begin a statement: read the clock once, here, and hand
+    /// back the guard that releases the reading. Every clock function
+    /// the statement folds — including the ones inside a view's body,
+    /// which is parsed during execution — answers from it.
+    ///
+    /// Beginning a statement inside one is a no-op, so an entry point
+    /// may open it without asking whether its caller already did.
+    /// The wire layers open it per protocol message; the engine's own
+    /// entry points open it for callers that embed the engine.
+    pub fn begin_statement(&self) -> crate::clock::StatementClock {
+        crate::clock::StatementClock::begin(self.clock)
+    }
+
     /// 8.0.3 — the three clock readings for the statement being prepared:
     /// the transaction's BEGIN when this slot has one open, the statement's
     /// own start otherwise, and the wall clock. See `clock::ClockAt`.
     pub(crate) fn clock_at(&self) -> Option<crate::clock::ClockAt> {
         let wall = self.clock.map(|f| f())?;
+        // 9.0.0 — the statement's start is read once, when it starts, so
+        // everything it grows on the way — a view's body above all —
+        // folds to the same instant. See `clock::StatementClock`.
+        let stmt = crate::clock::stmt_start_micros().unwrap_or(wall);
         let xact = self
             .current_tx
             .and_then(|tx| self.tx_catalogs.get(&tx))
             .and_then(|st| st.xact_start_micros)
-            .unwrap_or(wall);
-        Some(crate::clock::ClockAt {
-            xact,
-            stmt: wall,
-            wall,
-        })
+            .unwrap_or(stmt);
+        Some(crate::clock::ClockAt { xact, stmt, wall })
     }
 
     /// r1043 — every pre-pass a parsed statement gets before execution,
@@ -491,9 +509,14 @@ impl Engine {
     ///
     /// One function, both callers. A pass added here reaches every route
     /// by construction rather than by remembering.
-    pub(crate) fn preprocess(&self, stmt: &mut Statement) {
+    ///
+    /// Returns whether it folded a clock call — a statement that did
+    /// now holds an instant, which is why the plan cache may not keep
+    /// it (see `PreparedPlan::needs_preprocess`).
+    pub(crate) fn preprocess(&self, stmt: &mut Statement) -> bool {
+        let mut clock_folded = false;
         if let Some(at) = self.clock_at() {
-            crate::clock::rewrite_clock_calls_at(
+            clock_folded = crate::clock::rewrite_clock_calls_at(
                 stmt,
                 at,
                 self.speaks_mysql,
@@ -522,6 +545,7 @@ impl Engine {
                 self.env_cfg.plan_deterministic,
             );
         }
+        clock_folded
     }
 
     /// v6.3.0 — cached prepare. Returns a cloned `Statement` from
@@ -562,20 +586,33 @@ impl Engine {
         // v6.3.1 — version-aware lookup. If the cached plan was
         // prepared before the most recent ANALYZE, evict and replan.
         let current_version = self.statistics.version();
-        if let Some(plan) = self.plan_cache.get(sql) {
-            if plan.statistics_version == current_version {
-                return Ok(plan.stmt.clone());
+        // 9.0.0 — a hit on a clock-bearing statement hands back the
+        // PARSE and runs the pre-passes here, so the fold reads this
+        // execution's clock. See `PreparedPlan::needs_preprocess`.
+        let hit = self
+            .plan_cache
+            .get(sql)
+            .filter(|plan| plan.statistics_version == current_version)
+            .map(|plan| (plan.stmt.clone(), plan.needs_preprocess));
+        if let Some((mut stmt, needs_preprocess)) = hit {
+            if needs_preprocess {
+                self.preprocess(&mut stmt);
             }
-            // Stale entry — fall through to evict + re-prepare.
+            return Ok(stmt);
         }
+        // Stale entry (prepared before the most recent ANALYZE), or no
+        // entry — either way, replan.
         self.plan_cache.evict(sql);
-        let stmt = self.prepare(sql)?;
+        let parsed = parser::parse_statement_with(sql, self.sql_dialect())?;
+        let mut stmt = parsed.clone();
+        let clock_folded = self.preprocess(&mut stmt);
         let source_tables = plan_cache::collect_source_tables(&stmt);
         let plan = plan_cache::PreparedPlan {
-            stmt: stmt.clone(),
+            stmt: if clock_folded { parsed } else { stmt.clone() },
             statistics_version: current_version,
             source_tables,
             describe_columns: alloc::vec::Vec::new(),
+            needs_preprocess: clock_folded,
         };
         self.plan_cache.insert(String::from(sql), plan);
         Ok(stmt)
@@ -1545,7 +1582,18 @@ impl Engine {
                 "prepared statement \"{name}\" does not exist"
             )));
         };
-        let body = entry.body.clone();
+        let mut body = entry.body.clone();
+        // 9.0.0 — the body was stored as parsed: `PREPARE` keeps the
+        // statement, it does not run it. So it had reached none of the
+        // pre-passes, and the clock fold is one of them:
+        //
+        //   PREPARE p AS SELECT now();
+        //   EXECUTE p;                  ERROR: function now() does not exist
+        //
+        // PostgreSQL 18.6 answers with the clock of the EXECUTE, and a
+        // second EXECUTE reads a later instant — so the fold belongs
+        // here, at each execution, not once at PREPARE.
+        self.preprocess(&mut body);
         let empty: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
         let ctx = self.ev_ctx(&empty, None);
         let blank = spg_storage::Row::new(alloc::vec::Vec::new());
@@ -1615,6 +1663,9 @@ impl Engine {
         tx_id: TxId,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        // 9.0.0 — one clock reading for this statement; see
+        // `Engine::begin_statement`.
+        let _stmt_clock = self.begin_statement();
         substitute_placeholders(&mut stmt, params)?;
         // v7.16.0 — set `current_tx` for the duration of the
         // dispatch so the `exec_*` helpers see the right TX

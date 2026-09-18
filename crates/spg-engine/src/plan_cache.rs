@@ -45,6 +45,17 @@ pub struct PreparedPlan {
     /// Column shape v6.3.3 will populate for `Describe statement`.
     /// v6.3.0 leaves this empty.
     pub describe_columns: Vec<ColumnSchema>,
+    /// 9.0.0 — `stmt` is the statement as PARSED, not as prepared, and
+    /// the caller must run the pre-passes on its copy.
+    ///
+    /// A statement that names the clock folds to an instant, and an
+    /// instant may not be cached: `SELECT now()` over the extended
+    /// protocol answered the same microsecond for the life of the
+    /// process, and so did `SELECT localtimestamp` over the simple one.
+    /// Caching the parse still saves what the cache is for (the parse
+    /// is the dominant cost) and leaves the fold where it belongs — at
+    /// each execution.
+    pub needs_preprocess: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -393,6 +404,7 @@ mod tests {
             statistics_version: version,
             source_tables: tables.iter().map(|s| s.to_string()).collect(),
             describe_columns: Vec::new(),
+            needs_preprocess: false,
         }
     }
 

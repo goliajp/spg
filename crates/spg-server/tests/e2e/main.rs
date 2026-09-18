@@ -507,6 +507,7 @@ mod e2e_spg_stat_activity;
 mod e2e_spg_statistic;
 mod e2e_sq8;
 mod e2e_ssi_write_skew_round832;
+mod e2e_statement_clock_900;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,

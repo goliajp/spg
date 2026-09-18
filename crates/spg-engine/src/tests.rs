@@ -1943,7 +1943,8 @@ fn epic_p_panic_in_no_params_select_is_caught_and_engine_survives() {
     // so this is fine before the engine moves into the lock.
     let sel = e
         .prepare_select_streaming("SELECT * FROM inj_panic_np")
-        .unwrap();
+        .unwrap()
+        .stmt;
 
     let store = e.injection_store();
     let lock = RwLock::new(e);
@@ -2032,7 +2033,8 @@ fn epic_p_panic_in_streaming_select_is_caught_and_engine_survives() {
 
     let sel = e
         .prepare_select_streaming("SELECT id FROM inj_panic_stream ORDER BY id")
-        .unwrap();
+        .unwrap()
+        .stmt;
 
     let store = e.injection_store();
     let lock = RwLock::new(e);
@@ -2104,7 +2106,8 @@ fn epic_p_panic_inside_emit_callback_is_caught() {
     // materialising — the shape this is here to cover.
     let sel = e
         .prepare_select_streaming("SELECT * FROM inj_panic_emit")
-        .unwrap();
+        .unwrap()
+        .stmt;
     let lock = RwLock::new(e);
 
     {

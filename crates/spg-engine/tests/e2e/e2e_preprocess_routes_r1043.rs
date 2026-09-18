@@ -71,7 +71,8 @@ fn r1043_the_streaming_read_route_folds_too() {
         .prepare_select_streaming(
             "SELECT id FROM pp WHERE b = decode(lpad(to_hex(7), 16, '0'), 'hex')",
         )
-        .expect("prepares");
+        .expect("prepares")
+        .stmt;
     let text = format!("{s}");
     assert!(
         !text.contains("decode"),
@@ -95,6 +96,7 @@ fn r1043_the_routes_agree() {
             "SELECT {}",
             e.prepare_select_streaming(sql)
                 .expect("prepare_select_streaming")
+                .stmt
         );
         // `prepare` returns a Statement and the streaming route a
         // SelectStatement; compare the part they both render.
@@ -139,7 +141,8 @@ fn r1043_concatenation_of_constants_folds() {
             "SELECT id FROM pp WHERE b = decode(lpad(to_hex(7), 16, chr(48)), \
              chr(104) || chr(101) || chr(120))",
         )
-        .expect("prepares");
+        .expect("prepares")
+        .stmt;
     let text = format!("{s}");
     assert!(
         !text.contains("chr("),
@@ -155,7 +158,8 @@ fn r1043_an_unlisted_function_is_not_folded() {
     let e = engine();
     let s = e
         .prepare_select_streaming("SELECT id FROM pp WHERE k = length(upper('ab'))")
-        .expect("prepares");
+        .expect("prepares")
+        .stmt;
     let text = format!("{s}");
     assert!(
         text.contains("upper") || text.contains("length"),

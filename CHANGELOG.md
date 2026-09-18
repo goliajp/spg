@@ -10,6 +10,61 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a statement read the clock as many times as it folded SQL, and two caches kept the reading
+
+Reported by sentori (§4.2, third row): in autocommit, a view's `now()` and
+the statement's `now()` were different instants.
+
+A statement grows SQL on the way. A view's body is parsed and folded
+during execution, tens of microseconds after the statement that named it,
+and each fold read the wall clock again. Measured on PostgreSQL 18.6:
+
+```text
+  CREATE VIEW v_now AS SELECT now() AS n;
+  SELECT (SELECT n FROM v_now) = now();      PG t     SPG 8.0.4 f
+```
+
+The statement reads the clock once now, when it starts, the way
+PostgreSQL keeps `stmtStartTimestamp`; everything it folds answers from
+that reading. The reading is per backend — the read path runs concurrent
+statements through one shared engine — and beginning a statement inside
+one is a no-op, so a trigger's SQL belongs to the statement that provoked
+it.
+
+Two neighbours of the same defect came out of measuring it.
+
+`PREPARE` keeps the statement as parsed, and the stored body had reached
+none of the pre-passes:
+
+```text
+  PREPARE p AS SELECT now();
+  EXECUTE p;    PG 2026-09-17 23:47:02.347406+00     SPG ERROR: function now() does not exist
+```
+
+The passes run at each `EXECUTE` now, which is also where PostgreSQL
+reads the clock: a second `EXECUTE` reads a later instant.
+
+And both plan caches were keyed on SQL text and kept the statement with
+the instant folded into it, so a repeated statement answered the same
+microsecond for the life of the process:
+
+```text
+  SELECT now()             twice, 250 ms apart, extended protocol
+    PG   …:42.332500+00  …:42.584 +00           SPG  both …:42.332500+00
+  SELECT localtimestamp    twice, 250 ms apart, simple protocol
+    PG   …:43.204110     …:43.457                SPG  both …:43.204110
+```
+
+The wire's cache decided eligibility from its own list of six clock
+names against the folder's sixteen, which is why the simple protocol
+froze `localtimestamp`, `localtime` and `statement_timestamp()` and not
+`now()`. There is no second list now: the folder reports whether it
+folded anything, and a statement that folded is cached as its PARSE —
+which is what the cache was for — with the passes run on each use.
+
+Unchanged, and pinned: inside a transaction `now()` is the BEGIN for the
+whole block and `statement_timestamp()` moves with each statement.
+
 ### Fixed — the locale panel could call a slower PROCESS a slower collation
 
 The 8.0.4 prerelease read one LOSS on the locale panel (SPG under
