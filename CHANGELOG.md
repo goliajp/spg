@@ -10,6 +10,41 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — three semantic errors PostgreSQL raises before it scans
+
+PostgreSQL runs parse analysis first, so a statement that cannot mean
+anything is refused whether or not a row would have reached the
+expression. SPG checked these at row time, so over an EMPTY table it
+answered zero rows and no error, and raised the moment the table had
+one — the same shape as the unknown-column and wrong-arity defects
+closed before, in three more places.
+
+```text
+                                        PG 18.6                                  SPG 8.0.4
+  SELECT CAST(id AS nosuchtype) FROM t  type "nosuchtype" does not exist         0 rows
+  SELECT * FROM t WHERE n               argument of WHERE must be type boolean…  0 rows
+  SELECT (SELECT s.nosuch FROM t s)     column s.nosuch does not exist           0 rows
+```
+
+The cast check asks the ROW-TIME path with a NULL rather than keeping
+its own list of what names a type: that list spans enums, domains,
+composites, a table's row type, the reg\* family, pseudo-types and the
+builtin table, and a second copy of it is a copy that drifts. Two gaps
+in the row-time check surfaced while wiring it and are fixed with it: a
+pseudo-type (`NULL::void`) and a MySQL target carrying a length
+(`CAST('abc' AS BINARY(2))`) were both refused there.
+
+The predicate rule is PostgreSQL's alone — MySQL reads a number as a
+truth value — and only the shapes whose type is certain without a row
+are refused, so `WHERE 't'` still coerces as it does on PG.
+
+The subquery rule fires only when the qualifier names one of that
+subquery's OWN sources; a correlated reference outward is not this
+walk's to judge. It is pinned over the WIRE, because in-process the
+engine resolves an uncorrelated scalar subquery by executing it, and
+that execution runs the inner statement's own column check — so an
+engine pin passes with the analysis pass removed.
+
 ### Fixed — a function an extension supplies exists once the extension is installed
 
 Found by the describe sweep. SPG implements `uuid_generate_v4()`,

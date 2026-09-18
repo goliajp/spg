@@ -1634,6 +1634,25 @@ fn builtin_target_resolves_lower(name: &str, lower: &str, mysql: bool) -> bool {
     if is_known_scalar_name(lower) {
         return true;
     }
+    // 9.0.0 — a pseudo-type is a type: PostgreSQL 18.6 accepts
+    // `NULL::void` and `pg_typeof(NULL::void)` answers `void`. `cstring`
+    // reached here through the scalar table and `void` did not, so the
+    // two spellings of the same thing disagreed.
+    if crate::conversions::pseudo_type(lower).is_some() {
+        return true;
+    }
+    // 9.0.0 — MySQL's `BINARY(n)` / `CHAR(n)` carry a length, which the
+    // value path strips before it dispatches.
+    if mysql
+        && let Some(stem) = lower.split('(').next()
+        && lower.ends_with(')')
+        && matches!(
+            stem.trim(),
+            "binary" | "char" | "nchar" | "decimal" | "signed" | "unsigned"
+        )
+    {
+        return true;
+    }
     // v7.39 (round 515) — `<element>[]`, which this parser names
     // `<element>_array`. PG has an array type for every scalar, so the rule
     // is the stem's: `NULL::cstring[]`, `NULL::aclitem[]` and
