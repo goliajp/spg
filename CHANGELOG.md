@@ -10,6 +10,30 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Added — `ADD CONSTRAINT … PRIMARY KEY / UNIQUE USING INDEX`
+
+Reported by sentori (§5.2): the whole clause was a syntax error. It is
+how a table gets a primary key without locking out writers — the index
+is built `CONCURRENTLY` first and adopted afterwards.
+
+PostgreSQL renames the adopted index to the constraint's name and says
+so, and refuses four kinds of index. Measured on 18.6, message for
+message:
+
+```text
+  ALTER TABLE t ADD CONSTRAINT t_pk PRIMARY KEY USING INDEX t_uq
+    NOTICE: ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "t_uq" to "t_pk"
+
+  … USING INDEX <not unique>    ERROR: "x" is not a unique index
+  … USING INDEX <missing>       ERROR: index "x" does not exist
+  … USING INDEX <partial>       ERROR: "x" is a partial index
+  … USING INDEX <expression>    ERROR: index "x" contains expressions
+```
+
+The three refusals that name an index also carry PostgreSQL's DETAIL
+(*Cannot create a primary key or unique constraint using such an
+index.*). The ordinary spelling still builds its own index.
+
 ### Fixed — a scalar subquery that answers NULL lost its type
 
 Reported by sentori (§3.9). An uncorrelated scalar subquery is resolved

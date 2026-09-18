@@ -1810,9 +1810,85 @@ impl Engine {
             } => (deferrable, initially_deferred),
             _ => (false, false),
         };
+        // 9.0.0 — `ADD CONSTRAINT … { PRIMARY KEY | UNIQUE } USING INDEX
+        // <name>`: the constraint adopts an index that already exists
+        // rather than building one, and PostgreSQL renames that index to
+        // the constraint's name. Measured on PG 18.6, including all four
+        // refusals; sentori reported the whole clause missing (§5.2).
+        let using_index = match &tc {
+            spg_sql::ast::TableConstraint::PrimaryKey { using_index, .. }
+            | spg_sql::ast::TableConstraint::Unique { using_index, .. } => using_index.clone(),
+            _ => None,
+        };
+        let adopted: Option<(String, Vec<String>)> = match using_index {
+            None => None,
+            Some(idx_name) => {
+                let cannot = |why: &str| {
+                    EngineError::Unsupported(alloc::format!(
+                        "{why} DETAIL: Cannot create a primary key or unique \
+                         constraint using such an index."
+                    ))
+                };
+                let idx = table
+                    .indices()
+                    .iter()
+                    .find(|i| i.name.eq_ignore_ascii_case(&idx_name))
+                    .ok_or_else(|| {
+                        EngineError::Unsupported(alloc::format!(
+                            "index {idx_name:?} does not exist"
+                        ))
+                    })?;
+                if !idx.is_unique {
+                    return Err(cannot(&alloc::format!(
+                        "{idx_name:?} is not a unique index"
+                    )));
+                }
+                if idx.partial_predicate.is_some() {
+                    return Err(cannot(&alloc::format!("{idx_name:?} is a partial index")));
+                }
+                if idx.expression.is_some() || idx.extra_expressions.iter().any(Option::is_some) {
+                    return Err(cannot(&alloc::format!(
+                        "index {idx_name:?} contains expressions"
+                    )));
+                }
+                let schema_cols = &table.schema().columns;
+                let mut names = alloc::vec![schema_cols[idx.column_position].name.clone()];
+                for p in &idx.extra_column_positions {
+                    names.push(schema_cols[*p].name.clone());
+                }
+                let stored = idx.name.clone();
+                // PostgreSQL renames the index and says so.
+                if let Some(new_name) = &con_name
+                    && !stored.eq_ignore_ascii_case(new_name)
+                {
+                    self.notice(alloc::format!(
+                        "ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index {stored:?} to {new_name:?}"
+                    ));
+                }
+                let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+                })?;
+                if let Some(ix) = table
+                    .indices_mut()
+                    .iter_mut()
+                    .find(|i| i.name.eq_ignore_ascii_case(&stored))
+                {
+                    if let Some(new_name) = &con_name {
+                        ix.name = new_name.clone();
+                    }
+                    ix.constraint_backing = true;
+                    ix.constraint_internal = false;
+                }
+                Some((stored, names))
+            }
+        };
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
         match tc {
             spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
             | spg_sql::ast::TableConstraint::Unique { columns, .. } => {
+                let columns = adopted.as_ref().map_or(columns, |(_, names)| names.clone());
                 let positions: Vec<usize> = columns
                     .iter()
                     .map(|c| {
@@ -1859,10 +1935,12 @@ impl Engine {
                     // Add a BTree index on the leading
                     // column for INSERT-side enforcement.
                     let leading = &columns[0];
-                    let already_idx = table.indices().iter().any(|idx| {
-                        matches!(idx.kind, spg_storage::IndexKind::BTree(_))
-                            && table.schema().columns[idx.column_position].name == *leading
-                    });
+                    // 9.0.0 — an adopted index is already the one.
+                    let already_idx = adopted.is_some()
+                        || table.indices().iter().any(|idx| {
+                            matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+                                && table.schema().columns[idx.column_position].name == *leading
+                        });
                     if !already_idx {
                         let suffix = if is_pk { "pkey" } else { "key" };
                         let idx_name = alloc::format!("{}_{leading}_{suffix}", tbl);
@@ -4500,6 +4578,7 @@ impl Engine {
                     columns,
                     deferrable,
                     initially_deferred,
+                    ..
                 } => (
                     true,
                     columns.clone(),
@@ -4514,6 +4593,7 @@ impl Engine {
                     deferrable,
                     initially_deferred,
                     prefix_lengths,
+                    ..
                 } => {
                     // v7.40.0 — a UNIQUE key with a MySQL prefix is a
                     // DIFFERENT constraint: MySQL rejects two rows that

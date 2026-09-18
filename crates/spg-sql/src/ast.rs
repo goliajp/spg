@@ -2665,6 +2665,11 @@ pub enum TableConstraint {
         /// Round 621 consumed the clauses; these carry them.
         deferrable: bool,
         initially_deferred: bool,
+        /// 9.0.0 — `ADD CONSTRAINT … PRIMARY KEY USING INDEX <name>`:
+        /// the constraint takes an index that already exists rather
+        /// than building one, and `columns` is empty until the engine
+        /// reads them off that index.
+        using_index: Option<String>,
     },
     /// `UNIQUE (col1, col2, ...)`. Engine builds a BTree index
     /// named `<table>_<leading_col>_key` (single-column) or
@@ -2687,6 +2692,9 @@ pub enum TableConstraint {
         /// MySQL rejects two rows sharing the first four characters.
         /// Empty for every PostgreSQL spelling.
         prefix_lengths: Vec<Option<u32>>,
+        /// 9.0.0 — `ADD CONSTRAINT … UNIQUE USING INDEX <name>`; see
+        /// `PrimaryKey::using_index`.
+        using_index: Option<String>,
     },
     /// v7.13.0 — `CHECK (<expr>)` table-level constraint
     /// (mailrs round-5 G3). Column-level inline CHECKs fold into
