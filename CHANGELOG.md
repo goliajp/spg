@@ -10,6 +10,27 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — arithmetic on an infinite date or timestamp
+
+Recorded delta RD-2 said an interval infinity was not representable
+here, so a subtraction that produced one errored instead.
+`IntervalKind::{PosInf, NegInf}` has carried one since it was added:
+the reading was stale, and re-measuring it found four more shapes.
+
+```text
+                                           PG 18.6   SPG 8.0.4
+  'infinity'::ts - '-infinity'::ts         infinity  ERROR: interval out of range
+  'infinity'::ts - '2020-01-01'::ts        infinity  ERROR
+  'infinity'::date - '2020-01-01'::date    ERROR     2147465385
+  'infinity'::date + 1                     infinity  ERROR: DATE + integer overflows
+  'infinity'::date - '1 day'::interval     infinity  ERROR: DATE → TIMESTAMP lift overflows
+```
+
+Two infinities of the same sign still have no difference, and that is
+still `interval out of range`; an infinite DATE still cannot be
+subtracted at all (`cannot subtract infinite dates`). 14 statements
+measured against PG 18.6, all now identical.
+
 ### Fixed — the catalog columns PostgreSQL declares as `"char"`, and the type itself
 
 Reported by sentori (§5.1): 26 catalog columns read `text` where PG 18.6
