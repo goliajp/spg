@@ -118,12 +118,12 @@ fn it_renders_as_the_name_and_casts_to_the_oid() {
 fn pg_typeof_tells_regproc_from_regprocedure() {
     let mut e = fixture();
     assert_eq!(
-        first(&mut e, "SELECT pg_typeof('ff'::regproc)"),
-        Value::text("regproc")
+        spg_engine::eval::value_to_text(&first(&mut e, "SELECT pg_typeof('ff'::regproc)")),
+        "regproc"
     );
     assert_eq!(
-        first(&mut e, "SELECT pg_typeof(to_regproc('ff'))"),
-        Value::text("regproc")
+        spg_engine::eval::value_to_text(&first(&mut e, "SELECT pg_typeof(to_regproc('ff'))")),
+        "regproc"
     );
     assert_eq!(
         first(

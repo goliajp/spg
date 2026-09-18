@@ -4794,8 +4794,10 @@ impl Engine {
         if references_ctid(stmt) {
             let snapshot = self.current_snapshot();
             let mut ext_cols = schema_cols.to_vec();
-            for name in SYSTEM_COLUMNS {
-                ext_cols.push(ColumnSchema::new(name.to_string(), DataType::Text, false));
+            // 9.0.0 — each system column's own type; see
+            // `SYSTEM_COLUMN_TYPES`.
+            for (name, ty) in SYSTEM_COLUMNS.iter().zip(SYSTEM_COLUMN_TYPES) {
+                ext_cols.push(ColumnSchema::new(name.to_string(), ty, false));
             }
             let table_oid =
                 crate::system_catalog::relation_oid(self.active_catalog(), &primary.name)
@@ -12155,6 +12157,15 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         // query and answered "ORDER BY of this value type is not
         // supported" the moment the column carried its type.
         Value::Char1(b) => f64::from(*b),
+        // v7.39 (read01 ruleutils.c) — regclass / regproc / regtype order
+        // by OID, which is what `orderby::value_cmp` has always done for
+        // them. This extractor had no arm, so a sort that reached it
+        // raised "ORDER BY of this value type is not supported" — or,
+        // while an oid cast to regclass was answering plain text, sorted
+        // by the NAME without saying so.
+        Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _) => {
+            return Ok(OrderKey::Int(i128::from(*oid)));
+        }
         // v7.5.0 — Value is #[non_exhaustive]; future variants need
         // an explicit ORDER BY mapping. Surface as Unsupported until
         // engine support is added.
@@ -12179,6 +12190,29 @@ pub(crate) const CTID_COLUMN: &str = "ctid";
 /// All six are reserved names there, which is what lets `*` skip them and
 /// lets a scan tell them from a user column without a flag.
 pub(crate) const SYSTEM_COLUMNS: [&str; 6] = ["ctid", "xmin", "xmax", "cmin", "cmax", "tableoid"];
+
+/// 9.0.0 — each system column's declared type, in `SYSTEM_COLUMNS` order.
+///
+/// Read by the scan that appends them AND by the static Describe, which
+/// is the one a client's `\gdesc` and every prepared statement see. All
+/// six described as `text`; PostgreSQL 18.6 says tid, xid, xid, cid, cid,
+/// oid, and a binary client decodes by that.
+pub(crate) const SYSTEM_COLUMN_TYPES: [DataType; 6] = [
+    DataType::Tid,
+    DataType::Xid,
+    DataType::Xid,
+    DataType::Cid,
+    DataType::Cid,
+    DataType::Oid,
+];
+
+/// The declared type of a system column, by name.
+pub(crate) fn system_column_type(name: &str) -> Option<DataType> {
+    SYSTEM_COLUMNS
+        .iter()
+        .position(|s| name.eq_ignore_ascii_case(s))
+        .map(|i| SYSTEM_COLUMN_TYPES[i])
+}
 
 /// Is this name one of them?
 pub(crate) fn is_system_column(name: &str) -> bool {

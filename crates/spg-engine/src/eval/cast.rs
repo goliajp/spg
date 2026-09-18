@@ -768,6 +768,15 @@ pub fn cast_value_ref_in(
                     && let Some(name) = crate::conversions::regtype_oid_to_name_owned(n)
                 {
                     Ok(Value::RegType(n, name.into_boxed_str()))
+                } else if matches!(target, CastTarget::RegClass) {
+                    // 9.0.0 — an oid that names nothing is still a
+                    // regclass. PostgreSQL 18.6 renders `999999::regclass`
+                    // as `999999`, types it `regclass`, and casts it back
+                    // to 999999; this answered `text`, and a sort over it
+                    // ordered by the DECIMAL SPELLING. The catalog-aware
+                    // path one layer up resolves the ones that do name
+                    // something.
+                    Ok(Value::RegClass(n, alloc::format!("{n}").into_boxed_str()))
                 } else {
                     Ok(Value::text(alloc::format!("{n}")))
                 }

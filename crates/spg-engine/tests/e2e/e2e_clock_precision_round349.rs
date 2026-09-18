@@ -55,10 +55,21 @@ fn err(e: &mut Engine, sql: &str) -> String {
 fn the_clock_family_answers_in_both_dialects() {
     for mysql in [false, true] {
         let mut e = engine(mysql);
-        assert_eq!(one(&mut e, "SELECT NOW()"), Value::Timestamp(FIXED));
+        // 9.0.0 — MySQL's default fractional-seconds precision is 0:
+        // measured on MySQL 9.7.2, `NOW()` renders `2026-09-18 16:47:54`
+        // and `NOW(6)` is how six digits are asked for. PostgreSQL keeps
+        // microseconds. This pin asserted the two dialects equal, which
+        // is what let the MySQL wire answer PostgreSQL's shape.
+        let want = if mysql {
+            Value::Timestamp(FIXED - FIXED.rem_euclid(1_000_000))
+        } else {
+            Value::Timestamp(FIXED)
+        };
+        assert_eq!(one(&mut e, "SELECT NOW()"), want, "mysql={mysql}");
         assert_eq!(
             one(&mut e, "SELECT CURRENT_TIMESTAMP"),
-            Value::Timestamp(FIXED)
+            want,
+            "mysql={mysql}"
         );
         assert_eq!(
             one(&mut e, "SELECT CURDATE()"),

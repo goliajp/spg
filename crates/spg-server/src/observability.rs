@@ -593,6 +593,13 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 // v8.0 — `void` is never a column, so no column of it
                 // contributes bytes to a row.
                 DataType::Void => 0,
+                // 9.0.0 — `tid` / `cid` name virtual system columns,
+                // which a stored row never holds.
+                DataType::Tid
+                | DataType::Cid
+                | DataType::RegClass
+                | DataType::RegType
+                | DataType::RegProc => 0,
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
                 DataType::Real => 4,

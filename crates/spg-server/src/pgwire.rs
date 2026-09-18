@@ -7893,7 +7893,31 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
         Value::Bool(b) => put(&[u8::from(*b)]),
         Value::SmallInt(n) => put(&n.to_be_bytes()),
         Value::Int(n) => put(&n.to_be_bytes()),
+        // 9.0.0 — an `oid` is four bytes in binary; its cell is a BigInt
+        // (see `DataType::Oid`), so only the declared type can say so.
+        Value::BigInt(n) if ty == DataType::Oid => put(&(*n as u32).to_be_bytes()),
         Value::BigInt(n) => put(&n.to_be_bytes()),
+        // 9.0.0 — the system and reference types, which had no binary
+        // arm at all: every driver that asks for binary results — sqlx,
+        // pgx, psycopg with `binary=True` — got `binary result format
+        // not implemented` for a query that projected `ctid`, `xmin` or
+        // any reg value. Byte layouts measured on PostgreSQL 18.6:
+        //
+        //   ctid                  000000000001   block u32, offset u16
+        //   xmin                  00000dd0       u32
+        //   cmin                  00000001       u32
+        //   'pg_class'::regclass  000004eb       the oid, u32
+        //   pg_typeof(1)          00000017       the oid, u32
+        Value::Tid(block, offset) => {
+            let mut b = [0u8; 6];
+            b[..4].copy_from_slice(&block.to_be_bytes());
+            b[4..].copy_from_slice(&(*offset as u16).to_be_bytes());
+            put(&b);
+        }
+        Value::Xid(x) | Value::Cid(x) => put(&x.to_be_bytes()),
+        Value::RegClass(oid, _) | Value::RegType(oid, _) | Value::RegProc(oid, _) => {
+            put(&(*oid as u32).to_be_bytes());
+        }
         Value::Real(x) => put(&x.to_be_bytes()),
         Value::Float(x) => put(&x.to_be_bytes()),
         // Text-family binary format IS the UTF-8 payload.
@@ -8557,6 +8581,14 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         // v7.39 (round 640) — a transaction id introspects as one.
         DataType::Xid => 28,
         DataType::Xid8 => 5069,
+        // 9.0.0 — `ctid` is `tid` and `cmin` / `cmax` are `cid` on PG
+        // 18.6; all six system columns described as text (25).
+        DataType::Tid => 27,
+        DataType::Cid => 29,
+        // 9.0.0 — the reg types describe as themselves (PG 18.6).
+        DataType::RegClass => 2205,
+        DataType::RegType => 2206,
+        DataType::RegProc => 24,
         // v7.39 (round 667) — PG's oid type oid.
         DataType::Oid => 26,
         DataType::SmallInt => 21,

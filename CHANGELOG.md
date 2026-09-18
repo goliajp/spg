@@ -10,6 +10,99 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — eleven types were announced as `text`, and seven could not be sent in binary
+
+A driver decodes a column by the type it is announced as, and most
+drivers — sqlx, pgx, psycopg with `binary=True` — ask for binary
+results. Measured on PostgreSQL 18.6 with a raw extended-protocol probe:
+
+```text
+                         PG 18.6 announces     SPG 8.0.4 announced   binary on SPG 8.0.4
+  pg_typeof(1)           regtype   00000017    text                  refused
+  'int4'::regtype        regtype   00000017    text                  refused
+  'pg_class'::regclass   regclass  000004eb    text                  refused
+  ctid                   tid       6 bytes     text                  refused
+  xmin / xmax            xid       4 bytes     text                  refused
+  cmin / cmax            cid       4 bytes     text                  refused
+  tableoid               oid       4 bytes     text                  (8 bytes)
+  point(1,2)             point                 text
+  box(…)                 box                   text
+  int4range(1,3)         int4range             text
+  inet_client_addr()     inet                  text
+  similarity('a','b')    real                  double precision
+```
+
+"Refused" is `binary result format not implemented`: a query that
+projected a system column or any reg value failed outright for every
+binary client. `tid`, `cid`, `regclass`, `regtype` and `regproc` are now
+declared types of their own, the six system columns carry theirs, and
+`pg_typeof` answers the oid it names. `oid` is four bytes in binary.
+
+The describe sweep (`xtests/describe-sweep`) now records no divergence
+at all over its 189 expressions, and its setup must succeed: a leg
+whose table was never created used to be filed as a recorded
+divergence rather than failing the sweep.
+
+### Fixed — `format_type` could not name 22 types SPG's own `pg_type` lists
+
+Of the 97 rows in SPG's `pg_type` below oid 10000, 22 rendered as `???`
+— what `format_type` answers for an oid it does not recognise — among
+them `point`, `regclass`, `regtype`, `void`, `pg_lsn`, `record`, the
+multiranges and every `any*` pseudo-type. psql showed it:
+`SELECT '(1,2)'::point \gdesc` said `???`. All 97 now match PostgreSQL
+18.6 name for name, and a pin asks the engine to agree with itself over
+every row, so a type added to `pg_type` without a name fails there.
+
+### Fixed — an OID cast to `regclass` was its name in text
+
+It rendered right and was wrong for everything else:
+
+```text
+                                  PG 18.6     SPG 8.0.4
+  pg_typeof(<oid>::regclass)      regclass    text
+  (oid::regclass)::bigint         <oid>       invalid input syntax for
+                                              type bigint: "zz_last"
+  ORDER BY oid::regclass          by OID      by NAME
+  999999::regclass                999999      999999, typed text
+```
+
+The sort is the one that gives a wrong answer: with `zz_last` at oid
+21680 and `aa_first` at 21683, PostgreSQL orders `zz_last, aa_first` and
+SPG ordered `aa_first, zz_last`. The cast from a NAME already answered a
+regclass carrying both halves; the catalog-aware interception for an OID
+kept only the name. The ORDER BY key extractor had no `reg*` arm either,
+so even a correct value would have been refused there.
+
+### Fixed — a partitioned table's PRIMARY KEY was enforced nowhere
+
+The rows of a partitioned table live in its children, and the children
+were given none of the parent's keys or indexes. So a key declared on
+the parent was a declaration and nothing else:
+
+```text
+  CREATE TABLE pt(id int primary key, v text) PARTITION BY RANGE (id);
+  CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (0) TO (100);
+  INSERT INTO pt1 VALUES (5,'a');
+  INSERT INTO pt1 VALUES (5,'b');
+    PG 18.6    duplicate key value violates unique constraint "pt1_pkey"
+    SPG 8.0.4  INSERT 0 1        -- and count(*) is 2
+
+  pg_indexes   PG 18.6    pt1_pkey on the child, pt_pkey on the parent
+               SPG 8.0.4  pt_pkey alone
+```
+
+Both ways in were affected. `CREATE TABLE … PARTITION OF` replayed the
+parent's `CREATE INDEX` templates and not its constraints; `ALTER TABLE
+… ATTACH PARTITION` did neither, so an attached child got no key and no
+index at all. Attaching a child that already holds a duplicate is now
+refused in PostgreSQL's own words — `could not create unique index
+"rc2_pkey" / Key (id)=(105) is duplicated.` — before anything is
+installed, so a refused attach changes nothing.
+
+This is the defect closed for `CREATE TABLE … LIKE` in v7.40.0, at the
+other site: "the copy of a keyed table had no key — which is the shape
+that looks right until a duplicate goes in."
+
 ### Fixed — the MySQL wire's clock family was PostgreSQL's
 
 Both dialects read one table, so three spellings answered PostgreSQL's

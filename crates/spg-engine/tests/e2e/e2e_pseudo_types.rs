@@ -25,7 +25,11 @@ fn one(e: &mut Engine, sql: &str) -> String {
         .unwrap_or_else(|err| panic!("{sql}: {err:?}"))
     {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
+            // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
             spg_storage::Value::Text(t) => t.to_string(),
+            spg_storage::Value::RegClass(_, t)
+            | spg_storage::Value::RegType(_, t)
+            | spg_storage::Value::RegProc(_, t) => t.to_string(),
             other => format!("{other:?}"),
         },
         other => panic!("expected rows from {sql}, got {other:?}"),

@@ -640,6 +640,12 @@ mod tests {
 
     #[test]
     fn free_port_is_inside_the_suite_range() {
+        // 9.0.0 — every row that BINDS a suite port takes the shared
+        // guard. These three held a wildcard listener without it, so they
+        // raced the rows that do: `a_port_claimed_by_one_roster_is_not_
+        // handed_to_another` went red on a full run because a sibling
+        // took the port it had just released.
+        let _serial = server_test_guard();
         let r = Roster::new();
         let p = r.free_port().expect("a free port");
         assert!(PORT_RANGE.contains(&p), "{p}");
@@ -1128,6 +1134,12 @@ mod second_port_tests {
     /// locale panel disagreeing about a collation.
     #[test]
     fn the_second_port_also_skips_a_port_someone_is_serving() {
+        // 9.0.0 — every row that BINDS a suite port takes the shared
+        // guard. These three held a wildcard listener without it, so they
+        // raced the rows that do: `a_port_claimed_by_one_roster_is_not_
+        // handed_to_another` went red on a full run because a sibling
+        // took the port it had just released.
+        let _serial = super::tests_support::guard();
         let r = Roster::new();
         // v7.38.20 — take the port, do not merely be told it is free.
         //
@@ -1166,6 +1178,12 @@ mod second_port_tests {
     /// not fail at all.
     #[test]
     fn the_probe_is_still_right_past_the_backlog() {
+        // 9.0.0 — every row that BINDS a suite port takes the shared
+        // guard. These three held a wildcard listener without it, so they
+        // raced the rows that do: `a_port_claimed_by_one_roster_is_not_
+        // handed_to_another` went red on a full run because a sibling
+        // took the port it had just released.
+        let _serial = super::tests_support::guard();
         let r = Roster::new();
         let (taken, held) = (0..64)
             .find_map(|_| {
@@ -1190,6 +1208,12 @@ mod second_port_tests {
     /// yet bound — which nothing else can know about.
     #[test]
     fn the_second_port_is_never_the_first() {
+        // 9.0.0 — every row that BINDS a suite port takes the shared
+        // guard. These three held a wildcard listener without it, so they
+        // raced the rows that do: `a_port_claimed_by_one_roster_is_not_
+        // handed_to_another` went red on a full run because a sibling
+        // took the port it had just released.
+        let _serial = super::tests_support::guard();
         let r = Roster::new();
         let first = r.free_port().expect("a free port");
         for _ in 0..8 {

@@ -118,7 +118,11 @@ fn real_orders_and_dedups_like_pg() {
     let texts: Vec<&str> = got
         .iter()
         .map(|r| match &r[0] {
+            // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
             spg_storage::Value::Text(s) => s.as_ref(),
+            spg_storage::Value::RegClass(_, s)
+            | spg_storage::Value::RegType(_, s)
+            | spg_storage::Value::RegProc(_, s) => s.as_ref(),
             other => panic!("expected text, got {other:?}"),
         })
         .collect();
@@ -154,7 +158,9 @@ fn null_branch_column_adopts_concrete_type() {
         &mut e,
         "SELECT pg_typeof(x) FROM (VALUES (NULL),(1.5)) t(x) LIMIT 1",
     );
-    assert_eq!(got[0][0], spg_storage::Value::text("numeric"));
+    // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid
+    // beside the name; the NAME is what this pin means.
+    assert_eq!(spg_engine::eval::value_to_text(&got[0][0]), "numeric");
     let got = rows(&mut e, "SELECT pg_typeof(NULL)");
-    assert_eq!(got[0][0], spg_storage::Value::text("unknown"));
+    assert_eq!(spg_engine::eval::value_to_text(&got[0][0]), "unknown");
 }

@@ -17,7 +17,11 @@ fn typeof_of(e: &mut Engine, cast: &str) -> String {
     let sql = alloc_sql(cast);
     match e.execute(&sql).unwrap() {
         QueryResult::Rows { rows, .. } => match &rows[0].values[0] {
+            // 9.0.0 — `pg_typeof` answers a `regtype`, which carries the oid beside the name (PostgreSQL 18.6 describes it as `regtype` and sends the oid in binary). What this pin means is the NAME.
             spg_storage::Value::Text(s) => s.to_string(),
+            spg_storage::Value::RegClass(_, s)
+            | spg_storage::Value::RegType(_, s)
+            | spg_storage::Value::RegProc(_, s) => s.to_string(),
             other => panic!("{cast}: {other:?}"),
         },
         other => panic!("{cast}: {other:?}"),

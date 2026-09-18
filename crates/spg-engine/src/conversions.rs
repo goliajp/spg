@@ -3842,6 +3842,47 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         3910 => "tstzrange",
         3912 => "daterange",
         3926 => "int8range",
+        // 9.0.0 — the oids SPG's own `pg_type` lists and its own
+        // `format_type` could not name. Swept oid by oid against
+        // PostgreSQL 18.6 over every row of SPG's `pg_type`: 22 of the
+        // 97 answered `???`, which is what `format_type` returns for an
+        // oid it does not recognise. A catalog that lists a type and a
+        // renderer that cannot name it are the same catalog disagreeing
+        // with itself, and `\gdesc` showed it: `'(1,2)'::point`
+        // described as `???`.
+        24 => "regproc",
+        600 => "point",
+        // `box` is not in SPG's `pg_type` at all yet; it is named here
+        // because `format_type(603, -1)` is asked directly too.
+        603 => "box",
+        601 => "lseg",
+        602 => "path",
+        604 => "polygon",
+        628 => "line",
+        718 => "circle",
+        1033 => "aclitem",
+        // `_aclitem` has its own explicit `pg_type` row, so it is NOT in
+        // `ARRAY_TYPE_OIDS` — putting it there gave pg_type a SECOND row
+        // at oid 1034 and the `pg_proc JOIN pg_type` pin counted 883
+        // where pg_proc has 882. Named here instead.
+        1034 => "aclitem[]",
+        2205 => "regclass",
+        2206 => "regtype",
+        2249 => "record",
+        2277 => "anyarray",
+        2278 => "void",
+        2279 => "trigger",
+        2283 => "anyelement",
+        3220 => "pg_lsn",
+        3831 => "anyrange",
+        4451 => "int4multirange",
+        4532 => "nummultirange",
+        4533 => "tsmultirange",
+        4534 => "tstzmultirange",
+        4535 => "datemultirange",
+        4536 => "int8multirange",
+        4537 => "anymultirange",
+        5078 => "anycompatiblearray",
         _ => return None,
     })
 }
@@ -4420,6 +4461,12 @@ pub(crate) fn coerce_to_oid(v: &Value<'_>) -> Result<Option<Value<'static>>, Eva
         Value::SmallInt(n) => i64::from(*n),
         Value::Int(n) => i64::from(*n),
         Value::BigInt(n) => *n,
+        // 9.0.0 — a reg value IS an oid; `'text'::regtype::oid` is 25 on
+        // PostgreSQL 18.6. It used to reach here as something without a
+        // declared type and take another road; once the reg family got
+        // `DataType::RegType` and friends, this is the road, and it
+        // answered `cannot cast regtype to USER-DEFINED`.
+        Value::RegClass(oid, _) | Value::RegProc(oid, _) | Value::RegType(oid, _) => *oid,
         Value::Text(t) => match t.trim().parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
