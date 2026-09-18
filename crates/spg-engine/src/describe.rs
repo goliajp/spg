@@ -1118,7 +1118,7 @@ pub(crate) fn describe_expr_in(
         // disagreed with each other — a client that reads names from
         // Describe looked for `count` and was told `?column?`. Only the
         // NAME is taken here; the type still comes from the map below.
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             function_return_shape(name, args, schema_cols)
                 .map(|mut sh| {
                     if sh.name == "?column?" {
@@ -1151,7 +1151,7 @@ pub(crate) fn describe_expr_in(
             if matches!(name.to_ascii_lowercase().as_str(),
                         "percentile_cont" | "percentile_disc" | "mode")) =>
         {
-            let Expr::FunctionCall { name, args } = call.as_ref() else {
+            let Expr::FunctionCall { name, args, .. } = call.as_ref() else {
                 return None;
             };
             let lower = name.to_ascii_lowercase();

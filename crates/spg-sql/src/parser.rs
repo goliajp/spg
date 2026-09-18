@@ -18,7 +18,7 @@ use core::fmt;
 use core::mem;
 
 use crate::ast::{
-    AssignTarget, BinOp, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
+    AssignTarget, BinOp, CallSyntax, CastTarget, Collation, ColumnDef, ColumnName, ColumnTypeName,
     CreateFunctionStatement, CreateIndexStatement, CreatePublicationStatement,
     CreateSubscriptionStatement, CreateTableStatement, CreateTriggerStatement, DiscardTarget, Expr,
     ExtractField, FkAction, ForeignKeyConstraint, FrameBound, FrameExclusion, FrameKind,
@@ -1049,6 +1049,7 @@ mod frame_meter {
 #[inline(never)]
 fn build_center_call(e: Expr) -> Expr {
     Expr::FunctionCall {
+        syntax: CallSyntax::Written,
         name: alloc::string::String::from("center"),
         args: alloc::vec![e],
     }
@@ -9757,10 +9758,12 @@ impl Parser {
                 };
                 let assigned = match slice_hi {
                     None => Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "__array_assign".to_string(),
                         args: alloc::vec![base, index, value],
                     },
                     Some(hi) => Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "__array_assign_slice".to_string(),
                         args: alloc::vec![
                             base,
@@ -9793,6 +9796,7 @@ impl Parser {
             let value = if matches!(self.peek(), Token::Default) {
                 self.advance();
                 Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__column_default".to_string(),
                     args: Vec::new(),
                 }
@@ -13793,7 +13797,7 @@ impl Parser {
             *expr = Expr::Literal(Literal::Null);
             return;
         }
-        if let Expr::FunctionCall { name, args } = expr
+        if let Expr::FunctionCall { name, args, .. } = expr
             && name.eq_ignore_ascii_case("grouping")
         {
             let mut mask: i64 = 0;
@@ -13840,7 +13844,7 @@ impl Parser {
             //
             // `grouping(…)` is settled above, before this, so it keeps
             // reading the dropped set.
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 if is_aggregate_function_name(name) {
                     return;
                 }
@@ -14173,7 +14177,7 @@ impl Parser {
         // projection, so it says so rather than answering something else.
         if let [
             SelectItem::Expr {
-                expr: Expr::FunctionCall { name, args },
+                expr: Expr::FunctionCall { name, args, .. },
                 ..
             },
         ] = items.as_slice()
@@ -14182,6 +14186,7 @@ impl Parser {
             let Some(Expr::FunctionCall {
                 name: inner_name,
                 args: inner_args,
+                ..
             }) = args.first()
             else {
                 return Err(self.err(
@@ -14248,7 +14253,7 @@ impl Parser {
             let mut found: Option<(usize, TableRef, String)> = None;
             for (i, item) in items.iter().enumerate() {
                 if let SelectItem::Expr {
-                    expr: Expr::FunctionCall { name, args },
+                    expr: Expr::FunctionCall { name, args, .. },
                     alias,
                 } = item
                 {
@@ -14268,6 +14273,7 @@ impl Parser {
                             Some(alloc::vec![
                                 Expr::Literal(Literal::Integer(1)),
                                 Expr::FunctionCall {
+                                    syntax: CallSyntax::Written,
                                     name: "array_length".to_string(),
                                     args: args.clone(),
                                 },
@@ -14283,6 +14289,7 @@ impl Parser {
                             };
                             (
                                 Some(Box::new(Expr::FunctionCall {
+                                    syntax: CallSyntax::Written,
                                     name: array_fn.to_string(),
                                     args: args.clone(),
                                 })),
@@ -14302,6 +14309,7 @@ impl Parser {
                         {
                             (
                                 Some(Box::new(Expr::FunctionCall {
+                                    syntax: CallSyntax::Written,
                                     name: lname.clone(),
                                     args: args.clone(),
                                 })),
@@ -14313,6 +14321,7 @@ impl Parser {
                         // returns the matches as a TEXT array → unnest).
                         "jsonb_path_query" | "json_path_query" if args.len() == 2 => (
                             Some(Box::new(Expr::FunctionCall {
+                                syntax: CallSyntax::Written,
                                 name: lname.clone(),
                                 args: args.clone(),
                             })),
@@ -14907,6 +14916,7 @@ impl Parser {
         for e in keys {
             out.push(OrderBy {
                 expr: Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "grouping".into(),
                     args: alloc::vec![e.clone()],
                 },
@@ -15644,6 +15654,7 @@ impl Parser {
                 let name = s.to_ascii_uppercase();
                 self.advance();
                 crate::ast::Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name,
                     args: Vec::new(),
                 }
@@ -18273,6 +18284,7 @@ impl Parser {
                             self.advance();
                         }
                         on_update_runtime = Some(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: "now".into(),
                             args: Vec::new(),
                         });
@@ -18907,6 +18919,7 @@ impl Parser {
                 if matches!(self.peek(), Token::Default) {
                     self.advance();
                     values.push(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "__column_default".to_string(),
                         args: Vec::new(),
                     });
@@ -19126,6 +19139,7 @@ impl Parser {
                 if matches!(self.peek(), Token::Default) {
                     self.advance();
                     tuple.push(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "__column_default".to_string(),
                         args: Vec::new(),
                     });
@@ -19184,7 +19198,7 @@ impl Parser {
     /// the incoming row's value — exactly PG's EXCLUDED.col.
     fn rewrite_mysql_values_refs(e: &mut Expr) {
         match e {
-            Expr::FunctionCall { name, args }
+            Expr::FunctionCall { name, args, .. }
                 if name.eq_ignore_ascii_case("values")
                     && args.len() == 1
                     && matches!(&args[0], Expr::Column(c) if c.qualifier.is_none()) =>
@@ -19479,6 +19493,7 @@ impl Parser {
             self.advance(); // *
             return Ok(SelectItem::Expr {
                 expr: Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__record_expand".to_string(),
                     args: alloc::vec![expr],
                 },
@@ -20069,6 +20084,7 @@ impl Parser {
                 distinct_on: Vec::new(),
                 items: alloc::vec![SelectItem::Expr {
                     expr: Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "regexp_matches".to_string(),
                         args: fn_args,
                     },
@@ -20182,6 +20198,7 @@ impl Parser {
             // preceding FROM item (bare or qualified column) is correlated;
             // route it through the per-outer-row lateral channel.
             let expr = crate::ast::Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: call_name,
                 args: fn_args,
             };
@@ -20274,14 +20291,17 @@ impl Parser {
                     | "jsonb_object_keys"
                     | "json_object_keys"
                     | "generate_subscripts" => crate::ast::Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: fn_name,
                         args: fn_args,
                     },
                     "string_to_table" => crate::ast::Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "string_to_array".to_string(),
                         args: fn_args,
                     },
                     "regexp_split_to_table" => crate::ast::Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "regexp_split_to_array".to_string(),
                         args: fn_args,
                     },
@@ -20358,6 +20378,7 @@ impl Parser {
                 entries.pop().expect("len checked")
             } else {
                 crate::ast::Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__unnest_zip".to_string(),
                     args: entries,
                 }
@@ -20413,6 +20434,7 @@ impl Parser {
                 srf_args.pop().expect("len checked")
             } else {
                 crate::ast::Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__unnest_zip".to_string(),
                     args: srf_args,
                 }
@@ -20715,10 +20737,12 @@ impl Parser {
             }
             let draw = match sample_seed {
                 Some(seed) => Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__tsm_fract".to_string(),
                     args: alloc::vec![seed],
                 },
                 None => Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "random".to_string(),
                     args: Vec::new(),
                 },
@@ -21250,6 +21274,7 @@ impl Parser {
                     only: false,
                     as_of_segment: None,
                     unnest_expr: Some(Box::new(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: elem_fn.to_string(),
                         args: alloc::vec![arg],
                     })),
@@ -21685,6 +21710,7 @@ impl Parser {
         }
         self.advance(); // )
         Ok(Expr::FunctionCall {
+            syntax: CallSyntax::Written,
             name: name.into(),
             args,
         })
@@ -22153,6 +22179,7 @@ impl Parser {
                 }
                 maybe_not(
                     Expr::FunctionCall {
+                        syntax: CallSyntax::Operator,
                         name: String::from("regexp_like"),
                         args,
                     },
@@ -22166,10 +22193,12 @@ impl Parser {
                 case_insensitive: ci,
             },
             Sym::StartsWith => Expr::FunctionCall {
+                syntax: CallSyntax::Operator,
                 name: String::from("starts_with"),
                 args: alloc::vec![lhs.clone(), rhs],
             },
             Sym::Power => Expr::FunctionCall {
+                syntax: CallSyntax::Operator,
                 name: String::from("power"),
                 args: alloc::vec![lhs.clone(), rhs],
             },
@@ -22183,6 +22212,7 @@ impl Parser {
             },
             // range `-|-` "is adjacent to" — lowered to a catalog function.
             Sym::RangeAdjacent => Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: String::from("range_adjacent"),
                 args: alloc::vec![lhs.clone(), rhs],
             },
@@ -22303,6 +22333,7 @@ impl Parser {
                         _ => "value".to_string(),
                     };
                     let call = Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "pg_is_json".to_string(),
                         args: alloc::vec![expr, Expr::Literal(Literal::String(kind)),],
                     };
@@ -22350,6 +22381,7 @@ impl Parser {
                             args.push(Expr::Literal(Literal::String(f)));
                         }
                         let call = Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: "is_normalized".to_string(),
                             args,
                         };
@@ -22465,6 +22497,7 @@ impl Parser {
                     args.push(self.parse_expr(6)?);
                 }
                 let call = Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "__similar_to".to_string(),
                     args,
                 };
@@ -22537,6 +22570,7 @@ impl Parser {
                 self.advance();
                 let pattern = self.parse_expr(6)?;
                 let call = Expr::FunctionCall {
+                    syntax: CallSyntax::Operator,
                     name: String::from("regexp_like"),
                     args: alloc::vec![
                         expr,
@@ -22739,6 +22773,7 @@ impl Parser {
         self.advance();
         let e = self.parse_expr(9)?;
         Ok(Expr::FunctionCall {
+            syntax: CallSyntax::Written,
             name: alloc::string::String::from(name),
             args: alloc::vec![e],
         })
@@ -22751,6 +22786,7 @@ impl Parser {
         self.advance();
         let e = self.parse_expr(9)?;
         Ok(Expr::FunctionCall {
+            syntax: CallSyntax::Written,
             name: alloc::string::String::from(if vertical {
                 "isvertical"
             } else {
@@ -22831,6 +22867,7 @@ impl Parser {
         self.advance();
         let e = self.parse_expr(9)?;
         Ok(Expr::FunctionCall {
+            syntax: CallSyntax::Written,
             name: String::from("tsquery_not"),
             args: alloc::vec![e],
         })
@@ -23771,6 +23808,7 @@ impl Parser {
                 // Zone at comparison precedence so AND/OR stay out.
                 let zone = self.parse_expr(6)?;
                 expr = Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "timezone".to_string(),
                     args: alloc::vec![zone, expr],
                 };
@@ -24168,6 +24206,7 @@ impl Parser {
             }
             self.advance();
             let pair_fn = |name: &str, a: &Expr, b: &Expr| Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: String::from(name),
                 args: alloc::vec![a.clone(), b.clone()],
             };
@@ -24235,6 +24274,7 @@ impl Parser {
             // ROW(...) node. All the comparison / predicate forms returned above.
             _ => {
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: String::from("row"),
                     args: row,
                 });
@@ -24660,6 +24700,7 @@ impl Parser {
                 }
             }
             Ok(Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: "row".into(),
                 args,
             })
@@ -24716,6 +24757,7 @@ impl Parser {
                 });
                 body.unions[rec].1.items.push(SelectItem::Expr {
                     expr: Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "array_append".into(),
                         args: alloc::vec![col_ref(&srch.set_column), rec_key],
                     },
@@ -24801,6 +24843,7 @@ impl Parser {
             // rec path: array_append(cte.path, ROW(cols)).
             body.unions[rec].1.items.push(SelectItem::Expr {
                 expr: Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "array_append".into(),
                     args: alloc::vec![col_ref(&cyc.path_column), rec_row],
                 },
@@ -25564,12 +25607,14 @@ impl Parser {
         // plainto_tsquery('simple', term)` and OR-fold.
         let simple_lit = || Expr::Literal(crate::ast::Literal::String(String::from("simple")));
         let plainto = Expr::FunctionCall {
+            syntax: CallSyntax::Written,
             name: String::from("plainto_tsquery"),
             args: alloc::vec![simple_lit(), term.clone()],
         };
         let mut folded: Option<Expr> = None;
         for col in cols {
             let to_tsv = Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: String::from("to_tsvector"),
                 args: alloc::vec![simple_lit(), col],
             };
@@ -25740,6 +25785,7 @@ impl Parser {
             }
             self.advance(); // )
             return Ok(Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: alloc::string::String::from("interval"),
                 args,
             });
@@ -26530,6 +26576,7 @@ impl Parser {
                 if let Some(filter) = filter {
                     return Ok(Expr::AggregateOrdered {
                         call: Box::new(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: "count_star".into(),
                             args: Vec::new(),
                         }),
@@ -26539,6 +26586,7 @@ impl Parser {
                     });
                 }
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: "count_star".into(),
                     args: Vec::new(),
                 });
@@ -26631,6 +26679,7 @@ impl Parser {
                     return self.parse_row_comparison_tail(row_items);
                 }
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: String::from("row"),
                     args: row_items,
                 });
@@ -26657,6 +26706,7 @@ impl Parser {
                 }
                 self.advance();
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: String::from("__xmlparse"),
                     args: alloc::vec![src, Expr::Literal(Literal::String(mode))],
                 });
@@ -26693,6 +26743,7 @@ impl Parser {
                 }
                 self.advance();
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: String::from("xmlelement"),
                     args,
                 });
@@ -26807,6 +26858,7 @@ impl Parser {
                 }
                 self.advance();
                 return Ok(Expr::FunctionCall {
+                    syntax: CallSyntax::Written,
                     name: String::from("xmlforest"),
                     args,
                 });
@@ -26831,6 +26883,7 @@ impl Parser {
                     }
                     self.advance();
                     return Ok(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: String::from("strpos"),
                         args: alloc::vec![haystack, needle],
                     });
@@ -26888,6 +26941,7 @@ impl Parser {
                         trim_args.push(c);
                     }
                     return Ok(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: String::from(mode.unwrap_or("btrim")),
                         args: trim_args,
                     });
@@ -27011,6 +27065,7 @@ impl Parser {
                         args.push(pattern);
                         args.push(esc);
                         return Ok(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: "__substring_similar".to_string(),
                             args,
                         });
@@ -27042,6 +27097,7 @@ impl Parser {
                         }
                         self.advance();
                         return Ok(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: first.to_ascii_lowercase(),
                             args,
                         });
@@ -27077,6 +27133,7 @@ impl Parser {
                         }
                         self.advance();
                         return Ok(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: String::from("overlay"),
                             args,
                         });
@@ -27099,6 +27156,7 @@ impl Parser {
                         self.advance();
                         let chars = args.pop().expect("one arg");
                         return Ok(Expr::FunctionCall {
+                            syntax: CallSyntax::Written,
                             name: String::from("btrim"),
                             args: alloc::vec![target, chars],
                         });
@@ -27194,6 +27252,7 @@ impl Parser {
                 if values > 1 {
                     let sep_arg = if saw_separator { args.pop() } else { None };
                     let folded = Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
                         name: "concat".to_string(),
                         args: core::mem::take(&mut args),
                     };
@@ -27278,7 +27337,11 @@ impl Parser {
             }
             if !agg_order_by.is_empty() || agg_distinct || filter.is_some() {
                 return Ok(Expr::AggregateOrdered {
-                    call: Box::new(Expr::FunctionCall { name: first, args }),
+                    call: Box::new(Expr::FunctionCall {
+                        syntax: CallSyntax::Written,
+                        name: first,
+                        args,
+                    }),
                     order_by: agg_order_by,
                     distinct: agg_distinct,
                     filter,
@@ -27306,7 +27369,11 @@ impl Parser {
             if !self.mysql_dialect {
                 lift_date_add_arg_to_timestamptz(&first, &mut args);
             }
-            return Ok(Expr::FunctionCall { name: first, args });
+            return Ok(Expr::FunctionCall {
+                syntax: CallSyntax::Written,
+                name: first,
+                args,
+            });
         }
         // v7.9.20 — SQL-standard parenless keyword expressions
         // (PG treats these as functions called without parens).
@@ -27339,6 +27406,7 @@ impl Parser {
                 | "system_user"
         ) {
             return Ok(Expr::FunctionCall {
+                syntax: CallSyntax::Written,
                 name: lc,
                 args: Vec::new(),
             });
@@ -27816,6 +27884,7 @@ fn variable_ref_atom(raw: &str) -> Expr {
     let user_var = !raw.starts_with("@@");
     let bare = raw.trim_start_matches('@').to_ascii_lowercase();
     Expr::FunctionCall {
+        syntax: CallSyntax::Written,
         name: String::from(if user_var {
             "__spg_user_var"
         } else {
@@ -27881,6 +27950,7 @@ fn make_interval_call(qty: Expr, unit: &str) -> Expr {
         _ => args[3] = qty,
     }
     Expr::FunctionCall {
+        syntax: CallSyntax::Written,
         name: alloc::string::String::from("make_interval"),
         args,
     }
@@ -28413,7 +28483,7 @@ const AGG_NAMES: &[&str] = &[
 fn expr_has_toplevel_aggregate(e: &Expr) -> bool {
     match e {
         Expr::AggregateOrdered { .. } => true,
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             AGG_NAMES.contains(&name.to_ascii_lowercase().as_str())
                 || args.iter().any(expr_has_toplevel_aggregate)
         }

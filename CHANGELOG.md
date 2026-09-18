@@ -10,6 +10,25 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — an operator lowered onto a function reported the function's name
+
+Reported by sentori (§4.3). The parser lowers six operators onto
+functions — `~` `~*` `!~` `!~*` onto `regexp_like`, `^@` onto
+`starts_with`, `^` onto `power` — and the projected column then carried
+the function's name, which is a key an ORM reads its results by.
+
+```text
+                     PG 18.6     SPG 8.0.4
+  SELECT 'a' ~ 'a'   ?column?    regexp_like
+  SELECT 'ab' ^@ 'a' ?column?    starts_with
+  SELECT 2 ^ 3       ?column?    power
+```
+
+A call now records whether it was written as a call or arrived from an
+operator, and an operator expression is named the way every other
+operator expression is. A written `regexp_like('a','a')` still reports
+`regexp_like`.
+
 ### Fixed — a statement read the clock as many times as it folded SQL, and two caches kept the reading
 
 Reported by sentori (§4.2, third row): in autocommit, a view's `now()` and

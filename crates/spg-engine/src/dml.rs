@@ -1746,7 +1746,7 @@ impl Engine {
             for (pos, expr) in &targets {
                 // `SET col = DEFAULT` — the parser's marker call;
                 // resolve the column's declared default here.
-                if matches!(expr, Expr::FunctionCall { name, args }
+                if matches!(expr, Expr::FunctionCall { name, args, ..}
                     if name == "__column_default" && args.is_empty())
                 {
                     let v =
@@ -6727,7 +6727,7 @@ fn rewrite_returning_xmax(expr: &mut Expr, qualifier: &str) -> bool {
 
 /// v7.39 (round 130) — is `e` a bare `merge_action()` call?
 fn is_merge_action_call(e: &Expr) -> bool {
-    matches!(e, Expr::FunctionCall { name, args }
+    matches!(e, Expr::FunctionCall { name, args, ..}
         if name.eq_ignore_ascii_case("merge_action") && args.is_empty())
 }
 
@@ -6736,7 +6736,7 @@ fn is_merge_action_call(e: &Expr) -> bool {
 /// string). Mirrors `rewrite_returning_old_new`'s tree walk.
 fn rewrite_merge_action(expr: &mut Expr) {
     match expr {
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if name.eq_ignore_ascii_case("merge_action") && args.is_empty() =>
         {
             *expr = Expr::Column(spg_sql::ast::ColumnName {
@@ -6855,7 +6855,7 @@ fn expand_merge_returning_items(
 /// call with no args. `INSERT … VALUES (…, DEFAULT, …)` uses it for a slot, and
 /// the INSERT executor resolves it against the target column's declared default.
 fn is_column_default_marker(e: &Expr) -> bool {
-    matches!(e, Expr::FunctionCall { name, args } if name == "__column_default" && args.is_empty())
+    matches!(e, Expr::FunctionCall { name, args, ..} if name == "__column_default" && args.is_empty())
 }
 
 /// v7.39 (round 433) — does this AUTO_INCREMENT column need a generated
@@ -6944,6 +6944,7 @@ fn auto_cursor_seed(
 /// force a column to its declared default / sequence value.
 fn column_default_marker() -> Expr {
     Expr::FunctionCall {
+        syntax: spg_sql::ast::CallSyntax::Written,
         name: String::from("__column_default"),
         args: Vec::new(),
     }

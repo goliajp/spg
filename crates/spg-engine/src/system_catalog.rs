@@ -1994,7 +1994,7 @@ fn attrdef_rows(cat: &Catalog) -> Vec<(i64, i64, i32, String)> {
 
 /// The sequence a `nextval('s')` default reads, schema prefix dropped.
 fn nextval_target(default_text: &str) -> Option<String> {
-    let Ok(spg_sql::ast::Expr::FunctionCall { name, args }) =
+    let Ok(spg_sql::ast::Expr::FunctionCall { name, args, .. }) =
         spg_sql::parser::parse_expression(default_text)
     else {
         return None;

@@ -1979,6 +1979,7 @@ impl Engine {
                     let col_expr = Expr::Column(cte_col);
                     *e = if outer_has_group_by && !in_agg {
                         Expr::FunctionCall {
+                            syntax: spg_sql::ast::CallSyntax::Written,
                             name: "max".into(),
                             args: alloc::vec![col_expr],
                         }
@@ -1989,7 +1990,7 @@ impl Engine {
                 // Otherwise leave for the existing per-row resolver.
                 // The subquery body is a separate scope — don't descend.
             }
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 let child = in_agg || aggregate::is_aggregate_name(name);
                 for a in args.iter_mut() {
                     self.pull_up_walk_limit_one(
@@ -2329,6 +2330,7 @@ impl Engine {
         let argmax = Expr::ArraySubscript {
             target: alloc::boxed::Box::new(Expr::AggregateOrdered {
                 call: alloc::boxed::Box::new(Expr::FunctionCall {
+                    syntax: spg_sql::ast::CallSyntax::Written,
                     name: "array_agg".into(),
                     args: alloc::vec![proj_expr.clone()],
                 }),
@@ -2489,7 +2491,7 @@ impl Engine {
                 // Otherwise leave for the existing resolver; the subquery
                 // body is a separate scope, so don't descend into it.
             }
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 let child = in_agg || aggregate::is_aggregate_name(name);
                 for a in args.iter_mut() {
                     self.pull_up_walk(a, child, outer_aliases, joins_out);
@@ -3489,7 +3491,7 @@ fn proj_has_disqualifying_shape(
         | Expr::WindowFunction { .. }
         | Expr::ScalarSubquery(_)
         | Expr::Exists { .. } => true,
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             if aggregate::is_aggregate_name(name) {
                 return true;
             }
@@ -3955,7 +3957,7 @@ impl Engine {
             return None;
         };
         let is_count_shape = match expr {
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 (name.eq_ignore_ascii_case("count_star") && args.is_empty())
                     || name.eq_ignore_ascii_case("count")
             }
@@ -4070,7 +4072,7 @@ impl Engine {
             return Ok(None);
         };
         let is_count_shape = match expr {
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 (name.eq_ignore_ascii_case("count_star") && args.is_empty())
                     || name.eq_ignore_ascii_case("count")
             }

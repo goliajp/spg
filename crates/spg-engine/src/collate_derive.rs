@@ -180,6 +180,7 @@ mod tests {
 
     fn upper(e: Expr) -> Expr {
         Expr::FunctionCall {
+            syntax: spg_sql::ast::CallSyntax::Written,
             name: "upper".to_string(),
             args: vec![e],
         }

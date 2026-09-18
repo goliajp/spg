@@ -98,7 +98,7 @@ pub(crate) fn children_of_parent(catalog: &Catalog, parent: &str) -> Vec<String>
 /// `i64` microseconds-since-epoch literal coerced from a TIMESTAMPTZ
 /// (text) literal. Any other shape yields `EngineError::Unsupported`.
 pub(crate) fn evaluate_partition_bound(expr: Expr) -> Result<PartitionBound, EngineError> {
-    if let Expr::FunctionCall { name, args } = &expr
+    if let Expr::FunctionCall { name, args, .. } = &expr
         && args.is_empty()
     {
         let upper = name.to_ascii_uppercase();

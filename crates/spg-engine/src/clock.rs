@@ -328,7 +328,7 @@ fn rewrite_expr_clock(e: &mut Expr, cx: &ClockFold) {
         | Expr::FieldAccess { base: expr, .. } => {
             rewrite_expr_clock(expr, cx);
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             // v7.39 (read01 round 97) — the single-arg `age(t)` form is PG's
             // `age(date_trunc('day', current_timestamp), t)`: the age of `t`
             // relative to midnight today. The eval-time fallback anchors at
@@ -501,7 +501,7 @@ fn clock_replacement_for(e: &Expr, cx: &ClockFold) -> Option<Expr> {
     // as a MySQL one. (PG really has no `now(integer)`, and that one
     // error was right; it stays.)
     let precision = match e {
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if args.len() == 1 && (cx.mysql || !name.eq_ignore_ascii_case("now")) =>
         {
             match args.first() {
@@ -518,7 +518,7 @@ fn clock_replacement_for(e: &Expr, cx: &ClockFold) -> Option<Expr> {
         _ => None,
     };
     let (kind, name) = match e {
-        Expr::FunctionCall { name, args } if args.is_empty() => (ClockSite::Fn, name.as_str()),
+        Expr::FunctionCall { name, args, .. } if args.is_empty() => (ClockSite::Fn, name.as_str()),
         Expr::FunctionCall { name, .. } if precision.is_some() => (ClockSite::Fn, name.as_str()),
         Expr::Column(c) if c.qualifier.is_none() => (ClockSite::BareIdent, c.name.as_str()),
         _ => return None,

@@ -292,6 +292,7 @@ pub(crate) fn value_to_literal_expr_typed(
                 args.push(value_to_literal_expr(v)?);
             }
             return Ok(Expr::FunctionCall {
+                syntax: spg_sql::ast::CallSyntax::Written,
                 name: alloc::string::String::from("row"),
                 args,
             });

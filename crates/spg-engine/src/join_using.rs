@@ -158,6 +158,7 @@ impl Engine {
                     let merged_expr = match join.kind {
                         JoinKind::Right => right_ref.clone(),
                         JoinKind::FullOuter => Expr::FunctionCall {
+                            syntax: spg_sql::ast::CallSyntax::Written,
                             name: "coalesce".to_string(),
                             args: alloc::vec![left_ref.clone(), right_ref.clone()],
                         },

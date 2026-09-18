@@ -157,6 +157,7 @@ fn gen_select(
             },
             SelectItem::Expr {
                 expr: Expr::FunctionCall {
+                    syntax: spg_sql::ast::CallSyntax::Written,
                     name: agg.to_string(),
                     args: vec![gen_num_expr(rng, use_join, 1)],
                 },
@@ -166,6 +167,7 @@ fn gen_select(
         if rng.chance(30) {
             s.having = Some(Expr::Binary {
                 lhs: Box::new(Expr::FunctionCall {
+                    syntax: spg_sql::ast::CallSyntax::Written,
                     name: "count".to_string(),
                     args: vec![col(gq, gn)],
                 }),
