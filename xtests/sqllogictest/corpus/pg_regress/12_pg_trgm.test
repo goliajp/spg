@@ -4,6 +4,11 @@
 # pre-filter candidate rows by trigram intersection then re-eval
 # the pattern. similarity(a, b) and show_trgm(t) follow PG.
 
+# 9.0.0 — similarity() and show_trgm() are pg_trgm's, and PostgreSQL
+# does not have them until the extension is installed.
+statement ok
+CREATE EXTENSION pg_trgm
+
 statement ok
 CREATE TABLE docs (id INT NOT NULL, body TEXT)
 

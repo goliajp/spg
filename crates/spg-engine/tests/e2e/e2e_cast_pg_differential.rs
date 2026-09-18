@@ -4643,7 +4643,14 @@ fn pg_constraint_check_and_notnull_rows() {
     assert_eq!(
         q(
             &mut e,
-            "SELECT contype||':'||count(*)::text FROM pg_constraint GROUP BY contype ORDER BY contype"
+            // 9.0.0 — `contype` is a `"char"`, and PostgreSQL 18.6
+            // REFUSES `"char" || unknown` as ambiguous (both
+            // `anynonarray || text` and `text || anynonarray` apply).
+            // This line used to read the column as text, which is the
+            // divergence it was written to catch elsewhere; the cast
+            // is what PG requires and what a script has to write.
+            "SELECT contype::text||':'||count(*)::text FROM pg_constraint \
+             GROUP BY contype ORDER BY contype"
         ),
         "c:1,n:2,p:1,u:1"
     );

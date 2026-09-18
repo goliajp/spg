@@ -76,13 +76,11 @@ fn a_null_cast_reports_the_type_it_was_cast_to() {
 #[test]
 fn the_one_byte_char_type_is_not_distinguished_yet() {
     let mut e = Engine::new();
-    // Measured: SPG answers `unknown`, PG answers `"char"`. Pinned as
-    // it IS, so the residual is a recorded difference rather than a
-    // surprise later — and so that a future fix has to come here and
-    // say so.
+    // 9.0.0 — and a future fix did come here and say so: `"char"` is
+    // its own type now, and `pg_typeof` names it the way PG 18.6 does.
     assert_eq!(
         typeof_of(&mut e, "\"char\""),
-        "unknown",
-        "PG says \"char\"; SPG folds it into Char(u32) and has no name for it"
+        "\"char\"",
+        "PG says \"char\" and so does SPG"
     );
 }

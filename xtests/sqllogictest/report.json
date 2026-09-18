@@ -163,7 +163,7 @@
         { "file": "v73814_setop_collation.test", "pass": 21, "fail": 0, "skip": 0, "dialect": "mysql",
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1506, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1508, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 13, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -187,7 +187,7 @@
           "fail_reasons": [] },
         { "file": "11_date_functions_part2.test", "pass": 25, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
-        { "file": "12_pg_trgm.test", "pass": 16, "fail": 0, "skip": 0, "dialect": "postgres",
+        { "file": "12_pg_trgm.test", "pass": 17, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "13_timestamptz_offset.test", "pass": 11, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -279,7 +279,7 @@
           "fail_reasons": [] },
         { "file": "57_translate.test", "pass": 12, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
-        { "file": "58_uuid.test", "pass": 23, "fail": 0, "skip": 0, "dialect": "postgres",
+        { "file": "58_uuid.test", "pass": 24, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "59_string_agg.test", "pass": 14, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },

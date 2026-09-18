@@ -38,7 +38,7 @@ fn pg_proc_count_aggregate_is_aggregate_kind() {
     );
     assert!(!r.is_empty(), "expected at least one count() row");
     for row in &r {
-        assert_eq!(row[0], Value::text("a"), "count's prokind must be 'a'");
+        assert_eq!(row[0], Value::Char1(b'a'), "count's prokind must be 'a'");
     }
 }
 
@@ -50,7 +50,7 @@ fn pg_proc_window_function_kind() {
             .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::text("w"));
+    assert_eq!(r[0][0], Value::Char1(b'w'));
 }
 
 #[test]

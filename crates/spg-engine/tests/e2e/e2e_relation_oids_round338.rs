@@ -97,14 +97,14 @@ fn a_view_has_a_pg_class_row() {
     assert_eq!(
         r[0],
         alloc_row(&[
-            Value::text("v"),
+            Value::Char1(b'v'),
             Value::SmallInt(1),
             Value::Bool(true),
             Value::BigInt(0),
             Value::BigInt(0),
             Value::Int(0),
             Value::Float(-1.0),
-            Value::text("n"),
+            Value::Char1(b'n'),
             Value::Bool(false),
         ]),
     );
@@ -145,7 +145,7 @@ fn a_materialized_view_reports_its_own_relkind() {
     let mut e = fixture();
     assert_eq!(
         one(&mut e, "SELECT relkind FROM pg_class WHERE relname = 'mv'"),
-        Value::text("m"),
+        Value::Char1(b'm'),
     );
     assert_eq!(
         one(&mut e, "SELECT relname FROM pg_class WHERE relkind = 'm'"),
@@ -154,7 +154,7 @@ fn a_materialized_view_reports_its_own_relkind() {
     // A plain table is untouched by that.
     assert_eq!(
         one(&mut e, "SELECT relkind FROM pg_class WHERE relname = 't'"),
-        Value::text("r"),
+        Value::Char1(b'r'),
     );
 }
 

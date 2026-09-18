@@ -39,6 +39,8 @@ fn scalar(e: &mut Engine, sql: &str) -> Value<'static> {
 fn text(e: &mut Engine, sql: &str) -> String {
     match scalar(e, sql) {
         Value::Text(t) => t.to_string(),
+        // 9.0.0 — the catalog's single-letter columns are `"char"` now.
+        Value::Char1(b) => spg_engine::eval::value_to_text(&Value::Char1(b)),
         other => panic!("`{sql}` did not return text: {other:?}"),
     }
 }

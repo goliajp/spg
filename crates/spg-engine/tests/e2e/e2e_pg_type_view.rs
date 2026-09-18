@@ -97,7 +97,7 @@ fn pg_type_typcategory_for_numeric_is_n() {
         .unwrap(),
     );
     for row in &r {
-        assert_eq!(row[0], Value::text("N"));
+        assert_eq!(row[0], Value::Char1(b'N'));
     }
 }
 

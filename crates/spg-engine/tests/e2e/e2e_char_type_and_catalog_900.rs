@@ -167,3 +167,104 @@ fn a_digit_string_cast_to_regclass_is_that_oid() {
         "0"
     );
 }
+
+/// Every catalog relation answers `SELECT *` — the row a builder writes
+/// has to carry the type its schema declares, and three builders did
+/// not. The engine checks this on read, so the query is the check.
+#[test]
+fn every_catalog_relation_answers_a_select_star() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE TABLE pt(id int PRIMARY KEY, s text)");
+    run(&mut e, "CREATE INDEX pti ON pt(s)");
+    run(&mut e, "CREATE VIEW pv AS SELECT id FROM pt");
+    run(
+        &mut e,
+        "CREATE FUNCTION pf(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql IMMUTABLE",
+    );
+    run(&mut e, "CREATE TABLE pfk(id int REFERENCES pt(id))");
+    run(&mut e, "CREATE TYPE pc AS (a int, b text)");
+    run(&mut e, "CREATE DOMAIN pd AS int CHECK (VALUE > 0)");
+    run(&mut e, "CREATE POLICY pp ON pt FOR SELECT USING (true)");
+    let mut bad = Vec::new();
+    for rel in [
+        "pg_class",
+        "pg_attribute",
+        "pg_constraint",
+        "pg_type",
+        "pg_proc",
+        "pg_am",
+        "pg_operator",
+        "pg_collation",
+        "pg_cast",
+        "pg_database",
+        "pg_depend",
+        "pg_policy",
+        "pg_trigger",
+        "pg_index",
+        "pg_namespace",
+        "pg_extension",
+        "pg_indexes",
+        "pg_shdepend",
+        "pg_subscription",
+        "pg_publication",
+        "pg_attrdef",
+        "pg_enum",
+        "pg_range",
+        "pg_rewrite",
+    ] {
+        if let Err(err) = e.execute(&format!("SELECT * FROM {rel}")) {
+            bad.push(format!("{rel}: {err}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// A `"char"` is an ordinary value: it sorts, it materialises out of a
+/// scalar subquery, and it concatenates with everything PostgreSQL
+/// concatenates it with.
+#[test]
+fn a_char_value_sorts_materialises_and_concatenates() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE TABLE cs(id int PRIMARY KEY)");
+    // ORDER BY on a catalog "char" column.
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT contype FROM pg_constraint WHERE conrelid = 'cs'::regclass ORDER BY 1"
+        ),
+        // 'n' (the NOT NULL) sorts before 'p' (the primary key).
+        "n"
+    );
+    // A scalar subquery that answers one.
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT (SELECT relkind FROM pg_class WHERE relname = 'cs')"
+        ),
+        "r"
+    );
+    // PG 18.6 resolves these…
+    for (sql, want) in [
+        ("SELECT 'r'::\"char\" || 1", "r1"),
+        ("SELECT 'r'::\"char\" || 1.5", "r1.5"),
+        ("SELECT 'r'::\"char\" || true", "rtrue"),
+        ("SELECT 1 || 'r'::\"char\"", "1r"),
+        ("SELECT ('r'::\"char\")::text || 'x'", "rx"),
+    ] {
+        assert_eq!(one(&mut e, sql), want, "{sql}");
+    }
+    // …and refuses these, because both `anynonarray || text` and
+    // `text || anynonarray` apply.
+    for sql in [
+        "SELECT 'r'::\"char\" || 'x'",
+        "SELECT 'r'::\"char\" || 'x'::text",
+        "SELECT 'r'::\"char\" || 'r'::\"char\"",
+        "SELECT 'r'::\"char\" || 'x'::char(2)",
+    ] {
+        let err = e.execute(sql).expect_err(sql);
+        assert!(
+            format!("{err}").contains("operator is not unique"),
+            "{sql}: {err}"
+        );
+    }
+}

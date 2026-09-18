@@ -70,7 +70,7 @@ fn pg_proc_provolatile_v_for_now_random_current_timestamp() {
             .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == *name))
             .unwrap_or_else(|| panic!("missing pg_proc row for {name}"));
         assert!(
-            matches!(&row[14], Value::Text(s) if s.as_ref() == "v"),
+            matches!(&row[14], Value::Char1(b) if *b == b'v'),
             "provolatile for {name} should be 'v', got {:?}",
             row[14]
         );
@@ -89,7 +89,7 @@ fn pg_proc_provolatile_i_for_pure_scalars() {
             .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == *name))
             .unwrap_or_else(|| panic!("missing pg_proc row for {name}"));
         assert!(
-            matches!(&row[14], Value::Text(s) if s.as_ref() == "i"),
+            matches!(&row[14], Value::Char1(b) if *b == b'i'),
             "provolatile for {name} should be 'i', got {:?}",
             row[14]
         );

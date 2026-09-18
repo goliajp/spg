@@ -62,6 +62,8 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
                     spg_storage::Value::SmallInt(n) => n.to_string(),
                     spg_storage::Value::BigInt(n) => n.to_string(),
                     spg_storage::Value::Null => "NULL".to_string(),
+                    // 9.0.0 — the catalog's single-letter columns.
+                    v @ spg_storage::Value::Char1(_) => spg_engine::eval::value_to_text(v),
                     o => panic!("{o:?}"),
                 })
                 .collect()

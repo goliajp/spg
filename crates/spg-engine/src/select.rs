@@ -12145,6 +12145,11 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
                     .into(),
             ));
         }
+        // 9.0.0 — `"char"` sorts as its byte, which is what PostgreSQL's
+        // `charlt` compares. `ORDER BY contype` is an ordinary catalog
+        // query and answered "ORDER BY of this value type is not
+        // supported" the moment the column carried its type.
+        Value::Char1(b) => f64::from(*b),
         // v7.5.0 — Value is #[non_exhaustive]; future variants need
         // an explicit ORDER BY mapping. Surface as Unsupported until
         // engine support is added.

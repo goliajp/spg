@@ -3,6 +3,11 @@
 # unhyphenated / uppercase / brace-wrapped on input.
 
 # Canonical hyphenated round-trip.
+# 9.0.0 — uuid_generate_v4() is uuid-ossp's, and PostgreSQL does not
+# have it until the extension is installed. gen_random_uuid() is core.
+statement ok
+CREATE EXTENSION "uuid-ossp"
+
 statement ok
 CREATE TABLE u (id UUID NOT NULL, label TEXT NOT NULL)
 

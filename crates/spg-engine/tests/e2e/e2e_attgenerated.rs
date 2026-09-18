@@ -8,7 +8,7 @@ fn one(e: &mut Engine, sql: &str) -> Option<String> {
     match e.execute(sql).unwrap() {
         QueryResult::Rows { rows, .. } => rows.first().map(|r| match &r.values[0] {
             spg_storage::Value::Text(s) => s.to_string(),
-            v => format!("{v:?}"),
+            v => spg_engine::eval::value_to_text(v),
         }),
         _ => None,
     }
@@ -36,5 +36,5 @@ fn attgenerated_marks_stored_generated_columns() {
     );
     // The generated value itself is still computed.
     e.execute("INSERT INTO g(a) VALUES (5)").unwrap();
-    assert_eq!(one(&mut e, "SELECT b FROM g"), Some("Int(10)".to_string()));
+    assert_eq!(one(&mut e, "SELECT b FROM g"), Some("10".to_string()));
 }

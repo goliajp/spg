@@ -7,7 +7,7 @@ Per-corpus pass / fail / skip:
 | `15_regressions` | 367 | 0 | 0 | 100.0% | mysql × 2, postgres × 27 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 451 | 0 | 0 | 100.0% | mysql × 27 |
-| `pg_regress` | 1506 | 0 | 0 | 100.0% | postgres × 89 |
+| `pg_regress` | 1508 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
 | `spg_baseline/02_data_types` | 116 | 0 | 0 | 100.0% | postgres × 18 |
@@ -135,7 +135,7 @@ Per-corpus pass / fail / skip:
 | `09_bare_current.test` | 4 | 0 | 0 | postgres |
 | `10_interval.test` | 23 | 0 | 0 | postgres |
 | `11_date_functions_part2.test` | 25 | 0 | 0 | postgres |
-| `12_pg_trgm.test` | 16 | 0 | 0 | postgres |
+| `12_pg_trgm.test` | 17 | 0 | 0 | postgres |
 | `13_timestamptz_offset.test` | 11 | 0 | 0 | postgres |
 | `14_disable_trigger_tsvector.test` | 23 | 0 | 0 | postgres |
 | `15_do_block_information_schema.test` | 22 | 0 | 0 | postgres |
@@ -181,7 +181,7 @@ Per-corpus pass / fail / skip:
 | `55_sign.test` | 11 | 0 | 0 | postgres |
 | `56_random.test` | 6 | 0 | 0 | postgres |
 | `57_translate.test` | 12 | 0 | 0 | postgres |
-| `58_uuid.test` | 23 | 0 | 0 | postgres |
+| `58_uuid.test` | 24 | 0 | 0 | postgres |
 | `59_string_agg.test` | 14 | 0 | 0 | postgres |
 | `60_bool_agg.test` | 12 | 0 | 0 | postgres |
 | `61_json_build.test` | 25 | 0 | 0 | postgres |

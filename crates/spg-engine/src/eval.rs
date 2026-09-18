@@ -3670,6 +3670,30 @@ fn eval_function_call_arm(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // 9.0.0 — a function an EXTENSION supplies exists once the extension
+    // is installed, and not before. SPG answered `uuid_generate_v4()`
+    // and `similarity('a','ab')` on a database that had created no
+    // extension, where PG 18.6 says the function does not exist — so a
+    // client probing for a capability got the wrong answer, and SPG's
+    // own `CREATE EXTENSION "uuid-ossp"` warned that nothing that
+    // extension supplies would be available while supplying it.
+    // Found by the describe sweep.
+    if let Some(ext) = crate::extension::supplying_extension(name)
+        && !ctx
+            .catalog
+            .is_some_and(|c| c.extensions().keys().any(|k| k.eq_ignore_ascii_case(ext)))
+    {
+        let mut vals: alloc::vec::Vec<Value<'static>> = alloc::vec::Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(eval_expr(a, row, ctx)?);
+        }
+        return Err(EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "function {name}({}) does not exist",
+                crate::eval::functions::arg_type_list(&vals)
+            ),
+        });
+    }
     // v7.39 (read01 round 77) — named arguments (`f(x := 1)` / `f(x => 1)`).
     // The parser leaves them in the tree because only the catalog knows a user
     // function's parameter names; here they become positional, once, for

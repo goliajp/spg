@@ -26,7 +26,7 @@ fn pg_constraint_lists_primary_key() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::text("p"));
+    assert_eq!(r[0][0], Value::Char1(b'p'));
     // 7.38.1 S5.1 — conkey is a REAL smallint[] now (still renders
     // `{1}`); the value compares as the array.
     assert_eq!(r[0][1], Value::SmallIntArray(vec![Some(1)]));
@@ -50,7 +50,7 @@ fn pg_constraint_lists_foreign_key() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::text("f"));
+    assert_eq!(r[0][0], Value::Char1(b'f'));
     // conrelid + confrelid are now BigInt OIDs that match
     // pg_class.oid for the respective tables.
     let cls = rows(
@@ -87,7 +87,7 @@ fn pg_constraint_lists_composite_unique() {
         .unwrap(),
     );
     assert!(!r.is_empty());
-    assert_eq!(r[0][0], Value::text("u"));
+    assert_eq!(r[0][0], Value::Char1(b'u'));
     // Two columns: PG array literal `{1,2}`.
     assert_eq!(r[0][1], Value::SmallIntArray(vec![Some(1), Some(2)]));
 }
@@ -142,8 +142,8 @@ fn pg_constraint_fk_action_chars_match_pg() {
     );
     assert!(!r.is_empty());
     // ON UPDATE SET NULL → 'n'; ON DELETE CASCADE → 'c'.
-    assert_eq!(r[0][0], Value::text("n"));
-    assert_eq!(r[0][1], Value::text("c"));
+    assert_eq!(r[0][0], Value::Char1(b'n'));
+    assert_eq!(r[0][1], Value::Char1(b'c'));
 }
 
 #[test]
