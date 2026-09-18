@@ -17,7 +17,16 @@ use std::time::{Duration, Instant};
 use spg_wire::{Frame, Op, build_query, encode};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(8);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 9.0.0 — a liveness guard, not a budget.
+///
+/// This was 5 seconds, and the slow probe below — a 90 000-iteration
+/// recursive CTE, chosen to be well above the 5 ms threshold — takes
+/// **4.77 s** in a debug build on an idle box (measured). So the margin
+/// was 0.2 s, and a full workspace run went red on
+/// `Os { code: 35, kind: WouldBlock }` once in three. Nothing here
+/// asserts on wall time; the read timeout exists so a wedged server
+/// FAILS instead of hanging, which a minute does just as well.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// v6.0.x — race-free port allocation. Pass `127.0.0.1:0` to the
 /// child, parse the actual bound address from the captured stderr
@@ -28,8 +37,19 @@ fn extract_listen_addr_from_buf(buf: &Arc<Mutex<String>>) -> String {
         let snap = buf.lock().unwrap().clone();
         if let Some(after) = snap.find("listening on ") {
             let tail = &snap[after + "listening on ".len()..];
-            let end = tail.find([' ', '\n', '\r']).unwrap_or(tail.len());
-            return tail[..end].to_string();
+            // 9.0.0 — require the terminator.
+            //
+            // The sibling extractors in `common/mod.rs`, `e2e_limits`
+            // and `e2e_freezer` read stderr with `read_line`, so a hit
+            // is always a WHOLE line and "rest of the string" is the
+            // address. This one reads 4096-byte chunks into a shared
+            // buffer, so the snapshot can hold half a line — and it
+            // returned that half. Measured: `connect: Error { kind:
+            // InvalidInput, message: "invalid socket address" }`, once
+            // in three runs against a freshly linked binary.
+            if let Some(end) = tail.find([' ', '\n', '\r']) {
+                return tail[..end].to_string();
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
