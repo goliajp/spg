@@ -116,14 +116,15 @@ impl Engine {
                 Ok(_) => Ok(()),
                 Err(e) => {
                     let (sqlstate, message) = match &e {
-                        EngineError::LockWouldBlock | EngineError::Cancelled => {
-                            (triggers::INTERNAL_WAIT_SQLSTATE, alloc::format!("{e}"))
-                        }
+                        EngineError::LockWouldBlock | EngineError::Cancelled => (
+                            alloc::borrow::Cow::Borrowed(triggers::INTERNAL_WAIT_SQLSTATE),
+                            alloc::format!("{e}"),
+                        ),
                         other => {
                             // SQLERRM is the primary message alone, as PG's is.
                             let (code, full) = crate::sqlstate::error_to_wire(other);
                             let (main, _, _) = crate::sqlstate::split_detail_and_hint(&full);
-                            let main = crate::sqlstate::without_table_suffix(code, main);
+                            let main = crate::sqlstate::without_table_suffix(&code, main);
                             (code, alloc::string::String::from(main))
                         }
                     };
@@ -178,8 +179,14 @@ impl Engine {
                 return Err(engine_err);
             }
             return Err(match e {
-                triggers::TriggerError::RaiseException { message, .. } => EngineError::Raised {
-                    sqlstate: "P0001",
+                triggers::TriggerError::RaiseException {
+                    message, sqlstate, ..
+                } => EngineError::Raised {
+                    // 9.0.0 — the block may name its own, through
+                    // `SQLSTATE '…'`, a condition name, or
+                    // `USING ERRCODE`. P0001 is PG's default for a
+                    // `RAISE EXCEPTION` that names none.
+                    sqlstate: sqlstate.map_or(alloc::borrow::Cow::Borrowed("P0001"), Into::into),
                     message,
                 },
                 triggers::TriggerError::Sql {

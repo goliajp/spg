@@ -1113,7 +1113,7 @@ fn handle_pg_simple_query(
                 // a wire error so the client doesn't see a torn row.
                 wbuf.truncate(pre_len);
                 let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-                send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
+                send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
                 wbuf.clear();
@@ -1233,7 +1233,7 @@ fn handle_pg_simple_query(
             // surface it as a statement-timeout, not a
             // generic `42000` syntax / access error.
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
+            send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
             // After an error inside a TX, PG goes to 'E'
             // and stays there until ROLLBACK. We track
             // best-effort: if engine still in TX, mark
@@ -1492,7 +1492,7 @@ fn handle_pg_simple_query_one_into_wbuf(
         }
         Err(e) => {
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error_pos(wbuf, sqlstate, &msg, parse_error_position(&e, sql))?;
+            send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
             *tx_state = if state
                 .engine
                 .read()
@@ -1795,7 +1795,7 @@ fn run_pg_session(
     if let Some((_, opts)) = params.iter().find(|(k, _)| k == "options") {
         requested_settings.extend(parse_startup_options(opts));
     }
-    let mut startup_setting_error: Option<(&'static str, String)> = None;
+    let mut startup_setting_error: Option<(String, String)> = None;
 
     // v6.5.2 — register this connection in the activity registry.
     // Removed when `_conn_guard` drops at function exit.
@@ -1896,7 +1896,10 @@ fn run_pg_session(
                 local: false,
             };
             if let Err(err) = e.execute_prepared(stmt, &[]) {
-                startup_setting_error = Some(engine_error_to_wire(&err));
+                startup_setting_error = {
+                    let (code, msg) = engine_error_to_wire(&err);
+                    Some((code.into_owned(), msg))
+                };
                 break;
             }
         }
@@ -1912,7 +1915,7 @@ fn run_pg_session(
     // engine — a wrapper that asserted the first for both reported a
     // recognised parameter as unrecognised.
     if let Some((sqlstate, msg)) = startup_setting_error {
-        send_error(stream, sqlstate, &msg)?;
+        send_error(stream, &sqlstate, &msg)?;
         return Ok(());
     }
 
@@ -2348,7 +2351,7 @@ fn run_pg_session(
                     // (syntax error) would tell a driver the statement
                     // could never be valid.
                     Err((sqlstate, msg)) => {
-                        send_error(&mut wbuf, sqlstate, &msg)?;
+                        send_error(&mut wbuf, &sqlstate, &msg)?;
                         ext_error = true;
                     }
                 }
@@ -2475,7 +2478,7 @@ fn run_pg_session(
                     &mut tx_state,
                     &conn_state,
                 ) {
-                    send_error(&mut wbuf, sqlstate, &msg)?;
+                    send_error(&mut wbuf, &sqlstate, &msg)?;
                     ext_error = true;
                 }
             }
@@ -3694,13 +3697,19 @@ fn handle_parse(
     body: &[u8],
     prepared: &mut std::collections::HashMap<String, PreparedStmt>,
     state: &Arc<ServerState>,
-) -> Result<(), (&'static str, String)> {
+) -> Result<(), (std::borrow::Cow<'static, str>, String)> {
     let mut cur = 0;
     let name = read_cstring(body, &mut cur)
-        .ok_or(("42601", "Parse: name not null-terminated UTF-8".to_string()))?
+        .ok_or((
+            std::borrow::Cow::Borrowed("42601"),
+            "Parse: name not null-terminated UTF-8".to_string(),
+        ))?
         .to_string();
     let sql = read_cstring(body, &mut cur)
-        .ok_or(("42601", "Parse: SQL not null-terminated UTF-8".to_string()))?
+        .ok_or((
+            std::borrow::Cow::Borrowed("42601"),
+            "Parse: SQL not null-terminated UTF-8".to_string(),
+        ))?
         .trim_end_matches(';')
         .trim()
         .to_string();
@@ -3709,12 +3718,18 @@ fn handle_parse(
     // Bind parameters can be decoded by the right type's wire
     // format.
     if cur + 2 > body.len() {
-        return Err(("42601", "Parse: missing parameter type count".to_string()));
+        return Err((
+            std::borrow::Cow::Borrowed("42601"),
+            "Parse: missing parameter type count".to_string(),
+        ));
     }
     let oid_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
     cur += 2;
     if cur + oid_count * 4 > body.len() {
-        return Err(("42601", "Parse: truncated parameter OIDs".to_string()));
+        return Err((
+            std::borrow::Cow::Borrowed("42601"),
+            "Parse: truncated parameter OIDs".to_string(),
+        ));
     }
     let mut param_type_oids: Vec<u32> = Vec::with_capacity(oid_count);
     for _ in 0..oid_count {
@@ -3732,10 +3747,12 @@ fn handle_parse(
     // the same SQL across sessions hits the engine-wide plan cache
     // and skips re-parse + JOIN reorder. Needs `write()` because the
     // cache's LRU promote is `&mut`.
-    let mut eng = state
-        .engine
-        .write()
-        .map_err(|_| ("XX000", "Parse: engine lock poisoned".to_string()))?;
+    let mut eng = state.engine.write().map_err(|_| {
+        (
+            std::borrow::Cow::Borrowed("XX000"),
+            "Parse: engine lock poisoned".to_string(),
+        )
+    })?;
     let ast = eng
         .prepare_cached(&sql)
         // 8.0.2 — the parser's own sentence, not a stage label in front
@@ -3745,7 +3762,7 @@ fn handle_parse(
         // client. The wording after it is still narrower than PG's —
         // that is the same gap as the missing error POSITION and needs
         // the parser to carry spans, which is not a patch.
-        .map_err(|e| ("42601", format!("{e}")))?;
+        .map_err(|e| (std::borrow::Cow::Borrowed("42601"), format!("{e}")))?;
     // v7.37 (SPGS small-query bar) — describe at Parse time and
     // cache the wire-format RowDescription body. For repeated
     // executions of the same prepared statement (the sqlx hot
@@ -4445,7 +4462,7 @@ fn handle_execute(
     role: Role,
     tx_state: &mut u8,
     conn_state: &Arc<crate::ConnState>,
-) -> Result<(), (&'static str, String)> {
+) -> Result<(), (std::borrow::Cow<'static, str>, String)> {
     // v7.37 (SPGS proj_25k bar) — `out` was `&mut dyn Write`
     // pre-7.37; the simple-query Q path already wrote DataRow
     // frames into the response buffer via `encode_data_row`'s
@@ -4460,7 +4477,7 @@ fn handle_execute(
     // v7.17.0 Phase 2.3 — protocol-level errors keep SQLSTATE
     // `42000` to match prior behavior; only `EngineError::Cancelled`
     // promotes to `57014` via `engine_error_to_wire`.
-    let proto = |m: String| ("42000", m);
+    let proto = |m: String| (std::borrow::Cow::Borrowed("42000"), m);
     let mut cur = 0;
     let portal_name = read_cstring(body, &mut cur)
         .ok_or_else(|| proto("Execute: portal name not UTF-8".to_string()))?;
@@ -4569,7 +4586,7 @@ fn handle_execute(
     if crate::commands::parse_checkpoint_intent(stmt.sql.trim_end_matches(';').trim()) {
         return match crate::commands::perform_checkpoint(state) {
             Ok(()) => send_command_complete(stream, "CHECKPOINT").map_err(|e| proto(e.to_string())),
-            Err(msg) => Err(("25001", msg)),
+            Err(msg) => Err((std::borrow::Cow::Borrowed("25001"), msg)),
         };
     }
     let cached_row_desc = stmt.row_desc_body.clone();
@@ -5207,14 +5224,14 @@ pub(crate) fn new_cancel_secret() -> u32 {
 fn engine_error_to_wire_conn(
     e: &EngineError,
     conn_state: &crate::ConnState,
-) -> (&'static str, String) {
+) -> (std::borrow::Cow<'static, str>, String) {
     if matches!(e, EngineError::Cancelled)
         && conn_state
             .cancel_flag
             .load(std::sync::atomic::Ordering::Relaxed)
     {
         return (
-            "57014",
+            std::borrow::Cow::Borrowed("57014"),
             "canceling statement due to user request".to_string(),
         );
     }
@@ -5268,7 +5285,7 @@ fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
 /// The SQLSTATE and message for an engine error. The classification
 /// lives in `spg_engine::sqlstate` since 8.0.3 so PL/pgSQL exception
 /// handlers and the wire answer from one table.
-pub(crate) fn engine_error_to_wire(e: &EngineError) -> (&'static str, String) {
+pub(crate) fn engine_error_to_wire(e: &EngineError) -> (std::borrow::Cow<'static, str>, String) {
     spg_engine::sqlstate::error_to_wire(e)
 }
 
@@ -5277,20 +5294,23 @@ mod engine_error_sqlstate_tests {
     use super::engine_error_to_wire;
     use spg_engine::EngineError;
 
-    fn code(msg: &str) -> &'static str {
-        engine_error_to_wire(&EngineError::Unsupported(msg.to_string())).0
+    fn code(msg: &str) -> String {
+        engine_error_to_wire(&EngineError::Unsupported(msg.to_string()))
+            .0
+            .into_owned()
     }
 
     /// v7.39 (round 622) — the same, for a value that reached something of
     /// the wrong type. The classification of THIS one is by variant, not by
     /// message, so it needs its own constructor.
-    fn tm_code(detail: &str) -> &'static str {
+    fn tm_code(detail: &str) -> String {
         engine_error_to_wire(&EngineError::Eval(
             spg_engine::eval::EvalError::TypeMismatch {
                 detail: detail.to_string(),
             },
         ))
         .0
+        .into_owned()
     }
 
     /// v7.39 (round 622, S05a) — every wrong-argument-type error answered

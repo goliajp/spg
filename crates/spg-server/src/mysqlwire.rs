@@ -1577,7 +1577,7 @@ fn mysql_error_parts_inner(
                     },
                 );
             }
-            let (errno, my_state) = mysql_code_for_sqlstate(pg_state);
+            let (errno, my_state) = mysql_code_for_sqlstate(&pg_state);
             (errno, my_state, msg)
         }
     }

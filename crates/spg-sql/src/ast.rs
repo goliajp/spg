@@ -2140,6 +2140,14 @@ pub enum PlPgSqlStmt {
         level: RaiseLevel,
         message: String,
         args: Vec<Expr>,
+        /// 9.0.0 — where the statement's SQLSTATE comes from:
+        /// `RAISE SQLSTATE '22012'`, `RAISE division_by_zero`, or
+        /// `USING ERRCODE = …`. `None` is PG's default for the level
+        /// (`P0001` for EXCEPTION).
+        errcode: Option<RaiseErrcode>,
+        /// 9.0.0 — `USING DETAIL = …` and `USING HINT = …`.
+        detail: Option<Expr>,
+        hint: Option<Expr>,
     },
     /// v7.12.6 — embedded SQL statement inside the trigger body
     /// (`INSERT INTO …`, `UPDATE …`, `DELETE FROM …`, `SELECT …`).
@@ -2224,6 +2232,25 @@ pub enum PlPgSqlStmt {
         sql_expr: Expr,
         body: Vec<PlPgSqlStmt>,
     },
+}
+
+/// 9.0.0 — how a `RAISE` names its SQLSTATE.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RaiseErrcode {
+    /// A five-character code, written as `SQLSTATE '22012'` or
+    /// `USING ERRCODE = '22012'`.
+    State(String),
+    /// A condition name, written as `RAISE division_by_zero`. The
+    /// engine resolves it, because the name-to-code table is the
+    /// engine's.
+    Condition(String),
+    /// `USING ERRCODE = <expr>`. PostgreSQL evaluates the expression
+    /// and reads its text either way: five characters of digits and
+    /// upper-case letters is a SQLSTATE, anything else is a condition
+    /// name. Measured on 18.6 — `ERRCODE = 'ZZ999'` raises `ZZ999`,
+    /// `ERRCODE = 'division_by_zero'` raises `22012`, and
+    /// `ERRCODE = 'nosuch'` is `unrecognized exception condition`.
+    Value(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7571,6 +7598,9 @@ impl fmt::Display for PlPgSqlStmt {
                 level,
                 message,
                 args,
+                errcode,
+                detail,
+                hint,
             } => {
                 let lvl = match level {
                     RaiseLevel::Notice => "NOTICE",
@@ -7580,9 +7610,39 @@ impl fmt::Display for PlPgSqlStmt {
                     RaiseLevel::Debug => "DEBUG",
                     RaiseLevel::Exception => "EXCEPTION",
                 };
-                write!(f, "RAISE {lvl} '{}'", message.replace('\'', "''"))?;
-                for a in args {
-                    write!(f, ", {a}")?;
+                match errcode {
+                    // `RAISE division_by_zero` / `RAISE SQLSTATE 'x'`
+                    // carry no format string of their own.
+                    Some(RaiseErrcode::Condition(c)) if args.is_empty() => {
+                        write!(f, "RAISE {lvl} {c}")?;
+                    }
+                    Some(RaiseErrcode::State(c)) if args.is_empty() && message == c => {
+                        write!(f, "RAISE {lvl} SQLSTATE '{c}'")?;
+                    }
+                    _ => {
+                        write!(f, "RAISE {lvl} '{}'", message.replace('\'', "''"))?;
+                        for a in args {
+                            write!(f, ", {a}")?;
+                        }
+                        match errcode {
+                            Some(RaiseErrcode::State(c)) => {
+                                write!(f, " USING ERRCODE = '{c}'")?;
+                            }
+                            Some(RaiseErrcode::Condition(c)) => {
+                                write!(f, " USING ERRCODE = '{c}'")?;
+                            }
+                            Some(RaiseErrcode::Value(e)) => {
+                                write!(f, " USING ERRCODE = {e}")?;
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                if let Some(d) = detail {
+                    write!(f, ", DETAIL = {d}")?;
+                }
+                if let Some(h) = hint {
+                    write!(f, ", HINT = {h}")?;
                 }
                 Ok(())
             }
