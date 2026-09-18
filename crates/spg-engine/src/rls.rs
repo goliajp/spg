@@ -239,7 +239,7 @@ fn build_policy_predicate(
 /// evaluates correctly in a context that carries no session GUCs.
 fn fold_session_identity(e: &mut Expr, role: &str) {
     match e {
-        Expr::FunctionCall { name, args } if args.is_empty() => {
+        Expr::FunctionCall { name, args, .. } if args.is_empty() => {
             match name.to_ascii_lowercase().as_str() {
                 "current_user" | "current_role" | "user" => {
                     *e = Expr::Literal(Literal::String(String::from(role)));

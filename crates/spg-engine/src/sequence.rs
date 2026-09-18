@@ -217,7 +217,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         match expr {
             Expr::Literal(_) | Expr::Column(_) | Expr::Placeholder(_) => Ok(()),
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 // Descend first so nested calls — e.g.
                 // setval('seq', currval('other')) — resolve
                 // innermost-first.

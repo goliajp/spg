@@ -994,7 +994,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
         // pattern that is not a literal (or flags that are not) stays on the
         // interpreter, which still has to compile per row: the pattern can
         // differ row to row.
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if name.eq_ignore_ascii_case("regexp_like")
                 && matches!(args.len(), 2 | 3)
                 && regex_literal_parts(args.as_slice()).is_some()
@@ -1018,7 +1018,7 @@ fn compile_into(e: &Expr, ctx: &EvalContext<'_>, steps: &mut Vec<Step>) {
         // single Function step that pops them. `fully_compilable`
         // gates the whitelist + recurses into args, so this branch
         // only fires when the entire subtree is compilable.
-        Expr::FunctionCall { name, args } if is_pure_scalar_function(name) => {
+        Expr::FunctionCall { name, args, .. } if is_pure_scalar_function(name) => {
             // v7.36 — specialise `LENGTH(<column>)` /
             // `OCTET_LENGTH(<column>)` so the column's `Value::Text`
             // isn't cloned just to read its length. The general
@@ -1473,14 +1473,14 @@ pub(crate) fn fully_compilable(e: &Expr) -> bool {
         // pattern becomes a compile product (`Step::Regex`) rather than an
         // argument the step would have to re-parse per row. A non-literal
         // pattern stays off, because then it really can differ row to row.
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if name.eq_ignore_ascii_case("regexp_like")
                 && matches!(args.len(), 2 | 3)
                 && regex_literal_parts(args.as_slice()).is_some() =>
         {
             fully_compilable(&args[0])
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             is_pure_scalar_function(name) && args.iter().all(fully_compilable)
         }
         // v7.36 — CAST over a compilable expression. `cast_value`
@@ -1956,7 +1956,7 @@ pub(crate) fn constant_expr(e: &Expr) -> bool {
         Expr::Array(items) => items.iter().all(constant_expr),
         Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => constant_expr(expr),
         Expr::Binary { lhs, rhs, .. } => constant_expr(lhs) && constant_expr(rhs),
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             crate::immutable_fn::is_immutable_builtin(name) && args.iter().all(constant_expr)
         }
         _ => false,

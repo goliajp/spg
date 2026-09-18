@@ -194,6 +194,7 @@ impl Engine {
             // Keep (affect) the row iff the rule condition is NOT TRUE — false or
             // NULL both mean "rule does not apply". COALESCE(NOT(cond), TRUE).
             let keep = Expr::FunctionCall {
+                syntax: spg_sql::ast::CallSyntax::Written,
                 name: String::from("coalesce"),
                 args: alloc::vec![
                     Expr::Unary {

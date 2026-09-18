@@ -82,7 +82,7 @@ use crate::{
 /// rather than a bare column — indexing a derived value is a different
 /// build, and guessing at it would be worse than refusing.
 fn tsvector_source_column(e: &spg_sql::ast::Expr) -> Option<String> {
-    let spg_sql::ast::Expr::FunctionCall { name, args } = e else {
+    let spg_sql::ast::Expr::FunctionCall { name, args, .. } = e else {
         return None;
     };
     if !name.eq_ignore_ascii_case("to_tsvector") {
@@ -7027,7 +7027,7 @@ fn policy_cmd_to_storage(c: spg_sql::ast::PolicyCmd) -> spg_storage::PolicyCmd {
 /// its argument. `nextval('s')` and `nextval('s'::regclass)` are the
 /// same column; `pg_dump` writes the second.
 fn is_nextval_call(e: &Expr) -> bool {
-    matches!(e, Expr::FunctionCall { name, args }
+    matches!(e, Expr::FunctionCall { name, args, ..}
         if name.eq_ignore_ascii_case("nextval") && args.len() == 1)
 }
 
@@ -7134,7 +7134,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
         // 8.0.3 — a sequence function's argument is a `regclass`, and PG
         // stores the constant as one: `nextval('s')` reads back
         // `nextval('s'::regclass)` (measured on 18.6).
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if matches!(name.to_ascii_lowercase().as_str(), "nextval" | "currval")
                 && matches!(args.as_slice(), [Expr::Literal(Literal::String(_))]) =>
         {
@@ -7143,7 +7143,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
             };
             alloc::format!("{name}('{}'::regclass)", seq.replace('\'', "''"))
         }
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if args.iter().any(|a| {
                 matches!(a, Expr::Cast { expr: inner, .. }
                     if matches!(inner.as_ref(), Expr::Literal(Literal::String(_))))
@@ -7174,7 +7174,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
             _ => alloc::format!("{expr}"),
         },
         // Parenless SQL-standard keyword functions → bare uppercase keyword.
-        Expr::FunctionCall { name, args } if args.is_empty() => {
+        Expr::FunctionCall { name, args, .. } if args.is_empty() => {
             if let Some(kw) = pg_parenless_keyword(name) {
                 alloc::string::String::from(kw)
             } else {
@@ -7195,7 +7195,7 @@ fn deparse_default(expr: &Expr, col_ty: DataType) -> alloc::string::String {
 /// Phase-2 residual and is left to Display.)
 pub(crate) fn deparse_policy_qual(e: &Expr) -> alloc::string::String {
     match e {
-        Expr::FunctionCall { name, args } if args.is_empty() => pg_parenless_keyword(name)
+        Expr::FunctionCall { name, args, .. } if args.is_empty() => pg_parenless_keyword(name)
             .map_or_else(|| alloc::format!("{e}"), alloc::string::String::from),
         Expr::Binary { lhs, op, rhs } => alloc::format!(
             "({} {op} {})",
@@ -7241,7 +7241,7 @@ pub(crate) fn deparse_policy_qual(e: &Expr) -> alloc::string::String {
                 deparse_policy_qual(pattern)
             )
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             let rendered: alloc::vec::Vec<_> = args.iter().map(deparse_policy_qual).collect();
             alloc::format!("{name}({})", rendered.join(", "))
         }

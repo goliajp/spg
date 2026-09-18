@@ -3624,7 +3624,7 @@ fn mysql_coercibility(e: &Expr) -> i32 {
             | spg_sql::ast::Literal::Numeric { .. },
         ) => 5,
         Expr::Literal(_) => 4,
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             if matches!(
                 name.to_ascii_lowercase().as_str(),
                 "user"
@@ -5257,7 +5257,7 @@ fn eval_is_null_arm(
     // the check does not recurse. The `(a, b) IS NULL` tuple spelling
     // is already desugared to `a IS NULL AND b IS NULL` in the parser;
     // this covers the explicit `ROW(...)` constructor.
-    if let Expr::FunctionCall { name, args } = expr
+    if let Expr::FunctionCall { name, args, .. } = expr
         && name.eq_ignore_ascii_case("row")
     {
         let mut all_null = true;
@@ -5561,7 +5561,7 @@ pub fn eval_expr(
             value,
             negated,
         } => eval_bool_test_arm(expr, *value, *negated, row, ctx),
-        Expr::FunctionCall { name, args } => eval_function_call_arm(name, args, row, ctx),
+        Expr::FunctionCall { name, args, .. } => eval_function_call_arm(name, args, row, ctx),
         // v7.39 (read01 round 100) — VARIADIC is spliced into its enclosing
         // call before the args are evaluated (see eval_function_call_arm); a
         // bare one reaching here was written outside a function call.

@@ -212,7 +212,7 @@ fn render(e: &Expr, cx: &Ctx<'_>) -> String {
         // A varchar column handed to a function is printed with the
         // implicit cast PG applies (`length((name)::text)`): SPG's catalog
         // functions over character data all take text.
-        Expr::FunctionCall { name, args } if args.iter().any(|a| is_varchar_column(a, cx)) => {
+        Expr::FunctionCall { name, args, .. } if args.iter().any(|a| is_varchar_column(a, cx)) => {
             let rendered: Vec<String> = args.iter().map(|a| operand(a, cx)).collect();
             format!("{name}({})", rendered.join(", "))
         }

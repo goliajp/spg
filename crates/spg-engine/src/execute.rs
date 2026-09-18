@@ -209,7 +209,7 @@ impl Engine {
         let SelectItem::Expr { expr, .. } = &s.items[0] else {
             return Ok(None);
         };
-        let Expr::FunctionCall { name, args } = expr else {
+        let Expr::FunctionCall { name, args, .. } = expr else {
             return Ok(None);
         };
         if !(name.eq_ignore_ascii_case("set_config")

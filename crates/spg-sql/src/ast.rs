@@ -4506,6 +4506,16 @@ pub enum UnionKind {
     ExceptAll,
 }
 
+/// 9.0.0 — whether a [`Expr::FunctionCall`] was written as a call or
+/// arrived from an operator the parser lowers onto one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSyntax {
+    /// `lower(a)` — reports the function's name.
+    Written,
+    /// `a ~ b` — reports `?column?`, as every operator does.
+    Operator,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     Wildcard,
@@ -5139,6 +5149,13 @@ pub enum Expr {
     FunctionCall {
         name: String,
         args: Vec<Expr>,
+        /// 9.0.0 — how this call was written, which is not a detail of
+        /// the call: PostgreSQL names a select item after the function
+        /// it calls, and an operator expression `?column?`. The parser
+        /// lowers six operators onto functions (`~` and its family onto
+        /// `regexp_like`, `^@` onto `starts_with`, `^` onto `power`),
+        /// and the lowered call reported the function's name.
+        syntax: CallSyntax,
     },
     /// v7.24 (mailrs round-16 A) — an aggregate call with an
     /// internal ordering: `array_agg(x ORDER BY y DESC NULLS LAST)`.
@@ -9180,6 +9197,14 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
         // only LOOK like syntax — `EXTRACT(year FROM …)` reports
         // `extract`, `SUBSTRING(x FROM 1 FOR 2)` reports `substring` —
         // because PG resolves them to functions before naming them.
+        // 9.0.0 — an operator the parser lowers onto a function is still
+        // an operator, and PostgreSQL names an operator expression
+        // `?column?`: `SELECT 'a' ~ 'a'` was `regexp_like`, `'ab' ^@ 'a'`
+        // was `starts_with`, `2 ^ 3` was `power`.
+        Expr::FunctionCall {
+            syntax: CallSyntax::Operator,
+            ..
+        } => (None, NameStrength::None),
         Expr::FunctionCall { name, .. } | Expr::WindowFunction { name, .. } => {
             strong(canonical_function_name(name))
         }
@@ -9514,7 +9539,7 @@ impl fmt::Display for Expr {
                     write!(f, "({expr} IS {word})")
                 }
             }
-            Self::FunctionCall { name, args } => {
+            Self::FunctionCall { name, args, .. } => {
                 write!(f, "{name}(")?;
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {

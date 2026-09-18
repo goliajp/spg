@@ -2677,7 +2677,7 @@ impl Engine {
         let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
             return Ok(None);
         };
-        let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+        let spg_sql::ast::Expr::FunctionCall { name, args, .. } = expr else {
             return Ok(None);
         };
         if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
@@ -6352,7 +6352,7 @@ impl Engine {
         let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
             return Ok(None);
         };
-        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args, ..}
             if name.eq_ignore_ascii_case("count_star") && args.is_empty());
         if !is_count_star {
             return Ok(None);
@@ -6586,7 +6586,7 @@ impl Engine {
         let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
             return None;
         };
-        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args, ..}
             if name.eq_ignore_ascii_case("count_star") && args.is_empty());
         if !is_count_star {
             return None;
@@ -6703,7 +6703,7 @@ impl Engine {
         let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
             return None;
         };
-        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args, ..}
             if name.eq_ignore_ascii_case("count_star") && args.is_empty());
         if !is_count_star {
             return None;
@@ -13092,7 +13092,7 @@ pub(crate) fn unnest_zip_rows(
 /// Detect the parser's multi-arg unnest marker on an unnest_expr.
 pub(crate) fn unnest_zip_args(expr: &Expr) -> Option<&[Expr]> {
     match expr {
-        Expr::FunctionCall { name, args } if name == "__unnest_zip" => Some(args.as_slice()),
+        Expr::FunctionCall { name, args, .. } if name == "__unnest_zip" => Some(args.as_slice()),
         _ => None,
     }
 }
@@ -13495,7 +13495,7 @@ fn name_is(name: &str, names: &[&str]) -> bool {
 }
 
 pub(crate) fn top_level_srf_kind(expr: &spg_sql::ast::Expr) -> Option<SrfKind> {
-    let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+    let spg_sql::ast::Expr::FunctionCall { name, args, .. } = expr else {
         return None;
     };
     let n = args.len();
@@ -13553,7 +13553,7 @@ pub(crate) fn top_level_srf_output(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Vec<Value<'static>>, EngineError> {
-    let (Some(kind), spg_sql::ast::Expr::FunctionCall { name, args }) =
+    let (Some(kind), spg_sql::ast::Expr::FunctionCall { name, args, .. }) =
         (top_level_srf_kind(expr), expr)
     else {
         return Err(EngineError::Unsupported(
@@ -15316,7 +15316,7 @@ pub(crate) fn static_arg_type(e: &Expr, cols: &[ColumnSchema]) -> Option<alloc::
 /// count, NOT descending into a subquery (its scope is its own).
 fn collect_function_calls(e: &Expr, out: &mut Vec<(alloc::string::String, Vec<Expr>)>) {
     match e {
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             out.push((name.to_ascii_lowercase(), args.clone()));
             for a in args {
                 collect_function_calls(a, out);
@@ -15435,7 +15435,7 @@ fn validate_aggregate_placement(stmt: &SelectStatement) -> Result<(), EngineErro
         let mut probe = e.clone();
         crate::expr_analysis::rewrite_nodes_mut(&mut probe, &mut |n| {
             let args = match n {
-                Expr::FunctionCall { name, args } if aggregate::is_aggregate_name(name) => args,
+                Expr::FunctionCall { name, args, .. } if aggregate::is_aggregate_name(name) => args,
                 _ => return false,
             };
             if args.iter().any(aggregate::contains_aggregate) {
@@ -16315,7 +16315,7 @@ impl Engine {
         }
         // A user set-returning function. Its body runs through the real
         // executor, like every function body since round 63.
-        let spg_sql::ast::Expr::FunctionCall { name, args } = expr else {
+        let spg_sql::ast::Expr::FunctionCall { name, args, .. } = expr else {
             return Err(EngineError::Unsupported(
                 "expected a SELECT-list SRF call".into(),
             ));
@@ -16422,6 +16422,7 @@ impl Engine {
             let Some(Expr::FunctionCall {
                 name: fname,
                 args: fargs,
+                ..
             }) = args.first()
             else {
                 return Err(EngineError::Unsupported(
@@ -16612,6 +16613,7 @@ impl Engine {
                 )
             } else {
                 let call = spg_sql::ast::Expr::FunctionCall {
+                    syntax: spg_sql::ast::CallSyntax::Written,
                     name: name.clone(),
                     args: args.clone(),
                 };
@@ -16935,7 +16937,7 @@ fn try_count_over_offset(stmt: &SelectStatement, primary: &TableRef) -> Option<S
     let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
         return None;
     };
-    let E::FunctionCall { name, args } = expr else {
+    let E::FunctionCall { name, args, .. } = expr else {
         return None;
     };
     if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
@@ -16960,10 +16962,12 @@ fn try_count_over_offset(stmt: &SelectStatement, primary: &TableRef) -> Option<S
     let mut out = stmt.clone();
     out.items = alloc::vec![SelectItem::Expr {
         expr: E::FunctionCall {
+            syntax: spg_sql::ast::CallSyntax::Written,
             name: String::from("greatest"),
             args: alloc::vec![
                 E::Binary {
                     lhs: alloc::boxed::Box::new(E::FunctionCall {
+                        syntax: spg_sql::ast::CallSyntax::Written,
                         name: String::from("count_star"),
                         args: alloc::vec![],
                     }),
@@ -17066,7 +17070,7 @@ fn try_count_over_const_unnest(
     let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
         return None;
     };
-    let E::FunctionCall { name, args } = expr else {
+    let E::FunctionCall { name, args, .. } = expr else {
         return None;
     };
     if !name.eq_ignore_ascii_case("count_star") || !args.is_empty() {
@@ -17086,6 +17090,7 @@ fn try_count_over_const_unnest(
     let E::FunctionCall {
         name: fname,
         args: fargs,
+        ..
     } = item
     else {
         return None;
@@ -17112,6 +17117,7 @@ fn try_count_over_const_unnest(
     out.items = alloc::vec![SelectItem::Expr {
         expr: E::Binary {
             lhs: alloc::boxed::Box::new(E::FunctionCall {
+                syntax: spg_sql::ast::CallSyntax::Written,
                 name: String::from("count_star"),
                 args: alloc::vec![],
             }),

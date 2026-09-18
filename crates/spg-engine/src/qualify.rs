@@ -179,7 +179,7 @@ pub(crate) fn render_call_argument(a: &Expr) -> String {
 /// printed before qualifying), everything else is Display.
 pub(crate) fn render_qualified_expr(e: &Expr) -> String {
     match e {
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             let rendered: Vec<String> = args.iter().map(render_call_argument).collect();
             alloc::format!("{name}({})", rendered.join(", "))
         }

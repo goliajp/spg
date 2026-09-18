@@ -151,7 +151,7 @@ pub fn uses_aggregate_in(stmt: &SelectStatement, mysql: bool) -> bool {
 fn only_aggregate_is_any_value(stmt: &SelectStatement) -> bool {
     fn walk(e: &Expr, seen: &mut bool, other: &mut bool) {
         match e {
-            Expr::FunctionCall { name, args } => {
+            Expr::FunctionCall { name, args, .. } => {
                 if is_aggregate_name(&name.to_ascii_lowercase()) {
                     if name.eq_ignore_ascii_case("any_value") {
                         *seen = true;
@@ -220,7 +220,7 @@ pub(crate) fn uses_aggregate_ignoring_group_by(stmt: &SelectStatement) -> bool {
 
 pub fn contains_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             is_aggregate_name(name) || args.iter().any(contains_aggregate)
         }
         Expr::Collate { expr, .. } | Expr::NamedArg { expr, .. } => contains_aggregate(expr),
@@ -809,7 +809,7 @@ fn try_pure_count_star_short_circuit(
     let SelectItem::Expr { expr, alias } = &stmt.items[0] else {
         return None;
     };
-    let Expr::FunctionCall { name, args } = expr else {
+    let Expr::FunctionCall { name, args, .. } = expr else {
         return None;
     };
     if !name.eq_ignore_ascii_case("count") && !name.eq_ignore_ascii_case("count_star") {
@@ -5211,7 +5211,7 @@ fn validate_agg_arities(
     cols: &[ColumnSchema],
 ) -> Result<(), EvalError> {
     fn walk(e: &Expr, cols: &[ColumnSchema]) -> Result<(), EvalError> {
-        if let Expr::FunctionCall { name, args } = e {
+        if let Expr::FunctionCall { name, args, .. } = e {
             let lower = name.to_ascii_lowercase();
             let expected: Option<usize> = match lower.as_str() {
                 "count_star" => Some(0),
@@ -5332,7 +5332,7 @@ fn first_ordered_array_agg(e: &Expr) -> Option<(&Expr, &[spg_sql::ast::OrderBy],
     if *distinct || order_by.is_empty() {
         return None;
     }
-    let Expr::FunctionCall { name, args } = call.as_ref() else {
+    let Expr::FunctionCall { name, args, .. } = call.as_ref() else {
         return None;
     };
     if !name.eq_ignore_ascii_case("array_agg") || args.len() != 1 {
@@ -5403,7 +5403,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
             distinct,
             filter,
         } => {
-            if let Expr::FunctionCall { name, args } = call.as_ref() {
+            if let Expr::FunctionCall { name, args, .. } = call.as_ref() {
                 let lower = name.to_ascii_lowercase();
                 if is_aggregate_name(&lower) {
                     let canonical = if lower == "every" {
@@ -5466,7 +5466,7 @@ fn collect_aggregates(e: &Expr, out: &mut Vec<AggSpec>) {
                 collect_aggregates(&o.expr, out);
             }
         }
-        Expr::FunctionCall { name, args } => {
+        Expr::FunctionCall { name, args, .. } => {
             let lower = name.to_ascii_lowercase();
             if is_aggregate_name(&lower) {
                 let arg = if lower == "count_star" {
@@ -7218,6 +7218,7 @@ fn wrap_loose_group_columns(
                 && licensed.is_none_or(|l| column_is_key_determined(&c, l));
             if claimed {
                 Expr::FunctionCall {
+                    syntax: spg_sql::ast::CallSyntax::Written,
                     name: String::from("any_value"),
                     args: alloc::vec![Expr::Column(c)],
                 }
@@ -7225,11 +7226,16 @@ fn wrap_loose_group_columns(
                 Expr::Column(c)
             }
         }
-        Expr::FunctionCall { name, args } if is_aggregate_name(&name.to_ascii_lowercase()) => {
-            Expr::FunctionCall { name, args }
+        Expr::FunctionCall {
+            name, args, syntax, ..
+        } if is_aggregate_name(&name.to_ascii_lowercase()) => {
+            Expr::FunctionCall { syntax, name, args }
         }
         Expr::AggregateOrdered { .. } => e,
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+        Expr::FunctionCall {
+            name, args, syntax, ..
+        } => Expr::FunctionCall {
+            syntax,
             name,
             args: args.into_iter().map(wrap).collect(),
         },
@@ -7332,7 +7338,10 @@ fn substitute_having_aliases(e: Expr, aliases: &[(String, Expr)]) -> Expr {
             op,
             expr: Box::new(sub(*expr)),
         },
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+        Expr::FunctionCall {
+            name, args, syntax, ..
+        } => Expr::FunctionCall {
+            syntax,
             name,
             args: args.into_iter().map(sub).collect(),
         },
@@ -7421,7 +7430,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         distinct,
         filter,
     } = e
-        && let Expr::FunctionCall { name, args } = call.as_ref()
+        && let Expr::FunctionCall { name, args, .. } = call.as_ref()
     {
         let lower = name.to_ascii_lowercase();
         if is_aggregate_name(&lower) {
@@ -7461,7 +7470,7 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
         }
     }
     // Match aggregate FunctionCalls first — they sit outside group_by.
-    if let Expr::FunctionCall { name, args } = e {
+    if let Expr::FunctionCall { name, args, .. } = e {
         let lower = name.to_ascii_lowercase();
         if is_aggregate_name(&lower) {
             let arg = if lower == "count_star" {
@@ -7581,7 +7590,10 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
             value: *value,
             negated: *negated,
         },
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+        Expr::FunctionCall {
+            name, args, syntax, ..
+        } => Expr::FunctionCall {
+            syntax: *syntax,
             name: name.clone(),
             args: args
                 .iter()

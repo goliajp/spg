@@ -2780,7 +2780,7 @@ pub(crate) fn resolve_gin_col_query(
     // tsvector-typed v7.12 surface) skip the wrapper entirely.
     let column = match col_side {
         Expr::Column(c) => Some(c),
-        Expr::FunctionCall { name, args }
+        Expr::FunctionCall { name, args, .. }
             if name.eq_ignore_ascii_case("to_tsvector") && !args.is_empty() =>
         {
             // PG `to_tsvector` accepts either `to_tsvector(col)` or

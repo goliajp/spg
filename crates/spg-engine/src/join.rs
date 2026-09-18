@@ -3314,7 +3314,7 @@ impl Engine {
         let SelectItem::Expr { expr, .. } = &stmt.items[0] else {
             return Ok(None);
         };
-        let is_count_star = matches!(expr, Expr::FunctionCall { name, args }
+        let is_count_star = matches!(expr, Expr::FunctionCall { name, args, ..}
             if name.eq_ignore_ascii_case("count_star") && args.is_empty());
         if !is_count_star {
             return Ok(None);

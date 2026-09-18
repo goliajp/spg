@@ -1016,7 +1016,10 @@ fn substitute_excluded_refs(
             op,
             expr: Box::new(substitute_excluded_refs(*expr, schema_cols, incoming)),
         },
-        Expr::FunctionCall { name, args } => Expr::FunctionCall {
+        Expr::FunctionCall {
+            name, args, syntax, ..
+        } => Expr::FunctionCall {
+            syntax,
             name,
             args: args
                 .into_iter()
