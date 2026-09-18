@@ -2523,7 +2523,14 @@ fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
         "macaddr8" => DataType::Macaddr8,
         "pg_lsn" => DataType::PgLsn,
         // v7.39 (read01 varbit.c) — the B'...' literal's internal target.
-        "__bit_literal" => DataType::BitVarying(0),
+        //
+        // 9.0.0 — and it is the FIXED-width type. PostgreSQL 18.6 types
+        // `B'101'` as `"bit"`, and this said `bit varying`, so `\gdesc`
+        // and `pg_typeof` both named the wrong one of the two types the
+        // one `Value::BitString` stands for. The width is 0 because the
+        // target does not carry one; the VALUE carries the bits, and
+        // nothing reads the width off this.
+        "__bit_literal" => DataType::Bit(0),
         // v7.39 (round 640) — a transaction id has its own identity now.
         // The name used to resolve to `bigint`, which is why
         // `pg_typeof(NULL::xid)` said so, `pg_type` could not list oid

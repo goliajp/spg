@@ -9291,6 +9291,16 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
         Expr::ArraySubscript { target, .. } => (figure_name_inner(target).0, NameStrength::Weak),
         // A cast prefers its argument's name and settles for the type:
         // `upper(s)::text` is `upper`, `(a+b)::text` is `text`.
+        // 9.0.0 — `B'101'` parses as a cast onto an INTERNAL target, and
+        // the target's name was the column's: a client reading `\gdesc`
+        // saw a column called `__bit_literal`, which is a spelling of
+        // SPG's own. PostgreSQL has no cast there at all and names it
+        // `?column?`, the answer the `count_star` leak was given in
+        // v7.39.13.
+        Expr::Cast {
+            target: CastTarget::Named(n),
+            ..
+        } if n == "__bit_literal" => (None, NameStrength::None),
         Expr::Cast {
             expr: inner,
             target,

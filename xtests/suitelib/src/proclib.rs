@@ -684,10 +684,26 @@ mod tests {
     fn free_port_skips_a_port_another_process_is_serving() {
         let _serial = server_test_guard();
         let r = Roster::new();
-        let victim = r.free_port().expect("a free port");
+        // 9.0.0 — take the port, do not merely be told it is free.
+        //
+        // The two rows below were given this shape in v7.38.20 and this
+        // one was not, so it kept the probe-then-bind that the guard
+        // does not cover: the sibling rows hold a wildcard listener
+        // WITHOUT taking the guard, so one of them can bind the port
+        // between this probe and this bind. A full workspace run went
+        // red on `the probe just said this port was free`, which was
+        // true when it said it. The test is about the EXCLUSION, so it
+        // retries until it actually holds one.
+        //
         // Hold it the way a spawned server does: the wildcard address.
-        let held = std::net::TcpListener::bind(("0.0.0.0", victim))
-            .expect("the probe just said this port was free");
+        let (victim, held) = (0..64)
+            .find_map(|_| {
+                let p = r.free_port().ok()?;
+                std::net::TcpListener::bind(("0.0.0.0", p))
+                    .ok()
+                    .map(|l| (p, l))
+            })
+            .expect("a port this test can hold");
         for _ in 0..8 {
             let p = r.free_port().expect("a free port");
             assert_ne!(

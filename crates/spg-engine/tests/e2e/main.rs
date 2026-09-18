@@ -95,6 +95,7 @@ mod e2e_bit_count;
 mod e2e_bit_count_bitstring;
 mod e2e_bit_length;
 mod e2e_bit_length_round281;
+mod e2e_bit_literal_type_900;
 mod e2e_bit_string_literals;
 mod e2e_bool_2d_round75;
 mod e2e_bool_agg;

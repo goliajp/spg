@@ -80,12 +80,16 @@ fn bit_concat_yields_bitstring() {
 
 #[test]
 fn pg_typeof_bit_reports_bit_varying_not_unknown() {
-    // SPG carries bit / bit varying in one BitString variant, so
-    // pg_typeof reports "bit varying" (its data_type) — matching PG for
-    // varbit values and the concat result. (A `bit` literal reads as
-    // "bit varying" here vs PG's "bit"; that needs a fixed-vs-varying tag
-    // SPG doesn't keep.) The point of this test is that it is no longer
-    // "unknown". Live-PG18.4: pg_typeof('101'::varbit) = "bit varying".
+    // SPG carries bit / bit varying in one BitString variant, so the
+    // VALUE cannot say which of the two it is. The point of this test was
+    // that it is no longer "unknown".
+    //
+    // 9.0.0 — and which of the two it is now comes from the EXPRESSION,
+    // so a `bit` literal reads `bit` as it does on PG. Measured on 18.6:
+    //
+    //   pg_typeof('101'::varbit)   bit varying
+    //   pg_typeof(B'10' || B'11')  bit varying
+    //   pg_typeof(B'101')          bit
     let mut e = Engine::new();
     let t = |e: &mut Engine, sql: &str| -> String {
         match one(e, sql) {
@@ -101,8 +105,8 @@ fn pg_typeof_bit_reports_bit_varying_not_unknown() {
         t(&mut e, "SELECT pg_typeof(B'10' || B'11')::text"),
         "bit varying"
     );
-    // No longer "unknown" for a plain bit literal either.
-    assert_eq!(t(&mut e, "SELECT pg_typeof(B'101')::text"), "bit varying");
+    // A plain bit literal is the FIXED-width type, as on PG.
+    assert_eq!(t(&mut e, "SELECT pg_typeof(B'101')::text"), "bit");
 }
 
 #[test]

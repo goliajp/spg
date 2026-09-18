@@ -10,6 +10,26 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `B'101'` is the fixed-width `bit`, and its column has no name
+
+Found by the describe sweep. The parser routes a bit-string literal
+through an internal cast target, and two things leaked from it:
+
+```text
+                              PG 18.6          SPG 8.0.4
+  SELECT B'101' \gdesc        ?column?|"bit"   __bit_literal|bit varying
+  pg_typeof(B'101')           bit              bit varying
+  pg_typeof(B'101'::bit(3))   bit              bit varying
+  pg_typeof(B'101'::varbit)   bit varying      bit varying
+```
+
+`__bit_literal` is a spelling of SPG's own reaching a client — the same
+class as the `count_star` leak closed in v7.39.13 — and `bit` and
+`bit varying` are two types over one `Value::BitString`, so which one it
+is has to come from the expression, as it does for `timestamptz`. The
+bits themselves are untouched: `B'101' || B'0'`, `::int`, `length` and
+the comparisons all answer what they did, and what PG answers.
+
 ### Fixed — three semantic errors PostgreSQL raises before it scans
 
 PostgreSQL runs parse analysis first, so a statement that cannot mean

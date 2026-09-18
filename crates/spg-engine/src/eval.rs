@@ -3958,6 +3958,20 @@ fn resolve_named_args(
     Ok(out)
 }
 
+/// 9.0.0 — whether an expression names PostgreSQL's FIXED-width `bit`
+/// rather than `bit varying`: a `B'…'` literal (which the parser routes
+/// through an internal cast target) or an explicit `::bit(n)` / `::bit`.
+fn expr_is_fixed_width_bit(e: &Expr) -> bool {
+    let CastTarget::Named(n) = (match e {
+        Expr::Cast { target, .. } => target,
+        _ => return false,
+    }) else {
+        return false;
+    };
+    let lower = n.to_ascii_lowercase();
+    lower == "__bit_literal" || lower == "bit" || lower.starts_with("bit(")
+}
+
 fn eval_function_call_positional(
     name: &str,
     args: &[Expr],
@@ -4105,6 +4119,22 @@ fn eval_function_call_positional(
                 _ => {}
             }
         }
+    }
+    // 9.0.0 — `bit` and `bit varying` are two types over one value.
+    // `Value::BitString` carries the bits and not which of the two it
+    // is, so the value-driven namer can only ever say `bit varying`:
+    //
+    //   pg_typeof(B'101')          PG 18.6  bit          SPG  bit varying
+    //   pg_typeof(B'101'::bit(3))  PG 18.6  bit          SPG  bit varying
+    //   pg_typeof(B'101'::varbit)  PG 18.6  bit varying  SPG  bit varying
+    //
+    // Which of them it is lives in the EXPRESSION, the same place the
+    // timestamptz arm below reads its answer from.
+    if args.len() == 1
+        && name.eq_ignore_ascii_case("pg_typeof")
+        && expr_is_fixed_width_bit(&args[0])
+    {
+        return Ok(Value::text::<alloc::string::String>("bit".into()));
     }
     // v7.38 (T-tstz Phase 1) — the ONE case where pg_typeof needs the
     // static type: timestamptz. The runtime value is a tz-less
