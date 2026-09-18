@@ -800,6 +800,7 @@ mod e2e_qualified_wildcard_round128;
 mod e2e_querytree;
 mod e2e_quote_and_meta_funcs;
 mod e2e_quote_pseudotypes;
+mod e2e_raise_forms_900;
 mod e2e_raise_notice_round757;
 mod e2e_random_int;
 mod e2e_random_normal;

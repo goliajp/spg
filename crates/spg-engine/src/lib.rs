@@ -504,7 +504,9 @@ pub enum EngineError {
     /// clients as `42000` and `DO: trigger function "DO": RAISE EXCEPTION
     /// "boom"`, where PG sends `P0001` and `boom`.
     Raised {
-        sqlstate: &'static str,
+        /// 9.0.0 — owned, because `RAISE … SQLSTATE '<code>'` lets the
+        /// block choose one and PostgreSQL echoes whatever it wrote.
+        sqlstate: alloc::borrow::Cow<'static, str>,
         message: String,
     },
 }

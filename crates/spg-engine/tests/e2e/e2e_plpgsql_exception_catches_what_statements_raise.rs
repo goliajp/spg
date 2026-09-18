@@ -165,19 +165,15 @@ fn unknown_names_are_refused_and_an_uncaught_raise_is_p0001() {
     let err = e
         .execute("DO $$ BEGIN INSERT INTO ex2 VALUES (5, 5); EXCEPTION WHEN foo THEN NULL; END $$")
         .expect_err("unknown condition");
+    let (code, msg) = spg_engine::sqlstate::error_to_wire(&err);
     assert_eq!(
-        spg_engine::sqlstate::error_to_wire(&err),
-        (
-            "42704",
-            "unrecognized exception condition \"foo\"".to_string()
-        )
+        (code.as_ref(), msg.as_str()),
+        ("42704", "unrecognized exception condition \"foo\"")
     );
     assert_eq!(rows(&mut e), "1:1", "refused before the block ran");
     let err = e
         .execute("DO $$ BEGIN RAISE EXCEPTION 'boom %', 1; END $$")
         .expect_err("RAISE");
-    assert_eq!(
-        spg_engine::sqlstate::error_to_wire(&err),
-        ("P0001", "boom 1".to_string())
-    );
+    let (code, msg) = spg_engine::sqlstate::error_to_wire(&err);
+    assert_eq!((code.as_ref(), msg.as_str()), ("P0001", "boom 1"));
 }

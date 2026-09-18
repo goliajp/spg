@@ -8154,42 +8154,139 @@ impl Parser {
     /// v7.12.6 — `RAISE { NOTICE | WARNING | INFO | LOG | DEBUG
     /// | EXCEPTION } '<message>' [, args]*`. The `RAISE` keyword
     /// is already consumed.
+    /// 9.0.0 — PostgreSQL's SQLSTATE shape: five characters, digits and
+    /// upper-case letters only.
+    fn is_sqlstate_code_str(code: &str) -> bool {
+        code.len() == 5
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+    }
+
+    /// 9.0.0 — PostgreSQL's whole `RAISE` grammar:
+    ///
+    /// ```text
+    /// RAISE [ level ] { 'format' [, expr…] | condition_name | SQLSTATE 'code' }
+    ///       [ USING option = expr [, …] ]
+    /// ```
+    ///
+    /// The level is optional and defaults to EXCEPTION, which is what
+    /// makes `RAISE division_by_zero` and `RAISE SQLSTATE '22012'`
+    /// legal. SPG read a level word unconditionally and then demanded a
+    /// string, so every spelling but `RAISE <level> '…'` was a syntax
+    /// error (sentori, 8.0.4 CHANGELOG).
     fn parse_plpgsql_raise(&mut self) -> Result<PlPgSqlStmt, ParseError> {
-        let lvl_ident = self.expect_ident_like()?;
-        let level = match lvl_ident.to_ascii_lowercase().as_str() {
-            "notice" => RaiseLevel::Notice,
-            "warning" => RaiseLevel::Warning,
-            "info" => RaiseLevel::Info,
-            "log" => RaiseLevel::Log,
-            "debug" => RaiseLevel::Debug,
-            "exception" => RaiseLevel::Exception,
+        let level = match self.peek() {
+            Token::Ident(s) | Token::QuotedIdent(s) => {
+                match s.to_ascii_lowercase().as_str() {
+                    "notice" => Some(RaiseLevel::Notice),
+                    "warning" => Some(RaiseLevel::Warning),
+                    "info" => Some(RaiseLevel::Info),
+                    "log" => Some(RaiseLevel::Log),
+                    "debug" => Some(RaiseLevel::Debug),
+                    "exception" => Some(RaiseLevel::Exception),
+                    // Not a level: a condition name, or `SQLSTATE`.
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if level.is_some() {
+            self.advance();
+        }
+        // PG's default when the level is left out.
+        let level = level.unwrap_or(RaiseLevel::Exception);
+
+        let mut errcode: Option<crate::ast::RaiseErrcode> = None;
+        let mut args: Vec<Expr> = Vec::new();
+        let message = match self.peek().clone() {
+            // `RAISE [level] 'format' [, expr…]`
+            Token::String(msg) => {
+                self.advance();
+                while matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                    args.push(self.parse_expr(0)?);
+                }
+                msg
+            }
+            // `RAISE [level] SQLSTATE 'code'` — the code is the message.
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sqlstate") => {
+                self.advance();
+                let Token::String(code) = self.peek().clone() else {
+                    return Err(self.err(alloc::format!(
+                        "expected a SQLSTATE string after SQLSTATE, got {:?}",
+                        self.peek()
+                    )));
+                };
+                self.advance();
+                // PG checks the shape right here: `RAISE SQLSTATE
+                // 'abc'` is `invalid SQLSTATE code at or near "'abc'"`.
+                if !Self::is_sqlstate_code_str(&code) {
+                    return Err(self.err(alloc::format!(
+                        "invalid SQLSTATE code at or near \"'{code}'\""
+                    )));
+                }
+                errcode = Some(crate::ast::RaiseErrcode::State(code.clone()));
+                code
+            }
+            // `RAISE [level] condition_name` — the name is the message.
+            Token::Ident(s) | Token::QuotedIdent(s) => {
+                self.advance();
+                errcode = Some(crate::ast::RaiseErrcode::Condition(s.clone()));
+                s
+            }
             other => {
                 return Err(self.err(alloc::format!(
-                    "expected RAISE level (NOTICE/WARNING/INFO/LOG/DEBUG/EXCEPTION), got {other:?}"
+                    "expected RAISE message string, condition name or SQLSTATE, got {other:?}"
                 )));
             }
         };
-        // Message: required for v7.12.6. PG accepts a bare
-        // RAISE-rethrow form (no message), reserved for future
-        // RAISE-no-args support.
-        let Token::String(msg) = self.peek() else {
-            return Err(self.err(alloc::format!(
-                "expected RAISE message string, got {:?}",
-                self.peek()
-            )));
-        };
-        let message = msg.clone();
-        self.advance();
-        // Optional comma-separated args (PG `%` format substitution).
-        let mut args: Vec<Expr> = Vec::new();
-        while matches!(self.peek(), Token::Comma) {
+
+        // `USING option = expr [, …]`. PG names nine options; the three
+        // that reach a client through the wire are here and the rest
+        // parse and are dropped, which is what SPG does with every
+        // other diagnostic field it does not carry.
+        let mut detail: Option<Expr> = None;
+        let mut hint: Option<Expr> = None;
+        if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("using")) {
             self.advance();
-            args.push(self.parse_expr(0)?);
+            loop {
+                let opt = self.expect_ident_like()?.to_ascii_lowercase();
+                if !matches!(self.peek(), Token::Eq) {
+                    return Err(self.err(alloc::format!(
+                        "expected `=` after RAISE USING {opt}, got {:?}",
+                        self.peek()
+                    )));
+                }
+                self.advance();
+                match opt.as_str() {
+                    // PG evaluates this one and classifies its TEXT, so
+                    // a bare identifier here is a column reference and
+                    // errors as one — measured.
+                    "errcode" => {
+                        errcode = Some(crate::ast::RaiseErrcode::Value(self.parse_expr(0)?));
+                    }
+                    "detail" => detail = Some(self.parse_expr(0)?),
+                    "hint" => hint = Some(self.parse_expr(0)?),
+                    _ => {
+                        let _ = self.parse_expr(0)?;
+                    }
+                }
+                if matches!(self.peek(), Token::Comma) {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
         }
+
         Ok(PlPgSqlStmt::Raise {
             level,
             message,
             args,
+            errcode,
+            detail,
+            hint,
         })
     }
 

@@ -109,14 +109,23 @@ pub enum TriggerError {
     /// trigger body. The interpreter formats the args into the
     /// message via PG-style `%` substitution and surfaces the
     /// resolved text up to the caller.
-    RaiseException { function: String, message: String },
+    /// 9.0.0 — `sqlstate` carries what the RAISE named, if it named
+    /// one: a literal `SQLSTATE '…'`, a condition name already resolved
+    /// to its code, or `USING ERRCODE`.
+    RaiseException {
+        function: String,
+        message: String,
+        sqlstate: Option<String>,
+    },
     /// 8.0.3 — an embedded SQL statement failed while the block ran. Carries
     /// the SQLSTATE the wire would send, so an `EXCEPTION WHEN
     /// unique_violation` handler can match it, and the client-facing
     /// message `SQLERRM` reads.
     Sql {
         function: String,
-        sqlstate: &'static str,
+        /// 9.0.0 — owned, so a `RAISE … SQLSTATE '<code>'` inside a
+        /// handler can carry the code the block wrote.
+        sqlstate: alloc::borrow::Cow<'static, str>,
         message: String,
     },
 }
@@ -167,7 +176,9 @@ impl fmt::Display for TriggerError {
                 )
             }
             Self::Sql { message, .. } => f.write_str(message),
-            Self::RaiseException { function, message } => {
+            Self::RaiseException {
+                function, message, ..
+            } => {
                 write!(
                     f,
                     "trigger function {function:?}: RAISE EXCEPTION {message:?}"
@@ -603,6 +614,9 @@ fn execute_stmts(
                 level,
                 message,
                 args,
+                errcode,
+                detail,
+                hint,
             } => {
                 // Resolve every %-format placeholder by evaluating
                 // each arg expression and rendering its Value.
@@ -625,9 +639,84 @@ fn execute_stmts(
                     })?;
                     rendered_args.push(value_to_display_string(&v));
                 }
-                let resolved = format_raise_message(message, &rendered_args);
+                let mut resolved = format_raise_message(message, &rendered_args);
+                // 9.0.0 — `USING DETAIL = …` / `HINT = …` ride in the
+                // message, which is the shape the wire already splits
+                // into the `D` and `H` fields.
+                let mut eval_opt = |e: &Option<Expr>| -> Result<Option<String>, TriggerError> {
+                    let Some(e) = e else { return Ok(None) };
+                    let v = eval_with_new_old_and_locals(
+                        e,
+                        current_new.as_ref(),
+                        old_row,
+                        locals,
+                        ctx.columns,
+                        ctx.table_name,
+                        ctx.params,
+                        ctx.default_text_search_config,
+                        ctx.select_into_resolver,
+                    )
+                    .map_err(|cause| TriggerError::EvalFailed {
+                        function: ctx.function.into(),
+                        cause,
+                    })?;
+                    Ok(Some(value_to_display_string(&v)))
+                };
+                if let Some(d) = eval_opt(detail)? {
+                    resolved.push_str(" DETAIL: ");
+                    resolved.push_str(&d);
+                }
+                if let Some(h) = eval_opt(hint)? {
+                    resolved.push_str("\nHINT:  ");
+                    resolved.push_str(&h);
+                }
                 if matches!(level, RaiseLevel::Exception) {
+                    // 9.0.0 — the code the statement named, if it named
+                    // one. A condition name resolves through the same
+                    // table `EXCEPTION WHEN <name>` reads.
+                    let named: Option<alloc::string::String> = match errcode {
+                        None => None,
+                        Some(spg_sql::ast::RaiseErrcode::State(code)) => {
+                            Some(alloc::string::String::from(code))
+                        }
+                        Some(spg_sql::ast::RaiseErrcode::Condition(name)) => {
+                            Some(alloc::string::String::from(name))
+                        }
+                        // `USING ERRCODE = <expr>` is evaluated, and its
+                        // TEXT classified below the same way a written
+                        // name is. Measured on PG 18.6.
+                        Some(spg_sql::ast::RaiseErrcode::Value(e)) => eval_opt(&Some(e.clone()))?,
+                    };
+                    let sqlstate = match named {
+                        None => None,
+                        Some(text) => {
+                            // Five characters of digits and upper-case
+                            // letters is a code; anything else is a
+                            // condition name.
+                            if text.len() == 5
+                                && text
+                                    .bytes()
+                                    .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+                            {
+                                Some(text)
+                            } else {
+                                match condition_code(&text.to_ascii_lowercase()) {
+                                    Some(code) => Some(alloc::string::String::from(code)),
+                                    None => {
+                                        return Err(TriggerError::Sql {
+                                            function: ctx.function.into(),
+                                            sqlstate: alloc::borrow::Cow::Borrowed("42704"),
+                                            message: alloc::format!(
+                                                "unrecognized exception condition \"{text}\""
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    };
                     return Err(TriggerError::RaiseException {
+                        sqlstate,
                         function: ctx.function.into(),
                         message: resolved,
                     });
@@ -751,6 +840,7 @@ fn execute_stmts(
                 loop {
                     if iter >= FOR_RANGE_BUDGET {
                         return Err(TriggerError::RaiseException {
+                            sqlstate: None,
                             function: ctx.function.into(),
                             message: alloc::format!(
                                 "FOR loop iteration budget {FOR_RANGE_BUDGET} reached"
@@ -779,6 +869,7 @@ fn execute_stmts(
                 loop {
                     if iter >= LOOP_BUDGET {
                         return Err(TriggerError::RaiseException {
+                            sqlstate: None,
                             function: ctx.function.into(),
                             message: alloc::format!("LOOP iteration budget {LOOP_BUDGET} reached"),
                         });
@@ -1102,6 +1193,7 @@ fn execute_stmts(
                 loop {
                     if iter >= WHILE_LOOP_BUDGET {
                         return Err(TriggerError::RaiseException {
+                            sqlstate: None,
                             function: ctx.function.into(),
                             message: alloc::format!(
                                 "WHILE loop iteration budget {WHILE_LOOP_BUDGET} reached — likely runaway condition"
@@ -1189,7 +1281,7 @@ fn execute_stmts(
                     // condition to recover from.
                     return Err(TriggerError::Sql {
                         function: ctx.function.into(),
-                        sqlstate: "P0004",
+                        sqlstate: alloc::borrow::Cow::Borrowed("P0004"),
                         message: msg_text,
                     });
                 }
@@ -1230,12 +1322,20 @@ fn execute_stmts(
 
 /// 8.0.3 — the SQLSTATE and the `SQLERRM` text of an error a PL/pgSQL
 /// block raised, from the same classification the wire uses.
-pub(crate) fn error_state(err: &TriggerError) -> (&'static str, String) {
+pub(crate) fn error_state(err: &TriggerError) -> (alloc::borrow::Cow<'static, str>, String) {
     match err {
-        TriggerError::RaiseException { message, .. } => ("P0001", message.clone()),
+        // 9.0.0 — a RAISE may name its own code.
+        TriggerError::RaiseException {
+            message, sqlstate, ..
+        } => (
+            sqlstate
+                .clone()
+                .map_or(alloc::borrow::Cow::Borrowed("P0001"), Into::into),
+            message.clone(),
+        ),
         TriggerError::Sql {
             sqlstate, message, ..
-        } => (sqlstate, message.clone()),
+        } => (sqlstate.clone(), message.clone()),
         TriggerError::EvalFailed { cause, .. } => {
             crate::sqlstate::error_to_wire(&crate::EngineError::Eval(cause.clone()))
         }
@@ -1261,7 +1361,7 @@ pub(crate) fn check_exception_conditions(
             if !known {
                 return Err(TriggerError::Sql {
                     function: function.into(),
-                    sqlstate: "42704",
+                    sqlstate: alloc::borrow::Cow::Borrowed("42704"),
                     message: alloc::format!("unrecognized exception condition \"{c}\""),
                 });
             }
@@ -1702,7 +1802,7 @@ fn do_block<'a>(
         let handler = block
             .exception_handlers
             .iter()
-            .find(|h| h.conditions.iter().any(|c| condition_matches(c, sqlstate)));
+            .find(|h| h.conditions.iter().any(|c| condition_matches(c, &sqlstate)));
         let Some(handler) = handler else {
             return Err(err);
         };
@@ -1804,7 +1904,7 @@ pub fn call_plpgsql_scalar<'a>(
                 let matches = handler
                     .conditions
                     .iter()
-                    .any(|c| condition_matches(c, sqlstate));
+                    .any(|c| condition_matches(c, &sqlstate));
                 if matches {
                     locals.insert("sqlerrm".into(), Value::text(message.clone()));
                     locals.insert(

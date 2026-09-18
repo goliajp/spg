@@ -79,31 +79,31 @@ fn window_sqlstate(msg: &str) -> Option<&'static str> {
 /// v7.39 (round 429) — crate-visible so the MySQL wire can derive its own
 /// errno from the SAME classification: the two protocols disagree only on
 /// the code's spelling, never on which failure it was.
-pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
+pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, String) {
     // 8.0.3 — a PL/pgSQL error already knows its code.
     if let EngineError::Raised { sqlstate, message } = e {
-        return (sqlstate, message.clone());
+        return (sqlstate.clone(), message.clone());
     }
     if let EngineError::Cancelled = e {
         return (
-            "57014",
+            alloc::borrow::Cow::Borrowed("57014"),
             "canceling statement due to statement timeout".to_string(),
         );
     }
     // v7.38 (read01 P3.26) — an aborted-transaction rejection carries PG's
     // 25P02 so clients recognise "commands ignored until end of block".
     if let EngineError::InFailedTransaction = e {
-        return ("25P02", e.to_string());
+        return (alloc::borrow::Cow::Borrowed("25P02"), e.to_string());
     }
     // v7.38 (read01 P4.02) — a single-row subquery that returned many rows
     // is PG's 21000 CARDINALITY_VIOLATION.
     if let EngineError::CardinalityViolation = e {
-        return ("21000", e.to_string());
+        return (alloc::borrow::Cow::Borrowed("21000"), e.to_string());
     }
     // v7.37.17 (Phase E3) — a RR/SER commit that hit a write-write
     // conflict is PG's 40001 SERIALIZATION_FAILURE (clients retry).
     if let EngineError::SerializationFailure(_) = e {
-        return ("40001", e.to_string());
+        return (alloc::borrow::Cow::Borrowed("40001"), e.to_string());
     }
     // v7.39 (read01 round 232) — the ORDER BY legality rules are PG's
     // 42P10 INVALID_COLUMN_REFERENCE, and a set-operation arity mismatch is
@@ -114,12 +114,12 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
     // `lock_timeout` is PG's 55P03, same class as NOWAIT; a wait-for
     // cycle is 40P01, which clients retry.
     if let EngineError::LockDeadlock = e {
-        return ("40P01", e.to_string());
+        return (alloc::borrow::Cow::Borrowed("40P01"), e.to_string());
     }
     {
         let msg = e.to_string();
         if msg.contains("canceling statement due to lock timeout") {
-            return ("55P03", msg);
+            return (alloc::borrow::Cow::Borrowed("55P03"), msg);
         }
     }
     // v7.39 (round 297, E3 Phase 1b) — `FOR UPDATE NOWAIT` on a row
@@ -129,7 +129,7 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
     {
         let msg = e.to_string();
         if msg.contains("could not obtain lock on row in relation") {
-            return ("55P03", msg);
+            return (alloc::borrow::Cow::Borrowed("55P03"), msg);
         }
     }
     {
@@ -138,73 +138,73 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
             || msg.contains("must appear in select list")
             || msg.contains("must match initial ORDER BY expressions")
         {
-            return ("42P10", msg);
+            return (alloc::borrow::Cow::Borrowed("42P10"), msg);
         }
         // v7.39 (round 240) — the other two ON CONFLICT refusals: touching
         // the same row twice in one command is 21000 CARDINALITY_VIOLATION,
         // and DO UPDATE without a conflict target is 42601.
         if msg.contains("cannot affect row a second time") {
-            return ("21000", msg);
+            return (alloc::borrow::Cow::Borrowed("21000"), msg);
         }
         // v7.39 (round 241) — a qualifier naming no table in scope is PG's
         // 42P01 UNDEFINED_TABLE, same class as a missing relation.
         if msg.contains("missing FROM-clause entry for table") {
-            return ("42P01", msg);
+            return (alloc::borrow::Cow::Borrowed("42P01"), msg);
         }
         // v7.39 (round 242) — grouping() over a non-key is PG's 42803
         // GROUPING_ERROR. Parser-raised, so ahead of the Parse→42601
         // short-circuit.
         if msg.contains("arguments to GROUPING must be grouping expressions") {
-            return ("42803", msg);
+            return (alloc::borrow::Cow::Borrowed("42803"), msg);
         }
         // v7.39 (round 620) — an ungrouped column is the same class. It used
         // to reach the wire as 42703 UNDEFINED_COLUMN, because the engine
         // reported it as a column that does not exist; now it says what it is,
         // and the code says so too.
         if msg.contains("must appear in the GROUP BY clause") {
-            return ("42803", msg);
+            return (alloc::borrow::Cow::Borrowed("42803"), msg);
         }
         // v7.39 (round 620) — a cast target that names no type is PG's 42704
         // UNDEFINED_OBJECT. It used to reach the wire as the generic 42000,
         // under SPG's own wording.
         if msg.contains("does not exist") && strip_error_class(&msg).starts_with("type \"") {
-            return ("42704", msg);
+            return (alloc::borrow::Cow::Borrowed("42704"), msg);
         }
         // v7.39 (round 244) — sequence-range errors: a setval outside the
         // range is 22003 NUMERIC_VALUE_OUT_OF_RANGE, the CREATE SEQUENCE
         // option refusals 22023.
         if msg.contains("is out of bounds for sequence") {
-            return ("22003", msg);
+            return (alloc::borrow::Cow::Borrowed("22003"), msg);
         }
         if msg.contains("cannot be less than MINVALUE")
             || msg.contains("cannot be greater than MAXVALUE")
             || msg.contains("INCREMENT must not be zero")
         {
-            return ("22023", msg);
+            return (alloc::borrow::Cow::Borrowed("22023"), msg);
         }
         if msg.contains("ON CONFLICT DO UPDATE requires inference specification") {
-            return ("42601", msg);
+            return (alloc::borrow::Cow::Borrowed("42601"), msg);
         }
         if msg.contains("query must have the same number of columns") {
-            return ("42601", msg);
+            return (alloc::borrow::Cow::Borrowed("42601"), msg);
         }
         // v7.39 (round 239) — the row-count clause errors come from the
         // parser, so they must be classified ahead of the Parse
         // short-circuit below: a negative LIMIT is PG's 2201W, a negative
         // OFFSET 2201X, and a literal that won't coerce to bigint 22P02.
         if msg.contains("LIMIT must not be negative") {
-            return ("2201W", msg);
+            return (alloc::borrow::Cow::Borrowed("2201W"), msg);
         }
         if msg.contains("OFFSET must not be negative") {
-            return ("2201X", msg);
+            return (alloc::borrow::Cow::Borrowed("2201X"), msg);
         }
         if msg.contains("invalid input syntax for type bigint") {
-            return ("22P02", msg);
+            return (alloc::borrow::Cow::Borrowed("22P02"), msg);
         }
         // v7.39 (round 233) — two set-operation branch columns with no
         // common type are PG's 42804 DATATYPE_MISMATCH.
         if msg.contains(" types ") && msg.contains(" cannot be matched") {
-            return ("42804", msg);
+            return (alloc::borrow::Cow::Borrowed("42804"), msg);
         }
     }
     // v7.39 (read01 round 230) — window-clause errors carry PG's own class
@@ -214,13 +214,13 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
     // `Unsupported` (whose Display prefixes "unsupported: ", so the message
     // arms further down only ever see a substring).
     if let Some(code) = window_sqlstate(&e.to_string()) {
-        return (code, e.to_string());
+        return (alloc::borrow::Cow::Borrowed(code), e.to_string());
     }
     // v7.39 (read01 round 95) — a parse failure is PG's 42601 SYNTAX_ERROR
     // (was the generic 42000). The character position rides the separate `P`
     // field (see parse_error_position).
     if let EngineError::Parse(_) = e {
-        return ("42601", e.to_string());
+        return (alloc::borrow::Cow::Borrowed("42601"), e.to_string());
     }
     let msg = e.to_string();
     // Map constraint violations to their PG SQLSTATE class-23 codes so
@@ -721,7 +721,7 @@ pub fn error_to_wire(e: &EngineError) -> (&'static str, String) {
     // SQLSTATE classification above matched on the full string, so it is
     // unaffected.
     let msg = strip_error_class(&msg);
-    (code, msg)
+    (alloc::borrow::Cow::Borrowed(code), msg)
 }
 
 /// 8.0.3 — an engine message split the way a client receives it: the

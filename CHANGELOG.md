@@ -10,6 +10,36 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Added — PL/pgSQL's whole `RAISE` grammar, and the SQLSTATE it names
+
+SPG read a level word unconditionally and then demanded a format
+string, so every spelling but `RAISE <level> '…'` was a syntax error —
+and the error a block did raise always reached the client as `P0001`,
+whatever the block asked for.
+
+```text
+                                             PG 18.6             SPG 8.0.4
+  RAISE EXCEPTION SQLSTATE '22012'           22012: 22012        syntax error at end of input
+  RAISE SQLSTATE '22012'                     22012: 22012        syntax error at end of input
+  RAISE division_by_zero                     22012: division…    syntax error at end of input
+  RAISE EXCEPTION 'b' USING ERRCODE='22012'  22012: b            syntax error at end of input
+  RAISE EXCEPTION 'd' USING DETAIL='dd'      d + DETAIL: dd      syntax error at end of input
+```
+
+The level is optional and defaults to EXCEPTION, which is what makes
+the bare condition-name and SQLSTATE forms legal. `USING` carries
+`ERRCODE`, `DETAIL` and `HINT`; the other six options parse and are
+dropped.
+
+`ERRCODE` follows PostgreSQL's own rule, measured: the option's value
+is an EXPRESSION whose text is classified — five characters of digits
+and upper-case letters is a SQLSTATE, anything else is a condition name
+resolved through the same table `EXCEPTION WHEN <name>` reads, and an
+unknown name is `42704 unrecognized exception condition "x"`. A bare
+identifier there is a column reference and errors as one, exactly as on
+PG. `RAISE SQLSTATE 'abc'` is refused where it is written
+(`invalid SQLSTATE code at or near "'abc'"`).
+
 ### Added — `ADD CONSTRAINT … PRIMARY KEY / UNIQUE USING INDEX`
 
 Reported by sentori (§5.2): the whole clause was a syntax error. It is
