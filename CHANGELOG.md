@@ -10,6 +10,50 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the catalog columns PostgreSQL declares as `"char"`, and the type itself
+
+Reported by sentori (§5.1): 26 catalog columns read `text` where PG 18.6
+declares `"char"`, its internal single-byte type, so a client that types
+its result columns saw the wrong OID for `relkind`, `contype`,
+`typtype`, `castmethod` and the rest. They carry the type now, values
+included — the letters they read are unchanged.
+
+Measuring it found the type itself barely reachable, and three separate
+things wrong with it:
+
+```text
+                                    PG 18.6   SPG 8.0.4
+  pg_typeof('r'::"char")            "char"    unknown
+  CREATE TABLE t(k "char")          CREATE    syntax error at or near ""char""
+  (0::int::"char")::text            ''        a NUL byte inside the string
+  (126::int::"char")::text          ~         ~
+  ((-128)::int::"char")::text       \200      È
+  ((-128)::int::"char")::int        -128      128
+  128::int::"char"                  ERROR     accepted, as its low byte
+```
+
+`"char"` is a SIGNED byte with PG's own `charout`: byte 0 prints as
+nothing, an ASCII byte prints as itself, and a byte with the high bit
+set prints as a backslash and three octal digits — which is the form
+SPG's `charin` already read back.
+
+### Fixed — `psql \d <table>` failed outright
+
+`\d` ends with a constraint query whose last line is
+`VALUES ('16384'::pg_catalog.regclass)`, and SPG looked that up as a
+relation NAME:
+
+```text
+  \d d    PG 18.6   the table
+          SPG       ERROR: relation "16384" does not exist
+```
+
+PostgreSQL's `regclassin` reads an all-digit string as the OID itself,
+and the object need not exist (`'999999'::regclass` is `999999` there).
+So does SPG's now, and `regtypein` with it (`'23'::regtype` is
+`integer`). `\d` on a table with a primary key and an index prints
+byte-identically to PG 18.6's.
+
 ### Fixed — a DML that errored took the connection down (debug builds)
 
 The commit queue's audit barrier asserted that every queued DML had

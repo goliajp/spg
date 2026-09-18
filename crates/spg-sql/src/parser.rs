@@ -17172,6 +17172,19 @@ impl Parser {
     > {
         let mut ty_ident = match self.advance() {
             Token::Ident(s) => s,
+            // 9.0.0 — a QUOTED type name. `"char"` is PostgreSQL's
+            // internal single-byte type (oid 18, SPG `Char1`), which the
+            // catalog declares 45 of its own columns as and which
+            // `CREATE TABLE t(k "char")` could not parse at all; other
+            // quoted names resolve like idents, the same rule `::"x"`
+            // has followed since v7.39.
+            Token::QuotedIdent(q) => {
+                if q.eq_ignore_ascii_case("char") {
+                    "char1".to_string()
+                } else {
+                    q.to_ascii_lowercase()
+                }
+            }
             // v7.37.5 β-P2 — `INTERVAL` lexes as a reserved keyword
             // (Token::Interval) since v7.9.25 to drive the `INTERVAL
             // '<span>'` literal grammar. As a column type it lands
@@ -17668,6 +17681,10 @@ impl Parser {
                 ColumnTypeName::BitVarying(n)
             }
             "xml" => ColumnTypeName::Xml,
+            // 9.0.0 — `"char"`, reached through the quoted-ident arm
+            // above. Distinct from bare `char`, which is `char(1)`.
+            "char1" => ColumnTypeName::Char1,
+
             // v7.17.0 Phase 3.P0-39 — PG hstore extension type.
             "hstore" => ColumnTypeName::Hstore,
             // v7.17.0 Phase 3.P0-36 — MySQL inline ENUM

@@ -3484,7 +3484,8 @@ fn apply_function_dispatch(
                     Ok(Value::Int(s.chars().next().map_or(0, |ch| ch as i32)))
                 }
                 // v7.39 (read01 char.c) — ascii("char") is the byte value.
-                Value::Char1(b) => Ok(Value::Int(i32::from(*b))),
+                // 9.0.0 — signed; see the cast arm.
+                Value::Char1(b) => Ok(Value::Int(i32::from(*b as i8))),
                 other => Err(EvalError::TypeMismatch {
                     detail: alloc::format!(
                         "ascii() needs text, got {}",

@@ -136,6 +136,7 @@ mod e2e_catalog_vectors_v73911;
 mod e2e_ceil;
 mod e2e_char1_concat_v73911;
 mod e2e_char_bool_round41;
+mod e2e_char_type_and_catalog_900;
 mod e2e_chr_ascii_initcap;
 mod e2e_churn_seek_cap_round461;
 mod e2e_clock_family;

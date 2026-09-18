@@ -510,7 +510,8 @@ pub fn value_to_text_styled(v: &Value, style: &crate::eval::RenderStyle) -> Stri
         Value::Cid(c) => alloc::format!("{c}"),
         Value::BitString { nbits, bytes } => crate::conversions::format_bit_string(*nbits, bytes),
         Value::Xml(s) => s.to_string(),
-        Value::Char1(b) => format!("{}", *b as char),
+        // 9.0.0 — PG's charout; see `conversions::format_char1`.
+        Value::Char1(b) => crate::conversions::format_char1(*b),
         // v7.5.0 — #[non_exhaustive] fallback for future Value variants.
         _ => format!("{v:?}"),
     }

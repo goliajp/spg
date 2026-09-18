@@ -4435,6 +4435,35 @@ pub(crate) fn coerce_to_oid(v: &Value<'_>) -> Result<Option<Value<'static>>, Eva
     Ok(Some(Value::BigInt(as_i64)))
 }
 
+/// 9.0.0 — PostgreSQL's `charout`, measured on 18.6.
+///
+/// Byte 0 prints as nothing (`(0::int::"char")::text = ''`), an ASCII
+/// byte prints as itself including the control ones (`10::"char"` is a
+/// raw newline), and a byte with the high bit set prints as a backslash
+/// and three octal digits (`(-128)::int::"char"` is `\200`, four
+/// characters). SPG printed the byte as a `char`, so 0 became a NUL
+/// inside the string and 0x80 became `È`.
+#[must_use]
+pub(crate) fn format_char1(b: u8) -> alloc::string::String {
+    match b {
+        0 => alloc::string::String::new(),
+        0x01..=0x7f => alloc::string::String::from(b as char),
+        _ => alloc::format!("\\{:03o}", b),
+    }
+}
+
+/// 9.0.0 — PostgreSQL's `i4tochar`: `"char"` is a signed byte.
+///
+/// Measured on 18.6: -128..127 convert, anything else raises `"char"
+/// out of range`.
+fn char1_from_int(n: i64) -> Result<u8, EngineError> {
+    i8::try_from(n).map(|v| v as u8).map_err(|_| {
+        EngineError::Eval(EvalError::TypeMismatch {
+            detail: "\"char\" out of range".into(),
+        })
+    })
+}
+
 pub(crate) fn coerce_value(
     v: Value<'static>,
     expected: DataType,
@@ -5405,11 +5434,17 @@ pub(crate) fn coerce_value(
             }
             made
         }
-        // v7.39 (read01 char.c) — an integer coerces to "char" by its
-        // low byte (65::"char" = 'A'; PG's i2char/int4char).
-        (Value::Int(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
-        (Value::SmallInt(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
-        (Value::BigInt(n), DataType::Char1) => Some(Value::Char1((n & 0xff) as u8)),
+        // v7.39 (read01 char.c) — an integer coerces to "char"
+        // (65::"char" = 'A'; PG's i2char/int4char).
+        //
+        // 9.0.0 — and `"char"` is a SIGNED byte, so the integer must be
+        // one: PG 18.6 accepts -128..127 and raises `"char" out of
+        // range` outside, where SPG took the low byte of anything
+        // (`128::"char"` was accepted and `(-128)::"char"::int`
+        // answered 128).
+        (Value::Int(n), DataType::Char1) => Some(Value::Char1(char1_from_int(i64::from(n))?)),
+        (Value::SmallInt(n), DataType::Char1) => Some(Value::Char1(char1_from_int(i64::from(n))?)),
+        (Value::BigInt(n), DataType::Char1) => Some(Value::Char1(char1_from_int(n)?)),
         (Value::Text(s), DataType::Char1) => {
             // v7.39 (read01 utils/adt, char.c) — charin accepts the
             // `\ooo` octal form charout produces for high bytes
@@ -5467,7 +5502,7 @@ pub(crate) fn coerce_value(
             Some(Value::BigInt(bit_string_to_i64(nbits, &bytes)))
         }
         (Value::Xml(s), DataType::Text) => Some(Value::text(s)),
-        (Value::Char1(b), DataType::Text) => Some(Value::text((b as char).to_string())),
+        (Value::Char1(b), DataType::Text) => Some(Value::text(format_char1(b))),
         // v7.37.5 ε — Text → geometry coerce. Each parser returns
         // None on malformed input; we surface a TypeMismatch with
         // the column name so the engine error is debuggable.
