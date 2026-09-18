@@ -728,6 +728,9 @@ impl Engine {
             self.validate_from_relations(s, cat)?;
             self.validate_clause_columns_in(s, cat)?;
             self.validate_function_arity(s)?;
+            self.validate_cast_targets(s)?;
+            self.validate_predicate_is_boolean(s)?;
+            self.validate_subquery_qualified_columns(s)?;
         } else {
             self.validate_dml(stmt, self.active_catalog())?;
         }

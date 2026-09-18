@@ -13,6 +13,17 @@ mod e2e_alter_rebuild;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    clippy::unreadable_literal,
+    unused_mut,
+    unused_variables
+)]
+mod e2e_analysis_time_errors_900;
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::uninlined_format_args
@@ -148,16 +159,6 @@ mod e2e_exclude_wire_round217;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
 mod e2e_explain;
 mod e2e_explain_sort_spilled_wire_v7405;
-#[allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args,
-    clippy::unreadable_literal,
-    unused_mut,
-    unused_variables
-)]
 mod e2e_failing_dml_keeps_the_session_900;
 mod e2e_file_access_sqlstate_round191;
 #[allow(

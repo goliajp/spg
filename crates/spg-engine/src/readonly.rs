@@ -320,6 +320,9 @@ impl Engine {
         // shape reached.
         self.validate_clause_columns(s)?;
         self.validate_function_arity(s)?;
+        self.validate_cast_targets(s)?;
+        self.validate_predicate_is_boolean(s)?;
+        self.validate_subquery_qualified_columns(s)?;
         if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
             return self.exec_scalarsq_streaming(s, cancel, arena, emit);
         }
@@ -374,6 +377,9 @@ impl Engine {
         // for `GROUP BY` / `HAVING` — shapes this shortcut declines.
         self.validate_clause_columns(s)?;
         self.validate_function_arity(s)?;
+        self.validate_cast_targets(s)?;
+        self.validate_predicate_is_boolean(s)?;
+        self.validate_subquery_qualified_columns(s)?;
         if !crate::expr_tree_has_subquery(s)
             && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
         {
@@ -430,6 +436,9 @@ impl Engine {
         // v7.39.2 — before the shortcut, for the reason above.
         self.validate_clause_columns(&s)?;
         self.validate_function_arity(&s)?;
+        self.validate_cast_targets(&s)?;
+        self.validate_predicate_is_boolean(&s)?;
+        self.validate_subquery_qualified_columns(&s)?;
         if !crate::expr_tree_has_subquery(&s)
             && let Some(n) = self.try_exec_joined_streaming(&s, cancel, &mut emit)?
         {

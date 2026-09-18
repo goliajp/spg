@@ -3188,6 +3188,9 @@ impl Engine {
         // — the same statement answering two ways depending on the plan.
         self.validate_clause_columns(stmt)?;
         self.validate_function_arity(stmt)?;
+        self.validate_cast_targets(stmt)?;
+        self.validate_predicate_is_boolean(stmt)?;
+        self.validate_subquery_qualified_columns(stmt)?;
         // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
         // privilege gate above. Placed before it at first, and the
         // security-definer e2e caught it immediately: a SECURITY INVOKER
@@ -14716,6 +14719,207 @@ impl crate::Engine {
         }
     }
 
+    /// 9.0.0 — the cast targets a statement names, checked before the
+    /// scan.
+    ///
+    /// PostgreSQL runs parse analysis first, so a type that does not
+    /// exist is refused whether or not a row would have reached the
+    /// cast. SPG checked it at row time, so over an EMPTY table
+    /// `SELECT CAST(id AS nosuchtype) FROM t` answered zero rows and no
+    /// error, and raised the moment the table had one — the same shape
+    /// as the unknown-column and wrong-arity defects closed before it,
+    /// in a third place.
+    /// 9.0.0 — a QUALIFIED column inside a subquery, when the qualifier
+    /// names one of that subquery's own sources.
+    ///
+    /// The walk beside this one does not descend into a subquery,
+    /// because a correlated one resolves its bare names against an outer
+    /// scope it cannot see. A qualifier that names the subquery's OWN
+    /// source is not that case: the column has to be there, and
+    /// PostgreSQL 18.6 says `column s.nosuch does not exist` before it
+    /// scans anything. SPG answered zero rows over an empty table.
+    pub(crate) fn validate_subquery_qualified_columns(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let mut inner: Vec<&SelectStatement> = Vec::new();
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                collect_subqueries(expr, &mut inner);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            collect_subqueries(w, &mut inner);
+        }
+        if let Some(h) = &stmt.having {
+            collect_subqueries(h, &mut inner);
+        }
+        let cat = self.active_catalog();
+        for sub in inner {
+            let Some(from) = &sub.from else { continue };
+            if !sub.ctes.is_empty() {
+                continue;
+            }
+            let mut sources: Vec<(String, &spg_storage::Table)> = Vec::new();
+            let mut plain = true;
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if !t.names_a_relation() {
+                    plain = false;
+                    break;
+                }
+                let Some(table) = cat.get(&t.name) else {
+                    plain = false;
+                    break;
+                };
+                sources.push((t.alias.clone().unwrap_or_else(|| t.name.clone()), table));
+            }
+            if !plain {
+                continue;
+            }
+            let mut refs: Vec<spg_sql::ast::ColumnName> = Vec::new();
+            for it in &sub.items {
+                if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                    collect_plain_column_refs(expr, &mut refs);
+                }
+            }
+            if let Some(w) = &sub.where_ {
+                collect_plain_column_refs(w, &mut refs);
+            }
+            for c in refs {
+                let Some(q) = &c.qualifier else { continue };
+                if is_system_column(&c.name) {
+                    continue;
+                }
+                // Only when the qualifier is one of THIS subquery's
+                // sources; anything else reaches outward and is not
+                // this walk's to judge.
+                let Some((_, t)) = sources.iter().find(|(a, _)| a == q) else {
+                    continue;
+                };
+                if !t
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|sc| self.col_name_eq(&sc.name, &c.name))
+                {
+                    return Err(EngineError::Eval(EvalError::QualifiedColumnNotFound {
+                        qualifier: q.clone(),
+                        column: c.name.clone(),
+                        token: c.token,
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_cast_targets(&self, stmt: &SelectStatement) -> Result<(), EngineError> {
+        let mut targets: Vec<alloc::string::String> = Vec::new();
+        let mut push = |e: &Expr, out: &mut Vec<alloc::string::String>| {
+            collect_named_cast_targets(e, out);
+        };
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                push(expr, &mut targets);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            push(w, &mut targets);
+        }
+        if let Some(h) = &stmt.having {
+            push(h, &mut targets);
+        }
+        for o in &stmt.order_by {
+            push(&o.expr, &mut targets);
+        }
+        if targets.is_empty() {
+            return Ok(());
+        }
+        // The question is asked of the ROW-TIME path, with a NULL: it is
+        // the one place that knows every family a name can come from
+        // (enum, domain, composite, a table's row type, the reg* family,
+        // the builtin table, a MySQL spelling with a modifier), and a
+        // second copy of that list here is a list that drifts. A NULL
+        // cast has no side effects, and since v7.39 round 509 it checks
+        // the target rather than short-circuiting.
+        let empty: Vec<ColumnSchema> = Vec::new();
+        let ctx = self.ev_ctx(&empty, None);
+        let row = spg_storage::Row::new(Vec::new());
+        for name in targets {
+            let probe = Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(spg_sql::ast::Literal::Null)),
+                target: spg_sql::ast::CastTarget::Named(name.clone()),
+            };
+            // Only THIS answer is a refusal; any other outcome means the
+            // name resolved and the rest is a row's business.
+            if let Err(EvalError::TypeMismatch { detail }) =
+                crate::eval::eval_expr(&probe, &row, &ctx)
+                && detail == crate::eval::cast::unknown_type_error_text(&name)
+            {
+                return Err(EngineError::Eval(EvalError::TypeMismatch { detail }));
+            }
+        }
+        Ok(())
+    }
+
+    /// 9.0.0 — `WHERE` and `HAVING` take a boolean, checked before the
+    /// scan.
+    ///
+    /// PostgreSQL 18.6: `argument of WHERE must be type boolean, not
+    /// type numeric`. SPG evaluated the predicate per row, so over an
+    /// EMPTY table `SELECT * FROM t WHERE n` answered zero rows and no
+    /// error.
+    ///
+    /// Only the shapes whose type is certain without a row are refused —
+    /// a column, a cast, a numeric literal. An untyped string literal is
+    /// NOT one of them: PostgreSQL coerces `WHERE 't'` to boolean.
+    pub(crate) fn validate_predicate_is_boolean(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let cat = self.active_catalog();
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if let Some(table) = cat.get(&t.name) {
+                    cols.extend(table.schema().columns.iter().cloned());
+                }
+            }
+        }
+        let certain = |e: &Expr| -> Option<spg_storage::DataType> {
+            match e {
+                Expr::Column(_) | Expr::Cast { .. } | Expr::Literal(_) => {
+                    crate::describe::describe_expr_type(e, &cols)
+                }
+                _ => None,
+            }
+        };
+        // MySQL reads a number as a truth value, so the rule is
+        // PostgreSQL's alone.
+        if self.speaks_mysql {
+            return Ok(());
+        }
+        for (e, clause) in [(&stmt.where_, "WHERE"), (&stmt.having, "HAVING")] {
+            let Some(e) = e else { continue };
+            // A bare string literal is `unknown` on PostgreSQL and
+            // coerces; only a lexeme that fixes a type is refused.
+            if matches!(e, Expr::Literal(spg_sql::ast::Literal::String(_))) {
+                continue;
+            }
+            if let Some(ty) = certain(e)
+                && ty != spg_storage::DataType::Bool
+            {
+                return Err(EngineError::Eval(EvalError::TypeMismatch {
+                    detail: alloc::format!(
+                        "argument of {clause} must be type boolean, not type {}",
+                        crate::conversions::pg_type_name_for_error(ty)
+                    ),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_function_arity(
         &self,
         stmt: &SelectStatement,
@@ -15319,6 +15523,55 @@ pub(crate) fn static_arg_type(e: &Expr, cols: &[ColumnSchema]) -> Option<alloc::
 
 /// v7.39.2 — the function calls of an expression, name and argument
 /// count, NOT descending into a subquery (its scope is its own).
+/// 9.0.0 — every `::<name>` a statement writes, for
+/// `Engine::validate_cast_targets`.
+/// 9.0.0 — the SELECT statements a expression embeds, one level deep,
+/// for `Engine::validate_subquery_qualified_columns`.
+fn collect_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
+    match e {
+        Expr::ScalarSubquery(s) | Expr::Exists { subquery: s, .. } => out.push(s),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_subqueries(lhs, out);
+            collect_subqueries(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_subqueries(expr, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_subqueries(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_named_cast_targets(e: &Expr, out: &mut Vec<alloc::string::String>) {
+    match e {
+        Expr::Cast { expr, target } => {
+            if let spg_sql::ast::CastTarget::Named(n) = target {
+                out.push(n.clone());
+            }
+            collect_named_cast_targets(expr, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_named_cast_targets(lhs, out);
+            collect_named_cast_targets(rhs, out);
+        }
+        Expr::Unary { expr, .. } | Expr::Collate { expr, .. } => {
+            collect_named_cast_targets(expr, out);
+        }
+        Expr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_named_cast_targets(a, out);
+            }
+        }
+        // Not into a subquery: its scope, and its casts, are its own —
+        // the same rule the column and call walks beside this one keep.
+        _ => {}
+    }
+}
+
 fn collect_function_calls(e: &Expr, out: &mut Vec<(alloc::string::String, Vec<Expr>)>) {
     match e {
         Expr::FunctionCall { name, args, .. } => {
