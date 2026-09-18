@@ -2623,8 +2623,28 @@ fn try_queue_plain_dml(
     // WAL byte; the old post-hoc append here was the error-but-applied
     // site the S3.4 fault test caught. The assert keeps the invariant
     // loud: this path always has WAL on, so the leader always ran.
+    //
+    // 9.0.0 — and it says what the leader actually promises. The leader
+    // audits a statement that CHANGED durable state; a statement that
+    // errored changed nothing and audits nothing, so the assert as
+    // written fired on the most ordinary error there is:
+    //
+    //   INSERT INTO nosuchtable VALUES (1)
+    //     PG 18.6   ERROR: relation "nosuchtable" does not exist
+    //     SPG       the connection died (debug builds only — the
+    //               assert compiles out of a release build, which is
+    //               why no shipped binary did this and why the debug
+    //               test suite could not cover a failing DML at all)
     debug_assert!(
-        leader_audited || state.audit_path.is_none(),
+        leader_audited
+            || state.audit_path.is_none()
+            || !matches!(
+                result,
+                Ok(QueryResult::CommandOk {
+                    modified_catalog: true,
+                    ..
+                })
+            ),
         "queued DML skipped the leader audit barrier"
     );
     Some(result)
@@ -4680,8 +4700,19 @@ fn handle_execute(
             // r1055 (D29) — audit ran inside the leader, before any
             // WAL byte; the post-hoc append that lived here was the
             // extended-protocol copy of the error-but-applied defect.
+            // 9.0.0 — the same over-strong invariant as the simple
+            // protocol's, and the same cure: a statement that errored
+            // changed nothing, so it audits nothing.
             debug_assert!(
-                leader_audited || state.audit_path.is_none(),
+                leader_audited
+                    || state.audit_path.is_none()
+                    || !matches!(
+                        result,
+                        Ok(QueryResult::CommandOk {
+                            modified_catalog: true,
+                            ..
+                        })
+                    ),
                 "queued Execute skipped the leader audit barrier"
             );
             (result, true)

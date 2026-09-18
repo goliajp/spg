@@ -10,6 +10,27 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a DML that errored took the connection down (debug builds)
+
+The commit queue's audit barrier asserted that every queued DML had
+audited. The leader audits a statement that CHANGED durable state, so a
+statement that errored — which changed nothing — failed the assert:
+
+```text
+  INSERT INTO nosuchtable VALUES (1)
+    PG 18.6   ERROR: relation "nosuchtable" does not exist
+    SPG       connection to server was lost
+```
+
+Only in a debug build: `debug_assert!` compiles out of a release one, so
+no shipped binary did this. What it did do is leave the debug test suite
+unable to cover a failing DML at all — the suite's own servers have no
+audit log, which is the only reason its e2e tests never hit it. Both
+copies of the assert (simple and extended protocol) now say what the
+leader promises, and a server configured the way the published image is
+— audit log and WAL — is pinned on both protocols against a missing
+relation and a duplicate key.
+
 ### Fixed — an operator lowered onto a function reported the function's name
 
 Reported by sentori (§4.3). The parser lowers six operators onto
