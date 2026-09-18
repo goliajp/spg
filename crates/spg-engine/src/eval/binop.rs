@@ -2928,12 +2928,30 @@ fn char1_concat_is_ambiguous(l: &Value<'static>, r: &Value<'static>) -> Option<E
     if !matches!(l, Value::Char1(_)) && !matches!(r, Value::Char1(_)) {
         return None;
     }
+    // 9.0.0 — only when the OTHER side is a string type. Both
+    // candidates are `anynonarray || text` and `text || anynonarray`,
+    // and a non-string other side satisfies exactly one of them, which
+    // is why PostgreSQL 18.6 answers these:
+    //
+    //   'r'::"char" || 1                  r1
+    //   'r'::"char" || 1.5                r1.5
+    //   'r'::"char" || true               rtrue
+    //   'r'::"char" || '2020-01-01'::date r2020-01-01
+    //   'r'::"char" || 'x'::varchar       ERROR: operator is not unique
+    //   'r'::"char" || 'x'::char(2)       ERROR: operator is not unique
+    //   'r'::"char" || 'r'::"char"        ERROR: operator is not unique
+    let stringy =
+        |v: &Value<'static>| matches!(v, Value::Char1(_) | Value::Text(_) | Value::BpChar(_));
+    if !stringy(l) || !stringy(r) {
+        return None;
+    }
     // PostgreSQL names both operand types, and an untyped literal is
     // `unknown` there.
     let name = |v: &Value<'static>| -> &'static str {
         match v {
             Value::Char1(_) => "\"char\"",
             Value::Text(_) => "text",
+            Value::BpChar(_) => "character",
             _ => "unknown",
         }
     };

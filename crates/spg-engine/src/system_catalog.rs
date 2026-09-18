@@ -4759,7 +4759,11 @@ fn splice_pg_class_v18_row(
     view_reloptions: &alloc::collections::BTreeMap<alloc::string::String, &'static str>,
     cat: &Catalog,
 ) {
+    // 9.0.0 — relkind is a `"char"`, which is what PG declares it. This
+    // read matched `Value::Text` and silently answered "" once the
+    // column carried its type, so no relation had a freeze cutoff.
     let relkind = match row.values.get(PG_CLASS_RELKIND) {
+        Some(Value::Char1(k)) => alloc::string::String::from(*k as char),
         Some(Value::Text(k)) => k.to_string(),
         _ => alloc::string::String::new(),
     };
@@ -5125,7 +5129,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                 Value::Int(0),      // attinhcount
                 Value::BigInt(0),   // attcollation
                 Value::Null,        // attacl
-                Value::Text(alloc::borrow::Cow::Borrowed("")),
+                char1(""),          // attcompression
                 Value::Bool(false), // atthasmissing
                 Value::Null,        // attoptions
                 Value::Null,        // attfdwoptions
@@ -5388,6 +5392,10 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         // read 0 for an `xid` column and `format_type` answered `???`.
         DataType::Xid => 28,
         DataType::Xid8 => 5069,
+        // 9.0.0 — PG's internal single-byte type. Without it every
+        // catalog column declared `"char"` reported atttypid 0, so 28
+        // pg_attribute rows pointed at no pg_type row at all.
+        DataType::Char1 => 18,
         // v7.39.11 — PG's own OIDs for the catalog vectors.
         DataType::Int2Vector => 22,
         DataType::OidVector => 30,
@@ -6478,12 +6486,8 @@ pub(crate) fn synth_pg_proc(
             Value::Bool(def.leakproof),
             Value::Bool(def.strict),
             Value::Bool(false),
-            Value::text(alloc::string::String::from(
-                core::str::from_utf8(&[def.volatility]).unwrap_or("v"),
-            )), // provolatile
-            Value::text(alloc::string::String::from(
-                core::str::from_utf8(&[def.parallel]).unwrap_or("u"),
-            )), // proparallel
+            Value::Char1(def.volatility), // provolatile
+            Value::Char1(def.parallel),   // proparallel
             Value::SmallInt(i16::try_from(nargs).unwrap_or(i16::MAX)),
             Value::SmallInt(0),
             Value::BigInt(0),
@@ -9906,6 +9910,10 @@ pub(crate) const INSTALLED_EXTENSIONS: &[(&str, &str)] = &[
     // map listed it (same round) every hstore spelling works, so the
     // install is real rather than a warned no-op.
     ("hstore", "1.8"),
+    // 9.0.0 — the `uuid_generate_*` family is real here, so the install
+    // is real too. It used to WARN that nothing the extension supplies
+    // would be available, while supplying it.
+    ("uuid-ossp", "1.1"),
 ];
 
 /// surfaces natively (vector, pg_trgm, plpgsql-shaped DO blocks), so

@@ -27,7 +27,7 @@ fn rows(e: &mut Engine, sql: &str) -> Vec<Vec<String>> {
                         v @ spg_storage::Value::SmallIntArray(_) => {
                             spg_engine::eval::value_to_text(v)
                         }
-                        other => format!("{other:?}"),
+                        other => spg_engine::eval::value_to_text(other),
                     })
                     .collect()
             })

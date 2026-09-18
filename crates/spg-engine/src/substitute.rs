@@ -261,6 +261,20 @@ pub(crate) fn value_to_literal_expr_typed(
         // "subquery result type None not yet materialisable"; a regclass IS an
         // oid, so it materialises back as the integer the outer comparison wants.
         Value::RegClass(oid, _) | Value::RegProc(oid, _) => Literal::Integer(oid),
+        // 9.0.0 — `"char"` materialises as the cast of its text form,
+        // which is what `charin` reads back (byte 0 is the empty string,
+        // a high byte the `\ooo` escape). A scalar subquery over a
+        // catalog column — `(SELECT relkind FROM pg_class WHERE …)` —
+        // answered "subquery result type not yet materialisable" the
+        // moment the column carried its type.
+        Value::Char1(b) => {
+            return Ok(Expr::Cast {
+                expr: alloc::boxed::Box::new(Expr::Literal(Literal::String(
+                    crate::conversions::format_char1(b),
+                ))),
+                target: spg_sql::ast::CastTarget::Named(alloc::string::String::from("char1")),
+            });
+        }
         // v7.39 (round 511) — a tid materialises as the cast of its text
         // form, which is the only input syntax it has. Without this the
         // idiom `ctid` exists for — `DELETE … WHERE ctid NOT IN (SELECT

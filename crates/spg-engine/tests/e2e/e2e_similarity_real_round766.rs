@@ -7,6 +7,9 @@ use spg_engine::{Engine, QueryResult};
 #[test]
 fn round766_similarity_returns_real() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION pg_trgm").unwrap();
     let QueryResult::Rows { rows, .. } = e
         .execute("SELECT similarity('abc','abd'), pg_typeof(similarity('abc','abd'))")
         .unwrap()

@@ -64,7 +64,7 @@ fn pg_class_relkind_p_for_partition_parent() {
     };
     let cust = by_name("cust");
     assert!(
-        matches!(&cust[17], Value::Text(s) if s.as_ref() == "p"),
+        matches!(&cust[17], Value::Char1(b) if *b == b'p'),
         "parent relkind"
     );
     assert!(
@@ -75,7 +75,7 @@ fn pg_class_relkind_p_for_partition_parent() {
     assert!(matches!(apac[27], Value::Bool(true)), "apac is a partition");
     let plain = by_name("plain");
     assert!(
-        matches!(&plain[17], Value::Text(s) if s.as_ref() == "r"),
+        matches!(&plain[17], Value::Char1(b) if *b == b'r'),
         "plain table relkind"
     );
     assert!(

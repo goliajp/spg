@@ -10,6 +10,46 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a function an extension supplies exists once the extension is installed
+
+Found by the describe sweep. SPG implements `uuid_generate_v4()`,
+`similarity()` and their families natively, so they answered on a
+database that had created no extension:
+
+```text
+                             PG 18.6                              SPG 8.0.4
+  SELECT uuid_generate_v4()  ERROR: function … does not exist     a uuid
+  SELECT similarity('a','ab')ERROR: function … does not exist     0.25
+  CREATE EXTENSION "uuid-ossp"                                    WARNING: not provided by this build
+```
+
+The warning and the answer contradicted each other. `uuid-ossp` is a
+provided extension now (its functions are real here), and the sixteen
+functions the two extensions supply are refused until their extension
+is installed, which is the answer a client probes for.
+
+### Fixed — six things the `"char"` type broke on the way in
+
+The catalog columns declared `"char"` above are read by the engine
+itself, and five places only knew the text they used to hold. Each was
+found by the full test tier, which the commit gate does not run:
+
+- `pg_class`'s v18 splice read `relkind` as text, so it answered `""`
+  and NO relation had a freeze cutoff (`relfrozenxid` 0 everywhere).
+- `pg_type_oid` had no `"char"`, so 28 `pg_attribute` rows pointed at
+  no `pg_type` row at all.
+- `ORDER BY contype` answered *ORDER BY of this value type is not
+  supported*.
+- A scalar subquery over such a column answered *subquery result type
+  "char" not yet materialisable*.
+- `"char" || <non-string>` was refused as ambiguous. PostgreSQL refuses
+  it only when the other side is a string type — both `anynonarray ||
+  text` and `text || anynonarray` apply then, and exactly one otherwise:
+  `'r'::"char" || 1` is `r1` there, and now here.
+- Two more row builders still wrote text: `provolatile` / `proparallel`
+  for a user-defined function, and `attcompression` on a catalog
+  relation's own columns.
+
 ### Added — PL/pgSQL's whole `RAISE` grammar, and the SQLSTATE it names
 
 SPG read a level word unconditionally and then demanded a format

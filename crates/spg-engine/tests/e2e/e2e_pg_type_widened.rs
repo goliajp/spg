@@ -110,7 +110,7 @@ fn pg_type_typdelim_is_comma_for_all_builtins() {
     // Position 10 = typdelim.
     for r in &rs {
         assert!(
-            matches!(&r[10], Value::Text(s) if s.as_ref() == ","),
+            matches!(&r[10], Value::Char1(b) if *b == b','),
             "all built-in typdelim should be ','"
         );
     }

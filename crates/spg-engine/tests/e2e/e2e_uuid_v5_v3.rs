@@ -23,12 +23,18 @@ fn uuid_bytes(v: &spg_storage::Value<'_>) -> [u8; 16] {
 #[test]
 fn uuid_nil_all_zeros() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert_eq!(uuid_bytes(&first(&mut e, "SELECT uuid_nil()")), [0u8; 16]);
 }
 
 #[test]
 fn namespace_constants_match_rfc() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     // RFC 4122 Appendix C: DNS namespace = 6ba7b810-9dad-11d1-80b4-00c04fd430c8
     let dns = uuid_bytes(&first(&mut e, "SELECT uuid_ns_dns()"));
     assert_eq!(dns[0], 0x6b);
@@ -41,6 +47,9 @@ fn namespace_constants_match_rfc() {
 #[test]
 fn uuid_v5_deterministic_and_known_vector() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     // uuid_generate_v5(uuid_ns_dns(), 'www.example.com')
     // = 2ed6657d-e927-568b-95e1-2665a8aea6a2 (RFC 4122 well-known)
     let b = uuid_bytes(&first(
@@ -63,6 +72,9 @@ fn uuid_v5_deterministic_and_known_vector() {
 #[test]
 fn uuid_v3_version_and_deterministic() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     let a = uuid_bytes(&first(
         &mut e,
         "SELECT uuid_generate_v3(uuid_ns_dns(), 'test')",
@@ -79,6 +91,9 @@ fn uuid_v3_version_and_deterministic() {
 #[test]
 fn uuid_v5_null_passthrough() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert!(matches!(
         first(&mut e, "SELECT uuid_generate_v5(NULL::uuid, 'x')"),
         spg_storage::Value::Null

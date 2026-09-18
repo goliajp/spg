@@ -106,10 +106,10 @@ fn the_domains_exist_in_pg_type() {
              'character_data') ORDER BY typname"
         ),
         vec![
-            vec![Value::text("cardinal_number"), Value::text("d")],
-            vec![Value::text("character_data"), Value::text("d")],
-            vec![Value::text("sql_identifier"), Value::text("d")],
-            vec![Value::text("yes_or_no"), Value::text("d")],
+            vec![Value::text("cardinal_number"), Value::Char1(b'd')],
+            vec![Value::text("character_data"), Value::Char1(b'd')],
+            vec![Value::text("sql_identifier"), Value::Char1(b'd')],
+            vec![Value::text("yes_or_no"), Value::Char1(b'd')],
         ],
     );
 }

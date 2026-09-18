@@ -43,6 +43,9 @@ fn text_col(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn create_table_uuid_column() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     let r = e.execute("SELECT id FROM u").unwrap();
     let QueryResult::Rows { columns, .. } = r else {
@@ -54,6 +57,9 @@ fn create_table_uuid_column() {
 #[test]
 fn insert_canonical_hyphenated_round_trip() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-446655440000')")
         .unwrap();
@@ -75,6 +81,9 @@ fn insert_canonical_hyphenated_round_trip() {
 #[test]
 fn parse_uppercase_normalized_to_lowercase() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('550E8400-E29B-41D4-A716-446655440000')")
         .unwrap();
@@ -91,6 +100,9 @@ fn parse_uppercase_normalized_to_lowercase() {
 #[test]
 fn parse_unhyphenated_form_accepted() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('550e8400e29b41d4a716446655440000')")
         .unwrap();
@@ -107,6 +119,9 @@ fn parse_unhyphenated_form_accepted() {
 #[test]
 fn parse_braced_form_accepted() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('{550e8400-e29b-41d4-a716-446655440000}')")
         .unwrap();
@@ -123,6 +138,9 @@ fn parse_braced_form_accepted() {
 #[test]
 fn malformed_uuid_input_errors() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     assert!(e.execute("INSERT INTO u VALUES ('not-a-uuid')").is_err());
     assert!(
@@ -144,6 +162,9 @@ fn malformed_uuid_input_errors() {
 #[test]
 fn gen_random_uuid_returns_uuid_type() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     let r = e.execute("SELECT gen_random_uuid()").unwrap();
     let QueryResult::Rows { rows, columns } = r else {
         panic!()
@@ -157,6 +178,9 @@ fn gen_random_uuid_v4_version_and_variant_bits() {
     // RFC 4122: byte 6 high nibble = 4 (version),
     // byte 8 high 2 bits = 10 (variant 1).
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     for _ in 0..20 {
         let row = one_row(e.execute("SELECT gen_random_uuid()").unwrap());
         let Value::Uuid(b) = row[0] else {
@@ -170,6 +194,9 @@ fn gen_random_uuid_v4_version_and_variant_bits() {
 #[test]
 fn gen_random_uuid_is_unique_across_calls() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     let mut seen = std::collections::HashSet::new();
     for _ in 0..50 {
         let row = one_row(e.execute("SELECT gen_random_uuid()").unwrap());
@@ -182,6 +209,9 @@ fn gen_random_uuid_is_unique_across_calls() {
 fn uuid_generate_v4_alias_works() {
     // uuid-ossp historical alias.
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     let r = e.execute("SELECT uuid_generate_v4()").unwrap();
     let QueryResult::Rows { rows, columns } = r else {
         panic!()
@@ -197,6 +227,9 @@ fn uuid_generate_v4_alias_works() {
 #[test]
 fn gen_random_uuid_arity_errors() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert!(e.execute("SELECT gen_random_uuid('x')").is_err());
 }
 
@@ -204,6 +237,9 @@ fn gen_random_uuid_arity_errors() {
 fn gen_random_uuid_default_pk_pattern() {
     // The Django/Rails/Hibernate default PK pattern.
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL DEFAULT gen_random_uuid(), name TEXT NOT NULL)")
         .unwrap();
     e.execute("INSERT INTO u (name) VALUES ('alice'), ('bob'), ('carol')")
@@ -229,6 +265,9 @@ fn gen_random_uuid_default_pk_pattern() {
 #[test]
 fn uuid_equality_byte_wise() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL, name TEXT NOT NULL)")
         .unwrap();
     e.execute(
@@ -250,6 +289,9 @@ fn uuid_equality_byte_wise() {
 #[test]
 fn uuid_uppercase_input_equals_lowercase() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID NOT NULL)").unwrap();
     e.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-446655440000')")
         .unwrap();
@@ -271,6 +313,9 @@ fn uuid_uppercase_input_equals_lowercase() {
 #[test]
 fn cast_text_to_uuid() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     let r = e
         .execute("SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid")
         .unwrap();
@@ -287,6 +332,9 @@ fn cast_text_to_uuid() {
 #[test]
 fn cast_uuid_to_text_canonical_form() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert_eq!(
         text_col(
             &mut e,
@@ -299,6 +347,9 @@ fn cast_uuid_to_text_canonical_form() {
 #[test]
 fn cast_malformed_text_to_uuid_errors() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert!(e.execute("SELECT 'not-a-uuid'::uuid").is_err());
 }
 
@@ -307,6 +358,9 @@ fn cast_malformed_text_to_uuid_errors() {
 #[test]
 fn nullable_uuid_accepts_null() {
     let mut e = Engine::new();
+    // 9.0.0 — the functions under test are this extension's, and
+    // PostgreSQL does not have them until it is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     e.execute("CREATE TABLE u (id UUID, name TEXT NOT NULL)")
         .unwrap();
     e.execute("INSERT INTO u VALUES (NULL, 'alice')").unwrap();

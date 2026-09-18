@@ -264,13 +264,13 @@ fn pg_trigger_reports_registration_and_enabled_state() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0][0], Value::text("tr"));
     assert_eq!(r[0][1], Value::text("m"));
-    assert_eq!(r[0][2], Value::text("O"));
+    assert_eq!(r[0][2], Value::Char1(b'O'));
     db.execute("ALTER TABLE m DISABLE TRIGGER tr").unwrap();
     let r = rows_of(
         &mut db,
         "SELECT tgenabled FROM pg_trigger WHERE tgname = 'tr'",
     );
-    assert_eq!(r[0][0], Value::text("D"));
+    assert_eq!(r[0][0], Value::Char1(b'D'));
 }
 
 /// v7.24.1 follow-up — the two scope-cut items from round-16 A/B:

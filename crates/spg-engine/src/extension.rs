@@ -106,3 +106,43 @@ impl Engine {
         Ok(changed && self.catalog_change_is_committed())
     }
 }
+
+/// 9.0.0 — the functions PostgreSQL supplies only through an extension,
+/// and which one.
+///
+/// SPG implements them all natively, which is why they answered on a
+/// database that had installed nothing. PostgreSQL's answer there is
+/// `function <name>(…) does not exist`, and a client probes with
+/// exactly that call to decide whether the extension is present.
+///
+/// The list is the functions SPG HAS; a name absent from it is not an
+/// extension's, so nothing else changes.
+const EXTENSION_FUNCTIONS: &[(&str, &str)] = &[
+    // uuid-ossp. `gen_random_uuid` is NOT here: PostgreSQL 13 moved it
+    // into core, measured on 18.6.
+    ("uuid_generate_v1", "uuid-ossp"),
+    ("uuid_generate_v1mc", "uuid-ossp"),
+    ("uuid_generate_v3", "uuid-ossp"),
+    ("uuid_generate_v4", "uuid-ossp"),
+    ("uuid_generate_v5", "uuid-ossp"),
+    ("uuid_nil", "uuid-ossp"),
+    ("uuid_ns_dns", "uuid-ossp"),
+    ("uuid_ns_oid", "uuid-ossp"),
+    ("uuid_ns_url", "uuid-ossp"),
+    ("uuid_ns_x500", "uuid-ossp"),
+    // pg_trgm.
+    ("similarity", "pg_trgm"),
+    ("show_trgm", "pg_trgm"),
+    ("word_similarity", "pg_trgm"),
+    ("strict_word_similarity", "pg_trgm"),
+    ("show_limit", "pg_trgm"),
+    ("set_limit", "pg_trgm"),
+];
+
+/// The extension a function comes from, if it comes from one.
+pub(crate) fn supplying_extension(name: &str) -> Option<&'static str> {
+    EXTENSION_FUNCTIONS
+        .iter()
+        .find(|(f, _)| f.eq_ignore_ascii_case(name))
+        .map(|(_, e)| *e)
+}

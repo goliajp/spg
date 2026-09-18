@@ -49,6 +49,9 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round661_pg_catalog_claims_only_what_pg_has() {
     let mut e = Engine::new();
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
+    // does not have it until the extension is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert_eq!(
         one(
             &mut e,
@@ -77,6 +80,9 @@ fn round661_pg_catalog_claims_only_what_pg_has() {
 #[test]
 fn round661_the_moved_functions_still_answer() {
     let mut e = Engine::new();
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
+    // does not have it until the extension is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert_eq!(one(&mut e, "SELECT ifnull(NULL, 1)"), "1");
     assert_eq!(one(&mut e, "SELECT ucase('ab')"), "AB");
     assert_eq!(one(&mut e, "SELECT nullif(1, 1)"), "NULL");
@@ -89,6 +95,9 @@ fn round661_the_moved_functions_still_answer() {
 #[test]
 fn round661_the_namespace_is_registered() {
     let mut e = Engine::new();
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
+    // does not have it until the extension is installed.
+    e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
     assert_eq!(
         one(&mut e, "SELECT nspname FROM pg_namespace ORDER BY oid"),
         "pg_catalog,public,information_schema,pg_spg"
