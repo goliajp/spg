@@ -2244,7 +2244,10 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
 ///
 /// PG columns: oid, polname, polrelid, polcmd (char), polpermissive (bool),
 /// polroles (oid[]), polqual (pg_node_tree), polwithcheck (pg_node_tree).
-pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_policy(
+    cat: &Catalog,
+    roles: &crate::role_directory::RoleDirectory,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("polname", DataType::Name, false),
@@ -2265,14 +2268,27 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         for (i, p) in t.schema().policies.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let row_oid = table_oid.saturating_mul(1000).saturating_add(i as i64 + 1);
-            // 9.0.0 — `oid[]`, as PostgreSQL declares it; this built the
-            // array's TEXT rendering. PUBLIC is `{0}` there, and SPG has
-            // no oid for a role name, so a named grantee is 0 too — the
-            // shape is right and the identity is recorded (B16).
-            let roles: Vec<Option<i64>> = if p.roles.is_empty() {
+            // 9.0.0 — `oid[]`, as PostgreSQL declares it, and the
+            // grantee's own oid. Every entry used to be 0, which is
+            // PUBLIC: `CREATE POLICY … TO alice` read `{0}` and said
+            // the policy applies to everyone. `pg_policies.roles`, the
+            // view over the same fact, named `alice` correctly — two
+            // surfaces, one question, and only one of them right.
+            let role_oids: Vec<Option<i64>> = if p.roles.is_empty() {
                 alloc::vec![Some(0)]
             } else {
-                p.roles.iter().map(|_| Some(0)).collect()
+                p.roles
+                    .iter()
+                    .map(|r| {
+                        // PUBLIC is 0 on PostgreSQL, whichever way it
+                        // was spelled.
+                        Some(if r.eq_ignore_ascii_case("public") {
+                            0
+                        } else {
+                            roles.owner_oid(Some(r.as_str()))
+                        })
+                    })
+                    .collect()
             };
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(row_oid),
@@ -2280,7 +2296,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
                 Value::BigInt(table_oid),
                 Value::Char1(p.cmd.as_pg_char() as u8), // polcmd
                 Value::Bool(p.permissive),
-                Value::BigIntArray(roles), // polroles
+                Value::BigIntArray(role_oids), // polroles
                 p.using_expr.clone().map_or(Value::Null, Value::text),
                 p.with_check_expr.clone().map_or(Value::Null, Value::text),
             ]));
@@ -13425,7 +13441,9 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_opclass" => synth_pg_opclass(cat).0,
         "pg_opfamily" => synth_pg_opfamily(cat).0,
         "pg_operator" => synth_pg_operator(cat).0,
-        "pg_policy" => synth_pg_policy(cat).0,
+        "pg_policy" => {
+            synth_pg_policy(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0
+        }
         "pg_proc" => synth_pg_proc(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0,
         "pg_statistic" => synth_pg_statistic(cat, &crate::statistics::Statistics::new()).0,
         "pg_stats" => synth_pg_stats(cat, &crate::statistics::Statistics::new()).0,

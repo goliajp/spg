@@ -794,6 +794,7 @@ mod e2e_plpgsql_stacked_diagnostics;
 mod e2e_plpgsql_subquery_round335;
 mod e2e_plpgsql_type_ref;
 mod e2e_plpgsql_while;
+mod e2e_polroles_oids_900;
 mod e2e_positional_order_round80;
 mod e2e_prefix_walk_nullable_v7411;
 mod e2e_prepare_execute_pg_dump_compat;
