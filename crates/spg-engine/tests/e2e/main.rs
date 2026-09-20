@@ -138,6 +138,7 @@ mod e2e_catalog_self_describing_round623;
 mod e2e_catalog_system_columns_round540;
 mod e2e_catalog_types_round514;
 mod e2e_catalog_vectors_v73911;
+mod e2e_catalog_views_are_catalogued_900;
 mod e2e_ceil;
 mod e2e_char1_concat_v73911;
 mod e2e_char_bool_round41;
