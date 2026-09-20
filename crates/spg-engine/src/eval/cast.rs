@@ -1117,6 +1117,26 @@ pub fn cast_value_ref_in(
                     Value::SmallInt(n) => return Ok(Value::text(n.to_string())),
                     Value::Int(n) => return Ok(Value::text(n.to_string())),
                     Value::BigInt(n) => return Ok(Value::text(n.to_string())),
+                    // 9.0.0 — a reg value cast to its OWN type is itself.
+                    // PostgreSQL 18.6: `'int4in'::regproc::regproc` is
+                    // `int4in`. Once the catalog's `regproc` columns stopped
+                    // being text, `amhandler::pg_catalog.regproc` — which is
+                    // how a qualified cast reaches here — was refused with
+                    // `::regproc accepts TEXT, got regproc`.
+                    Value::RegProc(..) if lower_name.eq_ignore_ascii_case("regproc") => {
+                        return Ok(v);
+                    }
+                    Value::RegClass(..) if lower_name.eq_ignore_ascii_case("regclass") => {
+                        return Ok(v);
+                    }
+                    Value::RegType(..) if lower_name.eq_ignore_ascii_case("regtype") => {
+                        return Ok(v);
+                    }
+                    // A reg value cast to a DIFFERENT reg type goes through
+                    // its name, as PostgreSQL does.
+                    Value::RegProc(_, n) | Value::RegClass(_, n) | Value::RegType(_, n) => {
+                        n.to_string()
+                    }
                     other => {
                         return Err(EvalError::TypeMismatch {
                             detail: alloc::format!(

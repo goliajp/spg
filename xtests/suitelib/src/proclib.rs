@@ -68,6 +68,17 @@ impl Drop for PortClaim {
     }
 }
 
+/// Is this port currently claimed by a spawn that has not finished?
+/// Test-only: the claim set is what `PortClaim` adds to and drops from,
+/// and it is the thing a release pin should read.
+#[cfg(test)]
+fn port_is_claimed(p: u16) -> bool {
+    STARTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&p)
+}
+
 /// All processes this run owns. Dropping the roster reaps.
 #[derive(Default)]
 pub struct Roster {
@@ -663,8 +674,18 @@ mod tests {
         let other = b.free_port().expect("a free port");
         assert_ne!(claim.0, other, "both rosters were handed {other}");
         let claimed = claim.0;
+        assert!(port_is_claimed(claimed), "the claim is not in the set");
         drop(claim);
-        assert_eq!(b.free_port().expect("a free port"), claimed);
+        // 9.0.0 — ask the CLAIM SET, not which port the scan happens to
+        // pick next. This used to assert that the very next `free_port`
+        // returned `claimed` again, which is true only while nothing
+        // else on the machine touches the suite range — it went red
+        // twice in one session with `left: 25476 right: 25475`, and the
+        // release it means to pin was working both times.
+        assert!(
+            !port_is_claimed(claimed),
+            "dropping the claim left {claimed} claimed"
+        );
     }
 
     /// v7.38.19 — a port ANOTHER process is serving on the wildcard
