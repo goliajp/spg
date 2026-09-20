@@ -1448,3 +1448,235 @@ fn substitute_expr(e: &mut Expr, params: &[Value<'static>]) -> Result<(), Engine
     }
     Ok(())
 }
+
+/// 9.0.0 — rewrite every reference to the relation `old` as `new` in a
+/// stored view body. `true` when something changed.
+///
+/// A view body is stored as TEXT here and as a parse tree resolved to
+/// oids on PostgreSQL, so a rename of a relation a view reads left the
+/// view answering `relation "<old>" does not exist` and its
+/// `pg_get_viewdef` still naming the old relation — measured against PG
+/// 18.6, whose view keeps working and whose definition reads the new
+/// name.
+///
+/// Two things move, not one: the FROM item's NAME, and the QUALIFIER of
+/// every column that names it (`ft.id`). An unaliased FROM item is
+/// qualified by the relation's own name, so leaving the qualifiers
+/// behind turns the view into `UnknownQualifier` — which is what the
+/// first cut did, and what a join or a `WHERE t.c` shape catches.
+///
+/// Neither moves where the name is SHADOWED: a CTE of that name, or a
+/// FROM item aliased to it. That is what stops this reusing
+/// `acl::collect_read_tables`, which over-collects on purpose — safe
+/// for a privilege check, and a change of meaning here.
+pub(crate) fn rename_relation_in_select(s: &mut SelectStatement, old: &str, new: &str) -> bool {
+    let mut cx = RelationRename {
+        old,
+        new,
+        hit: false,
+        ctes: alloc::vec::Vec::new(),
+    };
+    cx.walk_select(s);
+    cx.hit
+}
+
+/// The walk's state: the rename, and the CTE names in scope.
+struct RelationRename<'a> {
+    old: &'a str,
+    new: &'a str,
+    hit: bool,
+    ctes: alloc::vec::Vec<String>,
+}
+
+impl RelationRename<'_> {
+    fn shadowed_by_cte(&self) -> bool {
+        self.ctes.iter().any(|c| c.eq_ignore_ascii_case(self.old))
+    }
+
+    fn walk_select(&mut self, s: &mut SelectStatement) {
+        let outer = self.ctes.len();
+        // PostgreSQL makes a non-recursive CTE visible to the ones AFTER
+        // it and to the body; a RECURSIVE one is visible inside itself.
+        for i in 0..s.ctes.len() {
+            let recursive = s.ctes[i].recursive;
+            let name = s.ctes[i].name.clone();
+            if recursive {
+                self.ctes.push(name.clone());
+            }
+            self.walk_cte_body(&mut s.ctes[i].body);
+            if !recursive {
+                self.ctes.push(name);
+            }
+        }
+        // A FROM item ALIASED to the old name shadows it for this level's
+        // qualifiers, and so does a CTE of that name.
+        let aliased = s.from.as_ref().is_some_and(|from| {
+            core::iter::once(&from.primary)
+                .chain(from.joins.iter().map(|j| &j.table))
+                .any(|t| {
+                    t.alias
+                        .as_deref()
+                        .is_some_and(|a| a.eq_ignore_ascii_case(self.old))
+                })
+        });
+        let rewrite_qualifiers = !aliased && !self.shadowed_by_cte();
+        if let Some(from) = &mut s.from {
+            let mut tables: alloc::vec::Vec<&mut spg_sql::ast::TableRef> =
+                alloc::vec::Vec::with_capacity(1 + from.joins.len());
+            tables.push(&mut from.primary);
+            for j in &mut from.joins {
+                tables.push(&mut j.table);
+            }
+            for t in tables {
+                self.walk_table_ref(t);
+            }
+            for j in &mut from.joins {
+                if let Some(on) = &mut j.on {
+                    self.walk_expr(on, rewrite_qualifiers);
+                }
+            }
+        }
+        for item in &mut s.items {
+            if let SelectItem::Expr { expr, .. } = item {
+                self.walk_expr(expr, rewrite_qualifiers);
+            }
+        }
+        for e in [s.where_.as_mut(), s.having.as_mut()].into_iter().flatten() {
+            self.walk_expr(e, rewrite_qualifiers);
+        }
+        if let Some(gs) = &mut s.group_by {
+            for g in gs {
+                self.walk_expr(g, rewrite_qualifiers);
+            }
+        }
+        for o in &mut s.order_by {
+            self.walk_expr(&mut o.expr, rewrite_qualifiers);
+        }
+        for (_, peer) in &mut s.unions {
+            self.walk_select(peer);
+        }
+        self.ctes.truncate(outer);
+    }
+
+    fn walk_cte_body(&mut self, body: &mut spg_sql::ast::CteBody) {
+        use spg_sql::ast::CteBody as B;
+        match body {
+            B::Select(s) => self.walk_select(s),
+            // A view body cannot hold a modifying CTE — PostgreSQL
+            // refuses it and so does `exec_create_view` — so these carry
+            // no relation a rename has to follow. The destructure stays
+            // total rather than silent.
+            B::Insert(_) | B::Update(_) | B::Delete(_) | B::Merge(_) => {}
+        }
+    }
+
+    fn walk_table_ref(&mut self, t: &mut spg_sql::ast::TableRef) {
+        if t.names_a_relation() && !self.shadowed_by_cte() && t.name.eq_ignore_ascii_case(self.old)
+        {
+            t.name = String::from(self.new);
+            self.hit = true;
+        }
+        let old = self.old;
+        let new = self.new;
+        let mut hit = self.hit;
+        let mut ctes = core::mem::take(&mut self.ctes);
+        let _: Result<(), core::convert::Infallible> = t.try_for_each_slot_mut(&mut |slot| {
+            let mut inner = RelationRename {
+                old,
+                new,
+                hit,
+                ctes: core::mem::take(&mut ctes),
+            };
+            match slot {
+                spg_sql::ast::FromSlot::Expr(e) => inner.walk_expr(e, false),
+                spg_sql::ast::FromSlot::Select(sub) => inner.walk_select(sub),
+            }
+            hit = inner.hit;
+            ctes = inner.ctes;
+            Ok(())
+        });
+        self.ctes = ctes;
+        self.hit = hit;
+    }
+
+    fn walk_expr(&mut self, e: &mut Expr, rewrite_qualifiers: bool) {
+        match e {
+            Expr::Column(c) => {
+                if rewrite_qualifiers
+                    && c.qualifier
+                        .as_deref()
+                        .is_some_and(|q| q.eq_ignore_ascii_case(self.old))
+                {
+                    c.qualifier = Some(String::from(self.new));
+                    self.hit = true;
+                }
+            }
+            Expr::ScalarSubquery(s) => self.walk_select(s),
+            Expr::Exists { subquery, .. } => self.walk_select(subquery),
+            Expr::InSubquery { expr, subquery, .. } => {
+                self.walk_select(subquery);
+                self.walk_expr(expr, rewrite_qualifiers);
+            }
+            Expr::RowInSubquery { row, subquery, .. } => {
+                self.walk_select(subquery);
+                for x in row {
+                    self.walk_expr(x, rewrite_qualifiers);
+                }
+            }
+            Expr::RowCmpSubquery { row, subquery, .. } => {
+                self.walk_select(subquery);
+                for x in row {
+                    self.walk_expr(x, rewrite_qualifiers);
+                }
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                self.walk_expr(lhs, rewrite_qualifiers);
+                self.walk_expr(rhs, rewrite_qualifiers);
+            }
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+                self.walk_expr(expr, rewrite_qualifiers);
+            }
+            Expr::FunctionCall { args, .. } => {
+                for a in args {
+                    self.walk_expr(a, rewrite_qualifiers);
+                }
+            }
+            Expr::Case {
+                operand,
+                branches,
+                else_branch,
+            } => {
+                if let Some(o) = operand {
+                    self.walk_expr(o, rewrite_qualifiers);
+                }
+                for (c, v) in branches {
+                    self.walk_expr(c, rewrite_qualifiers);
+                    self.walk_expr(v, rewrite_qualifiers);
+                }
+                if let Some(x) = else_branch {
+                    self.walk_expr(x, rewrite_qualifiers);
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                self.walk_expr(expr, rewrite_qualifiers);
+                for it in list {
+                    self.walk_expr(it, rewrite_qualifiers);
+                }
+            }
+            Expr::AnyAll { expr, array, .. } => {
+                self.walk_expr(expr, rewrite_qualifiers);
+                self.walk_expr(array, rewrite_qualifiers);
+            }
+            Expr::Array(items) => {
+                for it in items {
+                    self.walk_expr(it, rewrite_qualifiers);
+                }
+            }
+            Expr::ArraySubscript { target, index } => {
+                self.walk_expr(target, rewrite_qualifiers);
+                self.walk_expr(index, rewrite_qualifiers);
+            }
+            _ => {}
+        }
+    }
+}

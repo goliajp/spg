@@ -10,6 +10,31 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a rename now follows into the views that read the relation
+
+`CREATE VIEW v AS SELECT * FROM t; ALTER TABLE t RENAME TO t2` left `v`
+answering `relation "t" does not exist` and `pg_get_viewdef(v)` still
+naming `t`. Measured against PostgreSQL 18.6, whose `v` keeps working
+and whose definition reads `t2`. A view body is stored as TEXT here and
+as a parse tree resolved to oids there. **Not new in 9.0.0** — `ALTER
+TABLE … RENAME TO` has had it since views existed; it surfaced while
+adding the VIEW / MATERIALIZED VIEW / TYPE rename forms above.
+
+Two things move, not one: the FROM item's NAME and the QUALIFIER of
+every column that names it (`t.c`). An unaliased FROM item is qualified
+by the relation's own name, so leaving the qualifiers behind turns the
+view into `UnknownQualifier` — the first cut did exactly that, and the
+join shape in the pins caught it.
+
+Neither moves where the name is SHADOWED: a CTE of that name, or a FROM
+item aliased to it (`SELECT ft.id FROM fo AS ft` reads `fo`, and PG
+leaves it alone). That is what stops the rewrite reusing the ACL
+reader's relation collector, which over-collects on purpose — safe for
+a privilege check, a change of meaning here.
+
+Renaming a view or a materialized view carries the same rewrite, so a
+view over a view follows too.
+
 ### Fixed — `ALTER {VIEW|MATERIALIZED VIEW|TYPE} … RENAME TO` was a no-op
 
 Measured in a fresh schema against PostgreSQL 18.6: PG renames all four

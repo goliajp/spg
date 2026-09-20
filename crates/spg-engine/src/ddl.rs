@@ -2565,6 +2565,50 @@ impl Engine {
         Ok(())
     }
 
+    /// 9.0.0 — carry a relation rename into every stored view body.
+    ///
+    /// A view body is stored as TEXT here and as a parse tree resolved
+    /// to oids on PostgreSQL, so `CREATE VIEW v AS SELECT * FROM t;
+    /// ALTER TABLE t RENAME TO t2` left `v` answering `relation "t" does
+    /// not exist` and `pg_get_viewdef(v)` still naming `t` — measured
+    /// against PG 18.6, whose `v` keeps working and whose definition
+    /// reads `t2`. Not new in 9.0.0: `ALTER TABLE … RENAME TO` has had
+    /// it since views existed.
+    ///
+    /// The stored body is already a render of the parsed statement (see
+    /// `body_repr` in `exec_create_view`), so re-rendering after the
+    /// rewrite is the same round trip `CREATE VIEW` performs and drifts
+    /// nothing.
+    fn rewrite_view_bodies_for_rename(&mut self, old: &str, new: &str) {
+        use spg_sql::ast::Statement;
+        let rewritten = |body: &str| -> Option<alloc::string::String> {
+            let Ok(Statement::Select(mut sel)) = spg_sql::parser::parse_statement(body) else {
+                return None;
+            };
+            crate::substitute::rename_relation_in_select(&mut sel, old, new)
+                .then(|| alloc::format!("{}", Statement::Select(sel)))
+        };
+        let mut views: Vec<(alloc::string::String, alloc::string::String)> = Vec::new();
+        for (name, def) in self.active_catalog().views_all() {
+            if let Some(body) = rewritten(&def.body) {
+                views.push((name.clone(), body));
+            }
+        }
+        let mut matviews: Vec<(alloc::string::String, alloc::string::String)> = Vec::new();
+        for (name, body) in self.active_catalog().materialized_views() {
+            if let Some(next) = rewritten(body) {
+                matviews.push((name.clone(), next));
+            }
+        }
+        for (name, body) in views {
+            self.active_catalog_mut().set_view_body(&name, body);
+        }
+        for (name, body) in matviews {
+            self.active_catalog_mut()
+                .set_materialized_view_body(&name, body);
+        }
+    }
+
     fn alter_rename_table(&mut self, tbl: &str, new: String) -> Result<(), EngineError> {
         // v7.16.2 — table-level rename (mailrs round-10
         // A.5 — used by migrate-042's `ALTER TABLE
@@ -2590,6 +2634,7 @@ impl Engine {
         if let Some(stats) = self.table_write_stats.remove(&old) {
             self.table_write_stats.insert(new.clone(), stats);
         }
+        self.rewrite_view_bodies_for_rename(&old, &new);
         Ok(())
     }
 
@@ -6202,6 +6247,11 @@ impl Engine {
                     "ALTER FUNCTION … RENAME TO is not supported",
                 )));
             }
+        }
+        // A view or a materialized view is a relation another view can
+        // read, so the rewrite follows those renames too. A type is not.
+        if matches!(kind, K::View | K::MaterializedView | K::Sequence) {
+            self.rewrite_view_bodies_for_rename(name, new_name);
         }
         Ok(())
     }

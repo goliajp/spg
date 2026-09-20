@@ -7043,6 +7043,27 @@ impl Catalog {
         }
     }
 
+    /// 9.0.0 — replace a view's stored body, for the rewrite a rename of
+    /// a relation it reads needs. `false` = no such view.
+    pub fn set_view_body(&mut self, name: &str, body: String) -> bool {
+        let Some(def) = self.views.get_mut(name) else {
+            return false;
+        };
+        def.body = body;
+        self.mark_nontable_dirty(NonTableKind::View, name);
+        true
+    }
+
+    /// 9.0.0 — the same for a materialized view's source.
+    pub fn set_materialized_view_body(&mut self, name: &str, body: String) -> bool {
+        if !self.materialized_views.contains_key(name) {
+            return false;
+        }
+        self.materialized_views.insert(String::from(name), body);
+        self.mark_nontable_dirty(NonTableKind::MaterializedView, name);
+        true
+    }
+
     /// v7.17.0 Phase 1.2 — remove a view by name. Returns true if
     /// a view was removed.
     pub fn drop_view(&mut self, name: &str) -> bool {
