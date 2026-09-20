@@ -5547,7 +5547,8 @@ impl Engine {
             spg_sql::ast::FunctionReturn::Other(s) => s.clone(),
         };
         let body_text = match &s.body {
-            spg_sql::ast::FunctionBody::PlPgSql(b) => alloc::format!("{b}"),
+            // 9.0.0 — verbatim, as PostgreSQL stores it.
+            spg_sql::ast::FunctionBody::PlPgSql { src, .. } => src.clone(),
             spg_sql::ast::FunctionBody::Raw(s) => s.clone(),
         };
         let def = spg_storage::FunctionDef {
