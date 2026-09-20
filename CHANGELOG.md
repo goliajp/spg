@@ -10,6 +10,24 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — two of the partition catalog's own claims
+
+**A unique constraint on a partitioned table must include every
+partition-key column.** SPG accepted `UNIQUE (e)` on a table
+partitioned by `id` and then enforced it PER PARTITION — which is not
+what the declaration says: two partitions could each hold the same `e`.
+Measured on PostgreSQL 18.6, all three spellings are refused (the
+inline constraint, `ALTER TABLE … ADD CONSTRAINT` and
+`CREATE UNIQUE INDEX`) with one sentence and a DETAIL naming the
+missing column, and all three are refused here now.
+
+**A partition's index is named after the child.** `CREATE INDEX pt_v
+ON pt (v)` over a partition `pt1` gives `pt1_v_idx` on PostgreSQL; SPG
+suffixed the parent's index name instead (`pt_v__pt1`), a name no
+PostgreSQL client expects and the one a dump would restore under. The
+child's name now comes from the same generator an unnamed `CREATE
+INDEX` on the child would use, so the two cannot disagree.
+
 ### Fixed — `pg_proc.prosrc` was a re-render of the parsed body
 
 Measured against PostgreSQL 18.6, which stores the text between the
