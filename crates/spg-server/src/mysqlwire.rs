@@ -1975,7 +1975,7 @@ fn handle_com_stmt_prepare(
                 inline_enum_variants: None,
                 inline_set_variants: None,
                 generated_stored_expr: None,
-                identity_always: false,
+                identity: None,
                 default_text: None,
                 auto_restart: None,
                 scalar_row_source: false,

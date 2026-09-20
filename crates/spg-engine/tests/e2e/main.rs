@@ -1180,6 +1180,7 @@ mod e2e_group_by_all;
 mod e2e_groupby_pos_describe_limit;
 mod e2e_hnsw_opclass;
 mod e2e_identity_always;
+mod e2e_identity_kind_900;
 mod e2e_in_list_depth;
 mod e2e_in_list_index_seek;
 mod e2e_include;

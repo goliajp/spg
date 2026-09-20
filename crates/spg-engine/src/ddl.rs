@@ -350,6 +350,14 @@ impl Engine {
             T::AlterColumnDropIdentity { column, if_exists } => {
                 self.alter_column_drop_identity(tbl, column, if_exists)
             }
+            T::AlterColumnAddIdentity {
+                column,
+                kind,
+                seq_name,
+            } => self.alter_column_add_identity(tbl, &column, kind, seq_name),
+            T::AlterColumnSetIdentityKind { column, kind } => {
+                self.alter_column_set_identity_kind(tbl, &column, kind)
+            }
             T::AlterColumnSetExpression { column, expr } => {
                 self.alter_column_set_expression(tbl, column, expr)
             }
@@ -502,6 +510,13 @@ impl Engine {
             })?;
         if !table.schema().columns[pos].auto_increment {
             if if_exists {
+                // 9.0.0 — PG says so rather than staying silent; the
+                // whole point of the IF EXISTS spelling is that the
+                // operator wanted to know either way.
+                self.notice(alloc::format!(
+                    "column \"{column}\" of relation \"{tbl}\" is not an identity column, \
+                     skipping"
+                ));
                 return Ok(());
             }
             // PG18.4: `column "a" of relation "t3" is not an identity column`.
@@ -512,8 +527,89 @@ impl Engine {
         table.schema_mut().columns[pos].auto_increment = false;
         // v7.38 (read01) — a dropped identity is a plain column: clear the
         // ALWAYS marker too so explicit INSERT values are accepted again.
-        table.schema_mut().columns[pos].identity_always = false;
+        table.schema_mut().columns[pos].identity = None;
         Ok(())
+    }
+
+    /// 9.0.0 — `ALTER COLUMN c ADD GENERATED { ALWAYS | BY DEFAULT } AS
+    /// IDENTITY`.
+    ///
+    /// It used to lower to the auto-increment marker alone, so the
+    /// column read `is_identity NO` afterwards and PostgreSQL's two
+    /// refusals never fired. Measured on PG 18.6:
+    ///
+    /// ```text
+    ///   column "id" of relation "t" must be declared NOT NULL before
+    ///     identity can be added
+    ///   column "id" of relation "t" is already an identity column
+    /// ```
+    fn alter_column_add_identity(
+        &mut self,
+        tbl: &str,
+        column: &str,
+        kind: spg_sql::ast::IdentityKind,
+        seq_name: Option<String>,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .column_position(column)
+            .ok_or_else(|| Self::identity_no_such_column(tbl, column))?;
+        let col = &table.schema().columns[pos];
+        if col.identity.is_some() {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column \"{column}\" of relation \"{tbl}\" is already an identity column"
+            )));
+        }
+        if col.nullable {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column \"{column}\" of relation \"{tbl}\" must be declared NOT NULL \
+                 before identity can be added"
+            )));
+        }
+        let col = &mut table.schema_mut().columns[pos];
+        col.auto_increment = true;
+        col.identity = Some(kind);
+        // The sequence options ride SPG's max+1 semantics, as the
+        // auto-increment lowering this replaced already recorded.
+        let _ = seq_name;
+        Ok(())
+    }
+
+    /// 9.0.0 — `ALTER COLUMN c SET GENERATED { ALWAYS | BY DEFAULT }`:
+    /// change the flavour of a column that is already an identity one.
+    /// The SET tail's catch-all swallowed it.
+    fn alter_column_set_identity_kind(
+        &mut self,
+        tbl: &str,
+        column: &str,
+        kind: spg_sql::ast::IdentityKind,
+    ) -> Result<(), EngineError> {
+        let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
+            EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
+        })?;
+        let pos = table
+            .schema()
+            .column_position(column)
+            .ok_or_else(|| Self::identity_no_such_column(tbl, column))?;
+        if table.schema().columns[pos].identity.is_none() {
+            // PG 18.6's sentence for the same shape on DROP IDENTITY.
+            return Err(EngineError::Unsupported(alloc::format!(
+                "column \"{column}\" of relation \"{tbl}\" is not an identity column"
+            )));
+        }
+        table.schema_mut().columns[pos].identity = Some(kind);
+        Ok(())
+    }
+
+    /// PostgreSQL 18.6's wording for a column an identity ALTER names
+    /// and the relation does not have.
+    fn identity_no_such_column(tbl: &str, column: &str) -> EngineError {
+        EngineError::Unsupported(alloc::format!(
+            "column \"{column}\" of relation \"{tbl}\" does not exist"
+        ))
     }
 
     /// v7.37.18 (18.1) — set / drop column default.
@@ -4624,7 +4720,7 @@ impl Engine {
                 }
                 if !o.identity {
                     col.auto_increment = false;
-                    col.identity_always = false;
+                    col.identity = None;
                     col.auto_restart = None;
                 }
                 if !o.generated {
@@ -8140,7 +8236,7 @@ fn column_def_to_schema(c: ColumnDef, mysql: bool) -> Result<ColumnSchema, Engin
     // v7.38 (read01) — GENERATED ALWAYS AS IDENTITY marker. The engine
     // rejects an explicit non-DEFAULT INSERT value for such a column
     // unless the statement carries OVERRIDING SYSTEM VALUE.
-    schema.identity_always = c.identity_always;
+    schema.identity = c.identity;
     if let Some(default_expr) = c.default {
         // v7.38 (read01) — cache the PG-compatible source text of the DEFAULT
         // expression for catalog introspection, independent of the
