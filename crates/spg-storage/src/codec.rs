@@ -1303,6 +1303,10 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::RegClass => out.push(86),
         DataType::RegType => out.push(87),
         DataType::RegProc => out.push(88),
+        DataType::PgNodeTree => out.push(89),
+        DataType::AnyArray => out.push(90),
+        DataType::AclItemArray => out.push(91),
+        DataType::Char1Array => out.push(92),
         DataType::Xid8 => out.push(74),
         DataType::Oid => out.push(75),
         // v7.39 (round 694) — tag 76, `oid[]`. Its BODY is a BigIntArray's,
@@ -1515,6 +1519,10 @@ impl Cursor<'_> {
             86 => Ok(DataType::RegClass),
             87 => Ok(DataType::RegType),
             88 => Ok(DataType::RegProc),
+            89 => Ok(DataType::PgNodeTree),
+            90 => Ok(DataType::AnyArray),
+            91 => Ok(DataType::AclItemArray),
+            92 => Ok(DataType::Char1Array),
             74 => Ok(DataType::Xid8),
             75 => Ok(DataType::Oid),
             76 => Ok(DataType::OidArray),
@@ -4064,9 +4072,15 @@ impl<'a> Cursor<'a> {
             DataType::Float => Ok(Value::Float(self.read_f64()?)),
             DataType::Real => Ok(Value::Real(self.read_f32()?)),
             DataType::Bool => Ok(Value::Bool(self.read_u8()? != 0)),
-            DataType::Text | DataType::Varchar(_) | DataType::Name => {
-                Ok(Value::Text(Cow::Owned(self.read_str()?)))
-            }
+            // 9.0.0 — four result types whose cell IS the text rendering
+            // PostgreSQL prints; they read back the way text does.
+            DataType::Text
+            | DataType::Varchar(_)
+            | DataType::Name
+            | DataType::PgNodeTree
+            | DataType::AnyArray
+            | DataType::AclItemArray
+            | DataType::Char1Array => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             // v7.38 (read01, T11) — a CHAR(n) column reads back as bpchar.
             DataType::Char(_) => Ok(Value::BpChar(Cow::Owned(self.read_str()?))),
             DataType::Vector {

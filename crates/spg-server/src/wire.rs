@@ -101,7 +101,13 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         // no tag for; it travels in its text form.
         DataType::Tid => WireType::Text,
         // The native wire renders a reg value by its name, as text.
-        DataType::RegClass | DataType::RegType | DataType::RegProc => WireType::Text,
+        DataType::RegClass
+        | DataType::RegType
+        | DataType::RegProc
+        | DataType::PgNodeTree
+        | DataType::AnyArray
+        | DataType::AclItemArray
+        | DataType::Char1Array => WireType::Text,
         DataType::Float => WireType::Float,
         DataType::Real => WireType::Float,
         // VARCHAR / CHAR / NUMERIC / DATE / TIMESTAMP collapse to

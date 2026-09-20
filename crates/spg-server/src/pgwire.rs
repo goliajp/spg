@@ -8605,6 +8605,11 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::RegClass => 2205,
         DataType::RegType => 2206,
         DataType::RegProc => 24,
+        // 9.0.0 — the four the catalogs announce; see `DataType`.
+        DataType::PgNodeTree => 194,
+        DataType::AnyArray => 2277,
+        DataType::AclItemArray => 1034,
+        DataType::Char1Array => 1002,
         // v7.39 (round 667) — PG's oid type oid.
         DataType::Oid => 26,
         DataType::SmallInt => 21,

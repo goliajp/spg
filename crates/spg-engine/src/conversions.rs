@@ -2454,6 +2454,20 @@ pub(crate) fn with_lower_name<R>(name: &str, f: impl FnOnce(&str) -> R) -> R {
 }
 
 fn type_name_to_data_type_lower(n: &str) -> Option<DataType> {
+    // 9.0.0 — the table below is keyed on the `_array` suffix the parser
+    // canonicalises postfix `[]` into, so this function answered `None`
+    // for the SQL spelling of the same type. The one reader that hands it
+    // a name the parser never rewrote is `pg_prepared_statements
+    // .parameter_types`, which keeps the text as the user wrote it:
+    // `PREPARE p(int[])` read `{int[]}` there where PostgreSQL 18.6 reads
+    // `{integer[]}` (measured), because the name failed to resolve and
+    // was passed through unchanged.
+    if let Some(elem) = n.strip_suffix("[]") {
+        let mut owned = alloc::string::String::with_capacity(elem.len() + 6);
+        owned.push_str(elem.trim_end());
+        owned.push_str("_array");
+        return type_name_to_data_type_lower(&owned);
+    }
     // v7.37.5 ship triage — `numeric(p,s)` precision/scale params:
     // peel them off and route to a precision-bearing DataType.
     if let Some((head, paren)) = n.split_once('(')
@@ -3851,6 +3865,9 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         // with itself, and `\gdesc` showed it: `'(1,2)'::point`
         // described as `???`.
         24 => "regproc",
+        // 9.0.0 — the type PostgreSQL stores a parsed expression in
+        // (`pg_attrdef.adbin`, `pg_constraint.conbin`, `pg_index.indexprs`).
+        194 => "pg_node_tree",
         600 => "point",
         // `box` is not in SPG's `pg_type` at all yet; it is named here
         // because `format_type(603, -1)` is asked directly too.
@@ -6559,6 +6576,19 @@ pub(crate) fn coerce_value(
         // v7.39 (round 291) — `name` is text truncated to NAMEDATALEN-1
         // (63) bytes. PG truncates silently rather than erroring, which
         // is the behaviour a catalog identifier column needs.
+        // 9.0.0 — four types the catalogs announce whose cell is the
+        // text rendering PostgreSQL prints: `pg_node_tree`, `anyarray`,
+        // `aclitem[]` and `"char"[]`. `coalesce(relacl, 'NULL')` resolves
+        // to the column's declared type and coerces the other branch into
+        // it, so the coercion table has to know the declaration even
+        // though the value shape stays the text it has always been.
+        (
+            Value::Text(s),
+            DataType::PgNodeTree
+            | DataType::AnyArray
+            | DataType::AclItemArray
+            | DataType::Char1Array,
+        ) => Some(Value::text(s)),
         (Value::Text(s), DataType::Name) => {
             let mut cut = s.into_owned();
             if cut.len() > 63 {
@@ -6710,7 +6740,35 @@ pub(crate) fn types_unify(a: DataType, b: DataType) -> bool {
             _ => return None,
         })
     }
+    // 9.0.0 — `oid` and the reg types are their own family, and it is
+    // not a category because the relation is not transitive: measured on
+    // PostgreSQL 18.6, `1::oid = 1::int` is `t` and `1::int = 1::numeric`
+    // is `t`, but `1::oid = 1::numeric` is `operator does not exist: oid
+    // = numeric` (and `UNION` says `could not convert type numeric to
+    // oid`). `oid` shares its family with the three integer widths and
+    // with `regclass` / `regtype` / `regproc`, and with nothing else —
+    // `1::oid = 1::real` and `1::oid = 1::text` are both refused there.
+    //
+    // `oid` was in no family at all, so `WHERE atttypid IN (194)` — how a
+    // catalog query names a type — raised `operator does not exist: oid =
+    // integer` on the plan shapes where the column's type is known, while
+    // the identical `atttypid = 194` answered.
+    //
+    // `xid` / `xid8` / `tid` / `cid` are deliberately NOT here: PG refuses
+    // them against an integer outright (`cannot cast type integer to xid`).
+    fn oidish(t: DataType) -> bool {
+        matches!(
+            t,
+            DataType::Oid | DataType::RegClass | DataType::RegType | DataType::RegProc
+        )
+    }
+    fn integral(t: DataType) -> bool {
+        matches!(t, DataType::SmallInt | DataType::Int | DataType::BigInt)
+    }
     if a == b {
+        return true;
+    }
+    if (oidish(a) && (oidish(b) || integral(b))) || (oidish(b) && integral(a)) {
         return true;
     }
     match (category(a), category(b)) {

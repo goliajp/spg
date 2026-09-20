@@ -1105,6 +1105,7 @@ mod e2e_c1_gap_probe;
 mod e2e_cardinality_modulo;
 mod e2e_cast_pg_differential;
 mod e2e_cast_time_arith;
+mod e2e_catalog_declared_types_900;
 mod e2e_catalog_oid_columns_900;
 mod e2e_composite_component_types_v73913;
 mod e2e_composite_field;
