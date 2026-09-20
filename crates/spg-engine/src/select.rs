@@ -3897,7 +3897,7 @@ impl Engine {
                         // the same sentence, and it is a type mismatch.
                         return Err(EngineError::Eval(EvalError::TypeMismatch {
                             detail: alloc::format!(
-                                "unnest() expects an array argument, got {}",
+                                "function unnest({}) does not exist",
                                 crate::conversions::pg_type_name_for_error_opt(other.data_type())
                             ),
                         }));
@@ -13780,7 +13780,7 @@ pub(crate) fn array_value_to_elements(v: &Value) -> Result<Vec<Value<'static>>, 
             .collect()),
         other => Err(EngineError::Eval(EvalError::TypeMismatch {
             detail: alloc::format!(
-                "unnest() expects an array argument, got {}",
+                "function unnest({}) does not exist",
                 crate::conversions::pg_type_name_for_error_opt(other.data_type())
             ),
         })),

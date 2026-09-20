@@ -105,17 +105,21 @@ fn round621_what_is_not_a_literal_stays_refused() {
     let mut e2 = Engine::new();
     e2.execute("CREATE TABLE iv (t TEXT)").unwrap();
     e2.execute("INSERT INTO iv VALUES ('36 hours')").unwrap();
+    // 9.0.0 — and the refusal is PostgreSQL's own sentence now, measured
+    // on 18.6. Both of these used to be recorded as SPG's wording ("needs
+    // interval" / "got integer"), which is what the second assertion's
+    // own comment said: "PG says the function does not exist for integer,
+    // SPG that it needs an interval".
     let m = err(&mut e2, "SELECT justify_interval(t) FROM iv");
     assert!(
-        m.contains("needs interval") && !m.contains("Some("),
+        m.contains("function justify_interval(text) does not exist") && !m.contains("Some("),
         "a TEXT COLUMN is not an unknown literal — PG has no such overload \
          either — and the refusal names a type, not a Rust enum: {m}"
     );
     let m = err(&mut e, "SELECT justify_interval(1)");
     assert!(
-        m.contains("got integer") && !m.contains("Some("),
-        "recorded rather than faked: PG says the function does not exist for \
-         integer, SPG that it needs an interval — but no longer in Rust: {m}"
+        m.contains("function justify_interval(integer) does not exist") && !m.contains("Some("),
+        "{m}"
     );
 }
 

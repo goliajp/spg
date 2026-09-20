@@ -5860,7 +5860,7 @@ pub(crate) fn update_state(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "bool_and requires bool, got {}",
+                            "function bool_and({}) does not exist",
                             crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });
@@ -5879,7 +5879,7 @@ pub(crate) fn update_state(
                 other => {
                     return Err(EvalError::TypeMismatch {
                         detail: format!(
-                            "bool_or requires bool, got {}",
+                            "function bool_or({}) does not exist",
                             crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     });

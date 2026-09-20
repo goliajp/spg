@@ -55,29 +55,45 @@ fn err(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round622_error_messages_name_pg_types() {
     let mut e = Engine::new();
+    // 9.0.0 — PostgreSQL 18.6's whole sentence, measured, rather than
+    // `got <type>`: that tail was SPG's own wording, so the pin could
+    // only ever have confirmed SPG named the type its own way. PG says
+    // `function <name>(<argtypes>) does not exist`, and `unknown` for a
+    // bare string literal.
     for (sql, want) in [
-        ("SELECT upper(1)", "integer"),
-        ("SELECT lower(ARRAY[1,2])", "integer[]"),
-        ("SELECT abs('x'::TEXT)", "text"),
-        ("SELECT round('x'::TEXT)", "text"),
-        ("SELECT bool_and(1)", "integer"),
-        ("SELECT unnest(1)", "integer"),
-        ("SELECT date_trunc('day', 1)", "integer"),
+        ("SELECT upper(1)", "function upper(integer) does not exist"),
+        (
+            "SELECT lower(ARRAY[1,2])",
+            "function lower(integer[]) does not exist",
+        ),
+        ("SELECT abs('x'::TEXT)", "function abs(text) does not exist"),
+        (
+            "SELECT round('x'::TEXT)",
+            "function round(text) does not exist",
+        ),
+        (
+            "SELECT bool_and(1)",
+            "function bool_and(integer) does not exist",
+        ),
+        (
+            "SELECT unnest(1)",
+            "function unnest(integer) does not exist",
+        ),
+        (
+            "SELECT date_trunc('day', 1)",
+            "function date_trunc(unknown, integer) does not exist",
+        ),
     ] {
         let m = err(&mut e, sql);
         assert!(
-            m.contains(&alloc_fmt(want)),
-            "{sql}: message should name the type as {want:?}, said {m:?}"
+            m.contains(want),
+            "{sql}: wanted PG's sentence {want:?}, said {m:?}"
         );
         assert!(
             !m.contains("Some(") && !m.contains("None"),
             "{sql}: an Option leaked into the message: {m:?}"
         );
     }
-}
-
-fn alloc_fmt(s: &str) -> String {
-    format!("got {s}")
 }
 
 /// A cast with no path says what it failed to cast — not which column.

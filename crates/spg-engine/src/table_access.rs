@@ -205,7 +205,7 @@ impl Engine {
                     // of the three raised it. PG answers 42883 for all.
                     return Err(EngineError::Eval(EvalError::TypeMismatch {
                         detail: alloc::format!(
-                            "unnest() expects an array argument, got {}",
+                            "function unnest({}) does not exist",
                             crate::conversions::pg_type_name_for_error_opt(other.data_type())
                         ),
                     }));

@@ -3749,11 +3749,100 @@ fn eval_function_call_arm(
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
-    let v = eval_function_call_inner(name, args, row, ctx)?;
+    let v = match eval_function_call_inner(name, args, row, ctx) {
+        Ok(v) => v,
+        Err(e) => return Err(name_the_call_pg_s_way(e, name, args, ctx)),
+    };
     if name.eq_ignore_ascii_case("pg_typeof") {
         return pg_typeof_as_regtype(v, ctx);
     }
     Ok(v)
+}
+
+/// 9.0.0 — a built-in called with argument types no overload accepts is
+/// `function <name>(<argtypes>) does not exist` on PostgreSQL, and a
+/// bare string literal is `unknown` there, not `text`.
+///
+/// Measured on PG 18.6 against SPG:
+///
+/// ```text
+///   lower(id)            function lower(integer) does not exist
+///                        SPG: lower() needs text, got integer
+///   nosuchfn('a','b')    function nosuchfn(unknown, unknown) does not exist
+///                        SPG: … (text, text) …
+/// ```
+///
+/// 183 sites across the evaluator write the `needs …, got …` sentence,
+/// so the rewrite is here, where the call's own expressions are in hand
+/// — the same place `unknown_literal_cmp_error` and
+/// `name_untyped_concat_operands` already rename operands PostgreSQL
+/// names differently.
+///
+/// It fires only when EVERY argument can be typed: a rewrite that
+/// guessed at one would trade a clumsy sentence for a false one. And it
+/// leaves a call carrying a bare string literal on the `needs` path,
+/// because PostgreSQL does something else there again — it commits the
+/// literal to the only candidate's type and reports the input
+/// function's error (`abs('x')` is `invalid input syntax for type
+/// double precision`), which needs a per-function candidate table this
+/// does not have.
+#[cold]
+#[inline(never)]
+fn name_the_call_pg_s_way(
+    err: EvalError,
+    name: &str,
+    args: &[Expr],
+    ctx: &EvalContext<'_>,
+) -> EvalError {
+    let EvalError::TypeMismatch { detail } = &err else {
+        return err;
+    };
+    // The evaluator's own sentence, in the three spellings it uses:
+    // `<fn>() needs <what>, got <type>`, `<fn> requires …, got <type>`
+    // and `<fn>() expects …, got <type>`. The tail names the offending
+    // argument's type, which is the whole signature when there is one
+    // argument — and that is the case `describe_expr` cannot always
+    // type (an `ARRAY[…]` constructor, for one).
+    let ours = detail
+        .split_once(", got ")
+        .filter(|(head, _)| head.split(['(', ' ']).next() == Some(name));
+    let already_named = detail.starts_with("function ");
+    if !already_named && ours.is_none() {
+        return err;
+    }
+    // A lone bare string literal is the one shape PostgreSQL answers
+    // differently again: it commits the literal to the only candidate's
+    // type and reports the input function's error (`abs('x')` is
+    // `invalid input syntax for type double precision`). That needs a
+    // per-function candidate table this does not have, so the call
+    // keeps its own sentence.
+    if args.len() == 1 && is_unknown_string_literal(&args[0]) {
+        return err;
+    }
+    if already_named && !args.iter().any(is_unknown_string_literal) {
+        // Already PostgreSQL's sentence and no literal to rename.
+        return err;
+    }
+    let mut types: alloc::vec::Vec<alloc::string::String> =
+        alloc::vec::Vec::with_capacity(args.len());
+    for a in args {
+        if is_unknown_string_literal(a) {
+            types.push(alloc::string::String::from("unknown"));
+            continue;
+        }
+        match crate::describe::describe_expr(a, ctx.columns).map(|s| s.ty) {
+            Some(ty) => types.push(crate::conversions::pg_type_name_for_error(ty)),
+            // One argument, and the message already named its type.
+            None if args.len() == 1 => match ours {
+                Some((_, got)) => types.push(alloc::string::String::from(got)),
+                None => return err,
+            },
+            None => return err,
+        }
+    }
+    EvalError::TypeMismatch {
+        detail: alloc::format!("function {name}({}) does not exist", types.join(", ")),
+    }
 }
 
 fn eval_function_call_inner(

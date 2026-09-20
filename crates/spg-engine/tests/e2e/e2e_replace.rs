@@ -218,7 +218,8 @@ fn replace_numeric_args_coerced_to_text() {
         .expect_err("PG has no replace(integer, text, text)")
         .to_string();
     assert!(
-        m.contains("function replace(integer, text, text) does not exist"),
+        // 9.0.0 — `unknown` for the two bare literals, as PG 18.6 names them.
+        m.contains("function replace(integer, unknown, unknown) does not exist"),
         "{m}"
     );
 }
