@@ -10,6 +10,33 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a partitioned table's index declaration was invisible, and a dump lost it
+
+SPG keeps a partitioned table's `CREATE INDEX` as a template every
+partition replays. The template appeared in no catalog: `pg_indexes`
+had no row for it, `pg_class` no relation, `pg_inherits` no link — so
+`pg_dump` (which reads all three) wrote the partitions' indexes alone.
+Restore that dump and the parent has no declaration left: a partition
+created afterwards inherits nothing, silently.
+
+Measured against PostgreSQL 18.6, which carries the declaration as a
+relation of its own, reports `relkind 'I'` for it, lists it
+`CREATE INDEX pt_v ON ONLY public.pt USING btree (v)`, records
+`pg_inherits` from it to each partition's index, and writes all three
+lines in a dump. SPG answers each of those identically now, and a
+`pg_dump` → restore round trip comes back with the declaration intact
+and a later partition inheriting from it.
+
+Four separate things had to agree before `pg_dump` would write it, and
+each was silent on its own: `relhasindex` on the parent (which holds no
+storage index), the `pg_class` row, its `relkind`, and the
+`pg_inherits` pairing. Two statements had to be accepted for the dump
+to restore: `CREATE INDEX … ON ONLY <parent>`, which declares without
+building on the partitions, and `ALTER INDEX … ATTACH PARTITION …`,
+which resolves both indexes and has nothing else to do here — a
+partition's index comes from the template, so the attachment already
+holds by construction.
+
 ### Fixed — two of the partition catalog's own claims
 
 **A unique constraint on a partitioned table must include every

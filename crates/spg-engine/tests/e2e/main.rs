@@ -1277,6 +1277,7 @@ mod e2e_partition_explain;
 mod e2e_partition_key_enforced_900;
 mod e2e_partition_pruning;
 mod e2e_partition_unique_and_index_names_900;
+mod e2e_partitioned_index_declaration_900;
 mod e2e_per_table_budget;
 mod e2e_pg_am_collation;
 mod e2e_pg_amcheck;

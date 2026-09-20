@@ -112,6 +112,9 @@ pub(crate) fn create_index_statement_of(
         },
         key_collation: idx.collation.clone(),
         table: String::new(),
+        // A storage index is built; only a partitioned parent's
+        // declaration is `ONLY`.
+        only: false,
         column: column_name(idx.column_position)?,
         nulls_not_distinct: idx.nulls_not_distinct,
         method,
