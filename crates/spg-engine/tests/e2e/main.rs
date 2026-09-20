@@ -782,6 +782,7 @@ mod e2e_plpgsql_for_query;
 mod e2e_plpgsql_for_range;
 mod e2e_plpgsql_found;
 mod e2e_plpgsql_loop_exit;
+mod e2e_plpgsql_nested_blocks_900;
 mod e2e_plpgsql_perform;
 mod e2e_plpgsql_return_query;
 mod e2e_plpgsql_scalar_round64;
