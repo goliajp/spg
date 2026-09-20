@@ -19,6 +19,7 @@ mod e2e_age_wallclock_round97;
 mod e2e_age_xid;
 mod e2e_agg_normalize_round231;
 mod e2e_agg_subquery_pullup;
+mod e2e_aggregate_filter_leak_900;
 mod e2e_aggregate_order_collation_v73911;
 mod e2e_aggregate_pg_differential;
 mod e2e_aggregate_signatures_round626;

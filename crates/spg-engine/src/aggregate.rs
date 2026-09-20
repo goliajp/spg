@@ -7500,6 +7500,17 @@ fn rewrite_expr(e: &Expr, group_exprs: &[Expr], aggs: &[AggSpec]) -> Expr {
                     && spec.arg2 == arg2
                     && !spec.distinct
                     && spec.order_by.is_empty()
+                    // 9.0.0 — an aggregate written WITHOUT a FILTER must not
+                    // be answered by one that has one. A `FunctionCall` never
+                    // carries a filter, so leaving this off matched
+                    // `count(*)` to an earlier `count(*) FILTER (WHERE …)`
+                    // and answered the subtotal twice: measured `2|2` where
+                    // PG 18.6 answers `2|5`. Correct when the unfiltered one
+                    // came first, which is why nothing caught it. The dedup
+                    // at collection time (`collect_aggregates`) compares
+                    // `filter` already, and so do the two ordered-aggregate
+                    // arms below — this was the one site of four that did not.
+                    && spec.filter.is_none()
                 {
                     return Expr::Column(spg_sql::ast::ColumnName {
                         token: spg_sql::ast::SrcToken::NONE,
