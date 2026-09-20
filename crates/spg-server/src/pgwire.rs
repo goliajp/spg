@@ -5269,7 +5269,24 @@ fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
                 // is read out of the message and located in the text. A
                 // qualified name points at its qualifier, which is where
                 // PostgreSQL's caret sits too (measured on 18.6).
+                //
+                // 9.0.0 — an ALLOW-LIST, not every message with a quoted
+                // word in it. Locating any quoted identifier drew a caret
+                // PostgreSQL does not draw: measured on 18.6,
+                // `cannot insert a non-DEFAULT value into column "id"` and
+                // `column "a" of relation "t" is not an identity column`
+                // carry no position at all, and SPG pointed at the column
+                // in both. A deny-list would give every message added
+                // later a caret by default; this way a new message has to
+                // ask for one.
                 let (_, msg) = engine_error_to_wire(other);
+                let positioned = msg.contains("does not exist")
+                    || msg.contains("is ambiguous")
+                    || msg.contains("missing FROM-clause entry")
+                    || msg.contains("must appear in the GROUP BY clause");
+                if !positioned {
+                    return None;
+                }
                 let quoted = msg.split('"').nth(1)?;
                 return spg_sql::parser::identifier_position(
                     sql,

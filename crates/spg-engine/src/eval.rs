@@ -2030,6 +2030,24 @@ pub(crate) fn expr_enum_type_name_pub<'e>(
 /// some operands — `DATE_ADD(d3, INTERVAL 1 MICROSECOND)` prints six digits
 /// there. Taking the max over referenced columns covers the common shapes
 /// and never narrows below the source column.
+/// 9.0.0 — the fractional-seconds digits a cast target declares, as in
+/// `CAST(x AS DATETIME(3))`. The parser carries the precision through the
+/// `Named` spelling (`timestamp(3)`), which is the only place it survives.
+fn cast_target_fsp(target: &spg_sql::ast::CastTarget) -> Option<u8> {
+    let spg_sql::ast::CastTarget::Named(n) = target else {
+        return None;
+    };
+    let lower = n.to_ascii_lowercase();
+    let (base, rest) = lower.split_once('(')?;
+    if !matches!(base, "timestamp" | "timestamptz" | "datetime" | "time") {
+        return None;
+    }
+    rest.trim_end_matches(')')
+        .parse::<u8>()
+        .ok()
+        .filter(|d| *d <= 6)
+}
+
 pub(crate) fn expr_mysql_fsp(e: &Expr, columns: &[ColumnSchema]) -> Option<u8> {
     fn walk(e: &Expr, columns: &[ColumnSchema], best: &mut Option<u8>) {
         match e {
@@ -2046,7 +2064,22 @@ pub(crate) fn expr_mysql_fsp(e: &Expr, columns: &[ColumnSchema]) -> Option<u8> {
                 walk(lhs, columns, best);
                 walk(rhs, columns, best);
             }
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } => walk(expr, columns, best),
+            // 9.0.0 — a CAST to a temporal type with an explicit precision
+            // FIXES the precision; it does not inherit one. Measured on
+            // MySQL 9.7.2: `CAST('…05.090000' AS DATETIME(6))` prints
+            // `…05.090000`, `DATETIME(3)` of `…05.000000` prints `…05.000`
+            // and `DATETIME(1)` of `…05` prints `…05.0`. SPG printed
+            // `…05.09`, `…05` and `…05`, because nothing carried the
+            // target's digits: the walk went straight into the operand,
+            // which names no column at all here.
+            Expr::Cast { expr, target } => {
+                if let Some(f) = cast_target_fsp(target) {
+                    *best = Some(best.map_or(f, |b: u8| b.max(f)));
+                    return;
+                }
+                walk(expr, columns, best);
+            }
+            Expr::Unary { expr, .. } => walk(expr, columns, best),
             Expr::FunctionCall { args, .. } => {
                 for a in args {
                     walk(a, columns, best);
