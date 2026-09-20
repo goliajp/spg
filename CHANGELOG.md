@@ -10,6 +10,27 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — 18 more catalog columns: the array and vector types
+
+`oid[]` (8: `pg_constraint`'s four operator arrays, `pg_extension
+.extconfig`, `pg_policy.polroles`, `pg_proc.proallargtypes` and
+`protrftypes`), `text[]` (3), `real[]` (3), `int2vector` (2:
+`pg_statistic_ext.stxkeys`, `pg_trigger.tgattr`), `smallint[]` (1) and
+`bytea` (1) all announced `text`. They carry the declared type now, and
+`polroles`, `stxkeys`, `tgattr` and `tgargs` carry a real array, vector
+or byte value rather than its text rendering.
+
+`pg_proc.proargmodes` and `pg_statistic_ext.stxkind` are NOT among them:
+PostgreSQL types them `"char"[]` (`_char`, oid 1002) and SPG's
+`CharArray` is `bpchar[]` (1014) — a different type with a near-identical
+name. Declaring it made `format_type` answer `???`, which the sweep
+caught; recorded instead.
+
+The sweep creates a policy, extended statistics, a trigger and a foreign
+key now: each of those has a catalog row builder that an empty database
+never reaches, and three of them still held the old type after the
+declarations changed. The 365-column sweep is at 28 divergences, from 46.
+
 ### Fixed — the 10 `real` catalog columns
 
 `pg_class.reltuples`, `pg_proc.procost` / `prorows`,
