@@ -10,6 +10,19 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `pg_policy.polroles` said every policy applies to PUBLIC
+
+The column is `oid[]` and every entry was 0 — which is PUBLIC on
+PostgreSQL. So `CREATE POLICY p ON t FOR SELECT TO alice` read `{0}`,
+and anything reading the raw catalog was told the policy applies to
+everyone. `pg_policies.roles`, the VIEW over the same fact, named
+`alice` correctly all along: two surfaces answering one question, and
+only one of them right.
+
+Each grantee carries its own role oid now, and the oid resolves —
+`pg_policy JOIN pg_roles ON r.oid = polroles[1]` names `alice`.
+PUBLIC stays 0, written out or left off.
+
 ### Fixed — the `regproc` columns name the function now, not `-`
 
 `pg_type.typinput` read `-` — oid 0, PostgreSQL's own spelling for "no

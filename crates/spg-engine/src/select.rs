@@ -1333,8 +1333,10 @@ impl Engine {
                 }
                 // v7.39 (RLS) — pg_catalog.pg_policy (raw) + pg_policies (view).
                 "__spg_pg_policy" => {
-                    let (schema, rows) =
-                        crate::system_catalog::synth_pg_policy(self.active_catalog());
+                    let (schema, rows) = crate::system_catalog::synth_pg_policy(
+                        self.active_catalog(),
+                        &crate::role_directory::RoleDirectory::of(self),
+                    );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 "__spg_pg_policies" => {
