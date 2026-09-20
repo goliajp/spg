@@ -288,6 +288,7 @@ mod e2e_double_quote_dialect_v739;
 mod e2e_drop_column_drops_checks_v7382;
 mod e2e_drop_expression_if_exists_round187;
 mod e2e_drop_index_on_v7397;
+mod e2e_drop_view_dependents_900;
 mod e2e_drop_wider_pg_dump_compat;
 mod e2e_dump_restores_into_postgres;
 mod e2e_dump_roundtrip_r1054;

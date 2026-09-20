@@ -372,6 +372,13 @@ pub enum Statement {
     DropTable {
         names: Vec<String>,
         if_exists: bool,
+        /// 9.0.0 — `CASCADE` takes the dependent views with the table.
+        /// The keyword was parsed and thrown away, and nothing depended
+        /// on a table anyway: `DROP TABLE t` succeeded while a view read
+        /// it, leaving the view broken, where PostgreSQL 18.6 refuses
+        /// with `cannot drop table t because other objects depend on
+        /// it`.
+        cascade: bool,
     },
     /// v7.14.0 — `DROP INDEX [IF EXISTS] name`. Removes the
     /// matching index across whichever table holds it.
@@ -929,6 +936,8 @@ pub enum Statement {
     DropView {
         names: Vec<String>,
         if_exists: bool,
+        /// 9.0.0 — see [`Statement::DropTable`]'s `cascade`.
+        cascade: bool,
     },
     /// v7.17.0 Phase 1.3 — `CREATE MATERIALIZED VIEW [IF NOT
     /// EXISTS] name [(col, …)] AS <SELECT …> [WITH [NO] DATA]`.
@@ -6857,7 +6866,11 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
-            Self::DropTable { names, if_exists } => {
+            Self::DropTable {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 f.write_str("DROP TABLE ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
@@ -6867,6 +6880,9 @@ impl fmt::Display for Statement {
                         f.write_str(", ")?;
                     }
                     write!(f, "{}", quote_ident(n))?;
+                }
+                if *cascade {
+                    f.write_str(" CASCADE")?;
                 }
                 Ok(())
             }
@@ -7234,7 +7250,11 @@ impl fmt::Display for Statement {
                 Ok(())
             }
             Self::CreateView(v) => v.fmt(f),
-            Self::DropView { names, if_exists } => {
+            Self::DropView {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 f.write_str("DROP VIEW ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
@@ -7244,6 +7264,9 @@ impl fmt::Display for Statement {
                         f.write_str(", ")?;
                     }
                     write!(f, "{}", quote_ident(n))?;
+                }
+                if *cascade {
+                    f.write_str(" CASCADE")?;
                 }
                 Ok(())
             }

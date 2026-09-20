@@ -3495,14 +3495,12 @@ impl Parser {
                             self.advance();
                             names.push(self.expect_ident_like()?);
                         }
-                        if matches!(
-                            self.peek(),
-                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
-                                || s.eq_ignore_ascii_case("restrict")
-                        ) {
-                            self.advance();
-                        }
-                        Ok(Statement::DropView { names, if_exists })
+                        let cascade = self.consume_cascade_or_restrict();
+                        Ok(Statement::DropView {
+                            names,
+                            if_exists,
+                            cascade,
+                        })
                     }
                     // v7.17.0 — DROP SEQUENCE [IF EXISTS] name [,name…]
                     // [CASCADE|RESTRICT]. Real removal from catalog
@@ -5012,6 +5010,17 @@ impl Parser {
     /// `DROP TEMPORARY TABLE` (MySQL) runs the identical grammar instead of
     /// a second copy — the parser cannot rewind, so re-dispatch has to be a
     /// forward call.
+    /// 9.0.0 — the trailing `CASCADE` / `RESTRICT` of a DROP. `true` for
+    /// CASCADE; RESTRICT is PostgreSQL's default and reads the same as
+    /// no keyword at all.
+    fn consume_cascade_or_restrict(&mut self) -> bool {
+        let cascade = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("cascade"));
+        if cascade || matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("restrict")) {
+            self.advance();
+        }
+        cascade
+    }
+
     fn parse_drop_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
         self.advance(); // TABLE
         let if_exists = self.consume_if_exists();
@@ -5024,14 +5033,15 @@ impl Parser {
             }
             break;
         }
-        if matches!(
-            self.peek(),
-            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
-                || s.eq_ignore_ascii_case("restrict")
-        ) {
-            self.advance();
-        }
-        Ok(Statement::DropTable { names, if_exists })
+        // 9.0.0 — CASCADE is carried now: it decides whether the views
+        // that read the table go with it or the drop is refused.
+        // RESTRICT is PostgreSQL's default and says nothing extra.
+        let cascade = self.consume_cascade_or_restrict();
+        Ok(Statement::DropTable {
+            names,
+            if_exists,
+            cascade,
+        })
     }
 
     fn parse_drop_statistics_after_drop(&mut self) -> Result<Statement, ParseError> {
