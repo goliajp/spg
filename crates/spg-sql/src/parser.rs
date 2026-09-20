@@ -5627,7 +5627,10 @@ impl Parser {
         // when invoked with a clear unsupported message.
         let body = if language.eq_ignore_ascii_case("plpgsql") {
             match parse_plpgsql_body(&body_text) {
-                Ok(block) => FunctionBody::PlPgSql(block),
+                Ok(block) => FunctionBody::PlPgSql {
+                    block,
+                    src: body_text.clone(),
+                },
                 // Best-effort: if the body parser doesn't yet
                 // support a construct used inside, fall back to
                 // raw — keeps `CREATE FUNCTION` itself working
@@ -30749,7 +30752,7 @@ mod tests {
         assert!(f.args.is_empty());
         assert!(matches!(f.returns, FunctionReturn::Trigger));
         assert_eq!(f.language, "plpgsql");
-        let FunctionBody::PlPgSql(block) = f.body else {
+        let FunctionBody::PlPgSql { block, .. } = f.body else {
             panic!("expected PlPgSql body");
         };
         assert_eq!(block.statements.len(), 1);
@@ -30757,6 +30760,29 @@ mod tests {
             block.statements[0],
             PlPgSqlStmt::Return(ReturnTarget::New)
         ));
+    }
+
+    /// 9.0.0 — a PL/pgSQL body deparses as the text it was written as.
+    ///
+    /// The deparse used to re-render the parsed block, which drops
+    /// comments and adds parentheses, so a round trip through
+    /// `Display` did not give back the function that went in.
+    #[test]
+    fn create_function_deparses_its_own_source() {
+        let src = "\nBEGIN\n  -- a comment\n  RETURN x + 1;\nEND\n";
+        let q = "$$";
+        let sql =
+            alloc::format!("CREATE FUNCTION d1(x int) RETURNS int AS {q}{src}{q} LANGUAGE plpgsql");
+        let Statement::CreateFunction(f) = parse(&sql) else {
+            panic!("expected CreateFunction");
+        };
+        let FunctionBody::PlPgSql { src: kept, .. } = &f.body else {
+            panic!("expected PlPgSql body");
+        };
+        assert_eq!(kept, src);
+        let rendered = alloc::format!("{f}");
+        assert!(rendered.contains("-- a comment"), "{rendered}");
+        assert!(!rendered.contains("(x + 1)"), "re-rendered: {rendered}");
     }
 
     #[test]
@@ -30774,7 +30800,7 @@ $$";
             panic!("expected CreateFunction");
         };
         assert!(f.or_replace);
-        let FunctionBody::PlPgSql(block) = &f.body else {
+        let FunctionBody::PlPgSql { block, .. } = &f.body else {
             panic!("expected PlPgSql body");
         };
         assert_eq!(block.statements.len(), 2);

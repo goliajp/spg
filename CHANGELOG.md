@@ -10,6 +10,20 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `pg_proc.prosrc` was a re-render of the parsed body
+
+Measured against PostgreSQL 18.6, which stores the text between the
+dollar quotes verbatim. A PL/pgSQL body written as
+`\nBEGIN\n  -- a comment\n  RETURN x + 1;\nEND\n` came back as
+`BEGIN\n  RETURN (x + 1);\nEND`: the comment gone, the parentheses
+added, the surrounding newlines gone. `pg_get_functiondef` inherited
+it, so a dump did not carry the function's own source.
+
+A `LANGUAGE sql` body was already stored verbatim, so the two
+languages disagreed about what `prosrc` is. The block is still parsed
+and still what the executor walks; the source now rides beside it, and
+the statement deparses as the text it was written as.
+
 ### Fixed — `DROP TABLE` succeeded while a view read the table
 
 The view was left answering `relation "t" does not exist`, and nothing

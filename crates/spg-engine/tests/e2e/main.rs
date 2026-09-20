@@ -800,6 +800,7 @@ mod e2e_prepare_param_deduction_v7384;
 mod e2e_prepared_array_param_v7411;
 mod e2e_prepared_sql_round277;
 mod e2e_preprocess_routes_r1043;
+mod e2e_prosrc_verbatim_900;
 mod e2e_pseudo_types;
 mod e2e_publication_ddl_round754;
 mod e2e_qualified_wildcard_round128;

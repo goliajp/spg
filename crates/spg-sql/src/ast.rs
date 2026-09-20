@@ -2080,7 +2080,15 @@ pub enum FunctionBody {
     /// v7.12.4 — parsed PL/pgSQL `BEGIN … END` block. The
     /// trigger-function executor walks this directly without
     /// re-parsing.
-    PlPgSql(PlPgSqlBlock),
+    ///
+    /// 9.0.0 — and the SOURCE TEXT beside it. `pg_proc.prosrc` is the
+    /// text between the dollar quotes on PostgreSQL, verbatim; SPG
+    /// stored a re-render of the parsed block, so a body with a comment
+    /// and `RETURN x + 1;` came back as `BEGIN\n  RETURN (x + 1);\nEND`
+    /// — comment gone, parens added, the surrounding newlines gone. A
+    /// `LANGUAGE sql` body was already stored verbatim, so the two
+    /// languages disagreed about what `prosrc` is.
+    PlPgSql { block: PlPgSqlBlock, src: String },
     /// Raw source text — parser couldn't (or didn't try to)
     /// structure-parse the body. Used for `LANGUAGE sql`
     /// functions and any PL/pgSQL body that contains v7.12.5+
@@ -7660,7 +7668,10 @@ impl fmt::Display for CreateFunctionStatement {
         }
         write!(f, " LANGUAGE {} AS $$", self.language)?;
         match &self.body {
-            FunctionBody::PlPgSql(b) => write!(f, "\n{b}\n")?,
+            // 9.0.0 — the body deparses as the text it was written as,
+            // which is what `pg_dump` has to emit for the function to
+            // restore as itself.
+            FunctionBody::PlPgSql { src, .. } => f.write_str(src)?,
             FunctionBody::Raw(s) => f.write_str(s)?,
         }
         f.write_str("$$")
