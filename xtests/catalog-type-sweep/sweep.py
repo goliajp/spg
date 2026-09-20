@@ -119,7 +119,9 @@ def select_star_every_catalog(uri):
                 "CREATE TABLE sweep_t(a int, b text)",
                 "CREATE VIEW sweep_v AS SELECT a, b FROM sweep_t",
                 "CREATE TYPE sweep_c AS (x int, y text)",
-                "CREATE INDEX sweep_i ON sweep_t(a)"):
+                "CREATE INDEX sweep_i ON sweep_t(a)",
+                "DROP FUNCTION IF EXISTS sweep_f(int)",
+                "CREATE FUNCTION sweep_f(x int) RETURNS int LANGUAGE sql AS 'SELECT x'"):
         psql(uri, ddl)
     r = psql(uri, "SELECT relname FROM pg_class WHERE relname LIKE 'pg\\_%' ORDER BY 1")
     names = r.stdout.split()

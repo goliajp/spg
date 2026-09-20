@@ -10,6 +10,29 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the 21 `regproc` catalog columns, and a reg value cast to its own type
+
+`pg_am.amhandler`, `pg_type.typinput` and 19 others announced `bigint`
+or `text` where PostgreSQL 18.6 announces `regproc`. They carry the type
+now; what they hold is oid 0, which renders `-` — PostgreSQL's own
+spelling for "no function" and what it prints for `pg_type.typsubscript`
+on both engines. Naming a real function needs SPG's built-ins to have
+`pg_proc` oids for these columns to point at, which is recorded and not
+done here.
+
+That uncovered a cast defect the catalog had been hiding: a reg value
+cast to its OWN type was refused with `::regproc accepts TEXT, got
+regproc`, so `amhandler::pg_catalog.regproc` — the qualified spelling a
+tool writes — failed. PostgreSQL 18.6 answers `'int4in'::regproc::
+regproc` = `int4in`; SPG does now, and the cast between two different
+reg types goes through the name as PostgreSQL does.
+
+The catalog-type sweep found every value site that had to change with
+the declaration, including one that only a database holding a USER
+FUNCTION reaches — it creates one now, beside the table, view,
+composite type and index it already made. The 365-column sweep is at 56
+divergences, from 77.
+
 ### Fixed — 26 more catalog columns announced the wrong type, and a sweep that watches all 365
 
 `name`, `smallint` and `"char"` join the `oid` columns of the previous

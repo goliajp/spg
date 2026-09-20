@@ -1602,11 +1602,11 @@ pub(crate) fn synth_pg_ts_parser(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("prsname", DataType::Name, false),
         ColumnSchema::new("prsnamespace", DataType::Oid, false),
-        ColumnSchema::new("prsstart", DataType::BigInt, false),
-        ColumnSchema::new("prstoken", DataType::BigInt, false),
-        ColumnSchema::new("prsend", DataType::BigInt, false),
-        ColumnSchema::new("prsheadline", DataType::BigInt, false),
-        ColumnSchema::new("prslextype", DataType::BigInt, false),
+        ColumnSchema::new("prsstart", DataType::RegProc, false),
+        ColumnSchema::new("prstoken", DataType::RegProc, false),
+        ColumnSchema::new("prsend", DataType::RegProc, false),
+        ColumnSchema::new("prsheadline", DataType::RegProc, false),
+        ColumnSchema::new("prslextype", DataType::RegProc, false),
     ];
     // One parser, as PG has. The five function oids are 0 for the same
     // reason `pg_type`'s I/O oids are: SPG's parser is built into the
@@ -1616,11 +1616,11 @@ pub(crate) fn synth_pg_ts_parser(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         Value::BigInt(3722),
         Value::text("default"),
         Value::BigInt(11),
-        Value::BigInt(0),
-        Value::BigInt(0),
-        Value::BigInt(0),
-        Value::BigInt(0),
-        Value::BigInt(0),
+        Value::RegProc(0, "-".into()), // prsstart
+        Value::RegProc(0, "-".into()), // prstoken
+        Value::RegProc(0, "-".into()), // prsend
+        Value::RegProc(0, "-".into()), // prsheadline
+        Value::RegProc(0, "-".into()), // prslextype
     ])];
     (schema, rows)
 }
@@ -1630,8 +1630,8 @@ pub(crate) fn synth_pg_ts_template(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("tmplname", DataType::Name, false),
         ColumnSchema::new("tmplnamespace", DataType::Oid, false),
-        ColumnSchema::new("tmplinit", DataType::BigInt, false),
-        ColumnSchema::new("tmpllexize", DataType::BigInt, false),
+        ColumnSchema::new("tmplinit", DataType::RegProc, false),
+        ColumnSchema::new("tmpllexize", DataType::RegProc, false),
     ];
     // The two templates the two dictionaries point at. PG also ships
     // synonym, ispell and thesaurus; SPG implements none of them, and
@@ -1641,15 +1641,15 @@ pub(crate) fn synth_pg_ts_template(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
             Value::BigInt(3727),
             Value::text("simple"),
             Value::BigInt(11),
-            Value::BigInt(0),
-            Value::BigInt(0),
+            Value::RegProc(0, "-".into()), // tmplinit
+            Value::RegProc(0, "-".into()), // tmpllexize
         ]),
         Row::new(alloc::vec![
             Value::BigInt(13234),
             Value::text("snowball"),
             Value::BigInt(11),
-            Value::BigInt(0),
-            Value::BigInt(0),
+            Value::RegProc(0, "-".into()), // tmplinit
+            Value::RegProc(0, "-".into()), // tmpllexize
         ]),
     ];
     (schema, rows)
@@ -1848,7 +1848,7 @@ pub(crate) fn synth_pg_amproc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("amproclefttype", DataType::Oid, false),
         ColumnSchema::new("amprocrighttype", DataType::Oid, false),
         ColumnSchema::new("amprocnum", DataType::SmallInt, false),
-        ColumnSchema::new("amproc", DataType::BigInt, false),
+        ColumnSchema::new("amproc", DataType::RegProc, false),
     ];
     (schema, Vec::new())
 }
@@ -2561,7 +2561,7 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("amname", DataType::Name, false),
-        ColumnSchema::new("amhandler", DataType::BigInt, false),
+        ColumnSchema::new("amhandler", DataType::RegProc, false),
         ColumnSchema::new("amtype", DataType::Char1, false), // 't' table / 'i' index
     ];
     // v7.39 (read01 round 52/53) — every AM PG ships, at PG's own oids, so a
@@ -2573,44 +2573,44 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
         Row::new(alloc::vec![
             Value::BigInt(2),
             Value::text("heap"),
-            Value::BigInt(0),
-            char1("t"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("t"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(403),
             Value::text("btree"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(405),
             Value::text("hash"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(783),
             Value::text("gist"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(2742),
             Value::text("gin"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(4000),
             Value::text("spgist"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(3580),
             Value::text("brin"),
-            Value::BigInt(0),
-            char1("i"), // amtype
+            Value::RegProc(0, "-".into()), // amhandler
+            char1("i"),                    // amtype
         ]),
     ];
     (schema, rows)
@@ -5607,9 +5607,9 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("oprresult", DataType::Oid, false),
         ColumnSchema::new("oprcom", DataType::Oid, false),
         ColumnSchema::new("oprnegate", DataType::Oid, false),
-        ColumnSchema::new("oprcode", DataType::BigInt, false),
-        ColumnSchema::new("oprrest", DataType::BigInt, false),
-        ColumnSchema::new("oprjoin", DataType::BigInt, false),
+        ColumnSchema::new("oprcode", DataType::RegProc, false),
+        ColumnSchema::new("oprrest", DataType::RegProc, false),
+        ColumnSchema::new("oprjoin", DataType::RegProc, false),
     ];
     // The types the comparison and arithmetic families are emitted over.
     const CMP_TYPES: &[i64] = &[
@@ -5654,11 +5654,11 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             Value::BigInt(left),
             Value::BigInt(right),
             Value::BigInt(result),
-            Value::BigInt(0), // oprcom
-            Value::BigInt(0), // oprnegate
-            Value::BigInt(0), // oprcode — not a catalogued function here
-            Value::BigInt(0), // oprrest
-            Value::BigInt(0), // oprjoin
+            Value::BigInt(0),              // oprcom
+            Value::BigInt(0),              // oprnegate
+            Value::RegProc(0, "-".into()), // oprcode
+            Value::RegProc(0, "-".into()), // oprrest
+            Value::RegProc(0, "-".into()), // oprjoin
         ]));
     };
     for &t in CMP_TYPES {
@@ -5938,7 +5938,7 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typisdefined", DataType::Bool, false),
         ColumnSchema::new("typdelim", DataType::Char1, false),
         ColumnSchema::new("typrelid", DataType::Oid, false),
-        ColumnSchema::new("typsubscript", DataType::Text, false),
+        ColumnSchema::new("typsubscript", DataType::RegProc, false),
         ColumnSchema::new("typelem", DataType::Oid, false),
         ColumnSchema::new("typarray", DataType::Oid, false),
         // v7.39 (round 543) — PG names the type's I/O functions here.
@@ -5948,13 +5948,13 @@ pub(crate) fn synth_pg_type(
         // dangling. 0 is the value PG itself uses for a type with no
         // such function — which is what typmodin/typmodout/typanalyze
         // read on PG for int4 and text, measured.
-        ColumnSchema::new("typinput", DataType::BigInt, false),
-        ColumnSchema::new("typoutput", DataType::BigInt, false),
-        ColumnSchema::new("typreceive", DataType::BigInt, false),
-        ColumnSchema::new("typsend", DataType::BigInt, false),
-        ColumnSchema::new("typmodin", DataType::BigInt, false),
-        ColumnSchema::new("typmodout", DataType::BigInt, false),
-        ColumnSchema::new("typanalyze", DataType::BigInt, false),
+        ColumnSchema::new("typinput", DataType::RegProc, false),
+        ColumnSchema::new("typoutput", DataType::RegProc, false),
+        ColumnSchema::new("typreceive", DataType::RegProc, false),
+        ColumnSchema::new("typsend", DataType::RegProc, false),
+        ColumnSchema::new("typmodin", DataType::RegProc, false),
+        ColumnSchema::new("typmodout", DataType::RegProc, false),
+        ColumnSchema::new("typanalyze", DataType::RegProc, false),
         ColumnSchema::new("typalign", DataType::Char1, false),
         ColumnSchema::new("typstorage", DataType::Char1, false),
         ColumnSchema::new("typnotnull", DataType::Bool, false),
@@ -6022,10 +6022,10 @@ pub(crate) fn synth_pg_type(
             char1(ty),  // typtype
             char1(cat), // typcategory
             Value::Bool(typispreferred),
-            Value::Bool(true),                       // typisdefined
-            char1(","),                              // typdelim
-            Value::BigInt(0),                        // typrelid (composite-type table OID)
-            Value::text::<String>(subscript.into()), // typsubscript
+            Value::Bool(true),             // typisdefined
+            char1(","),                    // typdelim
+            Value::BigInt(0),              // typrelid (composite-type table OID)
+            Value::RegProc(0, "-".into()), // typsubscript
             Value::BigInt(elem),
             // v7.39 (round 640) — typarray names the type's array type,
             // and PG's invariant is that it resolves: zero dangling
@@ -6039,13 +6039,13 @@ pub(crate) fn synth_pg_type(
             Value::BigInt(arr),
             // round 543 — the seven I/O-function oids, all 0: SPG's I/O
             // is not a catalogued function, so there is nothing to name.
-            Value::BigInt(0), // typinput
-            Value::BigInt(0), // typoutput
-            Value::BigInt(0), // typreceive
-            Value::BigInt(0), // typsend
-            Value::BigInt(0), // typmodin
-            Value::BigInt(0), // typmodout
-            Value::BigInt(0), // typanalyze
+            Value::RegProc(0, "-".into()), // typinput
+            Value::RegProc(0, "-".into()), // typoutput
+            Value::RegProc(0, "-".into()), // typreceive
+            Value::RegProc(0, "-".into()), // typsend
+            Value::RegProc(0, "-".into()), // typmodin
+            Value::RegProc(0, "-".into()), // typmodout
+            Value::RegProc(0, "-".into()), // typanalyze
             char1(typalign),
             char1(typstorage),
             Value::Bool(false), // typnotnull — base types are nullable
@@ -6353,7 +6353,7 @@ pub(crate) fn synth_pg_proc(
         // 18.6). It read the number 0, and `pg_dump` — which tests the text
         // against "-" — wrote `SUPPORT 0` into every CREATE FUNCTION, a
         // syntax error on restore into PostgreSQL and into SPG alike.
-        ColumnSchema::new("prosupport", DataType::Text, false),
+        ColumnSchema::new("prosupport", DataType::RegProc, false),
         ColumnSchema::new("prokind", DataType::Char1, false),
         ColumnSchema::new("prosecdef", DataType::Bool, false),
         ColumnSchema::new("proleakproof", DataType::Bool, false),
@@ -6438,13 +6438,13 @@ pub(crate) fn synth_pg_proc(
             Value::BigInt(12), // prolang = internal
             Value::Float(1.0), // procost
             Value::Float(prorows),
-            Value::BigInt(0),         // provariadic
-            Value::text("-"),         // prosupport
-            char1(kind),              // prokind
-            Value::Bool(false),       // prosecdef
-            Value::Bool(false),       // proleakproof
-            Value::Bool(true),        // proisstrict
-            Value::Bool(kind == "w"), // proretset — window funcs return per-row sets
+            Value::BigInt(0),              // provariadic
+            Value::RegProc(0, "-".into()), // prosupport
+            char1(kind),                   // prokind
+            Value::Bool(false),            // prosecdef
+            Value::Bool(false),            // proleakproof
+            Value::Bool(true),             // proisstrict
+            Value::Bool(kind == "w"),      // proretset — window funcs return per-row sets
             char1(provolatile),
             char1("s"), // proparallel = safe
             Value::SmallInt(i16::try_from(nargs.max(0)).unwrap_or(i16::MAX)),
@@ -6494,8 +6494,8 @@ pub(crate) fn synth_pg_proc(
             Value::Float(def.cost.unwrap_or(100.0)),
             Value::Float(def.rows.unwrap_or(0.0)),
             Value::BigInt(0),
-            Value::text("-"), // prosupport
-            char1("f"),       // prokind — a normal function
+            Value::RegProc(0, "-".into()), // prosupport
+            char1("f"),                    // prokind — a normal function
             Value::Bool(def.security_definer),
             Value::Bool(def.leakproof),
             Value::Bool(def.strict),
