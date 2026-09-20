@@ -1488,10 +1488,10 @@ pub(crate) fn synth_pg_stat_progress_analyze(
 pub(crate) fn synth_pg_ts_config_map(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use crate::fts::{TokenType, TsDict};
     let schema = alloc::vec![
-        ColumnSchema::new("mapcfg", DataType::BigInt, false),
+        ColumnSchema::new("mapcfg", DataType::Oid, false),
         ColumnSchema::new("maptokentype", DataType::Int, false),
         ColumnSchema::new("mapseqno", DataType::Int, false),
-        ColumnSchema::new("mapdict", DataType::BigInt, false),
+        ColumnSchema::new("mapdict", DataType::Oid, false),
     ];
     const TYPES: &[TokenType] = &[
         TokenType::AsciiWord,
@@ -1542,11 +1542,11 @@ pub(crate) fn synth_pg_ts_config_map(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
 /// three of them are one piece of work.
 pub(crate) fn synth_pg_ts_config(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("cfgname", DataType::Name, false),
-        ColumnSchema::new("cfgnamespace", DataType::BigInt, false),
-        ColumnSchema::new("cfgowner", DataType::BigInt, false),
-        ColumnSchema::new("cfgparser", DataType::BigInt, false),
+        ColumnSchema::new("cfgnamespace", DataType::Oid, false),
+        ColumnSchema::new("cfgowner", DataType::Oid, false),
+        ColumnSchema::new("cfgparser", DataType::Oid, false),
     ];
     let rows = alloc::vec![
         Row::new(alloc::vec![
@@ -1569,11 +1569,11 @@ pub(crate) fn synth_pg_ts_config(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
 
 pub(crate) fn synth_pg_ts_dict(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("dictname", DataType::Name, false),
-        ColumnSchema::new("dictnamespace", DataType::BigInt, false),
-        ColumnSchema::new("dictowner", DataType::BigInt, false),
-        ColumnSchema::new("dicttemplate", DataType::BigInt, false),
+        ColumnSchema::new("dictnamespace", DataType::Oid, false),
+        ColumnSchema::new("dictowner", DataType::Oid, false),
+        ColumnSchema::new("dicttemplate", DataType::Oid, false),
         ColumnSchema::new("dictinitoption", DataType::Text, true),
     ];
     let rows = alloc::vec![
@@ -1599,9 +1599,9 @@ pub(crate) fn synth_pg_ts_dict(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 
 pub(crate) fn synth_pg_ts_parser(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("prsname", DataType::Name, false),
-        ColumnSchema::new("prsnamespace", DataType::BigInt, false),
+        ColumnSchema::new("prsnamespace", DataType::Oid, false),
         ColumnSchema::new("prsstart", DataType::BigInt, false),
         ColumnSchema::new("prstoken", DataType::BigInt, false),
         ColumnSchema::new("prsend", DataType::BigInt, false),
@@ -1627,9 +1627,9 @@ pub(crate) fn synth_pg_ts_parser(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
 
 pub(crate) fn synth_pg_ts_template(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("tmplname", DataType::Name, false),
-        ColumnSchema::new("tmplnamespace", DataType::BigInt, false),
+        ColumnSchema::new("tmplnamespace", DataType::Oid, false),
         ColumnSchema::new("tmplinit", DataType::BigInt, false),
         ColumnSchema::new("tmpllexize", DataType::BigInt, false),
     ];
@@ -1659,8 +1659,8 @@ pub(crate) fn synth_pg_ts_template(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
 pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_storage::PartitionRole;
     let schema = alloc::vec![
-        ColumnSchema::new("inhrelid", DataType::BigInt, false),
-        ColumnSchema::new("inhparent", DataType::BigInt, false),
+        ColumnSchema::new("inhrelid", DataType::Oid, false),
+        ColumnSchema::new("inhparent", DataType::Oid, false),
         ColumnSchema::new("inhseqno", DataType::Int, false),
         ColumnSchema::new("inhdetachpending", DataType::Bool, false),
     ];
@@ -1751,15 +1751,15 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// oid via the pg_am mapping, namespace is pg_catalog (11), owner 10.
 pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("opcmethod", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("opcmethod", DataType::Oid, false),
         ColumnSchema::new("opcname", DataType::Text, false),
-        ColumnSchema::new("opcnamespace", DataType::BigInt, false),
-        ColumnSchema::new("opcowner", DataType::BigInt, false),
-        ColumnSchema::new("opcfamily", DataType::BigInt, false),
-        ColumnSchema::new("opcintype", DataType::BigInt, false),
+        ColumnSchema::new("opcnamespace", DataType::Oid, false),
+        ColumnSchema::new("opcowner", DataType::Oid, false),
+        ColumnSchema::new("opcfamily", DataType::Oid, false),
+        ColumnSchema::new("opcintype", DataType::Oid, false),
         ColumnSchema::new("opcdefault", DataType::Bool, false),
-        ColumnSchema::new("opckeytype", DataType::BigInt, false),
+        ColumnSchema::new("opckeytype", DataType::Oid, false),
     ];
     let am_oid = |am: &str| -> i64 {
         match am {
@@ -1800,11 +1800,11 @@ pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// classes.
 pub(crate) fn synth_pg_opfamily(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("opfmethod", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("opfmethod", DataType::Oid, false),
         ColumnSchema::new("opfname", DataType::Text, false),
-        ColumnSchema::new("opfnamespace", DataType::BigInt, false),
-        ColumnSchema::new("opfowner", DataType::BigInt, false),
+        ColumnSchema::new("opfnamespace", DataType::Oid, false),
+        ColumnSchema::new("opfowner", DataType::Oid, false),
     ];
     let (oc_schema, oc_rows) = synth_pg_opclass(cat);
     let _ = oc_schema;
@@ -1828,25 +1828,25 @@ pub(crate) fn synth_pg_opfamily(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// pg_depend (also empty) to find extension-owned members.
 pub(crate) fn synth_pg_amop(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("amopfamily", DataType::BigInt, false),
-        ColumnSchema::new("amoplefttype", DataType::BigInt, false),
-        ColumnSchema::new("amoprighttype", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("amopfamily", DataType::Oid, false),
+        ColumnSchema::new("amoplefttype", DataType::Oid, false),
+        ColumnSchema::new("amoprighttype", DataType::Oid, false),
         ColumnSchema::new("amopstrategy", DataType::SmallInt, false),
         ColumnSchema::new("amoppurpose", DataType::Text, false),
-        ColumnSchema::new("amopopr", DataType::BigInt, false),
-        ColumnSchema::new("amopmethod", DataType::BigInt, false),
-        ColumnSchema::new("amopsortfamily", DataType::BigInt, false),
+        ColumnSchema::new("amopopr", DataType::Oid, false),
+        ColumnSchema::new("amopmethod", DataType::Oid, false),
+        ColumnSchema::new("amopsortfamily", DataType::Oid, false),
     ];
     (schema, Vec::new())
 }
 
 pub(crate) fn synth_pg_amproc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("amprocfamily", DataType::BigInt, false),
-        ColumnSchema::new("amproclefttype", DataType::BigInt, false),
-        ColumnSchema::new("amprocrighttype", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("amprocfamily", DataType::Oid, false),
+        ColumnSchema::new("amproclefttype", DataType::Oid, false),
+        ColumnSchema::new("amprocrighttype", DataType::Oid, false),
         ColumnSchema::new("amprocnum", DataType::SmallInt, false),
         ColumnSchema::new("amproc", DataType::BigInt, false),
     ];
@@ -1855,11 +1855,11 @@ pub(crate) fn synth_pg_amproc(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
 
 pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("classid", DataType::BigInt, false),
-        ColumnSchema::new("objid", DataType::BigInt, false),
+        ColumnSchema::new("classid", DataType::Oid, false),
+        ColumnSchema::new("objid", DataType::Oid, false),
         ColumnSchema::new("objsubid", DataType::Int, false),
-        ColumnSchema::new("refclassid", DataType::BigInt, false),
-        ColumnSchema::new("refobjid", DataType::BigInt, false),
+        ColumnSchema::new("refclassid", DataType::Oid, false),
+        ColumnSchema::new("refobjid", DataType::Oid, false),
         ColumnSchema::new("refobjsubid", DataType::Int, false),
         ColumnSchema::new("deptype", DataType::Char1, false),
     ];
@@ -2044,8 +2044,8 @@ fn nextval_target(default_text: &str) -> Option<String> {
 ///   * adbin (Text) — the default expression (pg_node_tree in PG)
 pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("adrelid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("adrelid", DataType::Oid, false),
         ColumnSchema::new("adnum", DataType::SmallInt, false),
         ColumnSchema::new("adbin", DataType::Text, false),
     ];
@@ -2096,9 +2096,9 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
 /// polroles (oid[]), polqual (pg_node_tree), polwithcheck (pg_node_tree).
 pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("polname", DataType::Text, false),
-        ColumnSchema::new("polrelid", DataType::BigInt, false),
+        ColumnSchema::new("polrelid", DataType::Oid, false),
         ColumnSchema::new("polcmd", DataType::Char1, false),
         ColumnSchema::new("polpermissive", DataType::Bool, false),
         ColumnSchema::new("polroles", DataType::Text, false),
@@ -2191,7 +2191,7 @@ pub(crate) fn synth_pg_largeobject(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
     /// PG's LOBLKSIZE (BLCKSZ/4 at the default 8 KB block).
     const PAGE: usize = 2048;
     let schema = alloc::vec![
-        ColumnSchema::new("loid", DataType::BigInt, false),
+        ColumnSchema::new("loid", DataType::Oid, false),
         ColumnSchema::new("pageno", DataType::Int, false),
         ColumnSchema::new("data", DataType::Bytes, false),
     ];
@@ -2216,8 +2216,8 @@ pub(crate) fn synth_pg_largeobject_metadata(
     cat: &Catalog,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("lomowner", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("lomowner", DataType::Oid, false),
         ColumnSchema::new("lomacl", DataType::Text, true),
     ];
     let rows: Vec<Row<'static>> = cat
@@ -2252,11 +2252,11 @@ pub(crate) fn synth_pg_largeobject_metadata(
 ///   * stxkeys (Text) — int2vector of column positions, flat
 pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("stxrelid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("stxrelid", DataType::Oid, false),
         ColumnSchema::new("stxname", DataType::Text, false),
-        ColumnSchema::new("stxnamespace", DataType::BigInt, false),
-        ColumnSchema::new("stxowner", DataType::BigInt, false),
+        ColumnSchema::new("stxnamespace", DataType::Oid, false),
+        ColumnSchema::new("stxowner", DataType::Oid, false),
         // v7.39 (round 543) — PG's order is stxkeys, stxstattarget,
         // stxkind, stxexprs; SPG had the first two swapped and the
         // other two missing.
@@ -2392,7 +2392,7 @@ pub(crate) fn synth_pg_statistic(
     stats: &crate::statistics::Statistics,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("starelid", DataType::BigInt, false),
+        ColumnSchema::new("starelid", DataType::Oid, false),
         ColumnSchema::new("staattnum", DataType::SmallInt, false),
         ColumnSchema::new("stainherit", DataType::Bool, false),
         ColumnSchema::new("stanullfrac", DataType::Float, false),
@@ -2559,7 +2559,7 @@ pub(crate) const fn am_oid_of(kind: &spg_storage::IndexKind) -> i64 {
 /// the join shape stable).
 pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("amname", DataType::Text, false),
         ColumnSchema::new("amhandler", DataType::BigInt, false),
         ColumnSchema::new("amtype", DataType::Char1, false), // 't' table / 'i' index
@@ -2644,10 +2644,10 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
 /// the candidate names, which is its own piece of work.
 pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("collname", DataType::Text, false),
-        ColumnSchema::new("collnamespace", DataType::BigInt, false),
-        ColumnSchema::new("collowner", DataType::BigInt, false),
+        ColumnSchema::new("collnamespace", DataType::Oid, false),
+        ColumnSchema::new("collowner", DataType::Oid, false),
         ColumnSchema::new("collprovider", DataType::Char1, false), // 'b'/'c'/'i'
         ColumnSchema::new("collisdeterministic", DataType::Bool, false),
         ColumnSchema::new("collencoding", DataType::Int, false),
@@ -2920,9 +2920,9 @@ pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
 /// queries don't get an empty join result.
 pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("spcname", DataType::Text, false),
-        ColumnSchema::new("spcowner", DataType::BigInt, false),
+        ColumnSchema::new("spcowner", DataType::Oid, false),
         ColumnSchema::new("spcacl", DataType::Text, true),
         ColumnSchema::new("spcoptions", DataType::Text, true),
     ];
@@ -2962,7 +2962,7 @@ pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
 pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("relid", DataType::BigInt, false),
-        ColumnSchema::new("indexrelid", DataType::BigInt, false),
+        ColumnSchema::new("indexrelid", DataType::Oid, false),
         ColumnSchema::new("schemaname", DataType::Text, false),
         ColumnSchema::new("relname", DataType::Text, false),
         ColumnSchema::new("indexrelname", DataType::Text, false),
@@ -3298,7 +3298,7 @@ pub(crate) fn synth_pg_stat_database(
 ///   * substream (Bool) — false (no streaming in-progress txs yet)
 pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("subdbid", DataType::BigInt, false),
         ColumnSchema::new("subname", DataType::Text, false),
         ColumnSchema::new("subowner", DataType::BigInt, false),
@@ -3384,7 +3384,7 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
 pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     use spg_sql::ast::PublicationScope;
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("pubname", DataType::Text, false),
         ColumnSchema::new("pubowner", DataType::BigInt, false),
         ColumnSchema::new("puballtables", DataType::Bool, false),
@@ -3610,8 +3610,8 @@ pub(crate) fn synth_information_schema_domains(
 ///   * enumlabel (Text) — the literal label
 pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("enumtypid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("enumtypid", DataType::Oid, false),
         ColumnSchema::new("enumsortorder", DataType::Float, false),
         ColumnSchema::new("enumlabel", DataType::Text, false),
     ];
@@ -4220,19 +4220,19 @@ pub(crate) fn namespace_oid_for_relname(name: &str) -> i64 {
 /// pg_class now lists.
 fn pg_class_schema() -> Vec<ColumnSchema> {
     alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("relname", DataType::Text, false),
-        ColumnSchema::new("relnamespace", DataType::BigInt, false),
-        ColumnSchema::new("reltype", DataType::BigInt, false),
-        ColumnSchema::new("reloftype", DataType::BigInt, false),
-        ColumnSchema::new("relowner", DataType::BigInt, false),
-        ColumnSchema::new("relam", DataType::BigInt, false),
-        ColumnSchema::new("relfilenode", DataType::BigInt, false),
-        ColumnSchema::new("reltablespace", DataType::BigInt, false),
+        ColumnSchema::new("relnamespace", DataType::Oid, false),
+        ColumnSchema::new("reltype", DataType::Oid, false),
+        ColumnSchema::new("reloftype", DataType::Oid, false),
+        ColumnSchema::new("relowner", DataType::Oid, false),
+        ColumnSchema::new("relam", DataType::Oid, false),
+        ColumnSchema::new("relfilenode", DataType::Oid, false),
+        ColumnSchema::new("reltablespace", DataType::Oid, false),
         ColumnSchema::new("relpages", DataType::Int, false),
         ColumnSchema::new("reltuples", DataType::Float, false),
         ColumnSchema::new("relallvisible", DataType::Int, false),
-        ColumnSchema::new("reltoastrelid", DataType::BigInt, false),
+        ColumnSchema::new("reltoastrelid", DataType::Oid, false),
         ColumnSchema::new("relhasindex", DataType::Bool, false),
         ColumnSchema::new("relisshared", DataType::Bool, false),
         ColumnSchema::new("relpersistence", DataType::Char1, false),
@@ -4750,7 +4750,7 @@ fn splice_pg_class_v18_schema(schema: &mut Vec<ColumnSchema>) {
     );
     schema.insert(
         PG_CLASS_RELISPARTITION + 1,
-        ColumnSchema::new("relrewrite", DataType::BigInt, false),
+        ColumnSchema::new("relrewrite", DataType::Oid, false),
     );
     schema.insert(
         PG_CLASS_RELALLVISIBLE + 1,
@@ -4879,9 +4879,9 @@ fn push_system_attributes(rows: &mut Vec<Row<'static>>, attrelid: i64) {
 /// back into the synth that calls it.
 fn pg_attribute_schema() -> Vec<ColumnSchema> {
     alloc::vec![
-        ColumnSchema::new("attrelid", DataType::BigInt, false),
+        ColumnSchema::new("attrelid", DataType::Oid, false),
         ColumnSchema::new("attname", DataType::Text, false),
-        ColumnSchema::new("atttypid", DataType::BigInt, false),
+        ColumnSchema::new("atttypid", DataType::Oid, false),
         ColumnSchema::new("attstattarget", DataType::Int, false),
         ColumnSchema::new("attlen", DataType::SmallInt, false),
         ColumnSchema::new("attnum", DataType::SmallInt, false),
@@ -4898,7 +4898,7 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("attisdropped", DataType::Bool, false),
         ColumnSchema::new("attislocal", DataType::Bool, false),
         ColumnSchema::new("attinhcount", DataType::Int, false),
-        ColumnSchema::new("attcollation", DataType::BigInt, false),
+        ColumnSchema::new("attcollation", DataType::Oid, false),
         // v7.39 (read01 round 59) — column-level privileges. NULL until a
         // `GRANT SELECT (col)` lands; a column grant never touches relacl.
         ColumnSchema::new("attacl", DataType::Text, true),
@@ -5399,6 +5399,10 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         DataType::Xid8 => 5069,
         DataType::Tid => 27,
         DataType::Cid => 29,
+        // 9.0.0 — the wire's own map had `oid` and this one did not, so a
+        // catalog column declared `oid` reported `atttypid` 0 and
+        // `format_type` answered `???`. Two maps, one question.
+        DataType::Oid => 26,
         DataType::RegClass => 2205,
         DataType::RegType => 2206,
         DataType::RegProc => 24,
@@ -5591,18 +5595,18 @@ pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
 /// same choice `pg_type`'s seven I/O-function OIDs made in round 543.
 pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("oprname", DataType::Text, false),
-        ColumnSchema::new("oprnamespace", DataType::BigInt, false),
-        ColumnSchema::new("oprowner", DataType::BigInt, false),
+        ColumnSchema::new("oprnamespace", DataType::Oid, false),
+        ColumnSchema::new("oprowner", DataType::Oid, false),
         ColumnSchema::new("oprkind", DataType::Char1, false),
         ColumnSchema::new("oprcanmerge", DataType::Bool, false),
         ColumnSchema::new("oprcanhash", DataType::Bool, false),
-        ColumnSchema::new("oprleft", DataType::BigInt, false),
-        ColumnSchema::new("oprright", DataType::BigInt, false),
-        ColumnSchema::new("oprresult", DataType::BigInt, false),
-        ColumnSchema::new("oprcom", DataType::BigInt, false),
-        ColumnSchema::new("oprnegate", DataType::BigInt, false),
+        ColumnSchema::new("oprleft", DataType::Oid, false),
+        ColumnSchema::new("oprright", DataType::Oid, false),
+        ColumnSchema::new("oprresult", DataType::Oid, false),
+        ColumnSchema::new("oprcom", DataType::Oid, false),
+        ColumnSchema::new("oprnegate", DataType::Oid, false),
         ColumnSchema::new("oprcode", DataType::BigInt, false),
         ColumnSchema::new("oprrest", DataType::BigInt, false),
         ColumnSchema::new("oprjoin", DataType::BigInt, false),
@@ -5922,10 +5926,10 @@ pub(crate) fn synth_pg_type(
     // shape matches PG exactly so introspection round-trips
     // succeed.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("typname", DataType::Text, false),
-        ColumnSchema::new("typnamespace", DataType::BigInt, false),
-        ColumnSchema::new("typowner", DataType::BigInt, false),
+        ColumnSchema::new("typnamespace", DataType::Oid, false),
+        ColumnSchema::new("typowner", DataType::Oid, false),
         ColumnSchema::new("typlen", DataType::SmallInt, false),
         ColumnSchema::new("typbyval", DataType::Bool, false),
         ColumnSchema::new("typtype", DataType::Char1, false),
@@ -5933,10 +5937,10 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typispreferred", DataType::Bool, false),
         ColumnSchema::new("typisdefined", DataType::Bool, false),
         ColumnSchema::new("typdelim", DataType::Char1, false),
-        ColumnSchema::new("typrelid", DataType::BigInt, false),
+        ColumnSchema::new("typrelid", DataType::Oid, false),
         ColumnSchema::new("typsubscript", DataType::Text, false),
-        ColumnSchema::new("typelem", DataType::BigInt, false),
-        ColumnSchema::new("typarray", DataType::BigInt, false),
+        ColumnSchema::new("typelem", DataType::Oid, false),
+        ColumnSchema::new("typarray", DataType::Oid, false),
         // v7.39 (round 543) — PG names the type's I/O functions here.
         // SPG's I/O is built into the engine and is not a catalogued
         // function, so there is no pg_proc row to point at; naming one
@@ -5954,10 +5958,10 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typalign", DataType::Char1, false),
         ColumnSchema::new("typstorage", DataType::Char1, false),
         ColumnSchema::new("typnotnull", DataType::Bool, false),
-        ColumnSchema::new("typbasetype", DataType::BigInt, false),
+        ColumnSchema::new("typbasetype", DataType::Oid, false),
         ColumnSchema::new("typtypmod", DataType::Int, false),
         ColumnSchema::new("typndims", DataType::Int, false),
-        ColumnSchema::new("typcollation", DataType::BigInt, false),
+        ColumnSchema::new("typcollation", DataType::Oid, false),
         // PG's last three; `pg_dump` selects typacl by name.
         ColumnSchema::new("typdefaultbin", DataType::Text, true),
         ColumnSchema::new("typdefault", DataType::Text, true),
@@ -6253,17 +6257,17 @@ pub(crate) const INFORMATION_SCHEMA_DOMAIN_OID_BASE: i64 = 13_500;
 /// `BEFORE INSERT … FOR EACH ROW` reads 7.
 pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("tgrelid", DataType::BigInt, false),
-        ColumnSchema::new("tgparentid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("tgrelid", DataType::Oid, false),
+        ColumnSchema::new("tgparentid", DataType::Oid, false),
         ColumnSchema::new("tgname", DataType::Text, false),
-        ColumnSchema::new("tgfoid", DataType::BigInt, false),
+        ColumnSchema::new("tgfoid", DataType::Oid, false),
         ColumnSchema::new("tgtype", DataType::SmallInt, false),
         ColumnSchema::new("tgenabled", DataType::Char1, false),
         ColumnSchema::new("tgisinternal", DataType::Bool, false),
-        ColumnSchema::new("tgconstrrelid", DataType::BigInt, false),
-        ColumnSchema::new("tgconstrindid", DataType::BigInt, false),
-        ColumnSchema::new("tgconstraint", DataType::BigInt, false),
+        ColumnSchema::new("tgconstrrelid", DataType::Oid, false),
+        ColumnSchema::new("tgconstrindid", DataType::Oid, false),
+        ColumnSchema::new("tgconstraint", DataType::Oid, false),
         ColumnSchema::new("tgdeferrable", DataType::Bool, false),
         ColumnSchema::new("tginitdeferred", DataType::Bool, false),
         ColumnSchema::new("tgnargs", DataType::SmallInt, false),
@@ -6336,14 +6340,14 @@ pub(crate) fn synth_pg_proc(
     // proisstrict for NULL-handling, provolatile / proparallel /
     // procost for planner annotations.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("proname", DataType::Text, false),
-        ColumnSchema::new("pronamespace", DataType::BigInt, false),
-        ColumnSchema::new("proowner", DataType::BigInt, false),
-        ColumnSchema::new("prolang", DataType::BigInt, false),
+        ColumnSchema::new("pronamespace", DataType::Oid, false),
+        ColumnSchema::new("proowner", DataType::Oid, false),
+        ColumnSchema::new("prolang", DataType::Oid, false),
         ColumnSchema::new("procost", DataType::Float, false),
         ColumnSchema::new("prorows", DataType::Float, false),
-        ColumnSchema::new("provariadic", DataType::BigInt, false),
+        ColumnSchema::new("provariadic", DataType::Oid, false),
         // v7.39 (round 543) — a planner-support function; SPG has none.
         // 8.0.3 — a `regproc`, which prints `-` for "none" (measured on
         // 18.6). It read the number 0, and `pg_dump` — which tests the text
@@ -6359,7 +6363,7 @@ pub(crate) fn synth_pg_proc(
         ColumnSchema::new("proparallel", DataType::Char1, false),
         ColumnSchema::new("pronargs", DataType::SmallInt, false),
         ColumnSchema::new("pronargdefaults", DataType::SmallInt, false),
-        ColumnSchema::new("prorettype", DataType::BigInt, false),
+        ColumnSchema::new("prorettype", DataType::Oid, false),
         // v7.39.11 — PG's own type; see the row builder below.
         ColumnSchema::new("proargtypes", DataType::OidVector, false),
         ColumnSchema::new("proallargtypes", DataType::Text, true),
@@ -8286,9 +8290,9 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
     // c.conrelid = p.oid` (ORM relationship-graph builders) now
     // resolve rows correctly.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("conname", DataType::Text, false),
-        ColumnSchema::new("connamespace", DataType::BigInt, false),
+        ColumnSchema::new("connamespace", DataType::Oid, false),
         ColumnSchema::new("contype", DataType::Char1, false),
         ColumnSchema::new("condeferrable", DataType::Bool, false),
         ColumnSchema::new("condeferred", DataType::Bool, false),
@@ -8296,11 +8300,11 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         // every constraint it accepts, so this is always true.
         ColumnSchema::new("conenforced", DataType::Bool, false),
         ColumnSchema::new("convalidated", DataType::Bool, false),
-        ColumnSchema::new("conrelid", DataType::BigInt, false),
-        ColumnSchema::new("contypid", DataType::BigInt, false),
-        ColumnSchema::new("conindid", DataType::BigInt, false),
-        ColumnSchema::new("conparentid", DataType::BigInt, false),
-        ColumnSchema::new("confrelid", DataType::BigInt, false),
+        ColumnSchema::new("conrelid", DataType::Oid, false),
+        ColumnSchema::new("contypid", DataType::Oid, false),
+        ColumnSchema::new("conindid", DataType::Oid, false),
+        ColumnSchema::new("conparentid", DataType::Oid, false),
+        ColumnSchema::new("confrelid", DataType::Oid, false),
         ColumnSchema::new("confupdtype", DataType::Char1, false),
         ColumnSchema::new("confdeltype", DataType::Char1, false),
         ColumnSchema::new("confmatchtype", DataType::Char1, false),
@@ -8692,7 +8696,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
     // It also named the database `postgres` while `current_database()`
     // answers `spg`, so a client joining the two found no row at all.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("datname", DataType::Text, false),
         ColumnSchema::new("datdba", DataType::BigInt, false),
         ColumnSchema::new("encoding", DataType::Int, false),
@@ -8805,7 +8809,7 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("rolvaliduntil", DataType::Timestamptz, true),
         ColumnSchema::new("rolbypassrls", DataType::Bool, false),
         ColumnSchema::new("rolconfig", DataType::TextArray, true),
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
     ];
     // 8.0.3 — every role, numbered once (see `role_directory`). The
     // bootstrap superuser is oid 10 and PostgreSQL's predefined roles carry
@@ -8905,7 +8909,7 @@ pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'sta
 /// `pg_auth_members JOIN pg_roles ON roleid = oid` join resolves.
 pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("roleid", DataType::BigInt, false),
         ColumnSchema::new("member", DataType::BigInt, false),
         ColumnSchema::new("grantor", DataType::BigInt, false),
@@ -9325,7 +9329,7 @@ pub(crate) fn synth_empty_pg_catalog(view: &str) -> Option<(Vec<ColumnSchema>, V
 /// divergence, recorded rather than silently taken.
 pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("rolname", DataType::Text, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
         ColumnSchema::new("rolinherit", DataType::Bool, false),
@@ -9477,7 +9481,7 @@ pub(crate) fn synth_pg_db_role_setting(engine: &Engine) -> (Vec<ColumnSchema>, V
 /// pg_type's typinput.
 pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("lanname", DataType::Text, false),
         ColumnSchema::new("lanowner", DataType::BigInt, false),
         ColumnSchema::new("lanispl", DataType::Bool, false),
@@ -9696,10 +9700,10 @@ pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, V
 /// this round.
 pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
-        ColumnSchema::new("castsource", DataType::BigInt, false),
-        ColumnSchema::new("casttarget", DataType::BigInt, false),
-        ColumnSchema::new("castfunc", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
+        ColumnSchema::new("castsource", DataType::Oid, false),
+        ColumnSchema::new("casttarget", DataType::Oid, false),
+        ColumnSchema::new("castfunc", DataType::Oid, false),
         ColumnSchema::new("castcontext", DataType::Char1, false),
         ColumnSchema::new("castmethod", DataType::Char1, false),
     ];
@@ -9945,10 +9949,10 @@ pub(crate) fn synth_pg_extension(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // namespace 11 (pg_catalog), not relocatable, and NULL for both
     // array columns.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("extname", DataType::Text, false),
-        ColumnSchema::new("extowner", DataType::BigInt, false),
-        ColumnSchema::new("extnamespace", DataType::BigInt, false),
+        ColumnSchema::new("extowner", DataType::Oid, false),
+        ColumnSchema::new("extnamespace", DataType::Oid, false),
         ColumnSchema::new("extrelocatable", DataType::Bool, false),
         ColumnSchema::new("extversion", DataType::Text, false),
         ColumnSchema::new("extconfig", DataType::TextArray, true),
@@ -10467,7 +10471,7 @@ pub(crate) fn render_rule_def(
 /// was no way to reach a rule by oid at all.
 pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("rulename", DataType::Text, false),
         ColumnSchema::new("ev_class", DataType::BigInt, false),
         ColumnSchema::new("ev_type", DataType::Text, false),
@@ -11873,8 +11877,8 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // explorer + sqlx introspection query, so the columns
     // dashboards walk are populated from live catalog state.
     let schema = alloc::vec![
-        ColumnSchema::new("indexrelid", DataType::BigInt, false),
-        ColumnSchema::new("indrelid", DataType::BigInt, false),
+        ColumnSchema::new("indexrelid", DataType::Oid, false),
+        ColumnSchema::new("indrelid", DataType::Oid, false),
         ColumnSchema::new("indnatts", DataType::SmallInt, false),
         ColumnSchema::new("indnkeyatts", DataType::SmallInt, false),
         ColumnSchema::new("indisunique", DataType::Bool, false),
@@ -12060,9 +12064,9 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // postgres` and a GRANT/REVOKE block for an owner PostgreSQL does not
     // have.
     let schema = alloc::vec![
-        ColumnSchema::new("oid", DataType::BigInt, false),
+        ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("nspname", DataType::Text, false),
-        ColumnSchema::new("nspowner", DataType::BigInt, false),
+        ColumnSchema::new("nspowner", DataType::Oid, false),
         // v7.39 (read01 round 60) — the schema ACL. Never NULL for `public`:
         // PG ships it with PUBLIC holding USAGE (but NOT create).
         ColumnSchema::new("nspacl", DataType::Text, true),

@@ -7895,7 +7895,23 @@ fn encode_binary_cell(out: &mut Vec<u8>, v: &Value, ty: DataType) -> Result<(), 
         Value::Int(n) => put(&n.to_be_bytes()),
         // 9.0.0 — an `oid` is four bytes in binary; its cell is a BigInt
         // (see `DataType::Oid`), so only the declared type can say so.
-        Value::BigInt(n) if ty == DataType::Oid => put(&(*n as u32).to_be_bytes()),
+        // 9.0.0 — four bytes for the 32-bit identifier types whose CELL is
+        // a BigInt: PostgreSQL 18.6 sends `oid`, `xid`, `cid` and the reg
+        // family as a u32, and the catalogs hold all of them as plain
+        // integers. Only the declared type can say which.
+        Value::BigInt(n)
+            if matches!(
+                ty,
+                DataType::Oid
+                    | DataType::Xid
+                    | DataType::Cid
+                    | DataType::RegClass
+                    | DataType::RegType
+                    | DataType::RegProc
+            ) =>
+        {
+            put(&(*n as u32).to_be_bytes());
+        }
         Value::BigInt(n) => put(&n.to_be_bytes()),
         // 9.0.0 — the system and reference types, which had no binary
         // arm at all: every driver that asks for binary results — sqlx,

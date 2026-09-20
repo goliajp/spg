@@ -731,26 +731,27 @@ fn extract_join_keys<'a>(
     // else keeps the residual path it has today.
     Vec<(usize, &'a Expr, &'a Expr)>,
     Vec<&'a Expr>,
-    // v7.38.14 — one flag per `eq_pairs` entry: may this key's TEXT fold?
+    // v7.38.14 — one entry per `eq_pairs` key: may this key's TEXT fold?
     // Resolved once here from the two columns' declared collations, never
     // per row, and read by BOTH the build side and the probe side. A mask
     // consulted on one side only would scatter equal rows across buckets
     // and stop the join matching entirely -- the trap 3b494b6e names for
     // DISTINCT's hash and comparator.
-    Vec<bool>,
+    // 9.0.0 — and whether the key compares as float8; see `JoinKeyMode`.
+    Vec<aggregate::JoinKeyMode>,
 ) {
     let mut eq_pairs: Vec<(usize, usize)> = Vec::new();
-    let mut eq_folds: Vec<bool> = Vec::new();
+    let mut eq_modes: Vec<aggregate::JoinKeyMode> = Vec::new();
     let mut eq_exprs: Vec<(usize, &Expr, &Expr)> = Vec::new();
     let mut eq_probe_exprs: Vec<(usize, &Expr, &Expr)> = Vec::new();
     let mut residual: Vec<&Expr> = Vec::new();
     if let (Some(on_expr), None) = (peer.on, peer.lateral) {
         for sub in reorder::split_and_conjunctions(on_expr) {
             if let Some(pair) = match_equi_pair(sub, peer, combined_schema, consumed_cols) {
-                let folds = equi_pair_folds(pair, peer, combined_schema, mysql);
+                let mode = equi_pair_mode(pair, peer, combined_schema, mysql);
                 eq_pairs.push(pair);
-                eq_folds.push(folds);
-                if folds {
+                eq_modes.push(mode);
+                if mode.fold {
                     // Fold-equal is COARSER than byte-equal, so the hash can
                     // now bring together rows that are not actually equal
                     // under any collation. Keeping the conjunct in `residual`
@@ -781,7 +782,7 @@ fn extract_join_keys<'a>(
             residual.push(sub);
         }
     }
-    (eq_pairs, eq_exprs, eq_probe_exprs, residual, eq_folds)
+    (eq_pairs, eq_exprs, eq_probe_exprs, residual, eq_modes)
 }
 
 /// v7.39 (round 720) — one conjunct as `<peer plain column> = <integer-only
@@ -1562,7 +1563,7 @@ impl Engine {
             }
             let right_arity = peer.cols.len();
             let peer_mask = keep_mask(needed, &peer.cols, &peer.alias);
-            let (mut eq_pairs, eq_exprs, eq_probe_exprs, residual, mut eq_folds) =
+            let (mut eq_pairs, eq_exprs, eq_probe_exprs, residual, mut eq_modes) =
                 extract_join_keys(
                     peer,
                     &combined_schema,
@@ -1579,17 +1580,16 @@ impl Engine {
                         match_equi_pair(cand, peer, &combined_schema, pipe.consumed_cols)
                         && !eq_pairs.contains(&pair)
                     {
-                        // v7.38.14 — `eq_folds` has to grow WITH `eq_pairs`,
+                        // v7.38.14 — `eq_modes` has to grow WITH `eq_pairs`,
                         // or the mask stops lining up with the key it
                         // describes. This site used to push the pair alone,
                         // which is why `FROM l, r WHERE l.s = r.s` stayed
                         // byte-wise and answered 0 while the `JOIN ... ON`
                         // spelling of the same query answered correctly.
-                        let folds =
-                            equi_pair_folds(pair, peer, &combined_schema, self.speaks_mysql);
+                        let mode = equi_pair_mode(pair, peer, &combined_schema, self.speaks_mysql);
                         eq_pairs.push(pair);
-                        eq_folds.push(folds);
-                        if folds {
+                        eq_modes.push(mode);
+                        if mode.fold {
                             // Left OUT of `pushed_set` on purpose: the
                             // conjunct stays in the WHERE and is re-checked
                             // by the comparator, because a folded key is
@@ -1645,7 +1645,7 @@ impl Engine {
                     &eq_exprs,
                     &eq_probe_exprs,
                     &residual,
-                    &eq_folds,
+                    &eq_modes,
                     &peer_mask,
                     right_arity,
                     &combined_schema,
@@ -1946,7 +1946,7 @@ impl Engine {
         residual: &[&Expr],
         // v7.38.14 — one flag per `eq_pairs` entry; see `extract_join_keys`.
         // The build and probe halves below both read it, and must.
-        eq_folds: &[bool],
+        eq_modes: &[aggregate::JoinKeyMode],
         peer_mask: &Option<Vec<bool>>,
         right_arity: usize,
         combined_schema: &[ColumnSchema],
@@ -2488,9 +2488,9 @@ impl Engine {
                 }
             }
             // v7.38.14 — the BUILD half of the fold. Its twin is the probe
-            // side below; they must read the same `eq_folds` or the hash
+            // side below; they must read the same `eq_modes` or the hash
             // stops matching altogether.
-            aggregate::encode_key_refs_folded(&keybuf, &mut keystr, eq_folds);
+            aggregate::encode_join_key_refs(&keybuf, &mut keystr, eq_modes);
             // v7.39 (round 590) — then the computed components, in the order
             // the probe will read them. A NULL never matches under `=`, so a
             // row whose key expression is NULL joins nothing and is left out
@@ -2628,7 +2628,7 @@ impl Engine {
                 }
                 if !left_has_null {
                     // v7.38.14 — the PROBE half; same mask as the build side.
-                    aggregate::encode_key_refs_folded(&probebuf, &mut keystr, eq_folds);
+                    aggregate::encode_join_key_refs(&probebuf, &mut keystr, eq_modes);
                     for (lpos, _, _) in eq_exprs {
                         match tuple_value(&pipe.sources, &pipe.offsets, tuple, *lpos) {
                             Some(v) if !matches!(v, Value::Null) => {
@@ -4734,20 +4734,30 @@ fn analyze_join_pushdown<'w>(
 ///
 /// An explicit `COLLATE utf8mb4_bin` on EITHER side keeps the pair
 /// byte-wise, mirroring `eval::resolve::mysql_text_fold_applies`.
-fn equi_pair_folds(
+fn equi_pair_mode(
     pair: (usize, usize),
     peer: &JoinedPeer<'_>,
     combined_schema: &[ColumnSchema],
     mysql: bool,
-) -> bool {
-    mysql
-        && combined_schema
-            .get(pair.0)
-            .is_some_and(|c| c.collation != spg_storage::Collation::Binary)
-        && peer
-            .cols
-            .get(pair.1)
-            .is_some_and(|c| c.collation != spg_storage::Collation::Binary)
+) -> aggregate::JoinKeyMode {
+    let left = combined_schema.get(pair.0);
+    let right = peer.cols.get(pair.1);
+    let fold = mysql
+        && left.is_some_and(|c| c.collation != spg_storage::Collation::Binary)
+        && right.is_some_and(|c| c.collation != spg_storage::Collation::Binary);
+    // 9.0.0 — a float on EITHER side makes PostgreSQL compare in float8.
+    let is_float = |c: Option<&ColumnSchema>| {
+        c.is_some_and(|c| {
+            matches!(
+                c.ty,
+                spg_storage::DataType::Float | spg_storage::DataType::Real
+            )
+        })
+    };
+    aggregate::JoinKeyMode {
+        fold,
+        as_float: is_float(left) || is_float(right),
+    }
 }
 
 fn build_combined_schema(
