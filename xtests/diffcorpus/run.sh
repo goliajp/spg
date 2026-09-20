@@ -213,6 +213,19 @@ for f in "${files[@]}"; do
     norm     < "$OUT/$n.$side.raw"  > "$OUT/$n.$side"
     norm_err < "$OUT/$n.$side.eraw" > "$OUT/$n.$side.err"
   done
+  # 9.0.0 — an EMPTY leg is not agreement. A run with a bad path
+  # (`run.sh 20-pg-trgm.sql` instead of `xtests/diffcorpus/20-pg-trgm.sql`)
+  # failed the INPUT redirect, so neither `.raw` was ever created, `diff`
+  # errored on two missing files, the `grep -c` over diff's own error
+  # message counted 0 — and the file was reported IDENTICAL. The
+  # instrument's failure looked exactly like its success.
+  for side in spg pg; do
+    if [ ! -s "$OUT/$n.$side" ] && [ ! -s "$OUT/$n.$side.err" ]; then
+      printf '%-28s LEG PRODUCED NOTHING (%s) — not a comparison\n' "$n" "$side" >&2
+      rc=2
+      continue 2
+    fi
+  done
   d_out=0; d_err=0
   diff -u "$OUT/$n.pg"     "$OUT/$n.spg"     > "$OUT/$n.diff"     2>&1 || d_out=$(grep -cE '^[+-][^+-]' "$OUT/$n.diff")
   diff -u "$OUT/$n.pg.err" "$OUT/$n.spg.err" > "$OUT/$n.diff.err" 2>&1 || d_err=$(grep -cE '^[+-][^+-]' "$OUT/$n.diff.err")
