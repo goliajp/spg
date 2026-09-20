@@ -6192,8 +6192,16 @@ pub(super) fn compare(
         (a, b)
             if (matches!(a, Value::Numeric { .. } | Value::NumericBig(_))
                 || matches!(b, Value::Numeric { .. } | Value::NumericBig(_)))
-                && !matches!(a.data_type(), Some(DataType::Float))
-                && !matches!(b.data_type(), Some(DataType::Float)) =>
+                // 9.0.0 — `Real` belongs beside `Float` here. It was
+                // missing, so `(Real, Numeric)` entered this arm, `widen`
+                // declined it, and the answer was `operator does not
+                // exist: real < numeric` — for `WHERE abs(r) < 0.5`,
+                // `WHERE (r + 0.0::real) < 0.5`, `WHERE 0.5 > abs(r)`, all
+                // of which PostgreSQL 18.6 answers. The float arm just
+                // below already pairs the two types; only this guard did
+                // not, so the pair never reached it.
+                && !matches!(a.data_type(), Some(DataType::Float | DataType::Real))
+                && !matches!(b.data_type(), Some(DataType::Float | DataType::Real)) =>
         {
             // r1039 — a NaN or an Infinity is not its canonical zero.
             // Same rule the owning path uses, from the same function.
