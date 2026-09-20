@@ -6931,6 +6931,118 @@ impl Catalog {
         Ok(())
     }
 
+    /// 9.0.0 — `ALTER VIEW old RENAME TO new`. It was a silent no-op:
+    /// the parser's consume-to-boundary tail reported success and the
+    /// view kept its name, so a migration that renamed a view left the
+    /// old one in place and the new one nowhere.
+    ///
+    /// The owner entry moves with it — `object_owners` is keyed by name,
+    /// so leaving it behind would hand the renamed view the default
+    /// owner and hand the NEXT view of the old name this one's.
+    pub fn rename_view(&mut self, old: &str, new: &str) -> Result<(), StorageError> {
+        if !self.views.contains_key(old) {
+            return Err(StorageError::TableNotFound {
+                name: String::from(old),
+            });
+        }
+        if self.relation_name_taken(new) {
+            return Err(StorageError::DuplicateTable {
+                name: String::from(new),
+            });
+        }
+        self.mark_nontable_dirty(NonTableKind::View, old);
+        self.mark_nontable_dirty(NonTableKind::View, new);
+        if let Some(mut def) = self.views.remove(old) {
+            def.name = String::from(new);
+            self.views.insert(String::from(new), def);
+        }
+        self.move_object_owner(NonTableKind::View, old, new);
+        Ok(())
+    }
+
+    /// 9.0.0 — `ALTER MATERIALIZED VIEW old RENAME TO new`: the source
+    /// registry entry and the backing table move together, because a
+    /// materialized view here is the pair.
+    pub fn rename_materialized_view(&mut self, old: &str, new: &str) -> Result<(), StorageError> {
+        if !self.materialized_views.contains_key(old) {
+            return Err(StorageError::TableNotFound {
+                name: String::from(old),
+            });
+        }
+        if self.relation_name_taken(new) {
+            return Err(StorageError::DuplicateTable {
+                name: String::from(new),
+            });
+        }
+        self.rename_table(old, new)?;
+        self.mark_nontable_dirty(NonTableKind::MaterializedView, old);
+        self.mark_nontable_dirty(NonTableKind::MaterializedView, new);
+        if let Some(body) = self.materialized_views.remove(old) {
+            self.materialized_views.insert(String::from(new), body);
+        }
+        self.move_object_owner(NonTableKind::MaterializedView, old, new);
+        Ok(())
+    }
+
+    /// 9.0.0 — `ALTER TYPE old RENAME TO new`, for whichever of the three
+    /// user type maps holds it. `false` = no such type.
+    ///
+    /// The caller checks first and words both refusals, because `type "x"
+    /// does not exist` is PostgreSQL's sentence for a type and nothing in
+    /// `StorageError` says it. Returning the bool keeps the membership
+    /// test where the rename is rather than growing a second one.
+    pub fn rename_type(&mut self, old: &str, new: &str) -> bool {
+        let kind = if self.enum_types.contains_key(old) {
+            NonTableKind::EnumType
+        } else if self.composite_types.contains_key(old) {
+            NonTableKind::CompositeType
+        } else if self.domain_types.contains_key(old) {
+            NonTableKind::DomainType
+        } else {
+            return false;
+        };
+        self.mark_nontable_dirty(kind, old);
+        self.mark_nontable_dirty(kind, new);
+        match kind {
+            NonTableKind::EnumType => {
+                if let Some(mut def) = self.enum_types.remove(old) {
+                    def.name = String::from(new);
+                    self.enum_types.insert(String::from(new), def);
+                }
+            }
+            NonTableKind::CompositeType => {
+                if let Some(mut def) = self.composite_types.remove(old) {
+                    def.name = String::from(new);
+                    self.composite_types.insert(String::from(new), def);
+                }
+            }
+            NonTableKind::DomainType => {
+                if let Some(mut def) = self.domain_types.remove(old) {
+                    def.name = String::from(new);
+                    self.domain_types.insert(String::from(new), def);
+                }
+            }
+            _ => unreachable!("kind is one of the three set just above"),
+        }
+        self.move_object_owner(kind, old, new);
+        true
+    }
+
+    /// 9.0.0 — is `name` already a table, a view or a sequence? PG puts
+    /// all three in one namespace, so a rename has to ask all three.
+    fn relation_name_taken(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
+            || self.views.contains_key(name)
+            || self.sequences.contains_key(name)
+    }
+
+    /// 9.0.0 — carry an owner entry across a rename.
+    fn move_object_owner(&mut self, kind: NonTableKind, old: &str, new: &str) {
+        if let Some(owner) = self.object_owners.remove(&(kind, String::from(old))) {
+            self.object_owners.insert((kind, String::from(new)), owner);
+        }
+    }
+
     /// v7.17.0 Phase 1.2 — remove a view by name. Returns true if
     /// a view was removed.
     pub fn drop_view(&mut self, name: &str) -> bool {

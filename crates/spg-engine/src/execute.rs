@@ -2357,6 +2357,19 @@ impl Engine {
                     modified_catalog: self.catalog_change_is_committed(),
                 })
             }
+            // 9.0.0 — `ALTER {VIEW|MATERIALIZED VIEW|TYPE} … RENAME TO`,
+            // which reported success and kept the old name.
+            Statement::AlterObjectRename {
+                kind,
+                name,
+                new_name,
+            } => {
+                self.exec_alter_object_rename(kind, &name, &new_name)?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: self.catalog_change_is_committed(),
+                })
+            }
             Statement::ValidateOnly { kind, names } => {
                 use spg_sql::ast::ValidateOnlyKind as K;
                 match kind {

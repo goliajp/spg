@@ -134,11 +134,12 @@ pub struct SetDbRoleSettingStatement {
     pub value: Option<String>,
 }
 
-/// 9.0.0 — the object kinds `ALTER … OWNER TO` names besides a table.
-/// `Type` covers all three of enum, composite and domain: which one a
-/// name is is the catalog's to say, not the parser's.
+/// 9.0.0 — the object kinds `ALTER … OWNER TO` and `ALTER … RENAME TO`
+/// name besides a table. `Type` covers all three of enum, composite and
+/// domain: which one a name is is the catalog's to say, not the
+/// parser's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OwnedObjectKind {
+pub enum AlterObjectKind {
     Sequence,
     View,
     MaterializedView,
@@ -320,9 +321,18 @@ pub enum Statement {
     /// and then did nothing, so a dump re-created them all under the
     /// restoring role.
     AlterObjectOwner {
-        kind: OwnedObjectKind,
+        kind: AlterObjectKind,
         name: String,
         role: String,
+    },
+    /// 9.0.0 — `ALTER {VIEW|MATERIALIZED VIEW|TYPE} <name> RENAME TO
+    /// <new>`. The sequence form worked; these three reported success
+    /// and kept the old name, so the renamed object was nowhere and the
+    /// old one was still there.
+    AlterObjectRename {
+        kind: AlterObjectKind,
+        name: String,
+        new_name: String,
     },
     ValidateOnly {
         kind: ValidateOnlyKind,
@@ -3944,13 +3954,15 @@ impl Statement {
             Self::CreateDomain { .. } => Some("CREATE DOMAIN"),
             Self::AlterDomain { .. } => Some("ALTER DOMAIN"),
             // 9.0.0 — ALTER <object> OWNER TO writes the catalog.
-            Self::AlterObjectOwner { kind, .. } => Some(match kind {
-                OwnedObjectKind::Sequence => "ALTER SEQUENCE",
-                OwnedObjectKind::View => "ALTER VIEW",
-                OwnedObjectKind::MaterializedView => "ALTER MATERIALIZED VIEW",
-                OwnedObjectKind::Type => "ALTER TYPE",
-                OwnedObjectKind::Function => "ALTER FUNCTION",
-            }),
+            Self::AlterObjectRename { kind, .. } | Self::AlterObjectOwner { kind, .. } => {
+                Some(match kind {
+                    AlterObjectKind::Sequence => "ALTER SEQUENCE",
+                    AlterObjectKind::View => "ALTER VIEW",
+                    AlterObjectKind::MaterializedView => "ALTER MATERIALIZED VIEW",
+                    AlterObjectKind::Type => "ALTER TYPE",
+                    AlterObjectKind::Function => "ALTER FUNCTION",
+                })
+            }
             Self::DropDomain { .. } => Some("DROP DOMAIN"),
             Self::CreateSchema { .. } => Some("CREATE SCHEMA"),
             Self::DropSchema { .. } => Some("DROP SCHEMA"),
@@ -6141,7 +6153,7 @@ impl Statement {
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
             Statement::ValidateOnly { .. } => false,
-            Statement::AlterObjectOwner { .. } => false,
+            Statement::AlterObjectOwner { .. } | Statement::AlterObjectRename { .. } => false,
             // v7.39 (round 750) — a credential rotation persists.
             Statement::AlterRolePassword { .. } => true,
             Statement::DropAggregate { .. } => false,
@@ -6454,13 +6466,32 @@ impl fmt::Display for Statement {
                 }
                 Ok(())
             }
+            Self::AlterObjectRename {
+                kind,
+                name,
+                new_name,
+            } => {
+                let what = match kind {
+                    AlterObjectKind::Sequence => "SEQUENCE",
+                    AlterObjectKind::View => "VIEW",
+                    AlterObjectKind::MaterializedView => "MATERIALIZED VIEW",
+                    AlterObjectKind::Type => "TYPE",
+                    AlterObjectKind::Function => "FUNCTION",
+                };
+                write!(
+                    f,
+                    "ALTER {what} {} RENAME TO {}",
+                    quote_ident(name),
+                    quote_ident(new_name)
+                )
+            }
             Self::AlterObjectOwner { kind, name, role } => {
                 let what = match kind {
-                    OwnedObjectKind::Sequence => "SEQUENCE",
-                    OwnedObjectKind::View => "VIEW",
-                    OwnedObjectKind::MaterializedView => "MATERIALIZED VIEW",
-                    OwnedObjectKind::Type => "TYPE",
-                    OwnedObjectKind::Function => "FUNCTION",
+                    AlterObjectKind::Sequence => "SEQUENCE",
+                    AlterObjectKind::View => "VIEW",
+                    AlterObjectKind::MaterializedView => "MATERIALIZED VIEW",
+                    AlterObjectKind::Type => "TYPE",
+                    AlterObjectKind::Function => "FUNCTION",
                 };
                 write!(
                     f,
