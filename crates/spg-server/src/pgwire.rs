@@ -5280,6 +5280,35 @@ fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
                 // later a caret by default; this way a new message has to
                 // ask for one.
                 let (_, msg) = engine_error_to_wire(other);
+                // 9.0.0 — `invalid input syntax for type T: "v"` points at
+                // the LITERAL, not at the call: measured on PG 18.6,
+                // `SELECT abs('x')` and `SELECT 1 + 'x'` both draw their
+                // caret under `'x'`.
+                if let Some(v) = msg
+                    .strip_prefix("invalid input syntax for type ")
+                    .and_then(|rest| rest.split('"').nth(1))
+                {
+                    return spg_sql::parser::string_literal_position(
+                        sql,
+                        spg_sql::lexer::Dialect::PG,
+                        v,
+                    );
+                }
+                // 9.0.0 — `function f(...) does not exist` and
+                // `function f(...) is not unique` point at the NAME, which
+                // the message carries unquoted. Measured: `SELECT upper(1)`
+                // and `SELECT unnest('x')` both draw their caret under the
+                // function name.
+                if let Some(rest) = msg.strip_prefix("function ")
+                    && (msg.contains("does not exist") || msg.contains("is not unique"))
+                    && let Some((fname, _)) = rest.split_once('(')
+                {
+                    return spg_sql::parser::identifier_position(
+                        sql,
+                        spg_sql::lexer::Dialect::PG,
+                        fname.trim(),
+                    );
+                }
                 let positioned = msg.contains("does not exist")
                     || msg.contains("is ambiguous")
                     || msg.contains("missing FROM-clause entry")

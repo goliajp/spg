@@ -121,14 +121,54 @@ fn a_bare_string_literal_is_unknown_not_text() {
 }
 
 #[test]
-fn a_lone_unknown_literal_keeps_the_evaluators_sentence() {
+fn a_lone_unknown_literal_is_committed_to_the_candidate() {
+    // 9.0.0 — this pin RECORDED the divergence; it asserts PostgreSQL's
+    // answer now. PG commits a lone unknown literal to the only
+    // candidate's type and reports the input function's error, and for
+    // the numeric family that type is `double precision`, the preferred
+    // type of the category. Measured on 18.6 for all five.
     let mut e = Engine::new();
-    // Recorded, not claimed: PG answers `invalid input syntax for type
-    // double precision: "x"` here, and a rewrite to `function
-    // abs(unknown) does not exist` would be a second wrong answer.
-    let got = err(&mut e, "SELECT abs('x')");
-    assert!(!got.contains("does not exist"), "{got}");
-    assert!(got.contains("got text"), "{got}");
+    for sql in [
+        "SELECT abs('x')",
+        "SELECT sqrt('x')",
+        "SELECT ceil('x')",
+        "SELECT ln('x')",
+        "SELECT round('x')",
+    ] {
+        let got = err(&mut e, sql);
+        assert!(
+            got.contains("invalid input syntax for type double precision: \"x\""),
+            "{sql}: {got}"
+        );
+    }
+    // A TYPED argument is a different question, and it already matched.
+    let got = err(&mut e, "SELECT abs('x'::text)");
+    assert!(got.contains("function abs(text) does not exist"), "{got}");
+}
+
+#[test]
+fn an_unknown_literal_beside_a_typed_operand_reports_the_input_error() {
+    // Measured on PG 18.6: `1 + 'x'`, `'x' + 1`, `1 - 'x'` answer
+    // `invalid input syntax for type integer: "x"` and `1.5 + 'x'`
+    // answers the numeric one. The comparison spelling `1 = 'x'` already
+    // matched, and must keep matching.
+    let mut e = Engine::new();
+    for (sql, ty) in [
+        ("SELECT 1 + 'x'", "integer"),
+        ("SELECT 'x' + 1", "integer"),
+        ("SELECT 1 - 'x'", "integer"),
+        ("SELECT 1.5 + 'x'", "numeric"),
+        ("SELECT 1 = 'x'", "integer"),
+    ] {
+        let got = err(&mut e, sql);
+        assert!(
+            got.contains(&format!("invalid input syntax for type {ty}: \"x\"")),
+            "{sql}: {got}"
+        );
+    }
+    // And the shapes that ANSWER keep answering.
+    e.execute("SELECT 'a' || 1").expect("concat");
+    e.execute("SELECT 1 + 2").expect("addition");
 }
 
 #[test]

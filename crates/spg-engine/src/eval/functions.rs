@@ -20734,7 +20734,7 @@ mod arity_table_generator {
         // `=> {`, so a one-line arm — `"host" => inet::inet_host(args),`,
         // which is most of them — was invisible. The consequence was not
         // a missing row but a WRONG SENTENCE: names outside the table are
-        // never refused before the scan, so `SELECT host('"'"'a'"'"','"'"'b'"'"')` fell
+        // never refused before the scan, so `SELECT host('a','b')` fell
         // through to row time, where a literal has become `text` and the
         // signature read `host(text, text)` where PostgreSQL 18.6 says
         // `host(unknown, unknown)`.
@@ -20760,10 +20760,21 @@ mod arity_table_generator {
         ] {
             for line in src.lines() {
                 let t = line.trim();
-                // Everything left of the arm'"'"'s `=>`; a line without one
-                // is not an arm.
-                let Some(head) = t.split_once("=>").map(|(h, _)| h) else {
-                    continue;
+                // Everything left of the arm's `=>`; a line without one
+                // is not an arm — EXCEPT a continuation line of a
+                // multi-line arm, which starts with `|`.
+                //
+                // 9.0.0 — that exception was missing, so a name on a
+                // continuation line was invisible: `strict_word_similarity_op`
+                // was absent from the table while its three siblings in the
+                // SAME arm were present, because each of those happens to
+                // appear on an `=>` line somewhere else in the file.
+                // Under-refusal is the module's safe direction, but the tool
+                // was covering less than it looked like it did.
+                let head = match t.split_once("=>") {
+                    Some((h, _)) => h,
+                    None if t.starts_with('|') => t,
+                    None => continue,
                 };
                 let mut rest = head;
                 while let Some(i) = rest.find('"') {
