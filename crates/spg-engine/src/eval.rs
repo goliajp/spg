@@ -2514,6 +2514,66 @@ fn name_untyped_concat_operands(e: EvalError, lhs: &Expr, rhs: &Expr) -> EvalErr
     }
 }
 
+/// 9.0.0 — the same rewrite as [`unknown_literal_cmp_error`], reading the
+/// other side's type from the EXPRESSION rather than from the value.
+///
+/// The comparison path already holds both values; the arithmetic path
+/// moves them into `apply_binary`, and cloning them to keep a copy grew
+/// `eval_expr`'s frame enough to trip the stack-depth guard — this
+/// repository's recorded frame cliff, caught by its own pin. Out of line
+/// and value-free, it costs the hot path nothing.
+#[inline(never)]
+fn unknown_literal_operand_error(
+    err: EvalError,
+    lhs: &Expr,
+    rhs: &Expr,
+    ctx: &EvalContext<'_>,
+) -> EvalError {
+    let EvalError::TypeMismatch { detail } = &err else {
+        return err;
+    };
+    if !detail.starts_with("operator does not exist")
+        && !detail.starts_with("cannot convert text to")
+        && !detail.starts_with("NUMERIC op against non-numeric")
+    {
+        return err;
+    }
+    let numeric = |t: spg_storage::DataType| {
+        matches!(
+            t,
+            spg_storage::DataType::SmallInt
+                | spg_storage::DataType::Int
+                | spg_storage::DataType::BigInt
+                | spg_storage::DataType::Float
+                | spg_storage::DataType::Real
+                | spg_storage::DataType::Numeric { .. }
+        )
+    };
+    let text_of = |e: &Expr| match e {
+        Expr::Literal(spg_sql::ast::Literal::String(t)) => Some(t.clone()),
+        _ => None,
+    };
+    for (lit, other) in [(lhs, rhs), (rhs, lhs)] {
+        if !is_unknown_string_literal(lit) {
+            continue;
+        }
+        let Some(text) = text_of(lit) else { continue };
+        let Some(ty) = crate::describe::describe_expr_type(other, ctx.columns) else {
+            continue;
+        };
+        if !numeric(ty) {
+            continue;
+        }
+        return EvalError::TypeMismatch {
+            detail: alloc::format!(
+                "invalid input syntax for type {}: \"{text}\"",
+                crate::conversions::pg_type_name_for_error(ty)
+            ),
+        };
+    }
+    err
+}
+
 fn unknown_literal_cmp_error(
     err: EvalError,
     lhs: &Expr,
@@ -2528,8 +2588,11 @@ fn unknown_literal_cmp_error(
     // and the owned numeric path's conversion error (`f = 'y'` reaches
     // "cannot convert text to FLOAT"). Both mean the literal failed to
     // lift; neither is what PG says about an unknown literal.
+    // 9.0.0 — the numeric path has a third spelling for the same
+    // fall-through (`1.5 + 'x'` reaches "NUMERIC op against non-numeric").
     if !detail.starts_with("operator does not exist")
         && !detail.starts_with("cannot convert text to")
+        && !detail.starts_with("NUMERIC op against non-numeric")
     {
         return err;
     }
@@ -3845,11 +3908,27 @@ fn name_the_call_pg_s_way(
     }
     // A lone bare string literal is the one shape PostgreSQL answers
     // differently again: it commits the literal to the only candidate's
-    // type and reports the input function's error (`abs('x')` is
-    // `invalid input syntax for type double precision`). That needs a
-    // per-function candidate table this does not have, so the call
-    // keeps its own sentence.
+    // type and reports the INPUT FUNCTION's error.
+    //
+    // 9.0.0 — for the numeric family that candidate is `double
+    // precision`, which is the preferred type of the numeric category,
+    // and the answer is the same sentence for every one of them.
+    // Measured on PG 18.6: `abs('x')`, `sqrt('x')`, `ceil('x')`,
+    // `ln('x')`, `round('x')` and `abs('')` all answer
+    // `invalid input syntax for type double precision: "x"`. SPG said
+    // `abs() needs numeric, got text`. A TYPED argument is a different
+    // question and already matched (`abs('x'::text)` is
+    // `function abs(text) does not exist` on both).
     if args.len() == 1 && is_unknown_string_literal(&args[0]) {
+        let needs_numeric = ours.is_some_and(|(head, _)| head.contains("needs numeric"))
+            || detail.contains("needs numeric");
+        if needs_numeric && let Expr::Literal(spg_sql::ast::Literal::String(text)) = &args[0] {
+            return EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "invalid input syntax for type double precision: \"{text}\""
+                ),
+            };
+        }
         return err;
     }
     if already_named && !args.iter().any(is_unknown_string_literal) {
@@ -5861,9 +5940,22 @@ pub fn eval_expr(
                 // branch on the op.
                 let untyped = matches!(op, spg_sql::ast::BinOp::Concat)
                     && (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs));
+                // 9.0.0 — an unknown literal beside a TYPED operand is
+                // committed to that type and reported as the input
+                // function's error, for arithmetic as well as for
+                // comparison. Measured on PG 18.6: `1 + 'x'`, `1 - 'x'`,
+                // `'x' + 1` and `1.5 + 'x'` all answer
+                // `invalid input syntax for type …: "x"`, where SPG named
+                // the operator instead. The comparison spelling
+                // (`1 = 'x'`) already matched — one rewriter, two callers
+                // now.
+                let unknown_here =
+                    !untyped && (is_unknown_string_literal(lhs) || is_unknown_string_literal(rhs));
                 binop::apply_binary(*op, l, r).map_err(|e| {
                     if untyped {
                         name_untyped_concat_operands(e, lhs, rhs)
+                    } else if unknown_here {
+                        unknown_literal_operand_error(e, lhs, rhs, ctx)
                     } else {
                         e
                     }

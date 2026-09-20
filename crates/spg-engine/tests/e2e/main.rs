@@ -1052,6 +1052,7 @@ mod e2e_unknown_collation_v7392;
 mod e2e_unknown_column_streaming_v7392;
 mod e2e_unknown_literal_bool_round620;
 mod e2e_unlogged_table;
+mod e2e_unnest_non_array_900;
 mod e2e_unnest_tsvector_round758;
 mod e2e_unsigned_cast_round527;
 mod e2e_updatability_probes;

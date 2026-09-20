@@ -734,6 +734,24 @@ pub fn identifier_position(input: &str, dialect: lexer::Dialect, name: &str) -> 
     Some(input[..byte_off].chars().count() + 1)
 }
 
+/// 9.0.0 — the 1-based character position of a STRING LITERAL spelling
+/// `value`, for the errors PostgreSQL points at the literal rather than
+/// at the call: measured on 18.6, `SELECT abs('x')` draws its caret under
+/// `'x'` and `SELECT 1 + 'x'` likewise, both reporting
+/// `invalid input syntax for type …: "x"`.
+#[must_use]
+pub fn string_literal_position(input: &str, dialect: lexer::Dialect, value: &str) -> Option<usize> {
+    let (tokens, offsets) = lexer::tokenize_with_offsets(input, dialect).ok()?;
+    let i = tokens
+        .iter()
+        .position(|t| matches!(t, Token::String(s) if s == value))?;
+    let byte_off = *offsets.get(i)?;
+    if byte_off > input.len() || !input.is_char_boundary(byte_off) {
+        return None;
+    }
+    Some(input[..byte_off].chars().count() + 1)
+}
+
 /// v7.39 (read01 round 95) — recover PG's 1-based CHARACTER error position for
 /// a [`ParseError::token_pos`]. Kept off the `ParseError` struct (and so off
 /// every recursive `Result` slot) to protect the nesting-budget frame cliff:

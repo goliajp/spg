@@ -120,8 +120,7 @@ fn only_the_families_postgresql_positions_get_a_caret() {
     ] {
         assert_eq!(position_of(&mut s, sql), None, "{sql}");
     }
-    // A position, measured on PG 18.6 — the four families the locator
-    // still serves.
+    // A position, measured on PG 18.6 — the families the locator serves.
     for sql in [
         "SELECT nosuch FROM cz",
         "SELECT * FROM cz WHERE x.a = 1",
@@ -130,6 +129,15 @@ fn only_the_families_postgresql_positions_get_a_caret() {
     ] {
         assert!(position_of(&mut s, sql).is_some(), "{sql}");
     }
+    // 9.0.0 — and the two families that point somewhere ELSE than the
+    // first quoted word. Measured on PG 18.6 with the caret column:
+    //   SELECT abs('x')   -> 20, under the literal
+    //   SELECT upper(1)   -> 16, under the function name
+    assert_eq!(
+        position_of(&mut s, "SELECT abs('x')").as_deref(),
+        Some("12")
+    );
+    assert_eq!(position_of(&mut s, "SELECT upper(1)").as_deref(), Some("8"));
 }
 
 /// The `P` field of the ErrorResponse `sql` raises, if it carries one.
