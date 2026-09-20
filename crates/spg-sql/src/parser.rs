@@ -7408,6 +7408,94 @@ impl Parser {
     /// Called by [`parse_plpgsql_body`] after the body's tokens
     /// have been lexed into this temporary parser.
     pub(crate) fn parse_plpgsql_block(&mut self) -> Result<PlPgSqlBlock, ParseError> {
+        let label = self.parse_plpgsql_opt_label()?;
+        self.parse_plpgsql_block_labeled(label)
+    }
+
+    /// 9.0.0 — the optional `<<label>>` a block or a loop may carry. The
+    /// lexer reads `<<` as the inet containment operator and `>>` as its
+    /// mirror; at statement position inside a plpgsql body neither can be
+    /// an operator, because a label is the only thing either can open.
+    fn parse_plpgsql_opt_label(&mut self) -> Result<Option<String>, ParseError> {
+        if !matches!(self.peek(), Token::InetContainedBy) {
+            return Ok(None);
+        }
+        self.advance();
+        let name = self.expect_ident_like()?;
+        if !matches!(self.peek(), Token::InetContains) {
+            return Err(self.err(alloc::format!(
+                "expected >> after label, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        Ok(Some(name))
+    }
+
+    /// 9.0.0 — the loop or block name an `EXIT` / `CONTINUE` may carry
+    /// before its optional `WHEN`. `WHEN` itself is an identifier here,
+    /// so it is the one word that is not a label.
+    fn parse_plpgsql_jump_label(&mut self) -> Option<String> {
+        let (Token::Ident(name) | Token::QuotedIdent(name)) = self.peek().clone() else {
+            return None;
+        };
+        if name.eq_ignore_ascii_case("when") {
+            return None;
+        }
+        self.advance();
+        Some(name)
+    }
+
+    /// 9.0.0 — the optional `WHEN <cond>` of an `EXIT` / `CONTINUE`.
+    fn parse_plpgsql_opt_when(&mut self) -> Result<Option<Expr>, ParseError> {
+        if !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+            if s.eq_ignore_ascii_case("when"))
+        {
+            return Ok(None);
+        }
+        self.advance();
+        Ok(Some(self.parse_expr(0)?))
+    }
+
+    /// 9.0.0 — `END LOOP [label]`, in one place. Five copies of this
+    /// check had grown, one per loop shape, so the end label could only
+    /// have been taught to one of them.
+    fn expect_end_loop(&mut self, label: Option<&str>, what: &str) -> Result<(), ParseError> {
+        let end_kw = self.expect_ident_like()?;
+        if !end_kw.eq_ignore_ascii_case("end") {
+            return Err(self.err(alloc::format!(
+                "expected END LOOP after {what} body, got {end_kw:?}"
+            )));
+        }
+        let loop_kw = self.expect_ident_like()?;
+        if !loop_kw.eq_ignore_ascii_case("loop") {
+            return Err(self.err(alloc::format!(
+                "expected END LOOP after {what} body, got END {loop_kw:?}"
+            )));
+        }
+        if let Token::Ident(end_label) | Token::QuotedIdent(end_label) = self.peek().clone() {
+            self.advance();
+            match label {
+                None => {
+                    return Err(self.err(alloc::format!(
+                        "end label \"{end_label}\" specified for unlabeled block"
+                    )));
+                }
+                Some(l) if !l.eq_ignore_ascii_case(&end_label) => {
+                    return Err(self.err(alloc::format!(
+                        "end label \"{end_label}\" differs from block's label \"{l}\""
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_plpgsql_block_labeled(
+        &mut self,
+        label: Option<String>,
+    ) -> Result<PlPgSqlBlock, ParseError> {
         // v7.12.6 — optional DECLARE prelude.
         let declarations = if matches!(
             self.peek(),
@@ -7443,7 +7531,38 @@ impl Parser {
         } else {
             Vec::new()
         };
+        // 9.0.0 — the block's own END, with the optional end label
+        // PostgreSQL checks against the block's. This used to be left
+        // for the caller, which was only possible while a block could
+        // not contain another one.
+        if !matches!(
+            self.peek(),
+            Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("end")
+        ) {
+            return Err(self.err(alloc::format!(
+                "expected END at the end of a plpgsql block, got {:?}",
+                self.peek()
+            )));
+        }
+        self.advance();
+        if let Token::Ident(end_label) | Token::QuotedIdent(end_label) = self.peek().clone() {
+            self.advance();
+            match &label {
+                None => {
+                    return Err(self.err(alloc::format!(
+                        "end label \"{end_label}\" specified for unlabeled block"
+                    )));
+                }
+                Some(l) if !l.eq_ignore_ascii_case(&end_label) => {
+                    return Err(self.err(alloc::format!(
+                        "end label \"{end_label}\" differs from block's label \"{l}\""
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         Ok(PlPgSqlBlock {
+            label,
             declarations,
             statements,
             exception_handlers,
@@ -7631,6 +7750,30 @@ impl Parser {
     }
 
     fn parse_plpgsql_stmt(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        // 9.0.0 — the optional `<<label>>` that may precede a nested
+        // block or any of the five loop shapes.
+        let label = self.parse_plpgsql_opt_label()?;
+        // 9.0.0 — a nested block. Any statement position may hold one,
+        // and both of its openings are unambiguous here: `BEGIN` is not
+        // a transaction statement inside a body (PostgreSQL refuses that
+        // spelling), and a statement never starts with `DECLARE`.
+        if matches!(self.peek(), Token::Begin)
+            || matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("declare"))
+        {
+            let block = self.parse_plpgsql_block_labeled(label)?;
+            return Ok(PlPgSqlStmt::Block(alloc::boxed::Box::new(block)));
+        }
+        if label.is_some()
+            && !matches!(self.peek(), Token::For)
+            && !matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s)
+                if s.eq_ignore_ascii_case("loop") || s.eq_ignore_ascii_case("while"))
+        {
+            return Err(self.err(alloc::format!(
+                "expected BEGIN, DECLARE, LOOP, WHILE or FOR after a label, got {:?}",
+                self.peek()
+            )));
+        }
         // 8.0.3 — `NULL;`, PL/pgSQL's no-op, and the body of the commonest
         // handler there is: `EXCEPTION WHEN others THEN NULL;`. It was a
         // syntax error. Represented as an IF with no branches, which runs
@@ -7710,22 +7853,12 @@ impl Parser {
                 )));
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
-            let end_kw = self.expect_ident_like()?;
-            if !end_kw.eq_ignore_ascii_case("end") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR IN EXECUTE body, got {end_kw:?}"
-                )));
-            }
-            let loop_kw2 = self.expect_ident_like()?;
-            if !loop_kw2.eq_ignore_ascii_case("loop") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR IN EXECUTE body, got END {loop_kw2:?}"
-                )));
-            }
+            self.expect_end_loop(label.as_deref(), "FOR IN EXECUTE")?;
             return Ok(PlPgSqlStmt::ForExecute {
                 var,
                 sql_expr,
                 body,
+                label,
             });
         }
         // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
@@ -7819,22 +7952,12 @@ impl Parser {
                 )));
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
-            let end_kw = self.expect_ident_like()?;
-            if !end_kw.eq_ignore_ascii_case("end") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR IN SELECT body, got {end_kw:?}"
-                )));
-            }
-            let loop_kw2 = self.expect_ident_like()?;
-            if !loop_kw2.eq_ignore_ascii_case("loop") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR IN SELECT body, got END {loop_kw2:?}"
-                )));
-            }
+            self.expect_end_loop(label.as_deref(), "FOR IN SELECT")?;
             return Ok(PlPgSqlStmt::ForQuery {
                 var,
                 query: Box::new(query),
                 body,
+                label,
             });
         }
         // v7.37.20 (20.4) — FOR <var> IN [REVERSE] <start>..<end> LOOP.
@@ -7878,24 +8001,14 @@ impl Parser {
                 )));
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
-            let end_kw = self.expect_ident_like()?;
-            if !end_kw.eq_ignore_ascii_case("end") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR body, got {end_kw:?}"
-                )));
-            }
-            let loop_kw2 = self.expect_ident_like()?;
-            if !loop_kw2.eq_ignore_ascii_case("loop") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after FOR body, got END {loop_kw2:?}"
-                )));
-            }
+            self.expect_end_loop(label.as_deref(), "FOR")?;
             return Ok(PlPgSqlStmt::ForRange {
                 var,
                 start,
                 end,
                 reverse,
                 body,
+                label,
             });
         }
         // v7.37.20 (20.2) — bare `LOOP <body> END LOOP;`.
@@ -7903,32 +8016,19 @@ impl Parser {
         {
             self.advance();
             let body = self.parse_plpgsql_stmt_list_until_end()?;
-            let end_kw = self.expect_ident_like()?;
-            if !end_kw.eq_ignore_ascii_case("end") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after LOOP body, got {end_kw:?}"
-                )));
-            }
-            let loop_kw = self.expect_ident_like()?;
-            if !loop_kw.eq_ignore_ascii_case("loop") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after LOOP body, got END {loop_kw:?}"
-                )));
-            }
-            return Ok(PlPgSqlStmt::Loop { body });
+            self.expect_end_loop(label.as_deref(), "LOOP")?;
+            return Ok(PlPgSqlStmt::Loop { body, label });
         }
-        // v7.37.20 (20.2) — `EXIT [WHEN <cond>]` inside a loop.
+        // v7.37.20 (20.2) — `EXIT [<label>] [WHEN <cond>]`.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exit"))
         {
             self.advance();
-            let when = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when"))
-            {
-                self.advance();
-                Some(self.parse_expr(0)?)
-            } else {
-                None
-            };
-            return Ok(PlPgSqlStmt::Exit { when });
+            let target = self.parse_plpgsql_jump_label();
+            let when = self.parse_plpgsql_opt_when()?;
+            return Ok(PlPgSqlStmt::Exit {
+                when,
+                label: target,
+            });
         }
         // v7.37.20 (20.13) — `EXECUTE <string_expr>`. Dispatches an
         // already-parsed Statement or a runtime-computed SQL string.
@@ -7942,18 +8042,16 @@ impl Parser {
             let sql = self.parse_expr(0)?;
             return Ok(PlPgSqlStmt::ExecuteDynamic { sql });
         }
-        // v7.37.20 (20.2) — `CONTINUE [WHEN <cond>]` inside a loop.
+        // v7.37.20 (20.2) — `CONTINUE [<label>] [WHEN <cond>]`.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("continue"))
         {
             self.advance();
-            let when = if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("when"))
-            {
-                self.advance();
-                Some(self.parse_expr(0)?)
-            } else {
-                None
-            };
-            return Ok(PlPgSqlStmt::Continue { when });
+            let target = self.parse_plpgsql_jump_label();
+            let when = self.parse_plpgsql_opt_when()?;
+            return Ok(PlPgSqlStmt::Continue {
+                when,
+                label: target,
+            });
         }
         // v7.37.20 (20.3) — WHILE <cond> LOOP <body> END LOOP.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("while"))
@@ -7967,20 +8065,12 @@ impl Parser {
                 )));
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
-            // Expect END LOOP.
-            let end_kw = self.expect_ident_like()?;
-            if !end_kw.eq_ignore_ascii_case("end") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after WHILE body, got {end_kw:?}"
-                )));
-            }
-            let loop_kw2 = self.expect_ident_like()?;
-            if !loop_kw2.eq_ignore_ascii_case("loop") {
-                return Err(self.err(alloc::format!(
-                    "expected END LOOP after WHILE body, got END {loop_kw2:?}"
-                )));
-            }
-            return Ok(PlPgSqlStmt::While { condition, body });
+            self.expect_end_loop(label.as_deref(), "WHILE")?;
+            return Ok(PlPgSqlStmt::While {
+                condition,
+                body,
+                label,
+            });
         }
         // v7.12.6 — RAISE.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("raise"))

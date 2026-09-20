@@ -220,7 +220,14 @@ impl Engine {
                 self.resolve_expr_subqueries(e, cancel)?;
             }
         }
-        self.resolve_plpgsql_stmts_subqueries(&mut block.statements, cancel)
+        self.resolve_plpgsql_stmts_subqueries(&mut block.statements, cancel)?;
+        // 9.0.0 — and the handler bodies, which this walker skipped: a
+        // subquery inside `EXCEPTION WHEN others THEN x := (SELECT …)`
+        // reached the trigger-flavoured evaluator unresolved.
+        for h in &mut block.exception_handlers {
+            self.resolve_plpgsql_stmts_subqueries(&mut h.body, cancel)?;
+        }
+        Ok(())
     }
 
     fn resolve_plpgsql_stmts_subqueries(
@@ -231,6 +238,9 @@ impl Engine {
         use spg_sql::ast::PlPgSqlStmt;
         for stmt in stmts {
             match stmt {
+                PlPgSqlStmt::Block(b) => {
+                    self.resolve_plpgsql_block_subqueries(b, cancel)?;
+                }
                 PlPgSqlStmt::Assign { value, .. } => {
                     self.resolve_expr_subqueries(value, cancel)?;
                 }
@@ -267,7 +277,9 @@ impl Engine {
                         self.resolve_expr_subqueries(m, cancel)?;
                     }
                 }
-                PlPgSqlStmt::While { condition, body } => {
+                PlPgSqlStmt::While {
+                    condition, body, ..
+                } => {
                     self.resolve_expr_subqueries(condition, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
@@ -278,15 +290,15 @@ impl Engine {
                     self.resolve_expr_subqueries(end, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::Loop { body } => {
+                PlPgSqlStmt::Loop { body, .. } => {
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::Exit { when } => {
+                PlPgSqlStmt::Exit { when, label } => {
                     if let Some(cond) = when {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }
                 }
-                PlPgSqlStmt::Continue { when } => {
+                PlPgSqlStmt::Continue { when, label } => {
                     if let Some(cond) = when {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }

@@ -10,6 +10,36 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — nested PL/pgSQL blocks, and the labels that name them
+
+`DO $$ BEGIN BEGIN NULL; END; END; $$` was a syntax error. Any statement
+position in PL/pgSQL may hold a `[<<label>>] [DECLARE …] BEGIN … END`
+block — it is how a body scopes a variable or catches an exception
+around part of itself — and none of it parsed: bare, with a DECLARE
+prelude, or with an EXCEPTION clause. A TOP-LEVEL `EXCEPTION` handler
+did work, which is why the gap stayed hidden.
+
+Labels went with it: `<<lp>> FOR … END LOOP lp`, `EXIT <label>` and
+`CONTINUE <label>` were all syntax errors, so a body could not leave an
+outer loop from an inner one at all.
+
+Measured against PostgreSQL 18.6 and now matching, sentence for
+sentence: an inner `DECLARE x` shadows the outer `x` for the block and
+the outer value is back afterwards, while an assignment to a name the
+inner block did not declare reaches the outer one and survives; an inner
+`EXCEPTION` catches and the outer block carries on; `EXIT <label>`
+leaves the loop *or* the block that carries it and `CONTINUE <label>`
+resumes that loop; `END <label>` must agree with the block's
+(`end label "b" differs from block's label "a"`) and an end label on an
+unlabelled block is an error.
+
+Two things this touched on the way: `END LOOP` was checked in five
+copies, one per loop shape, so the end label could only ever have been
+taught to one of them — they are one function now; and the walker that
+pre-resolves the subqueries in a body skipped the EXCEPTION handler
+bodies, so `WHEN others THEN x := (SELECT …)` reached the evaluator
+unresolved.
+
 ### Fixed — the last 27 catalog columns, and the three readers behind them
 
 `pg_node_tree` (12 columns — every stored expression a catalog holds:

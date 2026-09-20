@@ -2058,6 +2058,10 @@ pub enum FunctionBody {
 /// may; deferred to a future minor release.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlPgSqlBlock {
+    /// 9.0.0 — the optional `<<label>>` a block may carry. PostgreSQL
+    /// requires the `END <label>` that names one to agree with it, and
+    /// refuses an end label on a block that has none.
+    pub label: Option<String>,
     /// v7.12.6 — `DECLARE var TYPE [:= init_expr];` declarations
     /// preceding `BEGIN`. Empty when the body opens directly with
     /// `BEGIN`. Declarations execute in order; each may reference
@@ -2099,6 +2103,12 @@ pub struct PlPgSqlDeclare {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlPgSqlStmt {
+    /// 9.0.0 — a nested `[<<label>>] [DECLARE …] BEGIN … END` block.
+    /// Any statement position in PL/pgSQL may hold one, which is how a
+    /// body scopes a variable or catches an exception around part of
+    /// itself. It was a syntax error: `DO $$ BEGIN BEGIN NULL; END;
+    /// END; $$` did not parse, with or without an EXCEPTION clause.
+    Block(Box<PlPgSqlBlock>),
     /// `NEW.col := expr;` or `OLD.col := expr;`. OLD is parsed
     /// for clarity in error reporting (PG also forbids it) — the
     /// executor errors with a clear "OLD is read-only" message.
@@ -2184,6 +2194,10 @@ pub enum PlPgSqlStmt {
     While {
         condition: Expr,
         body: Vec<PlPgSqlStmt>,
+        /// 9.0.0 — the optional `<<label>>` this loop carries, which
+        /// `EXIT <label>` / `CONTINUE <label>` name and `END LOOP <label>`
+        /// must agree with.
+        label: Option<String>,
     },
     /// v7.37.20 (20.4) — `FOR <var> IN [REVERSE] <start>..<end> LOOP
     /// <body> END LOOP;`. Integer iteration; `var` is BigInt-valued;
@@ -2195,21 +2209,40 @@ pub enum PlPgSqlStmt {
         end: Expr,
         reverse: bool,
         body: Vec<PlPgSqlStmt>,
+        /// 9.0.0 — the optional `<<label>>` this loop carries, which
+        /// `EXIT <label>` / `CONTINUE <label>` name and `END LOOP <label>`
+        /// must agree with.
+        label: Option<String>,
     },
     /// v7.37.20 (20.2) — bare `LOOP <body> END LOOP;`. Runs the body
     /// repeatedly; only `EXIT [WHEN <cond>]` breaks out. Iteration
     /// budget guards runaway.
-    Loop { body: Vec<PlPgSqlStmt> },
+    Loop {
+        body: Vec<PlPgSqlStmt>,
+        /// 9.0.0 — the optional `<<label>>` this loop carries, which
+        /// `EXIT <label>` / `CONTINUE <label>` name and `END LOOP <label>`
+        /// must agree with.
+        label: Option<String>,
+    },
     /// v7.37.20 (20.2) — `EXIT [WHEN <condition>];` inside a loop.
     /// Unconditional (no WHEN) or conditional (only breaks when
     /// condition is truthy). Bubbles up as BodyOutcome::Break which
     /// the enclosing loop catches. Outside a loop it's a no-op.
-    Exit { when: Option<Expr> },
+    Exit {
+        when: Option<Expr>,
+        /// 9.0.0 — `EXIT <label>` leaves the loop OR block that carries
+        /// that label, not merely the innermost loop.
+        label: Option<String>,
+    },
     /// v7.37.20 (20.2) — `CONTINUE [WHEN <condition>];` inside a
     /// loop. Same shape as EXIT but bubbles up as BodyOutcome::Continue
     /// which the enclosing loop catches, skipping the remainder of
     /// the body and jumping to the next iteration.
-    Continue { when: Option<Expr> },
+    Continue {
+        when: Option<Expr>,
+        /// 9.0.0 — `CONTINUE <label>` resumes the loop that carries it.
+        label: Option<String>,
+    },
     /// v7.37.20 (20.13) — `EXECUTE <string_expr>;` runs a runtime-
     /// computed SQL statement. The expression is evaluated to a
     /// text value, the resulting string is parsed and dispatched
@@ -2229,6 +2262,10 @@ pub enum PlPgSqlStmt {
         var: String,
         query: Box<SelectStatement>,
         body: Vec<PlPgSqlStmt>,
+        /// 9.0.0 — the optional `<<label>>` this loop carries, which
+        /// `EXIT <label>` / `CONTINUE <label>` name and `END LOOP <label>`
+        /// must agree with.
+        label: Option<String>,
     },
     /// v7.37.20 (20.6) — `FOR <var> IN EXECUTE <string_expr> LOOP
     /// <body> END LOOP;`. Same shape as ForQuery but the SELECT is
@@ -2239,6 +2276,10 @@ pub enum PlPgSqlStmt {
         var: String,
         sql_expr: Expr,
         body: Vec<PlPgSqlStmt>,
+        /// 9.0.0 — the optional `<<label>>` this loop carries, which
+        /// `EXIT <label>` / `CONTINUE <label>` name and `END LOOP <label>`
+        /// must agree with.
+        label: Option<String>,
     },
 }
 
@@ -7528,6 +7569,9 @@ impl fmt::Display for CreateFunctionStatement {
 
 impl fmt::Display for PlPgSqlBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(l) = &self.label {
+            writeln!(f, "<<{l}>>")?;
+        }
         if !self.declarations.is_empty() {
             f.write_str("DECLARE\n")?;
             for d in &self.declarations {
@@ -7561,13 +7605,40 @@ impl fmt::Display for PlPgSqlBlock {
                 }
             }
         }
-        f.write_str("END")
+        f.write_str("END")?;
+        // The end label is optional to PostgreSQL, and rendering it
+        // keeps a labelled block re-parseable as the labelled block it
+        // was — `END` alone would silently drop the name `EXIT <label>`
+        // refers to.
+        if let Some(l) = &self.label {
+            write!(f, " {l}")?;
+        }
+        Ok(())
+    }
+}
+
+/// 9.0.0 — a loop's `<<label>>` prefix, when it has one.
+fn write_loop_label(f: &mut fmt::Formatter<'_>, label: Option<&str>) -> fmt::Result {
+    match label {
+        Some(l) => writeln!(f, "<<{l}>>"),
+        None => Ok(()),
+    }
+}
+
+/// 9.0.0 — `END LOOP [label]`. The label is optional to PostgreSQL, and
+/// keeping it is what makes a rendered body re-parse as the same loop an
+/// `EXIT <label>` elsewhere in it refers to.
+fn write_end_loop(f: &mut fmt::Formatter<'_>, label: Option<&str>) -> fmt::Result {
+    match label {
+        Some(l) => write!(f, "END LOOP {l}"),
+        None => f.write_str("END LOOP"),
     }
 }
 
 impl fmt::Display for PlPgSqlStmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Block(b) => write!(f, "{b}"),
             Self::Assign { target, value } => write!(f, "{target} := {value}"),
             Self::SelectInto { var, body } => write!(f, "{body} INTO {var}"),
             Self::ReturnNext(e) => write!(f, "RETURN NEXT {e}"),
@@ -7673,12 +7744,17 @@ impl fmt::Display for PlPgSqlStmt {
                 }
                 Ok(())
             }
-            Self::While { condition, body } => {
+            Self::While {
+                condition,
+                body,
+                label,
+            } => {
+                write_loop_label(f, label.as_deref())?;
                 writeln!(f, "WHILE {condition} LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
-                f.write_str("END LOOP")
+                write_end_loop(f, label.as_deref())
             }
             Self::ForRange {
                 var,
@@ -7686,7 +7762,9 @@ impl fmt::Display for PlPgSqlStmt {
                 end,
                 reverse,
                 body,
+                label,
             } => {
+                write_loop_label(f, label.as_deref())?;
                 write!(f, "FOR {var} IN ")?;
                 if *reverse {
                     f.write_str("REVERSE ")?;
@@ -7695,47 +7773,62 @@ impl fmt::Display for PlPgSqlStmt {
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
-                f.write_str("END LOOP")
+                write_end_loop(f, label.as_deref())
             }
-            Self::Loop { body } => {
+            Self::Loop { body, label } => {
+                write_loop_label(f, label.as_deref())?;
                 writeln!(f, "LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
-                f.write_str("END LOOP")
+                write_end_loop(f, label.as_deref())
             }
-            Self::Exit { when } => {
+            Self::Exit { when, label } => {
                 f.write_str("EXIT")?;
+                if let Some(l) = label {
+                    write!(f, " {l}")?;
+                }
                 if let Some(c) = when {
                     write!(f, " WHEN {c}")?;
                 }
                 Ok(())
             }
-            Self::Continue { when } => {
+            Self::Continue { when, label } => {
                 f.write_str("CONTINUE")?;
+                if let Some(l) = label {
+                    write!(f, " {l}")?;
+                }
                 if let Some(c) = when {
                     write!(f, " WHEN {c}")?;
                 }
                 Ok(())
             }
             Self::ExecuteDynamic { sql } => write!(f, "EXECUTE {sql}"),
-            Self::ForQuery { var, query, body } => {
+            Self::ForQuery {
+                var,
+                query,
+                body,
+                label,
+            } => {
+                write_loop_label(f, label.as_deref())?;
                 writeln!(f, "FOR {var} IN ({query}) LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
-                f.write_str("END LOOP")
+                write_end_loop(f, label.as_deref())
             }
             Self::ForExecute {
                 var,
                 sql_expr,
                 body,
+                label,
             } => {
+                write_loop_label(f, label.as_deref())?;
                 writeln!(f, "FOR {var} IN EXECUTE {sql_expr} LOOP")?;
                 for s in body {
                     writeln!(f, "  {s};")?;
                 }
-                f.write_str("END LOOP")
+                write_end_loop(f, label.as_deref())
             }
         }
     }

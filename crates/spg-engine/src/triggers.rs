@@ -308,6 +308,7 @@ pub fn fire_row_trigger(
         // A trigger function is not set-returning.
         set_sink: None,
         write_resolver: None,
+        savepoint: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -322,7 +323,7 @@ pub fn fire_row_trigger(
         // Body fell off without an explicit RETURN. PL/pgSQL
         // default is `RETURN NULL`; we mirror — the BEFORE
         // trigger then skips the row.
-        BodyOutcome::FellThrough | BodyOutcome::Break | BodyOutcome::Continue => {
+        BodyOutcome::FellThrough | BodyOutcome::Break(_) | BodyOutcome::Continue(_) => {
             TriggerOutcome::Skip
         }
     };
@@ -340,11 +341,17 @@ enum BodyOutcome {
     /// the current loop body's execute_stmts. WHILE / FOR / bare
     /// LOOP catch this at their iteration point and break; any
     /// non-loop caller treats it as a benign no-op.
-    Break,
+    ///
+    /// 9.0.0 — carries the label of `EXIT <label>`, which names the
+    /// loop OR the enclosing block to leave. `None` is the unlabelled
+    /// form, which the innermost loop catches.
+    Break(Option<String>),
     /// v7.37.20 (20.2) — `CONTINUE [WHEN <cond>];` bubbled up
     /// through the current loop body. WHILE / FOR / bare LOOP
     /// catch this and jump to the next iteration.
-    Continue,
+    ///
+    /// 9.0.0 — carries the label of `CONTINUE <label>`.
+    Continue(Option<String>),
 }
 
 /// v7.39 (round 757, F31-B3) — where `RAISE NOTICE / WARNING / INFO`
@@ -385,6 +392,11 @@ struct BodyCtx<'a> {
     /// reaches it. Present only for a DO block; a trigger fires inside a
     /// row-write borrow of the catalog and still defers.
     write_resolver: Option<&'a WriteResolver<'a>>,
+    /// 9.0.0 — the savepoint hook a protected block uses, so a NESTED
+    /// block that carries an EXCEPTION clause rolls its writes back the
+    /// way the outermost one already did. `None` on the trigger and
+    /// scalar-function paths, which have no savepoint of their own.
+    savepoint: Option<&'a dyn Fn(BlockSavepoint)>,
 }
 
 /// 8.0.3 — callback a DO block registers so its writes run in place.
@@ -422,6 +434,126 @@ pub type ForQueryResolver<'a> = dyn Fn(
         TriggerError,
     > + 'a;
 
+/// 9.0.0 — run a nested block: its own variable scope, and its own
+/// EXCEPTION clause.
+///
+/// PostgreSQL's scoping, measured: an inner `DECLARE x` SHADOWS the outer
+/// `x` for the length of the block and the outer value is back afterwards
+/// (`inner 2` / `outer 1`), while an assignment to a variable the inner
+/// block did NOT declare reaches the outer one and survives the block
+/// (`after 9`). So the names the block declares are saved on entry and
+/// put back on exit, and nothing else is touched.
+fn execute_nested_block(
+    block: &spg_sql::ast::PlPgSqlBlock,
+    current_new: &mut Option<Row<'static>>,
+    old_row: Option<&Row<'static>>,
+    locals: &mut BTreeMap<String, Value<'static>>,
+    ctx: &BodyCtx<'_>,
+    deferred: &mut Vec<DeferredEmbeddedStmt>,
+) -> Result<BodyOutcome, TriggerError> {
+    let shadowed: Vec<(String, Option<Value<'static>>)> = block
+        .declarations
+        .iter()
+        .map(|d| (d.name.clone(), locals.get(&d.name).cloned()))
+        .collect();
+    let result = run_nested_block_body(block, current_new, old_row, locals, ctx, deferred);
+    for (name, prior) in shadowed {
+        match prior {
+            Some(v) => {
+                locals.insert(name, v);
+            }
+            None => {
+                locals.remove(&name);
+            }
+        }
+    }
+    result
+}
+
+fn run_nested_block_body(
+    block: &spg_sql::ast::PlPgSqlBlock,
+    current_new: &mut Option<Row<'static>>,
+    old_row: Option<&Row<'static>>,
+    locals: &mut BTreeMap<String, Value<'static>>,
+    ctx: &BodyCtx<'_>,
+    deferred: &mut Vec<DeferredEmbeddedStmt>,
+) -> Result<BodyOutcome, TriggerError> {
+    init_locals_from_declarations(
+        &block.declarations,
+        locals,
+        current_new.as_ref(),
+        old_row,
+        ctx.columns,
+        ctx.table_name,
+        ctx.params,
+        ctx.default_text_search_config,
+        ctx.function,
+        ctx.select_into_resolver,
+    )?;
+    let protected = !block.exception_handlers.is_empty();
+    // Where this block's own embedded writes start, so a handler can
+    // drop exactly them and leave the ones the enclosing block queued.
+    let deferred_mark = deferred.len();
+    if protected && let Some(sp) = ctx.savepoint {
+        sp(BlockSavepoint::Take);
+    }
+    let body = execute_stmts(
+        &block.statements,
+        current_new,
+        old_row,
+        locals,
+        ctx,
+        deferred,
+    );
+    if let Ok(outcome) = body {
+        // 9.0.0 — `EXIT <label>` naming THIS block leaves it, which is
+        // the one jump a block answers: measured on PostgreSQL 18.6,
+        // `<<ob>> BEGIN BEGIN EXIT ob; END; RAISE NOTICE 'x'; END`
+        // prints nothing.
+        if let BodyOutcome::Break(Some(t)) = &outcome
+            && block
+                .label
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case(t))
+        {
+            return Ok(BodyOutcome::FellThrough);
+        }
+        return Ok(outcome);
+    }
+    let Err(err) = body else {
+        unreachable!("the Ok arm returned above");
+    };
+    let (sqlstate, message) = error_state(&err);
+    let Some(handler) = block
+        .exception_handlers
+        .iter()
+        .find(|h| h.conditions.iter().any(|c| condition_matches(c, &sqlstate)))
+    else {
+        return Err(err);
+    };
+    if let Some(sp) = ctx.savepoint {
+        sp(BlockSavepoint::RollBack);
+    }
+    deferred.truncate(deferred_mark);
+    locals.insert("sqlerrm".into(), Value::text(message));
+    locals.insert(
+        "sqlstate".into(),
+        Value::text(alloc::string::String::from(sqlstate)),
+    );
+    execute_stmts(&handler.body, current_new, old_row, locals, ctx, deferred)
+}
+
+/// 9.0.0 — does a loop carrying `label` answer this `EXIT` / `CONTINUE`?
+/// The unlabelled form is answered by the innermost loop; a labelled one
+/// only by the loop that carries that name, and travels outward until it
+/// finds it.
+fn jump_is_mine(loop_label: Option<&str>, target: Option<&str>) -> bool {
+    match target {
+        None => true,
+        Some(t) => loop_label.is_some_and(|l| l.eq_ignore_ascii_case(t)),
+    }
+}
+
 fn execute_stmts(
     stmts: &[PlPgSqlStmt],
     current_new: &mut Option<Row<'static>>,
@@ -432,6 +564,14 @@ fn execute_stmts(
 ) -> Result<BodyOutcome, TriggerError> {
     for stmt in stmts {
         match stmt {
+            // 9.0.0 — a nested `[<<label>>] [DECLARE …] BEGIN … END`.
+            PlPgSqlStmt::Block(inner) => {
+                let outcome =
+                    execute_nested_block(inner, current_new, old_row, locals, ctx, deferred)?;
+                if !matches!(outcome, BodyOutcome::FellThrough) {
+                    return Ok(outcome);
+                }
+            }
             PlPgSqlStmt::Assign { target, value } => {
                 let evaluated = eval_with_new_old_and_locals(
                     value,
@@ -593,20 +733,16 @@ fn execute_stmts(
                     if matches!(cond_val, Value::Bool(true)) {
                         matched = true;
                         match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                            BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
-                            BodyOutcome::Break => return Ok(BodyOutcome::Break),
-                            BodyOutcome::Continue => return Ok(BodyOutcome::Continue),
                             BodyOutcome::FellThrough => {}
+                            early => return Ok(early),
                         }
                         break;
                     }
                 }
                 if !matched && !else_branch.is_empty() {
                     match execute_stmts(else_branch, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::Return(t) => return Ok(BodyOutcome::Return(t)),
-                        BodyOutcome::Break => return Ok(BodyOutcome::Break),
-                        BodyOutcome::Continue => return Ok(BodyOutcome::Continue),
                         BodyOutcome::FellThrough => {}
+                        early => return Ok(early),
                     }
                 }
             }
@@ -782,6 +918,7 @@ fn execute_stmts(
                 end,
                 reverse,
                 body,
+                label,
             } => {
                 // v7.37.20 (20.4) — FOR <var> IN [REVERSE] <s>..<e> LOOP.
                 const FOR_RANGE_BUDGET: i64 = 1_000_000;
@@ -853,15 +990,19 @@ fn execute_stmts(
                     }
                     locals.insert(var.clone(), spg_storage::Value::BigInt(i));
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
-                        BodyOutcome::Break => break,
-                        early @ BodyOutcome::Return(_) => return Ok(early),
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Continue(t)
+                            if jump_is_mine(label.as_deref(), t.as_deref()) => {}
+                        BodyOutcome::Break(t) if jump_is_mine(label.as_deref(), t.as_deref()) => {
+                            break;
+                        }
+                        early => return Ok(early),
                     }
                     i = i.saturating_add(step);
                     iter += 1;
                 }
             }
-            PlPgSqlStmt::Loop { body } => {
+            PlPgSqlStmt::Loop { body, label } => {
                 // v7.37.20 (20.2) — bare LOOP: iterate body until an
                 // EXIT bubbles up, or the budget is exhausted.
                 const LOOP_BUDGET: u64 = 1_000_000;
@@ -875,14 +1016,18 @@ fn execute_stmts(
                         });
                     }
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
-                        BodyOutcome::Break => break,
-                        early @ BodyOutcome::Return(_) => return Ok(early),
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Continue(t)
+                            if jump_is_mine(label.as_deref(), t.as_deref()) => {}
+                        BodyOutcome::Break(t) if jump_is_mine(label.as_deref(), t.as_deref()) => {
+                            break;
+                        }
+                        early => return Ok(early),
                     }
                     iter += 1;
                 }
             }
-            PlPgSqlStmt::Exit { when } => {
+            PlPgSqlStmt::Exit { when, label } => {
                 // v7.37.20 (20.2) — EXIT [WHEN <cond>]. Unconditional
                 // exit or conditional (only breaks when truthy).
                 let should_break = match when {
@@ -907,13 +1052,14 @@ fn execute_stmts(
                     }
                 };
                 if should_break {
-                    return Ok(BodyOutcome::Break);
+                    return Ok(BodyOutcome::Break(label.clone()));
                 }
             }
             PlPgSqlStmt::ForExecute {
                 var,
                 sql_expr,
                 body,
+                label,
             } => {
                 // v7.37.20 (20.6) — FOR <var> IN EXECUTE <expr> LOOP.
                 // Evaluate the expression at runtime to obtain a SQL
@@ -988,13 +1134,22 @@ fn execute_stmts(
                         .unwrap_or(spg_storage::Value::Null);
                     locals.insert(var.clone(), first_cell);
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
-                        BodyOutcome::Break => break,
-                        early @ BodyOutcome::Return(_) => return Ok(early),
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Continue(t)
+                            if jump_is_mine(label.as_deref(), t.as_deref()) => {}
+                        BodyOutcome::Break(t) if jump_is_mine(label.as_deref(), t.as_deref()) => {
+                            break;
+                        }
+                        early => return Ok(early),
                     }
                 }
             }
-            PlPgSqlStmt::ForQuery { var, query, body } => {
+            PlPgSqlStmt::ForQuery {
+                var,
+                query,
+                body,
+                label,
+            } => {
                 // v7.37.20 (20.5) — FOR <var> IN <SELECT> LOOP.
                 // Runs the SELECT once via the DO block's registered
                 // resolver, iterates rows, binds the first cell of
@@ -1043,9 +1198,13 @@ fn execute_stmts(
                         .unwrap_or(spg_storage::Value::Null);
                     locals.insert(var.clone(), first_cell);
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
-                        BodyOutcome::Break => break,
-                        early @ BodyOutcome::Return(_) => return Ok(early),
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Continue(t)
+                            if jump_is_mine(label.as_deref(), t.as_deref()) => {}
+                        BodyOutcome::Break(t) if jump_is_mine(label.as_deref(), t.as_deref()) => {
+                            break;
+                        }
+                        early => return Ok(early),
                     }
                 }
             }
@@ -1154,7 +1313,7 @@ fn execute_stmts(
                     });
                 }
             }
-            PlPgSqlStmt::Continue { when } => {
+            PlPgSqlStmt::Continue { when, label } => {
                 // v7.37.20 (20.2) — CONTINUE [WHEN <cond>]. Same shape
                 // as EXIT but signals BodyOutcome::Continue.
                 let should_continue = match when {
@@ -1179,10 +1338,14 @@ fn execute_stmts(
                     }
                 };
                 if should_continue {
-                    return Ok(BodyOutcome::Continue);
+                    return Ok(BodyOutcome::Continue(label.clone()));
                 }
             }
-            PlPgSqlStmt::While { condition, body } => {
+            PlPgSqlStmt::While {
+                condition,
+                body,
+                label,
+            } => {
                 // v7.37.20 (20.3) — WHILE <cond> LOOP iteration.
                 // Iteration count bounded by a generous budget so a
                 // mis-spelled condition can't lock the engine. The
@@ -1225,9 +1388,13 @@ fn execute_stmts(
                     // inside the loop propagates back the same way
                     // the IF / ELSE arms do.
                     match execute_stmts(body, current_new, old_row, locals, ctx, deferred)? {
-                        BodyOutcome::FellThrough | BodyOutcome::Continue => {}
-                        BodyOutcome::Break => break,
-                        early @ BodyOutcome::Return(_) => return Ok(early),
+                        BodyOutcome::FellThrough => {}
+                        BodyOutcome::Continue(t)
+                            if jump_is_mine(label.as_deref(), t.as_deref()) => {}
+                        BodyOutcome::Break(t) if jump_is_mine(label.as_deref(), t.as_deref()) => {
+                            break;
+                        }
+                        early => return Ok(early),
                     }
                     iter += 1;
                 }
@@ -1365,6 +1532,22 @@ pub(crate) fn check_exception_conditions(
                     message: alloc::format!("unrecognized exception condition \"{c}\""),
                 });
             }
+        }
+        // 9.0.0 — a nested block inside a handler body carries handlers
+        // of its own.
+        check_nested_exception_conditions(function, &h.body)?;
+    }
+    check_nested_exception_conditions(function, &block.statements)
+}
+
+/// 9.0.0 — the same check over every nested block a statement list holds.
+fn check_nested_exception_conditions(
+    function: &str,
+    stmts: &[PlPgSqlStmt],
+) -> Result<(), TriggerError> {
+    for s in stmts {
+        if let PlPgSqlStmt::Block(b) = s {
+            check_exception_conditions(function, b)?;
         }
     }
     Ok(())
@@ -1777,6 +1960,7 @@ fn do_block<'a>(
         for_query_resolver,
         set_sink,
         write_resolver,
+        savepoint,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
@@ -1884,6 +2068,7 @@ pub fn call_plpgsql_scalar<'a>(
         for_query_resolver,
         set_sink,
         write_resolver: None,
+        savepoint: None,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
