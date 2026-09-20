@@ -10,6 +10,18 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the 10 `real` catalog columns
+
+`pg_class.reltuples`, `pg_proc.procost` / `prorows`,
+`pg_enum.enumsortorder`, `pg_statistic.stanullfrac` / `stadistinct` and
+four `pg_stats` columns announced `double precision` where PostgreSQL
+18.6 announces `real`. They carry `real` now, values and all —
+`reltuples` of a seven-row table reads 7 and types `real`.
+
+Their value sites were spread over five different row builders inside
+`pg_class` alone; the sweep and the compiler named each one rather than
+a grep. The 365-column sweep is at 46 divergences, from 56.
+
 ### Fixed — the 21 `regproc` catalog columns, and a reg value cast to its own type
 
 `pg_am.amhandler`, `pg_type.typinput` and 19 others announced `bigint`

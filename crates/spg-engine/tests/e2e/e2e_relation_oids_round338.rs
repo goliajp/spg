@@ -103,7 +103,7 @@ fn a_view_has_a_pg_class_row() {
             Value::BigInt(0),
             Value::BigInt(0),
             Value::Int(0),
-            Value::Float(-1.0),
+            Value::Real(-1.0),
             Value::Char1(b'n'),
             Value::Bool(false),
         ]),

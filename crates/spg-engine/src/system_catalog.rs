@@ -2324,18 +2324,18 @@ pub(crate) fn synth_pg_stats(
         ColumnSchema::new("tablename", DataType::Name, false),
         ColumnSchema::new("attname", DataType::Name, false),
         ColumnSchema::new("inherited", DataType::Bool, false),
-        ColumnSchema::new("null_frac", DataType::Float, false),
+        ColumnSchema::new("null_frac", DataType::Real, false),
         ColumnSchema::new("avg_width", DataType::Int, false),
-        ColumnSchema::new("n_distinct", DataType::Float, false),
+        ColumnSchema::new("n_distinct", DataType::Real, false),
         ColumnSchema::new("most_common_vals", DataType::Text, true),
         ColumnSchema::new("most_common_freqs", DataType::Text, true),
         ColumnSchema::new("histogram_bounds", DataType::Text, true),
-        ColumnSchema::new("correlation", DataType::Float, true),
+        ColumnSchema::new("correlation", DataType::Real, true),
         ColumnSchema::new("most_common_elems", DataType::Text, true),
         ColumnSchema::new("most_common_elem_freqs", DataType::Text, true),
         ColumnSchema::new("elem_count_histogram", DataType::Text, true),
         ColumnSchema::new("range_length_histogram", DataType::Text, true),
-        ColumnSchema::new("range_empty_frac", DataType::Float, true),
+        ColumnSchema::new("range_empty_frac", DataType::Real, true),
         ColumnSchema::new("range_bounds_histogram", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -2368,9 +2368,9 @@ pub(crate) fn synth_pg_stats(
                 Value::text(name.clone()),
                 Value::text(col.name.clone()),
                 Value::Bool(false),
-                Value::Float(f64::from(cs.null_frac)),
+                Value::Real(cs.null_frac), // null_frac
                 Value::Int(0),
-                Value::Float(distinct),
+                Value::Real(distinct as f32), // n_distinct
                 Value::Null,
                 Value::Null,
                 bounds,
@@ -2395,9 +2395,9 @@ pub(crate) fn synth_pg_statistic(
         ColumnSchema::new("starelid", DataType::Oid, false),
         ColumnSchema::new("staattnum", DataType::SmallInt, false),
         ColumnSchema::new("stainherit", DataType::Bool, false),
-        ColumnSchema::new("stanullfrac", DataType::Float, false),
+        ColumnSchema::new("stanullfrac", DataType::Real, false),
         ColumnSchema::new("stawidth", DataType::Int, false),
-        ColumnSchema::new("stadistinct", DataType::Float, false),
+        ColumnSchema::new("stadistinct", DataType::Real, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut starelid: i64 = 16384;
@@ -2439,9 +2439,9 @@ pub(crate) fn synth_pg_statistic(
                 Value::BigInt(starelid),
                 Value::SmallInt(attnum),
                 Value::Bool(false),
-                Value::Float(f64::from(cs.null_frac)),
+                Value::Real(cs.null_frac), // stanullfrac
                 Value::Int(0),
-                Value::Float(distinct),
+                Value::Real(distinct as f32), // stadistinct
             ]));
         }
         starelid = starelid.saturating_add(1);
@@ -3612,7 +3612,7 @@ pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("enumtypid", DataType::Oid, false),
-        ColumnSchema::new("enumsortorder", DataType::Float, false),
+        ColumnSchema::new("enumsortorder", DataType::Real, false),
         ColumnSchema::new("enumlabel", DataType::Name, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -3628,7 +3628,7 @@ pub(crate) fn synth_pg_enum(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stati
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(label_oid),
                 Value::BigInt(typid),
-                Value::Float((i + 1) as f64),
+                Value::Real((i + 1) as f32), // enumsortorder
                 Value::text(label.clone()),
             ]));
         }
@@ -4230,7 +4230,7 @@ fn pg_class_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("relfilenode", DataType::Oid, false),
         ColumnSchema::new("reltablespace", DataType::Oid, false),
         ColumnSchema::new("relpages", DataType::Int, false),
-        ColumnSchema::new("reltuples", DataType::Float, false),
+        ColumnSchema::new("reltuples", DataType::Real, false),
         ColumnSchema::new("relallvisible", DataType::Int, false),
         ColumnSchema::new("reltoastrelid", DataType::Oid, false),
         ColumnSchema::new("relhasindex", DataType::Bool, false),
@@ -4338,7 +4338,7 @@ pub(crate) fn synth_pg_class(
                 | Some(PartitionRole::Default { .. })
         );
         let relnatts = i16::try_from(schema_ref.columns.len()).unwrap_or(i16::MAX);
-        let reltuples = t.rows().len() as f64;
+        let reltuples = t.rows().len() as f32;
         // relpages in PG-page units (8 KiB) off the maintained
         // hot-tier byte meter — capacity queries multiply
         // relpages × 8192 to estimate table size.
@@ -4364,9 +4364,9 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(this_oid), // relfilenode shares oid in SPG (no separate fork)
             Value::BigInt(0),        // reltablespace (0 == default)
             Value::Int(relpages),    // hot_bytes in 8 KiB PG-page units
-            Value::Float(reltuples),
-            Value::Int(0),    // relallvisible — visibility map lands in 15.17
-            Value::BigInt(0), // reltoastrelid (SPG no TOAST)
+            Value::Real(reltuples),  // reltuples
+            Value::Int(0),           // relallvisible — visibility map lands in 15.17
+            Value::BigInt(0),        // reltoastrelid (SPG no TOAST)
             Value::Bool(has_index),
             Value::Bool(false), // relisshared
             // v7.39 (round 526) — 't' for a TEMPORARY relation. This was
@@ -4452,8 +4452,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0), // relam — a view has no access method
             Value::BigInt(0), // relfilenode — nor any storage
             Value::BigInt(0),
-            Value::Int(0),      // relpages
-            Value::Float(-1.0), // reltuples — -1 = never analysed
+            Value::Int(0),     // relpages
+            Value::Real(-1.0), // reltuples — -1 = never analysed
             Value::Int(0),
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
@@ -4495,8 +4495,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0), // relam
             Value::BigInt(0), // relfilenode
             Value::BigInt(0),
-            Value::Int(0),      // relpages
-            Value::Float(-1.0), // reltuples
+            Value::Int(0),     // relpages
+            Value::Real(-1.0), // reltuples
             Value::Int(0),
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
@@ -4542,7 +4542,7 @@ pub(crate) fn synth_pg_class(
                 Value::BigInt(idx_oid),
                 Value::BigInt(0),
                 Value::Int(0),
-                Value::Float(0.0),
+                Value::Real(0.0), // reltuples
                 Value::Int(0),
                 Value::BigInt(0),
                 Value::Bool(false), // relhasindex (an index has none)
@@ -4587,8 +4587,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(0), // relam — a sequence has no access method
             Value::BigInt(seq_oid),
             Value::BigInt(0),
-            Value::Int(1),     // relpages — a sequence is one page
-            Value::Float(1.0), // reltuples — and one tuple
+            Value::Int(1),    // relpages — a sequence is one page
+            Value::Real(1.0), // reltuples — and one tuple
             Value::Int(0),
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
@@ -4633,8 +4633,8 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(2),  // relam — heap
             Value::BigInt(*oid),
             Value::BigInt(0),
-            Value::Int(0),      // relpages
-            Value::Float(-1.0), // reltuples — never analysed
+            Value::Int(0),     // relpages
+            Value::Real(-1.0), // reltuples — never analysed
             Value::Int(0),
             Value::BigInt(0),
             Value::Bool(false), // relhasindex
@@ -6345,8 +6345,8 @@ pub(crate) fn synth_pg_proc(
         ColumnSchema::new("pronamespace", DataType::Oid, false),
         ColumnSchema::new("proowner", DataType::Oid, false),
         ColumnSchema::new("prolang", DataType::Oid, false),
-        ColumnSchema::new("procost", DataType::Float, false),
-        ColumnSchema::new("prorows", DataType::Float, false),
+        ColumnSchema::new("procost", DataType::Real, false),
+        ColumnSchema::new("prorows", DataType::Real, false),
         ColumnSchema::new("provariadic", DataType::Oid, false),
         // v7.39 (round 543) — a planner-support function; SPG has none.
         // 8.0.3 — a `regproc`, which prints `-` for "none" (measured on
@@ -6434,10 +6434,10 @@ pub(crate) fn synth_pg_proc(
             } else {
                 11
             }),
-            Value::BigInt(10), // proowner
-            Value::BigInt(12), // prolang = internal
-            Value::Float(1.0), // procost
-            Value::Float(prorows),
+            Value::BigInt(10),             // proowner
+            Value::BigInt(12),             // prolang = internal
+            Value::Real(1.0),              // procost
+            Value::Real(prorows as f32),   // prorows
             Value::BigInt(0),              // provariadic
             Value::RegProc(0, "-".into()), // prosupport
             char1(kind),                   // prokind
@@ -6491,8 +6491,8 @@ pub(crate) fn synth_pg_proc(
             // of PG defaults: `CREATE FUNCTION … IMMUTABLE STRICT` was a
             // parse error until this round, so there was nothing else to
             // report; now there is.
-            Value::Float(def.cost.unwrap_or(100.0)),
-            Value::Float(def.rows.unwrap_or(0.0)),
+            Value::Real(def.cost.unwrap_or(100.0) as f32), // procost
+            Value::Real(def.rows.unwrap_or(0.0) as f32),   // prorows
             Value::BigInt(0),
             Value::RegProc(0, "-".into()), // prosupport
             char1("f"),                    // prokind — a normal function
