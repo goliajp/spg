@@ -89,7 +89,7 @@ fn round625_string_functions_require_text() {
         ),
         (
             "SELECT strpos(1,'a')",
-            "function strpos(integer, text) does not exist",
+            "function strpos(integer, unknown) does not exist",
         ),
         (
             "SELECT left(1,1)",
@@ -101,7 +101,7 @@ fn round625_string_functions_require_text() {
         ),
         (
             "SELECT translate(1,'a','b')",
-            "function translate(integer, text, text) does not exist",
+            "function translate(integer, unknown, unknown) does not exist",
         ),
         (
             "SELECT quote_ident(1)",

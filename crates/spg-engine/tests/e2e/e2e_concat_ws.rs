@@ -252,7 +252,14 @@ fn integer_separator_refuses_like_pg() {
         e.execute("SELECT concat_ws(0, 'a', 'b')")
             .expect_err("non-text separator refuses")
     );
-    assert!(err.contains("needs a text separator, got integer"), "{err}");
+    // 9.0.0 — PostgreSQL's own sentence, measured on 18.6. This
+    // asserted SPG's former wording, which named the separator's type
+    // and nothing else; PG names the whole call, and `unknown` for the
+    // two bare literals.
+    assert!(
+        err.contains("function concat_ws(integer, unknown, unknown) does not exist"),
+        "{err}"
+    );
 }
 
 // ── COLUMN-LEVEL BEHAVIOR ─────────────────────────────────────────

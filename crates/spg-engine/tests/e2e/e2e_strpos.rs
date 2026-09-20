@@ -202,7 +202,8 @@ fn strpos_numeric_args_coerced() {
         .expect_err("PG has no strpos(integer, text)")
         .to_string();
     assert!(
-        m.contains("function strpos(integer, text) does not exist"),
+        // 9.0.0 — `unknown` for the bare literal, as PG 18.6 names it.
+        m.contains("function strpos(integer, unknown) does not exist"),
         "{m}"
     );
 }

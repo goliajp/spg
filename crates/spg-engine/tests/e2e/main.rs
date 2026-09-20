@@ -1165,6 +1165,7 @@ mod e2e_fts_snowball;
 mod e2e_fulltext_gin_seek;
 mod e2e_fulltext_index;
 mod e2e_fulltext_planner;
+mod e2e_function_call_error_900;
 mod e2e_gen_random_csprng;
 mod e2e_generate_series;
 mod e2e_generate_series_join;
