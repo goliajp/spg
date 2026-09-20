@@ -10,6 +10,33 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — 26 more catalog columns announced the wrong type, and a sweep that watches all 365
+
+`name`, `smallint` and `"char"` join the `oid` columns of the previous
+entry: `pg_class.relname`, `pg_type.typname`, `pg_attribute.attname` and
+19 other identifier columns announced `text` where PostgreSQL 18.6
+announces `name`; `attstattarget`, `attinhcount` and `coninhcount`
+announced `integer` where PostgreSQL says `smallint`; `amoppurpose`
+announced `text` where PostgreSQL says `"char"`.
+
+`xtests/catalog-type-sweep` now compares the declared type of every
+`pg_*` catalog column both engines have — 365 of them — and fails on a
+divergence it does not already know about. The 77 that remain
+(`regproc`, `pg_node_tree`, `real`, `aclitem[]`, `oid[]`, `anyarray` and
+the rest) are recorded in it by name.
+
+Writing that sweep cost two of its own defects, both of the kind where
+the instrument looks like agreement:
+
+* it read `pg_attribute` alone, so `pg_constraint` staying broken was
+  invisible — it now runs `SELECT *` over every catalog relation, and
+  any relation that cannot materialise fails the sweep;
+* it ran against an empty database, which reaches none of the per-kind
+  row builders — it now creates a table, a view, a composite type and an
+  index first. The first version passed while the builders for a view
+  and for a composite type still carried the old width, which the e2e
+  tier caught instead.
+
 ### Fixed — a join between two different numeric types found nothing
 
 The hash join's canonical-string key carried the numeric WIDTH, so
