@@ -47,10 +47,11 @@ fn pg_enum_enumsortorder_increments_per_type() {
         .unwrap();
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_enum");
     // enumsortorder at position 2 should be 1.0, 2.0, 3.0, 4.0.
-    let mut orders: Vec<f64> = rs
+    // 9.0.0 — `real`, as PostgreSQL 18.6 declares it.
+    let mut orders: Vec<f32> = rs
         .iter()
         .filter_map(|r| match r[2] {
-            Value::Float(f) => Some(f),
+            Value::Real(f) => Some(f),
             _ => None,
         })
         .collect();

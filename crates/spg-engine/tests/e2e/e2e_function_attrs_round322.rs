@@ -205,7 +205,7 @@ fn pg_proc_reports_the_declared_attributes() {
     );
     assert_eq!(
         scalar(&mut e, "SELECT procost FROM pg_proc WHERE proname = 'p1'"),
-        Value::Float(42.0)
+        Value::Real(42.0)
     );
 
     // And a function that declared nothing still reads as PG's defaults.
@@ -227,7 +227,7 @@ fn pg_proc_reports_the_declared_attributes() {
     );
     assert_eq!(
         scalar(&mut e, "SELECT procost FROM pg_proc WHERE proname = 'p2'"),
-        Value::Float(100.0)
+        Value::Real(100.0)
     );
 }
 

@@ -97,10 +97,11 @@ fn pg_class_reltuples_reflects_row_count() {
         .iter()
         .find(|r| matches!(&r[1], Value::Text(s) if s.as_ref() == "t"))
         .expect("missing pg_class row for t");
-    // Position 10 = reltuples (Float).
+    // Position 10 = reltuples. 9.0.0 — `real`, as PostgreSQL 18.6
+    // declares it; it was `double precision` here.
     match t_row[10] {
-        Value::Float(n) => assert!((n - 10.0).abs() < f64::EPSILON, "reltuples = 10"),
-        ref other => panic!("expected Float, got {other:?}"),
+        Value::Real(n) => assert!((n - 10.0).abs() < f32::EPSILON, "reltuples = 10"),
+        ref other => panic!("expected Real, got {other:?}"),
     }
 }
 
