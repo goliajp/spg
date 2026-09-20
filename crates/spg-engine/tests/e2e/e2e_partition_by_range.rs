@@ -369,26 +369,27 @@ fn create_index_on_parent_fans_out_to_children() {
     e.execute("CREATE INDEX ix_events_received_at ON events_partitioned (received_at)")
         .expect("CREATE INDEX ON parent");
     // Future child should auto-inherit the index without a re-issue:
-    // the child-create call replays templates internally. We verify
-    // by adding a fresh child and then issuing CREATE INDEX with the
-    // SAME name on the child — should be a duplicate (already exists).
+    // the child-create call replays templates internally.
     e.execute(
         "CREATE TABLE events_2026_08 PARTITION OF events_partitioned \
          FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')",
     )
     .expect("CREATE TABLE August child");
-    let err = e
-        .execute(
-            "CREATE INDEX ix_events_received_at__events_2026_08 \
-             ON events_2026_08 (received_at)",
-        )
-        .expect_err("expected duplicate-index error from template fan-out");
-    let msg = format!("{err}");
-    assert!(
-        msg.to_ascii_lowercase().contains("exists")
-            || msg.to_ascii_lowercase().contains("duplicate"),
-        "expected DuplicateIndex-style message: {msg}"
-    );
+    // 9.0.0 — asked of the catalog rather than by trying to collide
+    // with the child index's name. The name is PostgreSQL's own now
+    // (`<child>_<col>_idx`, measured), and a pin that probes by name
+    // tests the naming rather than the inheritance it is about.
+    let QueryResult::Rows { rows, .. } = e
+        .execute("SELECT indexname FROM pg_indexes WHERE tablename='events_2026_08' ORDER BY 1")
+        .expect("pg_indexes")
+    else {
+        panic!("expected rows");
+    };
+    let names: Vec<String> = rows
+        .into_iter()
+        .map(|r| spg_engine::eval::value_to_text(&r.values[0]))
+        .collect();
+    assert_eq!(names, vec!["events_2026_08_received_at_idx".to_string()]);
 }
 
 /// sentori acceptance probe — the exact migration shape from the

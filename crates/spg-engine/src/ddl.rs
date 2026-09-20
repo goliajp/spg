@@ -1995,6 +1995,12 @@ impl Engine {
                     .uniqueness_constraints
                     .iter()
                     .any(|u| u.columns == positions);
+                Self::check_partition_unique_covers_key(
+                    table.schema(),
+                    tbl,
+                    if is_pk { "PRIMARY KEY" } else { "UNIQUE" },
+                    &positions,
+                )?;
                 if !already {
                     table.schema_mut().uniqueness_constraints.push(
                         spg_storage::UniquenessConstraint {
@@ -2683,6 +2689,43 @@ impl Engine {
         Ok(())
     }
 
+    /// 9.0.0 — a UNIQUE / PRIMARY KEY on a partitioned table must
+    /// include every partition-key column.
+    ///
+    /// Measured on PostgreSQL 18.6 over all three entry points — the
+    /// inline constraint, `ALTER TABLE … ADD CONSTRAINT` and
+    /// `CREATE UNIQUE INDEX` — which refuse the same way. SPG accepted
+    /// all three and then enforced the constraint PER PARTITION, which
+    /// is not what the declaration says: two partitions could each hold
+    /// the same `e`.
+    fn check_partition_unique_covers_key(
+        schema: &spg_storage::TableSchema,
+        table: &str,
+        kind: &str,
+        columns: &[usize],
+    ) -> Result<(), EngineError> {
+        let Some(PartitionRole::Parent {
+            key_column_positions,
+            ..
+        }) = &schema.partition_role
+        else {
+            return Ok(());
+        };
+        let Some(missing) = key_column_positions
+            .iter()
+            .find(|k| !columns.contains(k))
+            .and_then(|k| schema.columns.get(*k))
+        else {
+            return Ok(());
+        };
+        Err(EngineError::Unsupported(alloc::format!(
+            "unique constraint on partitioned table must include all partitioning columns\n\
+             DETAIL:  {kind} constraint on table \"{table}\" lacks column \"{}\" \
+             which is part of the partition key.",
+            missing.name
+        )))
+    }
+
     /// 9.0.0 — carry a relation rename into every stored view body.
     ///
     /// A view body is stored as TEXT here and as a parse tree resolved
@@ -3052,6 +3095,25 @@ impl Engine {
         // Parent itself holds no rows, so the build is skipped on
         // the parent table.
         if crate::partition::is_partition_parent(self.active_catalog(), &stmt.table) {
+            // 9.0.0 — a UNIQUE index on a partitioned table is a unique
+            // constraint and answers to the same rule, measured on PG
+            // 18.6: it must include every partition-key column.
+            if stmt.is_unique
+                && let Some(t) = self.active_catalog().get(&stmt.table)
+            {
+                let mut positions: Vec<usize> = Vec::new();
+                for col in core::iter::once(&stmt.column).chain(stmt.extra_columns.iter()) {
+                    if let Some(p) = t.schema().column_position(col) {
+                        positions.push(p);
+                    }
+                }
+                Self::check_partition_unique_covers_key(
+                    t.schema(),
+                    &stmt.table,
+                    "UNIQUE",
+                    &positions,
+                )?;
+            }
             return self.exec_create_index_on_partition_parent(stmt);
         }
         // v7.36 — collect cold-tier rows BEFORE taking the mutable
@@ -4098,6 +4160,14 @@ impl Engine {
                 key_column_positions,
                 index_template_sources: Vec::new(),
             });
+            for uc in &schema.uniqueness_constraints {
+                let kind = if uc.is_primary_key {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                };
+                Self::check_partition_unique_covers_key(&schema, &table_name, kind, &uc.columns)?;
+            }
         }
         self.active_catalog_mut().create_table(schema)?;
         // v7.39 (round 621) — the indexes an `INCLUDING INDEXES` asked for,
@@ -4443,12 +4513,19 @@ impl Engine {
             )));
         };
         ci.table = child_name.to_string();
-        // Name suffix per child so different children don't collide
-        // on the same `<idx_name>`. Skip when the original index has
-        // no explicit name(SPG auto-generates).
-        if !ci.name.is_empty() {
-            ci.name = alloc::format!("{}__{}", ci.name, child_name);
-        }
+        // 9.0.0 — the child's index is named the way PostgreSQL names
+        // one: after the CHILD and its columns. Measured on PG 18.6,
+        // `CREATE INDEX pt_v ON pt (v)` over a partition `pt1` gives
+        // `pt1_v_idx` there; SPG suffixed the parent's name instead
+        // (`pt_v__pt1`), which is a name no PostgreSQL client expects
+        // and which a dump would restore under.
+        //
+        // Clearing it hands the name to `choose_auto_index_name`, the
+        // same generator an unnamed `CREATE INDEX` on the child uses,
+        // so the two cannot disagree. Replay stays idempotent because
+        // the generated name is a function of the child and its
+        // columns, and `if_not_exists` below matches it.
+        ci.name = String::new();
         // IF NOT EXISTS to make replay idempotent — when this is
         // called from the CREATE INDEX ON parent fan-out we want to
         // tolerate the case where a child already has the index
