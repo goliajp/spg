@@ -1003,6 +1003,7 @@ impl Engine {
                 uc
             })
             .collect();
+        self.install_partition_constraint_indexes(&child_name)?;
         for tmpl in &index_template_sources {
             self.execute_partition_index_template(&child_name, tmpl)?;
         }
@@ -4523,6 +4524,7 @@ impl Engine {
             .collect();
         schema.partition_role = Some(role);
         self.active_catalog_mut().create_table(schema)?;
+        self.install_partition_constraint_indexes(&stmt.name)?;
         // Replay parent's CREATE INDEX templates against the new
         // child so every parent-declared index materialises now.
         for tmpl in &index_template_sources {
@@ -5155,6 +5157,57 @@ impl Engine {
     }
 
     /// table-level PRIMARY KEY / UNIQUE / KEY / FULLTEXT constraint.
+    /// 9.0.0 — give a partition the B-tree its inherited uniqueness
+    /// constraints need.
+    ///
+    /// A child copies the parent's `uniqueness_constraints`, and that is
+    /// what ENFORCES the key (the insert path folds the rows). Nothing
+    /// installed the index, so `pg_indexes` showed `<child>_pkey`
+    /// (synthesised from the constraint) while storage had none — and
+    /// the `ON CONFLICT` arbiter, which probes storage indexes, found
+    /// nothing and answered "no conflict". The row then reached the
+    /// uniqueness check and was refused, so EVERY `ON CONFLICT` spelling
+    /// on a partition raised `duplicate key value violates unique
+    /// constraint` where PostgreSQL 18.6 upserts.
+    fn install_partition_constraint_indexes(
+        &mut self,
+        child_name: &str,
+    ) -> Result<(), EngineError> {
+        let Some(table) = self.active_catalog_mut().get_mut(child_name) else {
+            return Ok(());
+        };
+        let ucs = table.schema().uniqueness_constraints.clone();
+        for uc in &ucs {
+            let Some(lead) = uc.columns.first().copied() else {
+                continue;
+            };
+            let Some(col_name) = table.schema().columns.get(lead).map(|c| c.name.clone()) else {
+                continue;
+            };
+            let idx_name = if uc.is_primary_key {
+                alloc::format!("{child_name}_pkey")
+            } else {
+                alloc::format!("{child_name}_{col_name}_key")
+            };
+            if table.indices().iter().any(|i| i.name == idx_name) {
+                continue;
+            }
+            table
+                .add_index(idx_name.clone(), &col_name)
+                .map_err(EngineError::Storage)?;
+            if let Some(ix) = table.indices_mut().iter_mut().find(|i| i.name == idx_name) {
+                ix.constraint_backing = true;
+                ix.extra_column_positions = uc.columns[1..].to_vec();
+            }
+            if uc.columns.len() >= 2 {
+                table
+                    .convert_index_to_multi(&idx_name)
+                    .map_err(EngineError::Storage)?;
+            }
+        }
+        Ok(())
+    }
+
     fn install_implicit_indexes(
         &mut self,
         table_name: &str,

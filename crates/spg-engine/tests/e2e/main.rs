@@ -1275,6 +1275,7 @@ mod e2e_partition_by_list_hash;
 mod e2e_partition_by_range;
 mod e2e_partition_explain;
 mod e2e_partition_key_enforced_900;
+mod e2e_partition_parent_returning_900;
 mod e2e_partition_pruning;
 mod e2e_partition_unique_and_index_names_900;
 mod e2e_partitioned_index_declaration_900;
