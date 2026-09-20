@@ -6157,6 +6157,99 @@ impl Engine {
     /// swallowed by the parser's pg_dump no-op arm: success reported,
     /// nothing changed. Constraint names and the error wordings are PG's,
     /// probed live.
+    /// 9.0.0 — `ALTER {SEQUENCE|VIEW|MATERIALIZED VIEW|TYPE|DOMAIN|
+    /// FUNCTION} <name> … OWNER TO <role>`.
+    ///
+    /// Measured on PostgreSQL 18.6: the role must exist (`role "x" does
+    /// not exist`), and so must the object — `relation "x" does not
+    /// exist` for a view or a sequence, `type "x" does not exist`,
+    /// `function x() does not exist`.
+    pub(crate) fn exec_alter_object_owner(
+        &mut self,
+        kind: spg_sql::ast::OwnedObjectKind,
+        name: &str,
+        role: &str,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::OwnedObjectKind as K;
+        use spg_storage::NonTableKind as N;
+        if !self.role_exists(role) {
+            return Err(EngineError::Unsupported(alloc::format!(
+                "role \"{role}\" does not exist"
+            )));
+        }
+        let missing_relation = || {
+            EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                name: alloc::string::String::from(name),
+            })
+        };
+        match kind {
+            K::Sequence => {
+                let def = self
+                    .active_catalog_mut()
+                    .sequence_mut(name)
+                    .ok_or_else(missing_relation)?;
+                def.owner = Some(alloc::string::String::from(role));
+                self.active_catalog_mut()
+                    .mark_sequence_dirty_for_owner(name);
+            }
+            K::View => {
+                if self.active_catalog().view(name).is_none() {
+                    return Err(missing_relation());
+                }
+                self.active_catalog_mut()
+                    .set_object_owner(N::View, name, role);
+            }
+            K::MaterializedView => {
+                // A materialized view is backed by a real table here, and
+                // that backing table's `schema.owner` is the ONE store
+                // `pg_class.relowner` and `pg_matviews.matviewowner` both
+                // read. Writing an `object_owners` entry instead would
+                // have been a second store that nothing reads.
+                if !self
+                    .active_catalog()
+                    .materialized_views()
+                    .contains_key(name)
+                {
+                    return Err(missing_relation());
+                }
+                let t = self
+                    .active_catalog_mut()
+                    .get_mut(name)
+                    .ok_or_else(missing_relation)?;
+                t.schema_mut().owner = Some(alloc::string::String::from(role));
+            }
+            K::Type => {
+                let cat = self.active_catalog();
+                let which = if cat.enum_types().contains_key(name) {
+                    N::EnumType
+                } else if cat.composite_types().contains_key(name) {
+                    N::CompositeType
+                } else if cat.domain_types().contains_key(name) {
+                    N::DomainType
+                } else {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "type \"{name}\" does not exist"
+                    )));
+                };
+                self.active_catalog_mut()
+                    .set_object_owner(which, name, role);
+            }
+            K::Function => {
+                let mut found = false;
+                for f in self.active_catalog_mut().functions_named_mut(name) {
+                    f.owner = Some(alloc::string::String::from(role));
+                    found = true;
+                }
+                if !found {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "function {name}() does not exist"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn exec_alter_domain(
         &mut self,
         name: &str,

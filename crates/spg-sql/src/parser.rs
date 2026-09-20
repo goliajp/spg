@@ -6469,16 +6469,11 @@ impl Parser {
         // did not restore. The role must exist; the owner is not recorded,
         // as for SPG's other `ALTER … OWNER TO` forms.
         if kw == "owner" {
-            self.advance();
-            if matches!(self.peek(), Token::To) {
-                self.advance();
-            } else {
-                self.expect_keyword_ident("to")?;
-            }
-            let role = self.expect_ident_like()?;
-            return Ok(Statement::ValidateOnly {
-                kind: crate::ast::ValidateOnlyKind::RoleName,
-                names: alloc::vec![role],
+            let role = self.parse_owner_to_role()?;
+            return Ok(Statement::AlterObjectOwner {
+                kind: crate::ast::OwnedObjectKind::Type,
+                name,
+                role,
             });
         }
         let action = match kw.as_str() {
@@ -6588,6 +6583,77 @@ impl Parser {
         Ok(Statement::AlterDomain { name, action })
     }
 
+    /// 9.0.0 — does an `ALTER VIEW` / `ALTER MATERIALIZED VIEW` /
+    /// `ALTER FUNCTION` end in `OWNER TO`?
+    ///
+    /// The ALTER dispatch is a `match self.advance()`, so by the time a
+    /// guard runs the object keyword is already consumed and the cursor
+    /// is on what follows it: `VIEW` for the MATERIALIZED spelling, the
+    /// object's name otherwise.
+    fn alter_owner_to_follows(&self, materialized: bool) -> bool {
+        let mut i = self.pos;
+        if materialized {
+            if !matches!(self.tokens.get(i),
+                Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("view"))
+            {
+                return false;
+            }
+            i += 1;
+        }
+        // The object name, then a function's argument list.
+        i += 1;
+        if matches!(self.tokens.get(i), Some(Token::LParen)) {
+            let mut depth = 0i32;
+            while let Some(t) = self.tokens.get(i) {
+                match t {
+                    Token::LParen => depth += 1,
+                    Token::RParen => {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+        }
+        matches!(self.tokens.get(i),
+            Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("owner"))
+    }
+
+    /// 9.0.0 — step over a balanced `( … )` group at the cursor.
+    fn skip_balanced_parens(&mut self) {
+        let mut depth = 0i32;
+        while !matches!(self.peek(), Token::Eof) {
+            match self.peek() {
+                Token::LParen => depth += 1,
+                Token::RParen => depth -= 1,
+                _ => {}
+            }
+            self.advance();
+            if depth == 0 {
+                return;
+            }
+        }
+    }
+
+    /// 9.0.0 — `OWNER TO <role>`, with the cursor on `OWNER`. Five ALTER
+    /// forms carry it and each had its own copy; the domain and sequence
+    /// ones only validated the role name, and the view / type / function
+    /// ones fell into the consume-to-boundary tail and did nothing at
+    /// all, so a dump restored them under the restoring role.
+    fn parse_owner_to_role(&mut self) -> Result<String, ParseError> {
+        self.advance();
+        if matches!(self.peek(), Token::To) {
+            self.advance();
+        } else {
+            self.expect_keyword_ident("to")?;
+        }
+        self.expect_ident_like()
+    }
+
     fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_exists = self.parse_if_exists();
         let name = self.expect_ident_like()?;
@@ -6596,16 +6662,11 @@ impl Parser {
         // not restore. The role must exist; the owner itself is not
         // recorded, as for the other `ALTER … OWNER TO` forms SPG accepts.
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("owner")) {
-            self.advance();
-            if matches!(self.peek(), Token::To) {
-                self.advance();
-            } else {
-                self.expect_keyword_ident("to")?;
-            }
-            let role = self.expect_ident_like()?;
-            return Ok(Statement::ValidateOnly {
-                kind: crate::ast::ValidateOnlyKind::RoleName,
-                names: alloc::vec![role],
+            let role = self.parse_owner_to_role()?;
+            return Ok(Statement::AlterObjectOwner {
+                kind: crate::ast::OwnedObjectKind::Sequence,
+                name,
+                role,
             });
         }
         // v7.39 (read01 round 49) — `RENAME TO new`; mutually exclusive with
@@ -10994,6 +11055,17 @@ impl Parser {
                         new,
                     });
                 }
+                // 9.0.0 — `OWNER TO <role>`, which the tail below silently
+                // ignored: PostgreSQL 18.6 records the new owner and
+                // `pg_get_userbyid(typowner)` answers it.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("owner")) {
+                    let role = self.parse_owner_to_role()?;
+                    return Ok(Statement::AlterObjectOwner {
+                        kind: crate::ast::OwnedObjectKind::Type,
+                        name: type_name,
+                        role,
+                    });
+                }
                 // Other ALTER TYPE forms — the ACTION stays a no-op
                 // (pg_dump tail), but v7.39 (round 708) the NAME is
                 // validated: `ALTER TYPE nosuch RENAME TO x` reported
@@ -11226,6 +11298,35 @@ impl Parser {
                     kind: crate::ast::ValidateOnlyKind::AggregateName,
                     names,
                 });
+            }
+            // 9.0.0 — `ALTER {VIEW|MATERIALIZED VIEW|FUNCTION} <name>
+            // … OWNER TO <role>`. These three fell into the
+            // consume-to-boundary tail below, which reported success and
+            // recorded nothing, so a dump restored them owned by whoever
+            // ran the restore. Every other form of all three still falls
+            // through to that tail.
+            Token::Ident(s) | Token::QuotedIdent(s)
+                if matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "view" | "function" | "materialized"
+                ) && self.alter_owner_to_follows(s.eq_ignore_ascii_case("materialized")) =>
+            {
+                let kind = match s.to_ascii_lowercase().as_str() {
+                    "view" => crate::ast::OwnedObjectKind::View,
+                    "function" => crate::ast::OwnedObjectKind::Function,
+                    _ => {
+                        // MATERIALIZED VIEW: the second word is already
+                        // known to be `view` by the lookahead.
+                        self.advance();
+                        crate::ast::OwnedObjectKind::MaterializedView
+                    }
+                };
+                let name = self.expect_ident_like()?;
+                if matches!(self.peek(), Token::LParen) {
+                    self.skip_balanced_parens();
+                }
+                let role = self.parse_owner_to_role()?;
+                return Ok(Statement::AlterObjectOwner { kind, name, role });
             }
             Token::Ident(s) | Token::QuotedIdent(s)
                 if matches!(

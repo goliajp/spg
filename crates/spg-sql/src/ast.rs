@@ -134,6 +134,18 @@ pub struct SetDbRoleSettingStatement {
     pub value: Option<String>,
 }
 
+/// 9.0.0 — the object kinds `ALTER … OWNER TO` names besides a table.
+/// `Type` covers all three of enum, composite and domain: which one a
+/// name is is the catalog's to say, not the parser's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedObjectKind {
+    Sequence,
+    View,
+    MaterializedView,
+    Type,
+    Function,
+}
+
 /// v7.39 (round 696) — which operand a [`Statement::ValidateOnly`] names,
 /// and therefore which catalog answers whether it exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +313,16 @@ pub enum Statement {
     AlterRolePassword {
         name: String,
         password: Option<String>,
+    },
+    /// 9.0.0 — `ALTER {SEQUENCE|VIEW|MATERIALIZED VIEW|TYPE|DOMAIN|
+    /// FUNCTION} <name> … OWNER TO <role>`. `ALTER TABLE … OWNER TO`
+    /// recorded the new owner; the other five validated the role name
+    /// and then did nothing, so a dump re-created them all under the
+    /// restoring role.
+    AlterObjectOwner {
+        kind: OwnedObjectKind,
+        name: String,
+        role: String,
     },
     ValidateOnly {
         kind: ValidateOnlyKind,
@@ -3921,6 +3943,14 @@ impl Statement {
             }
             Self::CreateDomain { .. } => Some("CREATE DOMAIN"),
             Self::AlterDomain { .. } => Some("ALTER DOMAIN"),
+            // 9.0.0 — ALTER <object> OWNER TO writes the catalog.
+            Self::AlterObjectOwner { kind, .. } => Some(match kind {
+                OwnedObjectKind::Sequence => "ALTER SEQUENCE",
+                OwnedObjectKind::View => "ALTER VIEW",
+                OwnedObjectKind::MaterializedView => "ALTER MATERIALIZED VIEW",
+                OwnedObjectKind::Type => "ALTER TYPE",
+                OwnedObjectKind::Function => "ALTER FUNCTION",
+            }),
             Self::DropDomain { .. } => Some("DROP DOMAIN"),
             Self::CreateSchema { .. } => Some("CREATE SCHEMA"),
             Self::DropSchema { .. } => Some("DROP SCHEMA"),
@@ -6111,6 +6141,7 @@ impl Statement {
             // written; PG classes LOCK and the OWNED BY pair as writers and
             // a read-only session refuses them there.
             Statement::ValidateOnly { .. } => false,
+            Statement::AlterObjectOwner { .. } => false,
             // v7.39 (round 750) — a credential rotation persists.
             Statement::AlterRolePassword { .. } => true,
             Statement::DropAggregate { .. } => false,
@@ -6422,6 +6453,21 @@ impl fmt::Display for Statement {
                     }
                 }
                 Ok(())
+            }
+            Self::AlterObjectOwner { kind, name, role } => {
+                let what = match kind {
+                    OwnedObjectKind::Sequence => "SEQUENCE",
+                    OwnedObjectKind::View => "VIEW",
+                    OwnedObjectKind::MaterializedView => "MATERIALIZED VIEW",
+                    OwnedObjectKind::Type => "TYPE",
+                    OwnedObjectKind::Function => "FUNCTION",
+                };
+                write!(
+                    f,
+                    "ALTER {what} {} OWNER TO {}",
+                    quote_ident(name),
+                    quote_ident(role)
+                )
             }
             Self::AlterRolePassword { name, password } => {
                 write!(f, "ALTER ROLE {}", quote_ident(name))?;

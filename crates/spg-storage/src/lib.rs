@@ -6531,6 +6531,18 @@ impl Catalog {
         Ok(())
     }
 
+    /// 9.0.0 — every overload of `name`, mutably. `ALTER FUNCTION f(…)
+    /// OWNER TO` names ONE signature on PostgreSQL; SPG's parser carries
+    /// the bare name, so the owner lands on every overload of it. That is
+    /// a coarser grain than PG's, not a different answer for the shape a
+    /// dump writes, which names each overload in turn.
+    pub fn functions_named_mut(&mut self, name: &str) -> Vec<&mut FunctionDef> {
+        self.functions
+            .values_mut()
+            .filter(|f| f.name.eq_ignore_ascii_case(name))
+            .collect()
+    }
+
     /// v7.39 (read01 round 62) — every overload of `name`.
     #[must_use]
     pub fn functions_named(&self, name: &str) -> Vec<&FunctionDef> {
@@ -6602,6 +6614,14 @@ impl Catalog {
     pub fn sequence_mut(&mut self, name: &str) -> Option<&mut SequenceDef> {
         let key = self.sequence_key(name);
         self.sequences.get_mut(&key)
+    }
+
+    /// 9.0.0 — mark a sequence dirty after `ALTER SEQUENCE … OWNER TO`
+    /// wrote through [`Self::sequence_mut`], which does not mark on its
+    /// own (its other callers, `nextval` and `setval`, mark their own).
+    pub fn mark_sequence_dirty_for_owner(&mut self, name: &str) {
+        let key = self.sequence_key(name);
+        self.mark_nontable_dirty(NonTableKind::Sequence, &key);
     }
 
     /// v7.39 (read01 round 61) — mutable function access, for GRANT.

@@ -2346,6 +2346,17 @@ impl Engine {
                     modified_catalog: self.catalog_change_is_committed(),
                 })
             }
+            // 9.0.0 — `ALTER {SEQUENCE|VIEW|MATERIALIZED VIEW|TYPE|
+            // DOMAIN|FUNCTION} … OWNER TO <role>`. `ALTER TABLE` recorded
+            // the owner and these five did not, so a dump re-created them
+            // owned by whoever ran the restore.
+            Statement::AlterObjectOwner { kind, name, role } => {
+                self.exec_alter_object_owner(kind, &name, &role)?;
+                Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: self.catalog_change_is_committed(),
+                })
+            }
             Statement::ValidateOnly { kind, names } => {
                 use spg_sql::ast::ValidateOnlyKind as K;
                 match kind {
