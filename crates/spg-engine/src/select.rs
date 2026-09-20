@@ -3192,6 +3192,7 @@ impl Engine {
         self.validate_function_arity(stmt)?;
         self.validate_cast_targets(stmt)?;
         self.validate_predicate_is_boolean(stmt)?;
+        self.validate_oid_comparisons(stmt)?;
         self.validate_subquery_qualified_columns(stmt)?;
         // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
         // privilege gate above. Placed before it at first, and the
@@ -14851,6 +14852,65 @@ impl crate::Engine {
         Ok(())
     }
 
+    /// 9.0.0 — `oid` compares with the integer widths and with the reg
+    /// types, and with nothing else.
+    ///
+    /// Measured on PostgreSQL 18.6: `1::oid = 1` and `1::oid = 1::bigint`
+    /// are `t`, while `1::oid = 1::numeric`, `= 1::real` and `= 1.0` are
+    /// all `operator does not exist: oid = <that type>`. SPG answered `t`
+    /// to every one of them, because a value cast to `oid` is carried as
+    /// a plain integer and the comparison sees two integers.
+    ///
+    /// `types_unify` already encodes the rule — the set operations, `IN`
+    /// lists and `CASE` arms consult it — so this is the same question
+    /// asked where a bare comparison asks it. It fires only when BOTH
+    /// operands have a type that is certain without a row AND one of them
+    /// is oid-ish: an untyped literal has no certain type, so
+    /// `WHERE i = '5'` is untouched, which is the over-refusal a wider
+    /// version of this check was backed out for.
+    pub(crate) fn validate_oid_comparisons(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let cat = self.active_catalog();
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if let Some(table) = cat.get(&t.name) {
+                    cols.extend(table.schema().columns.iter().cloned());
+                }
+            }
+        }
+        let mut found: Option<(spg_storage::DataType, spg_storage::DataType, &'static str)> = None;
+        let mut visit = |e: &Expr| {
+            if found.is_some() {
+                return;
+            }
+            found = oid_comparison_mismatch(e, &cols);
+        };
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                visit(expr);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            visit(w);
+        }
+        if let Some(h) = &stmt.having {
+            visit(h);
+        }
+        if let Some((a, b, op)) = found {
+            return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!(
+                    "operator does not exist: {} {op} {}",
+                    crate::conversions::pg_type_name_for_error(a),
+                    crate::conversions::pg_type_name_for_error(b)
+                ),
+            }));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_cast_targets(&self, stmt: &SelectStatement) -> Result<(), EngineError> {
         let mut targets: Vec<alloc::string::String> = Vec::new();
         let mut push = |e: &Expr, out: &mut Vec<alloc::string::String>| {
@@ -15583,6 +15643,63 @@ fn collect_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
             }
         }
         _ => {}
+    }
+}
+
+/// 9.0.0 — the first comparison in `e` whose two operands have certain
+/// types, one of them oid-ish, that `types_unify` refuses. See
+/// [`Engine::validate_oid_comparisons`].
+fn oid_comparison_mismatch(
+    e: &Expr,
+    cols: &[ColumnSchema],
+) -> Option<(spg_storage::DataType, spg_storage::DataType, &'static str)> {
+    use spg_sql::ast::BinOp;
+    let certain = |x: &Expr| -> Option<spg_storage::DataType> {
+        match x {
+            Expr::Column(_) | Expr::Cast { .. } | Expr::Literal(_) => {
+                crate::describe::describe_expr_type(x, cols)
+            }
+            _ => None,
+        }
+    };
+    let oidish = |t: spg_storage::DataType| {
+        matches!(
+            t,
+            spg_storage::DataType::Oid
+                | spg_storage::DataType::RegClass
+                | spg_storage::DataType::RegType
+                | spg_storage::DataType::RegProc
+        )
+    };
+    match e {
+        Expr::Binary { op, lhs, rhs } => {
+            let spelling = match op {
+                BinOp::Eq => "=",
+                BinOp::NotEq => "<>",
+                BinOp::Lt => "<",
+                BinOp::LtEq => "<=",
+                BinOp::Gt => ">",
+                BinOp::GtEq => ">=",
+                _ => {
+                    return oid_comparison_mismatch(lhs, cols)
+                        .or_else(|| oid_comparison_mismatch(rhs, cols));
+                }
+            };
+            if let (Some(a), Some(b)) = (certain(lhs), certain(rhs))
+                && (oidish(a) || oidish(b))
+                && !crate::conversions::types_unify(a, b)
+            {
+                return Some((a, b, spelling));
+            }
+            oid_comparison_mismatch(lhs, cols).or_else(|| oid_comparison_mismatch(rhs, cols))
+        }
+        Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::IsNull { expr, .. } => {
+            oid_comparison_mismatch(expr, cols)
+        }
+        Expr::FunctionCall { args, .. } => {
+            args.iter().find_map(|a| oid_comparison_mismatch(a, cols))
+        }
+        _ => None,
     }
 }
 
