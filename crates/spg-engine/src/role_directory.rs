@@ -60,6 +60,13 @@ pub(crate) struct RoleEntry {
     pub can_login: bool,
 }
 
+/// Is this one of PostgreSQL's predefined roles? They exist without anyone
+/// declaring them, so a membership question about one is not a question
+/// about a name that does not exist.
+pub(crate) fn predefined_role(name: &str) -> bool {
+    PREDEFINED.iter().any(|(_, n)| n.eq_ignore_ascii_case(name))
+}
+
 pub(crate) struct RoleDirectory {
     /// Ordered by oid.
     entries: Vec<RoleEntry>,

@@ -953,6 +953,18 @@ pub(crate) fn apply_binary(
         // first (`7.5 DIV 2` is 3, `'9' DIV 2` is 4).
         BinOp::IntDiv => int_div_op(&l, &r),
         BinOp::Mod => mod_op(l, r),
+        // 9.0.0 — pg_trgm's eight. They reach here only when the operands
+        // are not two texts, or the extension is not installed; the eval
+        // site routes the pg_trgm reading before this. PostgreSQL's answer
+        // in both those cases is that the operator does not exist.
+        BinOp::TrgmWordSimilar
+        | BinOp::TrgmWordSimilarCommutator
+        | BinOp::TrgmStrictWordSimilar
+        | BinOp::TrgmStrictWordSimilarCommutator
+        | BinOp::TrgmWordDistance
+        | BinOp::TrgmWordDistanceCommutator
+        | BinOp::TrgmStrictWordDistance
+        | BinOp::TrgmStrictWordDistanceCommutator => Err(no_such_operator(op, &l, &r)),
         // v7.39 (round 245) — `tsquery <-> tsquery` is PG's phrase
         // concatenation (tsquery_phrase, distance 1), a different operator
         // from the vector distance that shares the spelling.
@@ -3239,8 +3251,13 @@ fn unwrap_vec_pair(
             _ => None,
         }
     };
-    let l_ty = l.data_type();
-    let r_ty = r.data_type();
+    // 9.0.0 — name the two sides the way PG names them. It used to print
+    // the Rust `Debug` of an `Option<DataType>`, so `'cat' <-> 'hat'`
+    // answered `<-> requires two vectors, got Some(Text) and Some(Text)`.
+    let (l_name, r_name) = (
+        super::strings::pg_typeof_name(&l),
+        super::strings::pg_typeof_name(&r),
+    );
     match (to_f32(l), to_f32(r)) {
         (Some(a), Some(b)) => {
             if a.len() != b.len() {
@@ -3251,7 +3268,7 @@ fn unwrap_vec_pair(
             Ok((a, b))
         }
         _ => Err(EvalError::TypeMismatch {
-            detail: format!("{op} requires two vectors, got {l_ty:?} and {r_ty:?}"),
+            detail: format!("operator does not exist: {l_name} {op} {r_name}"),
         }),
     }
 }
@@ -3808,6 +3825,17 @@ fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         }
         return Ok(Value::Float(a % b));
     }
+    // 9.0.0 — a zero divisor is checked HERE, the way `div_op` checks it.
+    // It used to be recovered from the message `arith` produced, by
+    // reading any type error that mentioned `%` as a zero divide — so
+    // `'x' % 'y'` answered `division by zero` instead of naming the
+    // operator it could not find. Found measuring pg_trgm's `%`.
+    if matches!(
+        r,
+        Value::SmallInt(0) | Value::Int(0) | Value::BigInt(0) | Value::Numeric { scaled: 0, .. }
+    ) {
+        return Err(EvalError::DivisionByZero);
+    }
     // `arith()` is integer-only when the float fast path above didn't
     // match; both closures take `i64`. `wrapping_rem` is truncated
     // remainder (sign of the dividend, matching PG / C / `mod()`) and
@@ -3827,10 +3855,6 @@ fn mod_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalEr
         |a, b| if b == 0.0 { 0.0 } else { a % b },
         "%",
     )
-    .map_err(|e| match e {
-        EvalError::TypeMismatch { detail } if detail.contains('%') => EvalError::DivisionByZero,
-        other => other,
-    })
 }
 
 fn div_op(l: Value<'static>, r: Value<'static>) -> Result<Value<'static>, EvalError> {
@@ -5935,6 +5959,30 @@ pub(super) fn require_comparable(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> Res
     }
 }
 
+/// 9.0.0 — the pg_trgm function an operator resolves to over two texts.
+///
+/// PostgreSQL resolves an operator by its operand types, so `%` over two
+/// integers is modulo and over two texts is pg_trgm's similarity test;
+/// `<->` is the pgvector distance over two vectors and pg_trgm's distance
+/// over two texts. The eval site applies this only when both sides are
+/// text AND the extension is installed — without it PostgreSQL answers
+/// that the operator does not exist, and so does the arm below.
+pub(crate) const fn trgm_operator_function(op: BinOp) -> Option<&'static str> {
+    Some(match op {
+        BinOp::Mod => "similarity_op",
+        BinOp::L2Distance => "similarity_dist",
+        BinOp::TrgmWordSimilar => "word_similarity_op",
+        BinOp::TrgmWordSimilarCommutator => "word_similarity_commutator_op",
+        BinOp::TrgmStrictWordSimilar => "strict_word_similarity_op",
+        BinOp::TrgmStrictWordSimilarCommutator => "strict_word_similarity_commutator_op",
+        BinOp::TrgmWordDistance => "word_similarity_dist_op",
+        BinOp::TrgmWordDistanceCommutator => "word_similarity_dist_commutator_op",
+        BinOp::TrgmStrictWordDistance => "strict_word_similarity_dist_op",
+        BinOp::TrgmStrictWordDistanceCommutator => "strict_word_similarity_dist_commutator_op",
+        _ => return None,
+    })
+}
+
 fn no_such_operator(op: BinOp, a: &Value<'_>, b: &Value<'_>) -> EvalError {
     // `pg_typeof_name` is the FULL value→type-name table (the one pg_typeof
     // itself answers from); `pg_typeof_name_for_datatype` covers only the
@@ -6674,6 +6722,14 @@ pub(super) fn compare(
         BinOp::Gt => ord.is_gt(),
         BinOp::GtEq => ord.is_ge(),
         BinOp::IntDiv
+        | BinOp::TrgmWordSimilar
+        | BinOp::TrgmWordSimilarCommutator
+        | BinOp::TrgmStrictWordSimilar
+        | BinOp::TrgmStrictWordSimilarCommutator
+        | BinOp::TrgmWordDistance
+        | BinOp::TrgmWordDistanceCommutator
+        | BinOp::TrgmStrictWordDistance
+        | BinOp::TrgmStrictWordDistanceCommutator
         | BinOp::And
         | BinOp::Or
         | BinOp::LogicalXor

@@ -1566,12 +1566,12 @@ impl Table {
                             // r1019 — address the String-keyed map with the borrowed
                             // trigram; allocate one only for a key the map has never
                             // seen, which after the first rows is rare.
-                            let key = trgm::trigram_str(&tri);
-                            if let Some(entries) = map.get_mut_by(key) {
+                            let key = trgm::trigram_key(&tri);
+                            if let Some(entries) = map.get_mut_by(key.as_ref()) {
                                 entries.push(RowLocator::Hot(new_row_idx));
                             } else {
                                 map.insert_mut(
-                                    alloc::string::ToString::to_string(key),
+                                    key.into_owned(),
                                     crate::posting::PostingList::single(RowLocator::Hot(
                                         new_row_idx,
                                     )),
@@ -2301,11 +2301,7 @@ impl Table {
             IndexKind::GinTrgm(map) => {
                 if let Value::Text(s) = cell {
                     for tri in trgm::extract_trigrams(s) {
-                        push_posting(
-                            map,
-                            alloc::string::ToString::to_string(trgm::trigram_str(&tri)),
-                            row_idx,
-                        );
+                        push_posting(map, trgm::trigram_key(&tri).into_owned(), row_idx);
                     }
                 }
             }
@@ -2699,12 +2695,12 @@ impl Table {
                         // r1019 — address the String-keyed map with the borrowed
                         // trigram; allocate one only for a key the map has never
                         // seen, which after the first rows is rare.
-                        let key = trgm::trigram_str(&tri);
-                        if let Some(entries) = map.get_mut_by(key) {
+                        let key = trgm::trigram_key(&tri);
+                        if let Some(entries) = map.get_mut_by(key.as_ref()) {
                             entries.push(RowLocator::Hot(i));
                         } else {
                             map.insert_mut(
-                                alloc::string::ToString::to_string(key),
+                                key.into_owned(),
                                 crate::posting::PostingList::single(RowLocator::Hot(i)),
                             );
                         }
@@ -4348,12 +4344,12 @@ impl Table {
                                     // r1019 — address the String-keyed map with the borrowed
                                     // trigram; allocate one only for a key the map has never
                                     // seen, which after the first rows is rare.
-                                    let key = trgm::trigram_str(&tri);
-                                    if let Some(entries) = map.get_mut_by(key) {
+                                    let key = trgm::trigram_key(&tri);
+                                    if let Some(entries) = map.get_mut_by(key.as_ref()) {
                                         entries.push(RowLocator::Hot(i));
                                     } else {
                                         map.insert_mut(
-                                            alloc::string::ToString::to_string(key),
+                                            key.into_owned(),
                                             crate::posting::PostingList::single(RowLocator::Hot(i)),
                                         );
                                     }

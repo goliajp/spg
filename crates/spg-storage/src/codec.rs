@@ -892,7 +892,19 @@ fn deserialize_indices(
                     )));
                 }
                 let map = read_gin_map(cur)?;
-                t.restore_gin_trgm_index(idx_name, &column_name, map)?;
+                if version < 103 {
+                    // 9.0.0 — the trigrams in a pre-v103 image were
+                    // extracted the old way: a non-ASCII word produced
+                    // none at all, and an apostrophe joined two words
+                    // into one. Restoring that map would answer today's
+                    // lookups with an empty posting list, so the index is
+                    // rebuilt from the rows instead. The same shape the
+                    // BTree tag uses when its payload is absent.
+                    drop(map);
+                    t.add_gin_trgm_index(idx_name, &column_name)?;
+                } else {
+                    t.restore_gin_trgm_index(idx_name, &column_name, map)?;
+                }
             }
             5 => {
                 // v7.17.0 Phase 2.2 — fulltext-GIN tag (MySQL

@@ -10279,7 +10279,13 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// 9.0.0 — v101 appends each extra index key part's expression and
 /// explicit collation, so a key may mix columns and expressions in any
 /// position. A v100 binary refuses a v101 image by its version.
-const FILE_VERSION: u8 = 102;
+/// 9.0.0 — v103 says the trigram indexes in the image were built the way
+/// this build extracts trigrams. Nothing new is written: the bump exists
+/// so an OLDER image's trigram-GIN is REBUILT from its rows on load
+/// rather than trusted, because extraction changed (non-ASCII text now
+/// yields trigrams, and an apostrophe now separates words) and a map
+/// built the old way answers the new lookups with nothing.
+const FILE_VERSION: u8 = 103;
 
 /// 8.0.3 — the byte a [`NonTableKind`] is written as.
 const fn non_table_kind_tag(kind: NonTableKind) -> u8 {

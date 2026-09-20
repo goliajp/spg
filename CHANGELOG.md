@@ -10,6 +10,156 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — pg_trgm's `%` worked in a select list and not in a `WHERE`
+
+`SELECT id FROM t WHERE txt % 'needle'` answered `operator does not
+exist: text % text` while `SELECT txt % 'needle' FROM t` answered the
+similarity test. A compiled predicate never passes through the tree
+evaluator's binary-operator arm, where an operator's resolution by
+operand type lives. The same VM had the same hole for the MySQL reading
+of `AND` / `OR`, found the same way; both readings are one named
+predicate now, called from both places.
+
+### Fixed — `set_limit()` did not stick over the wire
+
+`SELECT set_limit(0.66)` answered `0.66` and wrote nothing: a `SELECT`
+whose text carries no known mutating call takes a read-only fast path
+that cannot run the statement-level pass the write lives in. The next
+`SELECT show_limit()` said `0.3`. It appeared to work only when psql
+put several statements in one message, because a batch does not take
+that path. `show_limit` folds in the same pass now, so
+`SELECT show_limit(), set_limit(0.7), show_limit()` reads
+`0.3|0.7|0.7`, left to right, as PostgreSQL does.
+
+The list of names that force the write path is hand-kept, and this is
+the third family to have been left out of it.
+
+### Fixed — the differential corpus called two empty legs identical
+
+One of the six release gates. A run whose input path was wrong failed
+the input redirect, so neither engine's output file was written; `diff`
+errored on two missing files, and the count of differing lines — taken
+by grepping diff's own error message — came out 0. The file was
+reported IDENTICAL. The instrument's failure looked exactly like its
+success. It now refuses to score a file whose leg wrote neither rows
+nor errors, and names the leg.
+
+### Fixed — `FILTER` leaked onto a later aggregate
+
+`SELECT count(*) FILTER (WHERE g='a'), count(*) FROM t` answered the
+subtotal twice. Measured against PostgreSQL 18.6 on five rows: `2|2`
+where PG says `2|5`; `sum(v) FILTER (…), sum(v)` gave `30|30` for
+`30|150`; `max(v) FILTER (…), max(v)` gave `20|20` for `20|50`; and the
+same under `GROUP BY`.
+
+The aggregate written without a FILTER was matched to the earlier
+FILTERed one by name and arguments alone, so it read that one's column.
+Writing the unfiltered one FIRST was correct all along, which is why
+nothing caught it — and a total beside a subtotal is the ordinary way
+round to write it.
+
+The rewrite site now requires the spec to have no filter, which the
+collection-time dedup and both ordered-aggregate arms already did: one
+of four siblings had it missing.
+
+### Fixed — `pg_has_role` answered three things wrong
+
+Measured on PostgreSQL 18.6, as the superuser and again after
+`SET ROLE alice`:
+
+| call | PG superuser | PG alice | SPG |
+|---|---|---|---|
+| `pg_has_role('pg_monitor','USAGE')` | `t` | `f` | `f` for both |
+| `pg_has_role(999999::oid,'USAGE')` | `t` | `f` | `t` for both |
+| `pg_has_role('no_such_role','USAGE')` | ERROR | ERROR | `f` |
+
+The oid spelling returned `true` for any oid because a non-text
+argument fell through to a bare `return true`; a superuser was told it
+is a member of nothing; and a role name that is a typo answered
+`false`, which reads as a real "you are not a member".
+
+Every lookup goes through the role directory now — the same source
+`pg_roles` answers from. Asking the user store instead said the
+bootstrap superuser does not exist, because an embedded engine that ran
+no `CREATE USER` has an empty store while `pg_roles` still lists
+`admin` and `postgres`: one question, two surfaces.
+
+### Fixed — a `gin_trgm_ops` index made `LIKE` return the wrong rows
+
+Measured on 3,200 rows: `LIKE '%foo-bar%'` answered 3000 with no index
+and **0** with one, and `LIKE '%日本語%'` answered 200 and **0**. The
+pattern's literal run was windowed whole, so it demanded trigrams that
+span a separator (`oo-`, `o-b`) or a multi-byte boundary — and the
+index, which holds the trigrams of WORDS, contains neither. Every row
+was then intersected away.
+
+A pattern's literal run splits at every non-alphanumeric character now,
+the way an indexed value does, and a sub-word is padded only on the
+side where the pattern proves its word begins or ends.
+
+### Fixed — pg_trgm's operators were not the extension's
+
+With the extension installed, `'x' % 'y'` answered `division by zero`
+(it was integer modulo, and any type error whose message mentioned `%`
+was being re-read as a zero divide) where PostgreSQL 18.6 answers `f`;
+`'cat' <-> 'hat'` errored with `<-> requires two vectors, got
+Some(Text) and Some(Text)` — the Rust `Debug` of an `Option`, in a
+message a client reads — where PG answers `0.85714287`. The other
+eight operators (`<%`, `%>`, `<<%`, `%>>`, `<<->`, `<->>`, `<<<->`,
+`<->>>`) and fourteen functions did not exist at all.
+
+All ten operators resolve by operand type the way PostgreSQL resolves
+them, `word_similarity` and `strict_word_similarity` join
+`similarity`, and the ten wrapper functions the operators are built
+from are callable by name. `pg_trgm.similarity_threshold` and its two
+siblings are settings that `CREATE EXTENSION` brings with it, and
+`set_limit()` writes the first of them.
+
+A zero divisor is checked where `/` checks it, so `%` no longer
+reports one for a type it cannot resolve.
+
+### Fixed — trigrams stopped at ASCII
+
+`similarity('日本語','日本')` was 0 where PostgreSQL says 0.4, and
+`show_trgm('日本語')` was empty where PG lists four hashes: every
+non-ASCII character was a word SEPARATOR, so CJK text had no trigrams
+at all and a trigram index over it matched nothing. An apostrophe was
+the opposite mistake — a word CHARACTER, so `don't` was one word where
+PG makes it two.
+
+Extraction splits on Unicode alphanumerics, pads and windows over
+CHARACTERS, and compacts a window wider than three bytes with
+PostgreSQL's own legacy CRC-32 — so `show_trgm` prints the same hashes
+and `similarity` agrees on the same inputs. Verified against a live PG
+18.6 over 102 input pairs spanning Japanese, Korean, Greek, Cyrillic,
+an emoji and `ß`: **0 rows differ** across `similarity`,
+`word_similarity`, `strict_word_similarity`, `show_trgm` and all ten
+operators.
+
+A catalog written before this change has its trigram indexes REBUILT
+on load rather than trusted, because a map built the old way answers
+the new lookups with nothing.
+
+### Fixed — `SET x = 0.7` was a syntax error
+
+A numeric literal with a decimal point or an exponent lexes as
+NUMERIC, and only `Integer` and `Float` were admitted, so every
+fractional setting refused: `SET seq_page_cost = 0.7`, `SET
+cpu_tuple_cost = 0.02`, `SET pg_trgm.similarity_threshold = 0.7`. Only
+the quoted spelling parsed.
+
+### Fixed — the catalog listed an extension's functions before the extension
+
+`SELECT count(*) FROM pg_proc WHERE proname = 'similarity'` answered 1
+on a database that had created no extension — the exact probe a client
+uses to decide whether pg_trgm is there — while CALLING the function
+said it does not exist. Two surfaces, two answers; 9.0.0 had already
+fixed the calling half.
+
+An extension's functions and operators enter the catalog when the
+extension is installed, and in the schema it was installed into rather
+than in `pg_catalog`.
+
 ### Fixed — `pg_policy.polroles` said every policy applies to PUBLIC
 
 The column is `oid[]` and every entry was 0 — which is PUBLIC on

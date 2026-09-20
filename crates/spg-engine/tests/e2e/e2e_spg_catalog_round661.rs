@@ -49,9 +49,11 @@ fn one(e: &mut Engine, sql: &str) -> String {
 #[test]
 fn round661_pg_catalog_claims_only_what_pg_has() {
     let mut e = Engine::new();
-    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
-    // does not have it until the extension is installed.
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's and similarity is
+    // pg_trgm's, and PostgreSQL does not have either until its extension
+    // is installed. Both are created here so all ten names are present.
     e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
+    e.execute("CREATE EXTENSION pg_trgm").unwrap();
     assert_eq!(
         one(
             &mut e,
@@ -71,7 +73,20 @@ fn round661_pg_catalog_claims_only_what_pg_has() {
              ('ifnull','unix_timestamp','benchmark','pg_stat_get_idx_scan','pg_start_backup',\
               'spg_version','uuid_generate_v4','similarity','nullif','current_catalog')"
         ),
-        "10"
+        // 9.0.0 — eight, not ten: an extension's functions live in the
+        // schema the extension was installed into, which is where PG 18.6
+        // puts them, not in SPG's own `pg_spg`.
+        "8"
+    );
+    // The two that left `pg_spg` are in `public`, where CREATE EXTENSION
+    // put them — the same place PG 18.6 reports them from.
+    assert_eq!(
+        one(
+            &mut e,
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = 'public' AND p.proname IN ('uuid_generate_v4','similarity')"
+        ),
+        "2"
     );
 }
 
@@ -80,9 +95,11 @@ fn round661_pg_catalog_claims_only_what_pg_has() {
 #[test]
 fn round661_the_moved_functions_still_answer() {
     let mut e = Engine::new();
-    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
-    // does not have it until the extension is installed.
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's and similarity is
+    // pg_trgm's, and PostgreSQL does not have either until its extension
+    // is installed. Both are created here so all ten names are present.
     e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
+    e.execute("CREATE EXTENSION pg_trgm").unwrap();
     assert_eq!(one(&mut e, "SELECT ifnull(NULL, 1)"), "1");
     assert_eq!(one(&mut e, "SELECT ucase('ab')"), "AB");
     assert_eq!(one(&mut e, "SELECT nullif(1, 1)"), "NULL");
@@ -95,9 +112,11 @@ fn round661_the_moved_functions_still_answer() {
 #[test]
 fn round661_the_namespace_is_registered() {
     let mut e = Engine::new();
-    // 9.0.0 — uuid_generate_v4 is uuid-ossp's, and PostgreSQL
-    // does not have it until the extension is installed.
+    // 9.0.0 — uuid_generate_v4 is uuid-ossp's and similarity is
+    // pg_trgm's, and PostgreSQL does not have either until its extension
+    // is installed. Both are created here so all ten names are present.
     e.execute("CREATE EXTENSION \"uuid-ossp\"").unwrap();
+    e.execute("CREATE EXTENSION pg_trgm").unwrap();
     assert_eq!(
         one(&mut e, "SELECT nspname FROM pg_namespace ORDER BY oid"),
         "pg_catalog,public,information_schema,pg_spg"

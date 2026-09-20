@@ -2267,6 +2267,21 @@ where
                     continue;
                 }
                 let n = stack.len();
+                // 9.0.0 — pg_trgm's operators have to be here TOO, for the
+                // same reason the MySQL AND / OR reading is: a compiled
+                // predicate never passes through `eval_expr`'s arm, so
+                // `WHERE t % 'x'` over a column answered `operator does not
+                // exist: text % text` while the same `%` in a select list
+                // was pg_trgm's. The corpus found it, not the reading.
+                if n >= 2
+                    && let Some(fname) =
+                        super::trgm_operator_hook(*op, &stack[n - 2], &stack[n - 1], ctx)
+                {
+                    let r = stack.pop().unwrap_or(Value::Null).into_owned();
+                    let l = stack.pop().unwrap_or(Value::Null).into_owned();
+                    stack.push(super::functions::apply_function(fname, &[l, r], ctx)?);
+                    continue;
+                }
                 if n >= 2 {
                     if let Some(result) =
                         super::apply_binary_by_ref(*op, &stack[n - 2], &stack[n - 1])?

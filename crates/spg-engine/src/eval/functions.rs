@@ -1138,6 +1138,23 @@ pub(crate) fn wrong_arity(name: &str, args: &[Value<'_>]) -> EvalError {
     }
 }
 
+/// 9.0.0 — the threshold a pg_trgm operator compares its score against.
+/// PG keeps one per family, settable with `SET`; the defaults are the ones
+/// measured on PG 18.6 (0.3 / 0.6 / 0.5).
+fn trgm_threshold(ctx: &EvalContext<'_>, op: &str) -> f32 {
+    let (guc, default) = if op.starts_with("strict_word") {
+        ("pg_trgm.strict_word_similarity_threshold", 0.5)
+    } else if op.starts_with("word") {
+        ("pg_trgm.word_similarity_threshold", 0.6)
+    } else {
+        ("pg_trgm.similarity_threshold", 0.3)
+    };
+    ctx.session_gucs
+        .and_then(|g| g.get(guc))
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
 pub(crate) fn arg_type_list(args: &[Value<'_>]) -> alloc::string::String {
     args.iter()
         .map(|a| crate::conversions::pg_type_name_for_error_opt(a.data_type()))
@@ -16632,10 +16649,95 @@ fn apply_function_dispatch(
                 2 => (current_role_from_ctx(ctx), &args[0]),
                 _ => return Ok(Value::Bool(true)),
             };
-            let Value::Text(role) = role_arg else {
-                return Ok(Value::Bool(true));
+            // 9.0.0 — three answers were wrong, all measured on PG 18.6
+            // (as the superuser and again after `SET ROLE alice`):
+            //
+            // | call | superuser | alice |
+            // |---|---|---|
+            // | `pg_has_role('pg_monitor','USAGE')` | t | f |
+            // | `pg_has_role(999999::oid,'USAGE')`  | t | f |
+            // | `pg_has_role('no_such','USAGE')`    | ERROR | ERROR |
+            //
+            // SPG answered `f`, `t`, `f`. The order below is what makes all
+            // six agree: a NAME that does not exist raises before anything
+            // else, a superuser then holds every role, and only after that
+            // does an unresolvable OID answer `false`.
+            //
+            // Every lookup goes through the ROLE DIRECTORY, which is what
+            // `pg_roles` answers from — asking the user store instead said
+            // the bootstrap superuser does not exist, because an embedded
+            // engine that ran no `CREATE USER` has an empty store while
+            // `pg_roles` still lists `admin` and `postgres`. Two surfaces,
+            // one question.
+            let directory = ctx.engine.map(crate::role_directory::RoleDirectory::of);
+            let known = |name: &str| -> bool {
+                directory.as_ref().is_some_and(|d| {
+                    d.entries().iter().any(|e| e.name.eq_ignore_ascii_case(name))
+                }) || ctx.users.is_some_and(|u| u.contains(name))
+                    || crate::role_directory::predefined_role(name)
             };
-            let role = role.as_ref();
+            let by_name: Option<alloc::string::String> = match role_arg {
+                Value::Null => return Ok(Value::Null),
+                Value::Text(r) => Some(alloc::string::String::from(r.as_ref())),
+                _ => None,
+            };
+            if let Some(role) = &by_name
+                && (directory.is_some() || ctx.users.is_some())
+                && !known(role)
+                && !member.eq_ignore_ascii_case(role)
+            {
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("role \"{role}\" does not exist"),
+                });
+            }
+            // A SUPERUSER holds every role's privileges. SPG answered `f`, so
+            // every one of PostgreSQL's four information_schema views built
+            // on this function would have told a superuser it is a member of
+            // nothing.
+            let member_is_superuser = directory.as_ref().is_some_and(|d| {
+                d.entries()
+                    .iter()
+                    .any(|e| e.name.eq_ignore_ascii_case(&member) && e.superuser)
+            }) || ctx
+                .users
+                .and_then(|u| u.get(&member))
+                .is_some_and(|rec| rec.superuser);
+            if member_is_superuser {
+                return Ok(Value::Bool(true));
+            }
+            let role = match by_name {
+                Some(r) => r,
+                None => {
+                    // The OID spelling returned `true` for any oid without
+                    // looking at it, because a non-`Text` argument fell
+                    // straight through.
+                    let oid = match role_arg {
+                        Value::SmallInt(n) => Some(i64::from(*n)),
+                        Value::Int(n) => Some(i64::from(*n)),
+                        Value::BigInt(n) => Some(*n),
+                        _ => None,
+                    };
+                    let Some(oid) = oid else {
+                        return Err(EvalError::TypeMismatch {
+                            detail: alloc::format!(
+                                "pg_has_role() needs a role name or oid, got {}",
+                                crate::conversions::pg_type_name_for_error_opt(
+                                    role_arg.data_type()
+                                )
+                            ),
+                        });
+                    };
+                    let Some(d) = directory.as_ref() else {
+                        return Ok(Value::Bool(true));
+                    };
+                    match d.name_of(oid) {
+                        // An oid no role carries is `false`, not an error.
+                        None => return Ok(Value::Bool(false)),
+                        Some(n) => alloc::string::String::from(n),
+                    }
+                }
+            };
+            let role = role.as_str();
             if member.eq_ignore_ascii_case(role) {
                 return Ok(Value::Bool(true));
             }
@@ -19137,6 +19239,125 @@ fn apply_function_dispatch(
         // Scalar surface returns NULL; the real row-shape is only
         // useful through the pg_sequence catalog view.
         "pg_sequence_parameters" => Ok(Value::Null),
+        // 9.0.0 — the rest of pg_trgm's callable surface: the two word
+        // variants and the ten wrapper functions its operators are built
+        // from. Each wrapper is one of three shapes over one of three
+        // scores, and the commutator ones score the arguments the other
+        // way round — measured on PG 18.6, where `'cat' <% 'hat cat'` is
+        // true and `'hat cat' <% 'cat'` is false.
+        "word_similarity"
+        | "strict_word_similarity"
+        | "similarity_op"
+        | "similarity_dist"
+        | "word_similarity_op"
+        | "word_similarity_commutator_op"
+        | "word_similarity_dist_op"
+        | "word_similarity_dist_commutator_op"
+        | "strict_word_similarity_op"
+        | "strict_word_similarity_commutator_op"
+        | "strict_word_similarity_dist_op"
+        | "strict_word_similarity_dist_commutator_op" => {
+            if args.len() != 2 {
+                return Err(EvalError::WrongArity {
+                    name: alloc::string::String::from(name),
+                    types: arg_type_list(args),
+                });
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut text_arg = |v: &Value<'_>| -> Result<alloc::string::String, EvalError> {
+                match v {
+                    Value::Text(s) => Ok(s.to_string()),
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "{name}() needs text, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
+                    }),
+                }
+            };
+            let a = text_arg(&args[0])?;
+            let b = text_arg(&args[1])?;
+            let score = match name {
+                "similarity_op" | "similarity_dist" => spg_storage::trgm::similarity(&a, &b),
+                "word_similarity" | "word_similarity_op" | "word_similarity_dist_op" => {
+                    spg_storage::trgm::word_similarity(&a, &b)
+                }
+                "word_similarity_commutator_op" | "word_similarity_dist_commutator_op" => {
+                    spg_storage::trgm::word_similarity(&b, &a)
+                }
+                "strict_word_similarity"
+                | "strict_word_similarity_op"
+                | "strict_word_similarity_dist_op" => {
+                    spg_storage::trgm::strict_word_similarity(&a, &b)
+                }
+                _ => spg_storage::trgm::strict_word_similarity(&b, &a),
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let score = score as f32;
+            match name {
+                "similarity_op" => Ok(Value::Bool(score >= trgm_threshold(ctx, name))),
+                "word_similarity_op"
+                | "word_similarity_commutator_op"
+                | "strict_word_similarity_op"
+                | "strict_word_similarity_commutator_op" => {
+                    Ok(Value::Bool(score >= trgm_threshold(ctx, name)))
+                }
+                "word_similarity" | "strict_word_similarity" => Ok(Value::Real(score)),
+                // The `*_dist` wrappers are what the distance operators
+                // call: PG's distance is one minus the similarity.
+                _ => Ok(Value::Real(1.0 - score)),
+            }
+        }
+        // 9.0.0 — pg_trgm's threshold pair. `show_limit()` reads the GUC
+        // `SET pg_trgm.similarity_threshold` writes; `set_limit(real)` is
+        // the deprecated writer, and the statement-level path in
+        // `execute.rs` is what makes it stick (same shape as
+        // `set_config`). Reached here it still answers the value, which
+        // is what PG's `set_limit` returns.
+        "show_limit" | "set_limit" => {
+            let want = usize::from(name == "set_limit");
+            if args.len() != want {
+                return Err(EvalError::WrongArity {
+                    name: alloc::string::String::from(name),
+                    types: arg_type_list(args),
+                });
+            }
+            if name == "set_limit" {
+                #[allow(clippy::cast_possible_truncation)]
+                return match &args[0] {
+                    Value::Null => Ok(Value::Null),
+                    Value::Real(v) => Ok(Value::Real(*v)),
+                    Value::Float(v) => Ok(Value::Real(*v as f32)),
+                    Value::SmallInt(n) => Ok(Value::Real(f32::from(*n))),
+                    Value::Int(n) => Ok(Value::Real(*n as f32)),
+                    Value::Numeric { scaled, scale, .. } => Ok(Value::Real(
+                        (*scaled as f64 / f64_powi(10.0, i32::from(*scale))) as f32,
+                    )),
+                    // PG resolves the untyped literal to `real` and fails in
+                    // the CAST, so the sentence is the cast's, not the
+                    // function's: measured `set_limit('x')` →
+                    // `invalid input syntax for type real: "x"`.
+                    Value::Text(t) => match t.trim().parse::<f32>() {
+                        Ok(v) => Ok(Value::Real(v)),
+                        Err(_) => Err(EvalError::TypeMismatch {
+                            detail: format!(
+                                "invalid input syntax for type real: \"{}\"",
+                                t.as_ref()
+                            ),
+                        }),
+                    },
+                    other => Err(EvalError::TypeMismatch {
+                        detail: format!(
+                            "set_limit() needs real, got {}",
+                            crate::conversions::pg_type_name_for_error_opt(other.data_type())
+                        ),
+                    }),
+                };
+            }
+            Ok(Value::Real(trgm_threshold(ctx, "similarity_op")))
+        }
         // v7.15.0 — pg_trgm: similarity, show_trgm. Match PG
         // semantics: similarity returns Jaccard of trigram sets;
         // show_trgm returns the trigram set as TEXT[]. NULL on
@@ -19191,9 +19412,15 @@ fn apply_function_dispatch(
             // r1019 — trigrams are `[u8; 3]` now; show_trgm is the one caller
             // that genuinely wants them as text, so it is the one that pays
             // for the strings.
-            let trigrams: Vec<Option<String>> = spg_storage::trgm::extract_trigrams(s)
+            // 9.0.0 — PG's array order compares the three bytes as SIGNED
+            // chars, which puts a hashed trigram (first byte ≥ 0x80) ahead
+            // of a printable one. The set itself is ordered unsigned.
+            let mut ordered: Vec<spg_storage::trgm::Trigram> =
+                spg_storage::trgm::extract_trigrams(s).into_iter().collect();
+            ordered.sort_by_key(spg_storage::trgm::signed_order);
+            let trigrams: Vec<Option<String>> = ordered
                 .iter()
-                .map(|t| Some(spg_storage::trgm::trigram_str(t).to_string()))
+                .map(|t| Some(spg_storage::trgm::trigram_key(t).into_owned()))
                 .collect();
             Ok(Value::TextArray(trigrams))
         }

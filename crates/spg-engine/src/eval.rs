@@ -3845,6 +3845,38 @@ fn name_the_call_pg_s_way(
     }
 }
 
+/// 9.0.0 — the pg_trgm function `op` resolves to for THESE two operands,
+/// or `None` when the ordinary reading applies.
+///
+/// PostgreSQL picks an operator by operand type, so `%` over two integers
+/// is modulo and over two texts is pg_trgm's similarity test — and only
+/// once the extension is installed, which is why this asks the catalog
+/// rather than answering unconditionally.
+///
+/// Both evaluators call it. A compiled predicate never passes through
+/// `eval_expr`'s `Expr::Binary` arm, so `WHERE t % 'x'` over a COLUMN
+/// reached `apply_binary` and answered `operator does not exist: text %
+/// text` while the same expression in a select list worked. That is the
+/// shape the MySQL `AND` / `OR` reading was caught in, in the same VM.
+pub(crate) fn trgm_operator_hook(
+    op: BinOp,
+    l: &Value<'_>,
+    r: &Value<'_>,
+    ctx: &EvalContext<'_>,
+) -> Option<&'static str> {
+    if !matches!(l, Value::Text(_)) || !matches!(r, Value::Text(_)) {
+        return None;
+    }
+    let fname = binop::trgm_operator_function(op)?;
+    ctx.catalog
+        .is_some_and(|c| {
+            c.extensions()
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case("pg_trgm"))
+        })
+        .then_some(fname)
+}
+
 fn eval_function_call_inner(
     name: &str,
     args: &[Expr],
@@ -5739,6 +5771,11 @@ pub fn eval_expr(
             // — the helper is a no-op outside Text-Text equality
             // and inequality.
             let (l, r) = collation_fold_for_compare(*op, lhs, rhs, l, r, ctx);
+            // 9.0.0 — pg_trgm resolves `%` and `<->` over two texts to its
+            // own operators, and supplies eight more.
+            if let Some(fname) = trgm_operator_hook(*op, &l, &r, ctx) {
+                return functions::apply_function(fname, &[l, r], ctx);
+            }
             // v7.40.11 — `timestamptz ± interval` is a CALENDAR step in
             // the session zone for the months and days fields, and an
             // absolute duration only for the time part. See

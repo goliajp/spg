@@ -5903,7 +5903,7 @@ pub(crate) const ARRAY_TYPE_OIDS: &[(i64, &str, i64)] = &[
 /// `oprcode` and the selectivity estimators are 0 throughout: SPG's operators
 /// are not catalogued functions, so there is nothing to name, which is the
 /// same choice `pg_type`'s seven I/O-function OIDs made in round 543.
-pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+pub(crate) fn synth_pg_operator(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("oprname", DataType::Name, false),
@@ -6205,6 +6205,46 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     for &t in &[20i64, 21, 23] {
         for op in ["&", "|", "#"] {
             push(&mut rows, &mut oid, op, "b", t, t, t, false, false);
+        }
+    }
+    // 9.0.0 — pg_trgm's ten, over two texts, once the extension is
+    // installed. They live in the schema it was installed into, not in
+    // `pg_catalog`, so they are pushed here rather than through `push`.
+    if cat
+        .extensions()
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("pg_trgm"))
+    {
+        for (name, result) in [
+            ("%", 16i64),
+            ("<%", 16),
+            ("%>", 16),
+            ("<<%", 16),
+            ("%>>", 16),
+            ("<->", 700),
+            ("<<->", 700),
+            ("<->>", 700),
+            ("<<<->", 700),
+            ("<->>>", 700),
+        ] {
+            oid += 1;
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(oid),
+                Value::text::<String>(name.into()),
+                Value::BigInt(2200), // oprnamespace — the extension's schema
+                Value::BigInt(10),   // oprowner
+                char1("b"),
+                Value::Bool(false),
+                Value::Bool(false),
+                Value::BigInt(25), // text
+                Value::BigInt(25), // text
+                Value::BigInt(result),
+                Value::BigInt(0),
+                Value::BigInt(0),
+                Value::RegProc(0, "-".into()),
+                Value::RegProc(0, "-".into()),
+                Value::RegProc(0, "-".into()),
+            ]));
         }
     }
     (schema, rows)
@@ -7032,6 +7072,25 @@ pub(crate) fn synth_pg_proc(
         "current_schema",
     ];
     for &(oid, name, kind, nargs, rettype) in funcs {
+        // 9.0.0 — a function an EXTENSION supplies is in the catalog once
+        // the extension is installed, and not before. It was always
+        // listed, so `SELECT count(*) FROM pg_proc WHERE
+        // proname = 'similarity'` — the probe a client uses to decide
+        // whether pg_trgm is there — answered 1 on a database where
+        // CALLING it says it does not exist. Two surfaces, two answers.
+        let extension_schema = match crate::extension::supplying_extension(name) {
+            None => None,
+            Some(ext) => match cat
+                .extensions()
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(ext))
+            {
+                None => continue,
+                // Extensions install into `public` here; SPG has one
+                // user schema, so that is the oid whatever the name.
+                Some(_) => Some(2200),
+            },
+        };
         let provolatile: &str = if volatile_names.contains(&name) {
             "v"
         } else {
@@ -7054,11 +7113,13 @@ pub(crate) fn synth_pg_proc(
             Value::BigInt(oid),
             Value::text::<String>(name.into()),
             // v7.39 (round 661) — `pg_catalog` only for what PG18 really
-            // has; SPG's own surface goes to `pg_spg`.
-            Value::BigInt(if SPG_ONLY_PROCS.contains(&name) {
-                13500
-            } else {
-                11
+            // has; SPG's own surface goes to `pg_spg`. 9.0.0 — and an
+            // extension's goes to the schema it was installed into, which
+            // is where PG 18.6 puts it.
+            Value::BigInt(match extension_schema {
+                Some(ns) => ns,
+                None if SPG_ONLY_PROCS.contains(&name) => 13500,
+                None => 11,
             }),
             Value::BigInt(10),             // proowner
             Value::BigInt(12),             // prolang = internal
@@ -7233,7 +7294,6 @@ pub(crate) const SPG_ONLY_PROCS: &[&str] = &[
     "rand",
     "row",
     "row_count",
-    "similarity",
     "sleep",
     "spg_build_time",
     "spg_edition",
@@ -7241,13 +7301,7 @@ pub(crate) const SPG_ONLY_PROCS: &[&str] = &[
     "spg_version",
     "unix_timestamp",
     "user",
-    "uuid_generate_v4",
     "uuid_generate_v7",
-    "uuid_nil",
-    "uuid_ns_dns",
-    "uuid_ns_oid",
-    "uuid_ns_url",
-    "uuid_ns_x500",
     "uuid_short",
     "xmlforest",
 ];
@@ -7667,7 +7721,30 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (900068, "row", "f", 0, 2249),
     (900069, "row_count", "f", 0, 20),
     (1706, "sign", "f", 1, 23),
-    (900070, "similarity", "f", 2, 701),
+    // 9.0.0 — pg_trgm returns `real` (700), measured on 18.6. It said
+    // float8.
+    (900070, "similarity", "f", 2, 700),
+    (900086, "show_trgm", "f", 1, 1009),
+    (900087, "word_similarity", "f", 2, 700),
+    (900088, "strict_word_similarity", "f", 2, 700),
+    (900089, "set_limit", "f", 1, 700),
+    (900090, "show_limit", "f", 0, 700),
+    (900091, "similarity_op", "f", 2, 16),
+    (900092, "similarity_dist", "f", 2, 700),
+    (900093, "word_similarity_op", "f", 2, 16),
+    (900094, "word_similarity_commutator_op", "f", 2, 16),
+    (900095, "word_similarity_dist_op", "f", 2, 700),
+    (900096, "word_similarity_dist_commutator_op", "f", 2, 700),
+    (900097, "strict_word_similarity_op", "f", 2, 16),
+    (900098, "strict_word_similarity_commutator_op", "f", 2, 16),
+    (900099, "strict_word_similarity_dist_op", "f", 2, 700),
+    (
+        900100,
+        "strict_word_similarity_dist_commutator_op",
+        "f",
+        2,
+        700,
+    ),
     (1604, "sin", "f", 1, 701),
     (900071, "sleep", "f", 0, 23),
     (900072, "spg_build_time", "f", 0, 25),
@@ -7693,7 +7770,11 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (900076, "unix_timestamp", "f", 0, 20),
     (900077, "user", "f", 0, 25),
     (6342, "uuid_extract_timestamp", "f", 1, 1184),
+    (900101, "uuid_generate_v1", "f", 0, 2950),
+    (900102, "uuid_generate_v1mc", "f", 0, 2950),
+    (900103, "uuid_generate_v3", "f", 2, 2950),
     (900078, "uuid_generate_v4", "f", 0, 2950),
+    (900104, "uuid_generate_v5", "f", 2, 2950),
     (900079, "uuid_generate_v7", "f", 0, 2950),
     (900080, "uuid_nil", "f", 0, 2950),
     (900081, "uuid_ns_dns", "f", 0, 2950),

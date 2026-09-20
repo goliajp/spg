@@ -61,6 +61,14 @@ pub const MUTATING_CALL_NEEDLES: &[&[u8]] = &[
     b"lastval(",
     // Session GUC store.
     b"set_config(",
+    // 9.0.0 — pg_trgm's `set_limit` writes the same store, and
+    // `show_limit` has to fold in the SAME pass so it sees the instant
+    // PostgreSQL shows it. Left out, `SELECT set_limit(0.66)` took the
+    // read-only fast path, the pass never ran, and the write was lost:
+    // the next `SELECT show_limit()` answered 0.3. It only worked when
+    // psql happened to send the statement in a multi-statement string.
+    b"set_limit(",
+    b"show_limit(",
     // v7.40.12 — the sleep family. `pg_sleep` does not mutate, but the
     // `&self` executor cannot record the request the host has to serve,
     // and this list is what routes a call to the pass that can.
@@ -244,6 +252,20 @@ impl Engine {
                     *expr = Expr::Literal(value_to_literal(v));
                     return Ok(());
                 }
+                // 9.0.0 — pg_trgm's `set_limit(real)` writes the session
+                // setting `pg_trgm.similarity_threshold`, which
+                // `show_limit()` and the `%` operator then read. It lands
+                // here for the same reason the family above does: the
+                // value dispatch only ever holds `&EvalContext`.
+                if let Some(v) = self.eval_set_limit_call(&lc, args)? {
+                    *expr = Expr::Cast {
+                        expr: alloc::boxed::Box::new(Expr::Literal(value_to_literal(v))),
+                        target: spg_sql::ast::CastTarget::Named(alloc::string::String::from(
+                            "real",
+                        )),
+                    };
+                    return Ok(());
+                }
                 if let Some(v) = self.eval_advisory_call(&lc, args)? {
                     *expr = Expr::Literal(value_to_literal(v));
                     return Ok(());
@@ -355,6 +377,54 @@ impl Engine {
     /// directories gain addressability without a storage migration.
     /// The sequence is born synced to the column's current MAX so
     /// `nextval` immediately after creation continues the series.
+    /// 9.0.0 — `set_limit(real)`, pg_trgm's deprecated writer for
+    /// `pg_trgm.similarity_threshold`. `None` when this is not that call,
+    /// so the ordinary dispatch keeps every other name.
+    ///
+    /// The refusals — a non-numeric argument, the extension not being
+    /// installed — belong to the function, so the argument is handed to
+    /// it and its answer is what gets written.
+    fn eval_set_limit_call(
+        &mut self,
+        lc: &str,
+        args: &[Expr],
+    ) -> Result<Option<spg_storage::Value<'static>>, EngineError> {
+        // `show_limit()` folds here TOO, and in order. It is a read, so it
+        // does not need to — but it has to see the same instant PostgreSQL
+        // shows it: `SELECT show_limit(), set_limit(0.7), show_limit()`
+        // answers `0.3|0.7|0.7` there, left to right. Left at row time it
+        // read the FINAL value wherever it stood, so the first column
+        // answered 0.7. The pre-pass already walks the select list in
+        // order, which is why `currval, nextval, currval` matches PG.
+        let is_show = lc == "show_limit" && args.is_empty();
+        if !is_show && (lc != "set_limit" || args.len() != 1) {
+            return Ok(None);
+        }
+        let empty: alloc::vec::Vec<spg_storage::ColumnSchema> = alloc::vec::Vec::new();
+        let answered = {
+            let ctx = self.ev_ctx(&empty, None);
+            let dummy = spg_storage::Row::new(alloc::vec::Vec::new());
+            let call = Expr::FunctionCall {
+                syntax: spg_sql::ast::CallSyntax::Written,
+                name: alloc::string::String::from(lc),
+                args: args.to_vec(),
+            };
+            crate::eval::eval_expr(&call, &dummy, &ctx).map_err(EngineError::Eval)?
+        };
+        if is_show {
+            return Ok(Some(answered));
+        }
+        if let spg_storage::Value::Real(v) = answered {
+            self.set_session_param(
+                alloc::string::String::from("pg_trgm.similarity_threshold"),
+                spg_sql::ast::SetValue::String(crate::eval::values::value_to_text(
+                    &spg_storage::Value::Real(v),
+                )),
+            );
+        }
+        Ok(Some(answered))
+    }
+
     /// v7.39 (round 279) — evaluate an advisory-lock call against the
     /// shared registry, or `None` when this is not one.
     ///
