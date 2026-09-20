@@ -2101,7 +2101,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("polrelid", DataType::Oid, false),
         ColumnSchema::new("polcmd", DataType::Char1, false),
         ColumnSchema::new("polpermissive", DataType::Bool, false),
-        ColumnSchema::new("polroles", DataType::Text, false),
+        ColumnSchema::new("polroles", DataType::OidArray, false),
         ColumnSchema::new("polqual", DataType::Text, true),
         ColumnSchema::new("polwithcheck", DataType::Text, true),
     ];
@@ -2115,11 +2115,14 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         for (i, p) in t.schema().policies.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let row_oid = table_oid.saturating_mul(1000).saturating_add(i as i64 + 1);
-            let roles = if p.roles.is_empty() {
-                // PUBLIC — PG's polroles = {0}.
-                alloc::string::String::from("{0}")
+            // 9.0.0 — `oid[]`, as PostgreSQL declares it; this built the
+            // array's TEXT rendering. PUBLIC is `{0}` there, and SPG has
+            // no oid for a role name, so a named grantee is 0 too — the
+            // shape is right and the identity is recorded (B16).
+            let roles: Vec<Option<i64>> = if p.roles.is_empty() {
+                alloc::vec![Some(0)]
             } else {
-                alloc::format!("{{{}}}", p.roles.join(","))
+                p.roles.iter().map(|_| Some(0)).collect()
             };
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(row_oid),
@@ -2127,7 +2130,7 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
                 Value::BigInt(table_oid),
                 Value::Char1(p.cmd.as_pg_char() as u8), // polcmd
                 Value::Bool(p.permissive),
-                Value::text(roles),
+                Value::BigIntArray(roles), // polroles
                 p.using_expr.clone().map_or(Value::Null, Value::text),
                 p.with_check_expr.clone().map_or(Value::Null, Value::text),
             ]));
@@ -2260,7 +2263,7 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
         // v7.39 (round 543) — PG's order is stxkeys, stxstattarget,
         // stxkind, stxexprs; SPG had the first two swapped and the
         // other two missing.
-        ColumnSchema::new("stxkeys", DataType::Text, false),
+        ColumnSchema::new("stxkeys", DataType::Int2Vector, false),
         ColumnSchema::new("stxstattarget", DataType::SmallInt, true),
         ColumnSchema::new("stxkind", DataType::Text, false),
         ColumnSchema::new("stxexprs", DataType::Text, true),
@@ -2278,7 +2281,13 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
                 Value::text(st.name.clone()),
                 Value::BigInt(2200),
                 Value::BigInt(0),
-                Value::text(st.columns.join(" ")),
+                // 9.0.0 — `int2vector`, as PostgreSQL declares it.
+                Value::Int2Vector(
+                    st.columns
+                        .iter()
+                        .filter_map(|c| c.parse::<i16>().ok())
+                        .collect(),
+                ),
                 Value::Null, // stxstattarget — the default target
                 Value::text(alloc::format!("{{{}}}", st.kinds.join(","))),
                 Value::Null, // stxexprs — SPG has no expression statistics
@@ -2328,12 +2337,12 @@ pub(crate) fn synth_pg_stats(
         ColumnSchema::new("avg_width", DataType::Int, false),
         ColumnSchema::new("n_distinct", DataType::Real, false),
         ColumnSchema::new("most_common_vals", DataType::Text, true),
-        ColumnSchema::new("most_common_freqs", DataType::Text, true),
+        ColumnSchema::new("most_common_freqs", DataType::RealArray, true),
         ColumnSchema::new("histogram_bounds", DataType::Text, true),
         ColumnSchema::new("correlation", DataType::Real, true),
         ColumnSchema::new("most_common_elems", DataType::Text, true),
-        ColumnSchema::new("most_common_elem_freqs", DataType::Text, true),
-        ColumnSchema::new("elem_count_histogram", DataType::Text, true),
+        ColumnSchema::new("most_common_elem_freqs", DataType::RealArray, true),
+        ColumnSchema::new("elem_count_histogram", DataType::RealArray, true),
         ColumnSchema::new("range_length_histogram", DataType::Text, true),
         ColumnSchema::new("range_empty_frac", DataType::Real, true),
         ColumnSchema::new("range_bounds_histogram", DataType::Text, true),
@@ -2924,7 +2933,7 @@ pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("spcname", DataType::Name, false),
         ColumnSchema::new("spcowner", DataType::Oid, false),
         ColumnSchema::new("spcacl", DataType::Text, true),
-        ColumnSchema::new("spcoptions", DataType::Text, true),
+        ColumnSchema::new("spcoptions", DataType::TextArray, true),
     ];
     let rows = alloc::vec![
         Row::new(alloc::vec![
@@ -4908,8 +4917,8 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         // twenty-first); reordering the whole thing is its own change.
         ColumnSchema::new("attcompression", DataType::Char1, false),
         ColumnSchema::new("atthasmissing", DataType::Bool, false),
-        ColumnSchema::new("attoptions", DataType::Text, true),
-        ColumnSchema::new("attfdwoptions", DataType::Text, true),
+        ColumnSchema::new("attoptions", DataType::TextArray, true),
+        ColumnSchema::new("attfdwoptions", DataType::TextArray, true),
         ColumnSchema::new("attmissingval", DataType::Text, true),
     ]
 }
@@ -6271,8 +6280,8 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("tgdeferrable", DataType::Bool, false),
         ColumnSchema::new("tginitdeferred", DataType::Bool, false),
         ColumnSchema::new("tgnargs", DataType::SmallInt, false),
-        ColumnSchema::new("tgattr", DataType::Text, true),
-        ColumnSchema::new("tgargs", DataType::Text, true),
+        ColumnSchema::new("tgattr", DataType::Int2Vector, true),
+        ColumnSchema::new("tgargs", DataType::Bytes, true),
         ColumnSchema::new("tgqual", DataType::Text, true),
         ColumnSchema::new("tgoldtable", DataType::Name, true),
         ColumnSchema::new("tgnewtable", DataType::Name, true),
@@ -6318,11 +6327,11 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
                 Value::Bool(false),                       // tgdeferrable
                 Value::Bool(false),                       // tginitdeferred
                 Value::SmallInt(0),                       // tgnargs — SPG's triggers take none
-                Value::text(""),    // tgattr — empty int2vector, as PG prints it
-                Value::text("\\x"), // tgargs — empty bytea, as PG prints it
-                Value::Null,        // tgqual — no WHEN clause
-                Value::Null,        // tgoldtable
-                Value::Null,        // tgnewtable
+                Value::Int2Vector(Vec::new()),            // tgattr — empty, as PG has it
+                Value::Bytes(alloc::borrow::Cow::Owned(Vec::new())), // tgargs
+                Value::Null,                              // tgqual — no WHEN clause
+                Value::Null,                              // tgoldtable
+                Value::Null,                              // tgnewtable
             ])
         })
         .collect();
@@ -6366,14 +6375,14 @@ pub(crate) fn synth_pg_proc(
         ColumnSchema::new("prorettype", DataType::Oid, false),
         // v7.39.11 — PG's own type; see the row builder below.
         ColumnSchema::new("proargtypes", DataType::OidVector, false),
-        ColumnSchema::new("proallargtypes", DataType::Text, true),
+        ColumnSchema::new("proallargtypes", DataType::OidArray, true),
         ColumnSchema::new("proargmodes", DataType::Text, true),
         // The one of these five SPG really has: CREATE FUNCTION names
         // its parameters, and every client that offers named-argument
         // calls reads them from here.
         ColumnSchema::new("proargnames", DataType::TextArray, true),
         ColumnSchema::new("proargdefaults", DataType::Text, true),
-        ColumnSchema::new("protrftypes", DataType::Text, true),
+        ColumnSchema::new("protrftypes", DataType::OidArray, true),
         ColumnSchema::new("prosrc", DataType::Text, false),
         ColumnSchema::new("probin", DataType::Text, true),
         ColumnSchema::new("prosqlbody", DataType::Text, true),
@@ -8319,11 +8328,11 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         // The three operator arrays a foreign key records, the ON DELETE
         // SET column list and the exclusion operators — NULL here; SPG
         // has no pg_operator to name oids from.
-        ColumnSchema::new("conpfeqop", DataType::Text, true),
-        ColumnSchema::new("conppeqop", DataType::Text, true),
-        ColumnSchema::new("conffeqop", DataType::Text, true),
-        ColumnSchema::new("confdelsetcols", DataType::Text, true),
-        ColumnSchema::new("conexclop", DataType::Text, true),
+        ColumnSchema::new("conpfeqop", DataType::OidArray, true),
+        ColumnSchema::new("conppeqop", DataType::OidArray, true),
+        ColumnSchema::new("conffeqop", DataType::OidArray, true),
+        ColumnSchema::new("confdelsetcols", DataType::SmallIntArray, true),
+        ColumnSchema::new("conexclop", DataType::OidArray, true),
         // conbin is what a tool tests to know a constraint is a CHECK.
         // Measured on PG18: non-NULL for contype 'c', NULL for every
         // other kind. SPG keeps the written expression, the same choice
@@ -9955,7 +9964,7 @@ pub(crate) fn synth_pg_extension(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("extnamespace", DataType::Oid, false),
         ColumnSchema::new("extrelocatable", DataType::Bool, false),
         ColumnSchema::new("extversion", DataType::Text, false),
-        ColumnSchema::new("extconfig", DataType::TextArray, true),
+        ColumnSchema::new("extconfig", DataType::OidArray, true),
         ColumnSchema::new("extcondition", DataType::TextArray, true),
     ];
     // 8.0.3 — what this database INSTALLED, not what the build provides:
