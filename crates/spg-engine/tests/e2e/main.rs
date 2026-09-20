@@ -30,6 +30,7 @@ mod e2e_alter_column_type;
 mod e2e_alter_domain_round260;
 mod e2e_alter_drop_constraint_kinds;
 mod e2e_alter_drop_identity;
+mod e2e_alter_object_owner_900;
 mod e2e_alter_role_password_round750;
 mod e2e_alter_subcommands_round49;
 mod e2e_alter_table_pg_dump_compat;

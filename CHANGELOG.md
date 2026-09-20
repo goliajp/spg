@@ -10,6 +10,25 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `ALTER … OWNER TO` recorded the owner for a table and nothing else
+
+Measured against PostgreSQL 18.6 over all six spellings: PG records the
+new owner for a table, a sequence, a view, a materialized view, a type
+(enum / composite / domain alike) and a function. SPG recorded it for
+the TABLE alone. The sequence and domain forms validated that the role
+existed and then did nothing; the view, materialized view and function
+forms fell into the parser's consume-to-boundary tail, which reported
+success and read nothing at all. A dump therefore re-created every one
+of them owned by whoever ran the restore.
+
+All six record it now, and a name that does not exist is refused in
+PostgreSQL's own words (`relation "x" does not exist` for a view or a
+sequence, `type "x" does not exist`, `function x() does not exist`).
+
+`END LOOP`-style duplication turned up here too: `OWNER TO <role>` was
+parsed in its own copy per ALTER form, which is why only two of them had
+ever been taught to validate the role. It is one function now.
+
 ### Fixed — nested PL/pgSQL blocks, and the labels that name them
 
 `DO $$ BEGIN BEGIN NULL; END; END; $$` was a syntax error. Any statement
