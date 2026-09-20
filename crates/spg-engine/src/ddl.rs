@@ -6157,6 +6157,55 @@ impl Engine {
     /// swallowed by the parser's pg_dump no-op arm: success reported,
     /// nothing changed. Constraint names and the error wordings are PG's,
     /// probed live.
+    /// 9.0.0 — `ALTER {VIEW|MATERIALIZED VIEW|TYPE} <name> RENAME TO
+    /// <new>`. The SEQUENCE form already worked; these three reported
+    /// success and kept the old name, so a migration that renamed one
+    /// left the old object in place and the new name nowhere.
+    ///
+    /// NOT closed here and measured: a rename does not follow into the
+    /// views that reference the renamed object by name — the same gap
+    /// `ALTER TABLE … RENAME TO` has had all along, because a view body
+    /// is stored as text here and as a resolved parse tree on
+    /// PostgreSQL.
+    pub(crate) fn exec_alter_object_rename(
+        &mut self,
+        kind: spg_sql::ast::AlterObjectKind,
+        name: &str,
+        new_name: &str,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::AlterObjectKind as K;
+        let cat = self.active_catalog_mut();
+        match kind {
+            K::View => cat.rename_view(name, new_name)?,
+            K::MaterializedView => cat.rename_materialized_view(name, new_name)?,
+            K::Type => {
+                let taken = cat.enum_types().contains_key(new_name)
+                    || cat.composite_types().contains_key(new_name)
+                    || cat.domain_types().contains_key(new_name);
+                if taken {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "type \"{new_name}\" already exists"
+                    )));
+                }
+                if !cat.rename_type(name, new_name) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "type \"{name}\" does not exist"
+                    )));
+                }
+            }
+            K::Sequence => cat.rename_sequence(name, new_name)?,
+            // The parser never routes a function here: `ALTER FUNCTION
+            // … RENAME TO` names one signature, which SPG's bare-name
+            // carrier cannot express.
+            K::Function => {
+                return Err(EngineError::Unsupported(alloc::string::String::from(
+                    "ALTER FUNCTION … RENAME TO is not supported",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// 9.0.0 — `ALTER {SEQUENCE|VIEW|MATERIALIZED VIEW|TYPE|DOMAIN|
     /// FUNCTION} <name> … OWNER TO <role>`.
     ///
@@ -6166,11 +6215,11 @@ impl Engine {
     /// `function x() does not exist`.
     pub(crate) fn exec_alter_object_owner(
         &mut self,
-        kind: spg_sql::ast::OwnedObjectKind,
+        kind: spg_sql::ast::AlterObjectKind,
         name: &str,
         role: &str,
     ) -> Result<(), EngineError> {
-        use spg_sql::ast::OwnedObjectKind as K;
+        use spg_sql::ast::AlterObjectKind as K;
         use spg_storage::NonTableKind as N;
         if !self.role_exists(role) {
             return Err(EngineError::Unsupported(alloc::format!(

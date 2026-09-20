@@ -10,6 +10,29 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `ALTER {VIEW|MATERIALIZED VIEW|TYPE} … RENAME TO` was a no-op
+
+Measured in a fresh schema against PostgreSQL 18.6: PG renames all four
+of view / sequence / type / materialized view. SPG renamed the SEQUENCE
+alone and reported success for the other three, so the old object
+stayed where it was and the new name appeared nowhere in `pg_class` /
+`pg_type` — a migration that renamed a view left both halves wrong and
+said nothing. Same consume-to-boundary tail the OWNER TO entry above
+came out of.
+
+The owner entry moves with the object, because `object_owners` is keyed
+by name: leaving it behind would hand the renamed object the default
+owner and hand the NEXT object of the old name this one's.
+
+NOT closed, and measured while fixing this: a rename does not follow
+into the views that reference the renamed object by name. `CREATE VIEW
+v AS SELECT * FROM t; ALTER TABLE t RENAME TO t2` leaves `v` answering
+`relation "t" does not exist` and `pg_get_viewdef(v)` still naming `t`,
+where PostgreSQL's `v` keeps working and its definition reads `t2`. A
+view body is stored as text here and as a parse tree resolved to oids
+there. This is not new in 9.0.0 — `ALTER TABLE … RENAME TO` has had it
+all along.
+
 ### Fixed — `ALTER … OWNER TO` recorded the owner for a table and nothing else
 
 Measured against PostgreSQL 18.6 over all six spellings: PG records the

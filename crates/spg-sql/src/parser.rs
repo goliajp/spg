@@ -6471,7 +6471,7 @@ impl Parser {
         if kw == "owner" {
             let role = self.parse_owner_to_role()?;
             return Ok(Statement::AlterObjectOwner {
-                kind: crate::ast::OwnedObjectKind::Type,
+                kind: crate::ast::AlterObjectKind::Type,
                 name,
                 role,
             });
@@ -6584,13 +6584,14 @@ impl Parser {
     }
 
     /// 9.0.0 — does an `ALTER VIEW` / `ALTER MATERIALIZED VIEW` /
-    /// `ALTER FUNCTION` end in `OWNER TO`?
+    /// `ALTER FUNCTION` continue with `keyword TO …`, where `keyword` is
+    /// `OWNER` or `RENAME`?
     ///
     /// The ALTER dispatch is a `match self.advance()`, so by the time a
     /// guard runs the object keyword is already consumed and the cursor
     /// is on what follows it: `VIEW` for the MATERIALIZED spelling, the
     /// object's name otherwise.
-    fn alter_owner_to_follows(&self, materialized: bool) -> bool {
+    fn alter_keyword_follows_name(&self, materialized: bool, keyword: &str) -> bool {
         let mut i = self.pos;
         if materialized {
             if !matches!(self.tokens.get(i),
@@ -6620,7 +6621,7 @@ impl Parser {
             }
         }
         matches!(self.tokens.get(i),
-            Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case("owner"))
+            Some(Token::Ident(s) | Token::QuotedIdent(s)) if s.eq_ignore_ascii_case(keyword))
     }
 
     /// 9.0.0 — step over a balanced `( … )` group at the cursor.
@@ -6637,6 +6638,17 @@ impl Parser {
                 return;
             }
         }
+    }
+
+    /// 9.0.0 — `RENAME TO <name>`, with the cursor on `RENAME`.
+    fn parse_rename_to_name(&mut self) -> Result<String, ParseError> {
+        self.advance();
+        if matches!(self.peek(), Token::To) {
+            self.advance();
+        } else {
+            self.expect_keyword_ident("to")?;
+        }
+        self.expect_ident_like()
     }
 
     /// 9.0.0 — `OWNER TO <role>`, with the cursor on `OWNER`. Five ALTER
@@ -6664,7 +6676,7 @@ impl Parser {
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("owner")) {
             let role = self.parse_owner_to_role()?;
             return Ok(Statement::AlterObjectOwner {
-                kind: crate::ast::OwnedObjectKind::Sequence,
+                kind: crate::ast::AlterObjectKind::Sequence,
                 name,
                 role,
             });
@@ -11055,13 +11067,24 @@ impl Parser {
                         new,
                     });
                 }
+                // 9.0.0 — `RENAME TO <newtype>`, which the tail below
+                // silently ignored (the `RENAME VALUE` form above is a
+                // different statement). PostgreSQL 18.6 renames the type.
+                if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("rename")) {
+                    let new_name = self.parse_rename_to_name()?;
+                    return Ok(Statement::AlterObjectRename {
+                        kind: crate::ast::AlterObjectKind::Type,
+                        name: type_name,
+                        new_name,
+                    });
+                }
                 // 9.0.0 — `OWNER TO <role>`, which the tail below silently
                 // ignored: PostgreSQL 18.6 records the new owner and
                 // `pg_get_userbyid(typowner)` answers it.
                 if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("owner")) {
                     let role = self.parse_owner_to_role()?;
                     return Ok(Statement::AlterObjectOwner {
-                        kind: crate::ast::OwnedObjectKind::Type,
+                        kind: crate::ast::AlterObjectKind::Type,
                         name: type_name,
                         role,
                     });
@@ -11309,21 +11332,37 @@ impl Parser {
                 if matches!(
                     s.to_ascii_lowercase().as_str(),
                     "view" | "function" | "materialized"
-                ) && self.alter_owner_to_follows(s.eq_ignore_ascii_case("materialized")) =>
+                ) && (self.alter_keyword_follows_name(
+                    s.eq_ignore_ascii_case("materialized"),
+                    "owner",
+                ) || self.alter_keyword_follows_name(
+                    s.eq_ignore_ascii_case("materialized"),
+                    "rename",
+                )) =>
             {
                 let kind = match s.to_ascii_lowercase().as_str() {
-                    "view" => crate::ast::OwnedObjectKind::View,
-                    "function" => crate::ast::OwnedObjectKind::Function,
+                    "view" => crate::ast::AlterObjectKind::View,
+                    "function" => crate::ast::AlterObjectKind::Function,
                     _ => {
                         // MATERIALIZED VIEW: the second word is already
                         // known to be `view` by the lookahead.
                         self.advance();
-                        crate::ast::OwnedObjectKind::MaterializedView
+                        crate::ast::AlterObjectKind::MaterializedView
                     }
                 };
                 let name = self.expect_ident_like()?;
                 if matches!(self.peek(), Token::LParen) {
                     self.skip_balanced_parens();
+                }
+                if matches!(self.peek(), Token::Ident(k) | Token::QuotedIdent(k)
+                    if k.eq_ignore_ascii_case("rename"))
+                {
+                    let new_name = self.parse_rename_to_name()?;
+                    return Ok(Statement::AlterObjectRename {
+                        kind,
+                        name,
+                        new_name,
+                    });
                 }
                 let role = self.parse_owner_to_role()?;
                 return Ok(Statement::AlterObjectOwner { kind, name, role });
