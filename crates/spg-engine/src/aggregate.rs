@@ -8046,6 +8046,21 @@ pub(crate) fn encode_join_key_refs(vals: &[&Value], out: &mut String, modes: &[J
             push_canonical_key(out, v);
             continue;
         }
+        // 9.0.0 — a reg value joins by its OID, in the same lane an
+        // `oid` column's integer takes. `pg_type JOIN pg_proc ON p.oid =
+        // t.typinput` found nothing while the scalar comparison of the
+        // same two values answered `t`: the reg value carried its own
+        // tag into the key and never met the integer. Same defect as
+        // the numeric-width one this encoder was widened for.
+        //
+        // PostgreSQL compares the reg types by oid and against the
+        // integer types (`1::oid = 1::regclass` is `t` there, measured);
+        // `xid` / `tid` / `cid` it does NOT, and they keep their own
+        // lanes.
+        if let Value::RegClass(oid, _) | Value::RegType(oid, _) | Value::RegProc(oid, _) = v {
+            push_canonical_key(out, &Value::BigInt(*oid));
+            continue;
+        }
         encode_one_in(out, v, mode.fold);
     }
 }

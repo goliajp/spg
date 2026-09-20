@@ -235,7 +235,8 @@ pub(crate) fn information_schema_data_type(ty: DataType) -> alloc::string::Strin
         DataType::Int2Vector
         | DataType::OidVector
         | DataType::AclItemArray
-        | DataType::Char1Array => alloc::string::String::from("ARRAY"),
+        | DataType::Char1Array
+        | DataType::RegTypeArray => alloc::string::String::from("ARRAY"),
         other => pg_data_type_text(other),
     }
 }
@@ -265,6 +266,7 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::AnyArray => "anyarray",
         DataType::AclItemArray => "aclitem[]",
         DataType::Char1Array => "\"char\"[]",
+        DataType::RegTypeArray => "regtype[]",
         DataType::SmallInt => "smallint",
         DataType::Float => "double precision",
         DataType::Real => "real",
@@ -1117,7 +1119,8 @@ pub(crate) fn pg_prepared_statements_schema() -> Vec<ColumnSchema> {
     alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("statement", DataType::Text, false),
-        ColumnSchema::new("parameter_types", DataType::TextArray, false),
+        // 9.0.0 — PostgreSQL 18.6 declares it `regtype[]`.
+        ColumnSchema::new("parameter_types", DataType::RegTypeArray, false),
         ColumnSchema::new("from_sql", DataType::Bool, false),
     ]
 }
@@ -2723,6 +2726,18 @@ pub(crate) const fn am_name_of_oid(oid: i64) -> &'static str {
 /// real index AM; nsw / bloom / brin live as engine-private
 /// index kinds — they surface as `btree` via pg_class to keep
 /// the join shape stable).
+/// 9.0.0 — an access method's `amhandler`, as a `regproc`. Every one
+/// read `-` (oid 0), where PostgreSQL 18.6 names `bthandler`,
+/// `ginhandler` and the rest — the same gap `pg_type`'s I/O columns
+/// had, and the functions are in `pg_proc` now.
+fn am_handler(name: &str) -> Value<'static> {
+    let oid = PG_PROC_FUNCS
+        .iter()
+        .find(|(_, n, ..)| *n == name)
+        .map_or(0, |(o, ..)| *o);
+    Value::RegProc(oid, alloc::string::String::from(name).into_boxed_str())
+}
+
 pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
@@ -2739,44 +2754,44 @@ pub(crate) fn synth_pg_am(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static
         Row::new(alloc::vec![
             Value::BigInt(2),
             Value::text("heap"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("t"),                    // amtype
+            am_handler("heap_tableam_handler"), // amhandler
+            char1("t"),                         // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(403),
             Value::text("btree"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("bthandler"), // amhandler
+            char1("i"),              // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(405),
             Value::text("hash"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("hashhandler"), // amhandler
+            char1("i"),                // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(783),
             Value::text("gist"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("gisthandler"), // amhandler
+            char1("i"),                // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(2742),
             Value::text("gin"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("ginhandler"), // amhandler
+            char1("i"),               // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(4000),
             Value::text("spgist"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("spghandler"), // amhandler
+            char1("i"),               // amtype
         ]),
         Row::new(alloc::vec![
             Value::BigInt(3580),
             Value::text("brin"),
-            Value::RegProc(0, "-".into()), // amhandler
-            char1("i"),                    // amtype
+            am_handler("brinhandler"), // amhandler
+            char1("i"),                // amtype
         ]),
     ];
     (schema, rows)
@@ -5498,6 +5513,19 @@ const PG_SCALAR_TYPES: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
     // carry — the same defect round 640 closed for `xid`. Measured
     // off PG18: category Z (internal), no array type.
     (194, "pg_node_tree", -1, "b", "Z", 0, 0),
+    // 9.0.0 — the three pseudo-types the I/O functions return. Without
+    // them `pg_proc JOIN pg_type ON prorettype` left 64 rows orphaned —
+    // a pointer at a type nothing carries, which is the invariant
+    // round 640 closed for `xid` and round 638's pin holds. `typarray`
+    // is 0 rather than PG's 1263 for `cstring`, as the note in
+    // `build_row` explains for the rows above.
+    (2275, "cstring", -2, "p", "P", 0, 0),
+    // 9.0.0 — `regtype[]`, which `pg_prepared_statements.parameter_types`
+    // is declared as. Measured off PG 18.6: element 2206, no array type
+    // of its own, the generic array I/O.
+    (2211, "_regtype", -1, "b", "A", 2206, 0),
+    (269, "table_am_handler", 4, "p", "P", 0, 0),
+    (325, "index_am_handler", 4, "p", "P", 0, 0),
     // v7.39.11 — PG's catalog vectors. `pg_index.indkey` and kin are
     // typed as these now, and a column whose `atttypid` names a type
     // `pg_type` does not carry is exactly the defect round 640
@@ -5671,6 +5699,7 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         DataType::AnyArray => 2277,
         DataType::AclItemArray => 1034,
         DataType::Char1Array => 1002,
+        DataType::RegTypeArray => 2211,
         // 9.0.0 — PG's internal single-byte type. Without it every
         // catalog column declared `"char"` reported atttypid 0, so 28
         // pg_attribute rows pointed at no pg_type row at all.
@@ -6181,6 +6210,313 @@ pub(crate) fn synth_pg_operator(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
 /// Other pg_type columns (typowner, typinput/typoutput, etc.)
 /// land in follow-up work — sqlx encoders don't query them at
 /// connect time.
+/// 9.0.0 — the I/O functions each type names, read off PostgreSQL
+/// 18.6. `pg_type.typinput` / `typoutput` / `typreceive` / `typsend`
+/// all read `-` (oid 0, PG's spelling for "no function"), because
+/// SPG's I/O is built into the engine and there was no catalogued
+/// function to name. The functions are in `PG_PROC_FUNCS` now, so a
+/// `pg_type JOIN pg_proc ON proname = typinput::text` resolves, which
+/// is what the old comment said naming one without them would break.
+///
+/// `-` in a slot is PostgreSQL's own answer: a pseudo-type has no
+/// binary I/O.
+const PG_TYPE_IO: &[(i64, &str, &str, &str, &str)] = &[
+    (269, "table_am_handler_in", "table_am_handler_out", "-", "-"),
+    (325, "index_am_handler_in", "index_am_handler_out", "-", "-"),
+    (
+        2275,
+        "cstring_in",
+        "cstring_out",
+        "cstring_recv",
+        "cstring_send",
+    ),
+    (2211, "array_in", "array_out", "array_recv", "array_send"),
+    (16, "boolin", "boolout", "boolrecv", "boolsend"),
+    (17, "byteain", "byteaout", "bytearecv", "byteasend"),
+    (18, "charin", "charout", "charrecv", "charsend"),
+    (19, "namein", "nameout", "namerecv", "namesend"),
+    (20, "int8in", "int8out", "int8recv", "int8send"),
+    (21, "int2in", "int2out", "int2recv", "int2send"),
+    (
+        22,
+        "int2vectorin",
+        "int2vectorout",
+        "int2vectorrecv",
+        "int2vectorsend",
+    ),
+    (23, "int4in", "int4out", "int4recv", "int4send"),
+    (24, "regprocin", "regprocout", "regprocrecv", "regprocsend"),
+    (25, "textin", "textout", "textrecv", "textsend"),
+    (26, "oidin", "oidout", "oidrecv", "oidsend"),
+    (27, "tidin", "tidout", "tidrecv", "tidsend"),
+    (28, "xidin", "xidout", "xidrecv", "xidsend"),
+    (29, "cidin", "cidout", "cidrecv", "cidsend"),
+    (
+        30,
+        "oidvectorin",
+        "oidvectorout",
+        "oidvectorrecv",
+        "oidvectorsend",
+    ),
+    (114, "json_in", "json_out", "json_recv", "json_send"),
+    (142, "xml_in", "xml_out", "xml_recv", "xml_send"),
+    (143, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        194,
+        "pg_node_tree_in",
+        "pg_node_tree_out",
+        "pg_node_tree_recv",
+        "pg_node_tree_send",
+    ),
+    (199, "array_in", "array_out", "array_recv", "array_send"),
+    (600, "point_in", "point_out", "point_recv", "point_send"),
+    (650, "cidr_in", "cidr_out", "cidr_recv", "cidr_send"),
+    (651, "array_in", "array_out", "array_recv", "array_send"),
+    (700, "float4in", "float4out", "float4recv", "float4send"),
+    (701, "float8in", "float8out", "float8recv", "float8send"),
+    (
+        774,
+        "macaddr8_in",
+        "macaddr8_out",
+        "macaddr8_recv",
+        "macaddr8_send",
+    ),
+    (790, "cash_in", "cash_out", "cash_recv", "cash_send"),
+    (791, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        829,
+        "macaddr_in",
+        "macaddr_out",
+        "macaddr_recv",
+        "macaddr_send",
+    ),
+    (869, "inet_in", "inet_out", "inet_recv", "inet_send"),
+    (1000, "array_in", "array_out", "array_recv", "array_send"),
+    (1001, "array_in", "array_out", "array_recv", "array_send"),
+    (1002, "array_in", "array_out", "array_recv", "array_send"),
+    (1003, "array_in", "array_out", "array_recv", "array_send"),
+    (1005, "array_in", "array_out", "array_recv", "array_send"),
+    (1007, "array_in", "array_out", "array_recv", "array_send"),
+    (1008, "array_in", "array_out", "array_recv", "array_send"),
+    (1009, "array_in", "array_out", "array_recv", "array_send"),
+    (1014, "array_in", "array_out", "array_recv", "array_send"),
+    (1015, "array_in", "array_out", "array_recv", "array_send"),
+    (1016, "array_in", "array_out", "array_recv", "array_send"),
+    (1021, "array_in", "array_out", "array_recv", "array_send"),
+    (1022, "array_in", "array_out", "array_recv", "array_send"),
+    (1028, "array_in", "array_out", "array_recv", "array_send"),
+    (1033, "aclitemin", "aclitemout", "-", "-"),
+    (1034, "array_in", "array_out", "array_recv", "array_send"),
+    (1040, "array_in", "array_out", "array_recv", "array_send"),
+    (1041, "array_in", "array_out", "array_recv", "array_send"),
+    (1042, "bpcharin", "bpcharout", "bpcharrecv", "bpcharsend"),
+    (
+        1043,
+        "varcharin",
+        "varcharout",
+        "varcharrecv",
+        "varcharsend",
+    ),
+    (1082, "date_in", "date_out", "date_recv", "date_send"),
+    (1083, "time_in", "time_out", "time_recv", "time_send"),
+    (
+        1114,
+        "timestamp_in",
+        "timestamp_out",
+        "timestamp_recv",
+        "timestamp_send",
+    ),
+    (1115, "array_in", "array_out", "array_recv", "array_send"),
+    (1182, "array_in", "array_out", "array_recv", "array_send"),
+    (1183, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        1184,
+        "timestamptz_in",
+        "timestamptz_out",
+        "timestamptz_recv",
+        "timestamptz_send",
+    ),
+    (1185, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        1186,
+        "interval_in",
+        "interval_out",
+        "interval_recv",
+        "interval_send",
+    ),
+    (1187, "array_in", "array_out", "array_recv", "array_send"),
+    (1231, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        1266,
+        "timetz_in",
+        "timetz_out",
+        "timetz_recv",
+        "timetz_send",
+    ),
+    (1270, "array_in", "array_out", "array_recv", "array_send"),
+    (1560, "bit_in", "bit_out", "bit_recv", "bit_send"),
+    (
+        1562,
+        "varbit_in",
+        "varbit_out",
+        "varbit_recv",
+        "varbit_send",
+    ),
+    (
+        1700,
+        "numeric_in",
+        "numeric_out",
+        "numeric_recv",
+        "numeric_send",
+    ),
+    (
+        2205,
+        "regclassin",
+        "regclassout",
+        "regclassrecv",
+        "regclasssend",
+    ),
+    (
+        2206,
+        "regtypein",
+        "regtypeout",
+        "regtyperecv",
+        "regtypesend",
+    ),
+    (
+        2249,
+        "record_in",
+        "record_out",
+        "record_recv",
+        "record_send",
+    ),
+    (
+        2277,
+        "anyarray_in",
+        "anyarray_out",
+        "anyarray_recv",
+        "anyarray_send",
+    ),
+    (2278, "void_in", "void_out", "void_recv", "void_send"),
+    (2279, "trigger_in", "trigger_out", "-", "-"),
+    (2283, "anyelement_in", "anyelement_out", "-", "-"),
+    (2950, "uuid_in", "uuid_out", "uuid_recv", "uuid_send"),
+    (2951, "array_in", "array_out", "array_recv", "array_send"),
+    (
+        3220,
+        "pg_lsn_in",
+        "pg_lsn_out",
+        "pg_lsn_recv",
+        "pg_lsn_send",
+    ),
+    (
+        3614,
+        "tsvectorin",
+        "tsvectorout",
+        "tsvectorrecv",
+        "tsvectorsend",
+    ),
+    (
+        3615,
+        "tsqueryin",
+        "tsqueryout",
+        "tsqueryrecv",
+        "tsquerysend",
+    ),
+    (3643, "array_in", "array_out", "array_recv", "array_send"),
+    (3645, "array_in", "array_out", "array_recv", "array_send"),
+    (3802, "jsonb_in", "jsonb_out", "jsonb_recv", "jsonb_send"),
+    (3807, "array_in", "array_out", "array_recv", "array_send"),
+    (3831, "anyrange_in", "anyrange_out", "-", "-"),
+    (3904, "range_in", "range_out", "range_recv", "range_send"),
+    (3906, "range_in", "range_out", "range_recv", "range_send"),
+    (3908, "range_in", "range_out", "range_recv", "range_send"),
+    (3910, "range_in", "range_out", "range_recv", "range_send"),
+    (3912, "range_in", "range_out", "range_recv", "range_send"),
+    (3926, "range_in", "range_out", "range_recv", "range_send"),
+    (
+        4451,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (
+        4532,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (
+        4533,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (
+        4534,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (
+        4535,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (
+        4536,
+        "multirange_in",
+        "multirange_out",
+        "multirange_recv",
+        "multirange_send",
+    ),
+    (4537, "anymultirange_in", "anymultirange_out", "-", "-"),
+    (5069, "xid8in", "xid8out", "xid8recv", "xid8send"),
+    (
+        5078,
+        "anycompatiblearray_in",
+        "anycompatiblearray_out",
+        "anycompatiblearray_recv",
+        "anycompatiblearray_send",
+    ),
+];
+
+/// 9.0.0 — `(typinput, typoutput, typreceive, typsend)` for a type oid,
+/// as `regproc` values. `-` where PostgreSQL has none, and for a type
+/// the table does not carry.
+fn pg_type_io(
+    oid: i64,
+) -> (
+    Value<'static>,
+    Value<'static>,
+    Value<'static>,
+    Value<'static>,
+) {
+    let none = || Value::RegProc(0, alloc::string::String::from("-").into_boxed_str());
+    let Some((_, i, o, r, s)) = PG_TYPE_IO.iter().find(|(t, ..)| *t == oid) else {
+        return (none(), none(), none(), none());
+    };
+    // The oid is looked up in the same table the catalog publishes, so a
+    // name here and a `pg_proc` row there cannot disagree.
+    let proc_of = |name: &str| -> Value<'static> {
+        if name == "-" {
+            return none();
+        }
+        let oid = PG_PROC_FUNCS
+            .iter()
+            .find(|(_, n, ..)| *n == name)
+            .map_or(0, |(o, ..)| *o);
+        Value::RegProc(oid, alloc::string::String::from(name).into_boxed_str())
+    };
+    (proc_of(i), proc_of(o), proc_of(r), proc_of(s))
+}
+
 pub(crate) fn synth_pg_type(
     cat: &Catalog,
     roles: &crate::role_directory::RoleDirectory,
@@ -6255,6 +6591,10 @@ pub(crate) fn synth_pg_type(
                      arr: i64,
                      subscript: &str|
      -> Row<'static> {
+        // 9.0.0 — the four I/O functions this type names, by oid. A type
+        // the table does not carry keeps `-`, which is what every one of
+        // them read before.
+        let io = pg_type_io(oid);
         // v7.39 (round 640) — `tid` is 6 bytes, which is neither a width
         // a value can be passed in a register at nor one the 1/2/4/8
         // ladder below has a rung for. PG measures it typbyval false,
@@ -6304,10 +6644,15 @@ pub(crate) fn synth_pg_type(
             Value::BigInt(arr),
             // round 543 — the seven I/O-function oids, all 0: SPG's I/O
             // is not a catalogued function, so there is nothing to name.
-            Value::RegProc(0, "-".into()), // typinput
-            Value::RegProc(0, "-".into()), // typoutput
-            Value::RegProc(0, "-".into()), // typreceive
-            Value::RegProc(0, "-".into()), // typsend
+            // 9.0.0 — four of the seven ARE named now: the functions are
+            // in `pg_proc` (see `PG_TYPE_IO`), so `typinput` reads
+            // `int4in` as PostgreSQL 18.6 reports it and the join to
+            // `pg_proc` resolves. `typmodin` / `typmodout` /
+            // `typanalyze` read `-` on PG too for these types, measured.
+            io.0,
+            io.1,
+            io.2,
+            io.3,
             Value::RegProc(0, "-".into()), // typmodin
             Value::RegProc(0, "-".into()), // typmodout
             Value::RegProc(0, "-".into()), // typanalyze
@@ -7902,6 +8247,248 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3934, "tsrange", "f", 3, 3908),
     (3938, "tstzrange", "f", 3, 3910),
     (4236, "upper", "f", 1, 2283),
+    // 9.0.0 — the I/O functions every type names in `typinput` /
+    // `typoutput` / `typreceive` / `typsend`, and the handler every
+    // access method names in `amhandler`. Those columns read `-`
+    // (oid 0, PostgreSQL's spelling for "no function"), because SPG's
+    // I/O is built into the engine and had no catalogued function to
+    // point at — so `pg_type.typinput` said `-` where PG 18.6 says
+    // `int4in`, and a join to `pg_proc` had nothing to find either
+    // way. Oids, names, kinds, arities and return types are PG 18.6's,
+    // read off it; none collides with the 876 rows above.
+    (3, "heap_tableam_handler", "f", 1, 269),
+    (267, "table_am_handler_in", "f", 1, 269),
+    (268, "table_am_handler_out", "f", 1, 2275),
+    (326, "index_am_handler_in", "f", 1, 325),
+    (327, "index_am_handler_out", "f", 1, 2275),
+    (2292, "cstring_in", "f", 1, 2275),
+    (2293, "cstring_out", "f", 1, 2275),
+    (2500, "cstring_recv", "f", 1, 2275),
+    (2501, "cstring_send", "f", 1, 17),
+    (31, "byteaout", "f", 1, 2275),
+    (33, "charout", "f", 1, 2275),
+    (34, "namein", "f", 1, 19),
+    (35, "nameout", "f", 1, 2275),
+    (38, "int2in", "f", 1, 21),
+    (39, "int2out", "f", 1, 2275),
+    (40, "int2vectorin", "f", 1, 22),
+    (41, "int2vectorout", "f", 1, 2275),
+    (42, "int4in", "f", 1, 23),
+    (43, "int4out", "f", 1, 2275),
+    (44, "regprocin", "f", 1, 24),
+    (45, "regprocout", "f", 1, 2275),
+    (46, "textin", "f", 1, 25),
+    (47, "textout", "f", 1, 2275),
+    (48, "tidin", "f", 1, 27),
+    (49, "tidout", "f", 1, 2275),
+    (50, "xidin", "f", 1, 28),
+    (51, "xidout", "f", 1, 2275),
+    (52, "cidin", "f", 1, 29),
+    (53, "cidout", "f", 1, 2275),
+    (54, "oidvectorin", "f", 1, 30),
+    (55, "oidvectorout", "f", 1, 2275),
+    (117, "point_in", "f", 1, 600),
+    (118, "point_out", "f", 1, 2275),
+    (195, "pg_node_tree_in", "f", 1, 194),
+    (196, "pg_node_tree_out", "f", 1, 2275),
+    (197, "pg_node_tree_recv", "f", 1, 194),
+    (198, "pg_node_tree_send", "f", 1, 17),
+    (200, "float4in", "f", 1, 700),
+    (201, "float4out", "f", 1, 2275),
+    (214, "float8in", "f", 1, 701),
+    (215, "float8out", "f", 1, 2275),
+    (321, "json_in", "f", 1, 114),
+    (322, "json_out", "f", 1, 2275),
+    (323, "json_recv", "f", 1, 114),
+    (324, "json_send", "f", 1, 17),
+    (330, "bthandler", "f", 1, 325),
+    (331, "hashhandler", "f", 1, 325),
+    (332, "gisthandler", "f", 1, 325),
+    (333, "ginhandler", "f", 1, 325),
+    (334, "spghandler", "f", 1, 325),
+    (335, "brinhandler", "f", 1, 325),
+    (436, "macaddr_in", "f", 1, 829),
+    (437, "macaddr_out", "f", 1, 2275),
+    (460, "int8in", "f", 1, 20),
+    (461, "int8out", "f", 1, 2275),
+    (750, "array_in", "f", 3, 2277),
+    (751, "array_out", "f", 1, 2275),
+    (886, "cash_in", "f", 1, 790),
+    (887, "cash_out", "f", 1, 2275),
+    (910, "inet_in", "f", 1, 869),
+    (911, "inet_out", "f", 1, 2275),
+    (1031, "aclitemin", "f", 1, 1033),
+    (1032, "aclitemout", "f", 1, 2275),
+    (1044, "bpcharin", "f", 3, 1042),
+    (1045, "bpcharout", "f", 1, 2275),
+    (1046, "varcharin", "f", 3, 1043),
+    (1047, "varcharout", "f", 1, 2275),
+    (1084, "date_in", "f", 1, 1082),
+    (1085, "date_out", "f", 1, 2275),
+    (1143, "time_in", "f", 3, 1083),
+    (1144, "time_out", "f", 1, 2275),
+    (1150, "timestamptz_in", "f", 3, 1184),
+    (1151, "timestamptz_out", "f", 1, 2275),
+    (1160, "interval_in", "f", 3, 1186),
+    (1161, "interval_out", "f", 1, 2275),
+    (1242, "boolin", "f", 1, 16),
+    (1243, "boolout", "f", 1, 2275),
+    (1244, "byteain", "f", 1, 17),
+    (1245, "charin", "f", 1, 18),
+    (1267, "cidr_in", "f", 1, 650),
+    (1312, "timestamp_in", "f", 3, 1114),
+    (1313, "timestamp_out", "f", 1, 2275),
+    (1350, "timetz_in", "f", 3, 1266),
+    (1351, "timetz_out", "f", 1, 2275),
+    (1427, "cidr_out", "f", 1, 2275),
+    (1564, "bit_in", "f", 3, 1560),
+    (1565, "bit_out", "f", 1, 2275),
+    (1579, "varbit_in", "f", 3, 1562),
+    (1580, "varbit_out", "f", 1, 2275),
+    (1701, "numeric_in", "f", 3, 1700),
+    (1702, "numeric_out", "f", 1, 2275),
+    (1798, "oidin", "f", 1, 26),
+    (1799, "oidout", "f", 1, 2275),
+    (2218, "regclassin", "f", 1, 2205),
+    (2219, "regclassout", "f", 1, 2275),
+    (2220, "regtypein", "f", 1, 2206),
+    (2221, "regtypeout", "f", 1, 2275),
+    (2290, "record_in", "f", 3, 2249),
+    (2291, "record_out", "f", 1, 2275),
+    (2296, "anyarray_in", "f", 1, 2277),
+    (2297, "anyarray_out", "f", 1, 2275),
+    (2298, "void_in", "f", 1, 2278),
+    (2299, "void_out", "f", 1, 2275),
+    (2300, "trigger_in", "f", 1, 2279),
+    (2301, "trigger_out", "f", 1, 2275),
+    (2312, "anyelement_in", "f", 1, 2283),
+    (2313, "anyelement_out", "f", 1, 2275),
+    (2400, "array_recv", "f", 3, 2277),
+    (2401, "array_send", "f", 1, 17),
+    (2402, "record_recv", "f", 3, 2249),
+    (2403, "record_send", "f", 1, 17),
+    (2404, "int2recv", "f", 1, 21),
+    (2405, "int2send", "f", 1, 17),
+    (2406, "int4recv", "f", 1, 23),
+    (2407, "int4send", "f", 1, 17),
+    (2408, "int8recv", "f", 1, 20),
+    (2409, "int8send", "f", 1, 17),
+    (2410, "int2vectorrecv", "f", 1, 22),
+    (2411, "int2vectorsend", "f", 1, 17),
+    (2412, "bytearecv", "f", 1, 17),
+    (2413, "byteasend", "f", 1, 17),
+    (2414, "textrecv", "f", 1, 25),
+    (2415, "textsend", "f", 1, 17),
+    (2418, "oidrecv", "f", 1, 26),
+    (2419, "oidsend", "f", 1, 17),
+    (2420, "oidvectorrecv", "f", 1, 30),
+    (2421, "oidvectorsend", "f", 1, 17),
+    (2422, "namerecv", "f", 1, 19),
+    (2423, "namesend", "f", 1, 17),
+    (2424, "float4recv", "f", 1, 700),
+    (2425, "float4send", "f", 1, 17),
+    (2426, "float8recv", "f", 1, 701),
+    (2427, "float8send", "f", 1, 17),
+    (2428, "point_recv", "f", 1, 600),
+    (2429, "point_send", "f", 1, 17),
+    (2430, "bpcharrecv", "f", 3, 1042),
+    (2431, "bpcharsend", "f", 1, 17),
+    (2432, "varcharrecv", "f", 3, 1043),
+    (2433, "varcharsend", "f", 1, 17),
+    (2434, "charrecv", "f", 1, 18),
+    (2435, "charsend", "f", 1, 17),
+    (2436, "boolrecv", "f", 1, 16),
+    (2437, "boolsend", "f", 1, 17),
+    (2438, "tidrecv", "f", 1, 27),
+    (2439, "tidsend", "f", 1, 17),
+    (2440, "xidrecv", "f", 1, 28),
+    (2441, "xidsend", "f", 1, 17),
+    (2442, "cidrecv", "f", 1, 29),
+    (2443, "cidsend", "f", 1, 17),
+    (2444, "regprocrecv", "f", 1, 24),
+    (2445, "regprocsend", "f", 1, 17),
+    (2452, "regclassrecv", "f", 1, 2205),
+    (2453, "regclasssend", "f", 1, 17),
+    (2454, "regtyperecv", "f", 1, 2206),
+    (2455, "regtypesend", "f", 1, 17),
+    (2456, "bit_recv", "f", 3, 1560),
+    (2457, "bit_send", "f", 1, 17),
+    (2458, "varbit_recv", "f", 3, 1562),
+    (2459, "varbit_send", "f", 1, 17),
+    (2460, "numeric_recv", "f", 3, 1700),
+    (2461, "numeric_send", "f", 1, 17),
+    (2468, "date_recv", "f", 1, 1082),
+    (2469, "date_send", "f", 1, 17),
+    (2470, "time_recv", "f", 3, 1083),
+    (2471, "time_send", "f", 1, 17),
+    (2472, "timetz_recv", "f", 3, 1266),
+    (2473, "timetz_send", "f", 1, 17),
+    (2474, "timestamp_recv", "f", 3, 1114),
+    (2475, "timestamp_send", "f", 1, 17),
+    (2476, "timestamptz_recv", "f", 3, 1184),
+    (2477, "timestamptz_send", "f", 1, 17),
+    (2478, "interval_recv", "f", 3, 1186),
+    (2479, "interval_send", "f", 1, 17),
+    (2492, "cash_recv", "f", 1, 790),
+    (2493, "cash_send", "f", 1, 17),
+    (2494, "macaddr_recv", "f", 1, 829),
+    (2495, "macaddr_send", "f", 1, 17),
+    (2496, "inet_recv", "f", 1, 869),
+    (2497, "inet_send", "f", 1, 17),
+    (2498, "cidr_recv", "f", 1, 650),
+    (2499, "cidr_send", "f", 1, 17),
+    (2502, "anyarray_recv", "f", 1, 2277),
+    (2503, "anyarray_send", "f", 1, 17),
+    (2893, "xml_in", "f", 1, 142),
+    (2894, "xml_out", "f", 1, 2275),
+    (2898, "xml_recv", "f", 1, 142),
+    (2899, "xml_send", "f", 1, 17),
+    (2952, "uuid_in", "f", 1, 2950),
+    (2953, "uuid_out", "f", 1, 2275),
+    (2961, "uuid_recv", "f", 1, 2950),
+    (2962, "uuid_send", "f", 1, 17),
+    (3120, "void_recv", "f", 1, 2278),
+    (3121, "void_send", "f", 1, 17),
+    (3229, "pg_lsn_in", "f", 1, 3220),
+    (3230, "pg_lsn_out", "f", 1, 2275),
+    (3238, "pg_lsn_recv", "f", 1, 3220),
+    (3239, "pg_lsn_send", "f", 1, 17),
+    (3446, "macaddr8_recv", "f", 1, 774),
+    (3447, "macaddr8_send", "f", 1, 17),
+    (3610, "tsvectorin", "f", 1, 3614),
+    (3611, "tsvectorout", "f", 1, 2275),
+    (3612, "tsqueryin", "f", 1, 3615),
+    (3613, "tsqueryout", "f", 1, 2275),
+    (3638, "tsvectorsend", "f", 1, 17),
+    (3639, "tsvectorrecv", "f", 1, 3614),
+    (3640, "tsquerysend", "f", 1, 17),
+    (3641, "tsqueryrecv", "f", 1, 3615),
+    (3803, "jsonb_send", "f", 1, 17),
+    (3804, "jsonb_out", "f", 1, 2275),
+    (3805, "jsonb_recv", "f", 1, 3802),
+    (3806, "jsonb_in", "f", 1, 3802),
+    (3832, "anyrange_in", "f", 3, 3831),
+    (3833, "anyrange_out", "f", 1, 2275),
+    (3834, "range_in", "f", 3, 3831),
+    (3835, "range_out", "f", 1, 2275),
+    (3836, "range_recv", "f", 3, 3831),
+    (3837, "range_send", "f", 1, 17),
+    (4110, "macaddr8_in", "f", 1, 774),
+    (4111, "macaddr8_out", "f", 1, 2275),
+    (4229, "anymultirange_in", "f", 3, 4537),
+    (4230, "anymultirange_out", "f", 1, 2275),
+    (4231, "multirange_in", "f", 3, 4537),
+    (4232, "multirange_out", "f", 1, 2275),
+    (4233, "multirange_recv", "f", 3, 4537),
+    (4234, "multirange_send", "f", 1, 17),
+    (5070, "xid8in", "f", 1, 5069),
+    (5081, "xid8out", "f", 1, 2275),
+    (5082, "xid8recv", "f", 1, 5069),
+    (5083, "xid8send", "f", 1, 17),
+    (5088, "anycompatiblearray_in", "f", 1, 5078),
+    (5089, "anycompatiblearray_out", "f", 1, 2275),
+    (5090, "anycompatiblearray_recv", "f", 1, 5078),
+    (5091, "anycompatiblearray_send", "f", 1, 17),
 ];
 
 /// v7.17.0 Phase 3.P0-65 — synthesise `mysql.user`. MySQL admin
@@ -9064,7 +9651,7 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 /// relation's columns without building its rows. See `CATALOG_RELATIONS`.
 pub(crate) fn pg_roles_schema() -> Vec<ColumnSchema> {
     alloc::vec![
-        ColumnSchema::new("rolname", DataType::Text, false),
+        ColumnSchema::new("rolname", DataType::Name, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
         ColumnSchema::new("rolinherit", DataType::Bool, false),
         ColumnSchema::new("rolcreaterole", DataType::Bool, false),
@@ -9143,8 +9730,8 @@ fn pg_roles_row(
 /// relation's columns without building its rows. See `CATALOG_RELATIONS`.
 pub(crate) fn pg_user_schema() -> Vec<ColumnSchema> {
     alloc::vec![
-        ColumnSchema::new("usename", DataType::Text, false),
-        ColumnSchema::new("usesysid", DataType::BigInt, false),
+        ColumnSchema::new("usename", DataType::Name, false),
+        ColumnSchema::new("usesysid", DataType::Oid, false),
         ColumnSchema::new("usecreatedb", DataType::Bool, false),
         ColumnSchema::new("usesuper", DataType::Bool, false),
         ColumnSchema::new("userepl", DataType::Bool, false),
@@ -9607,7 +10194,7 @@ pub(crate) fn synth_empty_pg_catalog(view: &str) -> Option<(Vec<ColumnSchema>, V
 pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
-        ColumnSchema::new("rolname", DataType::Text, false),
+        ColumnSchema::new("rolname", DataType::Name, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
         ColumnSchema::new("rolinherit", DataType::Bool, false),
         ColumnSchema::new("rolcreaterole", DataType::Bool, false),
@@ -9805,9 +10392,9 @@ pub(crate) fn synth_pg_sequences(
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
-        ColumnSchema::new("sequencename", DataType::Text, false),
-        ColumnSchema::new("sequenceowner", DataType::Text, false),
-        ColumnSchema::new("data_type", DataType::Text, false),
+        ColumnSchema::new("sequencename", DataType::Name, false),
+        ColumnSchema::new("sequenceowner", DataType::Name, false),
+        ColumnSchema::new("data_type", DataType::RegType, false),
         ColumnSchema::new("start_value", DataType::BigInt, false),
         ColumnSchema::new("min_value", DataType::BigInt, false),
         ColumnSchema::new("max_value", DataType::BigInt, false),
@@ -10811,7 +11398,7 @@ pub(crate) fn synth_pg_rules(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'stat
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("tablename", DataType::Name, false),
-        ColumnSchema::new("rulename", DataType::Text, false),
+        ColumnSchema::new("rulename", DataType::Name, false),
         ColumnSchema::new("definition", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -10836,9 +11423,9 @@ pub(crate) fn synth_pg_views(
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
-        ColumnSchema::new("viewname", DataType::Text, false),
+        ColumnSchema::new("viewname", DataType::Name, false),
         // v7.39 (round 542) — PG's third column, which SPG omitted.
-        ColumnSchema::new("viewowner", DataType::Text, false),
+        ColumnSchema::new("viewowner", DataType::Name, false),
         ColumnSchema::new("definition", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -10882,9 +11469,9 @@ pub(crate) fn synth_pg_matviews(
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
-        ColumnSchema::new("matviewname", DataType::Text, false),
-        ColumnSchema::new("matviewowner", DataType::Text, false),
-        ColumnSchema::new("tablespace", DataType::Text, true),
+        ColumnSchema::new("matviewname", DataType::Name, false),
+        ColumnSchema::new("matviewowner", DataType::Name, false),
+        ColumnSchema::new("tablespace", DataType::Name, true),
         ColumnSchema::new("hasindexes", DataType::Bool, false),
         ColumnSchema::new("ispopulated", DataType::Bool, false),
         ColumnSchema::new("definition", DataType::Text, false),
@@ -11364,7 +11951,7 @@ pub(crate) fn pg_settings_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("source", DataType::Text, false),
         ColumnSchema::new("min_val", DataType::Text, true),
         ColumnSchema::new("max_val", DataType::Text, true),
-        ColumnSchema::new("enumvals", DataType::Text, true),
+        ColumnSchema::new("enumvals", DataType::TextArray, true),
         ColumnSchema::new("boot_val", DataType::Text, true),
         ColumnSchema::new("reset_val", DataType::Text, true),
         ColumnSchema::new("sourcefile", DataType::Text, true),
@@ -11550,8 +12137,8 @@ pub(crate) fn synth_pg_tables(
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("tablename", DataType::Name, false),
-        ColumnSchema::new("tableowner", DataType::Text, false),
-        ColumnSchema::new("tablespace", DataType::Text, true),
+        ColumnSchema::new("tableowner", DataType::Name, false),
+        ColumnSchema::new("tablespace", DataType::Name, true),
         ColumnSchema::new("hasindexes", DataType::Bool, false),
         ColumnSchema::new("hasrules", DataType::Bool, false),
         ColumnSchema::new("hastriggers", DataType::Bool, false),
@@ -12121,10 +12708,10 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     let schema = alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("tablename", DataType::Name, false),
-        ColumnSchema::new("indexname", DataType::Text, false),
+        ColumnSchema::new("indexname", DataType::Name, false),
         // v7.39 (round 542) — PG's fourth column: NULL means the
         // database default tablespace, which is the only one SPG has.
-        ColumnSchema::new("tablespace", DataType::Text, true),
+        ColumnSchema::new("tablespace", DataType::Name, true),
         ColumnSchema::new("indexdef", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();

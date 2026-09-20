@@ -1319,6 +1319,7 @@ pub(crate) fn write_data_type(out: &mut Vec<u8>, t: DataType) {
         DataType::AnyArray => out.push(90),
         DataType::AclItemArray => out.push(91),
         DataType::Char1Array => out.push(92),
+        DataType::RegTypeArray => out.push(93),
         DataType::Xid8 => out.push(74),
         DataType::Oid => out.push(75),
         // v7.39 (round 694) — tag 76, `oid[]`. Its BODY is a BigIntArray's,
@@ -4092,7 +4093,8 @@ impl<'a> Cursor<'a> {
             | DataType::PgNodeTree
             | DataType::AnyArray
             | DataType::AclItemArray
-            | DataType::Char1Array => Ok(Value::Text(Cow::Owned(self.read_str()?))),
+            | DataType::Char1Array
+            | DataType::RegTypeArray => Ok(Value::Text(Cow::Owned(self.read_str()?))),
             // v7.38 (read01, T11) — a CHAR(n) column reads back as bpchar.
             DataType::Char(_) => Ok(Value::BpChar(Cow::Owned(self.read_str()?))),
             DataType::Vector {

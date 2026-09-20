@@ -8610,6 +8610,7 @@ const fn pg_type_oid(ty: DataType) -> u32 {
         DataType::AnyArray => 2277,
         DataType::AclItemArray => 1034,
         DataType::Char1Array => 1002,
+        DataType::RegTypeArray => 2211,
         // v7.39 (round 667) — PG's oid type oid.
         DataType::Oid => 26,
         DataType::SmallInt => 21,

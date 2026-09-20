@@ -259,6 +259,10 @@ pub enum DataType {
     AnyArray,
     AclItemArray,
     Char1Array,
+    /// 9.0.0 — `regtype[]` (`_regtype`, oid 2211), which
+    /// `pg_prepared_statements.parameter_types` is declared as. Its cell
+    /// is the text rendering PostgreSQL prints, as the four above.
+    RegTypeArray,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -586,6 +590,7 @@ impl fmt::Display for DataType {
             Self::AnyArray => f.write_str("ANYARRAY"),
             Self::AclItemArray => f.write_str("ACLITEM[]"),
             Self::Char1Array => f.write_str("\"char\"[]"),
+            Self::RegTypeArray => f.write_str("regtype[]"),
             Self::Xid8 => f.write_str("XID8"),
             Self::Oid => f.write_str("OID"),
             Self::OidArray => f.write_str("OID[]"),
@@ -3904,7 +3909,8 @@ pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
         | DataType::PgNodeTree
         | DataType::AnyArray
         | DataType::AclItemArray
-        | DataType::Char1Array => false,
+        | DataType::Char1Array
+        | DataType::RegTypeArray => false,
         // Integers, and everything whose storage IS an i64 with the
         // same order: dates, both timestamps, times, money, year.
         DataType::SmallInt
