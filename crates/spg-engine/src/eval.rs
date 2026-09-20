@@ -1797,8 +1797,8 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
         other => {
             return crate::system_catalog::CATALOG_RELATIONS
                 .iter()
-                .find(|(n, _)| other.eq_ignore_ascii_case(n))
-                .map(|(_, oid)| *oid);
+                .find(|(n, _, _)| other.eq_ignore_ascii_case(n))
+                .map(|(_, oid, _)| *oid);
         }
     })
 }

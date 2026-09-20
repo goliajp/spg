@@ -169,7 +169,16 @@ fn round623_pg_attribute_describes_the_catalogs() {
         // v7.38.18 — 32 to 33: `pg_stats` joined it. The view a person
         // types to ask whether ANALYZE did anything did not exist, and
         // `pg_statistic` underneath it was reporting a stub.
-        vec!["33"]
+        // 9.0.0 — 33 to 43: the ten catalog VIEWS `pg_class` had no row
+        // for at all (`pg_views`, `pg_tables`, `pg_indexes`,
+        // `pg_matviews`, `pg_sequences`, `pg_settings`, `pg_roles`,
+        // `pg_user`, `pg_prepared_statements`, `pg_rules`). Each
+        // answered queries and appeared in no catalog, so this count
+        // could not see them. PostgreSQL 18.6 answers 268 to the same
+        // query: SPG publishes a subset of the catalogs and always has,
+        // and what this pin holds is that every one it DOES publish is
+        // self-described.
+        vec!["43"]
     );
 }
 

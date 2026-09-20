@@ -10,6 +10,32 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — ten catalog relations answered queries and were in no catalog
+
+`SELECT * FROM pg_views` worked; `SELECT … FROM pg_class WHERE
+relname='pg_views'` found nothing. The same for `pg_tables`,
+`pg_indexes`, `pg_matviews`, `pg_sequences`, `pg_settings`, `pg_roles`,
+`pg_user`, `pg_prepared_statements` and `pg_rules`. So `pg_attribute`
+described none of their columns, and `information_schema` could not
+list them at all: measured, `information_schema.columns WHERE
+table_name='pg_class'` answered 0 rows where PostgreSQL 18.6 answers
+34, and `information_schema.tables` had no `pg_catalog` row of any
+kind. A tool that reflects through `information_schema` was told the
+catalogs do not exist.
+
+`pg_stats`, which WAS listed, reported `relkind 'r'` where PostgreSQL
+says `'v'`. The list carries each relation's kind now, and
+`information_schema.tables` reports `BASE TABLE` / `VIEW` from it.
+
+The four views whose rows need an `Engine` publish their shape on its
+own, so listing a relation's columns never builds its rows.
+
+NOT closed, recorded: the set of catalogs SPG answers for is written in
+three places — this list, the `__spg_pg_*` dispatch and `META_VIEWS` —
+and that is what let ten of them fall out of one of the three.
+`pg_locks` is still in none of the catalogs: it is built by its own
+`exec_` and publishes no schema the catalog can read.
+
 ### Fixed — a call no overload accepts says what PostgreSQL says
 
 The evaluator wrote its own sentence — `lower() needs text, got

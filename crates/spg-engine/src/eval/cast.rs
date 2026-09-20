@@ -746,9 +746,9 @@ pub fn cast_value_ref_in(
                 // compares with pg_depend's numeric classid and still
                 // renders as the name (PG's regclass IS an oid). User
                 // relations keep the textual round-trip contract.
-                if let Some((_, oid)) = crate::system_catalog::CATALOG_RELATIONS
+                if let Some((_, oid, _)) = crate::system_catalog::CATALOG_RELATIONS
                     .iter()
-                    .find(|(n, _)| bare.eq_ignore_ascii_case(n))
+                    .find(|(n, _, _)| bare.eq_ignore_ascii_case(n))
                 {
                     return Ok(Value::RegClass(*oid, bare.into_boxed_str()));
                 }

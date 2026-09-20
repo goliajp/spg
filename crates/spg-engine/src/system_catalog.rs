@@ -484,6 +484,28 @@ pub(crate) fn synth_information_schema_columns(
             rows.push(info_column_row(vname, ordinal, col, Some(writable), false));
         }
     }
+    // 9.0.0 — the system catalogs' own columns. PostgreSQL 18.6 answers
+    // 34 rows for `WHERE table_name='pg_class'` and SPG answered none,
+    // so a tool reflecting through `information_schema` was told the
+    // catalogs have no columns — or do not exist.
+    for (name, _, relkind) in CATALOG_RELATIONS {
+        let Some(cols) = catalog_relation_columns(name, cat) else {
+            continue;
+        };
+        let updatable = (*relkind == "v").then_some(false);
+        for (i, col) in cols.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(info_column_row_in(
+                "pg_catalog",
+                name,
+                ordinal,
+                col,
+                updatable,
+                false,
+            ));
+        }
+    }
     (schema, rows)
 }
 
@@ -867,6 +889,19 @@ fn info_column_row(
     view_updatable: Option<bool>,
     mysql: bool,
 ) -> Row<'static> {
+    info_column_row_in("public", rel, ordinal, col, view_updatable, mysql)
+}
+
+/// 9.0.0 — the same row, in a named schema. Every caller said `public`
+/// because the catalogs were not listed at all.
+fn info_column_row_in(
+    table_schema: &str,
+    rel: &str,
+    ordinal: i32,
+    col: &ColumnSchema,
+    view_updatable: Option<bool>,
+    mysql: bool,
+) -> Row<'static> {
     // column_default: v7.38 (read01) — the deparsed source text of the
     // DEFAULT expression (cached at CREATE TABLE), matching PG's
     // pg_get_expr output. Falls back to the serial nextval
@@ -977,7 +1012,7 @@ fn info_column_row(
     };
     Row::new(alloc::vec![
         Value::text("spg"),
-        Value::text("public"),
+        Value::text(alloc::string::String::from(table_schema)),
         Value::text(rel.to_string()),
         Value::text(col.name.clone()),
         Value::Int(ordinal),
@@ -1076,15 +1111,21 @@ fn info_column_row(
 /// One row per SQL-level prepared statement in THIS session. PG reports
 /// the whole `PREPARE …` text as `statement` and the declared parameter
 /// types as a text array.
-pub(crate) fn synth_pg_prepared_statements(
-    prepared: &alloc::collections::BTreeMap<String, crate::PreparedSqlStatement>,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. See `CATALOG_RELATIONS`.
+pub(crate) fn pg_prepared_statements_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("statement", DataType::Text, false),
         ColumnSchema::new("parameter_types", DataType::TextArray, false),
         ColumnSchema::new("from_sql", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_prepared_statements(
+    prepared: &alloc::collections::BTreeMap<String, crate::PreparedSqlStatement>,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_prepared_statements_schema();
     let rows: Vec<Row<'static>> = prepared
         .iter()
         .map(|(name, p)| {
@@ -1187,6 +1228,30 @@ pub(crate) fn synth_information_schema_tables(
             Value::Null,
             Value::Null,
             Value::text::<&str>(if insertable { "YES" } else { "NO" }),
+            Value::text("NO"),
+            Value::Null,
+        ]));
+    }
+    // 9.0.0 — the system catalogs. PostgreSQL 18.6 lists them here —
+    // `SELECT … WHERE table_name='pg_class'` answers one row there and
+    // none here — so a tool that asks `information_schema` what the
+    // database holds was told the catalogs do not exist.
+    for (name, _, relkind) in CATALOG_RELATIONS {
+        rows.push(Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("pg_catalog"),
+            Value::text((*name).to_string()),
+            Value::text::<&str>(if *relkind == "v" {
+                "VIEW"
+            } else {
+                "BASE TABLE"
+            }),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text("NO"),
             Value::text("NO"),
             Value::Null,
         ]));
@@ -4799,7 +4864,7 @@ pub(crate) fn synth_pg_class(
     // namespace (pg_dump, psql \dt, and SPG's own pg_tables all do), and a
     // catalog landing in `public` would show up as a table the user owns.
     // relkind 'r' and relpersistence 'p', as PG reports for its own.
-    for (name, oid) in CATALOG_RELATIONS {
+    for (name, oid, relkind) in CATALOG_RELATIONS {
         let relnatts = catalog_relation_columns(name, cat)
             .map_or(0, |c| i16::try_from(c.len()).unwrap_or(i16::MAX));
         rows.push(Row::new(alloc::vec![
@@ -4819,7 +4884,10 @@ pub(crate) fn synth_pg_class(
             Value::Bool(false), // relhasindex
             Value::Bool(false), // relisshared
             char1("p"),         // relpersistence
-            char1("r"),         // relkind
+            // 9.0.0 — the catalog says which kind it is: `pg_stats` and
+            // the ten views beside it are `v` on PostgreSQL 18.6, and
+            // every one of them read `r` here.
+            char1(relkind), // relkind
             Value::SmallInt(relnatts),
             Value::SmallInt(0),
             Value::Bool(false), // relhasrules
@@ -5337,7 +5405,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // synth's schema, so a column added to a catalog shows up here without
     // anyone remembering to. `attnotnull` follows the schema's own
     // nullability; the rest is what a plain column reports.
-    for (name, oid) in CATALOG_RELATIONS {
+    for (name, oid, _) in CATALOG_RELATIONS {
         let Some(cols) = catalog_relation_columns(name, cat) else {
             continue;
         };
@@ -8992,8 +9060,10 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 ///
 /// rolpassword reads `********` for everybody, as PG's does — the view
 /// exists so that the hash does NOT leave the catalog.
-pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. See `CATALOG_RELATIONS`.
+pub(crate) fn pg_roles_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("rolname", DataType::Text, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
         ColumnSchema::new("rolinherit", DataType::Bool, false),
@@ -9007,7 +9077,11 @@ pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("rolbypassrls", DataType::Bool, false),
         ColumnSchema::new("rolconfig", DataType::TextArray, true),
         ColumnSchema::new("oid", DataType::Oid, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_roles(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_roles_schema();
     // 8.0.3 — every role, numbered once (see `role_directory`). The
     // bootstrap superuser is oid 10 and PostgreSQL's predefined roles carry
     // their own oids; `postgres` is listed only when it IS the bootstrap
@@ -9065,8 +9139,10 @@ fn pg_roles_row(
 /// the ones that can log in, with `use*` names.
 ///
 /// Derived from synth_pg_roles' rows so the two cannot disagree.
-pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. See `CATALOG_RELATIONS`.
+pub(crate) fn pg_user_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("usename", DataType::Text, false),
         ColumnSchema::new("usesysid", DataType::BigInt, false),
         ColumnSchema::new("usecreatedb", DataType::Bool, false),
@@ -9076,7 +9152,11 @@ pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("passwd", DataType::Text, true),
         ColumnSchema::new("valuntil", DataType::Timestamptz, true),
         ColumnSchema::new("useconfig", DataType::TextArray, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_user_schema();
     // pg_roles positions: 0 rolname, 1 rolsuper, 4 rolcreatedb,
     // 5 rolcanlogin, 6 rolreplication, 10 rolbypassrls, 12 oid.
     let (_, roles) = synth_pg_roles(engine);
@@ -11269,11 +11349,10 @@ fn pg_guc_row(
     ])
 }
 
-pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    // v7.38 (read01 P3.22) — PG 18's full 17-column pg_settings shape so
-    // admin tools that filter on context / vartype / source (pgAdmin's
-    // parameter editor, postgres_exporter) get the columns they expect.
-    let schema = alloc::vec![
+/// 9.0.0 — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. See `CATALOG_RELATIONS`.
+pub(crate) fn pg_settings_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("setting", DataType::Text, false),
         ColumnSchema::new("unit", DataType::Text, true),
@@ -11291,7 +11370,14 @@ pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("sourcefile", DataType::Text, true),
         ColumnSchema::new("sourceline", DataType::Int, true),
         ColumnSchema::new("pending_restart", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_settings(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.38 (read01 P3.22) — PG 18's full 17-column pg_settings shape so
+    // admin tools that filter on context / vartype / source (pgAdmin's
+    // parameter editor, postgres_exporter) get the columns they expect.
+    let schema = pg_settings_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     let defaults = canonical_gucs();
     // Build a full 17-column row. `setting` honours session overrides;
@@ -12639,42 +12725,65 @@ const PG_CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
     ("pg_user_mapping", 1418),
 ];
 
-pub(crate) const CATALOG_RELATIONS: &[(&str, i64)] = &[
-    ("pg_am", 2601),
-    ("pg_amop", 2602),
-    ("pg_amproc", 2603),
-    ("pg_attrdef", 2604),
-    ("pg_attribute", 1249),
-    ("pg_cast", 2605),
-    ("pg_class", 1259),
-    ("pg_collation", 3456),
-    ("pg_constraint", 2606),
-    ("pg_depend", 2608),
-    ("pg_enum", 3501),
-    ("pg_extension", 3079),
-    ("pg_index", 2610),
-    ("pg_inherits", 2611),
-    ("pg_ts_config", 3602),
-    ("pg_ts_config_map", 3603),
-    ("pg_ts_dict", 3600),
-    ("pg_ts_parser", 3601),
-    ("pg_ts_template", 3764),
-    ("pg_largeobject", 2613),
-    ("pg_largeobject_metadata", 2995),
-    ("pg_namespace", 2615),
-    ("pg_opclass", 2616),
-    ("pg_opfamily", 2753),
-    ("pg_operator", 2617),
-    ("pg_policy", 3256),
-    ("pg_proc", 1255),
-    ("pg_statistic", 2619),
+/// 9.0.0 — and each one's `relkind`.
+///
+/// `pg_stats` is a VIEW on PostgreSQL 18.6 and was reported `r` here.
+/// Ten more catalog relations SPG ANSWERS queries for — `pg_views`,
+/// `pg_tables`, `pg_indexes`, `pg_matviews`, `pg_sequences`,
+/// `pg_settings`, `pg_roles`, `pg_user`, `pg_prepared_statements`,
+/// `pg_rules` — were in no catalog at all: `pg_class` had no row, so
+/// `information_schema` could not list them and a reflection tool
+/// asking what the database holds was told they do not exist. Their
+/// oids are PostgreSQL 18.6's.
+pub(crate) const CATALOG_RELATIONS: &[(&str, i64, &str)] = &[
+    ("pg_am", 2601, "r"),
+    ("pg_amop", 2602, "r"),
+    ("pg_amproc", 2603, "r"),
+    ("pg_attrdef", 2604, "r"),
+    ("pg_attribute", 1249, "r"),
+    ("pg_cast", 2605, "r"),
+    ("pg_class", 1259, "r"),
+    ("pg_collation", 3456, "r"),
+    ("pg_constraint", 2606, "r"),
+    ("pg_depend", 2608, "r"),
+    ("pg_enum", 3501, "r"),
+    ("pg_extension", 3079, "r"),
+    ("pg_index", 2610, "r"),
+    ("pg_inherits", 2611, "r"),
+    ("pg_ts_config", 3602, "r"),
+    ("pg_ts_config_map", 3603, "r"),
+    ("pg_ts_dict", 3600, "r"),
+    ("pg_ts_parser", 3601, "r"),
+    ("pg_ts_template", 3764, "r"),
+    ("pg_largeobject", 2613, "r"),
+    ("pg_largeobject_metadata", 2995, "r"),
+    ("pg_namespace", 2615, "r"),
+    ("pg_opclass", 2616, "r"),
+    ("pg_opfamily", 2753, "r"),
+    ("pg_operator", 2617, "r"),
+    ("pg_policy", 3256, "r"),
+    ("pg_proc", 1255, "r"),
+    ("pg_statistic", 2619, "r"),
     // v7.38.18 — the readable view over `pg_statistic`, and the one a
     // person actually types. OID from a PG 18.4 catalog.
-    ("pg_stats", 12053),
-    ("pg_statistic_ext", 3381),
-    ("pg_tablespace", 1213),
-    ("pg_trigger", 2620),
-    ("pg_type", 1247),
+    ("pg_stats", 12053, "v"),
+    ("pg_statistic_ext", 3381, "r"),
+    ("pg_tablespace", 1213, "r"),
+    ("pg_trigger", 2620, "r"),
+    ("pg_type", 1247, "r"),
+    // 9.0.0 — the catalog VIEWS, which answered queries and appeared
+    // nowhere. `pg_locks` is not here: it is built by its own `exec_`
+    // and publishes no schema this file can read.
+    ("pg_views", 12028, "v"),
+    ("pg_tables", 12033, "v"),
+    ("pg_indexes", 12043, "v"),
+    ("pg_matviews", 12038, "v"),
+    ("pg_sequences", 12048, "v"),
+    ("pg_settings", 12104, "v"),
+    ("pg_roles", 12000, "v"),
+    ("pg_user", 12014, "v"),
+    ("pg_prepared_statements", 12095, "v"),
+    ("pg_rules", 12023, "v"),
 ];
 
 /// The columns one of those relations has.
@@ -12737,6 +12846,29 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_tablespace" => synth_pg_tablespace(cat).0,
         "pg_trigger" => synth_pg_trigger(cat).0,
         "pg_type" => synth_pg_type(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0,
+        // 9.0.0 — the catalog VIEWS. They answered queries and appeared
+        // in no catalog, so `pg_class` had no row and
+        // `information_schema` could not list them. The four that
+        // otherwise need an `Engine` publish their shape on its own, so
+        // listing a relation's columns never builds its rows.
+        "pg_views" => {
+            synth_pg_views(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0
+        }
+        "pg_tables" => {
+            synth_pg_tables(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0
+        }
+        "pg_matviews" => {
+            synth_pg_matviews(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0
+        }
+        "pg_sequences" => {
+            synth_pg_sequences(cat, &crate::role_directory::RoleDirectory::for_shape_only()).0
+        }
+        "pg_indexes" => synth_pg_indexes(cat).0,
+        "pg_rules" => synth_pg_rules(cat).0,
+        "pg_roles" => pg_roles_schema(),
+        "pg_user" => pg_user_schema(),
+        "pg_settings" => pg_settings_schema(),
+        "pg_prepared_statements" => pg_prepared_statements_schema(),
         _ => return None,
     })
 }
