@@ -12285,6 +12285,27 @@ impl Parser {
                         // without an explicit id then violated NOT
                         // NULL. Lower it to the auto-increment
                         // marker instead.
+                        // 9.0.0 — `SET GENERATED { ALWAYS | BY DEFAULT }`
+                        // changes an identity column's flavour. The SET
+                        // tail's catch-all swallowed it.
+                        if matches!(self.tokens.get(self.pos + 1),
+                            Some(Token::Ident(g)) if g.eq_ignore_ascii_case("generated"))
+                        {
+                            let kind = if matches!(self.tokens.get(self.pos + 2),
+                                Some(Token::Ident(k)) if k.eq_ignore_ascii_case("always"))
+                            {
+                                crate::ast::IdentityKind::Always
+                            } else {
+                                crate::ast::IdentityKind::ByDefault
+                            };
+                            self.consume_until_statement_boundary();
+                            return Ok(alloc::vec![
+                                crate::ast::AlterTableTarget::AlterColumnSetIdentityKind {
+                                    column: col_name,
+                                    kind,
+                                }
+                            ]);
+                        }
                         let is_default_nextval =
                             matches!(self.tokens.get(self.pos + 1), Some(Token::Default))
                                 && matches!(
@@ -12380,10 +12401,22 @@ impl Parser {
                                 self.tokens.get(self.pos + 1)
                             )));
                         }
+                        // 9.0.0 — WHICH identity, which this used to drop
+                        // on the floor by lowering to the auto-increment
+                        // marker alone.
+                        let kind = if matches!(
+                            self.tokens.get(self.pos + 2),
+                            Some(Token::Ident(k)) if k.eq_ignore_ascii_case("always")
+                        ) {
+                            crate::ast::IdentityKind::Always
+                        } else {
+                            crate::ast::IdentityKind::ByDefault
+                        };
                         let seq_name = self.scan_sequence_name_until_boundary();
                         return Ok(alloc::vec![
-                            crate::ast::AlterTableTarget::SetColumnAutoIncrement {
+                            crate::ast::AlterTableTarget::AlterColumnAddIdentity {
                                 column: col_name,
+                                kind,
                                 seq_name,
                             }
                         ]);
@@ -18509,7 +18542,7 @@ impl Parser {
         let mut check: Option<Expr> = None;
         let mut on_update_runtime: Option<Expr> = None;
         let mut generated_stored_expr: Option<Box<Expr>> = None;
-        let mut identity_always = false;
+        let mut identity: Option<crate::ast::IdentityKind> = None;
         loop {
             // v7.22 (mailrs round-13 gap 3) — PG 18 catalogs
             // not-null constraints by name and pg_dump emits them
@@ -18680,10 +18713,15 @@ impl Parser {
                     }
                 }
                 auto_increment = true;
-                // v7.38 (read01) — remember the ALWAYS flavour so the engine
+                // v7.38 (read01) — remember WHICH flavour so the engine
                 // can reject explicit non-DEFAULT INSERT values (unless
-                // OVERRIDING SYSTEM VALUE) the way PG does.
-                identity_always = saw_generated_always;
+                // OVERRIDING SYSTEM VALUE) the way PG does, and 9.0.0 so
+                // the catalogs can name it.
+                identity = Some(if saw_generated_always {
+                    crate::ast::IdentityKind::Always
+                } else {
+                    crate::ast::IdentityKind::ByDefault
+                });
                 // PG identity columns are implicitly NOT NULL.
                 nullable = false;
                 continue;
@@ -18940,7 +18978,7 @@ impl Parser {
             inline_enum_variants,
             inline_set_variants,
             generated_stored_expr,
-            identity_always,
+            identity,
             mysql_int_width,
             mysql_fsp,
             mysql_declared_timestamp,

@@ -1035,6 +1035,10 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
     // 8.0.3 — the identity-ALWAYS appendix (FILE_VERSION 100): a `u16`
     // count of 0 when no column is GENERATED ALWAYS. FOURTEENTH.
     const EMPTY_IDENTITY_ALWAYS_APPENDIX: usize = 2;
+    // 9.0.0 — the identity-BY-DEFAULT appendix (FILE_VERSION 102), its
+    // own list beside the ALWAYS one so an 8.0.x image still reads.
+    // FIFTEENTH.
+    const EMPTY_IDENTITY_BY_DEFAULT_APPENDIX: usize = 2;
     let tail_v60plus = EMPTY_CONSTRAINT_NAME_APPENDIX
         + EMPTY_COMPOSITE_APPENDIX
         + EMPTY_OWNER_ACL_APPENDIX
@@ -1048,7 +1052,8 @@ fn v52_snapshot_without_mvcc_appendix_loads_frozen_and_dense() {
         + EMPTY_UNIQUE_TIMING_APPENDIX
         + EMPTY_MYSQL_DECLARED_TS_APPENDIX
         + EMPTY_MYSQL_FLOAT_MD_APPENDIX
-        + EMPTY_IDENTITY_ALWAYS_APPENDIX;
+        + EMPTY_IDENTITY_ALWAYS_APPENDIX
+        + EMPTY_IDENTITY_BY_DEFAULT_APPENDIX;
     let mut v52 = Vec::with_capacity(v53.len() - appendix.len() - trailing_v53plus - tail_v60plus);
     v52.extend_from_slice(&v53[..start - trailing_v53plus]);
     v52.extend_from_slice(&v53[start + appendix.len() + tail_v60plus..]);
@@ -6427,7 +6432,7 @@ fn rederive_loses_nothing() {
     src.inline_enum_variants = Some(vec!["a".into(), "b".into()]);
     src.inline_set_variants = Some(vec!["x".into(), "y".into()]);
     src.generated_stored_expr = Some("a + 1".into());
-    src.identity_always = true;
+    src.identity = Some(spg_sql::ast::IdentityKind::Always);
     src.default_text = Some("'d'".into());
     src.auto_restart = Some(7);
     src.scalar_row_source = true;

@@ -59,7 +59,7 @@ pub(crate) fn deserialize_table(
             inline_enum_variants: None,
             inline_set_variants: None,
             generated_stored_expr: None,
-            identity_always: false,
+            identity: None,
             default_text: None,
             auto_restart: None,
             scalar_row_source: false,
@@ -673,18 +673,30 @@ pub(crate) fn deserialize_table(
     }
     // 8.0.3 — `GENERATED ALWAYS AS IDENTITY` columns (FILE_VERSION 100+).
     if version >= 100 {
-        let n = cur.read_u16()? as usize;
-        for _ in 0..n {
-            let idx = cur.read_u16()? as usize;
-            let cols = &mut t.schema_mut().columns;
-            let len = cols.len();
-            let Some(c) = cols.get_mut(idx) else {
-                return Err(StorageError::Corrupt(format!(
-                    "identity-always appendix: index {idx} past {len} columns \
-                     for table {table_name:?}"
-                )));
-            };
-            c.identity_always = true;
+        let mut read_list = |cur: &mut Cursor<'_>,
+                             t: &mut Table,
+                             kind: spg_sql::ast::IdentityKind|
+         -> Result<(), StorageError> {
+            let n = cur.read_u16()? as usize;
+            for _ in 0..n {
+                let idx = cur.read_u16()? as usize;
+                let cols = &mut t.schema_mut().columns;
+                let len = cols.len();
+                let Some(c) = cols.get_mut(idx) else {
+                    return Err(StorageError::Corrupt(format!(
+                        "identity appendix: index {idx} past {len} columns \
+                             for table {table_name:?}"
+                    )));
+                };
+                c.identity = Some(kind);
+            }
+            Ok(())
+        };
+        read_list(cur, t, spg_sql::ast::IdentityKind::Always)?;
+        // 9.0.0 — the BY DEFAULT half. An 8.0.x image stops after the
+        // ALWAYS list, which is every identity column it could name.
+        if version >= 102 {
+            read_list(cur, t, spg_sql::ast::IdentityKind::ByDefault)?;
         }
     }
     let _ = table_name;

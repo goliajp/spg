@@ -7537,11 +7537,10 @@ fn parse_insert_rows(
     // carries OVERRIDING SYSTEM VALUE. A DEFAULT marker is always allowed
     // (the sequence fills it). OVERRIDING USER VALUE already flattened any
     // explicit value above, so it too passes here and generates. BY DEFAULT
-    // identity columns (auto_increment && !identity_always) accept an
-    // explicit value unmodified — no check here.
+    // identity columns accept an explicit value unmodified — no check here.
     if overriding != Overriding::System {
         for (i, col) in column_meta.iter().enumerate() {
-            if !col.identity_always {
+            if col.identity != Some(spg_sql::ast::IdentityKind::Always) {
                 continue;
             }
             let slot: Option<usize> = match tuple_pos {
