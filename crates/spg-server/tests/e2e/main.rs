@@ -496,6 +496,7 @@ mod e2e_row_locks_round297;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_segment_forward;
 mod e2e_session_sync_commit_round172;
+mod e2e_set_limit_over_the_wire_900;
 mod e2e_setop_orderby_wire_round233;
 mod e2e_show_isolation_round118;
 #[allow(

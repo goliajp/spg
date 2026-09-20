@@ -23,6 +23,11 @@ pub(crate) fn value_to_literal(v: Value) -> Literal {
         Value::Int(n) => Literal::Integer(i64::from(n)),
         Value::BigInt(n) => Literal::Integer(n),
         Value::Float(x) => Literal::Float(x),
+        // 9.0.0 — a `real` folded to `Literal::String("Real(0.7)")` on
+        // the Debug catch-all below, and the re-parse then refused it:
+        // `invalid input syntax for type real: "Real(0.7)"`. f32 widens
+        // to f64 exactly, so the text is the same text.
+        Value::Real(x) => Literal::Float(f64::from(x)),
         Value::Text(s) | Value::Json(s) => Literal::String(s.into_owned()),
         Value::Bool(b) => Literal::Bool(b),
         Value::Vector(v) => Literal::Vector(v.into_owned()),

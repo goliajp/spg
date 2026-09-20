@@ -70,6 +70,20 @@ impl Engine {
         }
         let (name, schema) = (name.clone(), String::from(schema));
         let changed = self.active_catalog_mut().install_extension(&name, &schema);
+        // 9.0.0 — PostgreSQL's parameters arrive with the shared library,
+        // and `CREATE EXTENSION` is what loads it: measured on 18.6, the
+        // creating session answers `SHOW pg_trgm.similarity_threshold`
+        // with 0.3 while a LATER session that has not called the
+        // extension still says the parameter is unrecognised. Seeding
+        // them here gives the creating session the same three defaults.
+        if name.eq_ignore_ascii_case("pg_trgm") {
+            for (guc, default) in PG_TRGM_THRESHOLDS {
+                self.set_session_param(
+                    String::from(*guc),
+                    spg_sql::ast::SetValue::String(String::from(*default)),
+                );
+            }
+        }
         Ok(changed && self.catalog_change_is_committed())
     }
 
@@ -137,6 +151,27 @@ const EXTENSION_FUNCTIONS: &[(&str, &str)] = &[
     ("strict_word_similarity", "pg_trgm"),
     ("show_limit", "pg_trgm"),
     ("set_limit", "pg_trgm"),
+    // The ten wrapper functions pg_trgm's operators are built from. PG
+    // exposes them by name too, so a client that calls one on a database
+    // without the extension gets the same refusal.
+    ("similarity_op", "pg_trgm"),
+    ("similarity_dist", "pg_trgm"),
+    ("word_similarity_op", "pg_trgm"),
+    ("word_similarity_commutator_op", "pg_trgm"),
+    ("word_similarity_dist_op", "pg_trgm"),
+    ("word_similarity_dist_commutator_op", "pg_trgm"),
+    ("strict_word_similarity_op", "pg_trgm"),
+    ("strict_word_similarity_commutator_op", "pg_trgm"),
+    ("strict_word_similarity_dist_op", "pg_trgm"),
+    ("strict_word_similarity_dist_commutator_op", "pg_trgm"),
+];
+
+/// 9.0.0 — pg_trgm's three thresholds and the values PostgreSQL 18.6
+/// gives them. `show_limit()` and every `*_op` operator read the first.
+pub(crate) const PG_TRGM_THRESHOLDS: &[(&str, &str)] = &[
+    ("pg_trgm.similarity_threshold", "0.3"),
+    ("pg_trgm.word_similarity_threshold", "0.6"),
+    ("pg_trgm.strict_word_similarity_threshold", "0.5"),
 ];
 
 /// The extension a function comes from, if it comes from one.

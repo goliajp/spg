@@ -6000,7 +6000,28 @@ pub enum BinOp {
     Mod,
     /// pgvector L2 (Euclidean) distance `<->`. Defined for two vector
     /// operands of equal dimension; engine returns `Value::Float(d)`.
+    /// Over two texts it is pg_trgm's `similarity_dist` instead, resolved
+    /// by operand type the way PostgreSQL resolves it.
     L2Distance,
+    /// 9.0.0 — pg_trgm's word-similarity operators. The `Commutator`
+    /// ones score their arguments the other way round, and the
+    /// `Distance` ones answer one minus the score rather than a boolean.
+    /// `<%`
+    TrgmWordSimilar,
+    /// `%>`
+    TrgmWordSimilarCommutator,
+    /// `<<%`
+    TrgmStrictWordSimilar,
+    /// `%>>`
+    TrgmStrictWordSimilarCommutator,
+    /// `<<->`
+    TrgmWordDistance,
+    /// `<->>`
+    TrgmWordDistanceCommutator,
+    /// `<<<->`
+    TrgmStrictWordDistance,
+    /// `<->>>`
+    TrgmStrictWordDistanceCommutator,
     /// v7.39 (read01 geo_ops.c) — `?||` geometric "is parallel".
     GeomParallel,
     /// v7.39 (read01 rangetypes.c) — range `&<` / `&>`.
@@ -10310,6 +10331,14 @@ impl fmt::Display for BinOp {
             Self::Div => "/",
             Self::Mod => "%",
             Self::L2Distance => "<->",
+            Self::TrgmWordSimilar => "<%",
+            Self::TrgmWordSimilarCommutator => "%>",
+            Self::TrgmStrictWordSimilar => "<<%",
+            Self::TrgmStrictWordSimilarCommutator => "%>>",
+            Self::TrgmWordDistance => "<<->",
+            Self::TrgmWordDistanceCommutator => "<->>",
+            Self::TrgmStrictWordDistance => "<<<->",
+            Self::TrgmStrictWordDistanceCommutator => "<->>>",
             Self::GeomParallel => "?||",
             Self::OverLeft => "&<",
             Self::OverRight => "&>",

@@ -8955,6 +8955,12 @@ impl Parser {
             }
             Token::Integer(n) => Ok(crate::ast::SetValue::Number(n.to_string())),
             Token::Float(f) => Ok(crate::ast::SetValue::Number(f.to_string())),
+            // 9.0.0 — a literal with a decimal point or an exponent lexes
+            // as NUMERIC, not Float, so every fractional setting was a
+            // syntax error: `SET seq_page_cost = 0.7`, `SET
+            // cpu_tuple_cost = 0.02`, `SET pg_trgm.similarity_threshold =
+            // 0.7`. Only the quoted spelling parsed.
+            Token::Numeric(n) => Ok(crate::ast::SetValue::Number(n)),
             // v7.22 (mailrs round-13 gap 2) — PG boolean parameter
             // spellings that lex as keyword tokens, not idents:
             // `SET standard_conforming_strings = on` is in every
@@ -8986,6 +8992,7 @@ impl Parser {
             Token::Minus => match self.advance() {
                 Token::Integer(n) => Ok(crate::ast::SetValue::Number(alloc::format!("-{n}"))),
                 Token::Float(f) => Ok(crate::ast::SetValue::Number(alloc::format!("-{f}"))),
+                Token::Numeric(n) => Ok(crate::ast::SetValue::Number(alloc::format!("-{n}"))),
                 other => Err(self.err(format!(
                     "expected numeric after `-` in SET value, got {other:?}"
                 ))),
@@ -28057,6 +28064,16 @@ fn binop_from(tok: &Token) -> Option<(BinOp, u8)> {
         // pgvector distance ops all sit on the same rung — tighter than
         // comparisons (5) so `col <-> v < threshold` parses correctly.
         Token::L2Distance => (BinOp::L2Distance, 6),
+        // 9.0.0 — pg_trgm's eight, on the generic-operator rung with the
+        // rest of PostgreSQL's "other" operators.
+        Token::TrgmWordSimilar => (BinOp::TrgmWordSimilar, 6),
+        Token::TrgmWordSimilarCommutator => (BinOp::TrgmWordSimilarCommutator, 6),
+        Token::TrgmStrictWordSimilar => (BinOp::TrgmStrictWordSimilar, 6),
+        Token::TrgmStrictWordSimilarCommutator => (BinOp::TrgmStrictWordSimilarCommutator, 6),
+        Token::TrgmWordDistance => (BinOp::TrgmWordDistance, 6),
+        Token::TrgmWordDistanceCommutator => (BinOp::TrgmWordDistanceCommutator, 6),
+        Token::TrgmStrictWordDistance => (BinOp::TrgmStrictWordDistance, 6),
+        Token::TrgmStrictWordDistanceCommutator => (BinOp::TrgmStrictWordDistanceCommutator, 6),
         // v7.39 (read01 geo_ops.c) — geometric predicates ride the
         // comparison rung.
         Token::GeomParallel => (BinOp::GeomParallel, 5),

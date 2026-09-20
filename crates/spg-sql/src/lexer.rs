@@ -201,6 +201,20 @@ pub enum Token {
     InnerProduct,
     /// pgvector cosine distance operator `<=>`.
     CosineDistance,
+    /// 9.0.0 — pg_trgm's eight word-similarity operators. `<%` and `%>`
+    /// ask whether the word similarity clears the threshold (the second
+    /// scores the arguments the other way round); `<<%` and `%>>` are the
+    /// strict pair. `<<->`, `<->>`, `<<<->` and `<->>>` are their
+    /// distances. Lexed whole, longest first, so `<<->` never reads as
+    /// `<<` followed by `->`.
+    TrgmWordSimilar,
+    TrgmWordSimilarCommutator,
+    TrgmStrictWordSimilar,
+    TrgmStrictWordSimilarCommutator,
+    TrgmWordDistance,
+    TrgmWordDistanceCommutator,
+    TrgmStrictWordDistance,
+    TrgmStrictWordDistanceCommutator,
     /// PG-style cast `expr::type` — single token because we want it to bind
     /// at postfix precedence.
     DoubleColon,
@@ -923,7 +937,20 @@ pub fn tokenize_with_merges(
             }
             b'*' => single(&mut out, Token::Star, &mut i),
             b'/' => single(&mut out, Token::Slash, &mut i),
-            b'%' => single(&mut out, Token::Percent, &mut i),
+            b'%' => {
+                // 9.0.0 — pg_trgm's `%>` / `%>>`. `%` alone stays modulo,
+                // and `%` over two texts is pg_trgm's similarity test,
+                // resolved by operand type the way PostgreSQL resolves it.
+                if peek_eq(bytes, i + 1, b'>') && peek_eq(bytes, i + 2, b'>') {
+                    out.push(Token::TrgmStrictWordSimilarCommutator);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'>') {
+                    out.push(Token::TrgmWordSimilarCommutator);
+                    i += 2;
+                } else {
+                    single(&mut out, Token::Percent, &mut i);
+                }
+            }
             b'(' => single(&mut out, Token::LParen, &mut i),
             b')' => single(&mut out, Token::RParen, &mut i),
             b'[' => single(&mut out, Token::LBracket, &mut i),
@@ -953,7 +980,43 @@ pub fn tokenize_with_merges(
                 }
             }
             b'<' => {
-                if peek_eq(bytes, i + 1, b'=') && peek_eq(bytes, i + 2, b'>') {
+                // 9.0.0 — pg_trgm's operators are the longest ones that
+                // start with `<`, so they are tested first: `<<<->` before
+                // `<<->` before `<<=`, and `<->>>` before `<->>` before
+                // `<->`.
+                if peek_eq(bytes, i + 1, b'<')
+                    && peek_eq(bytes, i + 2, b'<')
+                    && peek_eq(bytes, i + 3, b'-')
+                    && peek_eq(bytes, i + 4, b'>')
+                {
+                    out.push(Token::TrgmStrictWordDistance);
+                    i += 5;
+                } else if peek_eq(bytes, i + 1, b'-')
+                    && peek_eq(bytes, i + 2, b'>')
+                    && peek_eq(bytes, i + 3, b'>')
+                    && peek_eq(bytes, i + 4, b'>')
+                {
+                    out.push(Token::TrgmStrictWordDistanceCommutator);
+                    i += 5;
+                } else if peek_eq(bytes, i + 1, b'<')
+                    && peek_eq(bytes, i + 2, b'-')
+                    && peek_eq(bytes, i + 3, b'>')
+                {
+                    out.push(Token::TrgmWordDistance);
+                    i += 4;
+                } else if peek_eq(bytes, i + 1, b'-')
+                    && peek_eq(bytes, i + 2, b'>')
+                    && peek_eq(bytes, i + 3, b'>')
+                {
+                    out.push(Token::TrgmWordDistanceCommutator);
+                    i += 4;
+                } else if peek_eq(bytes, i + 1, b'<') && peek_eq(bytes, i + 2, b'%') {
+                    out.push(Token::TrgmStrictWordSimilar);
+                    i += 3;
+                } else if peek_eq(bytes, i + 1, b'%') {
+                    out.push(Token::TrgmWordSimilar);
+                    i += 2;
+                } else if peek_eq(bytes, i + 1, b'=') && peek_eq(bytes, i + 2, b'>') {
                     out.push(Token::CosineDistance);
                     i += 3;
                 } else if peek_eq(bytes, i + 1, b'#') && peek_eq(bytes, i + 2, b'>') {

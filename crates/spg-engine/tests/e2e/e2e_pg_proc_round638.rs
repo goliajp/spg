@@ -55,14 +55,21 @@ fn round638_pg_proc_lists_what_the_engine_has() {
     // the 709 functions the engine answers. The gap was measured by calling
     // every candidate name and reading the engine's own reply, which
     // separates "does not exist" from "takes N args".
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["1115"]);
+    // 9.0.0 — 1115 became 1108. Nineteen rows joined (pg_trgm's fifteen
+    // and uuid-ossp's four generators that were implemented and unlisted)
+    // and twenty-six left: every function an EXTENSION supplies is in the
+    // catalog only once the extension is installed, which is PG 18.6's
+    // answer and is what this engine — which has created none — now says.
+    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["1108"]);
     assert_eq!(
         vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"),
         // 9.0.0 — 574 to 807: the 233 I/O and access-method-handler
         // functions every `regproc` column names. They were absent, so
         // `pg_type.typinput` read `-` and a join to `pg_proc` found
         // nothing to point at.
-        vec!["807"]
+        // 9.0.0 — then 807 to 800, the seven extension names this engine
+        // no longer claims without the extension.
+        vec!["800"]
     );
     // Signatures byte for byte with PG18's for the same names.
     assert_eq!(
@@ -95,7 +102,7 @@ fn round638_no_row_is_orphaned_by_the_join() {
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype"
         ),
-        vec!["1115"],
+        vec!["1108"],
         "as many as pg_proc has — nothing points at a type pg_type omits"
     );
 }
