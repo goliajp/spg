@@ -2669,7 +2669,11 @@ impl Engine {
                     modified_catalog: false,
                 })
             }
-            Statement::DropTable { names, if_exists } => self.exec_drop_table(names, if_exists),
+            Statement::DropTable {
+                names,
+                if_exists,
+                cascade,
+            } => self.exec_drop_table(names, if_exists, cascade),
             Statement::DropIndex {
                 name,
                 if_exists,
@@ -3363,7 +3367,11 @@ impl Engine {
                 self.exec_drop_sequence(&names, if_exists)
             }
             Statement::CreateView(s) => self.exec_create_view(s),
-            Statement::DropView { names, if_exists } => self.exec_drop_view(&names, if_exists),
+            Statement::DropView {
+                names,
+                if_exists,
+                cascade,
+            } => self.exec_drop_view(&names, if_exists, cascade),
             Statement::CreateMaterializedView(s) => self.exec_create_materialized_view(s),
             Statement::RefreshMaterializedView { name, with_data } => {
                 self.exec_refresh_materialized_view(&name, with_data)

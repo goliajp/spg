@@ -10,6 +10,34 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `DROP TABLE` succeeded while a view read the table
+
+The view was left answering `relation "t" does not exist`, and nothing
+had said so. Measured against PostgreSQL 18.6, which refuses with
+`cannot drop table t because other objects depend on it`, a `DETAIL`
+line per dependent (a view over a view included) and the
+`Use DROP ... CASCADE` hint. `DROP VIEW` of a view another view reads
+is refused the same way.
+
+`CASCADE` was parsed and thrown away, so it had nothing to do. It takes
+the dependents now, deepest first, and says what it took in
+PostgreSQL's own words — one object on one line, more than one behind
+a count.
+
+The dependency test is the rename rewrite above, run to the SAME name,
+so the two questions cannot drift apart: a reference the rename would
+follow is exactly a reference `DROP` must refuse, and a CTE of that
+name or a FROM item aliased to it shadows it in both.
+
+NOT closed, and measured: `ALTER TABLE t DROP COLUMN c` still succeeds
+while a view reads `c`. PostgreSQL's dependency is column-precise —
+dropping a column the view does NOT read is allowed there, and
+dropping one it reads is refused — and answering that needs the
+column resolution the executor already does, plus a decision about
+`SELECT *`: PostgreSQL expands it at `CREATE VIEW` time and SPG stores
+it unexpanded, so the two disagree about what such a view depends on
+before any dependency is recorded.
+
 ### Fixed — a rename now follows into the views that read the relation
 
 `CREATE VIEW v AS SELECT * FROM t; ALTER TABLE t RENAME TO t2` left `v`

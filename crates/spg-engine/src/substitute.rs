@@ -1480,6 +1480,17 @@ pub(crate) fn rename_relation_in_select(s: &mut SelectStatement, old: &str, new:
     cx.hit
 }
 
+/// 9.0.0 — does this SELECT read the relation `name`?
+///
+/// Asked by DROP, which PostgreSQL refuses while a view depends on the
+/// relation. It is the rename to the SAME name, so the two questions
+/// cannot drift apart: a reference the rename would follow is exactly
+/// a reference DROP must refuse, shadowing rules and all. The statement
+/// is left byte-identical.
+pub(crate) fn select_reads_relation(s: &mut SelectStatement, name: &str) -> bool {
+    rename_relation_in_select(s, name, name)
+}
+
 /// The walk's state: the rename, and the CTE names in scope.
 struct RelationRename<'a> {
     old: &'a str,

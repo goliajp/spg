@@ -2565,6 +2565,124 @@ impl Engine {
         Ok(())
     }
 
+    /// 9.0.0 — the views and materialized views that READ `name`,
+    /// transitively.
+    ///
+    /// `DROP TABLE t` succeeded while a view read `t`, leaving the view
+    /// answering `relation "t" does not exist`. Measured on PostgreSQL
+    /// 18.6: `cannot drop table t because other objects depend on it /
+    /// DETAIL: view v depends on table t / HINT: Use DROP ... CASCADE`.
+    ///
+    /// Dependents-of-dependents come with it, because a view over a
+    /// view is as broken by the drop as the first one.
+    pub(crate) fn dependent_views(
+        &self,
+        name: &str,
+    ) -> Vec<(alloc::string::String, alloc::string::String)> {
+        use spg_sql::ast::Statement;
+        let reads = |body: &str, target: &str| -> bool {
+            let Ok(Statement::Select(mut sel)) = spg_sql::parser::parse_statement(body) else {
+                return false;
+            };
+            crate::substitute::select_reads_relation(&mut sel, target)
+        };
+        let mut found: Vec<(alloc::string::String, alloc::string::String)> = Vec::new();
+        let mut frontier = alloc::vec![alloc::string::String::from(name)];
+        while let Some(target) = frontier.pop() {
+            let cat = self.active_catalog();
+            let mut hits: Vec<alloc::string::String> = Vec::new();
+            let seen = |f: &[(alloc::string::String, alloc::string::String)], n: &str| {
+                f.iter().any(|(d, _)| d.eq_ignore_ascii_case(n))
+            };
+            for (vname, def) in cat.views_all() {
+                if vname.eq_ignore_ascii_case(&target) || seen(&found, vname) {
+                    continue;
+                }
+                if reads(&def.body, &target) {
+                    hits.push(vname.clone());
+                }
+            }
+            for (mname, body) in cat.materialized_views() {
+                if mname.eq_ignore_ascii_case(&target) || seen(&found, mname) {
+                    continue;
+                }
+                if reads(body, &target) {
+                    hits.push(mname.clone());
+                }
+            }
+            for h in hits {
+                frontier.push(h.clone());
+                found.push((h, target.clone()));
+            }
+        }
+        found
+    }
+
+    /// 9.0.0 — PostgreSQL's refusal, word for word. Measured: the DETAIL
+    /// names EVERY dependent, one per line, and a dependent of a
+    /// dependent says which one it hangs off.
+    fn dependent_views_refusal(
+        kind: &str,
+        name: &str,
+        dependents: &[(alloc::string::String, alloc::string::String)],
+    ) -> EngineError {
+        let mut detail = alloc::string::String::new();
+        for (i, (dep, on)) in dependents.iter().enumerate() {
+            let head = if i == 0 { "DETAIL:  " } else { "" };
+            let on_kind = if on.eq_ignore_ascii_case(name) {
+                kind
+            } else {
+                "view"
+            };
+            detail.push_str(&alloc::format!(
+                "{head}view {dep} depends on {on_kind} {on}\n"
+            ));
+        }
+        EngineError::Unsupported(alloc::format!(
+            "cannot drop {kind} {name} because other objects depend on it\n\
+             {detail}HINT:  Use DROP ... CASCADE to drop the dependent objects too."
+        ))
+    }
+
+    /// 9.0.0 — refuse the drop, or take the dependents with it.
+    fn settle_view_dependents(
+        &mut self,
+        kind: &str,
+        name: &str,
+        cascade: bool,
+    ) -> Result<(), EngineError> {
+        let deps = self.dependent_views(name);
+        if deps.is_empty() {
+            return Ok(());
+        }
+        if !cascade {
+            return Err(Self::dependent_views_refusal(kind, name, &deps));
+        }
+        // PostgreSQL says what it took, measured: one object on one
+        // line, more than one behind a count.
+        if deps.len() == 1 {
+            self.notice(alloc::format!("drop cascades to view {}", deps[0].0));
+        } else {
+            let mut msg = alloc::format!("drop cascades to {} other objects", deps.len());
+            for (i, (dep, _)) in deps.iter().enumerate() {
+                let head = if i == 0 { "\nDETAIL:  " } else { "\n" };
+                msg.push_str(&alloc::format!("{head}drop cascades to view {dep}"));
+            }
+            self.notice(msg);
+        }
+        // Deepest first: a view over a view has to go before the view it
+        // reads, or the second drop finds its own dependent still there.
+        for (v, _) in deps.into_iter().rev() {
+            if self.active_catalog().materialized_views().contains_key(&v) {
+                self.active_catalog_mut().drop_materialized_view_source(&v);
+                self.active_catalog_mut().drop_table(&v);
+            } else {
+                self.active_catalog_mut().drop_view(&v);
+            }
+        }
+        Ok(())
+    }
+
     /// 9.0.0 — carry a relation rename into every stored view body.
     ///
     /// A view body is stored as TEXT here and as a parse tree resolved
@@ -3548,8 +3666,14 @@ impl Engine {
         &mut self,
         names: Vec<String>,
         if_exists: bool,
+        cascade: bool,
     ) -> Result<QueryResult, EngineError> {
         for name in names {
+            // 9.0.0 — a view that reads this table is broken by the
+            // drop; PostgreSQL refuses unless CASCADE takes it too.
+            if self.active_catalog().get(&name).is_some() {
+                self.settle_view_dependents("table", &name, cascade)?;
+            }
             // v7.39 (round 642) — dropping a partition parent drops its
             // partitions with it.
             //
@@ -5847,6 +5971,9 @@ impl Engine {
             self.active_catalog_mut()
                 .rename_sequence(&s.name, &new)
                 .map_err(EngineError::Storage)?;
+            // 9.0.0 — `SELECT * FROM my_seq` is legal, so a sequence is a
+            // relation a view can read and the rename follows here too.
+            self.rewrite_view_bodies_for_rename(&s.name, &new);
             return Ok(QueryResult::CommandOk {
                 affected: 0,
                 modified_catalog: self.catalog_change_is_committed(),
@@ -7221,9 +7348,15 @@ impl Engine {
         &mut self,
         names: &[String],
         if_exists: bool,
+        cascade: bool,
     ) -> Result<QueryResult, EngineError> {
         let mut removed = 0usize;
         for name in names {
+            // 9.0.0 — as for a table: a view another view reads cannot
+            // go without taking it.
+            if self.active_catalog().view(name).is_some() {
+                self.settle_view_dependents("view", name, cascade)?;
+            }
             // v7.39 (round 469) — a bare DROP names the session's
             // temporary view first, the way `Catalog::drop_table` resolves
             // a temporary table.
