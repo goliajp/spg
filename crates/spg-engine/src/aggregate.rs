@@ -7996,10 +7996,85 @@ pub(crate) fn encode_key_refs_into(vals: &[&Value], out: &mut String) {
 /// resolved once per join from the key columns' collations; a short or
 /// missing entry means "do not fold", which is what every existing
 /// caller wants.
-pub(crate) fn encode_key_refs_folded(vals: &[&Value], out: &mut String, folds: &[bool]) {
+/// 9.0.0 — how one equi-join key position is encoded, decided once per
+/// key from the two columns' declared types and read by BOTH halves of the
+/// hash join. One vector of these, never two parallel masks: a mask read
+/// on one side only scatters equal rows across buckets (see
+/// `join::extract_join_keys`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct JoinKeyMode {
+    /// MySQL text: fold case and accent (v7.38.14).
+    pub fold: bool,
+    /// Either side is `float4` / `float8`: PostgreSQL compares a number
+    /// with a float IN float8, so the key is the float8 value.
+    pub as_float: bool,
+}
+
+/// 9.0.0 — the key of one equi-join row, equal exactly when SQL `=` says
+/// the values are equal ACROSS numeric types.
+///
+/// The join encoded `1::int` as `I1|` and `1::bigint` as `B1|`, so a join
+/// whose two sides had different numeric types never met in the hash
+/// table. The single-key integer lane hid it; any key with two columns,
+/// or a numeric / float side, took this lane and answered nothing:
+///
+/// ```text
+///   ja(x int, y int) JOIN jb(x bigint, y bigint) ON ja.x = jb.x AND ja.y = jb.y
+///     PG 18.6   2      SPG 8.0.4   0       (also int-numeric, int-float8,
+///                                           int-smallint, and USING (x, y))
+/// ```
+///
+/// Not `encode_one`: GROUP BY and DISTINCT share that encoder, and there a
+/// width-blind or float-rounded key would MERGE groups with no later
+/// check. Here the width is dropped and the value kept exactly, and a
+/// float side switches the whole position to float8 values, which is the
+/// comparison PostgreSQL performs.
+pub(crate) fn encode_join_key_refs(vals: &[&Value], out: &mut String, modes: &[JoinKeyMode]) {
     out.clear();
     for (i, v) in vals.iter().enumerate() {
-        encode_one_in(out, v, folds.get(i).copied().unwrap_or(false));
+        let mode = modes.get(i).copied().unwrap_or_default();
+        if mode.as_float
+            && let Some(f) = numeric_as_f64(v)
+        {
+            push_float_key(out, f);
+            continue;
+        }
+        if matches!(
+            v,
+            Value::SmallInt(_) | Value::Int(_) | Value::BigInt(_) | Value::Numeric { .. }
+        ) {
+            push_canonical_key(out, v);
+            continue;
+        }
+        encode_one_in(out, v, mode.fold);
+    }
+}
+
+/// A number of any SQL numeric type as the float8 PostgreSQL would compare
+/// it as; `None` for anything else.
+fn numeric_as_f64(v: &Value) -> Option<f64> {
+    Some(match v {
+        Value::SmallInt(n) => f64::from(*n),
+        Value::Int(n) => f64::from(*n),
+        #[allow(clippy::cast_precision_loss)]
+        Value::BigInt(n) => *n as f64,
+        Value::Real(x) => f64::from(*x),
+        Value::Float(x) => *x,
+        Value::Numeric { .. } => crate::eval::value_to_text(v).parse::<f64>().ok()?,
+        _ => return None,
+    })
+}
+
+/// A float8 key: `-0` is `0`, and every NaN is one NaN (float8 equality
+/// treats NaN as equal to itself).
+fn push_float_key(out: &mut String, f: f64) {
+    use core::fmt::Write;
+    if f.is_nan() {
+        out.push_str("nNaN|");
+    } else if f == 0.0 {
+        out.push_str("n0|");
+    } else {
+        let _ = write!(out, "n{f}|");
     }
 }
 

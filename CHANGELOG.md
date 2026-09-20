@@ -10,6 +10,60 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a join between two different numeric types found nothing
+
+The hash join's canonical-string key carried the numeric WIDTH, so
+`1::int` was `I1|` and `1::bigint` was `B1|` and the two never met in
+the table. A single integer key takes a typed i64 lane and was never
+affected — which is how this survived. Any key with two columns, or a
+`numeric` or `float8` side, took the string lane and answered nothing:
+
+```text
+  ja(x int, y int) JOIN jb(x bigint, y bigint)
+    ON ja.x = jb.x                      PG 18.6  2    SPG 8.0.4  2
+    ON ja.x = jb.x AND ja.y = jb.y      PG 18.6  2    SPG 8.0.4  0
+    USING (x, y)                        PG 18.6  2    SPG 8.0.4  0
+  int ⋈ numeric / float8 / smallint, two columns
+                                        PG 18.6  2    SPG 8.0.4  0
+```
+
+Measured on the PUBLISHED images, not read off the code: 8.0.4, 8.0.0,
+7.40.11, 7.39.13 and 7.38.22 all answer 0 for the two-column key.
+
+The join now keys on the VALUE: the width is dropped and the number
+kept exactly, and a `float4` / `float8` on either side switches that key
+position to the float8 value — which is the comparison PostgreSQL
+performs, so `0.1::real` still does not equal `0.1::float8` while
+`0.1::numeric` does, `NaN` equals `NaN`, and `-0` equals `0`.
+
+`GROUP BY` and `DISTINCT` keep their own encoder untouched: there a
+width-blind or float-rounded key would merge groups with nothing to
+catch it afterwards.
+
+### Fixed — 122 catalog columns were `bigint` where PostgreSQL declares `oid`
+
+`SELECT oid FROM pg_class` announced `bigint` and sent eight bytes in
+binary; PostgreSQL 18.6 announces `oid` and sends four. The same held
+for every catalog column that names an object — `attrelid`, `atttypid`,
+`typelem`, `prorettype` and the rest.
+
+They were re-declared by asking PostgreSQL, not by guessing names: every
+`pg_*` catalog column SPG declared `bigint` was looked up on 18.6 — 142
+of them, 122 `oid`, 19 `regproc`, 1 `xid` — and the 122 changed to
+match. The other 20 stay `bigint` for now: a `regproc` column renders
+the function's name on PostgreSQL and these cells hold a number, so the
+declaration cannot change without the value.
+
+The same pass caught the catalog's own type map missing `oid` where the
+wire's map had it, so a column declared `oid` reported `atttypid` 0 and
+`format_type` answered `???` for it. A pin now asks the engine to name
+the type of every catalog column it has.
+
+A full sweep of the 365 catalog columns both engines have leaves 83
+still typed differently — `text` where PostgreSQL says `name`,
+`pg_node_tree`, `aclitem[]`, `oid[]` and others — recorded, not yet
+fixed.
+
 ### Fixed — eleven types were announced as `text`, and seven could not be sent in binary
 
 A driver decodes a column by the type it is announced as, and most
