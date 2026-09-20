@@ -1751,6 +1751,51 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
             Value::Bool(false),
         ]));
     }
+    // 9.0.0 — an INDEX inherits too. PostgreSQL records a partitioned
+    // table's index declaration as the parent of each partition's index
+    // here, and `pg_dump` reads exactly this to decide that the parent
+    // index is worth writing (`CREATE INDEX … ON ONLY …`) and to emit
+    // the `ALTER INDEX … ATTACH PARTITION …` that follows it. Without
+    // the rows, `pg_dump` wrote the partitions' indexes alone, so a
+    // restore lost the declaration and a partition created afterwards
+    // inherited nothing.
+    //
+    // The pairing is by COLUMNS, not by name: a child's index is named
+    // after the child, and the columns are what the template gave it.
+    let all = catalog_indexes(cat);
+    for parent_idx in all.iter().filter(|ci| ci.only) {
+        for child_name in crate::partition::children_of_parent(cat, &parent_idx.table) {
+            let Some(child) = cat.get(&child_name) else {
+                continue;
+            };
+            let parent_cols: Vec<&str> = parent_idx
+                .columns
+                .iter()
+                .filter_map(|p| {
+                    cat.get(&parent_idx.table)
+                        .and_then(|t| t.schema().columns.get(*p))
+                        .map(|c| c.name.as_str())
+                })
+                .collect();
+            let Some(child_idx) = all.iter().find(|ci| {
+                ci.table == child_name
+                    && !ci.only
+                    && ci
+                        .columns
+                        .iter()
+                        .filter_map(|p| child.schema().columns.get(*p).map(|c| c.name.as_str()))
+                        .eq(parent_cols.iter().copied())
+            }) else {
+                continue;
+            };
+            rows.push(Row::new(alloc::vec![
+                Value::BigInt(child_idx.oid),
+                Value::BigInt(parent_idx.oid),
+                Value::Int(1),
+                Value::Bool(false),
+            ]));
+        }
+    }
     (schema, rows)
 }
 
@@ -2588,6 +2633,16 @@ pub(crate) const fn am_oid_of(kind: &spg_storage::IndexKind) -> i64 {
         K::Brin { .. } => 3580,
         K::Gin(_) | K::GinTrgm(_) | K::GinFulltext(_) | K::GinJsonb(_) => 2742,
         _ => 403, // btree
+    }
+}
+
+/// 9.0.0 — the name of the access method an oid names, for the
+/// definitions SPG renders from a `CatalogIndex` alone.
+pub(crate) const fn am_name_of_oid(oid: i64) -> &'static str {
+    match oid {
+        3580 => "brin",
+        2742 => "gin",
+        _ => "btree",
     }
 }
 
@@ -3892,6 +3947,13 @@ pub(crate) struct CatalogIndex {
     /// index from a bare one — so every primary key and UNIQUE constraint
     /// dumped as `CREATE UNIQUE INDEX`, and restored as one.
     pub backs_constraint: Option<usize>,
+    /// 9.0.0 — `ON ONLY`: this index is a partitioned parent's
+    /// DECLARATION, which PostgreSQL carries as a relation of its own
+    /// and `pg_dump` writes as `CREATE INDEX … ON ONLY …`. SPG kept it
+    /// as a template string and listed nothing, so a dump emitted only
+    /// the partitions' indexes and a partition created after the
+    /// restore inherited none.
+    pub only: bool,
     /// 9.0.0 — each key part's expression text, aligned with `columns`;
     /// `None` where the part is the column itself. `indkey` is 0 for an
     /// expression part and `indexprs` lists them all.
@@ -3994,6 +4056,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 expression: idx.expression.clone(),
                 nulls_not_distinct: idx.nulls_not_distinct,
                 is_storage: true,
+                only: false,
                 backs_constraint: exact,
                 part_expressions: (0..=idx.extra_column_positions.len())
                     .map(|i| idx.part_expression(i).map(alloc::string::String::from))
@@ -4036,10 +4099,63 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 expression: None,
                 nulls_not_distinct: uc.nulls_not_distinct,
                 is_storage: false,
+                only: false,
                 backs_constraint: Some(i),
                 part_expressions: alloc::vec![None; uc.columns.len()],
                 part_orders: alloc::vec![spg_storage::KeyOrder::default(); uc.columns.len()],
             });
+        }
+        // 9.0.0 — a partitioned parent's index DECLARATION. SPG keeps it
+        // as a `CREATE INDEX` template that every partition replays, and
+        // listed nothing here: `pg_indexes` had no row for it, so
+        // `pg_dump` (which reads `indexdef` from this view) emitted the
+        // partitions' indexes alone and a partition created after the
+        // restore inherited none. PostgreSQL 18.6 carries the parent's
+        // index as a relation of its own and writes it `ON ONLY`.
+        if let Some(spg_storage::PartitionRole::Parent {
+            index_template_sources,
+            ..
+        }) = &t.schema().partition_role
+        {
+            for src in index_template_sources {
+                let Ok(spg_sql::ast::Statement::CreateIndex(ci)) =
+                    spg_sql::parser::parse_statement(src)
+                else {
+                    continue;
+                };
+                let positions: Vec<usize> = core::iter::once(&ci.column)
+                    .chain(ci.extra_columns.iter())
+                    .filter_map(|c| t.schema().column_position(c))
+                    .collect();
+                if positions.len() != 1 + ci.extra_columns.len() {
+                    continue;
+                }
+                oid += 1;
+                out.push(CatalogIndex {
+                    oid,
+                    table: tname.clone(),
+                    name: ci.name.clone(),
+                    part_expressions: alloc::vec![None; positions.len()],
+                    part_orders: alloc::vec![
+                        spg_storage::KeyOrder::default();
+                        positions.len()
+                    ],
+                    columns: positions,
+                    included: Vec::new(),
+                    is_unique: ci.is_unique,
+                    is_primary: false,
+                    am_oid: match ci.method {
+                        spg_sql::ast::IndexMethod::Brin => 3580,
+                        _ => 403,
+                    },
+                    partial_predicate: None,
+                    expression: None,
+                    nulls_not_distinct: ci.nulls_not_distinct,
+                    is_storage: false,
+                    backs_constraint: None,
+                    only: true,
+                });
+            }
         }
     }
     out
@@ -4386,7 +4502,18 @@ pub(crate) fn synth_pg_class(
         // hot-tier byte meter — capacity queries multiply
         // relpages × 8192 to estimate table size.
         let relpages = i32::try_from(t.hot_bytes().div_ceil(8192)).unwrap_or(i32::MAX);
-        let has_index = !t.indices().is_empty();
+        // 9.0.0 — a partitioned parent holds no storage index, and its
+        // index DECLARATIONS are what `pg_dump` looks for once this says
+        // the relation has any. It read `false`, so the declaration was
+        // never written and a restore lost it.
+        let has_index = !t.indices().is_empty()
+            || matches!(
+                &schema_ref.partition_role,
+                Some(PartitionRole::Parent {
+                    index_template_sources,
+                    ..
+                }) if !index_template_sources.is_empty()
+            );
         let has_triggers = cat
             .triggers()
             .iter()
@@ -4591,7 +4718,13 @@ pub(crate) fn synth_pg_class(
                 Value::Bool(false), // relhasindex (an index has none)
                 Value::Bool(false),
                 char1("p"), // relpersistence
-                char1("i"), // relkind — index
+                // 9.0.0 — `I` for a partitioned table's index declaration,
+                // as PostgreSQL 18.6 reports (measured). `pg_dump` reads
+                // this to decide whether to write the index at all: with
+                // `i` it took SPG's parent declaration for an ordinary
+                // index on a relation that stores nothing and emitted
+                // none.
+                char1(if ci.only { "I" } else { "i" }), // relkind — index
                 Value::SmallInt(relnatts),
                 Value::SmallInt(0),
                 Value::Bool(false),
@@ -11617,7 +11750,9 @@ fn builtin_schema_oid(name: &str) -> Option<i32> {
 /// listed column names. One renderer now feeds both.
 /// v7.39.13 — the `CREATE INDEX` PostgreSQL prints for a constraint's
 /// own index, which SPG synthesises because its storage has none.
-fn render_constraint_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> alloc::string::String {
+/// The definition of an index SPG has no storage object for: a
+/// constraint's, and 9.0.0 a partitioned parent's declaration.
+fn render_synthesised_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> alloc::string::String {
     let cols: alloc::vec::Vec<alloc::string::String> = ci
         .columns
         .iter()
@@ -11628,10 +11763,16 @@ fn render_constraint_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> allo
                 .map_or_else(|| "?".into(), |c| c.name.clone())
         })
         .collect();
+    // 9.0.0 — `UNIQUE` and `ONLY` are read off the entry. A constraint's
+    // row is always unique and never ONLY, which is why the hardcoded
+    // form served until a parent's declaration needed the same renderer.
     alloc::format!(
-        "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+        "CREATE {}INDEX {} ON {}public.{} USING {} ({})",
+        if ci.is_unique { "UNIQUE " } else { "" },
         ci.name,
+        if ci.only { "ONLY " } else { "" },
         ci.table,
+        am_name_of_oid(ci.am_oid),
         cols.join(", ")
     )
 }
@@ -11659,7 +11800,7 @@ pub(crate) fn catalog_indexdef(
     {
         return render_indexdef(t, idx, &ci.table, cat, qualify_in.is_some());
     }
-    render_constraint_indexdef(t, ci)
+    render_synthesised_indexdef(t, ci)
 }
 
 /// 9.0.0 — one key part of an index as `pg_get_indexdef` prints it: the

@@ -1409,6 +1409,15 @@ pub enum AlterIndexTarget {
     /// parameters no-op (SPG engine-manages them, as ALTER TABLE's
     /// SET/RESET arms already record).
     StorageParams,
+    /// 9.0.0 — `ATTACH PARTITION <child index>`, which `pg_dump` writes
+    /// after a partitioned table's index declaration. It was a syntax
+    /// error, so a dump carrying a partitioned index did not restore.
+    ///
+    /// SPG derives a partition's index from the parent's TEMPLATE, so
+    /// the attachment already holds by construction and there is
+    /// nothing for this to do beyond checking that both indexes are
+    /// there — which is what PostgreSQL refuses on.
+    AttachPartition { child_index: String },
 }
 
 /// v6.7.2 — `ALTER TABLE t SET <setting> = <value>`. v6.7.2 ships
@@ -2514,6 +2523,14 @@ pub struct CreateIndexStatement {
     /// the one a column inherits are different objects.
     pub key_collation: Option<String>,
     pub table: String,
+    /// 9.0.0 — `CREATE INDEX … ON ONLY <partitioned parent>`: declare the
+    /// index on the parent WITHOUT building it on the partitions.
+    ///
+    /// It is what `pg_dump` writes for a partitioned table's index, and
+    /// SPG could not parse it — so a dump of a partitioned table did not
+    /// restore its parent index at all, and a partition created after
+    /// the restore inherited nothing.
+    pub only: bool,
     pub column: String,
     /// v7.39 (read01 round 52) — `CREATE UNIQUE INDEX … NULLS NOT DISTINCT`
     /// (PG 15+). Default (`false`) is the SQL-standard NULLS DISTINCT, where
@@ -7108,6 +7125,12 @@ impl fmt::Display for Statement {
                         }
                         write!(f, "{} RENAME TO {}", quote_ident(&a.name), quote_ident(new))
                     }
+                    AlterIndexTarget::AttachPartition { child_index } => write!(
+                        f,
+                        "{} ATTACH PARTITION {}",
+                        quote_ident(&a.name),
+                        quote_ident(child_index)
+                    ),
                 }
             }
             Self::AlterTable(a) => {
@@ -8015,8 +8038,11 @@ impl fmt::Display for CreateIndexStatement {
         }
         write!(
             f,
-            "{} ON {} ",
+            "{} ON {}{} ",
             quote_ident(&self.name),
+            // 9.0.0 — a partitioned parent's index is declared `ON ONLY`
+            // and must re-parse as the same declaration.
+            if self.only { "ONLY " } else { "" },
             quote_ident(&self.table)
         )?;
         // 9.0.0 — the method as written, when it was: `gist` / `hash` load

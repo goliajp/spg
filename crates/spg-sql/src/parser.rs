@@ -11454,6 +11454,24 @@ impl Parser {
                 target: crate::ast::AlterIndexTarget::Rename { new, if_exists },
             }));
         }
+        // 9.0.0 — `ATTACH PARTITION <child index>`, the line `pg_dump`
+        // writes after a partitioned table's index declaration.
+        if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("attach")) {
+            self.advance();
+            // PARTITION lexes as its own reserved token.
+            if !matches!(self.peek(), Token::Partition) {
+                return Err(self.err(alloc::format!(
+                    "expected PARTITION after ALTER INDEX … ATTACH, got {:?}",
+                    self.peek()
+                )));
+            }
+            self.advance();
+            let child_index = self.expect_ident_like()?;
+            return Ok(Statement::AlterIndex(crate::ast::AlterIndexStatement {
+                name,
+                target: crate::ast::AlterIndexTarget::AttachPartition { child_index },
+            }));
+        }
         // v7.39 (round 710) — SET ( … ) / RESET ( … ) storage parameters.
         // A syntax error before; the index is validated, the params no-op.
         if matches!(self.peek(), Token::Ident(k) if k.eq_ignore_ascii_case("reset"))
@@ -17239,6 +17257,13 @@ impl Parser {
             )));
         }
         self.advance();
+        // 9.0.0 — `ON ONLY <parent>`: PostgreSQL's spelling for an index
+        // declared on a partitioned table without being built on its
+        // partitions, and the one `pg_dump` writes.
+        let only = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("only"));
+        if only {
+            self.advance();
+        }
         let table = self.expect_ident_like()?;
         // Optional `USING <method>` — only recognised method in v2.0 is
         // `hnsw` (a single-layer NSW graph for kNN). `USING` is the bare
@@ -17445,6 +17470,7 @@ impl Parser {
             key_order,
             key_collation,
             table,
+            only,
             column,
             nulls_not_distinct,
             method,

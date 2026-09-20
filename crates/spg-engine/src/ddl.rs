@@ -2984,6 +2984,26 @@ impl Engine {
                 modified_catalog: false,
             });
         }
+        // 9.0.0 — `ATTACH PARTITION <child index>`, which `pg_dump`
+        // writes after a partitioned table's index declaration. SPG
+        // derives a partition's index from the parent's TEMPLATE, so
+        // the attachment already holds by construction; both relations
+        // are still resolved, which is what PostgreSQL refuses on.
+        if let spg_sql::ast::AlterIndexTarget::AttachPartition { child_index } = &target {
+            let cat = self.active_catalog();
+            let declared = crate::system_catalog::catalog_indexes(cat);
+            for name in [&idx_name, child_index] {
+                if !declared.iter().any(|ci| ci.name == *name) {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "relation \"{name}\" does not exist"
+                    )));
+                }
+            }
+            return Ok(QueryResult::CommandOk {
+                affected: 0,
+                modified_catalog: false,
+            });
+        }
         let spg_sql::ast::AlterIndexTarget::Rebuild { encoding } = target else {
             unreachable!("Rename branch returned above");
         };
@@ -3585,8 +3605,26 @@ impl Engine {
         let parent_name = stmt.table.clone();
         // Display-form source (round-trips through fmt::Display)
         // → store on parent's PartitionRole::Parent template list.
-        let template_source = alloc::format!("{stmt}");
-        let children = crate::partition::children_of_parent(self.active_catalog(), &parent_name);
+        //
+        // 9.0.0 — the template describes what a CHILD gets, so it is
+        // stored without the `ONLY` that may have declared it: a child
+        // is not a partitioned table and the keyword would mean nothing
+        // there.
+        let template_source = {
+            let mut child_form = stmt.clone();
+            child_form.only = false;
+            alloc::format!("{child_form}")
+        };
+        // 9.0.0 — `ON ONLY` declares the index on the parent and does
+        // NOT build it on the partitions, which is what `pg_dump` writes
+        // (the partitions carry their own `CREATE INDEX` lines beside
+        // it). Fanning out there would try to create each child's index
+        // twice on restore.
+        let children = if stmt.only {
+            Vec::new()
+        } else {
+            crate::partition::children_of_parent(self.active_catalog(), &parent_name)
+        };
         // Append the template to the parent schema before fanning
         // out, so a child whose CREATE FAILS halfway through still
         // records the template the user asked for. Idempotency is
