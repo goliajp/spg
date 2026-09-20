@@ -1081,6 +1081,7 @@ fn render_data_type(ty: DataType) -> String {
         DataType::AnyArray => "ANYARRAY".into(),
         DataType::AclItemArray => "ACLITEM[]".into(),
         DataType::Char1Array => "\"char\"[]".into(),
+        DataType::RegTypeArray => "regtype[]".into(),
         DataType::Xid8 => "XID8".into(),
         DataType::Oid => "OID".into(),
         DataType::OidArray => "OID[]".into(),

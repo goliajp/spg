@@ -1345,6 +1345,7 @@ mod e2e_recursive_cte_wellformed_round145;
 mod e2e_redo_capture;
 mod e2e_regclass_from_oid_900;
 mod e2e_regexp_family;
+mod e2e_regproc_values_900;
 mod e2e_rename_follows_views_900;
 mod e2e_repeat;
 mod e2e_replace;

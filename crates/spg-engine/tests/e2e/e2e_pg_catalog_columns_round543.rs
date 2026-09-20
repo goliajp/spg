@@ -145,19 +145,19 @@ fn round543_pg_type_is_complete() {
         ]
     );
     assert_eq!(&cols[29..], &["typdefaultbin", "typdefault", "typacl"]);
-    // SPG's type I/O is built into the engine and is not a catalogued
-    // function, so there is nothing for these to name. 9.0.0 — the
-    // columns are `regproc` now, as PostgreSQL declares them, and oid 0
-    // RENDERS as `-` there: `SELECT 0::regproc` is `-` on 18.6, and
-    // `pg_type.typsubscript` for `int4` is `-` on both engines. What PG
-    // still has and SPG does not is a real function to name — `int4in`
-    // where this says `-`.
+    // 9.0.0 — and the functions are catalogued now, so these name them
+    // as PostgreSQL 18.6 does. The comment this replaces said what was
+    // still missing: "What PG still has and SPG does not is a real
+    // function to name — `int4in` where this says `-`." All 98 types
+    // SPG carries match PG's four I/O columns byte for byte, and
+    // `pg_type JOIN pg_proc ON p.oid = t.typinput` resolves for every
+    // one. `typdefault` / `typacl` are NULL on both.
     assert_eq!(
         rows(
             &mut e,
             "SELECT typinput, typoutput, typdefault, typacl FROM pg_type WHERE typname = 'int4'"
         ),
-        vec!["-|-|NULL|NULL"]
+        vec!["int4in|int4out|NULL|NULL"]
     );
 }
 

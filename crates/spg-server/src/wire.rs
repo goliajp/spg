@@ -107,7 +107,8 @@ const fn data_type_to_wire(t: DataType) -> WireType {
         | DataType::PgNodeTree
         | DataType::AnyArray
         | DataType::AclItemArray
-        | DataType::Char1Array => WireType::Text,
+        | DataType::Char1Array
+        | DataType::RegTypeArray => WireType::Text,
         DataType::Float => WireType::Float,
         DataType::Real => WireType::Float,
         // VARCHAR / CHAR / NUMERIC / DATE / TIMESTAMP collapse to

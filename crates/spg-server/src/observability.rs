@@ -603,7 +603,8 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 | DataType::PgNodeTree
                 | DataType::AnyArray
                 | DataType::AclItemArray
-                | DataType::Char1Array => 0,
+                | DataType::Char1Array
+                | DataType::RegTypeArray => 0,
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
                 DataType::Real => 4,

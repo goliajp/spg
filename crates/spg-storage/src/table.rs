@@ -4582,6 +4582,7 @@ fn column_accepts(actual: DataType, declared: DataType) -> bool {
                     | DataType::AnyArray
                     | DataType::AclItemArray
                     | DataType::Char1Array
+                    | DataType::RegTypeArray
             )
             // Both directions: a projection of one of these columns
             // builds a temp whose schema carries the declared type while
@@ -4590,9 +4591,16 @@ fn column_accepts(actual: DataType, declared: DataType) -> bool {
                 DataType::PgNodeTree
                     | DataType::AnyArray
                     | DataType::AclItemArray
-                    | DataType::Char1Array,
+                    | DataType::Char1Array
+                    | DataType::RegTypeArray,
                 DataType::Text
             )
+            // 9.0.0 — `regtype[]`'s cell is the TEXT ARRAY the catalog
+            // builds (`{integer[],text}`), not a scalar text; and a
+            // `regtype` cell is the type's NAME.
+            | (DataType::TextArray, DataType::RegTypeArray)
+            | (DataType::RegTypeArray, DataType::TextArray)
+            | (DataType::Text, DataType::RegType)
             | (DataType::Name, DataType::Text)
             // An XID column stores the Value::BigInt a transaction id
             // has always been; xid8 has no value of its own at all.

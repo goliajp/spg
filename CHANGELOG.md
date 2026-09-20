@@ -10,6 +10,36 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the `regproc` columns name the function now, not `-`
+
+`pg_type.typinput` read `-` — oid 0, PostgreSQL's own spelling for "no
+function" — where PG 18.6 names `int4in`, and every `pg_am` row's
+`amhandler` read `-` where PG names `bthandler`. SPG's I/O is built
+into the engine and had no catalogued function to point at, so naming
+one would have left `pg_type JOIN pg_proc ON p.oid = typinput`
+dangling. The 233 I/O and access-method-handler functions are in
+`pg_proc` now at PostgreSQL's own oids, and **all 101 types the two
+engines share match on all four I/O columns**, measured.
+
+Three pseudo-types the I/O functions RETURN joined the catalog for the
+same reason — `cstring`, `table_am_handler`, `index_am_handler` —
+without which 64 `pg_proc` rows pointed at a type nothing carried.
+
+**A second join-key defect of the J1 family**: a reg value carried its
+own tag into the join key and never met an `oid` column's integer, so
+`pg_type JOIN pg_proc ON p.oid = t.typinput` found NOTHING while the
+scalar comparison of the same two values answered `t`. A reg value
+joins by its oid now, in the lane an integer takes — which is how
+PostgreSQL compares them (`1::oid = 1::regclass` is `t` there);
+`xid` / `tid` / `cid`, which PostgreSQL does not compare against an
+integer, keep their own lanes.
+
+Making the ten catalog views visible made their columns measurable,
+and the sweep found 18 more declarations to fix — 14 `name`, one
+`oid`, one `text[]`, one `regtype` and one `regtype[]` (a new
+`DataType`, tag 93, oid 2211). **The sweep is at 0 over 447 columns**,
+up from 365.
+
 ### Fixed — ten catalog relations answered queries and were in no catalog
 
 `SELECT * FROM pg_views` worked; `SELECT … FROM pg_class WHERE

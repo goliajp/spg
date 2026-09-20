@@ -3868,6 +3868,12 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         // 9.0.0 — the type PostgreSQL stores a parsed expression in
         // (`pg_attrdef.adbin`, `pg_constraint.conbin`, `pg_index.indexprs`).
         194 => "pg_node_tree",
+        2211 => "regtype[]",
+        // 9.0.0 — the three pseudo-types the catalogued I/O functions
+        // return, as `format_type` names them on PG 18.6.
+        2275 => "cstring",
+        269 => "table_am_handler",
+        325 => "index_am_handler",
         600 => "point",
         // `box` is not in SPG's `pg_type` at all yet; it is named here
         // because `format_type(603, -1)` is asked directly too.
@@ -6582,12 +6588,15 @@ pub(crate) fn coerce_value(
         // to the column's declared type and coerces the other branch into
         // it, so the coercion table has to know the declaration even
         // though the value shape stays the text it has always been.
+        // 9.0.0 — a `regtype[]` cell is the catalog's TEXT ARRAY.
+        (v @ Value::TextArray(_), DataType::RegTypeArray) => Some(v),
         (
             Value::Text(s),
             DataType::PgNodeTree
             | DataType::AnyArray
             | DataType::AclItemArray
-            | DataType::Char1Array,
+            | DataType::Char1Array
+            | DataType::RegTypeArray,
         ) => Some(Value::text(s)),
         (Value::Text(s), DataType::Name) => {
             let mut cut = s.into_owned();
