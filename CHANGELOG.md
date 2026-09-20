@@ -10,6 +10,38 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — `INSERT INTO <partitioned parent> … RETURNING` / `… ON CONFLICT`
+
+Both were refused outright, with a message that said to "route through
+the child explicitly" — which asks the caller to work out which
+partition a row lands in, the one thing routing exists to answer.
+PostgreSQL 18.6 takes both.
+
+Measured there: the RETURNING rows come back in the statement's
+ORIGINAL tuple order, interleaved across partitions, not grouped by
+partition. Bucketing the tuples by destination — what the routing did,
+one statement per child — loses that order and the per-tuple
+attribution `ON CONFLICT DO NOTHING` needs, so those two shapes route a
+tuple at a time now. Everything else keeps the bucketed path.
+
+Two defects sat under it, both silent until now:
+
+* **A partition had no index for the constraints it inherits.** It
+  copies the parent's uniqueness constraints — which is what enforces
+  the key — but nothing installed the B-tree, so `pg_indexes` showed
+  `<child>_pkey` while storage had none. The `ON CONFLICT` arbiter
+  probes storage indexes, found nothing, answered "no conflict", and
+  the row went on to be refused by the uniqueness check: every `ON
+  CONFLICT` spelling on a partition raised `duplicate key value
+  violates unique constraint` where PostgreSQL upserts. The same
+  statement on a non-partitioned table has always worked.
+* **`ON CONFLICT DO UPDATE` must refuse two tuples that would affect
+  one row**, and per-row routing makes each tuple its own statement, so
+  the batch-local check never saw the pair. Comparing the conflict
+  target's key up front is enough: a partitioned table's unique
+  constraint must include every partition-key column, so two tuples
+  sharing a key always route to the same partition.
+
 ### Fixed — a partitioned table's index declaration was invisible, and a dump lost it
 
 SPG keeps a partitioned table's `CREATE INDEX` as a template every

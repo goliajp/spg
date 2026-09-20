@@ -5735,20 +5735,20 @@ impl Engine {
         stmt: InsertStatement,
     ) -> Result<QueryResult, EngineError> {
         use spg_storage::PartitionRole;
-        if stmt.on_conflict.is_some() {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "INSERT INTO partition parent {:?} … ON CONFLICT: not supported \
-                 at v7.37.6-B(route through the child explicitly)",
-                stmt.table
-            )));
-        }
-        if stmt.returning.is_some() {
-            return Err(EngineError::Unsupported(alloc::format!(
-                "INSERT INTO partition parent {:?} … RETURNING: not supported \
-                 at v7.37.6-B(route through the child explicitly)",
-                stmt.table
-            )));
-        }
+        // 9.0.0 — `RETURNING` and `ON CONFLICT` used to be refused here
+        // ("route through the child explicitly"), which asks the caller
+        // to know which partition a row lands in — the one thing
+        // routing exists to answer. PostgreSQL 18.6 takes both.
+        //
+        // They change HOW the rows are routed, not whether: measured,
+        // PG returns the RETURNING rows in the statement's ORIGINAL
+        // tuple order, interleaved across partitions, and `ON CONFLICT
+        // DO NOTHING` returns no row for a tuple it skipped. Bucketing
+        // by child loses both — the order and the per-tuple
+        // attribution — so those two run a tuple at a time, in order.
+        // Everything else keeps the bucketed path, which is one
+        // statement per child rather than one per row.
+        let per_row = stmt.returning.is_some() || stmt.on_conflict.is_some();
         // Pull what we need from the parent + child catalog state
         // before any mutating call(per-child exec_insert below
         // takes &mut self).
@@ -5806,6 +5806,59 @@ impl Engine {
                     })?
             }
         };
+        // 9.0.0 — `ON CONFLICT DO UPDATE` refuses two tuples that would
+        // affect the same row, and the per-row routing above would
+        // otherwise turn the second into a legitimate update: each row
+        // becomes its own statement, so the batch-local check the
+        // single-table path runs never sees the pair.
+        //
+        // Measured on PostgreSQL 18.6, and SPG's own single-table path
+        // already answers it: `ON CONFLICT DO UPDATE command cannot
+        // affect row a second time`.
+        //
+        // Comparing the TARGET's key is enough: a partitioned table's
+        // unique constraint must include every partition-key column
+        // (PG refuses one that does not, and so does SPG since 9.0.0),
+        // so two tuples sharing a key always route to one partition.
+        if let Some(clause) = &stmt.on_conflict
+            && matches!(clause.action, spg_sql::ast::OnConflictAction::Update { .. })
+            && !clause.target.is_empty()
+        {
+            let positions: Option<Vec<usize>> = clause
+                .target
+                .iter()
+                .map(|e| match &e.expr {
+                    Expr::Column(c) if c.qualifier.is_none() => match &stmt.columns {
+                        None => parent_columns
+                            .iter()
+                            .position(|col| col.name.eq_ignore_ascii_case(&c.name)),
+                        Some(list) => list.iter().position(|n| n.eq_ignore_ascii_case(&c.name)),
+                    },
+                    _ => None,
+                })
+                .collect();
+            if let Some(positions) = positions {
+                let mut seen: Vec<Vec<Value<'static>>> = Vec::new();
+                for tuple in &stmt.rows {
+                    let key: Option<Vec<Value<'static>>> = positions
+                        .iter()
+                        .map(|p| {
+                            tuple
+                                .get(*p)
+                                .cloned()
+                                .and_then(|e| literal_expr_to_value(e).ok())
+                        })
+                        .collect();
+                    let Some(key) = key else { continue };
+                    if seen.contains(&key) {
+                        return Err(EngineError::Unsupported(alloc::string::String::from(
+                            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                        )));
+                    }
+                    seen.push(key);
+                }
+            }
+        }
         // Snapshot every child(name, role)so the per-row routing
         // loop only touches an immutable view of the catalog.
         let children = crate::partition::children_of_parent(self.active_catalog(), &parent_name);
@@ -5846,6 +5899,8 @@ impl Engine {
         // tuple the user actually wrote.
         let mut buckets: alloc::collections::BTreeMap<String, Vec<Vec<Expr>>> =
             alloc::collections::BTreeMap::new();
+        // The per-row path keeps the statement's own tuple order.
+        let mut ordered: Vec<(String, Vec<Vec<Expr>>)> = Vec::new();
         for tuple in stmt.rows {
             if tuple.len() <= tuple_key_index {
                 return Err(EngineError::Unsupported(alloc::format!(
@@ -5920,10 +5975,21 @@ impl Engine {
                         })?
                 }
             };
-            buckets.entry(target).or_default().push(tuple);
+            if per_row {
+                ordered.push((target, alloc::vec![tuple]));
+            } else {
+                buckets.entry(target).or_default().push(tuple);
+            }
         }
         let mut total_affected: usize = 0;
-        for (child_name, rows) in buckets {
+        let mut returned_rows: Vec<spg_storage::Row<'static>> = Vec::new();
+        let mut returned_columns: Option<Vec<spg_storage::ColumnSchema>> = None;
+        let batches: Vec<(String, Vec<Vec<Expr>>)> = if per_row {
+            ordered
+        } else {
+            buckets.into_iter().collect()
+        };
+        for (child_name, rows) in batches {
             let child_stmt = InsertStatement {
                 ctes: Vec::new(),
                 table: child_name,
@@ -5931,16 +5997,26 @@ impl Engine {
                 columns: stmt.columns.clone(),
                 rows,
                 select_source: None,
-                on_conflict: None,
-                returning: None,
+                on_conflict: stmt.on_conflict.clone(),
+                returning: stmt.returning.clone(),
                 overriding: stmt.overriding,
                 // Routing a row to its partition keeps the statement's IGNORE.
                 mysql_ignore: stmt.mysql_ignore,
             };
-            let result = self.exec_insert(child_stmt)?;
-            if let QueryResult::CommandOk { affected, .. } = result {
-                total_affected += affected;
+            match self.exec_insert(child_stmt)? {
+                QueryResult::CommandOk { affected, .. } => total_affected += affected,
+                QueryResult::Rows { columns, mut rows } => {
+                    total_affected += rows.len();
+                    returned_columns.get_or_insert(columns);
+                    returned_rows.append(&mut rows);
+                }
             }
+        }
+        if let Some(columns) = returned_columns {
+            return Ok(QueryResult::Rows {
+                columns,
+                rows: returned_rows,
+            });
         }
         Ok(QueryResult::CommandOk {
             affected: total_affected,
