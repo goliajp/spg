@@ -239,6 +239,26 @@ pub enum DataType {
     RegClass,
     RegType,
     RegProc,
+    /// 9.0.0 — four more types the catalogs announce and SPG had no name
+    /// for, so every one of their columns said `text`. All four are
+    /// RESULT types here: their cells are the text rendering PostgreSQL
+    /// would print, and only the declared type changes. What each still
+    /// owes is its own value shape, recorded rather than claimed.
+    ///
+    /// * `pg_node_tree` (oid 194) — a parsed expression, which
+    ///   PostgreSQL stores as its internal node tree and prints as text;
+    ///   SPG stores the SQL text it deparses from, so the rendering is
+    ///   already what a reader wants.
+    /// * `anyarray` (2277) — the pseudo-type `pg_statistic`'s value
+    ///   columns carry.
+    /// * `aclitem[]` (1034) and `"char"[]` (1002) — arrays of two types
+    ///   SPG has (`aclitem` has no DataType at all; `Char1` has no array
+    ///   form), which is why `CharArray` (`bpchar[]`, 1014) is NOT the
+    ///   one to use.
+    PgNodeTree,
+    AnyArray,
+    AclItemArray,
+    Char1Array,
     /// `INTERVAL` — calendar-aware span (months + microseconds). v2.11
     /// supports INTERVAL only as a runtime intermediate (literals,
     /// arithmetic results); on-disk encoding is rejected so this branch
@@ -562,6 +582,10 @@ impl fmt::Display for DataType {
             Self::RegClass => f.write_str("REGCLASS"),
             Self::RegType => f.write_str("REGTYPE"),
             Self::RegProc => f.write_str("REGPROC"),
+            Self::PgNodeTree => f.write_str("PG_NODE_TREE"),
+            Self::AnyArray => f.write_str("ANYARRAY"),
+            Self::AclItemArray => f.write_str("ACLITEM[]"),
+            Self::Char1Array => f.write_str("\"char\"[]"),
             Self::Xid8 => f.write_str("XID8"),
             Self::Oid => f.write_str("OID"),
             Self::OidArray => f.write_str("OID[]"),
@@ -3870,7 +3894,11 @@ pub(crate) fn multi_component_type_ok(ty: DataType) -> bool {
         | DataType::Cid
         | DataType::RegClass
         | DataType::RegType
-        | DataType::RegProc => false,
+        | DataType::RegProc
+        | DataType::PgNodeTree
+        | DataType::AnyArray
+        | DataType::AclItemArray
+        | DataType::Char1Array => false,
         // Integers, and everything whose storage IS an i64 with the
         // same order: dates, both timestamps, times, money, year.
         DataType::SmallInt

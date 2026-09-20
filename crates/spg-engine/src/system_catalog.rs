@@ -218,6 +218,28 @@ fn char1(s: &str) -> Value<'static> {
     Value::Char1(s.as_bytes().first().copied().unwrap_or(0))
 }
 
+/// 9.0.0 — `information_schema.columns.data_type` and `.attributes
+/// .data_type`, and only those two, report every array as the single
+/// word `ARRAY`; the element type is left to `udt_name`. Measured on
+/// PostgreSQL 18.6, `information_schema.domains.data_type` does NOT —
+/// a domain over `int[]` reads `integer[]` there — which is why this
+/// is a separate reader and not a change to `pg_data_type_text`.
+pub(crate) fn information_schema_data_type(ty: DataType) -> alloc::string::String {
+    if crate::conversions::array_element_type(ty).is_some() {
+        return alloc::string::String::from("ARRAY");
+    }
+    match ty {
+        // The two catalog vectors and the two catalog array types are
+        // arrays to PostgreSQL even though SPG models them as scalars:
+        // `pg_index.indkey` and `pg_class.relacl` both read `ARRAY`.
+        DataType::Int2Vector
+        | DataType::OidVector
+        | DataType::AclItemArray
+        | DataType::Char1Array => alloc::string::String::from("ARRAY"),
+        other => pg_data_type_text(other),
+    }
+}
+
 pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
     // Ranges report their concrete type name (`int4range`, `numrange`,
     // …); multiranges append `multirange` (`int4multirange`).
@@ -239,6 +261,10 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::RegClass => "regclass",
         DataType::RegType => "regtype",
         DataType::RegProc => "regproc",
+        DataType::PgNodeTree => "pg_node_tree",
+        DataType::AnyArray => "anyarray",
+        DataType::AclItemArray => "aclitem[]",
+        DataType::Char1Array => "\"char\"[]",
         DataType::SmallInt => "smallint",
         DataType::Float => "double precision",
         DataType::Real => "real",
@@ -278,42 +304,50 @@ pub(crate) fn pg_data_type_text(ty: DataType) -> alloc::string::String {
         DataType::Circle => "circle",
         DataType::TsVector => "tsvector",
         DataType::TsQuery => "tsquery",
-        // Every array type surfaces as PG's `ARRAY` pseudo-name in
-        // information_schema.columns.data_type.
-        DataType::TextArray
-        | DataType::IntArray
-        | DataType::BigIntArray
-        | DataType::SmallIntArray
-        | DataType::FloatArray
-        | DataType::NumericArray
-        | DataType::BoolArray
-        | DataType::DateArray
-        | DataType::TimestampArray
-        | DataType::TimestamptzArray
-        | DataType::IntervalArray
-        | DataType::UuidArray
-        | DataType::JsonArray
-        | DataType::JsonbArray
-        | DataType::BytesArray
-        | DataType::VarcharArray
-        | DataType::CharArray
-        | DataType::MoneyArray
-        // v7.40.0 — `oid[]` joins them, for the same reason: measured
-        // on PostgreSQL 18.6, every array column reads `ARRAY` here
-        // and its element type only through `format_type`.
-        | DataType::OidArray
-        // v7.40.0 — five more, same reason.
-        | DataType::RealArray
-        | DataType::TimeArray
-        | DataType::TimeTzArray
-        | DataType::InetArray
-        | DataType::XmlArray => "ARRAY",
+        // 9.0.0 — an array spells its element type. This table used to
+        // answer the single word `ARRAY` for every one of them, which is
+        // right for exactly two readers (`information_schema.columns`
+        // and `.attributes`, which now call `information_schema_data_type`)
+        // and wrong for the four others that share it: PostgreSQL 18.6,
+        // measured, says `operator does not exist: integer[] + integer`,
+        // and `pg_prepared_statements.parameter_types` for `PREPARE
+        // p(int[])` reads `{integer[],text}` — both read `ARRAY` here.
+        // `dump.rs` had to carry a second copy of this table to undo it.
+        DataType::TextArray => "text[]",
+        DataType::IntArray => "integer[]",
+        DataType::BigIntArray => "bigint[]",
+        DataType::SmallIntArray => "smallint[]",
+        DataType::FloatArray => "double precision[]",
+        DataType::NumericArray => "numeric[]",
+        DataType::BoolArray => "boolean[]",
+        DataType::DateArray => "date[]",
+        DataType::TimestampArray => "timestamp without time zone[]",
+        DataType::TimestamptzArray => "timestamp with time zone[]",
+        DataType::IntervalArray => "interval[]",
+        DataType::UuidArray => "uuid[]",
+        DataType::JsonArray => "json[]",
+        DataType::JsonbArray => "jsonb[]",
+        DataType::BytesArray => "bytea[]",
+        DataType::VarcharArray => "character varying[]",
+        DataType::CharArray => "character[]",
+        DataType::MoneyArray => "money[]",
+        DataType::OidArray => "oid[]",
+        DataType::RealArray => "real[]",
+        DataType::TimeArray => "time without time zone[]",
+        DataType::TimeTzArray => "time with time zone[]",
+        DataType::InetArray => "inet[]",
+        DataType::XmlArray => "xml[]",
         DataType::Vector { .. } => "USER-DEFINED",
         // v7.39.11 — PG's catalog vectors have names, and an error that
         // does not use them ("got USER-DEFINED") tells the reader
         // nothing about what they had.
         DataType::Int2Vector => "int2vector",
         DataType::OidVector => "oidvector",
+        // 9.0.0 — `oid` reached the catch-all below, so an `oid` column
+        // read `USER-DEFINED` in `information_schema.columns` and the
+        // error for `atttypid IN (194)` was `operator does not exist:
+        // USER-DEFINED = integer`.
+        DataType::Oid => "oid",
         // v7.39.13 — measured on PostgreSQL 18.6, `information_schema
         // .columns.data_type` for a `timetz` column is `time with time
         // zone`; this table answered `USER-DEFINED` while `pg_typeof`
@@ -965,7 +999,7 @@ fn info_column_row(
         Value::text(if mysql {
             mysql_data_type_text_of(col)
         } else {
-            pg_data_type_text(col.ty)
+            information_schema_data_type(col.ty)
         }),
         default_text,
         // v7.39 (round 248) — a declared varchar(n)/char(n) reports
@@ -2047,7 +2081,7 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("adrelid", DataType::Oid, false),
         ColumnSchema::new("adnum", DataType::SmallInt, false),
-        ColumnSchema::new("adbin", DataType::Text, false),
+        ColumnSchema::new("adbin", DataType::PgNodeTree, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
@@ -2102,8 +2136,8 @@ pub(crate) fn synth_pg_policy(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         ColumnSchema::new("polcmd", DataType::Char1, false),
         ColumnSchema::new("polpermissive", DataType::Bool, false),
         ColumnSchema::new("polroles", DataType::OidArray, false),
-        ColumnSchema::new("polqual", DataType::Text, true),
-        ColumnSchema::new("polwithcheck", DataType::Text, true),
+        ColumnSchema::new("polqual", DataType::PgNodeTree, true),
+        ColumnSchema::new("polwithcheck", DataType::PgNodeTree, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut table_oid: i64 = 16384;
@@ -2221,7 +2255,7 @@ pub(crate) fn synth_pg_largeobject_metadata(
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("lomowner", DataType::Oid, false),
-        ColumnSchema::new("lomacl", DataType::Text, true),
+        ColumnSchema::new("lomacl", DataType::AclItemArray, true),
     ];
     let rows: Vec<Row<'static>> = cat
         .large_objects()
@@ -2265,8 +2299,8 @@ pub(crate) fn synth_pg_statistic_ext(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<R
         // other two missing.
         ColumnSchema::new("stxkeys", DataType::Int2Vector, false),
         ColumnSchema::new("stxstattarget", DataType::SmallInt, true),
-        ColumnSchema::new("stxkind", DataType::Text, false),
-        ColumnSchema::new("stxexprs", DataType::Text, true),
+        ColumnSchema::new("stxkind", DataType::Char1Array, false),
+        ColumnSchema::new("stxexprs", DataType::PgNodeTree, true),
     ];
     // v7.39 (round 280) — one row per catalogued CREATE STATISTICS.
     // The view was shape-stable empty because the statement was
@@ -2336,16 +2370,16 @@ pub(crate) fn synth_pg_stats(
         ColumnSchema::new("null_frac", DataType::Real, false),
         ColumnSchema::new("avg_width", DataType::Int, false),
         ColumnSchema::new("n_distinct", DataType::Real, false),
-        ColumnSchema::new("most_common_vals", DataType::Text, true),
+        ColumnSchema::new("most_common_vals", DataType::AnyArray, true),
         ColumnSchema::new("most_common_freqs", DataType::RealArray, true),
-        ColumnSchema::new("histogram_bounds", DataType::Text, true),
+        ColumnSchema::new("histogram_bounds", DataType::AnyArray, true),
         ColumnSchema::new("correlation", DataType::Real, true),
-        ColumnSchema::new("most_common_elems", DataType::Text, true),
+        ColumnSchema::new("most_common_elems", DataType::AnyArray, true),
         ColumnSchema::new("most_common_elem_freqs", DataType::RealArray, true),
         ColumnSchema::new("elem_count_histogram", DataType::RealArray, true),
-        ColumnSchema::new("range_length_histogram", DataType::Text, true),
+        ColumnSchema::new("range_length_histogram", DataType::AnyArray, true),
         ColumnSchema::new("range_empty_frac", DataType::Real, true),
-        ColumnSchema::new("range_bounds_histogram", DataType::Text, true),
+        ColumnSchema::new("range_bounds_histogram", DataType::AnyArray, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for name in cat.visible_table_names() {
@@ -2932,7 +2966,7 @@ pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("spcname", DataType::Name, false),
         ColumnSchema::new("spcowner", DataType::Oid, false),
-        ColumnSchema::new("spcacl", DataType::Text, true),
+        ColumnSchema::new("spcacl", DataType::AclItemArray, true),
         ColumnSchema::new("spcoptions", DataType::TextArray, true),
     ];
     let rows = alloc::vec![
@@ -3548,7 +3582,7 @@ pub(crate) fn synth_information_schema_attributes(
                 Value::text(def.name.clone()),
                 Value::text(field_name.clone()),
                 Value::Int(ordinal),
-                Value::text(pg_data_type_text(*field_type)),
+                Value::text(information_schema_data_type(*field_type)),
                 Value::text("YES"),
             ]));
         }
@@ -4260,7 +4294,7 @@ fn pg_class_schema() -> Vec<ColumnSchema> {
         // owner's implicit privileges apply, and materialises the aclitem
         // array on the first GRANT. SPG now does the same for real (round 51
         // hard-coded the NULL, because GRANT was a no-op).
-        ColumnSchema::new("relacl", DataType::Text, true),
+        ColumnSchema::new("relacl", DataType::AclItemArray, true),
     ]
 }
 
@@ -4748,10 +4782,14 @@ fn splice_pg_class_v18_schema(schema: &mut Vec<ColumnSchema>) {
     // holding `{check_option=local}` LOOKS right when printed and
     // fails both.
     schema.push(ColumnSchema::new("reloptions", DataType::TextArray, true));
-    schema.push(ColumnSchema::new("relpartbound", DataType::Text, true));
+    schema.push(ColumnSchema::new(
+        "relpartbound",
+        DataType::PgNodeTree,
+        true,
+    ));
     schema.insert(
         PG_CLASS_RELISPARTITION + 1,
-        ColumnSchema::new("relminmxid", DataType::BigInt, false),
+        ColumnSchema::new("relminmxid", DataType::Xid, false),
     );
     schema.insert(
         PG_CLASS_RELISPARTITION + 1,
@@ -4910,7 +4948,7 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("attcollation", DataType::Oid, false),
         // v7.39 (read01 round 59) — column-level privileges. NULL until a
         // `GRANT SELECT (col)` lands; a column grant never touches relacl.
-        ColumnSchema::new("attacl", DataType::Text, true),
+        ColumnSchema::new("attacl", DataType::AclItemArray, true),
         // v7.39 (round 543) — PG18's tail. They land here rather than at
         // PG's positions because SPG's pg_attribute order already
         // differs from PG's (attstattarget sits fourth where PG keeps it
@@ -4919,7 +4957,7 @@ fn pg_attribute_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("atthasmissing", DataType::Bool, false),
         ColumnSchema::new("attoptions", DataType::TextArray, true),
         ColumnSchema::new("attfdwoptions", DataType::TextArray, true),
-        ColumnSchema::new("attmissingval", DataType::Text, true),
+        ColumnSchema::new("attmissingval", DataType::AnyArray, true),
     ]
 }
 
@@ -5246,6 +5284,14 @@ const PG_SCALAR_TYPES: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
     (28, "xid", 4, "b", "U", 0, 0),
     (29, "cid", 4, "b", "U", 0, 0),
     (5069, "xid8", 8, "b", "U", 0, 0),
+    // 9.0.0 — `pg_node_tree` is the type every catalog column that
+    // holds a stored expression is declared as (`pg_index.indexprs`,
+    // `pg_attrdef.adbin`, `pg_constraint.conbin`, `pg_policy.polqual`
+    // and nine more). Declaring them without listing the type left
+    // twelve `pg_attribute` rows naming a type `pg_type` did not
+    // carry — the same defect round 640 closed for `xid`. Measured
+    // off PG18: category Z (internal), no array type.
+    (194, "pg_node_tree", -1, "b", "Z", 0, 0),
     // v7.39.11 — PG's catalog vectors. `pg_index.indkey` and kin are
     // typed as these now, and a column whose `atttypid` names a type
     // `pg_type` does not carry is exactly the defect round 640
@@ -5415,6 +5461,10 @@ pub(crate) fn pg_type_oid(ty: DataType) -> i64 {
         DataType::RegClass => 2205,
         DataType::RegType => 2206,
         DataType::RegProc => 24,
+        DataType::PgNodeTree => 194,
+        DataType::AnyArray => 2277,
+        DataType::AclItemArray => 1034,
+        DataType::Char1Array => 1002,
         // 9.0.0 — PG's internal single-byte type. Without it every
         // catalog column declared `"char"` reported atttypid 0, so 28
         // pg_attribute rows pointed at no pg_type row at all.
@@ -5972,9 +6022,9 @@ pub(crate) fn synth_pg_type(
         ColumnSchema::new("typndims", DataType::Int, false),
         ColumnSchema::new("typcollation", DataType::Oid, false),
         // PG's last three; `pg_dump` selects typacl by name.
-        ColumnSchema::new("typdefaultbin", DataType::Text, true),
+        ColumnSchema::new("typdefaultbin", DataType::PgNodeTree, true),
         ColumnSchema::new("typdefault", DataType::Text, true),
-        ColumnSchema::new("typacl", DataType::Text, true),
+        ColumnSchema::new("typacl", DataType::AclItemArray, true),
     ];
     let scalars = PG_SCALAR_TYPES;
     // Array companion types share the typelem / typcategory='A'.
@@ -6282,7 +6332,7 @@ pub(crate) fn synth_pg_trigger(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("tgnargs", DataType::SmallInt, false),
         ColumnSchema::new("tgattr", DataType::Int2Vector, true),
         ColumnSchema::new("tgargs", DataType::Bytes, true),
-        ColumnSchema::new("tgqual", DataType::Text, true),
+        ColumnSchema::new("tgqual", DataType::PgNodeTree, true),
         ColumnSchema::new("tgoldtable", DataType::Name, true),
         ColumnSchema::new("tgnewtable", DataType::Name, true),
     ];
@@ -6376,20 +6426,20 @@ pub(crate) fn synth_pg_proc(
         // v7.39.11 — PG's own type; see the row builder below.
         ColumnSchema::new("proargtypes", DataType::OidVector, false),
         ColumnSchema::new("proallargtypes", DataType::OidArray, true),
-        ColumnSchema::new("proargmodes", DataType::Text, true),
+        ColumnSchema::new("proargmodes", DataType::Char1Array, true),
         // The one of these five SPG really has: CREATE FUNCTION names
         // its parameters, and every client that offers named-argument
         // calls reads them from here.
         ColumnSchema::new("proargnames", DataType::TextArray, true),
-        ColumnSchema::new("proargdefaults", DataType::Text, true),
+        ColumnSchema::new("proargdefaults", DataType::PgNodeTree, true),
         ColumnSchema::new("protrftypes", DataType::OidArray, true),
         ColumnSchema::new("prosrc", DataType::Text, false),
         ColumnSchema::new("probin", DataType::Text, true),
-        ColumnSchema::new("prosqlbody", DataType::Text, true),
+        ColumnSchema::new("prosqlbody", DataType::PgNodeTree, true),
         ColumnSchema::new("proconfig", DataType::TextArray, true),
         // v7.39 (read01 round 61) — the function ACL. NULL means PG's default:
         // PUBLIC may EXECUTE.
-        ColumnSchema::new("proacl", DataType::Text, true),
+        ColumnSchema::new("proacl", DataType::AclItemArray, true),
     ];
     let funcs: &[(i64, &str, &str, i32, i64)] = PG_PROC_FUNCS;
     let mut rows: Vec<Row<'static>> = Vec::with_capacity(funcs.len());
@@ -8337,7 +8387,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         // Measured on PG18: non-NULL for contype 'c', NULL for every
         // other kind. SPG keeps the written expression, the same choice
         // pg_attrdef.adbin already makes here.
-        ColumnSchema::new("conbin", DataType::Text, true),
+        ColumnSchema::new("conbin", DataType::PgNodeTree, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let constraint_index: alloc::collections::BTreeMap<(String, usize), i64> = catalog_indexes(cat)
@@ -11913,8 +11963,8 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         // both non-NULL for `ON t ((a+1)) WHERE b <> ''`. SPG keeps the
         // written text rather than PG's node tree, which is the same
         // choice pg_attrdef.adbin already makes here.
-        ColumnSchema::new("indexprs", DataType::Text, true),
-        ColumnSchema::new("indpred", DataType::Text, true),
+        ColumnSchema::new("indexprs", DataType::PgNodeTree, true),
+        ColumnSchema::new("indpred", DataType::PgNodeTree, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut idx_oid: i64 = 100_000;
@@ -12078,7 +12128,7 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
         ColumnSchema::new("nspowner", DataType::Oid, false),
         // v7.39 (read01 round 60) — the schema ACL. Never NULL for `public`:
         // PG ships it with PUBLIC holding USAGE (but NOT create).
-        ColumnSchema::new("nspacl", DataType::Text, true),
+        ColumnSchema::new("nspacl", DataType::AclItemArray, true),
     ];
     let public_acl = crate::acl::render_nspacl(cat);
     // v7.38.14 — every session that owns a temporary relation also owns a

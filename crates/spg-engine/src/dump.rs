@@ -160,12 +160,17 @@ impl Engine {
 }
 
 /// A column type as re-parseable DDL. `pg_data_type_text` is the
-/// canonical name (information_schema's own renderer); the length /
-/// precision parameters it reports separately are re-attached here,
-/// because a dump that silently widens `varchar(9)` to `varchar`
-/// changes what the restored table accepts. The bare `DataType`
-/// Display was tried first and printed `NUMERIC(0)` for an
-/// unconstrained NUMERIC — not SQL.
+/// canonical name; the length / precision parameters it reports
+/// separately are re-attached here, because a dump that silently
+/// widens `varchar(9)` to `varchar` changes what the restored table
+/// accepts. The bare `DataType` Display was tried first and printed
+/// `NUMERIC(0)` for an unconstrained NUMERIC — not SQL.
+///
+/// 9.0.0 — a second copy of the array table used to live here, to undo
+/// `pg_data_type_text` answering the single word `ARRAY` for every
+/// array. That table now spells the element type and the `ARRAY`
+/// convention belongs to its two `information_schema` readers, so the
+/// copy is gone.
 fn ddl_type(ty: spg_storage::DataType) -> String {
     use spg_storage::DataType as T;
     match ty {
@@ -174,33 +179,6 @@ fn ddl_type(ty: spg_storage::DataType) -> String {
         T::Numeric { precision, scale } if precision > 0 => {
             format!("numeric({precision},{scale})")
         }
-        // information_schema reports every array as the single word
-        // ARRAY (element in udt_name) — right for that catalog, not
-        // SQL. Spell the element.
-        T::TextArray => "text[]".into(),
-        T::IntArray => "integer[]".into(),
-        T::BigIntArray => "bigint[]".into(),
-        T::SmallIntArray => "smallint[]".into(),
-        T::FloatArray => "double precision[]".into(),
-        T::BoolArray => "boolean[]".into(),
-        T::NumericArray => "numeric[]".into(),
-        T::DateArray => "date[]".into(),
-        T::TimestampArray => "timestamp without time zone[]".into(),
-        T::TimestamptzArray => "timestamp with time zone[]".into(),
-        T::RealArray => "real[]".into(),
-        T::TimeArray => "time without time zone[]".into(),
-        T::TimeTzArray => "time with time zone[]".into(),
-        T::InetArray => "inet[]".into(),
-        T::XmlArray => "xml[]".into(),
-        T::UuidArray => "uuid[]".into(),
-        T::JsonArray => "json[]".into(),
-        T::JsonbArray => "jsonb[]".into(),
-        T::BytesArray => "bytea[]".into(),
-        T::VarcharArray => "varchar[]".into(),
-        T::CharArray => "char[]".into(),
-        T::IntervalArray => "interval[]".into(),
-        T::OidArray => "oid[]".into(),
-        T::MoneyArray => "money[]".into(),
         other => crate::system_catalog::pg_data_type_text(other),
     }
 }

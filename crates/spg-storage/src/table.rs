@@ -4570,7 +4570,30 @@ fn column_accepts(actual: DataType, declared: DataType) -> bool {
                 | DataType::Name
                 | DataType::Json
                 | DataType::Jsonb
-        ) | (DataType::Name, DataType::Text)
+        )
+            // 9.0.0 — four types the catalogs announce whose CELL is the
+            // text rendering PostgreSQL prints: `pg_node_tree` (a parsed
+            // expression), `anyarray`, `aclitem[]` and `"char"[]`. Only
+            // the declaration is theirs; the value shape they still owe
+            // is recorded, not claimed.
+            | (
+                DataType::Text,
+                DataType::PgNodeTree
+                    | DataType::AnyArray
+                    | DataType::AclItemArray
+                    | DataType::Char1Array
+            )
+            // Both directions: a projection of one of these columns
+            // builds a temp whose schema carries the declared type while
+            // the cells are the text they always were.
+            | (
+                DataType::PgNodeTree
+                    | DataType::AnyArray
+                    | DataType::AclItemArray
+                    | DataType::Char1Array,
+                DataType::Text
+            )
+            | (DataType::Name, DataType::Text)
             // An XID column stores the Value::BigInt a transaction id
             // has always been; xid8 has no value of its own at all.
             | (DataType::BigInt, DataType::Xid | DataType::Xid8)

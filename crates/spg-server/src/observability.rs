@@ -599,7 +599,11 @@ fn approx_row_bytes(schema: &TableSchema) -> u64 {
                 | DataType::Cid
                 | DataType::RegClass
                 | DataType::RegType
-                | DataType::RegProc => 0,
+                | DataType::RegProc
+                | DataType::PgNodeTree
+                | DataType::AnyArray
+                | DataType::AclItemArray
+                | DataType::Char1Array => 0,
                 DataType::SmallInt => 2,
                 DataType::Int => 4,
                 DataType::Real => 4,

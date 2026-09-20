@@ -22,36 +22,12 @@
 #   * a comparison over a handful of columns — a floor on the overlap.
 import subprocess, sys, os, collections
 
-RECORDED = {
-    "pg_attrdef.adbin",
-    "pg_attribute.attacl",
-    "pg_attribute.attmissingval",
-    "pg_class.relacl",
-    "pg_class.relminmxid",
-    "pg_class.relpartbound",
-    "pg_constraint.conbin",
-    "pg_index.indexprs",
-    "pg_index.indpred",
-    "pg_largeobject_metadata.lomacl",
-    "pg_namespace.nspacl",
-    "pg_policy.polqual",
-    "pg_policy.polwithcheck",
-    "pg_proc.proacl",
-    "pg_proc.proargdefaults",
-    "pg_proc.proargmodes",
-    "pg_proc.prosqlbody",
-    "pg_statistic_ext.stxexprs",
-    "pg_statistic_ext.stxkind",
-    "pg_stats.histogram_bounds",
-    "pg_stats.most_common_elems",
-    "pg_stats.most_common_vals",
-    "pg_stats.range_bounds_histogram",
-    "pg_stats.range_length_histogram",
-    "pg_tablespace.spcacl",
-    "pg_trigger.tgqual",
-    "pg_type.typacl",
-    "pg_type.typdefaultbin",
-}
+# 9.0.0 — empty, and it stays empty: every one of the 365 shared
+# `pg_*` columns now announces the type PostgreSQL announces. An entry
+# here is a column whose divergence is known and accepted; the sweep
+# fails if one of them has since come to agree, so the set cannot rot
+# into a list of things that were fixed long ago.
+RECORDED: set[str] = set()
 
 TYPES = ("SELECT c.relname||'.'||a.attname||'='||format_type(a.atttypid,-1) "
          "FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid "
@@ -129,5 +105,9 @@ for k in common:
         print(f"NEW      {k:42s} SPG={spg[k]:22s} PG={pg[k]}")
 for (a, b), n in shape.most_common():
     print(f"recorded {n:4d}  SPG={a} PG={b}")
+stale = sorted(k for k in RECORDED if k in common and spg[k] == pg[k])
+if stale:
+    sys.exit("recorded columns that now agree - remove them:\n  "
+             + "\n  ".join(stale))
 print(f"columns={len(common)} recorded={len(RECORDED)} new={new}")
 sys.exit(1 if new else 0)

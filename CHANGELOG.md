@@ -10,6 +10,59 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — the last 27 catalog columns, and the three readers behind them
+
+`pg_node_tree` (12 columns — every stored expression a catalog holds:
+`pg_index.indexprs` / `indpred`, `pg_attrdef.adbin`,
+`pg_constraint.conbin`, `pg_policy.polqual` / `polwithcheck`,
+`pg_class.relpartbound`, `pg_trigger.tgqual`, `pg_proc.proargdefaults` /
+`prosqlbody`, `pg_statistic_ext.stxexprs`, `pg_type.typdefaultbin`),
+`aclitem[]` (7), `anyarray` (6) and `"char"[]` (2, the two the previous
+entry recorded) announced `text`. Each cell keeps the text rendering
+PostgreSQL prints; only the declaration was missing, and a driver that
+decodes by the announced type was told the wrong thing. **The 365-column
+sweep is at 0 divergences**, and the recorded set is empty — the sweep
+now fails if an entry in it has since come to agree, so it cannot rot
+into a list of things that were fixed long ago.
+
+Declaring them surfaced three defects that had never been reached:
+
+* `coalesce(relacl, 'NULL')` — how a query reads an ACL without a NULL
+  — resolves to the column's declared type and coerces the other branch
+  into it. The coercion table did not know the type, so the query
+  failed outright.
+* Twelve `pg_attribute` rows named a type `pg_type` did not carry
+  (`pg_node_tree`, oid 194), the same defect round 640 closed for `xid`.
+* `oid` reached the type-name table's catch-all, so an `oid` column read
+  `USER-DEFINED` in `information_schema.columns` and `WHERE atttypid IN
+  (194)` was refused as `operator does not exist: USER-DEFINED =
+  integer` on the plan shapes where the column's type is known — while
+  the identical `atttypid = 194` answered. Measured on PostgreSQL 18.6,
+  `oid` compares against `smallint` / `integer` / `bigint` and against
+  `regclass` / `regtype` / `regproc`, and against nothing else
+  (`1::oid = 1::numeric` and `1::oid = 1::real` are both refused there),
+  so it is a pair rule: the relation is not transitive and no type
+  category can express it.
+
+### Fixed — `ARRAY` is `information_schema`'s word, not every reader's
+
+`pg_data_type_text` answered the single word `ARRAY` for every array
+type. That is right for exactly two readers — `information_schema
+.columns.data_type` and `.attributes.data_type` — and wrong for the four
+others that shared it. `dump.rs` carried a second copy of the array
+table to undo it; `information_schema.domains.data_type` reads
+`integer[]` on PostgreSQL 18.6 for a domain over `int[]`, not `ARRAY`;
+and `pg_prepared_statements.parameter_types` read `{ARRAY,text}` where
+PostgreSQL reads `{integer[],text}`. The name table spells the element
+type now, the `ARRAY` convention lives in its own reader, and the
+duplicate table in `dump.rs` is gone.
+
+`PREPARE p(int[])` also read `{int[]}` rather than `{integer[]}`: the
+type-name table is keyed on the `_array` suffix the parser canonicalises
+postfix `[]` into, and `pg_prepared_statements` is the one reader that
+hands it a name the parser never rewrote, so the name failed to resolve
+and passed through as written.
+
 ### Fixed — 18 more catalog columns: the array and vector types
 
 `oid[]` (8: `pg_constraint`'s four operator arrays, `pg_extension
