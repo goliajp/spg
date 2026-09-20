@@ -14773,7 +14773,11 @@ impl Parser {
         let where_ = if matches!(self.peek(), Token::Where) {
             self.advance();
             where_token = SrcToken::at(self.pos);
-            Some(self.parse_expr(0)?)
+            let w = self.parse_expr(0)?;
+            // 9.0.0 — `SELECT 1 WHERE INTERVAL 1 DAY` is errno 1064 on
+            // MySQL 9.7.2, the same as the bare select item.
+            self.reject_bare_interval_in_mysql(&w)?;
+            Some(w)
         } else {
             None
         };
@@ -19945,6 +19949,18 @@ impl Parser {
         }
     }
 
+    /// 9.0.0 — refuse a bare interval literal where MySQL refuses one.
+    /// A no-op in the PostgreSQL dialect, where `SELECT INTERVAL '1 day'`
+    /// is an ordinary value.
+    fn reject_bare_interval_in_mysql(&self, e: &Expr) -> Result<(), ParseError> {
+        if !self.mysql_dialect || !matches!(e, Expr::Literal(Literal::Interval { .. })) {
+            return Ok(());
+        }
+        Err(self.err(alloc::string::String::from(
+            "INTERVAL is only allowed as an operand of + or - or as a function argument",
+        )))
+    }
+
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
         if matches!(self.peek(), Token::Star) {
             self.advance();
@@ -20013,6 +20029,15 @@ impl Parser {
             Some(a) => Some(a),
             None => self.mysql_item_label(&expr, start_tok, end_tok),
         };
+        // 9.0.0 — MySQL's `INTERVAL n UNIT` is a *simple_expr*, legal only
+        // as an operand of `+` / `-` or as a function argument. Measured on
+        // 9.7.2: `SELECT NOW() + INTERVAL 1 DAY`,
+        // `SELECT INTERVAL 1 DAY + NOW()` and
+        // `DATE_ADD(NOW(), INTERVAL 1 DAY)` all answer, while
+        // `SELECT INTERVAL 1 DAY` and `SELECT (INTERVAL 1 DAY)` are errno
+        // 1064. SPG answered `1 day`. Parentheses do not survive into the
+        // tree, so both spellings arrive here as the bare literal.
+        self.reject_bare_interval_in_mysql(&expr)?;
         Ok(SelectItem::Expr { expr, alias })
     }
 

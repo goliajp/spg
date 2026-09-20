@@ -594,6 +594,7 @@ mod e2e_mysql_insert_set_round428;
 mod e2e_mysql_int_range_round387;
 mod e2e_mysql_int_temporal_round414;
 mod e2e_mysql_int_width_round386;
+mod e2e_mysql_interval_and_fsp_900;
 mod e2e_mysql_interval_expr_round422;
 mod e2e_mysql_interval_fn_round409;
 mod e2e_mysql_introducer_v7392;
