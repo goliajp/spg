@@ -3423,7 +3423,11 @@ impl Engine {
                 name,
                 if_not_exists,
             } => self.exec_create_schema(name, if_not_exists),
-            Statement::DropSchema { names, if_exists } => self.exec_drop_schema(&names, if_exists),
+            Statement::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => self.exec_drop_schema(&names, if_exists, cascade),
             Statement::ResetParameter(target) => {
                 match target {
                     // v7.39 (round 320, V53) — RESET ALL resets GUCs. It

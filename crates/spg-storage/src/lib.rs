@@ -5589,6 +5589,14 @@ pub struct Catalog {
     temp_prefix: Option<String>,
     /// v7.39.2 — see [`Catalog::set_case_insensitive_names`].
     case_insensitive_names: bool,
+    /// 9.0.0 (C9) — the calling session's `search_path`, the schemas an
+    /// UNQUALIFIED relation name is looked for in, in order. Empty means
+    /// `public` alone, which is what a session that never set one has.
+    ///
+    /// Process-local and never serialised, installed per session the way
+    /// `temp_prefix` is, and for the same reason: one catalog serves every
+    /// connection while the search path is the session's own.
+    search_path: Vec<String>,
     /// v7.39 (round 496) — the names of tables this catalog handle has had
     /// changed since the set was last cleared.
     ///
@@ -6430,6 +6438,7 @@ impl Catalog {
             },
             tables: Vec::new(),
             by_name: BTreeMap::new(),
+            search_path: Vec::new(),
             temp_prefix: None,
             case_insensitive_names: false,
             dirty_tables: alloc::collections::BTreeSet::new(),
@@ -7828,6 +7837,20 @@ impl Catalog {
                 return Some(idx);
             }
         }
+        // 9.0.0 (C9) — a name that already carries its schema names ONE
+        // relation; nothing else may answer for it. `sa.t` is not `t`.
+        if spg_sql::namespace::is_qualified(name) {
+            return self.by_name.get(name).copied();
+        }
+        // …and an unqualified one is looked for along the search path,
+        // which is PostgreSQL's rule. The `public` entry is the bare key,
+        // so a session that never set a path resolves exactly as before.
+        for schema in &self.search_path {
+            let key = spg_sql::namespace::qualified_key(schema, name);
+            if let Some(idx) = self.by_name.get(&key) {
+                return Some(*idx);
+            }
+        }
         if let Some(idx) = self.by_name.get(name) {
             return Some(*idx);
         }
@@ -8496,6 +8519,17 @@ impl Catalog {
             }
             None => name.into(),
         };
+        // 9.0.0 (C9) — and through the search path, for the same reason:
+        // `DROP TABLE t` under `search_path = c9a` drops `c9a.t`, which
+        // is the one `SELECT … FROM t` was reading.
+        let key = if self.by_name.contains_key(&key) {
+            key
+        } else {
+            match self.resolve_index(&key) {
+                Some(idx) => self.tables[idx].schema.name.clone(),
+                None => key,
+            }
+        };
         let Some(idx) = self.by_name.remove(&key) else {
             return false;
         };
@@ -8642,21 +8676,57 @@ impl Catalog {
     /// Round 436 stored temp tables under a prefix without teaching the
     /// listings about it, so the mangled names leaked to every client.
     #[must_use]
+    /// 9.0.0 (C9) — a relation outside `public` is listed under its BARE
+    /// name; the schema it belongs to is [`Catalog::listed_schema`], which
+    /// is the column a listing puts it in (`pg_class.relnamespace`,
+    /// `information_schema.tables.table_schema`, `pg_tables.schemaname`).
     pub fn listed_name<'a>(&self, stored: &'a str) -> Option<&'a str> {
-        if !stored.starts_with(Self::TEMP_NAME_MARKER) {
-            return Some(stored);
+        let bare = spg_sql::namespace::bare_of(stored);
+        if !bare.starts_with(Self::TEMP_NAME_MARKER) {
+            return Some(bare);
         }
         let prefix = self.temp_prefix.as_ref()?;
-        stored.strip_prefix(prefix.as_str())
+        bare.strip_prefix(prefix.as_str())
     }
 
-    /// The listing names of every table this session may see, in catalog
-    /// order. See [`Catalog::listed_name`].
+    /// 9.0.0 (C9) — the schema a stored key belongs to: `public` unless
+    /// the key carries another one.
     #[must_use]
-    pub fn visible_table_names(&self) -> Vec<String> {
+    pub fn listed_schema<'a>(&self, stored: &'a str) -> &'a str {
+        spg_sql::namespace::schema_of(stored)
+    }
+
+    /// 9.0.0 (C9) — install the calling session's `search_path`. Same
+    /// shape as [`Catalog::set_temp_prefix`] and for the same reason: one
+    /// catalog serves every connection, so a per-session answer has to be
+    /// re-installed on each switch. An empty path means `public` alone.
+    pub fn set_search_path(&mut self, path: Vec<String>) {
+        self.search_path = path;
+    }
+
+    /// The schemas an unqualified name is looked for in, in order.
+    #[must_use]
+    pub fn search_path(&self) -> &[String] {
+        &self.search_path
+    }
+
+    /// The stored KEY of every relation this session may see, in catalog
+    /// order.
+    ///
+    /// 9.0.0 (C9) — this used to answer the listing NAMES, which stopped
+    /// being enough the moment a relation could live outside `public`:
+    /// two schemas may hold a `t`, so the name alone neither identifies
+    /// the relation for [`Catalog::get`] nor tells a listing which
+    /// schema column to put it in. Callers take the key and ask
+    /// [`Catalog::listed_name`] / [`Catalog::listed_schema`] for the two
+    /// halves they display. The rename is deliberate: every caller had
+    /// to be looked at.
+    #[must_use]
+    pub fn visible_relation_keys(&self) -> Vec<String> {
         self.tables
             .iter()
-            .filter_map(|t| self.listed_name(&t.schema.name).map(String::from))
+            .filter(|t| self.listed_name(&t.schema.name).is_some())
+            .map(|t| t.schema.name.clone())
             .collect()
     }
 
@@ -9804,7 +9874,14 @@ impl fmt::Display for StorageError {
             // (42P01). DROP TABLE says "table" and raises its own error at
             // the engine; every other path (SELECT / ALTER / …) says
             // "relation", which is what this carries.
-            Self::TableNotFound { name } => write!(f, "relation \"{name}\" does not exist"),
+            // 9.0.0 (C9) — a key carries its schema, and the sentence
+            // writes it the way PostgreSQL writes it: `sa.t`, not the
+            // separator the key holds it with.
+            Self::TableNotFound { name } => write!(
+                f,
+                "relation \"{}\" does not exist",
+                spg_sql::namespace::display_key(name)
+            ),
             Self::ArityMismatch { expected, actual } => write!(
                 f,
                 "row arity mismatch: expected {expected} columns, got {actual}"
@@ -10303,7 +10380,13 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// rather than trusted, because extraction changed (non-ASCII text now
 /// yields trigrams, and an apostrophe now separates words) and a map
 /// built the old way answers the new lookups with nothing.
-const FILE_VERSION: u8 = 104;
+/// 9.0.0 (C9) — v105 says a relation in this image may live in a schema
+/// other than `public`: its key carries the schema, and a v104 binary
+/// would read that key as the relation's NAME. Nothing new is written —
+/// a database whose relations are all in `public` is byte-identical —
+/// but the version has to move so an older binary refuses the image by
+/// its version rather than by misreading a name.
+const FILE_VERSION: u8 = 105;
 
 /// 8.0.3 — the byte a [`NonTableKind`] is written as.
 const fn non_table_kind_tag(kind: NonTableKind) -> u8 {

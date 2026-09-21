@@ -14,6 +14,7 @@ pub mod ast;
 pub mod catalog_registry;
 pub mod charset;
 pub mod lexer;
+pub mod namespace;
 pub mod parser;
 
 /// v7.12.4 — convenience re-export of the PL/pgSQL body parser.

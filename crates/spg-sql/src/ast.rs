@@ -1045,9 +1045,13 @@ pub enum Statement {
     /// [, name…] [CASCADE | RESTRICT]`. Removes the schema
     /// from the registry; built-in `public` / `pg_catalog` /
     /// `information_schema` cannot be dropped.
+    /// 9.0.0 (C9) — `cascade` is load-bearing now that a schema owns
+    /// relations: without it PostgreSQL refuses to drop a schema that
+    /// still has any, and with it the schema's objects go too.
     DropSchema {
         names: Vec<String>,
         if_exists: bool,
+        cascade: bool,
     },
 }
 
@@ -1470,6 +1474,11 @@ pub enum AlterTableTarget {
     /// Per-table hot-tier byte budget override. The freezer
     /// reads this before falling back to `SPG_HOT_TIER_BYTES`.
     SetHotTierBytes(u64),
+    /// 9.0.0 (C9) — `ALTER TABLE t SET SCHEMA s`, which MOVES the
+    /// relation. Consumed and ignored since v7.37.18, on the reasoning
+    /// that SPG had one schema; now that a relation belongs to one, the
+    /// no-op was a statement reporting success while nothing moved.
+    SetSchema(String),
     /// v7.6.8 — `ALTER TABLE t ADD CONSTRAINT name FOREIGN KEY
     /// (cols) REFERENCES parent[(pcols)] [ON DELETE/UPDATE …]`.
     /// Engine validates existing rows against the new constraint
@@ -7481,7 +7490,11 @@ impl fmt::Display for Statement {
                 }
                 write!(f, "{}", quote_ident(name))
             }
-            Self::DropSchema { names, if_exists } => {
+            Self::DropSchema {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 f.write_str("DROP SCHEMA ")?;
                 if *if_exists {
                     f.write_str("IF EXISTS ")?;
@@ -7491,6 +7504,9 @@ impl fmt::Display for Statement {
                         f.write_str(", ")?;
                     }
                     write!(f, "{}", quote_ident(n))?;
+                }
+                if *cascade {
+                    f.write_str(" CASCADE")?;
                 }
                 Ok(())
             }
@@ -8300,6 +8316,7 @@ fn fmt_alter_target(f: &mut fmt::Formatter<'_>, t: &AlterTableTarget) -> fmt::Re
         AlterTableTarget::SetHotTierBytes(n) => {
             write!(f, "SET hot_tier_bytes = {n}")
         }
+        AlterTableTarget::SetSchema(s) => write!(f, "SET SCHEMA {}", quote_ident(s)),
         AlterTableTarget::AddForeignKey(fk) => write!(f, "ADD {fk}"),
         AlterTableTarget::DropForeignKey { name, if_exists } => {
             f.write_str("DROP CONSTRAINT ")?;

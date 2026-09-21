@@ -2868,6 +2868,7 @@ impl Engine {
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
         self.refresh_temp_prefix();
+        self.refresh_search_path();
         self.plan_cache.clear();
     }
 
@@ -2964,6 +2965,45 @@ impl Engine {
         self.catalog.set_temp_prefix(prefix.clone());
         for shadow in self.tx_catalogs.values_mut() {
             shadow.catalog.set_temp_prefix(prefix.clone());
+        }
+    }
+
+    /// 9.0.0 (C9) — install this session's `search_path` into every
+    /// catalog it can reach, the way [`Engine::refresh_temp_prefix`]
+    /// installs its temp namespace and for the same reason: one catalog
+    /// serves every connection while the path is the session's own.
+    ///
+    /// The GUC's spelling is PostgreSQL's — a comma-separated list whose
+    /// entries may be quoted, where `$user` is the session user and
+    /// `pg_temp` / `pg_catalog` are resolved before it by their own
+    /// rules. What the catalog needs is the ordered list of schemas an
+    /// unqualified name is looked for in.
+    pub(crate) fn refresh_search_path(&mut self) {
+        let raw = self
+            .session_param("search_path")
+            .map_or_else(|| String::from("\"$user\", public"), String::from);
+        let user = String::from(self.session_user());
+        let mut path: Vec<String> = Vec::new();
+        for entry in raw.split(',') {
+            let e = entry.trim().trim_matches('"');
+            if e.is_empty()
+                || e.eq_ignore_ascii_case("pg_temp")
+                || e.eq_ignore_ascii_case("pg_catalog")
+            {
+                continue;
+            }
+            let name = if e == "$user" {
+                user.clone()
+            } else {
+                String::from(e)
+            };
+            if !path.contains(&name) {
+                path.push(name);
+            }
+        }
+        self.catalog.set_search_path(path.clone());
+        for shadow in self.tx_catalogs.values_mut() {
+            shadow.catalog.set_search_path(path.clone());
         }
     }
 

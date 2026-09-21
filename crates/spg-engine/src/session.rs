@@ -261,6 +261,7 @@ impl Engine {
     /// answers NULL, which PG agrees with.
     pub(crate) fn clear_session_param(&mut self, name: &str) {
         let key = name.to_ascii_lowercase();
+        let is_search_path = key == "search_path";
         if key.contains('.') {
             self.session_params
                 .insert(key, alloc::string::String::new());
@@ -268,6 +269,9 @@ impl Engine {
             self.session_params.remove(&key);
         }
         self.refresh_render_style();
+        if is_search_path {
+            self.refresh_search_path();
+        }
     }
 
     /// v7.40.11 — `SET <name> = NULL`. Measured on MySQL 9.7.2, exactly
@@ -506,9 +510,16 @@ impl Engine {
             // accepted and never read.
             "datestyle" | "intervalstyle" | "extra_float_digits" | "bytea_output"
         );
+        // 9.0.0 (C9) — the path an unqualified relation name is looked
+        // for along lives in the catalog, which is shared; this is the
+        // one write that can change it.
+        let is_search_path = key == "search_path";
         self.session_params.insert(key, normalised);
         if is_render_guc {
             self.refresh_render_style();
+        }
+        if is_search_path {
+            self.refresh_search_path();
         }
     }
 
@@ -702,6 +713,7 @@ impl Engine {
         for (k, v) in keep {
             self.session_params.insert(k, v);
         }
+        self.refresh_search_path();
     }
 
     /// v7.39 (round 318, V41) — raise a PG-style WARNING. Same channel as

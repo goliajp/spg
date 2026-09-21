@@ -2051,6 +2051,58 @@ impl Parser {
         Ok(first)
     }
 
+    /// 9.0.0 (C9) — a RELATION name, which keeps its schema.
+    ///
+    /// [`Parser::expect_ident_like`] drops a leading `<qualifier>.` and
+    /// returns the trailing identifier alone. For a column, an alias or a
+    /// type that is right; for a relation it was the whole of C9 —
+    /// `CREATE TABLE sa.t` and `CREATE TABLE sb.t` made ONE table, and a
+    /// two-schema application read the other schema's rows.
+    ///
+    /// The qualifier is kept as part of the key (see
+    /// [`crate::namespace`]) except where it does not name a schema of
+    /// this database:
+    ///
+    ///   * `public` and the two catalog schemas — the relation's identity
+    ///     is its bare name, which is what keeps an existing catalog
+    ///     keyed as it was;
+    ///   * a MySQL session, where `db.tbl` names a DATABASE and SPG
+    ///     ignores that part exactly as it did before.
+    ///
+    /// A three-part `db.schema.rel` keeps the middle part, which is the
+    /// schema, and drops the database — the same rule one level up.
+    fn expect_relation_name(&mut self) -> Result<String, ParseError> {
+        let mut parts: alloc::vec::Vec<String> = alloc::vec![self.expect_one_ident()?];
+        while matches!(self.peek(), Token::Dot) {
+            self.advance();
+            parts.push(self.expect_one_ident()?);
+        }
+        let name = parts.pop().expect("at least one part");
+        let schema = parts.pop();
+        match schema {
+            None => Ok(name),
+            // MySQL's qualifier is a database, not a schema.
+            Some(_) if self.mysql_dialect => Ok(name),
+            Some(s) => Ok(crate::namespace::qualified_key(&s, &name)),
+        }
+    }
+
+    /// One identifier, keyword-or-not, with no qualifier handling. The
+    /// inner half of [`Parser::expect_ident_like`], so the two agree on
+    /// what an identifier is.
+    fn expect_one_ident(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => Ok(s),
+            other if unreserved_keyword_text(&other).is_some() => {
+                Ok(unreserved_keyword_text(&other).expect("checked just above"))
+            }
+            other => Err(ParseError {
+                message: format!("expected identifier, got {other:?}"),
+                token_pos: self.consumed_pos(),
+            }),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn parse_one_statement(&mut self) -> Result<Statement, ParseError> {
         // v7.14.0 — empty / comment-only / semicolon-only input
@@ -2551,7 +2603,7 @@ impl Parser {
                 ) =>
             {
                 self.advance();
-                let table = self.expect_ident_like()?;
+                let table = self.expect_relation_name()?;
                 Ok(Statement::ShowColumns(table))
             }
             // `COPY table [(cols)] TO STDOUT` — the export half of
@@ -2566,7 +2618,7 @@ impl Parser {
                     ) =>
             {
                 self.advance(); // COPY
-                let table = self.expect_ident_like()?;
+                let table = self.expect_relation_name()?;
                 let columns = if matches!(self.peek(), Token::LParen) {
                     self.advance();
                     let mut cols = alloc::vec![self.expect_ident_like()?];
@@ -3261,14 +3313,19 @@ impl Parser {
                             self.advance();
                             names.push(self.expect_ident_like()?);
                         }
-                        if matches!(
-                            self.peek(),
-                            Token::Ident(s) if s.eq_ignore_ascii_case("cascade")
-                                || s.eq_ignore_ascii_case("restrict")
-                        ) {
+                        let mut cascade = false;
+                        if let Token::Ident(s) = self.peek()
+                            && (s.eq_ignore_ascii_case("cascade")
+                                || s.eq_ignore_ascii_case("restrict"))
+                        {
+                            cascade = s.eq_ignore_ascii_case("cascade");
                             self.advance();
                         }
-                        Ok(Statement::DropSchema { names, if_exists })
+                        Ok(Statement::DropSchema {
+                            names,
+                            if_exists,
+                            cascade,
+                        })
                     }
                     // v7.17.0 Phase 1.4 — DROP TYPE [IF EXISTS]
                     // name [, name…] [CASCADE|RESTRICT].
@@ -3715,7 +3772,7 @@ impl Parser {
                 // Table names (comma-separated).
                 let mut tables = Vec::new();
                 loop {
-                    tables.push(self.expect_ident_like()?);
+                    tables.push(self.expect_relation_name()?);
                     if matches!(self.peek(), Token::Comma) {
                         self.advance();
                         continue;
@@ -4850,7 +4907,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         Ok(Statement::CreateStatistics {
             name,
             if_not_exists,
@@ -4882,7 +4939,7 @@ impl Parser {
         let if_exists = self.consume_if_exists();
         let mut names: Vec<String> = Vec::new();
         loop {
-            names.push(self.expect_ident_like()?);
+            names.push(self.expect_relation_name()?);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();
                 continue;
@@ -6079,7 +6136,7 @@ impl Parser {
     /// consumed.
     fn parse_create_materialized_view_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_ident_like()?;
+        let name = self.expect_relation_name()?;
         let mut columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -6190,7 +6247,7 @@ impl Parser {
         temporary: bool,
     ) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_ident_like()?;
+        let name = self.expect_relation_name()?;
         // Optional `(col, col, …)` rename list.
         let mut columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
@@ -6296,7 +6353,7 @@ impl Parser {
         temporary: bool,
     ) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_ident_like()?;
+        let name = self.expect_relation_name()?;
         // Optional `AS data_type`.
         let data_type = if matches!(self.peek(), Token::As) {
             self.advance();
@@ -7218,7 +7275,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         // Optional `WHERE <cond>` (no parentheses, unlike a trigger WHEN).
         let when_condition = if matches!(self.peek(), Token::Where) {
             self.advance();
@@ -8674,7 +8731,7 @@ impl Parser {
     /// are consumed and discarded per the parse-accept-discard
     /// commitment above.
     fn parse_publication_table_entry(&mut self) -> Result<String, ParseError> {
-        let name = self.expect_ident_like()?;
+        let name = self.expect_relation_name()?;
         // Optional column list — `(col, col, …)`.
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -9267,7 +9324,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
 
         let mut permissive = true;
         if matches!(self.peek(), Token::As) {
@@ -9385,7 +9442,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
 
         // RENAME TO new
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("rename"))
@@ -9456,7 +9513,7 @@ impl Parser {
             )));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         Ok(Statement::DropPolicy(crate::ast::DropPolicyStatement {
             name,
             table,
@@ -9662,7 +9719,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         // v7.39 (round 241) — `UPDATE t [AS] alias SET …`. PG allows the
         // bare spelling; a bare identifier that is the SET keyword itself
         // is the clause, not an alias.
@@ -10233,7 +10290,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         // v7.39 (round 241) — `DELETE FROM t [AS] alias …`. The bare
         // spelling must not swallow the clause keywords that can follow
         // the target.
@@ -10458,7 +10515,7 @@ impl Parser {
             return Err(self.err(format!("expected INTO after MERGE, got {:?}", self.peek())));
         }
         self.advance();
-        let target = self.expect_ident_like()?;
+        let target = self.expect_relation_name()?;
         // Optional alias — bare ident before USING.
         let target_alias = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) if !s.eq_ignore_ascii_case("using") => {
@@ -10504,7 +10561,7 @@ impl Parser {
             };
             (String::new(), Some(Box::new(sub)))
         } else {
-            (self.expect_ident_like()?, None)
+            (self.expect_relation_name()?, None)
         };
         let source_alias = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s)
@@ -11406,7 +11463,7 @@ impl Parser {
     /// v7.13.2 — mailrs round-6 S1: accepts comma-separated
     /// subactions. Single-subaction shape stays a 1-element vec.
     fn parse_alter_table_after_keyword(&mut self) -> Result<Statement, ParseError> {
-        let table_name = self.expect_ident_like()?;
+        let table_name = self.expect_relation_name()?;
         let mut targets: Vec<crate::ast::AlterTableTarget> = Vec::new();
         loop {
             let subaction = self.parse_alter_table_subaction()?;
@@ -11581,8 +11638,16 @@ impl Parser {
                 //   SET WITHOUT OIDS             (PG legacy)
                 //   SET (option = value, …)      (storage parameters)
                 //   SET REPLICA IDENTITY {…}     (18.14)
-                if setting.eq_ignore_ascii_case("schema")
-                    || setting.eq_ignore_ascii_case("tablespace")
+                // 9.0.0 (C9) — `SET SCHEMA` moves the relation now, so it
+                // is carried rather than consumed.
+                if setting.eq_ignore_ascii_case("schema") {
+                    let target = self.expect_one_ident()?;
+                    self.consume_until_statement_boundary();
+                    return Ok(alloc::vec![crate::ast::AlterTableTarget::SetSchema(
+                        target
+                    )]);
+                }
+                if setting.eq_ignore_ascii_case("tablespace")
                     || setting.eq_ignore_ascii_case("logged")
                     || setting.eq_ignore_ascii_case("unlogged")
                     || setting.eq_ignore_ascii_case("without")
@@ -15319,7 +15384,7 @@ impl Parser {
     #[inline(never)]
     fn parse_create_table_like(&mut self, at: usize) -> Result<crate::ast::LikeSpec, ParseError> {
         self.advance(); // LIKE
-        let source = self.expect_ident_like()?;
+        let source = self.expect_relation_name()?;
         let mut options = crate::ast::LikeOptions::default();
         loop {
             let including = match self.peek() {
@@ -15371,7 +15436,7 @@ impl Parser {
         debug_assert!(matches!(self.peek(), Token::Table));
         self.advance();
         let if_not_exists = self.consume_if_not_exists();
-        let name = self.expect_ident_like()?;
+        let name = self.expect_relation_name()?;
         // v7.37.6-B — `CREATE TABLE c PARTITION OF parent <bounds>`
         // child shape has no column list; the child inherits its
         // columns from the parent at engine-DDL time. Detect it
@@ -15737,7 +15802,7 @@ impl Parser {
     ///   <parent> DEFAULT
     fn parse_partition_of_tail(&mut self) -> Result<crate::ast::PartitionOfSpec, ParseError> {
         use crate::ast::{PartitionOfBoundsAst, PartitionOfSpec};
-        let parent_name = self.expect_ident_like()?;
+        let parent_name = self.expect_relation_name()?;
         // v7.37.6-B rejects an explicit column list — the child
         // inherits from the parent. mailrs round-7 taught us that
         // CREATE TABLE-side schema reconciliation hides drift, so
@@ -16750,7 +16815,7 @@ impl Parser {
             Token::Ident(s) if s.eq_ignore_ascii_case("references") => {}
             other => return Err(self.err(format!("expected REFERENCES, got {other:?}"))),
         }
-        let parent_table = self.expect_ident_like()?;
+        let parent_table = self.expect_relation_name()?;
         let mut parent_columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -17164,7 +17229,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         // Optional `USING <method>` — only recognised method in v2.0 is
         // `hnsw` (a single-layer NSW graph for kNN). `USING` is the bare
         // ident `using` (we don't promote it to a reserved keyword
@@ -19223,7 +19288,7 @@ impl Parser {
             return Err(self.err(format!("expected INTO after INSERT, got {:?}", self.peek())));
         }
         self.advance();
-        let table = self.expect_ident_like()?;
+        let table = self.expect_relation_name()?;
         // v7.39 (round 240) — `INSERT INTO t AS alias`: PG's insert_target
         // grammar requires the AS keyword here (a bare identifier would be
         // ambiguous with a column list). The alias is what the ON CONFLICT
@@ -20988,7 +21053,7 @@ impl Parser {
         } else if let Some((synth, orig)) = self.try_peek_meta_bare() {
             (synth, Some(orig))
         } else {
-            (self.expect_ident_like()?, None)
+            (self.expect_relation_name()?, None)
         };
         // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
         // time-travel clause. Parse BEFORE the alias so the
@@ -21458,7 +21523,7 @@ impl Parser {
     fn parse_table_shorthand(&mut self) -> Result<SelectStatement, ParseError> {
         debug_assert!(matches!(self.peek(), Token::Table));
         self.advance(); // TABLE
-        let tname = self.expect_ident_like()?;
+        let tname = self.expect_relation_name()?;
         Ok(SelectStatement {
             where_token: SrcToken::NONE,
             having_token: SrcToken::NONE,
@@ -24371,13 +24436,23 @@ impl Parser {
         let mut out = Vec::new();
         while let Token::Ident(n) | Token::QuotedIdent(n) = self.peek().clone() {
             self.advance();
+            // 9.0.0 (C9) — these are RELATION names (`LOCK TABLE a, b`),
+            // so the qualifier is part of the name. `pg_dump` locks every
+            // table it is about to read, qualified, and dropping the
+            // schema made it lock a relation that does not exist.
             let mut last = n;
+            let mut schema: Option<String> = None;
             while matches!(self.peek(), Token::Dot) {
                 self.advance();
                 if let Token::Ident(t) | Token::QuotedIdent(t) = self.advance() {
+                    schema = Some(last);
                     last = t;
                 }
             }
+            let last = match schema {
+                Some(s) if !self.mysql_dialect => crate::namespace::qualified_key(&s, &last),
+                _ => last,
+            };
             out.push(last);
             if matches!(self.peek(), Token::Comma) {
                 self.advance();

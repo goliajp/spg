@@ -18,7 +18,7 @@
 //! notice.
 //!
 //! One name, two spaces. `catalog_indexes` assigns the OIDs that
-//! `pg_index`/`pg_class` report: it walks `visible_table_names()` and
+//! `pg_index`/`pg_class` report: it walks `visible_relation_keys()` and
 //! SKIPS the probe indexes SPG derives for a constraint's non-leading
 //! columns, which PostgreSQL has no equivalent of. The function's
 //! reverse walk replayed the count over `table_names()` and skipped

@@ -520,7 +520,11 @@ pub fn build_copy_insert(
     columns: Option<&[String]>,
     values: &[Option<String>],
 ) -> String {
-    let mut sql = format!("INSERT INTO {table} ");
+    // 9.0.0 (C9) — the row is inserted by re-parsing SQL, so the key
+    // goes back to the spelling a parser accepts (`c9a.t`): the
+    // separator it carries the schema with is not a character an
+    // identifier may contain.
+    let mut sql = alloc::format!("INSERT INTO {} ", spg_sql::namespace::display_key(table));
     if let Some(cols) = columns {
         sql.push('(');
         for (i, c) in cols.iter().enumerate() {

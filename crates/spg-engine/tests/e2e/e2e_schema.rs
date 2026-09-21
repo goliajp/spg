@@ -75,31 +75,34 @@ fn drop_schema_if_exists_silent_on_missing() {
 }
 
 #[test]
-fn schema_qualified_table_strips_prefix_at_lookup() {
-    // v7.17.0 Phase 1.6 is prefix routing, not isolation:
-    // `app.users` and `analytics.users` both resolve to the
-    // bare `users` table. This pin test documents the
-    // behaviour so the v7.18+ isolation work has a clear before
-    // state.
+fn schema_qualified_table_belongs_to_its_schema() {
+    // 9.0.0 (C9) — v7.17.0 Phase 1.6 was prefix ROUTING, not isolation:
+    // `app.users` and `analytics.users` both resolved to a bare `users`,
+    // and this test pinned that. It was a silent wrong answer — a
+    // two-schema application read the other schema's rows — and the
+    // relation belongs to its schema now.
     let mut e = Engine::new();
     e.execute("CREATE SCHEMA app").unwrap();
     e.execute("CREATE TABLE app.users (id INT NOT NULL)")
         .unwrap();
     e.execute("INSERT INTO app.users VALUES (1)").unwrap();
-    // Bare-name lookup works (prefix stripped at CREATE).
-    let r = e.execute("SELECT id FROM users").unwrap();
+    // `app` is not on the default search path, so the bare name finds
+    // nothing — PostgreSQL 18.6's answer.
+    let bare = e.execute("SELECT id FROM users");
+    assert!(
+        bare.is_err(),
+        "a relation in `app` is not reachable bare from `public`"
+    );
+    // And a schema nobody made holds nothing.
+    let other = e.execute("SELECT id FROM other_schema.users");
+    assert!(other.is_err(), "`other_schema.users` is not `app.users`");
+    // Qualified, it answers.
+    let r = e.execute("SELECT id FROM app.users").unwrap();
     let rows = match r {
         spg_engine::QueryResult::Rows { rows, .. } => rows,
         _ => panic!("expected rows"),
     };
     assert_eq!(rows.len(), 1);
-    // Different schema also resolves (same prefix-routing rule).
-    let r2 = e.execute("SELECT id FROM other_schema.users").unwrap();
-    let rows2 = match r2 {
-        spg_engine::QueryResult::Rows { rows, .. } => rows,
-        _ => panic!("expected rows"),
-    };
-    assert_eq!(rows2.len(), 1);
 }
 
 #[test]
