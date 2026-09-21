@@ -23,17 +23,16 @@ use crate::{
     apply_offset_and_limit, apply_offset_and_limit_tagged, approx_row_bytes, build_order_keys,
     collect_meta_view_names, collect_qualified_refs, collect_scalar_subqueries,
     collect_window_nodes, compute_window_partition, eval, expr_tree_has_subquery,
-    materialise_in_order, materialise_meta_view, memoize, order_by_value_cmp_in, partition_key_cmp,
+    materialise_in_order, materialise_meta_view, memoize, partition_key_cmp,
     rewrite_window_to_columns, select_has_window, select_references_meta_view, select_refers_to,
-    sort_by_keys, synth_info_key_column_usage, synth_info_referential_constraints,
-    synth_info_routines, synth_info_statistics, synth_information_schema_columns,
-    synth_information_schema_tables, synth_mysql_db, synth_mysql_user, synth_pg_attribute,
-    synth_pg_class, synth_pg_constraint, synth_pg_database, synth_pg_extension, synth_pg_index_raw,
-    synth_pg_indexes, synth_pg_namespace, synth_pg_operator, synth_pg_proc, synth_pg_roles,
-    synth_pg_sequence, synth_pg_settings, synth_pg_timezone_abbrevs, synth_pg_timezone_names,
-    synth_pg_trigger, synth_pg_type, synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek,
-    try_index_seek, try_nsw_knn, try_pk_walk_top_n, try_trgm_seek, value_is_bigint,
-    value_is_integer, value_to_i64,
+    synth_info_key_column_usage, synth_info_referential_constraints, synth_info_routines,
+    synth_info_statistics, synth_information_schema_columns, synth_information_schema_tables,
+    synth_mysql_db, synth_mysql_user, synth_pg_attribute, synth_pg_class, synth_pg_constraint,
+    synth_pg_database, synth_pg_extension, synth_pg_index_raw, synth_pg_indexes,
+    synth_pg_namespace, synth_pg_operator, synth_pg_proc, synth_pg_roles, synth_pg_sequence,
+    synth_pg_settings, synth_pg_timezone_abbrevs, synth_pg_timezone_names, synth_pg_trigger,
+    synth_pg_type, synth_pg_views, topk_trim, try_gin_jsonb_seek, try_gin_seek, try_index_seek,
+    try_nsw_knn, try_pk_walk_top_n, try_trgm_seek, value_is_bigint, value_is_integer, value_to_i64,
 };
 
 /// v7.39 (round 618) — a recursive term that can be run over the working set
@@ -3546,6 +3545,14 @@ impl Engine {
                 })
                 .collect();
             let descs: Vec<bool> = resolved_order.iter().map(|o| o.desc).collect();
+            // 9.0.1 — the combined sort takes the collation the same way
+            // every other ORDER BY does. It sorted by BYTES: on a
+            // database collating `en_US.UTF-8`, `SELECT x FROM w UNION
+            // ALL SELECT x FROM w ORDER BY x` answered
+            // `t_pkey t_pkey tj tj` where PostgreSQL 18.6 answers
+            // `tj tj t_pkey t_pkey` — silently the wrong order, not an
+            // error, on the surface a paginating client reads.
+            let order_colls = crate::orderby::order_by_collations(&resolved_order, &synth_ctx)?;
             let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
             for r in rows {
                 // v7.39.12 — a correlated subquery in ORDER BY is resolved
@@ -3560,7 +3567,12 @@ impl Engine {
                 )?;
                 tagged.push((keys, r));
             }
-            sort_by_keys(&mut tagged, &descs, self.session_parallel_workers());
+            crate::orderby::sort_by_keys_in(
+                &mut tagged,
+                &descs,
+                &order_colls,
+                self.session_parallel_workers(),
+            );
             rows = tagged.into_iter().map(|(_, r)| r).collect();
         }
         apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());
@@ -4203,12 +4215,16 @@ impl Engine {
                     Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
+            // 9.0.1 — the collation, resolved once for this sort; see
+            // the sibling paths.
+            let order_colls = crate::orderby::order_by_collations(&order_by, &scan_ctx)?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &order_by[idx];
-                    let cmp = order_by_value_cmp_in(
+                    let cmp = crate::orderby::value_cmp_with(
                         o.desc,
                         o.nulls_first,
+                        order_colls.get(idx).and_then(Option::as_ref),
                         ka,
                         kb,
                         scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
@@ -4437,12 +4453,21 @@ impl Engine {
                     Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
+            // 9.0.1 — the collation, resolved once for this sort. These
+            // comparators were collation-blind, so a synthetic source
+            // sorted by BYTES while the same rows from a table sorted
+            // by the database's collation: on `en_US.UTF-8`,
+            // `SELECT x FROM (VALUES ('tj'),('t_pkey')) v(x) ORDER BY x`
+            // answered `t_pkey tj` where PostgreSQL 18.6 answers
+            // `tj t_pkey`.
+            let order_colls = crate::orderby::order_by_collations(&stmt.order_by, &scan_ctx)?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp_in(
+                    let cmp = crate::orderby::value_cmp_with(
                         o.desc,
                         o.nulls_first,
+                        order_colls.get(idx).and_then(Option::as_ref),
                         ka,
                         kb,
                         scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
@@ -5967,12 +5992,21 @@ impl Engine {
                     Ok((i, keys?))
                 })
                 .collect::<Result<_, _>>()?;
+            // 9.0.1 — the collation, resolved once for this sort. These
+            // comparators were collation-blind, so a synthetic source
+            // sorted by BYTES while the same rows from a table sorted
+            // by the database's collation: on `en_US.UTF-8`,
+            // `SELECT x FROM (VALUES ('tj'),('t_pkey')) v(x) ORDER BY x`
+            // answered `t_pkey tj` where PostgreSQL 18.6 answers
+            // `tj t_pkey`.
+            let order_colls = crate::orderby::order_by_collations(&stmt.order_by, &scan_ctx)?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp_in(
+                    let cmp = crate::orderby::value_cmp_with(
                         o.desc,
                         o.nulls_first,
+                        order_colls.get(idx).and_then(Option::as_ref),
                         ka,
                         kb,
                         scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
@@ -6244,12 +6278,21 @@ impl Engine {
                     Ok((k, keys?))
                 })
                 .collect::<Result<_, _>>()?;
+            // 9.0.1 — the collation, resolved once for this sort. These
+            // comparators were collation-blind, so a synthetic source
+            // sorted by BYTES while the same rows from a table sorted
+            // by the database's collation: on `en_US.UTF-8`,
+            // `SELECT x FROM (VALUES ('tj'),('t_pkey')) v(x) ORDER BY x`
+            // answered `t_pkey tj` where PostgreSQL 18.6 answers
+            // `tj t_pkey`.
+            let order_colls = crate::orderby::order_by_collations(&stmt.order_by, &scan_ctx)?;
             indexed.sort_by(|a, b| {
                 for (idx, (ka, kb)) in a.1.iter().zip(b.1.iter()).enumerate() {
                     let o = &stmt.order_by[idx];
-                    let cmp = order_by_value_cmp_in(
+                    let cmp = crate::orderby::value_cmp_with(
                         o.desc,
                         o.nulls_first,
+                        order_colls.get(idx).and_then(Option::as_ref),
                         ka,
                         kb,
                         scan_ctx.mysql_dialect && !crate::eval::is_binary_coerced(&o.expr),
@@ -6397,6 +6440,9 @@ impl Engine {
                     })
                     .collect();
                 let descs: Vec<bool> = resolved.iter().map(|o| o.desc).collect();
+                // 9.0.1 — and the collation, as every other ORDER BY
+                // does; see the sibling paths.
+                let order_colls = crate::orderby::order_by_collations(&resolved, &synth_ctx)?;
                 let mut tagged: Vec<(Vec<OrderKey>, Row)> = Vec::with_capacity(rows.len());
                 for r in rows {
                     // v7.39.12 — a correlated subquery in ORDER BY is resolved
@@ -6412,7 +6458,12 @@ impl Engine {
                         build_order_keys(per_row.as_deref().unwrap_or(&resolved), &r, &synth_ctx)?;
                     tagged.push((keys, r));
                 }
-                sort_by_keys(&mut tagged, &descs, self.session_parallel_workers());
+                crate::orderby::sort_by_keys_in(
+                    &mut tagged,
+                    &descs,
+                    &order_colls,
+                    self.session_parallel_workers(),
+                );
                 rows = tagged.into_iter().map(|(_, r)| r).collect();
             }
             apply_offset_and_limit(&mut rows, stmt.offset_literal(), stmt.limit_literal());

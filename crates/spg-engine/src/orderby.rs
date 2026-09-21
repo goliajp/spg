@@ -1,6 +1,6 @@
 //! Row / value ordering split out of `lib.rs` (lib.rs split 7): the
 //! ORDER BY comparator stack (`order_by_value_cmp` with NULLS placement,
-//! the `build_order_keys` / `sort_by_keys` / `partial_sort_tagged` /
+//! the `build_order_keys` / `sort_by_keys_in` / `partial_sort_tagged` /
 //! `cmp_multi_key` tagged-sort pipeline, `apply_offset_and_limit[_tagged]`
 //! windowing, and the `expand_group_by_all` / `resolve_order_by_position`
 //! pre-passes), the generic value-comparison primitives (`value_cmp` /
@@ -50,6 +50,47 @@ pub(crate) fn order_by_value_cmp_in(
     mysql: bool,
 ) -> core::cmp::Ordering {
     order_by_value_cmp_coll(desc, nulls_first, a, b, mysql, None)
+}
+
+/// 9.0.1 — one ORDER BY key's comparison, with a collation already
+/// RESOLVED.
+///
+/// The four synthetic-source paths (`unnest`, `generate_series`,
+/// `jsonb_each_text`, and the derived-table / SRF projection) build
+/// their sort keys as `Value`s and compared them collation-blind, so a
+/// derived table sorted by BYTES while the same rows from a table
+/// sorted by the database's collation. Resolving the collator once per
+/// sort is what [`order_by_collations`] exists for; this is the
+/// per-comparison half.
+pub(crate) fn value_cmp_with(
+    desc: bool,
+    nulls_first: Option<bool>,
+    collation: Option<&crate::collate::Collated>,
+    a: &Value,
+    b: &Value,
+    mysql: bool,
+) -> core::cmp::Ordering {
+    if let (Some(c), Value::Text(x), Value::Text(y)) = (collation, a, b) {
+        let ord = c.compare(x.as_ref(), y.as_ref());
+        return if desc { ord.reverse() } else { ord };
+    }
+    // A RECORD's fields carry the collation too — PostgreSQL compares
+    // each field under its own, and a whole-row key is the shape that
+    // reaches here.
+    if let (Some(c), Value::Composite(x), Value::Composite(y)) = (collation, a, b) {
+        for ((_, xv), (_, yv)) in x.iter().zip(y.iter()) {
+            let ord = match (xv, yv) {
+                (Value::Text(p), Value::Text(q)) => c.compare(p.as_ref(), q.as_ref()),
+                _ => value_cmp(xv, yv),
+            };
+            if ord != core::cmp::Ordering::Equal {
+                return if desc { ord.reverse() } else { ord };
+            }
+        }
+        let ord = x.len().cmp(&y.len());
+        return if desc { ord.reverse() } else { ord };
+    }
+    order_by_value_cmp_in(desc, nulls_first, a, b, mysql)
 }
 
 /// v7.39 (round 686) — the value-comparing family, with a collation.
@@ -665,6 +706,20 @@ pub(crate) fn value_cmp(a: &Value, b: &Value) -> core::cmp::Ordering {
                 offset_secs: ob,
             },
         ) => spg_storage::timetz_sort_key(*ua, *oa).cmp(&spg_storage::timetz_sort_key(*ub, *ob)),
+        // 9.0.1 — a RECORD compares field by field, which is
+        // PostgreSQL's rule and what a whole-row `ORDER BY` means.
+        // It had no arm, so it fell through to the debug rendering
+        // below — the Rust `Debug` spelling of the field, not the
+        // field. Same family as the NUMERIC and TIMETZ arms above.
+        (Value::Composite(x), Value::Composite(y)) => {
+            for ((_, xv), (_, yv)) in x.iter().zip(y.iter()) {
+                let c = value_cmp(xv, yv);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
         // Cross-type compare: fall back to the debug rendering —
         // same-partition is the goal, exact order is irrelevant.
         _ => alloc::format!("{a:?}").cmp(&alloc::format!("{b:?}")),
@@ -1387,6 +1442,23 @@ fn order_key_elem_cmp_in(
         }
         return c.compare(x.as_str(), y.as_str());
     }
+    // 9.0.1 — an ARRAY key carries the collation into its ELEMENTS. A
+    // composite is an Array of its fields' keys (`value_to_order_key`),
+    // so a whole-row `ORDER BY` compared its text field by BYTES while
+    // the same field as a column was compared under the database's
+    // collation: on `en_US.UTF-8`, `SELECT w FROM w ORDER BY w`
+    // answered `(t_pkey) (tj)` where PostgreSQL 18.6 answers
+    // `(tj) (t_pkey)`. PostgreSQL compares a record field by field,
+    // each field under its own collation.
+    if let (OrderKey::Array(x), OrderKey::Array(y), Some(_)) = (a, b, collation) {
+        for (ex, ey) in x.iter().zip(y.iter()) {
+            let c = order_key_elem_cmp_in(ex, ey, collation);
+            if c != core::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+        return x.len().cmp(&y.len());
+    }
     // v7.38.19 — one side keyed, one side not.
     //
     // Under a collation that orders `[0-9a-z]` by bytes, a value drawn
@@ -1814,15 +1886,14 @@ fn sort_tagged_by_inline_int_key(
     true
 }
 
-pub(crate) fn sort_by_keys(
-    tagged: &mut Vec<(Vec<OrderKey>, Row)>,
-    descs: &[bool],
-    workers: crate::parsort::Workers,
-) {
-    sort_by_keys_in(tagged, descs, &[], workers);
-}
-
-/// v7.39 (round 683) — `sort_by_keys` honouring one collation per position.
+/// v7.39 (round 683) — sort by prebuilt keys, honouring one collation
+/// per position.
+///
+/// 9.0.1 — the collation-BLIND wrapper that used to stand in front of
+/// this is gone. It had no callers left once the four synthetic-source
+/// paths and the UNION sort took their collations, and leaving an
+/// entry point that silently drops one is how three ORDER BY surfaces
+/// came to disagree with PostgreSQL in the first place.
 pub(crate) fn sort_by_keys_in(
     tagged: &mut Vec<(Vec<OrderKey>, Row)>,
     descs: &[bool],
@@ -1857,7 +1928,55 @@ pub(crate) fn sort_by_keys_in(
 /// the caller reads as "no opinion" and treats exactly as it did before
 /// this existed — the conservative direction, since the cost of not
 /// knowing is a collator that never gets consulted, not a wrong answer.
-fn static_term_type(expr: &spg_sql::ast::Expr, ctx: &EvalContext) -> Option<spg_storage::DataType> {
+/// 9.0.1 — does this term take its collation from its TYPE rather than
+/// from an input?
+///
+/// PostgreSQL derives an expression's collation from its INPUTS and
+/// propagates it through a cast; the result type's own collation
+/// applies only when no input carries one. Measured on 18.6, in an
+/// `en_US.utf8` database, with `x` a text column holding `tj` and
+/// `t_pkey`:
+///
+/// ```text
+///   min(x::name)                  tj       ← x's, through the cast
+///   min(<a name column>)          t_pkey   ← the name type's own `C`
+///   'tj'::name < 't_pkey'::name   f        ← literals carry none
+/// ```
+pub(crate) fn term_collation_is_type_c(expr: &spg_sql::ast::Expr, ctx: &EvalContext) -> bool {
+    use spg_sql::ast::Expr;
+    match expr {
+        Expr::Column(_) => {
+            static_term_type(expr, ctx).is_some_and(|t| crate::collate::type_collates_as_c(&t))
+        }
+        Expr::Cast {
+            expr: inner,
+            target,
+        } => {
+            matches!(
+                target,
+                spg_sql::ast::CastTarget::Named(n) if n.eq_ignore_ascii_case("name")
+            ) && term_carries_no_collation(inner)
+        }
+        _ => false,
+    }
+}
+
+/// An operand that brings no collation of its own: a literal, a
+/// parameter, or a cast of one. A COLUMN brings one even when it
+/// declares nothing — the database's.
+fn term_carries_no_collation(expr: &spg_sql::ast::Expr) -> bool {
+    use spg_sql::ast::Expr;
+    match expr {
+        Expr::Literal(_) | Expr::Placeholder(_) => true,
+        Expr::Cast { expr: inner, .. } => term_carries_no_collation(inner),
+        _ => false,
+    }
+}
+
+pub(crate) fn static_term_type(
+    expr: &spg_sql::ast::Expr,
+    ctx: &EvalContext,
+) -> Option<spg_storage::DataType> {
     use spg_sql::ast::Expr;
     match expr {
         Expr::Column(c) => {
@@ -1978,8 +2097,15 @@ pub(crate) fn order_by_collations(
             //
             // A term whose type is not statically knowable keeps the old
             // behaviour: unknown means unaccelerated, never wrong.
-            let term_takes_a_collation =
-                static_term_type(&o.expr, ctx).is_none_or(|t| crate::collate::is_collatable(&t));
+            // 9.0.1 — and not a term whose collation comes from a TYPE
+            // that collates as `C`. A `name` is the catalog's
+            // identifier type and carries `C` in PostgreSQL however the
+            // database collates, so `ORDER BY relname` is byte order
+            // there and was the locale's here. An explicit `COLLATE`
+            // still wins — it returned above.
+            let term_takes_a_collation = static_term_type(&o.expr, ctx)
+                .is_none_or(|t| crate::collate::is_collatable(&t))
+                && !term_collation_is_type_c(&o.expr, ctx);
             let db = ctx
                 .catalog
                 .map(spg_storage::Catalog::db_collation)

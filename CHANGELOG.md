@@ -10,6 +10,107 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — pg_dump SEGFAULTED on a sequence outside `public`
+
+**Shipped in 9.0.0.** A relation in a schema had no catalog identity of
+its own. 9.0.0 keys a relation by `schema\0name`, but the catalog
+synths resolved a relation's oid by the name a CLIENT reads — so two
+relations of one name in two schemas shared one oid, and a sequence's
+oid was findable only under its bare name. Measured against
+PostgreSQL 18.6's own `pg_dump` on the published 9.0.0, with a table,
+a view, a sequence and an index of the same name in `public` and in
+`sa`:
+
+| surface | 9.0.0 | PostgreSQL 18.6 |
+|---|---|---|
+| `pg_dump` | **rc=139 (SIGSEGV)** | a dump |
+| `pg_class` (the two sequences) | `300001\|s\|2200`, `300001\|s\|700000` | distinct oids |
+| `pg_get_sequence_data` | one row where `pg_sequence` lists two | one per sequence |
+| `conname` of `sa.t`'s primary key | `sa` | `t_pkey` |
+| `connamespace` | `public` for every constraint | the table's schema |
+| `relpersistence` | `t` for every relation in a schema | `p` |
+| `pg_get_viewdef('sa.v')` | empty | the body |
+| `conrelid::regclass` | `t` for both tables | `t` and `sa.t` |
+
+`pg_dump` joins `pg_sequence` against `pg_get_sequence_data`; a
+sequence with no data row is a NULL it dereferences. The constraint
+name is the clearest view of the cause: it was built from the KEY, and
+a key reaches a client as a C string that stops at the key's own
+separator — so `sa\0t_pkey` arrived as `sa`, and restoring that dump
+failed with `constraint "sa" for relation "t" already exists`.
+
+An oid now resolves by KEY first and completely, then by the readable
+name; one walk answers oid → (key, name) so the two cannot drift; and
+a relation is WRITTEN with a qualifier exactly when a client would
+need one — including `public.`, which is the only way to name a
+relation another schema on the search path shadows (PostgreSQL 18.6,
+measured).
+
+Fourteen call sites that resolved a written name by stripping a
+leading `public.` — the single-schema rule — go through one
+spelling→key function, shared with `::regclass`. `nextval('sa.s')`
+answered `relation "sa.s" does not exist` for a sequence that exists.
+
+### Fixed — four ORDER BY surfaces were not asking the collation
+
+**Shipped in 9.0.0 and earlier.** Found by running the differential
+corpus, not by anything in the repository. Every one of them turns on
+the same pair of names — `tj` and `t_pkey` — which the two orders
+disagree about: bytes put `t_pkey` first (`_` is 0x5F, `j` is 0x6A)
+and an `en_US.utf8` locale puts `tj` first. That pair is what a
+catalog listing produces on its own, from a table with an index.
+
+* **`name` collates as `C`.** It is PostgreSQL's identifier type and
+  carries `C` at the TYPE level whatever the database collates as, so
+  a catalog listing is ordered the same way on every server. SPG
+  compared it under the database's collation, so every
+  `ORDER BY relname` — psql's listings, a schema-diff tool, a dump's
+  object order — came back in a different order from PostgreSQL's
+  whenever two names differed by punctuation.
+* **A UNION's combined sort** was collation-blind:
+  `SELECT x FROM w UNION ALL SELECT x FROM w ORDER BY x` answered
+  `t_pkey t_pkey tj tj` against PostgreSQL's `tj tj t_pkey t_pkey`.
+* **Four synthetic-source sorts** (a `VALUES` list as a FROM item,
+  `unnest`, `generate_series`, and the derived-table / SRF
+  projection) were too. The same rows through a CTE, a subquery or a
+  TABLE were already right, which is what kept it out of sight.
+* **A whole-row key** compared its text field by bytes: a composite's
+  sort key is an array of its fields' keys, and the array comparison
+  dropped the collation. `SELECT w FROM w ORDER BY w` answered
+  `(t_pkey) (tj)` against PostgreSQL's `(tj) (t_pkey)`.
+* **`min` / `max` over an expression** took no collation at all — only
+  a bare column did. `min(x || '')` compared by bytes while `min(x)`
+  over the same column compared under the database's.
+
+Where a collation COMES FROM is measured, not assumed: PostgreSQL
+derives it from the INPUTS and carries it through a cast, and the
+result type's own applies only when no input has one. So
+`min(x::name)` over a text column answers the locale's order, a
+`name` COLUMN answers `C`, and two `name` literals answer `C`.
+
+The collation-blind sort entry point is gone rather than left
+standing: it had no callers once these paths took their collations,
+and an entry point that silently drops one is how three of these
+came to disagree in the first place.
+
+### Fixed — a written qualifier was the search path's to reinterpret
+
+**Shipped in 9.0.0.** `public`'s relations are keyed by their bare
+names, so nothing recorded whether `t` or `public.t` was written, and
+the search path was walked for both. With `search_path = sa, public`
+and a `t` in each schema, `SELECT a FROM public.t` read `sa`'s table
+(and answered `column "a" does not exist`), and `INSERT INTO public.t`
+wrote to it. PostgreSQL 18.6 reads and writes `public`'s.
+
+A relation reference and the three DML statements carry what the
+client wrote, and the resolver honours it. Nine statements over the
+two-schema fixture now answer byte for byte what PostgreSQL answers.
+
+Round-trip, on a database with two schemas: SPG → `pg_dump` →
+PostgreSQL restores clean under `ON_ERROR_STOP`, PostgreSQL's own dump
+of the result is identical to SPG's, and SPG restoring its own dump is
+a fixed point.
+
 ### Fixed — a schema reached the relations and only half the catalog
 
 **Shipped in 9.0.0.** 9.0.0 gave a relation a schema, and six catalog

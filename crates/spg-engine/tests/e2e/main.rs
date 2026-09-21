@@ -653,6 +653,7 @@ mod e2e_mysql_uuid_round416;
 mod e2e_mysql_value_pick_collation_round412;
 mod e2e_mysql_week_mode_round378;
 mod e2e_mysqldump_preamble_round554;
+mod e2e_name_collation_901;
 mod e2e_name_encoding_round42;
 mod e2e_name_type_round291;
 mod e2e_named_args;
