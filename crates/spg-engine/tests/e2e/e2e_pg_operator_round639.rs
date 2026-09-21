@@ -42,9 +42,20 @@ fn vals(e: &mut Engine, sql: &str) -> Vec<String> {
 #[test]
 fn round639_pg_operator_lists_what_the_engine_evaluates() {
     let mut e = Engine::new();
+    // 9.0.0 (N22) — 330 to 690. The table was generated (same-type
+    // comparisons over one type list, arithmetic over another, oids
+    // from 70,000 up); it carries PostgreSQL 18.6's own rows now, for
+    // every operator a NON-NULL probe showed SPG evaluates. The first
+    // cut probed with NULLs and came out at 689 different rows, because
+    // SPG answers NULL for a NULL operand before it checks the types —
+    // see this file's `round639_unsupported_operators_stay_unlisted`,
+    // which is what caught it. The second cut left out every operator
+    // whose operands are polymorphic, because `anyarray` has no literal
+    // of its own; spelling them concretely added 82 rows, among them
+    // `&&` over arrays and the whole range family.
     assert_eq!(
         vals(&mut e, "SELECT count(*) FROM pg_operator"),
-        vec!["330"]
+        vec!["690"]
     );
     // Cross-type arithmetic, which the same-type loops never produced.
     assert_eq!(
@@ -68,11 +79,17 @@ fn round639_pg_operator_lists_what_the_engine_evaluates() {
     );
 }
 
-/// Every binary row's three type ends resolve; the six that do not are the
-/// unary operators, where PG also carries oprleft = 0.
+/// The rows whose three type ends all resolve against `pg_type`, and the
+/// unary ones, where PG also carries oprleft = 0.
 #[test]
 fn round639_only_the_unary_rows_have_no_left_type() {
     let mut e = Engine::new();
+    // 654 rows carry three non-zero type ends; 570 of them resolve. The
+    // other 84 name a type `pg_type` does not list — `anyarray`,
+    // `anyrange`, `anymultirange`, `record`, `anyenum`, `aclitem`,
+    // `jsonpath`. The operator rows are PG's, so they name PG's operand
+    // types whether or not `pg_type` reaches that far; the gap is
+    // `pg_type`'s, and it is the one round 639 measured and left open.
     assert_eq!(
         vals(
             &mut e,
@@ -80,19 +97,22 @@ fn round639_only_the_unary_rows_have_no_left_type() {
              JOIN pg_type l ON l.oid = o.oprleft JOIN pg_type r ON r.oid = o.oprright \
              JOIN pg_type t ON t.oid = o.oprresult"
         ),
-        vec!["324"]
+        vec!["570"]
     );
     assert_eq!(
         vals(&mut e, "SELECT count(*) FROM pg_operator WHERE oprleft = 0"),
-        vec!["6"],
-        "the unary minus per numeric type — 330 - 324"
+        vec!["36"],
+        "the unary operators — 690 - 654 whose three type ends all resolve"
     );
     assert_eq!(
         vals(
             &mut e,
-            "SELECT DISTINCT oprname, oprkind FROM pg_operator WHERE oprleft = 0"
+            "SELECT DISTINCT oprname, oprkind FROM pg_operator WHERE oprleft = 0 \
+             ORDER BY oprname"
         ),
-        vec!["-|l"]
+        vec![
+            "!!|l", "#|l", "+|l", "-|l", "?-|l", "?||l", "@|l", "@-@|l", "@@|l", "~|l"
+        ]
     );
 }
 

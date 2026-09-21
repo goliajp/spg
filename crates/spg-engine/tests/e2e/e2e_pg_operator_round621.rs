@@ -11,9 +11,9 @@
 //! than the missing relation, because a client would believe them. The row for
 //! `=` between two `int4` matches PG's byte for byte.
 //!
-//! `oprcode` and the two selectivity estimators are 0 throughout — SPG's
-//! operators are not catalogued functions, so there is nothing to name. That
-//! is the choice `pg_type`'s seven I/O-function OIDs already made in round 543.
+//! `oprcode` and the two selectivity estimators were 0 throughout — SPG's
+//! operators are not catalogued functions, so there was nothing to name. 9.0.0
+//! (N22) carries PG's own rows instead, so all three name what PG names.
 //!
 //! Measured and NOT closed (filed as F25): no synthesised catalog's COLUMNS
 //! appear in `pg_attribute` — `pg_type` and `pg_proc` answer 0 there as well,
@@ -102,10 +102,22 @@ fn round621_the_columns_carry_their_meaning() {
         vec!["11"],
         "all of them live in pg_catalog"
     );
+    // 9.0.0 (N22) — `oprcode` was the literal `-` on every row, so this
+    // counted one distinct value. It names PostgreSQL's own function per
+    // row now.
     assert_eq!(
         vals(&mut e, "SELECT count(DISTINCT oprcode) FROM pg_operator"),
-        vec!["1"],
-        "oprcode is 0 throughout — SPG's operators are not catalogued functions"
+        vec!["687"],
+        "oprcode names the function, so near enough one per row"
+    );
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT oprcode FROM pg_operator WHERE oprname = '=' AND oprleft = 23 \
+             AND oprright = 23"
+        ),
+        vec!["int4eq"],
+        "PG's own name for it"
     );
 }
 
@@ -156,9 +168,9 @@ fn round621_the_operator_families() {
     assert!(
         !vals(
             &mut e,
-            "SELECT oprname FROM pg_operator WHERE oprname = '&&' AND oprleft = 1007"
+            "SELECT oprname FROM pg_operator WHERE oprname = '&&' AND oprleft = 2277"
         )
         .is_empty(),
-        "array overlap"
+        "array overlap, where PG declares it: `anyarray`, not `int4[]`"
     );
 }
