@@ -3989,12 +3989,85 @@ pub(crate) fn trgm_operator_hook(
         .then_some(fname)
 }
 
+/// 9.0.0 — `json_populate_record(base, json)` as a SCALAR, returning the
+/// composite. `None` when the first argument does not name a row type,
+/// which leaves the ordinary dispatch to answer.
+fn populate_record_as_composite(
+    name: &str,
+    args: &[Expr],
+    row: &Row<'static>,
+    ctx: &EvalContext<'_>,
+) -> Result<Option<Value<'static>>, EvalError> {
+    let Some(Expr::Cast {
+        target: spg_sql::ast::CastTarget::Named(type_name),
+        ..
+    }) = args.first()
+    else {
+        return Ok(None);
+    };
+    let Some(cat) = ctx.catalog else {
+        return Ok(None);
+    };
+    let fields: alloc::vec::Vec<(alloc::string::String, spg_storage::DataType)> =
+        if let Some(t) = cat.get(type_name) {
+            t.schema()
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.ty))
+                .collect()
+        } else if let Some(c) = cat.composite_types().get(type_name) {
+            c.fields.clone()
+        } else {
+            return Ok(None);
+        };
+    let base = eval_expr(&args[0], row, ctx)?;
+    let doc = eval_expr(&args[1], row, ctx)?;
+    if matches!(doc, Value::Null) {
+        return Ok(Some(base));
+    }
+    let base_fields = match &base {
+        Value::Composite(f) => f.clone(),
+        _ => alloc::vec::Vec::new(),
+    };
+    let mut out: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
+        alloc::vec::Vec::with_capacity(fields.len());
+    for (i, (fname, ty)) in fields.iter().enumerate() {
+        let raw = crate::json::path_get(&doc, &Value::text(fname.clone()), true)?;
+        let v = if matches!(raw, Value::Null) {
+            base_fields.get(i).map_or(Value::Null, |(_, v)| v.clone())
+        } else {
+            crate::conversions::coerce_value(raw, *ty, "", 0).map_err(|e| {
+                EvalError::TypeMismatch {
+                    detail: alloc::format!("{name}(): {e:?}"),
+                }
+            })?
+        };
+        out.push((fname.clone(), v));
+    }
+    Ok(Some(Value::Composite(out)))
+}
+
 fn eval_function_call_inner(
     name: &str,
     args: &[Expr],
     row: &Row<'static>,
     ctx: &EvalContext<'_>,
 ) -> Result<Value<'static>, EvalError> {
+    // 9.0.0 — the populate-record family in a SELECT LIST. In a FROM it
+    // is a table function and the executor resolves its row shape from
+    // the catalog; as a scalar it answers the composite itself, which
+    // PostgreSQL 18.6 prints as `(1,,)`. SPG had no scalar arm at all,
+    // so the select-list spelling said the function does not exist.
+    // The shape comes from the first argument's CAST target, which only
+    // the AST carries — hence here rather than in the value dispatch.
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "json_populate_record" | "jsonb_populate_record"
+    ) && args.len() == 2
+        && let Some(v) = populate_record_as_composite(name, args, row, ctx)?
+    {
+        return Ok(v);
+    }
     // 9.0.0 — a function an EXTENSION supplies exists once the extension
     // is installed, and not before. SPG answered `uuid_generate_v4()`
     // and `similarity('a','ab')` on a database that had created no

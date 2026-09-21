@@ -5291,7 +5291,13 @@ impl Engine {
             .as_deref()
             .expect("caller guards table_fn_call.is_some()");
         let empty_schema: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
-        let ctx = EvalContext::new(&empty_schema, None);
+        // 9.0.0 — with the catalog, so an argument that casts to a
+        // COMPOSITE type resolves. Without it,
+        // `json_populate_record(ROW(9,'base',7)::jr, …)` answered
+        // `type "jr" does not exist` while the same cast answered on its
+        // own, and the `NULL::jr` spelling worked because a NULL needs no
+        // type to cast.
+        let ctx = EvalContext::new(&empty_schema, None).with_catalog(self.active_catalog());
         let dummy_row = Row::new(alloc::vec::Vec::new());
         let arg0: Option<Value<'static>> = match args.first() {
             Some(e) => Some(eval::eval_expr(e, &dummy_row, &ctx).map_err(EngineError::Eval)?),
@@ -5349,16 +5355,28 @@ impl Engine {
                 } else {
                     alloc::vec![json_arg]
                 };
+                // 9.0.0 — the BASE argument supplies the fields the JSON
+                // omits. Measured on PG 18.6:
+                // `json_populate_record(ROW(9,'base',7)::jr, '{"a":1}')`
+                // answers `1|base|7`, not `1||`. SPG took the base only
+                // for its TYPE and filled every absent key with NULL, so
+                // the documented use — patch a record with a JSON
+                // fragment — lost every field the fragment left out.
+                let base: alloc::vec::Vec<(alloc::string::String, Value<'static>)> =
+                    match arg0.as_ref() {
+                        Some(Value::Composite(f)) => f.clone(),
+                        _ => alloc::vec::Vec::new(),
+                    };
                 let mut rows = alloc::vec::Vec::with_capacity(docs.len());
                 for doc in &docs {
                     let mut vals = alloc::vec::Vec::with_capacity(cols.len());
-                    for c in &cols {
+                    for (i, c) in cols.iter().enumerate() {
                         // `->>` semantics: a missing key is NULL, present keys
                         // arrive as text and cast to the declared column type.
                         let raw = crate::json::path_get(doc, &Value::text(c.name.clone()), true)
                             .map_err(EngineError::Eval)?;
                         let v = if matches!(raw, Value::Null) {
-                            Value::Null
+                            base.get(i).map_or(Value::Null, |(_, v)| v.clone())
                         } else {
                             crate::conversions::coerce_value(raw, c.ty, "", 0)
                                 .map_err(|e| EngineError::Unsupported(alloc::format!("{e:?}")))?
