@@ -5063,6 +5063,13 @@ pub(crate) fn builtin_type_oid_exists(oid: i64) -> bool {
 pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
     for (pos, tname) in cat.table_names().iter().enumerate() {
         if OID_TABLE_BASE + pos as i64 == oid {
+            // 9.0.0 (C8) — a relation of ANOTHER database has an oid and
+            // is not this session's to name. The walk stays over the raw
+            // list so a position keeps its oid; the OUTPUT is filtered,
+            // which is what the temp check beside it does.
+            if !cat.in_current_database(tname) {
+                return None;
+            }
             return cat.listed_name(tname).map(alloc::string::String::from);
         }
     }
@@ -5315,6 +5322,13 @@ pub(crate) fn synth_pg_class(
     // it is only skipped from the OUTPUT.
     for (pos, stored) in cat.table_names().into_iter().enumerate() {
         let this_oid = OID_TABLE_BASE + pos as i64;
+        // 9.0.0 (C8) — a relation another database owns is not listed
+        // here. It was, and `pg_dump` read `pg_class` to decide what to
+        // lock, so a dump of one database answered
+        // `relation "c8t" does not exist` on its own LOCK statement.
+        if !cat.in_current_database(&stored) {
+            continue;
+        }
         let Some(tname) = cat.listed_name(&stored).map(alloc::string::String::from) else {
             continue;
         };
@@ -21317,6 +21331,10 @@ pub(crate) fn synth_pg_matviews(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for stored in cat.table_names() {
+        // 9.0.0 (C8) — this session's database only; see `synth_pg_class`.
+        if !cat.in_current_database(&stored) {
+            continue;
+        }
         let Some(name) = cat.listed_name(&stored).map(alloc::string::String::from) else {
             continue;
         };
