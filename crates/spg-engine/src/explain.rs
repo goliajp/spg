@@ -913,7 +913,12 @@ fn child_cost(n: &PlanNode) -> (f64, f64, u64, u64) {
 /// the delta is per STATEMENT, so a plan with two Sort nodes attributes
 /// the same spill to both. PG attributes per node. A plan that sorts
 /// twice is the shape to fix that on, and it is not this one.
-fn annotate_sort_method(node: &mut PlanNode, has_limit: bool, spilled_bytes: Option<u64>) {
+fn annotate_sort_method(
+    node: &mut PlanNode,
+    has_limit: bool,
+    spilled_bytes: Option<u64>,
+    peak_bytes: u64,
+) {
     if node.head == "Sort"
         && !node.attrs.iter().any(|a| a.starts_with("Sort Method:"))
         && let Some(pos) = node.attrs.iter().position(|a| a.starts_with("Sort Key:"))
@@ -926,13 +931,32 @@ fn annotate_sort_method(node: &mut PlanNode, has_limit: bool, spilled_bytes: Opt
                 "Sort Method: external merge  Disk: {}kB",
                 bytes.div_ceil(1024)
             ),
-            None if has_limit => alloc::string::String::from("Sort Method: top-N heapsort"),
-            None => alloc::string::String::from("Sort Method: quicksort"),
+            // 9.0.0 — PG names the memory an in-memory sort held
+            // (`Sort Method: quicksort  Memory: 25kB`), and the sorter
+            // records its own high-water mark. Left off when nothing
+            // reported one — a sort that never reached the instrumented
+            // path has no measurement to print, and 0kB would be a
+            // claim rather than a gap.
+            None => {
+                let method = if has_limit {
+                    "top-N heapsort"
+                } else {
+                    "quicksort"
+                };
+                if peak_bytes == 0 {
+                    alloc::format!("Sort Method: {method}")
+                } else {
+                    alloc::format!(
+                        "Sort Method: {method}  Memory: {}kB",
+                        peak_bytes.div_ceil(1024)
+                    )
+                }
+            }
         };
         node.attrs.insert(pos + 1, line);
     }
     for c in &mut node.children {
-        annotate_sort_method(c, has_limit, spilled_bytes);
+        annotate_sort_method(c, has_limit, spilled_bytes, peak_bytes);
     }
 }
 
@@ -1047,6 +1071,20 @@ fn fill_actuals(
         && let Some((_, rows)) = child.actual
     {
         node.actual = Some((None, rows));
+    }
+    // 9.0.0 — and a Sort directly under a Limit, which the arm above
+    // leaves alone because a top-N sort does not emit what it reads. It
+    // emits what the Limit took, which the Limit node has already
+    // counted — so the number is in hand, from the right side of the
+    // node. PG prints it (`Sort (actual rows=10.00 loops=1)`) and SPG
+    // printed a bare `-> Sort`.
+    if node.head == "Limit"
+        && let Some((_, taken)) = node.actual
+        && let [child] = node.children.as_mut_slice()
+        && child.head == "Sort"
+        && child.actual.is_none()
+    {
+        child.actual = Some((None, taken));
     }
 }
 
@@ -1650,14 +1688,24 @@ fn build_plan_tree(stmt: &SelectStatement, engine: &Engine) -> PlanNode {
         }
     } else if !stmt.order_by.is_empty() {
         let mut s = PlanNode::new(String::from("Sort"));
+        // 9.0.0 — PostgreSQL qualifies a sort key only when more than
+        // one relation is in scope. Measured on 18.6: `ORDER BY s.v`
+        // over one table reads `Sort Key: v`, and the same key in a
+        // join reads `Sort Key: a.name, b.amt`. SPG printed what the
+        // statement wrote, so a single-table plan said `Sort Key: s.v`.
+        let one_relation = stmt.from.as_ref().is_some_and(|f| f.joins.is_empty());
         let keys: Vec<String> = stmt
             .order_by
             .iter()
             .map(|o| {
+                let key = match (&o.expr, one_relation) {
+                    (spg_sql::ast::Expr::Column(c), true) => c.name.clone(),
+                    (e, _) => alloc::format!("{e}"),
+                };
                 if o.desc {
-                    alloc::format!("{} DESC", o.expr)
+                    alloc::format!("{key} DESC")
                 } else {
-                    alloc::format!("{}", o.expr)
+                    key
                 }
             })
             .collect();
@@ -1994,6 +2042,13 @@ impl Engine {
                     .bytes
                     .load(core::sync::atomic::Ordering::Relaxed),
             );
+            // 9.0.0 — and the sort's high-water memory, for
+            // `Sort Method: … Memory: NkB`. Reset rather than
+            // subtracted: a maximum is not a counter, and the delta of
+            // two maxima is not one.
+            self.spill_stats
+                .peak_bytes
+                .store(0, core::sync::atomic::Ordering::Relaxed);
             let started = self.clock.map(|f| f());
             // v7.37 (round 903) — ANALYZE runs the path the QUERY runs.
             //
@@ -2062,10 +2117,15 @@ impl Engine {
                     &deltas,
                     sel.limit.is_some(),
                 );
+                let peak_bytes = self
+                    .spill_stats
+                    .peak_bytes
+                    .load(core::sync::atomic::Ordering::Relaxed);
                 annotate_sort_method(
                     tree,
                     sel.limit.is_some(),
                     (spilled_files > 0).then_some(spilled_bytes),
+                    peak_bytes,
                 );
                 lines.clear();
                 render_costed(tree, !e.costs_off, &mut lines);
@@ -2082,40 +2142,21 @@ impl Engine {
                 let ms = us as f64 / 1000.0;
                 lines.push(alloc::format!("Execution Time: {ms:.3} ms"));
             }
-            // v7.37.22 (22.7) — BUFFERS adds a hot/cold row
-            // breakdown after Total. SPG's hot-tier row count is
-            // exactly the live-row count we already display; cold
-            // rows live in segments and don't get streamed through
-            // this scan's row counter, so the cold side reads as 0
-            // when the query touched only hot tier. The shape
-            // matches PG's "Buffers: shared hit=N read=M dirtied=K"
-            // line so dashboards parsing PG buffers can adapt.
-            if e.buffers {
-                // v7.37.19 (19.23 [PG+]) — cache-hit ratio
-                // alongside the hot/cold breakdown. PG dashboards
-                // commonly compute `shared_hit / (shared_hit +
-                // shared_read)` from pg_statio_user_tables; SPG's
-                // hot-tier rows are the cache-hit equivalent (no
-                // disk seek) and cold-tier rows the cache-miss
-                // equivalent. row_count = hot_rows + cold_rows;
-                // when both are zero (no rows touched) the ratio
-                // surfaces as "n/a" rather than 0/0.
-                let cold_rows: u64 = 0;
-                let hot_rows: u64 = row_count as u64;
-                let total_rows = hot_rows.saturating_add(cold_rows);
-                let ratio = if total_rows == 0 {
-                    alloc::string::String::from("n/a")
-                } else {
-                    // Two-decimal-place integer arithmetic — keeps
-                    // spg-engine no_std without pulling in libm.
-                    // ratio_x10000 ∈ [0, 10000]; divide for output.
-                    let ratio_x10000 = (hot_rows.saturating_mul(10_000)) / total_rows;
-                    alloc::format!("{}.{:02}", ratio_x10000 / 100, ratio_x10000 % 100)
-                };
-                lines.push(alloc::format!(
-                    "Buffers: hot_rows={hot_rows} cold_rows={cold_rows} cache_hit_ratio={ratio}"
-                ));
-            }
+            // 9.0.0 — BUFFERS used to add a line of SPG's own:
+            // `Buffers: hot_rows=10 cold_rows=0 cache_hit_ratio=100.00`.
+            // PostgreSQL's is `Buffers: shared hit=N read=M`, counted in
+            // 8 kB blocks, and it sits under each NODE and under
+            // `Planning:`. SPG has no buffer pool and no block, so the
+            // count does not exist to report; what it printed instead
+            // was its own vocabulary on a PostgreSQL surface — the
+            // hot_rows figure was the RESULT row count and cold_rows
+            // was the literal 0, so every query answered
+            // `cache_hit_ratio=100.00`.
+            //
+            // Nothing is printed now. A client asking for BUFFERS gets
+            // no buffer lines, which is a gap; it used to get a line no
+            // PostgreSQL tool can read carrying a number that meant
+            // something else.
         }
         // v7.37.22 (22.7) — SETTINGS appends GUCs that diverge from
         // default. Independent of ANALYZE — `EXPLAIN (SETTINGS) S`

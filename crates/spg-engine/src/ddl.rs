@@ -145,6 +145,115 @@ fn duplicate_column_message(name: &str, mysql: bool) -> alloc::string::String {
     }
 }
 
+/// 9.0.0 (D8) — does this SELECT read a column of that name anywhere?
+///
+/// The qualifier is not consulted: a view over `t` that names `a` reads
+/// `t.a` unless another relation in its FROM also has an `a`, and in
+/// that case refusing the drop is the safe answer — PostgreSQL's own
+/// dependency is recorded per column of per relation, and SPG's
+/// approximation may only be WIDER, never narrower.
+///
+/// A surviving `*` counts as reading everything.
+fn select_reads_column(sel: &spg_sql::ast::SelectStatement, column: &str) -> bool {
+    use spg_sql::ast::{Expr, SelectItem};
+    if sel
+        .items
+        .iter()
+        .any(|i| matches!(i, SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)))
+    {
+        // A `*` that survived D9's expansion stands over something the
+        // catalog cannot enumerate. A DERIVED TABLE can be asked,
+        // though — its own select list is right there — so recurse
+        // rather than refusing every column of the table it reads.
+        // Measured: PG allows `DROP COLUMN c` under
+        // `SELECT * FROM (SELECT a, b FROM sq) q` and refuses `b`.
+        let derived: Vec<&spg_sql::ast::SelectStatement> = sel
+            .from
+            .iter()
+            .flat_map(|f| core::iter::once(&f.primary).chain(f.joins.iter().map(|j| &j.table)))
+            .filter_map(|r| r.lateral_subquery.as_deref())
+            .collect();
+        if derived.is_empty() {
+            return true;
+        }
+        return derived.iter().any(|d| select_reads_column(d, column));
+    }
+    // One node walk, applied to every expression a SELECT holds. A
+    // free function rather than a closure so the `USING` check below can
+    // read `found` without the borrow outliving it.
+    fn names_column(e: &Expr, column: &str) -> bool {
+        let mut hit = false;
+        let mut probe = e.clone();
+        let Ok(()) = probe.for_each_node_mut::<core::convert::Infallible>(
+            &mut |node| {
+                if let Expr::Column(c) = node
+                    && c.name.eq_ignore_ascii_case(column)
+                {
+                    hit = true;
+                }
+                Ok(())
+            },
+            &mut |_| Ok(()),
+        );
+        hit
+    }
+    let mut found = false;
+    let mut visit = |e: &Expr, found: &mut bool| {
+        if names_column(e, column) {
+            *found = true;
+        }
+    };
+    for it in &sel.items {
+        if let SelectItem::Expr { expr, .. } = it {
+            visit(expr, &mut found);
+        }
+    }
+    if let Some(w) = &sel.where_ {
+        visit(w, &mut found);
+    }
+    if let Some(h) = &sel.having {
+        visit(h, &mut found);
+    }
+    if let Some(g) = &sel.group_by {
+        for e in g {
+            visit(e, &mut found);
+        }
+    }
+    for o in &sel.order_by {
+        visit(&o.expr, &mut found);
+    }
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(on) = &j.on {
+                visit(on, &mut found);
+            }
+        }
+    }
+    if let Some(from) = &sel.from {
+        for j in &from.joins {
+            if let Some(cols) = &j.using_cols
+                && cols.iter().any(|c| c.eq_ignore_ascii_case(column))
+            {
+                found = true;
+            }
+        }
+    }
+    found
+}
+
+/// 9.0.0 (D9) — one expanded wildcard column, as PostgreSQL writes it:
+/// qualified only where more than one relation is in scope.
+fn wildcard_column_item(qualifier: Option<String>, name: String) -> spg_sql::ast::SelectItem {
+    spg_sql::ast::SelectItem::Expr {
+        expr: spg_sql::ast::Expr::Column(spg_sql::ast::ColumnName {
+            qualifier,
+            name,
+            token: spg_sql::ast::SrcToken::default(),
+        }),
+        alias: None,
+    }
+}
+
 impl Engine {
     /// v6.7.2 — `ALTER TABLE t SET hot_tier_bytes = X`. Dispatch
     /// arm. Currently the only setting is `hot_tier_bytes`; later
@@ -2310,6 +2419,53 @@ impl Engine {
         Ok(())
     }
 
+    /// 9.0.0 (D8) — the views that read `table.column`.
+    ///
+    /// PostgreSQL's dependency is COLUMN-precise: dropping a column no
+    /// view reads is allowed, dropping one a view reads is refused.
+    /// SPG's check was relation-level (D7), so it could not tell the
+    /// two apart and allowed both — leaving a view whose every SELECT
+    /// then failed.
+    ///
+    /// Readable now because a view's `*` is expanded at CREATE (D9), so
+    /// the stored body names every column it reads. A body that still
+    /// carries a `*` (over a subquery or a table function) is treated
+    /// as reading EVERY column of the relations it names: over-refusing
+    /// there is the safe direction, and PostgreSQL refuses it too,
+    /// because its own `*` is expanded.
+    pub(crate) fn views_reading_column(
+        &self,
+        tbl: &str,
+        column: &str,
+    ) -> Vec<alloc::string::String> {
+        use spg_sql::ast::Statement;
+        let cat = self.active_catalog();
+        let mut out: Vec<alloc::string::String> = Vec::new();
+        let bodies = cat
+            .views_all()
+            .iter()
+            .map(|(n, d)| (n.clone(), d.body.clone()))
+            .chain(
+                cat.materialized_views()
+                    .iter()
+                    .map(|(n, b)| (n.clone(), b.clone())),
+            );
+        for (vname, body) in bodies {
+            let Ok(Statement::Select(mut sel)) = spg_sql::parser::parse_statement(&body) else {
+                continue;
+            };
+            if !crate::substitute::select_reads_relation(&mut sel, tbl) {
+                continue;
+            }
+            if select_reads_column(&sel, column) {
+                out.push(vname);
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
     fn alter_drop_column(
         &mut self,
         tbl: &str,
@@ -2323,6 +2479,32 @@ impl Engine {
         // FK on this table or partial-index predicate
         // references the column; CASCADE removes those
         // dependents first.
+        // 9.0.0 (D8) — a view that READS this column, refused the way
+        // PostgreSQL refuses it. Before the borrow below, because the
+        // check reads the whole catalog.
+        //
+        // ```text
+        //   ERROR:  cannot drop column a of table dt8 because other objects depend on it
+        //   DETAIL:  view dv8 depends on column a of table dt8
+        //   HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+        // ```
+        if !cascade {
+            let readers = self.views_reading_column(tbl, &column);
+            if !readers.is_empty() {
+                let mut detail = alloc::string::String::new();
+                for (i, v) in readers.iter().enumerate() {
+                    let head = if i == 0 { "DETAIL:  " } else { "" };
+                    detail.push_str(&alloc::format!(
+                        "{head}view {v} depends on column {column} of table {tbl}\n"
+                    ));
+                }
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot drop column {column} of table {tbl} because other objects \
+                     depend on it\n{detail}HINT:  Use DROP ... CASCADE to drop the \
+                     dependent objects too."
+                )));
+            }
+        }
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -3610,10 +3792,16 @@ impl Engine {
                 // restoring into PostgreSQL then silently changed the
                 // index type. Every query those AMs exist for is answered
                 // by scan either way, so the name is all that was lost.
+                //
+                // `gin` and `brin` are here for the same reason even
+                // though SPG has both: it builds them for the shapes its
+                // GIN and BRIN kinds cover, and a B-tree for the rest —
+                // `USING gin (int_array_column)` was one of those, and
+                // reported `btree`.
                 idx.declared_am = stmt
                     .method_name
                     .as_deref()
-                    .filter(|m| matches!(*m, "gist" | "spgist" | "hash"))
+                    .filter(|m| matches!(*m, "gist" | "spgist" | "hash" | "gin" | "brin"))
                     .map(alloc::string::String::from);
                 // v7.39.11 — and each extra's ordering clause, which the
                 // parser used to drop. See `Index::extra_orders`.
@@ -6376,7 +6564,22 @@ impl Engine {
             Some(spg_sql::ast::ViewCheckOption::Local) => 1,
             Some(spg_sql::ast::ViewCheckOption::Cascaded) => 2,
         };
-        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body));
+        // 9.0.0 (D9) — `*` is expanded HERE, as PostgreSQL expands it.
+        //
+        // PG analyses a view at CREATE time and stores the columns the
+        // relation had at that moment: adding a column to `t` does not
+        // change `v`, and dropping one `v` reads is refused. SPG stored
+        // the text `SELECT * FROM t` and resolved it on every read, so
+        // the view followed the table's shape — a different answer from
+        // the same statement — and there was no column-level dependency
+        // for `DROP COLUMN` to check (D8).
+        //
+        // Measured on PG 18.6: one relation expands UNQUALIFIED even
+        // when it is aliased (`SELECT * FROM wt1 x` → `SELECT id, nm`),
+        // and a join qualifies by the alias.
+        let mut body = s.body;
+        self.expand_view_wildcards(&mut body)?;
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(body));
         let def = spg_storage::ViewDef {
             name,
             columns,
@@ -6398,6 +6601,100 @@ impl Engine {
     /// through the real executor with a zero-row bound, so it reflects exactly
     /// what a SELECT from the view would return — column overrides, view-on-view
     /// expansion, joins and all. Types come from the empty result's schema.
+    /// 9.0.0 (D9) — replace every `*` in a view body with the columns
+    /// it stands for, the way PostgreSQL stores them.
+    ///
+    /// Only a body whose FROM is plain relations is expanded: a
+    /// subquery, a table function or a set operation keeps its `*`,
+    /// because the columns it stands for are not the catalog's to read
+    /// and a WRONG expansion is worse than a late-bound one.
+    ///
+    /// # Errors
+    /// The qualifier of `q.*` naming no relation in the FROM.
+    fn expand_view_wildcards(
+        &self,
+        body: &mut spg_sql::ast::SelectStatement,
+    ) -> Result<(), EngineError> {
+        use spg_sql::ast::SelectItem;
+        let Some(from) = &body.from else {
+            return Ok(());
+        };
+        if !body.ctes.is_empty() || !body.unions.is_empty() {
+            return Ok(());
+        }
+        let cat = self.active_catalog();
+        // Each relation as it is named in the FROM, with the columns the
+        // catalog gives it. A relation this cannot resolve leaves every
+        // `*` alone.
+        let mut rels: alloc::vec::Vec<(String, alloc::vec::Vec<String>)> = alloc::vec::Vec::new();
+        for r in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+            if r.lateral_subquery.is_some()
+                || r.unnest_expr.is_some()
+                || r.generate_series_args.is_some()
+                || r.jsonb_each_text_arg.is_some()
+                || r.table_fn_call.is_some()
+            {
+                return Ok(());
+            }
+            let Some(table) = cat.get(&r.name) else {
+                return Ok(());
+            };
+            let label = r.alias.clone().unwrap_or_else(|| r.name.clone());
+            rels.push((
+                label,
+                table
+                    .schema()
+                    .columns
+                    .iter()
+                    .map(|c| c.name.clone())
+                    .collect(),
+            ));
+        }
+        if rels.is_empty()
+            || !body
+                .items
+                .iter()
+                .any(|i| matches!(i, SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)))
+        {
+            return Ok(());
+        }
+        // One relation: PostgreSQL writes the columns bare, alias or no
+        // alias. More than one: it qualifies.
+        let qualify = rels.len() > 1;
+        let mut out: alloc::vec::Vec<SelectItem> = alloc::vec::Vec::new();
+        for item in core::mem::take(&mut body.items) {
+            match item {
+                SelectItem::Wildcard => {
+                    for (label, cols) in &rels {
+                        for c in cols {
+                            out.push(wildcard_column_item(
+                                qualify.then(|| label.clone()),
+                                c.clone(),
+                            ));
+                        }
+                    }
+                }
+                SelectItem::QualifiedWildcard(qualifier) => {
+                    let Some((label, cols)) = rels
+                        .iter()
+                        .find(|(l, _)| l.eq_ignore_ascii_case(&qualifier))
+                    else {
+                        // A qualifier naming no relation: leave it, and
+                        // the body's own resolution raises PG's error.
+                        out.push(SelectItem::QualifiedWildcard(qualifier));
+                        continue;
+                    };
+                    for c in cols {
+                        out.push(wildcard_column_item(Some(label.clone()), c.clone()));
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        body.items = out;
+        Ok(())
+    }
+
     pub(crate) fn view_output_columns(
         &self,
         body: &spg_sql::ast::SelectStatement,
@@ -7197,7 +7494,15 @@ impl Engine {
             )));
         }
         // Render the body to canonical form for the registry.
-        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(s.body.clone()));
+        // 9.0.0 (D9) — with `*` expanded, as PostgreSQL stores it for a
+        // materialized view too (measured on 18.6: `CREATE MATERIALIZED
+        // VIEW mv AS SELECT * FROM mvt` reads back `SELECT a, b FROM
+        // mvt`). A matview's shape is fixed by its own contents anyway;
+        // what the expansion fixes here is the DEFINITION a dump
+        // carries, and the column dependency `DROP COLUMN` reads.
+        let mut mat_body = s.body.clone();
+        self.expand_view_wildcards(&mut mat_body)?;
+        let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(mat_body));
         // Execute the body to learn the columns. With WITH DATA we
         // also materialise the rows; with WITH NO DATA we only need
         // the schema, so re-use a LIMIT 0 wrap to keep the column

@@ -2,9 +2,25 @@
 //! option family. PG's standard surface; dashboards / regression
 //! tools depend on the option keywords being accepted (whether
 //! or not SPG's internals can produce a meaningful number for
-//! each one). Where SPG can fill the number in (BUFFERS hot rows,
-//! WAL records=0 for read-only SELECT) it does; the rest stay
-//! shaped but inert.
+//! each one). Where SPG can fill the number in (WAL records=0 for a
+//! read-only SELECT) it does; the rest stay shaped but inert.
+//!
+//! 9.0.0 — BUFFERS no longer emits a line. It used to add one of SPG's
+//! own —
+//!
+//! ```text
+//!   Buffers: hot_rows=3 cold_rows=0 cache_hit_ratio=100.00
+//! ```
+//!
+//! — where PostgreSQL 18.6 writes `Buffers: shared hit=6` under each
+//! NODE and under `Planning:`, counted in 8 kB blocks. SPG has no
+//! buffer pool and no block, so that count does not exist to report;
+//! what it printed instead was SPG's vocabulary on a PostgreSQL
+//! surface, and the numbers in it were the RESULT row count and the
+//! literal zero, so every query in the world answered
+//! `cache_hit_ratio=100.00`. The three tests that pinned that line
+//! now pin its ABSENCE, which is what a PostgreSQL client parsing the
+//! plan sees.
 
 use spg_engine::{Engine, QueryResult};
 use spg_storage::Value;
@@ -27,47 +43,45 @@ fn plan_text(e: &mut Engine, sql: &str) -> String {
 }
 
 #[test]
-fn explain_buffers_includes_cache_hit_ratio() {
-    // v7.37.19 (19.23 [PG+]) — BUFFERS line carries
-    // cache_hit_ratio next to hot_rows / cold_rows.
+fn explain_buffers_is_accepted_and_prints_no_line_of_its_own() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1), (2), (3), (4)")
         .unwrap();
     let plan = plan_text(&mut e, "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t");
+    // The option is still accepted — a tool that always asks for
+    // BUFFERS must not get a syntax error.
+    assert!(plan.contains("Seq Scan on t"), "no plan at all: {plan}");
     assert!(
-        plan.contains("cache_hit_ratio="),
-        "missing cache_hit_ratio: {plan}"
-    );
-    // 4 hot, 0 cold → ratio = 100.00.
-    assert!(
-        plan.contains("cache_hit_ratio=100.00"),
-        "ratio for 4 hot / 0 cold should be 100.00: {plan}"
+        !plan.contains("hot_rows") && !plan.contains("cache_hit_ratio"),
+        "SPG's own buffer vocabulary is back: {plan}"
     );
 }
 
 #[test]
-fn explain_buffers_cache_hit_ratio_is_na_on_empty_result() {
+fn explain_buffers_says_nothing_on_an_empty_result_either() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT)").unwrap();
-    // Empty table — 0 hot + 0 cold → ratio = n/a.
     let plan = plan_text(&mut e, "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t");
-    assert!(
-        plan.contains("cache_hit_ratio=n/a"),
-        "empty-result ratio should be n/a: {plan}"
-    );
+    assert!(!plan.contains("Buffers:"), "a buffer line appeared: {plan}");
 }
 
 #[test]
-fn explain_buffers_emits_hot_cold_line() {
+fn a_client_parsing_the_plan_sees_no_buffers_key_it_cannot_read() {
+    // PostgreSQL's key is `Buffers: shared hit=N`. Any other spelling
+    // under that name is worse than no line: an explain parser reads
+    // the key and fails on the value.
     let mut e = Engine::new();
     e.execute("CREATE TABLE t (id INT NOT NULL)").unwrap();
     e.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
     let plan = plan_text(&mut e, "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM t");
-    assert!(
-        plan.contains("Buffers: hot_rows=3 cold_rows=0"),
-        "missing Buffers line: {plan}"
-    );
+    for line in plan.lines() {
+        let trimmed = line.trim();
+        assert!(
+            !trimmed.starts_with("Buffers:") || trimmed.starts_with("Buffers: shared "),
+            "a Buffers line PostgreSQL does not write: {trimmed}"
+        );
+    }
 }
 
 #[test]
@@ -125,7 +139,6 @@ fn explain_combined_options_compose() {
         &mut e,
         "EXPLAIN (ANALYZE, BUFFERS, WAL, SETTINGS, TIMING OFF) SELECT * FROM t",
     );
-    assert!(plan.contains("Buffers:"), "missing Buffers: {plan}");
     assert!(plan.contains("WAL:"), "missing WAL: {plan}");
     assert!(plan.contains("Settings:"), "missing Settings: {plan}");
     assert!(!plan.contains("elapsed="), "TIMING OFF wins: {plan}");

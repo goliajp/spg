@@ -22293,6 +22293,7 @@ impl Parser {
                     on: None,
                     using_cols: None,
                     natural: false,
+                    comma: true,
                 });
                 continue;
             }
@@ -22397,6 +22398,7 @@ impl Parser {
                     on: None,
                     using_cols: None,
                     natural: true,
+                    comma: false,
                 });
                 continue;
             }
@@ -22496,6 +22498,7 @@ impl Parser {
                 on,
                 using_cols,
                 natural: false,
+                comma: false,
             });
         }
         Ok(joins)
@@ -28000,27 +28003,70 @@ fn lift_date_add_arg_to_timestamptz(name: &str, args: &mut alloc::vec::Vec<Expr>
 /// position keeps working with expression indexes). Returns
 /// `None` when the expression has no column ref at all — caller
 /// surfaces that as a parse error.
+/// The first column an index key's expression reads, in source order —
+/// which is the column SPG files the key under.
+///
+/// 9.0.0 — exhaustive. It used to list six node kinds and answer `None`
+/// for the rest, so `CREATE INDEX … ((a LIKE 'p%'))`, `((a IS NULL))`,
+/// `((a IN ('p','q')))` and `(CASE WHEN a = 'x' …)` — all ordinary
+/// PostgreSQL — were refused with "expression index key must reference
+/// at least one column", naming a column that is right there. The
+/// catch-all is what let each new node kind arrive already broken; there
+/// is none now, so the next one will not compile until it is answered.
 fn extract_first_column(expr: &Expr) -> Option<String> {
+    let first = |es: &[Expr]| es.iter().find_map(extract_first_column);
     match expr {
         Expr::Column(cn) => Some(cn.name.clone()),
-        Expr::FunctionCall { args, .. } => args.iter().find_map(extract_first_column),
+        Expr::Literal(_) | Expr::Placeholder(_) => None,
+        // A subquery is not a column of THIS table, and PostgreSQL
+        // refuses one in an index key outright.
+        Expr::ScalarSubquery(_) | Expr::Exists { .. } => None,
+        Expr::Collate { expr: e, .. }
+        | Expr::NamedArg { expr: e, .. }
+        | Expr::Variadic(e)
+        | Expr::Unary { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::FieldAccess { base: e, .. }
+        | Expr::IsNull { expr: e, .. }
+        | Expr::BoolTest { expr: e, .. }
+        | Expr::Extract { source: e, .. }
+        | Expr::AggregateOrdered { call: e, .. }
+        | Expr::InSubquery { expr: e, .. } => extract_first_column(e),
         Expr::Binary { lhs, rhs, .. } => {
             extract_first_column(lhs).or_else(|| extract_first_column(rhs))
         }
-        Expr::Unary { expr: e, .. } => extract_first_column(e),
-        // v7.39 (read01 round 93) — a cast wraps its operand: a common
-        // expression-index key is `lower(col::text)`, where the column
-        // sits under the `::text` cast inside the function arg. Without
-        // descending here the key was rejected as "references no column".
-        Expr::Cast { expr: e, .. } => extract_first_column(e),
-        // v7.39.2 — and a COLLATE wraps its operand the same way.
-        // `CREATE INDEX rc ON t (c COLLATE "C" DESC)` stopped naming a
-        // column the moment the clause became a node instead of being
-        // absorbed, and the key was rejected as referencing none. This
-        // is the shape the wildcard below silently produces, which is
-        // why it is spelled out.
-        Expr::Collate { expr: e, .. } => extract_first_column(e),
-        _ => None,
+        Expr::Like {
+            expr: e, pattern, ..
+        } => extract_first_column(e).or_else(|| extract_first_column(pattern)),
+        Expr::ArraySubscript { target, index } => {
+            extract_first_column(target).or_else(|| extract_first_column(index))
+        }
+        Expr::ArraySlice { target, lo, hi } => extract_first_column(target)
+            .or_else(|| lo.as_deref().and_then(extract_first_column))
+            .or_else(|| hi.as_deref().and_then(extract_first_column)),
+        Expr::AnyAll { expr: e, array, .. } => {
+            extract_first_column(e).or_else(|| extract_first_column(array))
+        }
+        Expr::InList { expr: e, list, .. } => extract_first_column(e).or_else(|| first(list)),
+        Expr::FunctionCall { args, .. } => first(args),
+        Expr::Array(items) => first(items),
+        Expr::RowInSubquery { row, .. } | Expr::RowCmpSubquery { row, .. } => first(row),
+        Expr::WindowFunction {
+            args, partition_by, ..
+        } => first(args).or_else(|| first(partition_by)),
+        Expr::Case {
+            operand,
+            branches,
+            else_branch,
+        } => operand
+            .as_deref()
+            .and_then(extract_first_column)
+            .or_else(|| {
+                branches
+                    .iter()
+                    .find_map(|(w, r)| extract_first_column(w).or_else(|| extract_first_column(r)))
+            })
+            .or_else(|| else_branch.as_deref().and_then(extract_first_column)),
     }
 }
 

@@ -727,6 +727,8 @@ impl Engine {
             let cat = staged.as_ref().unwrap_or_else(|| self.active_catalog());
             self.validate_from_relations(s, cat)?;
             self.validate_clause_columns_in(s, cat)?;
+            self.validate_function_names(s)?;
+            self.validate_literal_coercions(s)?;
             self.validate_function_arity(s)?;
             self.validate_cast_targets(s)?;
             self.validate_predicate_is_boolean(s)?;

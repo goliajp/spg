@@ -502,6 +502,21 @@ pub fn cast_value_ref_in(
     if matches!(v, Value::Null) {
         return Ok(Value::Null);
     }
+    // 9.0.0 — `oidvector` and `int2vector` are arrays to every cast that
+    // takes one; PostgreSQL converts them element-wise. `indkey::int[]`
+    // and `indclass::oid[]` — the shape a schema-diff query uses to read
+    // an index — answered "::INT[] does not accept int2vector". The
+    // vector's own targets (`::text`, `::oidvector`) are unaffected: they
+    // do not reach here as an array target.
+    let v = match (&v, array_element_cast_target(target)) {
+        (Value::OidVector(items), true) => {
+            Value::BigIntArray(items.iter().map(|n| Some(i64::from(*n))).collect())
+        }
+        (Value::Int2Vector(items), true) => {
+            Value::IntArray(items.iter().map(|n| Some(i32::from(*n))).collect())
+        }
+        _ => v,
+    };
     match target {
         CastTarget::Vector => cast_to_vector(v),
         // v7.38 (read01) — the inet/cidr ::text cast shows the mask even for
@@ -1982,6 +1997,17 @@ fn is_bare_temporal_type(name: &str) -> bool {
     ["time", "timestamp", "datetime"]
         .iter()
         .any(|k| t.eq_ignore_ascii_case(k))
+}
+
+/// 9.0.0 — whether this cast target is an array, so a vector input should
+/// be spread into one first. `Named` covers every `foo[]` the parser did
+/// not give its own variant.
+fn array_element_cast_target(target: &CastTarget) -> bool {
+    match target {
+        CastTarget::TextArray | CastTarget::IntArray | CastTarget::BigIntArray => true,
+        CastTarget::Named(n) => n.ends_with("[]") || n.starts_with('_'),
+        _ => false,
+    }
 }
 
 fn cast_to_int_array(v: Value) -> Result<Value, EvalError> {

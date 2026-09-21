@@ -91,4 +91,11 @@ pub struct SpillStats {
     pub files: core::sync::atomic::AtomicU64,
     /// Bytes written across those runs.
     pub bytes: core::sync::atomic::AtomicU64,
+    /// 9.0.0 — the most bytes a sort batch held at once, which is what
+    /// `EXPLAIN (ANALYZE)` reports beside `Sort Method` (PG prints
+    /// `Sort Method: quicksort  Memory: 25kB`; SPG printed the method
+    /// alone). Measured, not estimated: the batch's arena plus its key
+    /// and offset vectors, the same figure the spill budget is compared
+    /// against.
+    pub peak_bytes: core::sync::atomic::AtomicU64,
 }

@@ -319,6 +319,8 @@ impl Engine {
         // statement answered two ways depending on which executor its
         // shape reached.
         self.validate_clause_columns(s)?;
+        self.validate_function_names(s)?;
+        self.validate_literal_coercions(s)?;
         self.validate_function_arity(s)?;
         self.validate_cast_targets(s)?;
         self.validate_predicate_is_boolean(s)?;
@@ -376,6 +378,8 @@ impl Engine {
         // zero rows there while raising in-process, on the MySQL wire, and
         // for `GROUP BY` / `HAVING` — shapes this shortcut declines.
         self.validate_clause_columns(s)?;
+        self.validate_function_names(s)?;
+        self.validate_literal_coercions(s)?;
         self.validate_function_arity(s)?;
         self.validate_cast_targets(s)?;
         self.validate_predicate_is_boolean(s)?;
@@ -435,6 +439,8 @@ impl Engine {
         // still wins because Engine::execute path keeps materialising.
         // v7.39.2 — before the shortcut, for the reason above.
         self.validate_clause_columns(&s)?;
+        self.validate_function_names(&s)?;
+        self.validate_literal_coercions(&s)?;
         self.validate_function_arity(&s)?;
         self.validate_cast_targets(&s)?;
         self.validate_predicate_is_boolean(&s)?;

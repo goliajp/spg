@@ -171,6 +171,32 @@ pub(crate) fn rewrite_clock_calls_at(
     cx.folded.get()
 }
 
+/// 9.0.0 — does the clock folder answer this call?
+///
+/// `now()` and its fifteen siblings never reach the scalar dispatch: the
+/// folder replaces them before it runs, which is why the dispatch does
+/// not know the name and why `validate_function_names` refused
+/// `PREPARE p AS SELECT now()` the moment that check existed.
+///
+/// Asked of the folder itself rather than of a list beside it: every
+/// name in the family is decided in `clock_replacement_for`, so a name
+/// added there is answered here without anything else changing.
+pub(crate) fn folds_clock_call(e: &Expr, mysql: bool) -> bool {
+    let cx = ClockFold {
+        // Any instant will do — the question is whether the folder
+        // CLAIMS the call, not what it would put there.
+        at: ClockAt {
+            xact: 0,
+            stmt: 0,
+            wall: 0,
+        },
+        mysql,
+        tz_offset: 0,
+        folded: core::cell::Cell::new(false),
+    };
+    clock_replacement_for(e, &cx).is_some()
+}
+
 fn rewrite_stmt_clock(stmt: &mut Statement, cx: &ClockFold) {
     match stmt {
         Statement::Select(s) => rewrite_select_clock(s, cx),
