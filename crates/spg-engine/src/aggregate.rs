@@ -1153,18 +1153,41 @@ pub(crate) fn run(
     // at least one enum type, and a collation has nothing to do with enums.
     for spec in &mut agg_specs {
         if matches!(spec.kind, AggKind::Min | AggKind::Max)
-            && let Some(Expr::Column(c)) = &spec.arg
+            && let Some(arg) = &spec.arg
         {
-            // A bare column argument carries its collation; an expression
-            // produces a new value and has none (derivation is unbuilt).
-            spec.arg_collation = schema_cols
-                .iter()
-                .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
-                .and_then(|sc| sc.collation_name.clone())
+            // 9.0.1 — DERIVED, the way an ORDER BY key's collation has
+            // been since round 692. The comment that stood here said an
+            // expression argument "has none (derivation is unbuilt)",
+            // and by then it was built: only a BARE COLUMN took a
+            // collation, so `min(x || '')` compared by BYTES while
+            // `min(x)` over the same column compared under the
+            // database's. On `en_US.utf8`, PostgreSQL 18.6 answers `tj`
+            // to both and SPG answered `t_pkey` to the first.
+            let derived = crate::collate_derive::derive(arg, &|c| {
+                schema_cols
+                    .iter()
+                    .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                    .and_then(|sc| sc.collation_name.clone())
+            });
+            // …and a `name` COLUMN takes no database collation: its
+            // type's own is `C`. A cast to `name` does NOT suppress it
+            // — PostgreSQL derives a collation from the INPUTS and
+            // carries it through a cast, so `min(x::name)` over a text
+            // column answers the locale's order (measured).
+            let arg_is_c = match arg {
+                Expr::Column(c) => schema_cols
+                    .iter()
+                    .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
+                    .is_some_and(|sc| crate::collate::type_collates_as_c(&sc.ty)),
+                _ => false,
+            };
+            spec.arg_collation = derived
+                .name()
+                .map(alloc::string::String::from)
                 // v7.38.18 (S2) — the database's when the column
                 // declares none. `C` filters out below, so nothing moves
                 // for a database that has not asked for a locale.
-                .or_else(|| db_collation.map(alloc::string::String::from))
+                .or_else(|| (!arg_is_c).then(|| db_collation.map(alloc::string::String::from))?)
                 .filter(|n| crate::collate::is_supported(n));
         }
     }

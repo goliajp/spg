@@ -20,3 +20,5 @@
 19-sqlstate-codes	0
 20-pg-trgm	0
 21-schemas	0
+22-schema-collisions	0
+23-name-collation	0

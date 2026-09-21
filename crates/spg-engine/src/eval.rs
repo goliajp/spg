@@ -2415,6 +2415,19 @@ fn collate_compare_hook(
     if crate::eval::is_binary_coerced(lhs) || crate::eval::is_binary_coerced(rhs) {
         return None;
     }
+    // 9.0.1 — an operand whose collation comes from a TYPE that
+    // collates as `C` ends the chain the same way, and it takes the
+    // comparison with it: PostgreSQL 18.6 answers `f` to all three of
+    // `'tj'::name < 't_pkey'::name`, `< 't_pkey'` and `< 't_pkey'::text`
+    // where `'tj'::text < 't_pkey'::text` is `t`. A name DECLARED on an
+    // operand still wins — it is what `derived` carries, checked first.
+    if derived.name().is_none()
+        && [lhs, rhs]
+            .iter()
+            .any(|e| crate::orderby::term_collation_is_type_c(e, ctx))
+    {
+        return None;
+    }
     // v7.39.4 — the SESSION sits between the two, and it was missing.
     //
     // The chain here was "what the operands declare, else the DATABASE",

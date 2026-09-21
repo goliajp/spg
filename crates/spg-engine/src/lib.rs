@@ -328,7 +328,7 @@ pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
 pub(crate) use orderby::{
     OrderKey, apply_offset_and_limit, apply_offset_and_limit_tagged, build_order_keys,
     canonical_value_repr, cmp_multi_key, expand_group_by_all, order_by_value_cmp,
-    order_by_value_cmp_in, render_histogram_bounds, resolve_order_by_position, sort_by_keys,
+    order_by_value_cmp_in, render_histogram_bounds, resolve_order_by_position,
     sort_values_for_histogram, topk_trim, value_cmp, value_to_f64,
 };
 pub use select::{DISTINCT_DUP_DROPPED, PROJ_DIRECT_FIRE, PROJ_ROW_BUILT, SCAN_PATH_ENTERED};

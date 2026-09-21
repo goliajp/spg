@@ -635,6 +635,34 @@ pub(crate) const fn is_collatable(t: &spg_storage::DataType) -> bool {
     )
 }
 
+/// 9.0.1 — the types whose OWN collation is `C`, whatever the database
+/// collates as.
+///
+/// `name` is the catalog's identifier type, and PostgreSQL gives it the
+/// `C` collation at the type level so that a catalog listing is ordered
+/// the same way everywhere. Measured on PostgreSQL 18.6 in an
+/// `en_US.utf8` database:
+///
+/// ```text
+///   'tj'::name < 't_pkey'::name          f      (bytes: `_` < `j`)
+///   'tj'::text < 't_pkey'::text          t      (the locale ignores `_`)
+///   min(<a name column>)                 t_pkey
+///   … COLLATE "en_US.utf8"               t      (an explicit name wins)
+/// ```
+///
+/// SPG answered `t` throughout, so every `ORDER BY relname` — which is
+/// what psql's listings, schema-diff tools and a dump's object order
+/// are built on — came back in a different order from PostgreSQL's
+/// whenever two names differed by punctuation.
+///
+/// It is not the same question as [`is_collatable`]: `name` IS
+/// collatable, which is why `ORDER BY relname COLLATE "en_US.utf8"`
+/// is legal and answers the locale's order.
+#[must_use]
+pub(crate) const fn type_collates_as_c(t: &spg_storage::DataType) -> bool {
+    matches!(t, spg_storage::DataType::Name)
+}
+
 /// PostgreSQL's own wording for the refusal, so a driver reading the
 /// message gets the same string from both engines.
 #[must_use]
