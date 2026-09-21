@@ -10,6 +10,35 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Fixed — a schema reached the relations and only half the catalog
+
+**Shipped in 9.0.0.** 9.0.0 gave a relation a schema, and six catalog
+surfaces went on answering `public` or answering nothing. Found by
+comparing a two-schema database against PostgreSQL 18.6 line by line —
+not by anything in the repository, which is why that comparison is now
+a corpus file (`xtests/diffcorpus/21-schemas.sql`, 17 shapes over 13
+surfaces) and runs on every release.
+
+* an index's `relnamespace` was its own name's schema, so every index
+  was in `public`;
+* a view was listed in `public` by `information_schema.tables` while
+  `pg_class` had it right — two surfaces disagreeing about one view;
+* `information_schema.columns` listed no column of any relation outside
+  `public`, and none of a view's at all;
+* `pg_indexes` listed nothing outside `public`;
+* `'sa.t'::regclass` answered `relation "t" does not exist`.
+
+Two of them put the stored KEY into text a client reads, and a key
+carries its schema with a byte no identifier may contain, so the text
+truncates there. `pg_indexes.indexdef` came back as
+`CREATE INDEX sa_t_n ON public.sa`, and — worse — a view's stored BODY
+became `SELECT id FROM "sa`, which cannot be re-parsed: `SELECT * FROM
+sa.v` answered `invalid byte sequence for encoding "UTF8": 0x00`.
+
+That last class is fixed at one point rather than two hundred: the AST's
+identifier renderer recognises a key, and the test is exact because the
+separator cannot occur in a name the lexer will produce.
+
 ### Fixed — `pg_class` listed another database's relations, and `pg_dump` stopped
 
 **Shipped in 9.0.0 and found on the published image.** 9.0.0 gave a

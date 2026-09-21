@@ -1765,7 +1765,33 @@ pub(crate) fn mysql_leading_number(s: &str) -> f64 {
 /// 32768+, and the synthesised system catalogs at their REAL PG oids.
 /// `None` when the name is unknown (the caller keeps the legacy text
 /// behaviour so `'anything'::regclass::text` still round-trips).
+/// 9.0.0 (C9) — the name `::regclass` looks a relation up by.
+///
+/// A qualified spelling becomes the KEY the catalog stores the relation
+/// under; `public`, `pg_catalog` and `information_schema` are implicit,
+/// so those reduce to the bare name exactly as before. An unqualified
+/// spelling is left alone for the catalog's own resolver to place.
+fn regclass_lookup_name(text: &str) -> alloc::string::String {
+    let trimmed = text.trim();
+    match trimmed.rsplit_once('.') {
+        Some((schema, name)) => {
+            spg_sql::namespace::qualified_key(schema.trim_matches('"'), name.trim_matches('"'))
+        }
+        None => alloc::string::String::from(trimmed.trim_matches('"')),
+    }
+}
+
 pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Option<i64> {
+    // 9.0.0 (C9) — a relation may live in a schema, so the name is
+    // resolved by the catalog's OWN resolver first: that is what knows
+    // the session's `search_path`, its temporary namespace and its
+    // database. The walk below matches a stored key literally, and an
+    // unqualified `t` is not the key of `sa.t`.
+    if let Some(key) = cat.get(bare).map(|t| t.schema().name.clone())
+        && let Some(oid) = crate::system_catalog::relation_oid(cat, &key)
+    {
+        return Some(oid);
+    }
     // v7.39 (round 337, V62) — an INDEX and a SEQUENCE are relations too:
     // both have a `pg_class` row, so both answer to `::regclass` in PG.
     // v7.39 (round 338, V64) — and the bands live in ONE allocator now,
@@ -3043,12 +3069,10 @@ fn eval_cast_arm(
             return Ok(Value::RegClass(oid, name.into()));
         }
         if let (Value::Text(s), Some(cat)) = (&v, ctx.catalog) {
-            let bare = s
-                .rsplit('.')
-                .next()
-                .unwrap_or(s)
-                .trim_matches('"')
-                .to_string();
+            // 9.0.0 (C9) — `'sa.t'::regclass` names the relation in `sa`.
+            // The qualifier was stripped here, so it looked for a bare
+            // `t` and answered `relation "t" does not exist`.
+            let bare = regclass_lookup_name(s);
             // 9.0.0 — PostgreSQL's `regclassin` reads an all-digit string
             // as the OID itself, and the relation need not exist
             // (`'999999'::regclass` is `999999` on 18.6). SPG looked it
@@ -3064,7 +3088,12 @@ fn eval_cast_arm(
                 return Ok(Value::RegClass(oid, name.into()));
             }
             if let Some(oid) = regclass_name_to_oid(cat, &bare) {
-                return Ok(Value::RegClass(oid, bare.into()));
+                // 9.0.0 (C9) — a RegClass carries the name a client
+                // READS. `bare` is the stored key, whose separator is
+                // not a character a name may contain, so
+                // `'sa.t'::regclass::text` rendered `sa`.
+                let shown = spg_sql::namespace::display_key(&bare);
+                return Ok(Value::RegClass(oid, shown.into()));
             }
             // v7.39 (round 337, V62) — a name that is no relation at all is
             // PG's error, not a silent pass-through. `'nope'::regclass`
