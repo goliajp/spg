@@ -197,15 +197,22 @@ fn a_relation_in_a_schema_has_its_own_catalog_identity() {
     // A sequence in a schema has a data row. This join is `pg_dump`'s
     // own; with no row for a sequence `pg_class` lists, it dereferences
     // the miss and SEGFAULTS.
+    // Counting rows is the weakest thing to assert here: two rows under
+    // ONE oid also count two. The oids must be the two `pg_class`
+    // publishes, and each sequence's own START must come back with it.
+    let seq_oids = rows(
+        &mut c,
+        "SELECT oid FROM pg_class WHERE relkind = 'S' ORDER BY oid",
+    );
+    assert_eq!(seq_oids.len(), 2, "two sequences in pg_class");
     assert_eq!(
         rows(
             &mut c,
             "SELECT seqrelid, last_value FROM pg_catalog.pg_sequence, \
              pg_get_sequence_data(seqrelid) ORDER BY seqrelid"
-        )
-        .len(),
-        2,
-        "both sequences answer, not just the one in public"
+        ),
+        vec![format!("{}|5", seq_oids[0]), format!("{}|50", seq_oids[1]),],
+        "each sequence answers under its OWN oid, with its own value"
     );
 
     // …and it advances by its own name.
