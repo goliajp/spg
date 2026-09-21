@@ -659,6 +659,7 @@ mod e2e_named_cast_round607;
 mod e2e_named_constraints_round48;
 mod e2e_named_timezones;
 mod e2e_named_zone_wall_cast_round309;
+mod e2e_namespaces_900;
 mod e2e_nested_composite_round264;
 mod e2e_nested_order_distinct_round529;
 mod e2e_nested_over_computed_view_round155;

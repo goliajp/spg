@@ -166,17 +166,25 @@ fn round697_the_extension_list_and_the_catalog_agree() {
     ok(&mut e, "DROP EXTENSION pg_trgm");
 }
 
-/// Residuals pinned as differences so the day one changes, someone sees it
-/// — and round 707 proved the mechanism: the DROP AGGREGATE half of this
-/// pin went red the day that gap closed, and left this file carrying only
-/// the SET SCHEMA half.
+/// 9.0.0 (C9) — the last recorded residual, closed. It was pinned as a
+/// difference so the day it changed someone would see it, and this is the
+/// second time the mechanism worked: round 707 took the DROP AGGREGATE
+/// half, and namespaces take the SET SCHEMA half.
+///
+/// `ALTER TABLE … SET SCHEMA` was consumed and ignored because SPG had
+/// one schema; with a relation belonging to one, an ignored move is a
+/// statement that reports success while the catalog disagrees.
 #[test]
-fn round697_the_two_recorded_residuals() {
+fn round697_set_schema_moves_the_relation() {
     let mut e = Engine::new();
     e.execute("CREATE TABLE t697(i INT)").unwrap();
-    // PG: `schema "nosuch697" does not exist`. See the header for why this
-    // one cannot be checked while CREATE SCHEMA does not register.
-    ok(&mut e, "ALTER TABLE t697 SET SCHEMA nosuch697");
+    let err = e
+        .execute("ALTER TABLE t697 SET SCHEMA nosuch697")
+        .expect_err("PG: schema \"nosuch697\" does not exist");
+    assert!(
+        format!("{err}").contains("schema \"nosuch697\" does not exist"),
+        "{err}"
+    );
     ok(&mut e, "CREATE SCHEMA s697");
     let schemas = match e.execute("SELECT nspname FROM pg_namespace").unwrap() {
         QueryResult::Rows { rows, .. } => rows
@@ -185,9 +193,15 @@ fn round697_the_two_recorded_residuals() {
             .collect::<Vec<_>>(),
         other => panic!("{other:?}"),
     };
+    assert!(schemas.iter().any(|s| s == "s697"), "{schemas:?}");
+    ok(&mut e, "ALTER TABLE t697 SET SCHEMA s697");
     assert!(
-        !schemas.iter().any(|s| s == "s697"),
-        "if CREATE SCHEMA starts registering, SET SCHEMA becomes checkable: {schemas:?}"
+        e.execute("SELECT i FROM t697").is_err(),
+        "it is not in `public` any more"
+    );
+    assert!(
+        e.execute("SELECT i FROM s697.t697").is_ok(),
+        "it is in `s697` now"
     );
 }
 

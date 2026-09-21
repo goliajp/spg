@@ -1674,6 +1674,19 @@ fn lex_quoted(
             }
         } else {
             let ch = input[i..].chars().next().expect("non-empty UTF-8 boundary");
+            // 9.0.0 (C9) — NUL is not a character a name or a string may
+            // contain. PostgreSQL refuses it (`invalid byte sequence for
+            // encoding "UTF8": 0x00`, measured on 18.6) because its
+            // identifiers and its wire protocol are NUL-terminated; the
+            // embedded API hands the parser a Rust `&str`, which can hold
+            // one, and a relation key uses NUL to carry the schema, so a
+            // name that contained one would forge a key.
+            if ch == '\0' {
+                return Err(LexError {
+                    kind: LexErrorKind::InvalidByteSequence(0),
+                    pos: i,
+                });
+            }
             s.push(ch);
             i += ch.len_utf8();
         }

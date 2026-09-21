@@ -2916,7 +2916,9 @@ fn eval_cast_arm(
             }
         {
             let named = if name.eq_ignore_ascii_case("regnamespace") {
-                crate::system_catalog::schema_name_for_oid(oid)
+                ctx.engine.and_then(|e| {
+                    crate::system_catalog::schema_name_for_oid(e.active_catalog(), oid)
+                })
             } else {
                 ctx.engine.and_then(|e| e.role_name_for_oid(oid))
             };

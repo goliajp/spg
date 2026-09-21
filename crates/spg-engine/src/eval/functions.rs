@@ -15807,7 +15807,7 @@ fn apply_function_dispatch(
                     // PRODUCES, rather than replaying the count and
                     // getting it wrong. `catalog_indexes` is what assigns
                     // the OIDs `pg_index` and `pg_class` report: it walks
-                    // `visible_table_names()` and SKIPS the probe indexes
+                    // `visible_relation_keys()` and SKIPS the probe indexes
                     // SPG derives for a constraint's non-leading columns,
                     // which PostgreSQL has no equivalent of. This replay
                     // walked `table_names()` and skipped nothing, so every

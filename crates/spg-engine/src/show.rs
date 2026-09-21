@@ -19,7 +19,7 @@ impl Engine {
         let columns = alloc::vec![ColumnSchema::new("name", DataType::Text, false)];
         let rows: Vec<Row<'static>> = self
             .active_catalog()
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .map(|n| Row::new(alloc::vec![Value::text(n)]))
             .collect();

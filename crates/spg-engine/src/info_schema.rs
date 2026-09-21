@@ -6111,7 +6111,7 @@ pub(crate) fn synth_derived_info_schema(
             .collect(),
         // Each column's own type, named as the catalog names it.
         "column_udt_usage" => cat
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .filter_map(|t| cat.get(&t).map(|tb| (t, tb)))
             .flat_map(|(tname, tb)| {
@@ -6134,7 +6134,7 @@ pub(crate) fn synth_derived_info_schema(
             .collect(),
         // A column whose type is a DOMAIN.
         "column_domain_usage" => cat
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .filter_map(|t| cat.get(&t).map(|tb| (t, tb)))
             .flat_map(|(tname, tb)| {
@@ -6166,7 +6166,7 @@ pub(crate) fn synth_derived_info_schema(
         // own index for a key; SPG's naming helper is the one
         // `pg_constraint` already uses.
         "constraint_table_usage" => cat
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .filter_map(|tname| cat.get(&tname).map(|tb| (tname, tb)))
             .flat_map(|(tname, tb)| {
@@ -6214,7 +6214,7 @@ pub(crate) fn synth_derived_info_schema(
         // A column whose type is an ARRAY: its element type, keyed by
         // the column's attnum the way PG keys it (`a1`, `a2`).
         "element_types" => cat
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .filter_map(|tname| cat.get(&tname).map(|tb| (tname, tb)))
             .flat_map(|(tname, tb)| {
@@ -6252,7 +6252,7 @@ pub(crate) fn synth_derived_info_schema(
             .collect(),
         // A GENERATED column and the columns its expression reads.
         "column_column_usage" => cat
-            .visible_table_names()
+            .visible_relation_keys()
             .into_iter()
             .filter_map(|tname| cat.get(&tname).map(|tb| (tname, tb)))
             .flat_map(|(tname, tb)| {
@@ -6351,7 +6351,7 @@ pub(crate) fn synth_derived_info_schema(
         "data_type_privileges" => {
             let mut out: Vec<Row<'static>> = Vec::new();
             let c = || Value::text(alloc::string::String::from(catalog_name));
-            for tname in cat.visible_table_names() {
+            for tname in cat.visible_relation_keys() {
                 let Some(tb) = cat.get(&tname) else { continue };
                 for (i, _) in tb.schema().columns.iter().enumerate() {
                     out.push(Row::new(alloc::vec![

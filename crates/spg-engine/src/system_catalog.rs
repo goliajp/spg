@@ -447,16 +447,24 @@ pub(crate) fn synth_information_schema_columns(
     // filled in and the collation still NULL. The existing column
     // answers in MySQL's terms on a MySQL session instead.
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         // v7.39 (round 536) — a MATERIALIZED VIEW is not in this view.
         // PG omits them from information_schema entirely (they are not in
         // the SQL standard), and `information_schema.tables` here already
         // did — so SPG listed a relation that had columns and no table
         // row, disagreeing with PG and with itself.
-        if cat.materialized_views().contains_key(&tname) {
+        if cat.materialized_views().contains_key(&key) {
             continue;
         }
-        let Some(t) = cat.get(&tname) else { continue };
+        let Some(t) = cat.get(&key) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
@@ -575,11 +583,19 @@ fn mysql_info_columns(cat: &Catalog, schema_name: &str) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("srs_id", DataType::Int, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        if cat.materialized_views().contains_key(&tname) {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        if cat.materialized_views().contains_key(&key) {
             continue;
         }
-        let Some(t) = cat.get(&tname) else { continue };
+        let Some(t) = cat.get(&key) else { continue };
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
@@ -832,8 +848,16 @@ fn mysql_info_tables(cat: &Catalog, schema_name: &str) -> (Vec<ColumnSchema>, Ve
         ])
     };
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        if cat.materialized_views().contains_key(&tname) {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        if cat.materialized_views().contains_key(&key) {
             continue;
         }
         rows.push(row(tname.clone(), false));
@@ -1215,18 +1239,26 @@ pub(crate) fn synth_information_schema_tables(
         ColumnSchema::new("commit_action", DataType::Text, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         // v7.39 (round 267) — a materialized view is backed by a real
         // table in SPG, but PG omits materialized views from this view
         // entirely (they are not in the SQL standard), and reporting one
         // as a BASE TABLE would have a migration tool try to recreate it
         // as a table.
-        if cat.materialized_views().contains_key(&tname) {
+        if cat.materialized_views().contains_key(&key) {
             continue;
         }
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
-            Value::text("public"),
+            Value::text(nsp.clone()),
             Value::text(tname.clone()),
             Value::text("BASE TABLE"),
             Value::Null,
@@ -1319,7 +1351,7 @@ pub(crate) fn synth_information_schema_tables(
 /// (Liquibase, Flyway) query this at start-up to validate the
 /// target connection.
 pub(crate) fn synth_information_schema_schemata(
-    _cat: &Catalog,
+    cat: &Catalog,
     mysql: bool,
     // v7.39.2 — the databases a MySQL session lists, from
     // `Engine::listed_database_names`. In MySQL a schema IS a database
@@ -1394,10 +1426,14 @@ pub(crate) fn synth_information_schema_schemata(
     let listed: Vec<alloc::string::String> = if mysql {
         mysql_databases.iter().cloned().collect()
     } else {
-        ["public", "pg_catalog", "information_schema"]
+        // 9.0.0 (C9) — and every schema `CREATE SCHEMA` made, which this
+        // view is the SQL-standard way of asking about.
+        let mut names: Vec<alloc::string::String> = ["public", "pg_catalog", "information_schema"]
             .into_iter()
             .map(alloc::string::String::from)
-            .collect()
+            .collect();
+        names.extend(cat.user_schemas().iter().cloned());
+        names
     };
     let rows: Vec<Row<'static>> = listed
         .into_iter()
@@ -1849,18 +1885,34 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     let mut by_name: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
     let mut oid: i64 = 16384;
-    for tname in cat.visible_table_names() {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         by_name.insert(tname.clone(), oid);
         oid = oid.saturating_add(1);
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for cname in cat.visible_table_names() {
-        let Some(c) = cat.get(&cname) else { continue };
+    for cname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `cname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = cname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(cname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(c) = cat.get(&key) else { continue };
         // v7.39 (round 645) — an inheritance child names one or more
         // parents, and a parent's POSITION in that list is exactly what
         // inhseqno means. This is the only shape where it is not 1.
         if let Some(PartitionRole::Inherits { parent_names }) = &c.schema().partition_role {
-            let Some(&child_oid) = by_name.get(&cname) else {
+            let Some(&child_oid) = by_name.get(&key) else {
                 continue;
             };
             for (i, pname) in parent_names.iter().enumerate() {
@@ -1883,7 +1935,7 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
             | Some(PartitionRole::Default { parent_name }) => parent_name.clone(),
             _ => continue,
         };
-        let Some(&child_oid) = by_name.get(&cname) else {
+        let Some(&child_oid) = by_name.get(&key) else {
             continue;
         };
         let Some(&parent_oid) = by_name.get(&parent_name) else {
@@ -2515,8 +2567,16 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
             rows.push(dep_row((2604, row_oid, 0), (1259, seq_oid, 0), "n"));
         }
     }
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         use spg_storage::PartitionRole as R;
         let parent = match t.schema().partition_role.as_ref() {
             Some(
@@ -2617,11 +2677,19 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("adbin", DataType::PgNodeTree, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         // 8.0.3 — pg_class's oid for the table. A running count over the
         // visible names drifted from it past any other session's
         // temporary table, which pg_class still numbers.
-        let (Some(t), Some(table_oid)) = (cat.get(&tname), relation_oid(cat, &tname)) else {
+        let (Some(t), Some(table_oid)) = (cat.get(&key), relation_oid(cat, &key)) else {
             continue;
         };
         for (i, col) in t.schema().columns.iter().enumerate() {
@@ -2677,8 +2745,16 @@ pub(crate) fn synth_pg_policy(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut table_oid: i64 = 16384;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else {
             table_oid = table_oid.saturating_add(1);
             continue;
         };
@@ -2748,8 +2824,16 @@ pub(crate) fn pg_policies_schema() -> Vec<ColumnSchema> {
 pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = pg_policies_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         for p in &t.schema().policies {
             let roles = if p.roles.is_empty() {
                 alloc::string::String::from("{public}")
@@ -2757,7 +2841,7 @@ pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
                 alloc::format!("{{{}}}", p.roles.join(","))
             };
             rows.push(Row::new(alloc::vec![
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(tname.clone()),
                 Value::text(p.name.clone()),
                 Value::text(if p.permissive {
@@ -2939,17 +3023,25 @@ pub(crate) fn synth_pg_stats(
         ColumnSchema::new("range_bounds_histogram", DataType::AnyArray, true),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for name in cat.visible_table_names() {
+    for name in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `name` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = name;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(name) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         if crate::is_internal_table_name(&name) {
             continue;
         }
-        let Some(t) = cat.get(&name) else {
+        let Some(t) = cat.get(&key) else {
             continue;
         };
         let row_count = t.rows().len();
         #[allow(clippy::cast_precision_loss)]
         for col in &t.schema().columns {
-            let Some(cs) = stats.get(&name, &col.name) else {
+            let Some(cs) = stats.get(&key, &col.name) else {
                 continue;
             };
             let distinct = if row_count > 0 && cs.n_distinct as usize == row_count {
@@ -2964,7 +3056,7 @@ pub(crate) fn synth_pg_stats(
                 Value::text(alloc::format!("{{{}}}", cs.histogram_bounds.join(",")))
             };
             rows.push(Row::new(alloc::vec![
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(name.clone()),
                 Value::text(col.name.clone()),
                 Value::Bool(false),
@@ -3001,11 +3093,19 @@ pub(crate) fn synth_pg_statistic(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut starelid: i64 = 16384;
-    for name in cat.visible_table_names() {
+    for name in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `name` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = name;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(name) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         if crate::is_internal_table_name(&name) {
             continue;
         }
-        let Some(t) = cat.get(&name) else {
+        let Some(t) = cat.get(&key) else {
             continue;
         };
         // v7.38.18 — the REAL statistics, and only for columns ANALYZE
@@ -3025,7 +3125,7 @@ pub(crate) fn synth_pg_statistic(
         // the ratio to the row count, and -1 means every value differs.
         #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
         for (i, col) in t.schema().columns.iter().enumerate() {
-            let Some(cs) = stats.get(&name, &col.name) else {
+            let Some(cs) = stats.get(&key, &col.name) else {
                 continue;
             };
             let attnum = (i + 1) as i16;
@@ -3696,7 +3796,15 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
     let mut relid: i64 = 16384;
     let mut relid_of: alloc::collections::BTreeMap<alloc::string::String, i64> =
         alloc::collections::BTreeMap::new();
-    for tname in cat.visible_table_names() {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         if crate::is_internal_table_name(&tname) {
             continue;
         }
@@ -3776,11 +3884,19 @@ pub(crate) fn synth_pg_stat_user_tables(
     let schema = pg_stat_user_tables_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut relid: i64 = 16384; // PG user-relation OID floor
-    for name in cat.visible_table_names() {
+    for name in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `name` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = name;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(name) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
         if crate::is_internal_table_name(&name) {
             continue;
         }
-        let Some(t) = cat.get(&name) else {
+        let Some(t) = cat.get(&key) else {
             continue;
         };
         // v7.39 (pg_stat knife A) — real counters: live = visible
@@ -3793,7 +3909,7 @@ pub(crate) fn synth_pg_stat_user_tables(
         let live_rows = (t.rows().len() as i64).saturating_sub(dead);
         // r192 — engine-side non-transactional counters (the on-table
         // ones vanished in the RC rebase when bumped inside a tx).
-        let (ins, upd, del) = write_stats.get(&name).copied().unwrap_or((0, 0, 0));
+        let (ins, upd, del) = write_stats.get(&key).copied().unwrap_or((0, 0, 0));
         // v7.39 (pg_stat knife B) — scan counters (scan_visible +
         // index-seek instrumentation). This synth query itself walks
         // the catalog, not the user tables, so it doesn't self-count.
@@ -3804,7 +3920,7 @@ pub(crate) fn synth_pg_stat_user_tables(
         };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(relid),
-            Value::text("public"),
+            Value::text(nsp.clone()),
             Value::Text(alloc::borrow::Cow::Owned(name)),
             as_big(&sc.seq_scan),
             as_big(&sc.seq_tup_read),
@@ -3928,8 +4044,16 @@ pub(crate) fn synth_pg_stat_database(
     {
         use core::sync::atomic::Ordering;
         let cat = eng.active_catalog();
-        for name in cat.visible_table_names() {
-            if let Some(t) = cat.get(&name) {
+        for name in cat.visible_relation_keys() {
+            // 9.0.0 (C9) — the loop walks KEYS; `name` is the name a client
+            // reads and `nsp` the schema column it belongs in, while every
+            // catalog lookup below goes on `key`.
+            let key = name;
+            let nsp = alloc::string::String::from(cat.listed_schema(&key));
+            let Some(name) = cat.listed_name(&key).map(alloc::string::String::from) else {
+                continue;
+            };
+            if let Some(t) = cat.get(&key) {
                 let sc = t.scan_stats();
                 tup_returned = tup_returned
                     .saturating_add(sc.seq_tup_read.load(Ordering::Relaxed))
@@ -4433,8 +4557,16 @@ pub(crate) fn synth_information_schema_table_constraints(
         ColumnSchema::new("enforced", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         // Uniqueness constraints — both PK and UNIQUE forms.
         for uc in t.schema().uniqueness_constraints.iter() {
             let conname = if mysql && uc.is_primary_key {
@@ -4449,10 +4581,10 @@ pub(crate) fn synth_information_schema_table_constraints(
             };
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(conname),
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(tname.clone()),
                 Value::text(kind),
                 Value::text("NO"),
@@ -4481,10 +4613,10 @@ pub(crate) fn synth_information_schema_table_constraints(
             });
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(conname),
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(tname.clone()),
                 Value::text("FOREIGN KEY"),
                 Value::text("NO"),
@@ -4497,10 +4629,10 @@ pub(crate) fn synth_information_schema_table_constraints(
         for (ci, _check) in t.schema().checks.iter().enumerate() {
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(check_names[ci].clone()),
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(tname.clone()),
                 Value::text("CHECK"),
                 Value::text("NO"),
@@ -4518,10 +4650,10 @@ pub(crate) fn synth_information_schema_table_constraints(
             }
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(alloc::format!("{tname}_{}_not_null", col.name)),
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(tname.clone()),
                 Value::text("CHECK"),
                 Value::text("NO"),
@@ -4651,8 +4783,16 @@ fn constraint_index_name(
 pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
     let mut out: Vec<CatalogIndex> = Vec::new();
     let mut oid = OID_INDEX_BASE;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let ucs = &t.schema().uniqueness_constraints;
         let col_names: Vec<alloc::string::String> =
             t.schema().columns.iter().map(|c| c.name.clone()).collect();
@@ -5002,7 +5142,15 @@ pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
 /// The same three `pg_namespace` publishes, so a join on `relnamespace`
 /// and the cast agree.
 #[must_use]
-pub(crate) fn schema_name_for_oid(oid: i64) -> Option<alloc::string::String> {
+pub(crate) fn schema_name_for_oid(cat: &Catalog, oid: i64) -> Option<alloc::string::String> {
+    // 9.0.0 (C9) — a schema `CREATE SCHEMA` made.
+    if let Some(i) = oid.checked_sub(USER_NS_OID_BASE)
+        && (0..USER_NS_OID_SPAN).contains(&i)
+        && let Ok(i) = usize::try_from(i)
+        && let Some(name) = cat.user_schemas().iter().nth(i)
+    {
+        return Some(name.clone());
+    }
     // v7.38.14 — a session's temporary namespace, which PG publishes as
     // `pg_temp_N` and SPG reported as `public`.
     //
@@ -5040,9 +5188,35 @@ pub(crate) const TEMP_NS_OID_SPAN: i64 = 100_000;
 /// The namespace oid a relation named `name` belongs to: its session's
 /// temporary one when the name carries a temp prefix, `public` otherwise.
 #[must_use]
-pub(crate) fn namespace_oid_for_relname(name: &str) -> i64 {
-    crate::Engine::temp_session_of(name).map_or(2200, |sid| TEMP_NS_OID_BASE + i64::from(sid))
+pub(crate) fn namespace_oid_for_relname(cat: &Catalog, name: &str) -> i64 {
+    // 9.0.0 (C9) — a relation key carries the schema it belongs to.
+    let (schema, bare) = spg_sql::namespace::split_key(name);
+    if let Some(sid) = crate::Engine::temp_session_of(bare) {
+        return TEMP_NS_OID_BASE + i64::from(sid);
+    }
+    user_schema_oid(cat, schema).unwrap_or(2200)
 }
+
+/// 9.0.0 (C9) — the oid a `CREATE SCHEMA` schema takes, or `None` for
+/// `public` and the built-ins, which have PostgreSQL's own oids.
+///
+/// Positional inside the registry, the way every other oid this catalog
+/// hands out is positional: what a client can rely on is that
+/// `relnamespace` joins `pg_namespace` and that `::regnamespace` names
+/// the same schema, which the two functions here settle between them.
+#[must_use]
+pub(crate) fn user_schema_oid(cat: &Catalog, schema: &str) -> Option<i64> {
+    let i = cat.user_schemas().iter().position(|s| s == schema)?;
+    i64::try_from(i).ok().map(|i| USER_NS_OID_BASE + i)
+}
+
+/// 9.0.0 (C9) — the oid band a `CREATE SCHEMA` schema is numbered in.
+/// Above every relation oid this catalog hands out (which start at
+/// 16384 and count up with the relations) and below the temp-namespace
+/// band, so the three spaces cannot collide.
+pub(crate) const USER_NS_OID_BASE: i64 = 700_000;
+/// How many schemas the band covers. See [`TEMP_NS_OID_SPAN`].
+pub(crate) const USER_NS_OID_SPAN: i64 = 100_000;
 
 /// v7.39 (round 623, S05b) — pg_class's own columns, hoisted for the same
 /// reason as [`pg_attribute_schema`]: pg_class is one of the relations
@@ -5115,7 +5289,7 @@ pub(crate) fn synth_pg_class(
     // question is "does any relation name this one as its parent", and
     // answering it inside the loop would walk the catalog per relation.
     let parents_with_children: alloc::collections::BTreeSet<alloc::string::String> = cat
-        .visible_table_names()
+        .visible_relation_keys()
         .iter()
         .filter_map(|n| cat.get(n))
         .flat_map(|c| match &c.schema().partition_role {
@@ -5144,7 +5318,7 @@ pub(crate) fn synth_pg_class(
         let Some(tname) = cat.listed_name(&stored).map(alloc::string::String::from) else {
             continue;
         };
-        let Some(t) = cat.get(&tname) else { continue };
+        let Some(t) = cat.get(&stored) else { continue };
         let is_temp = stored != tname;
         let schema_ref = t.schema();
         // v7.39 (round 338, V64) — a MATERIALIZED VIEW is backed by a real
@@ -5193,7 +5367,7 @@ pub(crate) fn synth_pg_class(
             Value::BigInt(this_oid),
             Value::text(tname.clone()),
             // v7.38.14 — `pg_temp_N` for a session's temporary relation.
-            Value::BigInt(namespace_oid_for_relname(&stored)),
+            Value::BigInt(namespace_oid_for_relname(cat, &stored)),
             Value::BigInt(0), // reltype (composite type OID; SPG no composite)
             Value::BigInt(0), // reloftype
             Value::BigInt(roles.owner_oid(schema_ref.owner.as_deref())),
@@ -5283,7 +5457,7 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(view_oid),
             Value::text(vname.to_string()),
-            Value::BigInt(namespace_oid_for_relname(stored)),
+            Value::BigInt(namespace_oid_for_relname(cat, stored)),
             Value::BigInt(0), // reltype
             Value::BigInt(0), // reloftype
             Value::BigInt(
@@ -5326,7 +5500,7 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(comp_oid),
             Value::text(cname.clone()),
-            Value::BigInt(namespace_oid_for_relname(cname)),
+            Value::BigInt(namespace_oid_for_relname(cat, cname)),
             Value::BigInt(54_001 + ci as i64), // reltype — the pg_type row
             Value::BigInt(0),                  // reloftype
             Value::BigInt(
@@ -5371,7 +5545,7 @@ pub(crate) fn synth_pg_class(
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
                 Value::text(ci.name.clone()),
-                Value::BigInt(namespace_oid_for_relname(&ci.name)),
+                Value::BigInt(namespace_oid_for_relname(cat, &ci.name)),
                 Value::BigInt(0), // reltype (indexes have none)
                 Value::BigInt(0), // reloftype
                 // An index belongs to its table's owner, as in PG.
@@ -5426,7 +5600,7 @@ pub(crate) fn synth_pg_class(
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
             Value::text(name.to_string()),
-            Value::BigInt(namespace_oid_for_relname(stored)),
+            Value::BigInt(namespace_oid_for_relname(cat, stored)),
             Value::BigInt(0),
             Value::BigInt(0),
             Value::BigInt(roles.owner_oid(sequence_owner(cat, def))),
@@ -5771,8 +5945,16 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     let schema = pg_attribute_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut attrelid: i64 = 16384;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else {
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else {
             attrelid = attrelid.saturating_add(1);
             continue;
         };
@@ -18082,8 +18264,16 @@ pub(crate) fn synth_info_constraint_column_usage(
             Value::text(conname),
         ]));
     };
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
             cols.get(pos)
@@ -18184,15 +18374,23 @@ pub(crate) fn synth_info_check_constraints(
         ColumnSchema::new("check_clause", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         // Same PG-canonical `{table}_{col}_check` naming pg_constraint
         // and pg_get_constraintdef use, so the three agree.
         let check_names = pg_check_connames(t, &tname, &t.schema().checks);
         for (ci, clause) in t.schema().checks.iter().enumerate() {
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(check_names[ci].clone()),
                 Value::text(clause.expr.clone()),
             ]));
@@ -18208,7 +18406,7 @@ pub(crate) fn synth_info_check_constraints(
             }
             rows.push(Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp.clone()),
                 Value::text(alloc::format!("{tname}_{}_not_null", col.name)),
                 Value::text(alloc::format!("{} IS NOT NULL", col.name)),
             ]));
@@ -18301,8 +18499,16 @@ pub(crate) fn synth_info_key_column_usage(
         schema.truncate(KCU_PG_COLUMNS);
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
             cols.get(pos)
@@ -18347,15 +18553,17 @@ pub(crate) fn synth_info_key_column_usage(
                 let in_unique = (in_unique + 1) as i32;
                 let mut vals = alloc::vec![
                     Value::text("spg"),
-                    Value::text("public"),
+                    Value::text(nsp.clone()),
                     Value::text(conname.clone()),
                     Value::text("spg"),
-                    Value::text("public"),
+                    Value::text(nsp.clone()),
                     Value::text(tname.clone()),
                     Value::text(col_name_at(local)),
                     Value::Int(ordinal),
                     Value::Int(in_unique),
-                    Value::text("public"),
+                    Value::text(alloc::string::String::from(spg_sql::namespace::schema_of(
+                        &fk.parent_table
+                    ))),
                     Value::text(fk.parent_table.clone()),
                     Value::text(parent_name),
                 ];
@@ -18373,10 +18581,10 @@ pub(crate) fn synth_info_key_column_usage(
                 let ordinal = (i + 1) as i32;
                 let mut vals = alloc::vec![
                     Value::text("spg"),
-                    Value::text("public"),
+                    Value::text(nsp.clone()),
                     Value::text(conname.clone()),
                     Value::text("spg"),
-                    Value::text("public"),
+                    Value::text(nsp.clone()),
                     Value::text(tname.clone()),
                     Value::text(col_name_at(local)),
                     Value::Int(ordinal),
@@ -18435,8 +18643,16 @@ pub(crate) fn synth_info_referential_constraints(
         }
     }
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         for fk in t.schema().foreign_keys.iter() {
             let conname = fk
                 .name
@@ -18460,7 +18676,7 @@ pub(crate) fn synth_info_referential_constraints(
             // The parent-side qualifiers exist only when the parent key
             // was actually located, so they track unique_constraint_name.
             let has_unique = !matches!(unique_name, Value::Null);
-            let qualifier = |text: &'static str| {
+            let qualifier = |text: alloc::string::String| {
                 if has_unique {
                     Value::text(text)
                 } else {
@@ -18475,9 +18691,11 @@ pub(crate) fn synth_info_referential_constraints(
                 Value::text::<String>(rule_name(fk.on_update).into()),
                 Value::text::<String>(rule_name(fk.on_delete).into()),
                 Value::text("spg"),
-                Value::text("public"),
-                qualifier("spg"),
-                qualifier("public"),
+                Value::text(nsp.clone()),
+                qualifier(alloc::string::String::from("spg")),
+                qualifier(alloc::string::String::from(spg_sql::namespace::schema_of(
+                    &fk.parent_table
+                ))),
                 Value::text::<&str>(match fk.match_type {
                     spg_storage::MatchType::Simple => "NONE",
                     spg_storage::MatchType::Full => "FULL",
@@ -18696,7 +18914,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         .filter_map(|ix| Some(((ix.table, ix.backs_constraint?), ix.oid)))
         .collect();
     // Build the same name → oid map pg_class uses (start at 16384).
-    let names = cat.visible_table_names();
+    let names = cat.visible_relation_keys();
     let mut by_table: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
     let mut next_oid: i64 = 16384;
@@ -19964,7 +20182,9 @@ pub(crate) fn synth_pg_sequences(
             continue;
         };
         rows.push(Row::new(alloc::vec![
-            Value::text("public"),
+            // 9.0.0 (C9) — the sequence's own schema, not `public` for
+            // every one of them.
+            Value::text(alloc::string::String::from(cat.listed_schema(&stored))),
             Value::text(alloc::string::String::from(name)),
             Value::text(String::from(roles.owner_name(sequence_owner(cat, def)))),
             Value::text("bigint"),
@@ -20061,8 +20281,16 @@ pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, V
     use spg_storage::{PartitionKind, PartitionRole};
     let schema = pg_partitioned_table_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let Some(PartitionRole::Parent {
             kind,
             key_column_positions,
@@ -20930,7 +21158,7 @@ pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
     let schema = pg_rewrite_schema();
     // `ev_class` has to be the SAME oid pg_class / pg_constraint hand out
     // for that table, or a join against them silently returns nothing.
-    let mut names: Vec<String> = cat.visible_table_names();
+    let mut names: Vec<String> = cat.visible_relation_keys();
     names.sort();
     let by_table: alloc::collections::BTreeMap<String, i64> = names
         .iter()
@@ -21065,7 +21293,7 @@ pub(crate) fn synth_pg_matviews(
         let Some(name) = cat.listed_name(&stored).map(alloc::string::String::from) else {
             continue;
         };
-        let Some(t) = cat.get(&name) else { continue };
+        let Some(t) = cat.get(&stored) else { continue };
         let Some(body) = cat.materialized_views().get(&name) else {
             continue;
         };
@@ -21745,17 +21973,25 @@ pub(crate) fn synth_pg_tables(
         ColumnSchema::new("rowsecurity", DataType::Bool, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let has_indexes = !t.indices().is_empty() || !t.schema().uniqueness_constraints.is_empty();
         rows.push(Row::new(alloc::vec![
-            Value::text("public"),
+            Value::text(nsp.clone()),
             Value::text(tname.clone()),
             Value::text(String::from(roles.owner_name(t.schema().owner.as_deref()))),
             Value::Null,
             Value::Bool(has_indexes),
             Value::Bool(false),
-            Value::Bool(cat.triggers().iter().any(|tg| tg.table == tname)),
+            Value::Bool(cat.triggers().iter().any(|tg| tg.table == key)),
             Value::Bool(t.schema().row_security),
         ]));
     }
@@ -21787,8 +22023,16 @@ pub(crate) fn synth_info_role_table_grants(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     let _ = grantee;
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         let sc = t.schema();
         let owner = sc
             .owner
@@ -21834,7 +22078,7 @@ pub(crate) fn synth_info_role_table_grants(
                         who.clone()
                     }),
                     Value::text(alloc::string::String::from("app")),
-                    Value::text(alloc::string::String::from("public")),
+                    Value::text(nsp.clone()),
                     Value::text(tname.clone()),
                     Value::text(alloc::string::String::from(word)),
                     Value::text(alloc::string::String::from(if grantable & bit != 0 {
@@ -21874,8 +22118,16 @@ pub(crate) fn synth_info_column_privileges(
         ColumnSchema::new("is_grantable", DataType::Text, false),
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
-    for tname in cat.visible_table_names() {
-        let Some(t) = cat.get(&tname) else { continue };
+    for tname in cat.visible_relation_keys() {
+        // 9.0.0 (C9) — the loop walks KEYS; `tname` is the name a client
+        // reads and `nsp` the schema column it belongs in, while every
+        // catalog lookup below goes on `key`.
+        let key = tname;
+        let nsp = alloc::string::String::from(cat.listed_schema(&key));
+        let Some(tname) = cat.listed_name(&key).map(alloc::string::String::from) else {
+            continue;
+        };
+        let Some(t) = cat.get(&key) else { continue };
         // 9.0.0 (N23) — the OWNER's implicit column privileges, which
         // PostgreSQL lists here and this did not: it reported explicit
         // column GRANTs alone, so an un-granted database answered zero
@@ -21894,7 +22146,7 @@ pub(crate) fn synth_info_column_privileges(
                         Value::text(owner.clone()),
                         Value::text(owner.clone()),
                         Value::text(alloc::string::String::from("app")),
-                        Value::text(alloc::string::String::from("public")),
+                        Value::text(nsp.clone()),
                         Value::text(tname.clone()),
                         Value::text(col.name.clone()),
                         Value::text(alloc::string::String::from(priv_word)),
@@ -21912,7 +22164,7 @@ pub(crate) fn synth_info_column_privileges(
                             a.grantee.clone()
                         }),
                         Value::text(alloc::string::String::from("app")),
-                        Value::text(alloc::string::String::from("public")),
+                        Value::text(nsp.clone()),
                         Value::text(tname.clone()),
                         Value::text(col.name.clone()),
                         Value::text(alloc::string::String::from(crate::acl::priv_word(bit))),
@@ -22502,7 +22754,7 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // Build a name → user-relation OID map so indrelid matches
     // pg_class.oid (synth_pg_class starts at 16384). Without
     // this, joins between pg_index and pg_class fail.
-    let names = cat.visible_table_names();
+    let names = cat.visible_relation_keys();
     let mut table_oid: i64 = 16384;
     let mut by_table: alloc::collections::BTreeMap<String, i64> =
         alloc::collections::BTreeMap::new();
@@ -22761,6 +23013,21 @@ pub(crate) fn synth_pg_namespace(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
             Value::Null,
         ]),
     ];
+    // 9.0.0 (C9) — every schema `CREATE SCHEMA` made. The registry has
+    // held these names since v7.17.0 and nothing published them, so a
+    // client asking whether its schema exists was told no while
+    // `CREATE SCHEMA … IF NOT EXISTS` said it already did.
+    for name in cat.user_schemas() {
+        let Some(oid) = user_schema_oid(cat, name) else {
+            continue;
+        };
+        rows.push(Row::new(alloc::vec![
+            Value::BigInt(oid),
+            Value::text(name.clone()),
+            Value::BigInt(10),
+            Value::Null,
+        ]));
+    }
     for sid in temp_ns {
         rows.push(Row::new(alloc::vec![
             Value::BigInt(TEMP_NS_OID_BASE + i64::from(sid)),

@@ -300,6 +300,7 @@ impl Engine {
             // stayed attached is the worst shape a statement can have.
             T::Inherit { parent, detach } => self.alter_inherit(tbl, &parent, detach),
             T::SetHotTierBytes(n) => self.alter_set_hot_tier_bytes(tbl, n),
+            T::SetSchema(target) => self.alter_set_schema(tbl, &target),
             T::AddForeignKey(fk) => self.alter_add_foreign_key(tbl, fk),
             T::DropForeignKey { name, if_exists } => {
                 self.alter_drop_foreign_key(tbl, name, if_exists)
@@ -4192,10 +4193,44 @@ impl Engine {
         })
     }
 
+    /// 9.0.0 (C9) — a relation key names a schema that has to exist.
+    /// PostgreSQL 18.6: `CREATE TABLE nosuch.t (…)` answers
+    /// `schema "nosuch" does not exist`, not a relation in a schema
+    /// nobody made.
+    /// 9.0.0 (C9) — the key an unqualified CREATE puts the relation
+    /// under: the first EXISTING schema on the session's search path,
+    /// which is what `current_schema()` answers and where PostgreSQL
+    /// puts it. A name that already carries a schema is left alone, and
+    /// so is a temporary one, which has a namespace of its own.
+    pub(crate) fn creation_key(&self, name: &str) -> String {
+        if spg_sql::namespace::is_qualified(name)
+            || name.starts_with(spg_storage::Catalog::TEMP_NAME_MARKER)
+        {
+            return String::from(name);
+        }
+        let cat = self.active_catalog();
+        match cat.search_path().iter().find(|s| cat.schema_exists(s)) {
+            Some(schema) => spg_sql::namespace::qualified_key(schema, name),
+            None => String::from(name),
+        }
+    }
+
+    fn ensure_schema_exists(&self, key: &str) -> Result<(), EngineError> {
+        let schema = spg_sql::namespace::schema_of(key);
+        if self.active_catalog().schema_exists(schema) {
+            return Ok(());
+        }
+        Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+            alloc::format!("schema \"{schema}\" does not exist"),
+        )))
+    }
+
     pub(crate) fn exec_create_table(
         &mut self,
         mut stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
+        self.ensure_schema_exists(&stmt.name)?;
+        stmt.name = self.creation_key(&stmt.name);
         // v7.39 — an ENGINE MySQL does not know is refused, as MySQL does.
         // The clause was consumed and dropped, so `ENGINE=NONSUCH` built a
         // table while `sql_mode` claimed `NO_ENGINE_SUBSTITUTION` — a typo
@@ -6318,6 +6353,9 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateSequenceStatement,
     ) -> Result<QueryResult, EngineError> {
+        self.ensure_schema_exists(&s.name)?;
+        let mut s = s;
+        s.name = self.creation_key(&s.name);
         // v7.39 (round 469) — a TEMPORARY sequence lives in the calling
         // session's namespace, exactly as round 436 put temporary tables
         // there. Until this round the keyword parsed and was dropped, so
@@ -6495,6 +6533,9 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        self.ensure_schema_exists(&s.name)?;
+        let mut s = s;
+        s.name = self.creation_key(&s.name);
         // v7.39.2 — a name twice in the view's own column list. Both
         // engines refuse it; SPG built the view and every reference to
         // the name after that was ambiguous.
@@ -7370,9 +7411,27 @@ impl Engine {
         &mut self,
         names: &[String],
         if_exists: bool,
+        cascade: bool,
     ) -> Result<QueryResult, EngineError> {
         let mut removed = 0usize;
         for name in names {
+            // 9.0.0 (C9) — a schema owns relations now, so RESTRICT (the
+            // default) has something to refuse and CASCADE has something
+            // to take. PostgreSQL 18.6's sentences, measured.
+            let owned = self.relations_in_schema(name);
+            if !owned.is_empty() {
+                if !cascade {
+                    return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                        alloc::format!(
+                            "cannot drop schema {name} because other objects depend on it                              DETAIL: {} objects in schema {name} HINT: Use DROP ... CASCADE                              to drop the dependent objects too.",
+                            owned.len()
+                        ),
+                    )));
+                }
+                for key in owned {
+                    self.drop_relation_key(&key);
+                }
+            }
             let was_present = self
                 .active_catalog_mut()
                 .drop_schema(name)
@@ -7392,6 +7451,41 @@ impl Engine {
             affected: removed,
             modified_catalog: removed > 0 && self.catalog_change_is_committed(),
         })
+    }
+
+    /// 9.0.0 (C9) — `ALTER TABLE t SET SCHEMA s`: the relation moves.
+    /// PostgreSQL 18.6 refuses a schema that does not exist and a move
+    /// onto a name the target schema already holds.
+    fn alter_set_schema(&mut self, tbl: &str, target: &str) -> Result<(), EngineError> {
+        if !self.active_catalog().schema_exists(target) {
+            return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
+                alloc::format!("schema \"{target}\" does not exist"),
+            )));
+        }
+        let bare = spg_sql::namespace::bare_of(tbl);
+        let moved = spg_sql::namespace::qualified_key(target, bare);
+        self.active_catalog_mut()
+            .rename_table(tbl, &moved)
+            .map_err(EngineError::Storage)
+    }
+
+    /// 9.0.0 (C9) — every relation key this schema owns: tables,
+    /// sequences and views alike, since all three are keyed the same way.
+    fn relations_in_schema(&self, schema: &str) -> Vec<String> {
+        let cat = self.active_catalog();
+        let mine = |key: &String| spg_sql::namespace::schema_of(key) == schema;
+        let mut out: Vec<String> = cat.table_names().into_iter().filter(mine).collect();
+        out.extend(cat.sequences_all().keys().filter(|k| mine(k)).cloned());
+        out.extend(cat.views_all().keys().filter(|k| mine(k)).cloned());
+        out
+    }
+
+    /// 9.0.0 (C9) — drop one relation by its key, whichever kind it is.
+    fn drop_relation_key(&mut self, key: &str) {
+        let cat = self.active_catalog_mut();
+        cat.drop_table(key);
+        cat.drop_sequence(key);
+        cat.drop_view(key);
     }
 
     /// v7.17.0 Phase 1.4 — `DROP TYPE [IF EXISTS] names`. Only
@@ -7443,6 +7537,9 @@ impl Engine {
         &mut self,
         s: spg_sql::ast::CreateMaterializedViewStatement,
     ) -> Result<QueryResult, EngineError> {
+        self.ensure_schema_exists(&s.name)?;
+        let mut s = s;
+        s.name = self.creation_key(&s.name);
         // v7.39 (round 436) — `CREATE TEMPORARY TABLE x AS <select>` arrives
         // here (CTAS lowers to this node with `as_plain_table`). Same
         // treatment as the column-list form: build it under the session's

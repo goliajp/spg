@@ -649,7 +649,11 @@ fn handle_pg_simple_query(
                 send_ready_for_query(stream, *tx_state)?;
             }
             CopyIntent::To(table, opts) => {
-                let sql = format!("SELECT * FROM {table}");
+                // 9.0.0 (C9) — the relation is read back as SQL, so the
+                // key goes back to the spelling a parser accepts: the
+                // separator it carries the schema with is not a
+                // character an identifier may contain.
+                let sql = format!("SELECT * FROM {}", spg_sql::namespace::display_key(&table));
                 handle_copy_to_stdout(
                     stream,
                     state,
@@ -5665,13 +5669,16 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
     if i == table_start {
         return None;
     }
-    // Strip optional `<schema>.` qualifier — pg_dump emits
-    // `public.posts`. The SPG SQL parser does the same strip; do
-    // the COPY-path equivalent here so the catalog lookup hits
-    // the bare table name.
+    // 9.0.0 (C9) — keep the `<schema>.` qualifier pg_dump emits, as the
+    // SQL parser now does: `COPY c9a.t (id) TO stdout` names the relation
+    // in `c9a`, and stripping it looked up a bare `t` that a two-schema
+    // database does not have. `public.posts` still reduces to `posts`,
+    // which is the key a relation in `public` is stored under.
     let raw = &rest[table_start..i];
     let table = match raw.rsplit_once('.') {
-        Some((_, bare)) => bare.to_string(),
+        Some((schema, bare)) => {
+            spg_sql::namespace::qualified_key(schema.trim_matches('"'), bare.trim_matches('"'))
+        }
         None => raw.to_string(),
     };
     // Skip an optional `(col, col, …)` column list. v7.15.0
@@ -6672,7 +6679,8 @@ fn build_copy_insert_from_json(
     // parser, but pgwire.rs doesn't depend on spg-engine internals
     // for this path — we keep the parse local.
     let pairs = parse_json_object_top_level(line)?;
-    let mut sql = format!("INSERT INTO {table} (");
+    // 9.0.0 (C9) — see `spg_engine::copy::build_copy_insert`.
+    let mut sql = format!("INSERT INTO {} (", spg_sql::namespace::display_key(table));
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
             sql.push(',');
