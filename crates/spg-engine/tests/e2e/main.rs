@@ -761,6 +761,7 @@ mod e2e_pg_input_is_valid;
 mod e2e_pg_internal_helpers;
 mod e2e_pg_lock_status;
 mod e2e_pg_lsn_ops;
+mod e2e_pg_operator_900;
 mod e2e_pg_operator_round621;
 mod e2e_pg_operator_round639;
 mod e2e_pg_proc_round638;
