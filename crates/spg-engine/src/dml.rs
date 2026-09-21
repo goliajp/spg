@@ -4108,7 +4108,10 @@ impl Engine {
     /// `get_mut` window): the clock fn, BEFORE/AFTER row triggers + their
     /// session config, the column ENUM / SET variant lookups, and the
     /// AUTO_INCREMENT sequence floors.
-    fn prepare_insert_snapshots(&self, table_name: &str) -> Result<InsertSnapshots, EngineError> {
+    fn prepare_insert_snapshots(
+        &mut self,
+        table_name: &str,
+    ) -> Result<InsertSnapshots, EngineError> {
         // v7.9.21 — snapshot the clock fn pointer before the mut
         // borrow on the catalog opens; runtime DEFAULT eval needs
         // it inside the row hot loop.
@@ -4176,6 +4179,25 @@ impl Engine {
         // beyond one map probe per auto column per statement).
         let mut seq_floors: alloc::collections::BTreeMap<usize, i64> =
             alloc::collections::BTreeMap::new();
+        // 9.0.0 — PostgreSQL's nextval is a COUNTER: it does not consult
+        // the table, so an explicit id does not move it. Measured on
+        // 18.6, `INSERT (v); INSERT (id=50,v); INSERT (v); INSERT (v)`
+        // hands out 1, 2, 3 where SPG handed out 1, 51, 52 — SPG derived
+        // the next value from the table's MAX. The counter lives in the
+        // column's implicit sequence, so it has to EXIST: born here, at
+        // the first insert that needs it, seeded from the table's
+        // current max so no value the table already holds is handed out
+        // again. That one-time catch-up is what keeps an existing
+        // database from colliding on the upgrade; after it, the
+        // behaviour is PostgreSQL's.
+        if !self.speaks_mysql {
+            for col in pre_borrow_column_meta.iter() {
+                if col.auto_increment {
+                    let seq_name = alloc::format!("{}_{}_seq", table_name, col.name);
+                    self.ensure_implicit_sequence(&seq_name);
+                }
+            }
+        }
         for (i, col) in pre_borrow_column_meta.iter().enumerate() {
             if col.auto_increment
                 && let Some(sd) = self.active_catalog().sequence(&alloc::format!(
@@ -4981,6 +5003,8 @@ impl Engine {
         // v7.40.11 — the OK packet's key, which includes an explicit one;
         // see `Engine::statement_insert_id`.
         let mut first_auto_key: Option<i64> = None;
+        let mut auto_cursors_out: alloc::collections::BTreeMap<usize, i64> =
+            alloc::collections::BTreeMap::new();
         // v7.38.18 (C12) — collected here, published to the session
         // after the statement so `SHOW WARNINGS` can read it.
         let mut stmt_warnings: Vec<crate::MysqlWarning> = Vec::new();
@@ -4998,6 +5022,7 @@ impl Engine {
             overriding,
             &mut first_auto,
             &mut first_auto_key,
+            &mut auto_cursors_out,
             insert_mysql,
             // v7.39 (round 470) — `INSERT IGNORE` bends values, and so does
             // a non-strict `sql_mode`. Same conversion, different trigger.
@@ -5063,6 +5088,22 @@ impl Engine {
         if let Some(v) = first_auto_key {
             self.statement_insert_id
                 .store(v, core::sync::atomic::Ordering::Relaxed);
+        }
+        // 9.0.0 — and the counter moves with the values handed out, so
+        // the NEXT statement continues where this one stopped. Without
+        // it the sequence would answer the same number again: the cursor
+        // above is per-statement. MySQL keeps its table-derived rule.
+        if !self.speaks_mysql {
+            for (i, next) in &auto_cursors_out {
+                if let Some(col) = column_meta.get(*i) {
+                    let seq_name = alloc::format!("{}_{}_seq", stmt.table, col.name);
+                    if self.active_catalog().has_sequence(&seq_name) {
+                        let _ =
+                            self.active_catalog_mut()
+                                .sequence_set_value(&seq_name, next - 1, true);
+                    }
+                }
+            }
         }
         // v7.37.7(sentori Epic 3 P1)— stored generated-column
         // evaluation runs AFTER ordinary INSERT values are coerced
@@ -7016,6 +7057,25 @@ fn auto_cursor_seed(
     Ok(base.max(seq_floors.get(&i).copied().unwrap_or(i64::MIN)))
 }
 
+/// 9.0.0 — the next auto value PostgreSQL would hand out: the column's
+/// implicit sequence and nothing else. The table's MAX is MySQL's rule
+/// (an explicit `50` moves `AUTO_INCREMENT` to 51 there, measured), not
+/// PostgreSQL's, where `nextval` never consults the table.
+fn pg_auto_cursor_seed(
+    i: usize,
+    col: &ColumnSchema,
+    seq_floors: &alloc::collections::BTreeMap<usize, i64>,
+) -> Option<i64> {
+    let from_sequence = seq_floors.get(&i).copied()?;
+    // `ALTER … RESTART WITH n` (and `CREATE TABLE … AUTO_INCREMENT = n`)
+    // records a floor on the column; it is the counter's new position, so
+    // it wins over where the sequence stood.
+    Some(match col.auto_restart {
+        Some(floor) => from_sequence.max(floor),
+        None => from_sequence,
+    })
+}
+
 /// The `DEFAULT`-slot marker expression (`__column_default()`), used to
 /// force a column to its declared default / sequence value.
 fn column_default_marker() -> Expr {
@@ -7435,6 +7495,11 @@ fn parse_insert_rows(
     // leaves the session's previous value alone.
     first_auto: &mut Option<i64>,
     first_auto_key: &mut Option<i64>,
+    // 9.0.0 — where each auto column's counter STOPPED, so the caller
+    // can move the column's sequence to it once the table borrow is
+    // released. The cursor itself is per-statement; the sequence is what
+    // carries PostgreSQL's counter between statements.
+    auto_cursors_out: &mut alloc::collections::BTreeMap<usize, i64>,
     // v7.39 (round 367, M20) — the session dialect, so a `0x…` / `X'…'`
     // binary-string literal coerces into its target column the MySQL way
     // (big-endian number into a numeric column, bytes-as-string into a
@@ -7480,8 +7545,7 @@ fn parse_insert_rows(
     // (then sailed through, compounding with the inline-PK
     // enforcement gap). First use per column seeds from the
     // table; subsequent rows increment.
-    let mut auto_cursors: alloc::collections::BTreeMap<usize, i64> =
-        alloc::collections::BTreeMap::new();
+    let auto_cursors = &mut *auto_cursors_out;
     // v7.38 (read01 P6.41) — PG rejects an EXPLICIT value for a generated
     // column ("cannot insert a non-DEFAULT value into column …"), but a
     // `DEFAULT` marker for it is allowed (the column recomputes). So a
@@ -7515,7 +7579,14 @@ fn parse_insert_rows(
     // USER override on an ALWAYS column generates rather than erroring.
     if overriding == Overriding::User {
         for (i, col) in column_meta.iter().enumerate() {
-            if !col.auto_increment {
+            // 9.0.0 — only an IDENTITY column. Measured on PG 18.6, a
+            // plain SERIAL keeps the value written:
+            // `INSERT INTO t (id, v) OVERRIDING USER VALUE VALUES (43, 2)`
+            // stores 43 there. SPG replaced it with the generated one,
+            // which went unnoticed while the generator derived its value
+            // from the table's max and happened to produce the same
+            // number.
+            if !col.auto_increment || col.identity.is_none() {
                 continue;
             }
             let slot: Option<usize> = match tuple_pos {
@@ -7631,7 +7702,10 @@ fn parse_insert_rows(
                 if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {
                         Some(n) => *n,
-                        None => auto_cursor_seed(table, i, col, seq_floors)?,
+                        None => match (mysql, pg_auto_cursor_seed(i, col, seq_floors)) {
+                            (false, Some(from_sequence)) => from_sequence,
+                            _ => auto_cursor_seed(table, i, col, seq_floors)?,
+                        },
                     };
                     auto_cursors.insert(i, next + 1);
                     if first_auto.is_none() {
@@ -7789,7 +7863,10 @@ fn parse_insert_rows(
                 if auto_increment_needs_value(col, &raw, mysql) {
                     let next = match auto_cursors.get(&i) {
                         Some(n) => *n,
-                        None => auto_cursor_seed(table, i, col, seq_floors)?,
+                        None => match (mysql, pg_auto_cursor_seed(i, col, seq_floors)) {
+                            (false, Some(from_sequence)) => from_sequence,
+                            _ => auto_cursor_seed(table, i, col, seq_floors)?,
+                        },
                     };
                     auto_cursors.insert(i, next + 1);
                     if first_auto.is_none() {

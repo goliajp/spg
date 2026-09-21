@@ -2713,6 +2713,18 @@ pub(crate) fn synth_pg_stat_user_functions(
 /// v7.39 (read01 round 53) — the pg_am oid backing an index, derived from what
 /// the index ACTUALLY is. `USING hash` / `USING gist` are accepted but built as
 /// btree, so they report btree — the catalog never claims an AM SPG lacks.
+/// 9.0.0 — the access-method oid an index reports: the one it ASKED for
+/// when SPG recorded a declaration, else the one it is. See
+/// `Index::declared_am`; PostgreSQL's oids, measured on 18.6.
+pub(crate) fn am_oid_of_index(idx: &spg_storage::Index) -> i64 {
+    match idx.declared_am.as_deref() {
+        Some("gist") => 783,
+        Some("spgist") => 4000,
+        Some("hash") => 405,
+        _ => am_oid_of(&idx.kind),
+    }
+}
+
 pub(crate) const fn am_oid_of(kind: &spg_storage::IndexKind) -> i64 {
     use spg_storage::IndexKind as K;
     match kind {
@@ -2729,6 +2741,10 @@ pub(crate) const fn am_name_of_oid(oid: i64) -> &'static str {
     match oid {
         3580 => "brin",
         2742 => "gin",
+        // 9.0.0 — the three SPG backs with a B-tree but reports as asked.
+        783 => "gist",
+        4000 => "spgist",
+        405 => "hash",
         _ => "btree",
     }
 }
@@ -4150,7 +4166,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 included: idx.included_columns.clone(),
                 is_unique: idx.is_unique || uc.is_some(),
                 is_primary: uc.is_some_and(|u| u.is_primary_key),
-                am_oid: am_oid_of(&idx.kind),
+                am_oid: am_oid_of_index(idx),
                 partial_predicate: idx.partial_predicate.clone(),
                 expression: idx.expression.clone(),
                 nulls_not_distinct: idx.nulls_not_distinct,
@@ -12775,6 +12791,11 @@ pub(crate) fn render_indexdef(
         // detail the dump must not see.
         spg_storage::IndexKind::BTree(_) | spg_storage::IndexKind::BTreeMulti(_) => "btree",
     };
+    // 9.0.0 — and the method the statement ASKED for wins over the one
+    // underneath, when SPG recorded one. `USING gist` came back as
+    // `USING btree`, so a dump restored into PostgreSQL as a different
+    // index type. See `Index::declared_am`.
+    let am: &str = idx.declared_am.as_deref().unwrap_or(am);
     match &idx.partial_predicate {
         Some(pred) => {
             // 8.0.3 — PG's catalog form (see `catalog_deparse`): a bare

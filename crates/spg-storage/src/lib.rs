@@ -3306,6 +3306,16 @@ pub struct Index {
     pub name: String,
     pub column_position: usize,
     pub kind: IndexKind,
+    /// 9.0.0 — the access method the statement ASKED for, when SPG backs
+    /// it with a different one. `USING gist / spgist / hash` load as a
+    /// B-tree here; reporting `btree` made a dump write `USING btree`
+    /// where the source said `USING gist`, so restoring into PostgreSQL
+    /// silently changed the index type. Answering every query those AMs
+    /// exist for is unaffected — SPG evaluates `&&`, `<@` and `%` by scan
+    /// whether or not an index is there — so what the catalog owes is the
+    /// name the user wrote. `None` when the method asked for is the one
+    /// underneath.
+    pub declared_am: Option<String>,
     /// v6.8.0 — column positions of `INCLUDE (col1, col2, …)`
     /// non-key columns. Carries the planner's "this query is
     /// covered by the index" signal; lookup paths still resolve
@@ -4065,6 +4075,7 @@ impl Index {
 
     fn new_btree(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::BTree(PersistentBTreeMap::new()),
@@ -4091,6 +4102,7 @@ impl Index {
     /// key arity is `1 + extras` from then on.
     fn new_btree_multi(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             kind: IndexKind::BTreeMulti(PersistentBTreeMap::new()),
             ..Self::new_btree(name, column_position)
         }
@@ -4107,6 +4119,7 @@ impl Index {
 
     fn new_nsw(name: String, column_position: usize, m: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::Nsw(NswGraph::new(m)),
@@ -4133,6 +4146,7 @@ impl Index {
     /// encoder + planner for type-checking range predicates.
     fn new_brin(name: String, column_position: usize, column_type: DataType) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::Brin {
@@ -4163,6 +4177,7 @@ impl Index {
     /// or from a deserialised snapshot.
     fn new_gin(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::Gin(PersistentBTreeMap::new()),
@@ -4190,6 +4205,7 @@ impl Index {
     /// type is `TEXT` / `VARCHAR` (not `TSVECTOR`).
     fn new_gin_trgm(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::GinTrgm(PersistentBTreeMap::new()),
@@ -4218,6 +4234,7 @@ impl Index {
     /// `TEXT` / `VARCHAR` (not `TSVECTOR`).
     fn new_gin_fulltext(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::GinFulltext(PersistentBTreeMap::new()),
@@ -4247,6 +4264,7 @@ impl Index {
     /// same in-memory string-backed Value).
     fn new_gin_jsonb(name: String, column_position: usize) -> Self {
         Self {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::GinJsonb(PersistentBTreeMap::new()),
@@ -10285,7 +10303,7 @@ const FILE_MAGIC: &[u8; 8] = b"SPGDB001";
 /// rather than trusted, because extraction changed (non-ASCII text now
 /// yields trigrams, and an apostrophe now separates words) and a map
 /// built the old way answers the new lookups with nothing.
-const FILE_VERSION: u8 = 103;
+const FILE_VERSION: u8 = 104;
 
 /// 8.0.3 — the byte a [`NonTableKind`] is written as.
 const fn non_table_kind_tag(kind: NonTableKind) -> u8 {
@@ -10735,6 +10753,23 @@ impl Catalog {
                                     write_str(&mut out, text);
                                 }
                             }
+                        }
+                    }
+                }
+                // 9.0.0 — the access method the statement asked for
+                // (FILE_VERSION 104+). Appended at the end of the
+                // per-index block, so a v103 reader stops before it and
+                // defaults to None, which is the behaviour it had. The
+                // version gate matters on the WRITE side too: a test
+                // that builds a v96 image with `serialize_at` must not
+                // carry a byte v96 readers do not consume — the same
+                // desync v99's byte caused when it was added.
+                if version >= 104 {
+                    match &idx.declared_am {
+                        None => out.push(0),
+                        Some(am) => {
+                            out.push(1);
+                            write_str(&mut out, am);
                         }
                     }
                 }

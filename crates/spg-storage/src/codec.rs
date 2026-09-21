@@ -1187,6 +1187,20 @@ fn deserialize_indices(
                         last.extra_collations = colls;
                     }
                 }
+                // 9.0.0 — the access method the statement ASKED for
+                // (FILE_VERSION 104+). A v103 snapshot has no byte here
+                // and every index in it reads as the method it is, which
+                // is what it recorded.
+                if version >= 104 {
+                    let declared = if cur.read_u8()? == 0 {
+                        None
+                    } else {
+                        Some(cur.read_str()?)
+                    };
+                    if let Some(last) = t.indices.last_mut() {
+                        last.declared_am = declared;
+                    }
+                }
             }
         }
     }
