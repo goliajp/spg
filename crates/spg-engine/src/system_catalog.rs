@@ -16334,7 +16334,13 @@ pub(crate) fn synth_pg_type(
     // and yes_or_no over character varying, cardinal_number over integer);
     // SPG reported nothing at all, so a client resolving the type behind
     // an information_schema column found no such type.
-    for (full, base) in INFORMATION_SCHEMA_DOMAINS {
+    // 9.0.0 — the oid is the domain's POSITION in the list, not its BASE
+    // type. It was `BASE + base_oid`, and two of the four domains are
+    // over `character varying`, so `character_data` and `yes_or_no`
+    // shared oid 14543: `pg_type` answered two rows for one oid, which
+    // is the shape `pg_dump` stops on (`query returned 2 rows instead of
+    // one`). A base type does not identify a domain.
+    for (i, (full, base)) in INFORMATION_SCHEMA_DOMAINS.iter().enumerate() {
         let bare = full.rsplit('.').next().unwrap_or(full);
         let (base_oid, len): (i64, i16) = match base {
             DataType::Name => (19, 64),
@@ -16342,7 +16348,7 @@ pub(crate) fn synth_pg_type(
             _ => (1043, -1),
         };
         let mut row = build_row(
-            INFORMATION_SCHEMA_DOMAIN_OID_BASE + base_oid,
+            INFORMATION_SCHEMA_DOMAIN_OID_BASE + i64::try_from(i).unwrap_or(0),
             bare,
             len,
             "d",
@@ -17322,23 +17328,30 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (1706, "sign", "f", 1, 23),
     // 9.0.0 — pg_trgm returns `real` (700), measured on 18.6. It said
     // float8.
-    (900070, "similarity", "f", 2, 700),
-    (900086, "show_trgm", "f", 1, 1009),
-    (900087, "word_similarity", "f", 2, 700),
-    (900088, "strict_word_similarity", "f", 2, 700),
-    (900089, "set_limit", "f", 1, 700),
-    (900090, "show_limit", "f", 0, 700),
-    (900091, "similarity_op", "f", 2, 16),
-    (900092, "similarity_dist", "f", 2, 700),
-    (900093, "word_similarity_op", "f", 2, 16),
-    (900094, "word_similarity_commutator_op", "f", 2, 16),
-    (900095, "word_similarity_dist_op", "f", 2, 700),
-    (900096, "word_similarity_dist_commutator_op", "f", 2, 700),
-    (900097, "strict_word_similarity_op", "f", 2, 16),
-    (900098, "strict_word_similarity_commutator_op", "f", 2, 16),
-    (900099, "strict_word_similarity_dist_op", "f", 2, 700),
+    //
+    // The pg_trgm family is numbered from 901000 because the 900000
+    // band it was written into was already full: `show_trgm` and
+    // `xmlforest` were BOTH 900086, and `word_similarity` and `isnull`
+    // both 900087, so `pg_proc` answered two rows for one oid and
+    // `pg_dump` stopped on `query returned 2 rows instead of one`. That
+    // was invisible while a separate defect stopped `pg_dump` earlier.
+    (901015, "similarity", "f", 2, 700),
+    (901000, "show_trgm", "f", 1, 1009),
+    (901001, "word_similarity", "f", 2, 700),
+    (901002, "strict_word_similarity", "f", 2, 700),
+    (901003, "set_limit", "f", 1, 700),
+    (901004, "show_limit", "f", 0, 700),
+    (901005, "similarity_op", "f", 2, 16),
+    (901006, "similarity_dist", "f", 2, 700),
+    (901007, "word_similarity_op", "f", 2, 16),
+    (901008, "word_similarity_commutator_op", "f", 2, 16),
+    (901009, "word_similarity_dist_op", "f", 2, 700),
+    (901010, "word_similarity_dist_commutator_op", "f", 2, 700),
+    (901011, "strict_word_similarity_op", "f", 2, 16),
+    (901012, "strict_word_similarity_commutator_op", "f", 2, 16),
+    (901013, "strict_word_similarity_dist_op", "f", 2, 700),
     (
-        900100,
+        901014,
         "strict_word_similarity_dist_commutator_op",
         "f",
         2,

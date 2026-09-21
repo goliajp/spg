@@ -16100,8 +16100,21 @@ fn oid_comparison_mismatch(
     cols: &[ColumnSchema],
 ) -> Option<(spg_storage::DataType, spg_storage::DataType, &'static str)> {
     use spg_sql::ast::BinOp;
+    // 9.0.0 (N14) — a STRING literal is not a certain type. PostgreSQL
+    // types one `unknown` and coerces it to whatever the other side
+    // needs, so `WHERE oid = '54001'` is an ordinary catalog query and
+    // `pg_dump` issues exactly that one. Every other literal IS typed
+    // there: measured on 18.6, `1::oid = '54001'` answers `f` while
+    // `1::oid = 1.0` and `1::oid = 1.5e0` are both
+    // `operator does not exist: oid = numeric`.
+    //
+    // The list used to treat a string literal as `text`, and nothing
+    // caught it because the route `pg_dump` takes did not run this
+    // check at all. Consolidating the three check lists is what
+    // surfaced it, and `pg_dump` stopped on its first composite type.
     let certain = |x: &Expr| -> Option<spg_storage::DataType> {
         match x {
+            Expr::Literal(spg_sql::ast::Literal::String(_)) => None,
             Expr::Column(_) | Expr::Cast { .. } | Expr::Literal(_) => {
                 crate::describe::describe_expr_type(x, cols)
             }

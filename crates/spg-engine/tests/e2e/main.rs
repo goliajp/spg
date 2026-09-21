@@ -136,6 +136,7 @@ mod e2e_catalog_deparse_pretty_900;
 mod e2e_catalog_functions_round516;
 mod e2e_catalog_functions_round517;
 mod e2e_catalog_name_type_round313;
+mod e2e_catalog_oid_uniqueness_900;
 mod e2e_catalog_qualifier_r1052;
 mod e2e_catalog_registry_900;
 mod e2e_catalog_self_describing_round623;

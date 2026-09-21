@@ -146,6 +146,23 @@ fn an_oid_compared_with_a_non_integer_is_refused_on_the_wire_too() {
         assert_eq!(error_of(&mut s, sql).as_deref(), Some(expected), "{sql}");
     }
 
+    // 9.0.0 — a bare LITERAL is `unknown` to PostgreSQL, which coerces
+    // it, so `WHERE oid = '54001'` is an ordinary catalog query. It is
+    // the one `pg_dump` issues for every composite type, and treating
+    // the literal as `text` stopped the dump on the first one.
+    assert_eq!(
+        error_of(&mut s, "SELECT count(*) FROM pg_class WHERE oid = '54001'"),
+        None
+    );
+    assert_eq!(error_of(&mut s, "SELECT o = '1' FROM n14t"), None);
+    // Every OTHER literal is typed there, and still refused: measured on
+    // PG 18.6, `1::oid = 1.0` and `1::oid = 1.5e0` are both
+    // `operator does not exist: oid = numeric`.
+    assert_eq!(
+        error_of(&mut s, "SELECT o = 1.0 FROM n14t").as_deref(),
+        Some("operator does not exist: oid = numeric")
+    );
+
     // …and what PostgreSQL ALLOWS still answers: oid shares its family
     // with the integer widths.
     assert_eq!(error_of(&mut s, "SELECT o = i FROM n14t"), None);

@@ -248,6 +248,25 @@ been masking the arity — so both are listed at PostgreSQL's oids, and
 PostgreSQL, which extends the array leftwards and gives it a new lower
 bound. SPG's arrays have none to give.
 
+### Fixed — two catalog rows shared one oid, and `pg_dump` stopped on it
+
+An oid is a row's identity: `pg_dump` prepares `dumpFunc($1)` and
+`dumpCompositeType($1)` and executes one per object, and a catalog that
+answers TWO rows for the oid it was given fails the whole dump with
+`query returned 2 rows instead of one`. There is no wrong answer to
+look at — the dump simply does not happen.
+
+`pg_proc` had two: `show_trgm` and `xmlforest` were both 900086, and
+`word_similarity` and `isnull` both 900087, because the pg_trgm family
+had been numbered into a band that was already full. `pg_type` had one:
+`character_data` and `yes_or_no` were both 14543, because a domain's
+oid was derived from its BASE type and both are domains over
+`character varying` — a base type does not identify a domain.
+
+Neither was visible while a separate defect stopped `pg_dump` at its
+first composite type. A pin now asks every catalog that publishes an
+oid, so the next one cannot hide behind the one before it.
+
 ### Fixed — a dump of an identity table did not restore
 
 `COPY t (id, n) FROM stdin` into a `GENERATED ALWAYS AS IDENTITY`
