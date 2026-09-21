@@ -1223,6 +1223,7 @@ mod e2e_join_using;
 mod e2e_json_build;
 mod e2e_json_builder_whitespace;
 mod e2e_json_path;
+mod e2e_json_populate_base_900;
 mod e2e_jsonb;
 mod e2e_jsonb_column_validates_v7388;
 mod e2e_jsonb_epic6;
