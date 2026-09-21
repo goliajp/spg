@@ -224,7 +224,18 @@ def per_expr(uri):
     return res
 
 
-setup = "CREATE SEQUENCE IF NOT EXISTS seq_gd; CREATE TABLE IF NOT EXISTS gd_t (a int);"
+# 9.0.0 — and pg_trgm, on BOTH legs. PostgreSQL's image has it
+# installed already, and SPG stopped answering an extension's functions
+# before the extension is created, which is PostgreSQL's own rule — so
+# `similarity('abc','abd')` read as a divergence when what differed was
+# the two legs' SETUP. A sweep that installs it on neither leg or on
+# both compares the answer; one that installs it on one compares the
+# instrument.
+setup = (
+    "CREATE SEQUENCE IF NOT EXISTS seq_gd;"
+    " CREATE TABLE IF NOT EXISTS gd_t (a int);"
+    " CREATE EXTENSION IF NOT EXISTS pg_trgm;"
+)
 PG, SPG = sys.argv[1], sys.argv[2]
 # 9.0.0 — the setup must SUCCEED, and be seen to. Its output was
 # discarded, so a leg whose `gd_t` was never created reported
