@@ -10460,7 +10460,35 @@ impl fmt::Display for BinOp {
 /// non-folded case, leading digit, embedded non-`[A-Za-z0-9_]`, empty).
 /// Otherwise return it as-is. Returns an owned `String` to keep the call site
 /// uniform.
+/// 9.0.0 (C9) — a RELATION name, rendered the way SQL spells it.
+///
+/// A relation's name is a KEY: `public` keeps the bare name and any
+/// other schema carries it, with a separator that is not a character an
+/// identifier may contain. Rendering the key itself put that separator
+/// into stored SQL — a view's body is this `Display`, so
+/// `CREATE VIEW sa.v AS SELECT id FROM sa.t` stored
+/// `SELECT id FROM "sa\0t"`, which re-parsed as
+/// `invalid byte sequence for encoding "UTF8": 0x00` and rendered in
+/// `pg_views.definition` as `SELECT id FROM "sa`.
+///
+/// Each half is quoted on its own, as PostgreSQL quotes them.
 pub(crate) fn quote_ident(s: &str) -> String {
+    // 9.0.0 (C9) — a relation's name is a KEY: `public` keeps the bare
+    // name and any other schema travels with it, separated by a byte no
+    // identifier may contain. Rendering the key itself put that byte
+    // into stored SQL — a view's body IS this `Display`, so
+    // `CREATE VIEW sa.v AS SELECT id FROM sa.t` stored
+    // `SELECT id FROM "sa\0t"`, which re-parsed as `invalid byte
+    // sequence for encoding "UTF8": 0x00` and showed in
+    // `pg_views.definition` as `SELECT id FROM "sa`.
+    //
+    // It is handled HERE rather than at the two hundred call sites
+    // because the test is exact: the separator cannot occur in a name
+    // the lexer will produce, so nothing else can take this branch.
+    if crate::namespace::is_qualified(s) {
+        let (schema, name) = crate::namespace::split_key(s);
+        return alloc::format!("{}.{}", quote_ident(schema), quote_ident(name));
+    }
     let needs_quote = match s.chars().next() {
         None => true,
         Some(c) if !c.is_ascii_alphabetic() && c != '_' => true,

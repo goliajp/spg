@@ -468,30 +468,50 @@ pub(crate) fn synth_information_schema_columns(
         for (i, col) in t.schema().columns.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
-            rows.push(info_column_row(&tname, ordinal, col, None, false));
+            // 9.0.0 (C9) — in the relation's own schema. `info_column_row`
+            // says `public`, which was every relation before a schema
+            // could hold one.
+            rows.push(info_column_row_in(&nsp, &tname, ordinal, col, None, false));
         }
     }
     // v7.39 (round 268) — view columns. The view reported NO rows for a
     // view before this, so a reflection tool saw every view as a
     // relation with no columns at all. Shapes whose body does not fully
     // resolve contribute nothing rather than a guess.
-    for (vname, _) in cat.views_all() {
+    for (vkey, _) in cat.views_all() {
         // v7.39 (round 469) — a temporary view belongs to one session; the
         // others must not see it listed under its mangled storage name.
-        let Some(vname) = cat.listed_name(vname) else {
+        //
+        // 9.0.0 (C9) — and a view has a schema of its own.
+        if !cat.in_current_database(vkey) {
+            continue;
+        }
+        let vnsp = alloc::string::String::from(cat.listed_schema(vkey));
+        let Some(vname) = cat.listed_name(vkey) else {
             continue;
         };
-        let cols = crate::describe::describe_view_columns(cat, vname);
+        // 9.0.0 (C9) — the three questions are asked of the KEY, which
+        // is what the view registry is keyed by; the bare name finds
+        // nothing for a view in another schema, so its columns were
+        // listed nowhere.
+        let cols = crate::describe::describe_view_columns(cat, vkey);
         // A column is writable only if the view itself is auto-updatable
         // AND the column is a plain base column — the same two questions
         // the write path asks (round 267).
-        let updatable = crate::dml::view_is_auto_updatable(cat, vname);
-        let simple = crate::dml::view_simple_column_names(cat, vname);
+        let updatable = crate::dml::view_is_auto_updatable(cat, vkey);
+        let simple = crate::dml::view_simple_column_names(cat, vkey);
         for (i, col) in cols.iter().enumerate() {
             #[allow(clippy::cast_possible_wrap)]
             let ordinal = (i + 1) as i32;
             let writable = updatable && simple.iter().any(|n| n == &col.name);
-            rows.push(info_column_row(vname, ordinal, col, Some(writable), false));
+            rows.push(info_column_row_in(
+                &vnsp,
+                vname,
+                ordinal,
+                col,
+                Some(writable),
+                false,
+            ));
         }
     }
     // 9.0.0 — the system catalogs' own columns. PostgreSQL 18.6 answers
@@ -1275,14 +1295,21 @@ pub(crate) fn synth_information_schema_tables(
     // reflection tool saw a database with no views in it. table_type is
     // VIEW and is_insertable_into follows the same auto-updatability
     // judgement the write path uses.
-    for (name, _) in cat.views_all() {
-        let Some(name) = cat.listed_name(name) else {
+    for (key, _) in cat.views_all() {
+        // 9.0.0 (C9) — a view belongs to its schema, like a table. It
+        // was listed in `public` whatever the key said, so `pg_class`
+        // and this view disagreed about the same view.
+        if !cat.in_current_database(key) {
+            continue;
+        }
+        let nsp = alloc::string::String::from(cat.listed_schema(key));
+        let Some(name) = cat.listed_name(key) else {
             continue;
         };
         let insertable = crate::dml::view_is_auto_updatable(cat, name);
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
-            Value::text("public"),
+            Value::text(nsp),
             Value::text(name.to_string()),
             Value::text("VIEW"),
             Value::Null,
@@ -1487,11 +1514,20 @@ pub(crate) fn synth_information_schema_views(
         .values()
         // v7.39 (round 469) — a temporary view belongs to one session; the
         // others must not see it listed under its mangled storage name.
-        .filter_map(|v| cat.listed_name(&v.name).map(|n| (n.to_string(), v)))
-        .map(|(vname, v)| {
+        // 9.0.0 (C9) — and its schema, which was hardcoded `public`.
+        .filter_map(|v| {
+            cat.listed_name(&v.name).map(|n| {
+                (
+                    n.to_string(),
+                    alloc::string::String::from(cat.listed_schema(&v.name)),
+                    v,
+                )
+            })
+        })
+        .map(|(vname, nsp, v)| {
             Row::new(alloc::vec![
                 Value::text("spg"),
-                Value::text("public"),
+                Value::text(nsp),
                 Value::text(vname),
                 // v7.39 (round 336, V58) — the DEPARSED definition, the same
                 // text `pg_get_viewdef` gives. This used to be the stored
@@ -3821,8 +3857,12 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(relid),
                 Value::BigInt(indexrelid),
-                Value::text("public"),
-                Value::Text(alloc::borrow::Cow::Owned(tname.clone())),
+                // 9.0.0 (C9) — the table's own schema and bare name.
+                Value::text(alloc::string::String::from(cat.listed_schema(&ci.table))),
+                Value::Text(alloc::borrow::Cow::Owned(
+                    cat.listed_name(&ci.table)
+                        .map_or_else(|| ci.table.clone(), alloc::string::String::from),
+                )),
                 Value::Text(alloc::borrow::Cow::Owned(ci.name.clone())),
                 Value::BigInt(0), // idx_scan
                 Value::BigInt(0), // idx_tup_read
@@ -4713,6 +4753,9 @@ pub(crate) const OID_INDEX_BASE: i64 = 100_000;
 /// which is how an inline `PRIMARY KEY (a, b)` stays one row.
 pub(crate) struct CatalogIndex {
     pub oid: i64,
+    /// 9.0.0 (C9) — the table's stored KEY, so a lookup finds it
+    /// whichever schema it is in. A surface that DISPLAYS it asks
+    /// `Catalog::listed_name` / `listed_schema` for the two halves.
     pub table: alloc::string::String,
     pub name: alloc::string::String,
     /// 0-based column positions on the parent table.
@@ -4847,7 +4890,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
             );
             out.push(CatalogIndex {
                 oid,
-                table: tname.clone(),
+                table: key.clone(),
                 name,
                 columns,
                 included: idx.included_columns.clone(),
@@ -4896,7 +4939,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 .collect();
             out.push(CatalogIndex {
                 oid,
-                table: tname.clone(),
+                table: key.clone(),
                 name: constraint_index_name(&tname, uc, &cols),
                 columns: uc.columns.clone(),
                 included: Vec::new(),
@@ -4942,7 +4985,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 oid += 1;
                 out.push(CatalogIndex {
                     oid,
-                    table: tname.clone(),
+                    table: key.clone(),
                     name: ci.name.clone(),
                     part_expressions: alloc::vec![None; positions.len()],
                     part_orders: alloc::vec![
@@ -5559,7 +5602,11 @@ pub(crate) fn synth_pg_class(
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(idx_oid),
                 Value::text(ci.name.clone()),
-                Value::BigInt(namespace_oid_for_relname(cat, &ci.name)),
+                // 9.0.0 (C9) — an index belongs to its TABLE's schema.
+                // Its own name carries none, so asking for the index's
+                // put every index in `public`, including those on a
+                // relation in another schema.
+                Value::BigInt(namespace_oid_for_relname(cat, &ci.table)),
                 Value::BigInt(0), // reltype (indexes have none)
                 Value::BigInt(0), // reloftype
                 // An index belongs to its table's owner, as in PG.
@@ -18795,7 +18842,11 @@ pub(crate) fn synth_info_statistics(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Ro
                 .get(*pos)
                 .map_or("?".into(), |c| c.name.clone());
             rows.push(Row::new(alloc::vec![
-                Value::text(idx.table.clone()),
+                // 9.0.0 (C9) — the bare name, which is what MySQL shows.
+                Value::text(
+                    cat.listed_name(&idx.table)
+                        .map_or_else(|| idx.table.clone(), alloc::string::String::from),
+                ),
                 Value::text(mysql_index_name(&idx)),
                 Value::text(col),
                 Value::Int(i32::try_from(seq + 1).unwrap_or(1)),
@@ -21283,12 +21334,18 @@ pub(crate) fn synth_pg_views(
     ];
     let mut rows: Vec<Row<'static>> = Vec::new();
     for (stored, def) in cat.views_all() {
+        // 9.0.0 (C9) — the view's own schema; see
+        // `synth_information_schema_tables`.
+        if !cat.in_current_database(stored) {
+            continue;
+        }
+        let nsp = alloc::string::String::from(cat.listed_schema(stored));
         let Some(name) = cat.listed_name(stored) else {
             continue;
         };
         let owner = cat.object_owner(spg_storage::NonTableKind::View, stored);
         rows.push(Row::new(alloc::vec![
-            Value::text("public"),
+            Value::text(nsp),
             Value::text(name.to_string()),
             Value::text(String::from(roles.owner_name(owner))),
             Value::text(def.body.clone()),
@@ -21343,7 +21400,8 @@ pub(crate) fn synth_pg_matviews(
             continue;
         };
         rows.push(Row::new(alloc::vec![
-            Value::text("public"),
+            // 9.0.0 (C9) — the materialized view's own schema.
+            Value::text(alloc::string::String::from(cat.listed_schema(&stored))),
             Value::text(name.clone()),
             Value::text(String::from(roles.owner_name(t.schema().owner.as_deref()))),
             Value::Null,
@@ -22372,12 +22430,18 @@ fn render_synthesised_indexdef(t: &spg_storage::Table, ci: &CatalogIndex) -> all
     // 9.0.0 — `UNIQUE` and `ONLY` are read off the entry. A constraint's
     // row is always unique and never ONLY, which is why the hardcoded
     // form served until a parent's declaration needed the same renderer.
+    // 9.0.0 (C9) — the relation's own schema. This form is always
+    // qualified (PostgreSQL writes `public.t` here too); what changed is
+    // that the schema is the relation's rather than the literal
+    // `public`, and the relation is its bare name rather than the key.
+    let (rel_schema, rel_name) = spg_sql::namespace::split_key(&ci.table);
     alloc::format!(
-        "CREATE {}INDEX {} ON {}public.{} USING {} ({})",
+        "CREATE {}INDEX {} ON {}{}.{} USING {} ({})",
         if ci.is_unique { "UNIQUE " } else { "" },
         ci.name,
         if ci.only { "ONLY " } else { "" },
-        ci.table,
+        rel_schema,
+        rel_name,
         am_name_of_oid(ci.am_oid),
         cols.join(", ")
     )
@@ -22682,7 +22746,17 @@ pub(crate) fn render_indexdef_in(
     let am: &str = idx.declared_am.as_deref().unwrap_or(am);
     // 9.0.0 — the pretty form drops the schema qualification, as PG's
     // does; the plain one always writes it.
-    let schema = if pretty { "" } else { "public." };
+    // 9.0.0 (C9) — the relation's OWN schema, and the relation under its
+    // bare name. `tname` is the stored key here, so this wrote
+    // `ON public.<key>` and the key's separator truncated the line at
+    // the client: `CREATE INDEX sa_t_n ON public.sa`.
+    let (rel_schema, rel_name) = spg_sql::namespace::split_key(tname);
+    let schema = if pretty {
+        alloc::string::String::new()
+    } else {
+        alloc::format!("{rel_schema}.")
+    };
+    let tname = rel_name;
     match &idx.partial_predicate {
         Some(pred) => {
             // 8.0.3 — PG's catalog form (see `catalog_deparse`): a bare
@@ -22733,10 +22807,17 @@ pub(crate) fn synth_pg_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
             continue;
         };
         {
-            let tname = ci.table.clone();
+            // 9.0.0 (C9) — the index is listed under its TABLE's schema,
+            // and the table under its bare name. Both were hardcoded
+            // `public` and the stored key, so an index on a relation in
+            // another schema was listed nowhere a client would look.
+            let nsp = alloc::string::String::from(cat.listed_schema(&ci.table));
+            let Some(tname) = cat.listed_name(&ci.table).map(alloc::string::String::from) else {
+                continue;
+            };
             let indexdef = catalog_indexdef(cat, t, &ci, None);
             rows.push(Row::new(alloc::vec![
-                Value::text("public"),
+                Value::text(nsp),
                 Value::text(tname.clone()),
                 Value::text(ci.name.clone()),
                 Value::Null, // tablespace — the default one
