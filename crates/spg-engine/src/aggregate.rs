@@ -65,7 +65,9 @@ impl crate::Engine {
         {
             return None;
         }
-        let table = self.active_catalog().get(&from.primary.name)?;
+        let table = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)?;
         let alias = from
             .primary
             .alias
@@ -7141,7 +7143,7 @@ fn qualifiers_grouped_by_primary_key(
         if tr.unnest_expr.is_some() {
             continue;
         }
-        let Some(table) = cat.get(&tr.name) else {
+        let Some(table) = cat.get_written(&tr.name, tr.qualified) else {
             continue;
         };
         let schema = table.schema();

@@ -121,7 +121,7 @@ fn choose_order_inner(
     }
     let mut sizes: Vec<u64> = Vec::with_capacity(n);
     for t in &tables {
-        let table = catalog.get(&t.name)?;
+        let table = catalog.get_written(&t.name, t.qualified)?;
         sizes.push(table.rows().len() as u64);
     }
     Some(if n <= FULL_ENUM_MAX {
@@ -241,7 +241,7 @@ pub fn reorder_joins_with(
     // a different code path — but we double-check) bail.
     let mut sizes: Vec<u64> = Vec::with_capacity(n);
     for t in &tables {
-        let Some(table) = catalog.get(&t.name) else {
+        let Some(table) = catalog.get_written(&t.name, t.qualified) else {
             return;
         };
         sizes.push(table.rows().len() as u64);

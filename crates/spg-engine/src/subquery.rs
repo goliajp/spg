@@ -2392,6 +2392,7 @@ impl Engine {
         let join = FromJoin {
             kind: JoinKind::Left,
             table: TableRef {
+                qualified: false,
                 token: spg_sql::ast::SrcToken::NONE,
                 name: cte_name.clone(),
                 alias: None,
@@ -2680,6 +2681,7 @@ impl Engine {
         let join = FromJoin {
             kind: JoinKind::Left,
             table: TableRef {
+                qualified: false,
                 token: spg_sql::ast::SrcToken::NONE,
                 name: inner_table,
                 alias: Some(fresh.clone()),
@@ -2775,7 +2777,10 @@ impl Engine {
             if !from.joins.is_empty() {
                 continue;
             }
-            let Some(t) = self.active_catalog().get(&from.primary.name) else {
+            let Some(t) = self
+                .active_catalog()
+                .get_written(&from.primary.name, from.primary.qualified)
+            else {
                 continue;
             };
             for col in &t.schema().columns {
@@ -3360,6 +3365,7 @@ impl Engine {
                 JoinKind::Semi
             },
             table: TableRef {
+                qualified: false,
                 token: spg_sql::ast::SrcToken::NONE,
                 name: inner_table,
                 alias: Some(fresh.clone()),
@@ -4335,7 +4341,7 @@ fn inner_scope_column_names(
         if t.unnest_expr.is_some() || t.generate_series_args.is_some() || t.name.is_empty() {
             return false;
         }
-        let Some(tbl) = cat.get(&t.name) else {
+        let Some(tbl) = cat.get_written(&t.name, t.qualified) else {
             // A CTE, a view, or a name this catalog does not hold.
             return false;
         };

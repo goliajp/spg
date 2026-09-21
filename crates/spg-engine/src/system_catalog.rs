@@ -2545,10 +2545,15 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         }
     };
     for (vname, def) in cat.views_all() {
-        let Some(listed) = cat.listed_name(vname) else {
+        if cat.listed_name(vname).is_none() {
             continue;
-        };
-        if let Some(self_oid) = relation_oid(cat, listed) {
+        }
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        if let Some(self_oid) = relation_oid(cat, vname) {
             push_edges(&def.body, self_oid, &mut rows);
         }
     }
@@ -2566,13 +2571,19 @@ pub(crate) fn synth_pg_depend(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'sta
         let Some((table, column)) = &def.owned_by else {
             continue;
         };
-        let (Some(name), Some(t)) = (cat.listed_name(&stored), cat.get(table)) else {
+        let (Some(_), Some(t)) = (cat.listed_name(&stored), cat.get(table)) else {
             continue;
         };
         let Some(pos) = t.schema().columns.iter().position(|c| c.name == *column) else {
             continue;
         };
-        let (Some(seq_oid), Some(table_oid)) = (relation_oid(cat, name), relation_oid(cat, table))
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        let (Some(seq_oid), Some(table_oid)) =
+            (relation_oid(cat, &stored), relation_oid(cat, table))
         else {
             continue;
         };
@@ -2690,7 +2701,9 @@ fn nextval_target(default_text: &str) -> Option<String> {
         },
         _ => return None,
     };
-    Some(String::from(lit.strip_prefix("public.").unwrap_or(lit)))
+    // 9.0.1 (C9) — the KEY, so a `DEFAULT nextval('sa.s')` depends on
+    // the sequence in `sa` and `pg_dump` orders it ahead of the table.
+    Some(spg_sql::namespace::key_from_text(lit))
 }
 
 /// v7.38 (read01) — synthesise `pg_catalog.pg_attrdef`, the column-default
@@ -5103,7 +5116,11 @@ pub(crate) fn builtin_type_oid_exists(oid: i64) -> bool {
     .any(|t| pg_type_oid(t) == oid)
 }
 
-pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
+/// 9.0.1 (C9) — the STORED KEY an oid names together with the name a
+/// client reads for it. Every oid→name answer comes from this one walk,
+/// so the name a tool is shown and the key the engine looks the
+/// relation up by cannot drift apart.
+fn relation_entry_for_oid(cat: &Catalog, oid: i64) -> Option<(String, String)> {
     for (pos, tname) in cat.table_names().iter().enumerate() {
         if OID_TABLE_BASE + pos as i64 == oid {
             // 9.0.0 (C8) — a relation of ANOTHER database has an oid and
@@ -5113,67 +5130,175 @@ pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
             if !cat.in_current_database(tname) {
                 return None;
             }
-            return cat.listed_name(tname).map(alloc::string::String::from);
+            let listed = cat.listed_name(tname)?;
+            return Some((tname.clone(), alloc::string::String::from(listed)));
         }
     }
-    for (pos, vname) in cat.views_all().keys().enumerate() {
-        let Some(vname) = cat.listed_name(vname) else {
+    for (pos, vkey) in cat.views_all().keys().enumerate() {
+        let Some(listed) = cat.listed_name(vkey) else {
             continue;
         };
         if OID_VIEW_BASE + pos as i64 == oid {
-            return Some(alloc::string::String::from(vname));
+            return Some((vkey.clone(), alloc::string::String::from(listed)));
         }
     }
     for ci in catalog_indexes(cat) {
         if ci.oid == oid {
-            return Some(ci.name);
+            let listed = alloc::string::String::from(cat.listed_name(&ci.name)?);
+            return Some((ci.name, listed));
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
-    for (name, _) in crate::sequence::catalog_sequences(cat) {
-        let Some(name) = cat.listed_name(&name) else {
+    for (key, _) in crate::sequence::catalog_sequences(cat) {
+        let Some(listed) = cat.listed_name(&key) else {
             continue;
         };
         seq_oid += 1;
         if seq_oid == oid {
-            return Some(alloc::string::String::from(name));
+            let listed = alloc::string::String::from(listed);
+            return Some((key, listed));
         }
     }
     None
 }
 
+pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
+    relation_entry_for_oid(cat, oid).map(|(_, listed)| listed)
+}
+
+/// 9.0.1 (C9) — the index a bare name reaches: the first schema on the
+/// session's search path that holds an index called that. An empty path
+/// means `public` alone, which is where a session that never set one
+/// resolves.
+fn index_key_on_path(cat: &Catalog, listed: &str) -> Option<String> {
+    let indexes = catalog_indexes(cat);
+    let named = |schema: &str| {
+        indexes.iter().find(|ci| {
+            cat.listed_name(&ci.name) == Some(listed)
+                && spg_sql::namespace::schema_of(&ci.name) == schema
+        })
+    };
+    if cat.search_path().is_empty() {
+        return named(spg_sql::namespace::PUBLIC).map(|ci| ci.name.clone());
+    }
+    cat.search_path()
+        .iter()
+        .find_map(|s| named(s))
+        .map(|ci| ci.name.clone())
+}
+
+/// 9.0.1 (C9) — how PostgreSQL WRITES the relation an oid names: bare
+/// when a client writing that bare name would reach this very relation,
+/// qualified otherwise. Measured on 18.6 — `'q1.only_here'::regclass`
+/// prints `q1.only_here` while `q1` is off the search path and
+/// `only_here` once it is on it, and it stays qualified whenever
+/// another schema on the path shadows the name.
+///
+/// `conrelid::regclass` printed a bare `t` for both `public.t` and
+/// `sa.t`, so a schema diff read two different tables as one.
+pub(crate) fn relation_display_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
+    let (key, listed) = relation_entry_for_oid(cat, oid)?;
+    let reached = cat
+        .path_key(&listed)
+        // An INDEX is in no registry the catalog path-resolves, so its
+        // own walk answers: the first schema on the path that holds an
+        // index of this name.
+        .or_else(|| index_key_on_path(cat, &listed));
+    if reached.as_deref() == Some(key.as_str()) {
+        return Some(listed);
+    }
+    // The qualifier is written even when it is `public`: a relation in
+    // `public` that another schema on the path SHADOWS can only be
+    // named `public.tz`, and PostgreSQL 18.6 writes exactly that
+    // (measured, with `q3` ahead of `public` and a `tz` in each).
+    Some(alloc::format!(
+        "{}.{listed}",
+        spg_sql::namespace::schema_of(&key)
+    ))
+}
+
 pub(crate) fn relation_oid(cat: &Catalog, bare: &str) -> Option<i64> {
+    relation_oid_by(cat, bare, RelationOidBy::Key)
+        .or_else(|| relation_oid_by(cat, bare, RelationOidBy::ListedName))
+}
+
+/// 9.0.1 (C9) — which spelling `relation_oid` is matching on.
+///
+/// Callers hold one of two things. A catalog synth walks a registry and
+/// hands over the STORED KEY (`sa\0s`); a user's `'s'::regclass` hands
+/// over the name a client writes. Matching only the listed name gave a
+/// sequence in a schema no oid at all — `pg_get_sequence_data` then
+/// returned no row for a sequence `pg_class` and `pg_sequence` both
+/// list, and `pg_dump` dereferenced the missing row and SEGFAULTED.
+///
+/// The key pass runs FIRST and completely, so `public.s` and `sa.s`
+/// keep distinct oids: a bare `s` can only fall through to the listed
+/// pass once no key is spelled that way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RelationOidBy {
+    Key,
+    ListedName,
+}
+
+fn relation_oid_by(cat: &Catalog, want: &str, by: RelationOidBy) -> Option<i64> {
+    // 9.0.1 (C8+C9) — the name pass compares what a client READS, and
+    // a relation of another database reads as its own bare name. The
+    // key pass cannot confuse the two (a foreign key carries its
+    // database), but the name pass would have answered `'c8t'::regclass`
+    // from a database that does not hold it.
+    let mine = |key: &str| by == RelationOidBy::Key || cat.in_current_database(key);
     // v7.39 (round 437) — the RAW list, because that is the order the synths
     // assign oids in (a foreign session's temporary table still consumes
     // its slot, it is only left out of the OUTPUT). The name is matched
     // through the session's temp namespace, so `tmp` finds the caller's own
     // temporary table at its real catalog position.
-    let stored = cat.temp_name_for(bare);
+    let stored = cat.temp_name_for(want);
     for (pos, tname) in cat.table_names().iter().enumerate() {
-        if tname == bare || Some(tname) == stored.as_ref() {
+        let matched = mine(tname)
+            && match by {
+                RelationOidBy::Key => tname == want || Some(tname) == stored.as_ref(),
+                RelationOidBy::ListedName => cat.listed_name(tname) == Some(want),
+            };
+        if matched {
             return Some(OID_TABLE_BASE + pos as i64);
         }
     }
-    for (pos, vname) in cat.views_all().keys().enumerate() {
-        let Some(vname) = cat.listed_name(vname) else {
-            continue;
-        };
-        if vname == bare {
+    for (pos, vkey) in cat.views_all().keys().enumerate() {
+        let matched = mine(vkey)
+            && match by {
+                RelationOidBy::Key => vkey == want,
+                RelationOidBy::ListedName => cat.listed_name(vkey) == Some(want),
+            };
+        if matched {
             return Some(OID_VIEW_BASE + pos as i64);
         }
     }
     for ci in catalog_indexes(cat) {
-        if ci.name == bare {
+        let matched = mine(&ci.name)
+            && match by {
+                RelationOidBy::Key => ci.name == want,
+                RelationOidBy::ListedName => cat.listed_name(&ci.name) == Some(want),
+            };
+        if matched {
             return Some(ci.oid);
         }
     }
     let mut seq_oid = OID_SEQ_BASE;
-    for (name, _) in crate::sequence::catalog_sequences(cat) {
-        let Some(name) = cat.listed_name(&name) else {
+    for (key, _) in crate::sequence::catalog_sequences(cat) {
+        // A sequence the caller cannot see (another session's temporary
+        // one) consumes NO slot here, because `relation_name_for_oid`
+        // counts the same way. Increment after the skip or the two stop
+        // agreeing and an oid names a different sequence in each.
+        let Some(listed) = cat.listed_name(&key) else {
             continue;
         };
         seq_oid += 1;
-        if name == bare {
+        let matched = mine(&key)
+            && match by {
+                RelationOidBy::Key => key == want,
+                RelationOidBy::ListedName => listed == want,
+            };
+        if matched {
             return Some(seq_oid);
         }
     }
@@ -5376,7 +5501,14 @@ pub(crate) fn synth_pg_class(
             continue;
         };
         let Some(t) = cat.get(&stored) else { continue };
-        let is_temp = stored != tname;
+        // 9.0.0 (C9) — a relation is TEMPORARY when its NAME carries the
+        // temp marker, not when its key differs from its name. The key
+        // differs for every relation in a schema too, so `sa.s` reported
+        // `relpersistence = t` — and a temporary relation in a non-temp
+        // schema is a contradiction `pg_dump` does not survive: it
+        // segfaulted on the sequence.
+        let is_temp = spg_sql::namespace::bare_of(&stored)
+            .starts_with(spg_storage::Catalog::TEMP_NAME_MARKER);
         let schema_ref = t.schema();
         // v7.39 (round 338, V64) — a MATERIALIZED VIEW is backed by a real
         // table in SPG, and that showed through: it reported relkind 'r',
@@ -5487,8 +5619,20 @@ pub(crate) fn synth_pg_class(
         };
         // v7.39 (round 526) — a temp relation is stored under a
         // session-prefixed name; that is the same witness the resolver uses.
-        let is_temp = stored != vname;
-        let Some(view_oid) = relation_oid(cat, vname) else {
+        // 9.0.0 (C9) — a relation is TEMPORARY when its NAME carries the
+        // temp marker, not when its key differs from its name. The key
+        // differs for every relation in a schema too, so `sa.s` reported
+        // `relpersistence = t` — and a temporary relation in a non-temp
+        // schema is a contradiction `pg_dump` does not survive: it
+        // segfaulted on the sequence.
+        let is_temp =
+            spg_sql::namespace::bare_of(stored).starts_with(spg_storage::Catalog::TEMP_NAME_MARKER);
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        let Some(view_oid) = relation_oid(cat, stored) else {
             continue;
         };
         let relnatts = i16::try_from(crate::describe::describe_view_columns(cat, vname).len())
@@ -5654,8 +5798,20 @@ pub(crate) fn synth_pg_class(
             continue;
         };
         // v7.39 (round 526) — same witness as the table loop.
-        let is_temp = stored != name;
-        let Some(seq_oid) = relation_oid(cat, name) else {
+        // 9.0.0 (C9) — a relation is TEMPORARY when its NAME carries the
+        // temp marker, not when its key differs from its name. The key
+        // differs for every relation in a schema too, so `sa.s` reported
+        // `relpersistence = t` — and a temporary relation in a non-temp
+        // schema is a contradiction `pg_dump` does not survive: it
+        // segfaulted on the sequence.
+        let is_temp =
+            spg_sql::namespace::bare_of(stored).starts_with(spg_storage::Catalog::TEMP_NAME_MARKER);
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        let Some(seq_oid) = relation_oid(cat, stored) else {
             continue;
         };
         rows.push(Row::new(alloc::vec![
@@ -6128,11 +6284,16 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // — the join psql \d and every reflection tool run to learn a view's
     // shape — came back empty even though information_schema.columns
     // (round 268) already knew the answer. Same resolver, so the two agree.
-    for vname in cat.views_all().keys() {
-        let Some(vname) = cat.listed_name(vname) else {
+    for stored in cat.views_all().keys() {
+        let Some(vname) = cat.listed_name(stored) else {
             continue;
         };
-        let Some(view_oid) = relation_oid(cat, vname) else {
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        let Some(view_oid) = relation_oid(cat, stored) else {
             continue;
         };
         for (i, col) in crate::describe::describe_view_columns(cat, vname)
@@ -18931,11 +19092,16 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     // 32768 while pg_class numbered them from 300_000, which broke PG's
     // canonical `pg_class JOIN pg_sequence ON oid = seqrelid` outright —
     // and 32768 was the view band, so the two kinds collided besides.
-    for (name, def) in crate::sequence::catalog_sequences(cat) {
-        let Some(name) = cat.listed_name(&name) else {
+    for (stored, def) in crate::sequence::catalog_sequences(cat) {
+        if cat.listed_name(&stored).is_none() {
             continue;
-        };
-        let Some(seq_oid) = relation_oid(cat, name) else {
+        }
+        // 9.0.1 (C9) — the KEY, not the name a client reads. Two
+        // relations in two schemas share one name, and resolving by
+        // name handed BOTH of them the first one's oid: `pg_class`
+        // published two rows under one oid, which stops `pg_dump`
+        // outright (`query returned 2 rows instead of one`).
+        let Some(seq_oid) = relation_oid(cat, &stored) else {
             continue;
         };
         rows.push(Row::new(alloc::vec![
@@ -19025,6 +19191,17 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
     for tname in &names {
         let Some(t) = cat.get(tname) else { continue };
         let conrelid = *by_table.get(tname).unwrap_or(&0);
+        // 9.0.1 (C9) — the loop walks KEYS, and a constraint is named
+        // after the table's BARE name in the table's OWN schema.
+        // Building the name from the key put a NUL inside it: psql
+        // truncates a value at the first NUL, so `sa.t`'s primary key
+        // reached `pg_dump` called `sa`, and restoring that dump failed
+        // (`constraint "sa" for relation "t" already exists`) because
+        // the NOT NULL constraint had been truncated to `sa` as well.
+        let Some(bare) = cat.listed_name(tname) else {
+            continue;
+        };
+        let connamespace = namespace_oid_for_relname(cat, tname);
         let cols = &t.schema().columns;
         let col_name_at = |pos: usize| -> String {
             cols.get(pos)
@@ -19046,12 +19223,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
                 .get(&(tname.clone(), ui))
                 .copied()
                 .unwrap_or(0);
-            let conname = pg_unique_conname(t, uc, tname);
+            let conname = pg_unique_conname(t, uc, bare);
             let conkey_display = conkey_vec(&uc.columns);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
-                Value::BigInt(2200),
+                Value::BigInt(connamespace),
                 char1(kind), // contype
                 // v7.39 (round 711) — real, now that the flags are stored.
                 Value::Bool(uc.deferrable),         // condeferrable
@@ -19101,7 +19278,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             let conname = fk
                 .name
                 .clone()
-                .unwrap_or_else(|| pg_fk_conname(t, fk, tname));
+                .unwrap_or_else(|| pg_fk_conname(t, fk, bare));
             let confrelid = by_table.get(&fk.parent_table).copied().unwrap_or(0);
             let conkey = conkey_vec(&fk.local_columns);
             let confkey = conkey_vec(&fk.parent_columns);
@@ -19113,7 +19290,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
-                Value::BigInt(2200),
+                Value::BigInt(connamespace),
                 char1("f"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
@@ -19143,12 +19320,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         }
         // v7.37 U5 — CHECK constraints (contype 'c'). Previously
         // omitted, so pg_constraint enumeration missed every CHECK.
-        let check_names = pg_check_connames(t, tname, &t.schema().checks);
+        let check_names = pg_check_connames(t, bare, &t.schema().checks);
         for (conname, check_src) in check_names.into_iter().zip(t.schema().checks.iter()) {
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
-                Value::BigInt(2200),
+                Value::BigInt(connamespace),
                 char1("c"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
@@ -19195,7 +19372,7 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(ex.name.clone()),
-                Value::BigInt(2200),
+                Value::BigInt(connamespace),
                 char1("x"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
@@ -19238,12 +19415,12 @@ pub(crate) fn synth_pg_constraint(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
             if col.nullable && !pk_cols.contains(&i) {
                 continue;
             }
-            let conname = alloc::format!("{tname}_{}_not_null", col.name);
+            let conname = alloc::format!("{bare}_{}_not_null", col.name);
             let conkey_display = conkey_vec(&[i]);
             rows.push(Row::new(alloc::vec![
                 Value::BigInt(next_con_oid()),
                 Value::text(conname),
-                Value::BigInt(2200),
+                Value::BigInt(connamespace),
                 char1("n"), // contype
                 Value::Bool(false),
                 Value::Bool(false),
@@ -23618,7 +23795,7 @@ pub(crate) fn collect_view_refs(
     into: &mut Vec<String>,
 ) {
     if cat.has_view(&tref.name)
-        && cat.get(&tref.name).is_none()
+        && cat.get_written(&tref.name, tref.qualified).is_none()
         && !into.iter().any(|n| n == &tref.name)
     {
         into.push(tref.name.clone());

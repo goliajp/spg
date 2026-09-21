@@ -3673,6 +3673,12 @@ pub struct UpdateStatement {
     /// level UPDATE. Empty for a plain UPDATE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// 9.0.1 (C9) — the client WROTE a schema in front of the target.
+    /// A relation in `public` is keyed by its bare name, so the key
+    /// cannot say `t` from `public.t`, and the two resolve differently
+    /// once another schema on the `search_path` holds a `t` too. See
+    /// [`TableRef::qualified`].
+    pub table_qualified: bool,
     /// v7.39 (round 646) — `UPDATE ONLY t` / `DELETE FROM ONLY t`: apply
     /// to `t`'s own rows and not to anything that descends from it.
     ///
@@ -3718,6 +3724,12 @@ pub struct DeleteStatement {
     /// level DELETE. Empty for a plain DELETE.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// 9.0.1 (C9) — the client WROTE a schema in front of the target.
+    /// A relation in `public` is keyed by its bare name, so the key
+    /// cannot say `t` from `public.t`, and the two resolve differently
+    /// once another schema on the `search_path` holds a `t` too. See
+    /// [`TableRef::qualified`].
+    pub table_qualified: bool,
     /// v7.39 (round 646) — `DELETE FROM ONLY t`, the sibling of `UpdateStatement::only`: apply
     /// to `t`'s own rows and not to anything that descends from it.
     ///
@@ -3830,6 +3842,12 @@ pub struct InsertStatement {
     /// outer INSERT runs, sharing the same transaction.
     pub ctes: Vec<Cte>,
     pub table: String,
+    /// 9.0.1 (C9) — the client WROTE a schema in front of the target.
+    /// A relation in `public` is keyed by its bare name, so the key
+    /// cannot say `t` from `public.t`, and the two resolve differently
+    /// once another schema on the `search_path` holds a `t` too. See
+    /// [`TableRef::qualified`].
+    pub table_qualified: bool,
     /// v7.39 (round 240) — `INSERT INTO t AS alias`: the alias the ON
     /// CONFLICT DO UPDATE expressions (and RETURNING) refer to the target
     /// row by. PG requires the AS keyword in this position.
@@ -4791,6 +4809,15 @@ pub struct TableRef {
     /// 9.0.0 — where this relation is named; see [`SrcToken`].
     pub token: SrcToken,
     pub name: String,
+    /// 9.0.1 (C9) — the client WROTE a schema in front of this name.
+    ///
+    /// A relation in `public` is keyed by its bare name, so the key
+    /// alone cannot say whether `t` or `public.t` was written — and the
+    /// two resolve differently the moment another schema on the
+    /// `search_path` holds a `t` of its own. PostgreSQL 18.6, measured
+    /// with a `t` in `public` and one in `sa` and `search_path =
+    /// sa, public`: `SELECT a FROM public.t` reads `public`'s.
+    pub qualified: bool,
     pub alias: Option<String>,
     /// v7.39 (round 644) — `FROM ONLY t`: do not descend into `t`'s
     /// children.
@@ -4995,6 +5022,7 @@ impl TableRef {
         let Self {
             token: _,
             name: _,
+            qualified: _,
             alias: _,
             only: _,
             as_of_segment: _,
@@ -5072,6 +5100,7 @@ impl TableRef {
             // Not expressions — named so the destructure stays total.
             token: _,
             name: _,
+            qualified: _,
             alias: _,
             only: _,
             as_of_segment: _,
@@ -5141,6 +5170,7 @@ impl TableRef {
         let Self {
             token: _,
             name: _,
+            qualified: _,
             alias: _,
             only: _,
             as_of_segment: _,
@@ -10612,6 +10642,7 @@ mod tests {
             items: vec![SelectItem::Wildcard],
             from: Some(FromClause {
                 primary: TableRef {
+                    qualified: false,
                     token: crate::ast::SrcToken::NONE,
                     name: "users".into(),
                     alias: None,

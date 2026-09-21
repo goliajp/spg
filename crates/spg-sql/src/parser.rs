@@ -2127,6 +2127,18 @@ impl Parser {
     /// A three-part `db.schema.rel` keeps the middle part, which is the
     /// schema, and drops the database — the same rule one level up.
     fn expect_relation_name(&mut self) -> Result<String, ParseError> {
+        self.expect_relation_ref().map(|(name, _)| name)
+    }
+
+    /// 9.0.1 (C9) — the relation's key AND whether the client wrote a
+    /// schema in front of it.
+    ///
+    /// The key cannot carry that on its own: a relation in `public` is
+    /// keyed by its bare name, so `t` and `public.t` arrive here
+    /// identical while PostgreSQL resolves them differently — the
+    /// second names `public`'s relation even when another schema on
+    /// the `search_path` holds a `t` of its own.
+    fn expect_relation_ref(&mut self) -> Result<(String, bool), ParseError> {
         let mut parts: alloc::vec::Vec<String> = alloc::vec![self.expect_one_ident()?];
         while matches!(self.peek(), Token::Dot) {
             self.advance();
@@ -2135,10 +2147,10 @@ impl Parser {
         let name = parts.pop().expect("at least one part");
         let schema = parts.pop();
         match schema {
-            None => Ok(name),
+            None => Ok((name, false)),
             // MySQL's qualifier is a database, not a schema.
-            Some(_) if self.mysql_dialect => Ok(name),
-            Some(s) => Ok(crate::namespace::qualified_key(&s, &name)),
+            Some(_) if self.mysql_dialect => Ok((name, false)),
+            Some(s) => Ok((crate::namespace::qualified_key(&s, &name), true)),
         }
     }
 
@@ -9843,7 +9855,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_relation_name()?;
+        let (table, table_qualified) = self.expect_relation_ref()?;
         // v7.39 (round 241) — `UPDATE t [AS] alias SET …`. PG allows the
         // bare spelling; a bare identifier that is the SET keyword itself
         // is the clause, not an alias.
@@ -10314,6 +10326,7 @@ impl Parser {
             (assignments, where_)
         };
         Ok(Statement::Update(crate::ast::UpdateStatement {
+            table_qualified,
             ctes: Vec::new(),
             table,
             only,
@@ -10414,7 +10427,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_relation_name()?;
+        let (table, table_qualified) = self.expect_relation_ref()?;
         // v7.39 (round 241) — `DELETE FROM t [AS] alias …`. The bare
         // spelling must not swallow the clause keywords that can follow
         // the target.
@@ -10612,6 +10625,7 @@ impl Parser {
             where_
         };
         Ok(Statement::Delete(crate::ast::DeleteStatement {
+            table_qualified,
             ctes: Vec::new(),
             table,
             only,
@@ -14436,6 +14450,7 @@ impl Parser {
                     items: alloc::vec![SelectItem::Wildcard],
                     from: Some(FromClause {
                         primary: TableRef {
+                            qualified: false,
                             token: crate::ast::SrcToken::NONE,
                             name: "subquery".to_string(),
                             alias: None,
@@ -14650,6 +14665,7 @@ impl Parser {
                 ));
             }
             let fn_ref = TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name: inner_name.clone(),
                 alias: None,
@@ -14782,6 +14798,7 @@ impl Parser {
                     found = Some((
                         i,
                         TableRef {
+                            qualified: false,
                             token: crate::ast::SrcToken::NONE,
                             name: colname.clone(),
                             alias: Some(colname.clone()),
@@ -19428,7 +19445,7 @@ impl Parser {
             return Err(self.err(format!("expected INTO after INSERT, got {:?}", self.peek())));
         }
         self.advance();
-        let table = self.expect_relation_name()?;
+        let (table, table_qualified) = self.expect_relation_ref()?;
         // v7.39 (round 240) — `INSERT INTO t AS alias`: PG's insert_target
         // grammar requires the AS keyword here (a bare identifier would be
         // ambiguous with a column list). The alias is what the ON CONFLICT
@@ -19484,6 +19501,7 @@ impl Parser {
             let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
+                table_qualified,
                 ctes: Vec::new(),
                 table,
                 alias,
@@ -19530,6 +19548,7 @@ impl Parser {
                 let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
                 let returning = self.parse_optional_returning()?;
                 return Ok(Statement::Insert(InsertStatement {
+                    table_qualified,
                     ctes: Vec::new(),
                     table,
                     alias: alias.clone(),
@@ -19613,6 +19632,7 @@ impl Parser {
             let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
+                table_qualified,
                 ctes: Vec::new(),
                 table,
                 alias: alias.clone(),
@@ -19647,6 +19667,7 @@ impl Parser {
             let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
             let returning = self.parse_optional_returning()?;
             return Ok(Statement::Insert(InsertStatement {
+                table_qualified,
                 ctes: Vec::new(),
                 table,
                 alias: alias.clone(),
@@ -19730,6 +19751,7 @@ impl Parser {
         let on_conflict = self.parse_insert_conflict_clause(replace, ignore)?;
         let returning = self.parse_optional_returning()?;
         Ok(Statement::Insert(InsertStatement {
+            table_qualified,
             ctes: Vec::new(),
             table,
             alias,
@@ -20331,6 +20353,7 @@ impl Parser {
                 ],
                 from: Some(crate::ast::FromClause {
                     primary: TableRef {
+                        qualified: false,
                         token: crate::ast::SrcToken::NONE,
                         name: srf_alias.clone(),
                         alias: Some(srf_alias.clone()),
@@ -20361,6 +20384,7 @@ impl Parser {
                 window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name: alias.clone(),
                 alias: Some(alias),
@@ -20418,6 +20442,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "values".to_string());
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -20487,6 +20512,7 @@ impl Parser {
                 .clone()
                 .unwrap_or_else(|| "subquery".to_string());
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -20531,6 +20557,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| "lateral".to_string());
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -20575,6 +20602,7 @@ impl Parser {
             let (alias_ident, column_aliases) = self.parse_optional_alias_with_columns()?;
             let name = alias_ident.clone().unwrap_or_else(|| each_fn.clone());
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -20679,6 +20707,7 @@ impl Parser {
                 window_check_exprs: Vec::new(),
             };
             return Ok(TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name: table_alias.clone(),
                 alias: Some(table_alias),
@@ -20780,6 +20809,7 @@ impl Parser {
             };
             let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -20927,6 +20957,7 @@ impl Parser {
                     .iter()
                     .any(|(_, a)| a.iter().any(Self::expr_has_any_column));
                 let tref = TableRef {
+                    qualified: false,
                     token: crate::ast::SrcToken::NONE,
                     name,
                     alias: alias_ident,
@@ -20960,6 +20991,7 @@ impl Parser {
                 }
             };
             let tref = TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -21020,6 +21052,7 @@ impl Parser {
             let name = alias_ident.clone().unwrap_or_else(|| "unnest".to_string());
             let correlated = Self::expr_has_any_column(&expr);
             let tref = TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -21155,6 +21188,7 @@ impl Parser {
                 .unwrap_or_else(|| "generate_series".to_string());
             let correlated = args.iter().any(Self::expr_has_any_column);
             let tref = TableRef {
+                qualified: false,
                 token: crate::ast::SrcToken::NONE,
                 name,
                 alias: alias_ident,
@@ -21188,12 +21222,15 @@ impl Parser {
         // 9.0.0 — the token this relation is named by, for the position
         // `relation "x" does not exist` carries (see `TableRef::token`).
         let name_token = crate::ast::SrcToken::at(self.pos);
+        let mut written_qualified = false;
         let (name, meta_original) = if let Some((synth, orig)) = self.try_peek_meta_qualified() {
             (synth, Some(orig))
         } else if let Some((synth, orig)) = self.try_peek_meta_bare() {
             (synth, Some(orig))
         } else {
-            (self.expect_relation_name()?, None)
+            let (name, q) = self.expect_relation_ref()?;
+            written_qualified = q;
+            (name, None)
         };
         // v6.10.2 — optional `AS OF SEGMENT '<id>'` cold-tier
         // time-travel clause. Parse BEFORE the alias so the
@@ -21334,6 +21371,7 @@ impl Parser {
             });
         }
         Ok(TableRef {
+            qualified: written_qualified,
             token: name_token,
             name,
             alias,
@@ -21460,6 +21498,7 @@ impl Parser {
             window_check_exprs: Vec::new(),
         };
         TableRef {
+            qualified: false,
             token: crate::ast::SrcToken::NONE,
             name,
             alias,
@@ -21674,6 +21713,7 @@ impl Parser {
             items: alloc::vec![SelectItem::Wildcard],
             from: Some(FromClause {
                 primary: TableRef {
+                    qualified: false,
                     token: crate::ast::SrcToken::NONE,
                     name: tname,
                     alias: None,
@@ -21761,6 +21801,7 @@ impl Parser {
             if let Some(base_expr) = base {
                 let alias = alias_opt.unwrap_or_else(|| fn_name.clone());
                 return Ok(TableRef {
+                    qualified: false,
                     token: crate::ast::SrcToken::NONE,
                     name: alias.clone(),
                     alias: Some(alias),
@@ -21848,6 +21889,7 @@ impl Parser {
             };
             Some(FromClause {
                 primary: TableRef {
+                    qualified: false,
                     token: crate::ast::SrcToken::NONE,
                     name: "value".to_string(),
                     alias: None,
@@ -21894,6 +21936,7 @@ impl Parser {
             window_check_exprs: Vec::new(),
         };
         Ok(TableRef {
+            qualified: false,
             token: crate::ast::SrcToken::NONE,
             name: alias.clone(),
             alias: Some(alias),
@@ -21964,6 +22007,7 @@ impl Parser {
         let (alias_ident, unnest_column_aliases) = self.parse_optional_alias_with_columns()?;
         let name = alias_ident.clone().unwrap_or_else(|| fn_name.clone());
         Ok(TableRef {
+            qualified: false,
             token: crate::ast::SrcToken::NONE,
             name,
             alias: alias_ident,
@@ -22036,6 +22080,7 @@ impl Parser {
             .clone()
             .unwrap_or_else(|| String::from("json_table"));
         Ok(TableRef {
+            qualified: false,
             token: crate::ast::SrcToken::NONE,
             name,
             alias: alias_ident,

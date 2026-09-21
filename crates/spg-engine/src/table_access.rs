@@ -298,12 +298,12 @@ impl Engine {
             }
             return Ok((rows, columns));
         }
-        let table =
-            self.active_catalog()
-                .get(&tref.name)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    name: tref.name.clone(),
-                })?;
+        let table = self
+            .active_catalog()
+            .get_written(&tref.name, tref.qualified)
+            .ok_or_else(|| StorageError::TableNotFound {
+                name: tref.name.clone(),
+            })?;
         // v7.37.15 Phase B — visibility-gated materialise.
         let snap = self.current_snapshot();
         // v7.39 (round 295, E3 Phase 1b) — drop the rows the locking
@@ -343,7 +343,10 @@ impl Engine {
         {
             return self.materialise_table_ref(tref);
         }
-        let Some(table) = self.active_catalog().get(&tref.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&tref.name, tref.qualified)
+        else {
             return self.materialise_table_ref(tref);
         };
         let cols = table.schema().columns.clone();

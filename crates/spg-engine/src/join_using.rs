@@ -301,7 +301,7 @@ impl Engine {
         }
         let cols = self
             .active_catalog()
-            .get(&tref.name)
+            .get_written(&tref.name, tref.qualified)
             .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect());
         (qual, cols)
     }

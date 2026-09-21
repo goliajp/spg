@@ -310,8 +310,10 @@ impl Engine {
                     let lit = |e: &Expr| -> Option<String> {
                         match e {
                             Expr::Literal(spg_sql::ast::Literal::String(v)) => {
-                                let t = v.strip_prefix("public.").unwrap_or(v).trim_matches('"');
-                                Some(t.to_string())
+                                // 9.0.1 (C9) — the KEY, so
+                                // `pg_get_serial_sequence('sa.t','id')`
+                                // finds the table in `sa`.
+                                Some(spg_sql::namespace::key_from_text(v))
                             }
                             _ => None,
                         }
@@ -810,29 +812,20 @@ impl Engine {
             }));
         }
         let seq_name = match &args[0] {
-            Expr::Literal(spg_sql::ast::Literal::String(s)) => {
-                // v7.17 dump-compat — pg_dump emits sequence
-                // names schema-qualified (`'public.posts_id_seq'`).
-                // SPG is single-schema; strip a leading
-                // `public.` / `pg_catalog.` so the catalog lookup
-                // matches the bare-name CREATE SEQUENCE used.
-                let trimmed = s
-                    .strip_prefix("public.")
-                    .or_else(|| s.strip_prefix("pg_catalog."))
-                    .unwrap_or(s);
-                trimmed.to_string()
-            }
+            // v7.17 dump-compat — pg_dump emits sequence names
+            // schema-qualified (`'public.posts_id_seq'`).
+            // 9.0.1 (C9) — through the shared spelling→key rule, so a
+            // sequence in a schema is REACHED rather than folded away:
+            // stripping only a leading `public.` left `nextval('sa.s')`
+            // answering `relation "sa.s" does not exist`.
+            Expr::Literal(spg_sql::ast::Literal::String(s)) => spg_sql::namespace::key_from_text(s),
             // v7.17 dump-compat — pg_dump also emits
             // `nextval('public.posts_id_seq'::regclass)`
             // where the cast wraps the literal. Peel the cast
             // and continue.
             Expr::Cast { expr, .. } => {
                 if let Expr::Literal(spg_sql::ast::Literal::String(s)) = expr.as_ref() {
-                    let trimmed = s
-                        .strip_prefix("public.")
-                        .or_else(|| s.strip_prefix("pg_catalog."))
-                        .unwrap_or(s);
-                    trimmed.to_string()
+                    spg_sql::namespace::key_from_text(s)
                 } else {
                     return Err(EngineError::Unsupported(alloc::format!(
                         "{op}() first argument must be a literal sequence name"
@@ -939,8 +932,13 @@ impl Engine {
                         .map_err(EngineError::Storage)?;
                 }
                 let Some(&v) = self.seq_currvals.get(&seq_name) else {
+                    // 9.0.1 (C9) — the BARE name, which is what PG 18.6
+                    // prints for a sequence in a schema (measured:
+                    // `currval('sq1.s')` says `sequence "s"`). Printing
+                    // the stored key put its NUL separator on the wire.
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "currval of sequence {seq_name:?} is not yet defined in this session"
+                        "currval of sequence {:?} is not yet defined in this session",
+                        spg_sql::namespace::bare_of(&seq_name)
                     )));
                 };
                 Ok(Value::BigInt(v))

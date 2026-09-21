@@ -496,6 +496,7 @@ mod e2e_returning_command_tag_round131;
 mod e2e_rls_authenticated_round830;
 mod e2e_role_tx_round828;
 mod e2e_row_locks_round297;
+mod e2e_schema_catalog_surfaces_901;
 #[allow(clippy::uninlined_format_args)]
 mod e2e_segment_forward;
 mod e2e_session_sync_commit_round172;

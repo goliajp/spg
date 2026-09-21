@@ -188,7 +188,7 @@ fn relation_columns(
         let cols = describe_select_columns(sub, catalog, typing, &[], depth + 1);
         return (!cols.is_empty()).then_some(cols);
     }
-    if let Some(table) = catalog.get(&t.name) {
+    if let Some(table) = catalog.get_written(&t.name, t.qualified) {
         return Some(table.schema().columns.clone());
     }
     if let Some(cte) = ctes.iter().find(|c| c.name == t.name) {
@@ -2044,7 +2044,7 @@ fn walk_placeholder_type_contexts(
             if !from.joins.is_empty() {
                 return;
             }
-            let Some(t) = catalog.get(&from.primary.name) else {
+            let Some(t) = catalog.get_written(&from.primary.name, from.primary.qualified) else {
                 return;
             };
             let schema = t.schema().columns.clone();

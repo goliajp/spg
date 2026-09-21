@@ -130,6 +130,24 @@ pub fn display_key(key: &str) -> String {
     out
 }
 
+/// The key a relation name WRITTEN IN A STRING resolves to: the inverse
+/// of [`display_key`], for the places a client hands over a spelling
+/// rather than an identifier — `nextval('sa.s')`, `'sa.t'::regclass`,
+/// `pg_get_viewdef('sa.v')`.
+///
+/// 9.0.1 (C9) — one implementation, because there were two: `::regclass`
+/// built the key while `nextval` merely stripped a leading `public.`,
+/// which is what left `nextval('sa.s')` answering `relation "sa.s" does
+/// not exist` for a sequence that exists.
+#[must_use]
+pub fn key_from_text(text: &str) -> String {
+    let trimmed = text.trim();
+    match trimmed.rsplit_once('.') {
+        Some((schema, name)) => qualified_key(schema.trim_matches('"'), name.trim_matches('"')),
+        None => trimmed.trim_matches('"').to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +188,15 @@ mod tests {
         let k = qualified_key("public", "a.b");
         assert_eq!(split_key(&k), ("public", "a.b"));
         assert!(!is_qualified(&k));
+    }
+
+    #[test]
+    fn a_written_name_round_trips_through_its_key() {
+        assert_eq!(key_from_text("t"), "t");
+        assert_eq!(key_from_text("public.t"), "t");
+        assert_eq!(key_from_text("pg_catalog.pg_class"), "pg_class");
+        assert_eq!(key_from_text("sa.s"), qualified_key("sa", "s"));
+        assert_eq!(key_from_text("\"sa\".\"s\""), qualified_key("sa", "s"));
+        assert_eq!(display_key(&key_from_text("sa.s")), "sa.s");
     }
 }

@@ -1422,7 +1422,9 @@ impl Engine {
             && from.primary.lateral_subquery.is_none()
             && from.primary.as_of_segment.is_none()
         {
-            self.active_catalog().get(&from.primary.name).filter(|t|
+            self.active_catalog()
+                .get_written(&from.primary.name, from.primary.qualified)
+                .filter(|t|
                 // v7.36 (cold-tier coverage) — the deferred-index
                 // primary path threads `Vec<usize>` row indices into
                 // `JoinSrc::Stored(t.rows())` (hot-tier only), so a
@@ -3395,7 +3397,9 @@ impl Engine {
                 None
             }
         };
-        let Some(outer_table) = catalog.get(from.primary.name.as_str()) else {
+        let Some(outer_table) =
+            catalog.get_written(from.primary.name.as_str(), from.primary.qualified)
+        else {
             return Ok(None);
         };
         let outer_schema = outer_table.schema();
@@ -3521,7 +3525,10 @@ impl Engine {
         let Some(on_expr) = j.on.as_ref() else {
             return Ok(None);
         };
-        let Some(primary_table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(primary_table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         if self.active_catalog().get(&j.table.name).is_none() {
@@ -3937,7 +3944,10 @@ impl Engine {
         };
         // Plain catalog tables only — views / virtual tables keep the
         // general path's materialise_table_ref fallback.
-        let Some(primary_table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(primary_table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         if self.active_catalog().get(&j.table.name).is_none() {
@@ -4286,7 +4296,7 @@ fn derived_is_plain_table_select(s: &SelectStatement, cat: &crate::Catalog) -> b
             // all put the function's name here and their correlation in
             // the arguments. Resolving the name against the catalog is
             // what tells a stored table from one of those.
-            && cat.get(&t.name).is_some()
+            && cat.get_written(&t.name, t.qualified).is_some()
     };
     plain(&from.primary) && from.joins.iter().all(|j| plain(&j.table))
 }

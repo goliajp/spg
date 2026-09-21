@@ -1772,13 +1772,22 @@ pub(crate) fn mysql_leading_number(s: &str) -> f64 {
 /// so those reduce to the bare name exactly as before. An unqualified
 /// spelling is left alone for the catalog's own resolver to place.
 fn regclass_lookup_name(text: &str) -> alloc::string::String {
-    let trimmed = text.trim();
-    match trimmed.rsplit_once('.') {
-        Some((schema, name)) => {
-            spg_sql::namespace::qualified_key(schema.trim_matches('"'), name.trim_matches('"'))
-        }
-        None => alloc::string::String::from(trimmed.trim_matches('"')),
+    spg_sql::namespace::key_from_text(text)
+}
+
+/// 9.0.1 (C9) — resolve a relation KEY to its oid, saying whether the
+/// client WROTE a qualifier. A qualified name is not the search path's
+/// to reinterpret: `public.t` means the one in `public` even while
+/// another schema on the path holds a `t` of its own.
+pub(crate) fn regclass_oid_for(
+    cat: &spg_storage::Catalog,
+    key: &str,
+    written_qualified: bool,
+) -> Option<i64> {
+    if written_qualified {
+        return crate::system_catalog::relation_oid(cat, key);
     }
+    regclass_name_to_oid(cat, key)
 }
 
 pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Option<i64> {
@@ -2845,7 +2854,7 @@ fn eval_cast_arm(
             _ => None,
         };
         if let Some(oid) = oid
-            && let Some(name) = crate::system_catalog::relation_name_for_oid(cat, oid)
+            && let Some(name) = crate::system_catalog::relation_display_for_oid(cat, oid)
         {
             // 9.0.0 — keep the OID. This answered the NAME as plain text,
             // so an oid cast to regclass rendered right and was wrong for
@@ -3073,6 +3082,11 @@ fn eval_cast_arm(
             // The qualifier was stripped here, so it looked for a bare
             // `t` and answered `relation "t" does not exist`.
             let bare = regclass_lookup_name(s);
+            // 9.0.1 (C9) — a name the client QUALIFIED names that
+            // relation and no other. A relation in `public` is keyed by
+            // its bare name, so `public.t` reached the path resolver and
+            // came back as `sa.t` whenever `sa` sat ahead of `public`.
+            let written_qualified = s.contains('.');
             // 9.0.0 — PostgreSQL's `regclassin` reads an all-digit string
             // as the OID itself, and the relation need not exist
             // (`'999999'::regclass` is `999999` on 18.6). SPG looked it
@@ -3084,15 +3098,22 @@ fn eval_cast_arm(
                 && let Ok(oid) = bare.parse::<i64>()
             {
                 // 9.0.0 (C8) — the same one resolver; see above.
-                let name = crate::system_catalog::relation_name_for_oid(cat, oid).unwrap_or(bare);
+                // 9.0.1 (C9) — and it writes the qualifier when a client
+                // would need one, the way `regclassout` does.
+                let name =
+                    crate::system_catalog::relation_display_for_oid(cat, oid).unwrap_or(bare);
                 return Ok(Value::RegClass(oid, name.into()));
             }
-            if let Some(oid) = regclass_name_to_oid(cat, &bare) {
+            if let Some(oid) = regclass_oid_for(cat, &bare, written_qualified) {
                 // 9.0.0 (C9) — a RegClass carries the name a client
                 // READS. `bare` is the stored key, whose separator is
                 // not a character a name may contain, so
                 // `'sa.t'::regclass::text` rendered `sa`.
-                let shown = spg_sql::namespace::display_key(&bare);
+                // 9.0.1 (C9) — and the qualifier appears only when a
+                // client would need it, which is the one rule the oid
+                // form uses as well.
+                let shown = crate::system_catalog::relation_display_for_oid(cat, oid)
+                    .unwrap_or_else(|| spg_sql::namespace::display_key(&bare));
                 return Ok(Value::RegClass(oid, shown.into()));
             }
             // v7.39 (round 337, V62) — a name that is no relation at all is

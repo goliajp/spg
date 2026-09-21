@@ -57,7 +57,7 @@ impl Engine {
         if from.primary.lateral_subquery.is_some() {
             return Ok(None);
         }
-        let Some(table) = cat.get(&from.primary.name) else {
+        let Some(table) = cat.get_written(&from.primary.name, from.primary.qualified) else {
             return Ok(None);
         };
         if !table.schema().row_security {
@@ -308,7 +308,9 @@ fn is_rls_base(tref: &TableRef, cat: &Catalog) -> bool {
     tref.lateral_subquery.is_none()
         && tref.unnest_expr.is_none()
         && tref.generate_series_args.is_none()
-        && cat.get(&tref.name).is_some_and(|t| t.schema().row_security)
+        && cat
+            .get_written(&tref.name, tref.qualified)
+            .is_some_and(|t| t.schema().row_security)
 }
 
 /// Rewrite a bare RLS base-table operand into `(SELECT * FROM base) alias`,
@@ -335,6 +337,7 @@ fn wrap_rls_table(tref: &mut TableRef, cat: &Catalog) {
 /// A minimal `TableRef` naming a base table with no alias / modifiers.
 fn bare_table_ref(name: String) -> TableRef {
     TableRef {
+        qualified: false,
         token: spg_sql::ast::SrcToken::NONE,
         name,
         alias: None,

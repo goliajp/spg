@@ -808,6 +808,7 @@ impl Engine {
         cancel: CancelToken<'_>,
     ) -> Result<Vec<Value<'static>>, EngineError> {
         let primary = spg_sql::ast::TableRef {
+            qualified: false,
             token: spg_sql::ast::SrcToken::NONE,
             name: table_name.to_string(),
             alias: Some(alias.to_string()),

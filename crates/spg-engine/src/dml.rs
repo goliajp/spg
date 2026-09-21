@@ -861,7 +861,7 @@ impl Engine {
         let mut source_cols: Vec<alloc::string::String> = Vec::new();
         for t in core::iter::once(&src.from.primary).chain(src.from.joins.iter().map(|j| &j.table))
         {
-            if let Some(tbl) = self.active_catalog().get(&t.name) {
+            if let Some(tbl) = self.active_catalog().get_written(&t.name, t.qualified) {
                 for c in &tbl.schema().columns {
                     source_cols.push(c.name.clone());
                 }
@@ -907,6 +907,7 @@ impl Engine {
         let mut total: usize = 0;
         for child in children {
             let del = DeleteStatement {
+                table_qualified: false,
                 ctes: Vec::new(),
                 table: child.clone(),
                 only: false,
@@ -1021,6 +1022,7 @@ impl Engine {
         let outcome = match result {
             Ok(()) if !all_post.is_empty() => self
                 .exec_insert(InsertStatement {
+                    table_qualified: false,
                     ctes: Vec::new(),
                     table: parent.clone(),
                     alias: None,
@@ -1041,6 +1043,7 @@ impl Engine {
                     continue;
                 }
                 let _ = self.exec_insert(InsertStatement {
+                    table_qualified: false,
                     ctes: Vec::new(),
                     table: child,
                     alias: None,
@@ -1309,11 +1312,14 @@ impl Engine {
             let inherit_fanout =
                 !crate::partition::is_partition_parent(self.active_catalog(), &stmt.table);
             let key_cols: Vec<String> = {
-                let parent = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: stmt.table.clone(),
-                    })
-                })?;
+                let parent = self
+                    .active_catalog()
+                    .get_written(&stmt.table, stmt.table_qualified)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: stmt.table.clone(),
+                        })
+                    })?;
                 match &parent.schema().partition_role {
                     Some(spg_storage::PartitionRole::Parent {
                         key_column_positions,
@@ -1408,7 +1414,7 @@ impl Engine {
         if let Some(w) = &stmt.where_ {
             let schema_cols = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
                         name: stmt.table.clone(),
@@ -1424,11 +1430,11 @@ impl Engine {
                 self.speaks_mysql,
                 // v7.38.18 (S2) — this table's database collation.
                 self.active_catalog()
-                    .get(stmt.table.as_str())
+                    .get_written(stmt.table.as_str(), stmt.table_qualified)
                     .map_or("C", spg_storage::Table::db_collation),
             ) && let Some(idx_name) = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
             {
                 // Promote may be a no-op (key is hot-only or absent);
@@ -1468,7 +1474,9 @@ impl Engine {
                     // so it short-circuits rather than replaces: the exact
                     // walk still runs whenever cold rows might exist, and
                     // the answer is unchanged.
-                    if let Some(t) = self.active_catalog().get(&stmt.table)
+                    if let Some(t) = self
+                        .active_catalog()
+                        .get_written(&stmt.table, stmt.table_qualified)
                         && t.has_cold_rows_fast()
                         && t.count_cold_locators() > 0
                     {
@@ -1495,7 +1503,7 @@ impl Engine {
                 if !pre_promote_keys.is_empty()
                     && let Some(idx_name) = self
                         .active_catalog()
-                        .get(&stmt.table)
+                        .get_written(&stmt.table, stmt.table_qualified)
                         .and_then(crate::constraints::pk_btree_index_name)
                 {
                     for key in pre_promote_keys {
@@ -1525,11 +1533,14 @@ impl Engine {
         // can re-enter the engine read path (`eval_expr_with_correlated`
         // also takes `&self`) with the target row as its outer
         // context. The apply phase re-acquires `active_catalog_mut()`.
-        let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: stmt.table.clone(),
-            })
-        })?;
+        let table = self
+            .active_catalog()
+            .get_written(&stmt.table, stmt.table_qualified)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
         // v7.39 (round 533) — finish the `UPDATE … FROM` lowering the
         // parser could only start. It classifies a QUALIFIED leaf and
@@ -1549,11 +1560,14 @@ impl Engine {
         // Before `targets` below, which borrows the assignments.
         let resolved = self.resolve_update_from_leaves(stmt, &schema_cols)?;
         let stmt = resolved.as_ref().unwrap_or(stmt);
-        let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: stmt.table.clone(),
-            })
-        })?;
+        let table = self
+            .active_catalog()
+            .get_written(&stmt.table, stmt.table_qualified)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: stmt.table.clone(),
+                })
+            })?;
         // Resolve each SET target to a column position once, validate
         // up front so a typo'd column doesn't leave a partial mutation
         // behind.
@@ -1920,7 +1934,7 @@ impl Engine {
             // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
             let cols = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .map(|t| t.schema().columns.clone())
                 .unwrap_or_default();
             self.rls_check_new_rows(
@@ -1969,7 +1983,7 @@ impl Engine {
             // each updated row's pre-image is excluded from the scan.
             let exclusions = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .map(|t| t.schema().exclusion_constraints.clone())
                 .unwrap_or_default();
             crate::constraints::enforce_exclusion_updates(
@@ -2015,11 +2029,14 @@ impl Engine {
                 spg_storage::row_header::RelId,
                 Vec<spg_storage::row_header::RowId>,
             ) = {
-                let t = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: stmt.table.clone(),
-                    })
-                })?;
+                let t = self
+                    .active_catalog()
+                    .get_written(&stmt.table, stmt.table_qualified)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: stmt.table.clone(),
+                        })
+                    })?;
                 (
                     t.rel_id(),
                     planned
@@ -2040,7 +2057,7 @@ impl Engine {
         // Stage 3b — apply the original UPDATE.
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -3492,7 +3509,7 @@ impl Engine {
         if let Some(w) = &stmt.where_ {
             let schema_cols = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .ok_or_else(|| {
                     EngineError::Storage(StorageError::TableNotFound {
                         name: stmt.table.clone(),
@@ -3508,11 +3525,11 @@ impl Engine {
                 self.speaks_mysql,
                 // v7.38.18 (S2) — this table's database collation.
                 self.active_catalog()
-                    .get(stmt.table.as_str())
+                    .get_written(stmt.table.as_str(), stmt.table_qualified)
                     .map_or("C", spg_storage::Table::db_collation),
             ) && let Some(idx_name) = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .and_then(|t| t.index_on(col_pos).map(|i| i.name.clone()))
             {
                 cold_shadow_count = self
@@ -3548,7 +3565,9 @@ impl Engine {
                     // so it short-circuits rather than replaces: the exact
                     // walk still runs whenever cold rows might exist, and
                     // the answer is unchanged.
-                    if let Some(t) = self.active_catalog().get(&stmt.table)
+                    if let Some(t) = self
+                        .active_catalog()
+                        .get_written(&stmt.table, stmt.table_qualified)
                         && t.has_cold_rows_fast()
                         && t.count_cold_locators() > 0
                     {
@@ -3575,7 +3594,7 @@ impl Engine {
                 if !pre_shadow_keys.is_empty()
                     && let Some(idx_name) = self
                         .active_catalog()
-                        .get(&stmt.table)
+                        .get_written(&stmt.table, stmt.table_qualified)
                         .and_then(crate::constraints::pk_btree_index_name)
                 {
                     for key in pre_shadow_keys {
@@ -3613,11 +3632,14 @@ impl Engine {
             .is_some_and(|w| crate::subquery::expr_has_subquery(w))
         {
             let w = stmt.where_.as_ref().expect("guarded above");
-            let table = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-                EngineError::Storage(StorageError::TableNotFound {
-                    name: stmt.table.clone(),
-                })
-            })?;
+            let table = self
+                .active_catalog()
+                .get_written(&stmt.table, stmt.table_qualified)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.table.clone(),
+                    })
+                })?;
             let schema_cols: Vec<ColumnSchema> = table.schema().columns.clone();
             // v7.39 (read01 round 54) — carry the catalog (see above).
             let cat_for_ctx = self.active_catalog().clone();
@@ -3685,7 +3707,7 @@ impl Engine {
         let mysql_dialect = self.speaks_mysql;
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -3972,11 +3994,14 @@ impl Engine {
                 spg_storage::row_header::RelId,
                 Vec<spg_storage::row_header::RowId>,
             ) = {
-                let t = self.active_catalog().get(&stmt.table).ok_or_else(|| {
-                    EngineError::Storage(StorageError::TableNotFound {
-                        name: stmt.table.clone(),
-                    })
-                })?;
+                let t = self
+                    .active_catalog()
+                    .get_written(&stmt.table, stmt.table_qualified)
+                    .ok_or_else(|| {
+                        EngineError::Storage(StorageError::TableNotFound {
+                            name: stmt.table.clone(),
+                        })
+                    })?;
                 (
                     t.rel_id(),
                     positions
@@ -3995,7 +4020,7 @@ impl Engine {
         }
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -4936,6 +4961,7 @@ impl Engine {
                 materialised.push(tuple);
             }
             let recurse = InsertStatement {
+                table_qualified: false,
                 ctes: Vec::new(),
                 table: stmt.table,
                 alias: stmt.alias,
@@ -4975,7 +5001,7 @@ impl Engine {
         let insert_sess_bag = self.dml_session();
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -5299,7 +5325,7 @@ impl Engine {
             )?;
             let exclusions = self
                 .active_catalog()
-                .get(&stmt.table)
+                .get_written(&stmt.table, stmt.table_qualified)
                 .map(|t| t.schema().exclusion_constraints.clone())
                 .unwrap_or_default();
             crate::constraints::enforce_exclusion_updates(
@@ -5377,7 +5403,7 @@ impl Engine {
         let functions = crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.table));
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -6032,6 +6058,7 @@ impl Engine {
         };
         for (child_name, rows) in batches {
             let child_stmt = InsertStatement {
+                table_qualified: false,
                 ctes: Vec::new(),
                 table: child_name,
                 alias: stmt.alias.clone(),
