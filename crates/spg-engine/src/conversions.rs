@@ -3897,6 +3897,10 @@ pub(crate) fn regtype_oid_to_name(oid: i64) -> Option<&'static str> {
         2279 => "trigger",
         2283 => "anyelement",
         3220 => "pg_lsn",
+        // 9.0.0 (S1) — `anycompatible`, the three-argument `lag` /
+        // `lead` return type. `pg_type` lists it, so `format_type` has
+        // to name it.
+        5077 => "anycompatible",
         3831 => "anyrange",
         4451 => "int4multirange",
         4532 => "nummultirange",

@@ -848,6 +848,7 @@ mod e2e_recursive_worktable_round618;
 mod e2e_redundant_begin_and_gin_expr_round475;
 mod e2e_reflection_charset_v739;
 mod e2e_refresh_matview_round699;
+mod e2e_refusal_sweep_900;
 mod e2e_reg_types_round513;
 mod e2e_regclass_dual_round30;
 mod e2e_regclass_forms_round337;

@@ -86,14 +86,19 @@ fn round475_gin_on_to_tsvector_builds_a_fulltext_index() {
 #[test]
 fn round475_a_refused_index_leaves_nothing_behind() {
     // The state corruption: the error used to arrive after the build.
+    //
+    // 9.0.0 (S1) — BRIN is no longer the example: PostgreSQL 18.6
+    // accepts `USING brin (lower(doc))` and so does SPG now. HNSW is,
+    // and it is a method PostgreSQL does not have at all, so no
+    // measurement contradicts the refusal.
     let mut e = Engine::new();
     e.execute("CREATE TABLE g (id INT, doc TEXT)").unwrap();
     let err = e
-        .execute("CREATE INDEX gx ON g USING brin (lower(doc))")
-        .expect_err("an expression key on BRIN is refused");
+        .execute("CREATE INDEX gx ON g USING hnsw (lower(doc))")
+        .expect_err("an expression key on HNSW is refused");
     let msg = format!("{err}");
     assert!(
-        msg.contains("expression keys are not supported on BRIN indexes"),
+        msg.contains("expression keys are not supported on HNSW indexes"),
         "the message must name the method it refused: {msg}"
     );
     assert_eq!(
@@ -103,6 +108,18 @@ fn round475_a_refused_index_leaves_nothing_behind() {
         ),
         "0",
         "a refused CREATE INDEX must not leave an index behind"
+    );
+    // …and the BRIN form builds, and reports the method it was asked
+    // for, which is A7's contract.
+    e.execute("CREATE INDEX bx ON g USING brin (lower(doc))")
+        .expect("PostgreSQL 18.6 accepts it");
+    assert!(
+        scalar(
+            &mut e,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = 'bx'"
+        )
+        .contains("USING brin"),
+        "the catalog names the access method the statement asked for"
     );
 }
 

@@ -3541,16 +3541,21 @@ impl Engine {
         if let Some(key_expr) = &stmt.expression
             && gin_fulltext_col.is_none()
             && gin_expr_kind.is_none()
-            && matches!(
-                stmt.method,
-                IndexMethod::Hnsw | IndexMethod::Brin | IndexMethod::Gin
-            )
+            && matches!(stmt.method, IndexMethod::Hnsw | IndexMethod::Gin)
         {
+            // 9.0.0 (S1) — BRIN is no longer here. PostgreSQL 18.6
+            // accepts `USING brin ((a+1))` and `USING brin (lower(b))`,
+            // and SPG refused both, so a schema that had one did not
+            // load. It is backed by the expression B-tree every other
+            // expression key uses — `declared_am` still reports `brin`,
+            // which is the contract A7 settled: the catalog names the
+            // access method the statement asked for, the structure
+            // underneath is SPG's own business.
+            //
             // The old wording named HNSW and BRIN while also covering GIN,
             // so a refused GIN index reported two methods it was not.
             let method = match stmt.method {
                 IndexMethod::Hnsw => "HNSW",
-                IndexMethod::Brin => "BRIN",
                 _ => "GIN",
             };
             return Err(EngineError::Unsupported(alloc::format!(
@@ -3599,9 +3604,9 @@ impl Engine {
                 }
                 IndexMethod::Hnsw => {
                     if !included_positions.is_empty() {
-                        return Err(EngineError::Unsupported(
-                            "INCLUDE columns are not supported on HNSW indexes".into(),
-                        ));
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "access method \"hnsw\" does not support included columns"
+                        )));
                     }
                     table.add_nsw_index(
                         stmt.name.clone(),
@@ -3612,11 +3617,19 @@ impl Engine {
                 // v6.7.1 — BRIN. Pure metadata; no in-memory data.
                 IndexMethod::Brin => {
                     if !included_positions.is_empty() {
-                        return Err(EngineError::Unsupported(
-                            "INCLUDE columns are not supported on BRIN indexes".into(),
-                        ));
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "access method \"brin\" does not support included columns"
+                        )));
                     }
-                    table.add_brin_index(stmt.name.clone(), &stmt.column)?;
+                    // 9.0.0 (S1) — an expression key gets the B-tree the
+                    // other expression keys get; a BRIN summary is built
+                    // from a COLUMN's values and would answer a lookup
+                    // on `lower(b)` from the wrong ones.
+                    if stmt.expression.is_some() {
+                        table.add_index(stmt.name.clone(), &stmt.column)?;
+                    } else {
+                        table.add_brin_index(stmt.name.clone(), &stmt.column)?;
+                    }
                 }
                 // v7.12.3 — GIN inverted index. Real posting-list-backed
                 // GIN when the indexed column is `tsvector`; falls back
@@ -3627,9 +3640,9 @@ impl Engine {
                 // schemas keep loading.
                 IndexMethod::Gin => {
                     if !included_positions.is_empty() {
-                        return Err(EngineError::Unsupported(
-                            "INCLUDE columns are not supported on GIN indexes".into(),
-                        ));
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "access method \"gin\" does not support included columns"
+                        )));
                     }
                     let col_pos =
                         table
@@ -6242,9 +6255,14 @@ impl Engine {
         s: spg_sql::ast::CreateRuleStatement,
     ) -> Result<QueryResult, EngineError> {
         if s.event.eq_ignore_ascii_case("SELECT") {
-            return Err(EngineError::Unsupported(
-                "ON SELECT rules are not supported; use CREATE VIEW".into(),
-            ));
+            // 9.0.0 (S1) — PostgreSQL 18.6's own sentence, measured:
+            // `relation "s1t" cannot have ON SELECT rules` with the
+            // DETAIL beneath it. SPG named no relation and gave advice
+            // PG does not give.
+            return Err(EngineError::Unsupported(alloc::format!(
+                "relation \"{}\" cannot have ON SELECT rules DETAIL: This operation is not supported for tables.",
+                spg_sql::namespace::display_key(&s.table)
+            )));
         }
         // v7.39 (round 333, V59) — the conditional `DO INSTEAD <command>`
         // form is supported now: the rows the WHERE holds for take the
@@ -7000,13 +7018,26 @@ impl Engine {
                 }
             }
             K::Sequence => cat.rename_sequence(name, new_name)?,
-            // The parser never routes a function here: `ALTER FUNCTION
-            // … RENAME TO` names one signature, which SPG's bare-name
-            // carrier cannot express.
+            // 9.0.0 (S1) — `ALTER FUNCTION f(…) RENAME TO g`. It was
+            // refused outright, on the reasoning that the statement
+            // names one SIGNATURE which SPG's bare-name carrier cannot
+            // express. The registry has been keyed by signature since
+            // round 62, so what was left was the ambiguity, and that is
+            // answered the way `DROP FUNCTION` answers it: one overload
+            // moves, several refuse in PostgreSQL's own sentence.
             K::Function => {
-                return Err(EngineError::Unsupported(alloc::string::String::from(
-                    "ALTER FUNCTION … RENAME TO is not supported",
-                )));
+                let overloads = cat.functions_named(name).len();
+                if overloads == 0 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "function {name} does not exist"
+                    )));
+                }
+                if overloads > 1 {
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "function name \"{name}\" is not unique HINT: Specify the argument list to select the function unambiguously."
+                    )));
+                }
+                cat.rename_function(name, new_name);
             }
         }
         // A view or a materialized view is a relation another view can

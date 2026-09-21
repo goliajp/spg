@@ -60,7 +60,9 @@ fn round638_pg_proc_lists_what_the_engine_has() {
     // and twenty-six left: every function an EXTENSION supplies is in the
     // catalog only once the extension is installed, which is PG 18.6's
     // answer and is what this engine — which has created none — now says.
-    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["1108"]);
+    // 9.0.0 (S1) — 1108 to 1110: the three-argument `lag` and `lead`,
+    // which the engine answers and the catalog had left out.
+    assert_eq!(vals(&mut e, "SELECT count(*) FROM pg_proc"), vec!["1110"]);
     assert_eq!(
         vals(&mut e, "SELECT count(DISTINCT proname) FROM pg_proc"),
         // 9.0.0 — 574 to 807: the 233 I/O and access-method-handler
@@ -102,7 +104,7 @@ fn round638_no_row_is_orphaned_by_the_join() {
             &mut e,
             "SELECT count(*) FROM pg_proc p JOIN pg_type t ON t.oid = p.prorettype"
         ),
-        vec!["1108"],
+        vec!["1110"],
         "as many as pg_proc has — nothing points at a type pg_type omits"
     );
 }
