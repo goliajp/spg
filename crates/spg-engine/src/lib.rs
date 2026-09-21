@@ -2868,6 +2868,7 @@ impl Engine {
         // The incoming session's temp namespace must be live before its very
         // first statement resolves a name.
         self.refresh_temp_prefix();
+        self.refresh_database();
         self.refresh_search_path();
         self.plan_cache.clear();
     }
@@ -2965,6 +2966,24 @@ impl Engine {
         self.catalog.set_temp_prefix(prefix.clone());
         for shadow in self.tx_catalogs.values_mut() {
             shadow.catalog.set_temp_prefix(prefix.clone());
+        }
+    }
+
+    /// 9.0.0 (C8) — install the database this session is connected to
+    /// into every catalog it can reach, the way
+    /// [`Engine::refresh_search_path`] installs the search path.
+    ///
+    /// A name `CREATE DATABASE` made owns its own relations; any other
+    /// name is the datadir's own database, which is what every
+    /// connection reached before this and what keeps an existing
+    /// deployment — where nothing ever ran `CREATE DATABASE` — seeing
+    /// its own tables.
+    pub(crate) fn refresh_database(&mut self) {
+        let named = self.session_param("spg.database").map(String::from);
+        let db = named.filter(|n| self.catalog.created_databases().contains(n));
+        self.catalog.set_database(db.clone());
+        for shadow in self.tx_catalogs.values_mut() {
+            shadow.catalog.set_database(db.clone());
         }
     }
 
