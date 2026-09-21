@@ -318,13 +318,8 @@ impl Engine {
         // streamable and `GROUP BY` / `HAVING` are not, so the same
         // statement answered two ways depending on which executor its
         // shape reached.
-        self.validate_clause_columns(s)?;
-        self.validate_function_names(s)?;
-        self.validate_literal_coercions(s)?;
-        self.validate_function_arity(s)?;
-        self.validate_cast_targets(s)?;
-        self.validate_predicate_is_boolean(s)?;
-        self.validate_subquery_qualified_columns(s)?;
+        // 9.0.0 (N14) — the ONE list; see `Engine::validate_before_scan`.
+        self.validate_before_scan(s)?;
         if crate::scalarsq_streaming::is_scalarsq_streaming_shape(s) {
             return self.exec_scalarsq_streaming(s, cancel, arena, emit);
         }
@@ -377,13 +372,8 @@ impl Engine {
         // which is why `WHERE nosuch = 1` over an empty table answered
         // zero rows there while raising in-process, on the MySQL wire, and
         // for `GROUP BY` / `HAVING` — shapes this shortcut declines.
-        self.validate_clause_columns(s)?;
-        self.validate_function_names(s)?;
-        self.validate_literal_coercions(s)?;
-        self.validate_function_arity(s)?;
-        self.validate_cast_targets(s)?;
-        self.validate_predicate_is_boolean(s)?;
-        self.validate_subquery_qualified_columns(s)?;
+        // 9.0.0 (N14) — the ONE list; see `Engine::validate_before_scan`.
+        self.validate_before_scan(s)?;
         if !crate::expr_tree_has_subquery(s)
             && let Some(n) = self.try_exec_joined_streaming(s, cancel, &mut emit)?
         {

@@ -317,6 +317,7 @@ mod e2e_nowal_returning_round182;
     unused_variables
 )]
 mod e2e_observability;
+mod e2e_oid_comparison_900;
 mod e2e_panel_collation_v7395;
 mod e2e_parallel_freezer;
 mod e2e_parse_analysis_wire_v7411;

@@ -3238,14 +3238,7 @@ impl Engine {
         // and the two of them swallowed `WHERE` and `ORDER BY` while
         // `GROUP BY` and `HAVING`, which cannot take those routes, raised
         // — the same statement answering two ways depending on the plan.
-        self.validate_clause_columns(stmt)?;
-        self.validate_function_names(stmt)?;
-        self.validate_literal_coercions(stmt)?;
-        self.validate_function_arity(stmt)?;
-        self.validate_cast_targets(stmt)?;
-        self.validate_predicate_is_boolean(stmt)?;
-        self.validate_oid_comparisons(stmt)?;
-        self.validate_subquery_qualified_columns(stmt)?;
+        self.validate_before_scan(stmt)?;
         // v7.39 (round 559) — the bare `count(*)` fast path, AFTER the
         // privilege gate above. Placed before it at first, and the
         // security-definer e2e caught it immediately: a SECURITY INVOKER
@@ -14962,6 +14955,30 @@ impl crate::Engine {
     /// is oid-ish: an untyped literal has no certain type, so
     /// `WHERE i = '5'` is untouched, which is the over-refusal a wider
     /// version of this check was backed out for.
+    /// 9.0.0 (N14) — every semantic check a SELECT owes before a row is
+    /// read, in one list.
+    ///
+    /// It was three lists: this one, and a copy in each of the two
+    /// read-only streaming entry points, which are the routes an
+    /// autocommit SELECT actually takes over the PostgreSQL wire. The
+    /// copies were made because those shortcuts run BELOW
+    /// `exec_select_cancel` — and one of them was already short by a
+    /// check when it was written, then all three drifted: the oid-pair
+    /// check reached neither, so `SELECT o = n FROM t` with an `oid` and
+    /// a `numeric` column answered `t` over the wire while raising
+    /// in-process. One list, so a check added here cannot reach one
+    /// route and not another.
+    pub(crate) fn validate_before_scan(&self, stmt: &SelectStatement) -> Result<(), EngineError> {
+        self.validate_clause_columns(stmt)?;
+        self.validate_function_names(stmt)?;
+        self.validate_literal_coercions(stmt)?;
+        self.validate_function_arity(stmt)?;
+        self.validate_cast_targets(stmt)?;
+        self.validate_predicate_is_boolean(stmt)?;
+        self.validate_oid_comparisons(stmt)?;
+        self.validate_subquery_qualified_columns(stmt)
+    }
+
     pub(crate) fn validate_oid_comparisons(
         &self,
         stmt: &SelectStatement,
