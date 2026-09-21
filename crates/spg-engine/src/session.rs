@@ -514,9 +514,15 @@ impl Engine {
         // for along lives in the catalog, which is shared; this is the
         // one write that can change it.
         let is_search_path = key == "search_path";
+        // 9.0.0 (C8) — and the database this session is on, which the
+        // server sets with the same write at connection time.
+        let is_database = key == "spg.database";
         self.session_params.insert(key, normalised);
         if is_render_guc {
             self.refresh_render_style();
+        }
+        if is_database {
+            self.refresh_database();
         }
         if is_search_path {
             self.refresh_search_path();

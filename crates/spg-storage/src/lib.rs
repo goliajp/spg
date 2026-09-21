@@ -5589,6 +5589,13 @@ pub struct Catalog {
     temp_prefix: Option<String>,
     /// v7.39.2 — see [`Catalog::set_case_insensitive_names`].
     case_insensitive_names: bool,
+    /// 9.0.0 (C8) — the database this session is connected to, when it
+    /// is one `CREATE DATABASE` made. `None` is the datadir's own
+    /// database, whose relations keep the shorter key.
+    ///
+    /// Process-local and never serialised, installed per session like
+    /// `temp_prefix` and `search_path`.
+    database: Option<String>,
     /// 9.0.0 (C9) — the calling session's `search_path`, the schemas an
     /// UNQUALIFIED relation name is looked for in, in order. Empty means
     /// `public` alone, which is what a session that never set one has.
@@ -6438,6 +6445,7 @@ impl Catalog {
             },
             tables: Vec::new(),
             by_name: BTreeMap::new(),
+            database: None,
             search_path: Vec::new(),
             temp_prefix: None,
             case_insensitive_names: false,
@@ -7338,6 +7346,13 @@ impl Catalog {
         &self.created_databases
     }
 
+    /// 9.0.0 (C8) — `DROP DATABASE` takes the name off the list. Its
+    /// relations are dropped by the caller, which is the one that knows
+    /// the three kinds apart.
+    pub fn forget_created_database(&mut self, name: &str) -> bool {
+        self.created_databases.remove(name)
+    }
+
     pub const fn replication_slots(&self) -> &BTreeMap<String, (String, String)> {
         &self.replication_slots
     }
@@ -7839,19 +7854,26 @@ impl Catalog {
         }
         // 9.0.0 (C9) — a name that already carries its schema names ONE
         // relation; nothing else may answer for it. `sa.t` is not `t`.
+        //
+        // 9.0.0 (C8) — and the lookup happens inside the session's
+        // database: a relation another database owns is not reachable
+        // from here, which is what `CREATE DATABASE` means.
         if spg_sql::namespace::is_qualified(name) {
-            return self.by_name.get(name).copied();
+            let key = self.in_this_database(name);
+            return self.by_name.get(key.as_ref()).copied();
         }
         // …and an unqualified one is looked for along the search path,
         // which is PostgreSQL's rule. The `public` entry is the bare key,
         // so a session that never set a path resolves exactly as before.
         for schema in &self.search_path {
-            let key = spg_sql::namespace::qualified_key(schema, name);
-            if let Some(idx) = self.by_name.get(&key) {
+            let qualified = spg_sql::namespace::qualified_key(schema, name);
+            let key = self.in_this_database(&qualified);
+            if let Some(idx) = self.by_name.get(key.as_ref()) {
                 return Some(*idx);
             }
         }
-        if let Some(idx) = self.by_name.get(name) {
+        let key = self.in_this_database(name);
+        if let Some(idx) = self.by_name.get(key.as_ref()) {
             return Some(*idx);
         }
         // v7.39.2 — a MySQL session finds the relation under any
@@ -8696,6 +8718,51 @@ impl Catalog {
         spg_sql::namespace::schema_of(stored)
     }
 
+    /// 9.0.0 (C8) — the key `key` takes inside the session's database.
+    /// For the datadir's own database that is the key itself, which is
+    /// why nothing existing is re-keyed.
+    fn in_this_database<'a>(&self, key: &'a str) -> alloc::borrow::Cow<'a, str> {
+        // A synthesised catalog relation is materialised into a scratch
+        // catalog under its own internal name and read straight back; it
+        // belongs to no database, and the leading underscores keep the
+        // name out of anything a client can write.
+        if key.starts_with(Self::INTERNAL_NAME_MARKER) {
+            return alloc::borrow::Cow::Borrowed(key);
+        }
+        match &self.database {
+            None => alloc::borrow::Cow::Borrowed(key),
+            Some(db) => {
+                let (schema, name) = spg_sql::namespace::split_key(key);
+                alloc::borrow::Cow::Owned(spg_sql::namespace::database_key(db, schema, name))
+            }
+        }
+    }
+
+    /// 9.0.0 (C8) — the prefix every internally synthesised relation
+    /// name carries. Same convention as [`Catalog::TEMP_NAME_MARKER`].
+    pub const INTERNAL_NAME_MARKER: &'static str = "__spg_";
+
+    /// 9.0.0 (C8) — does this key belong to the session's database?
+    #[must_use]
+    pub fn in_current_database(&self, key: &str) -> bool {
+        key.starts_with(Self::INTERNAL_NAME_MARKER)
+            || spg_sql::namespace::database_of(key) == self.database.as_deref()
+    }
+
+    /// 9.0.0 (C8) — install the database this session is connected to.
+    /// `None` is the datadir's own. Same shape as
+    /// [`Catalog::set_search_path`].
+    pub fn set_database(&mut self, database: Option<String>) {
+        self.database = database;
+    }
+
+    /// The database this session is connected to, or `None` for the
+    /// datadir's own.
+    #[must_use]
+    pub fn database(&self) -> Option<&str> {
+        self.database.as_deref()
+    }
+
     /// 9.0.0 (C9) — install the calling session's `search_path`. Same
     /// shape as [`Catalog::set_temp_prefix`] and for the same reason: one
     /// catalog serves every connection, so a per-session answer has to be
@@ -8725,6 +8792,7 @@ impl Catalog {
     pub fn visible_relation_keys(&self) -> Vec<String> {
         self.tables
             .iter()
+            .filter(|t| self.in_current_database(&t.schema.name))
             .filter(|t| self.listed_name(&t.schema.name).is_some())
             .map(|t| t.schema.name.clone())
             .collect()

@@ -2574,10 +2574,6 @@ impl Engine {
                 // PG refuses this inside a transaction block; so does
                 // CREATE DATABASE, and both go through the same guard.
                 self.require_no_transaction_block("DROP DATABASE")?;
-                // SPG serves one database, so the name is either the one
-                // this session is connected to or a name that does not
-                // exist here. PG has wording for both and never lets
-                // either succeed, which is the whole behaviour.
                 let is_current = self
                     .session_param("spg.database")
                     .unwrap_or("spg")
@@ -2586,6 +2582,21 @@ impl Engine {
                     return Err(EngineError::Unsupported(alloc::string::String::from(
                         "cannot drop the currently open database",
                     )));
+                }
+                // 9.0.0 (C8) — a database `CREATE DATABASE` made owns its
+                // relations, so dropping it takes them. Before this, the
+                // name was the whole of it: the statement could only
+                // refuse, because there was nothing to drop.
+                if self.active_catalog().created_databases().contains(&name) {
+                    let owned = self.relations_in_database(&name);
+                    for key in owned {
+                        self.drop_relation_key(&key);
+                    }
+                    self.active_catalog_mut().forget_created_database(&name);
+                    return Ok(QueryResult::CommandOk {
+                        affected: 0,
+                        modified_catalog: self.catalog_change_is_committed(),
+                    });
                 }
                 if if_exists {
                     self.notice(alloc::format!(
@@ -2637,11 +2648,14 @@ impl Engine {
                         // being single-database means and cannot be
                         // fixed without a second database; being silent
                         // about it can be.
+                        // 9.0.0 (C8) — a database made here owns its
+                        // relations, but the COLLATION is still one
+                        // setting for the whole datadir: index keys are
+                        // built under it, and they are not per database.
                         self.warning(alloc::format!(
-                            "SPG serves one database and answers to any name, so \
-                             collation {c:?} now applies to this database too. \
-                             PostgreSQL would have created a separate one; here \
-                             the names are aliases onto the same storage"
+                            "SPG stores one collation per datadir, so {c:?} now \
+                             applies to every database it holds. PostgreSQL \
+                             keeps one per database"
                         ));
                     } else {
                         self.warning(alloc::format!(

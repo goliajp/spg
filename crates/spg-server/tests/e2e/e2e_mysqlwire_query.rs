@@ -2000,9 +2000,17 @@ fn only_full_group_by_speaks_mysqls_words_and_numbers() {
 
     // The schema name follows the session, as every other
     // `db.table.column` on this wire does.
+    //
+    // 9.0.0 (C8) — a database made by `CREATE DATABASE` owns its
+    // relations, so the `g` this asks about is `other`'s own. It used to
+    // be `testdb`'s, read from another database, which is the defect C8
+    // closed.
+    exec_ok(&mut s, "CREATE DATABASE other");
     exec_ok(&mut s, "USE other");
+    exec_ok(&mut s, "CREATE TABLE g (a INT, b INT, c INT)");
     let (_e, _st, msg) = err_of(&mut s, "SELECT a, b FROM g GROUP BY a");
     assert!(msg.contains("'other.g.b'"), "{msg}");
+    exec_ok(&mut s, "USE testdb");
 
     // The control: turning the mode off runs the loose query.
     exec_ok(&mut s, "SET sql_mode=''");

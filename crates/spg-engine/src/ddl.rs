@@ -4203,15 +4203,34 @@ impl Engine {
     /// puts it. A name that already carries a schema is left alone, and
     /// so is a temporary one, which has a namespace of its own.
     pub(crate) fn creation_key(&self, name: &str) -> String {
-        if spg_sql::namespace::is_qualified(name)
-            || name.starts_with(spg_storage::Catalog::TEMP_NAME_MARKER)
+        // A temporary relation has a namespace of its own, and an
+        // internally synthesised one belongs to no database.
+        if name.starts_with(spg_storage::Catalog::TEMP_NAME_MARKER)
+            || name.starts_with(spg_storage::Catalog::INTERNAL_NAME_MARKER)
         {
             return String::from(name);
         }
         let cat = self.active_catalog();
-        match cat.search_path().iter().find(|s| cat.schema_exists(s)) {
-            Some(schema) => spg_sql::namespace::qualified_key(schema, name),
-            None => String::from(name),
+        let key = if spg_sql::namespace::is_qualified(name) {
+            String::from(name)
+        } else {
+            match cat
+                .search_path()
+                .iter()
+                .find(|s| cat.schema_exists(s))
+                .cloned()
+            {
+                Some(schema) => spg_sql::namespace::qualified_key(&schema, name),
+                None => String::from(name),
+            }
+        };
+        // 9.0.0 (C8) — and inside the database this session is on.
+        match cat.database() {
+            None => key,
+            Some(db) => {
+                let (schema, name) = spg_sql::namespace::split_key(&key);
+                spg_sql::namespace::database_key(db, schema, name)
+            }
         }
     }
 
@@ -7480,8 +7499,18 @@ impl Engine {
         out
     }
 
+    /// 9.0.0 (C8) — every relation key this database owns.
+    pub(crate) fn relations_in_database(&self, database: &str) -> Vec<String> {
+        let cat = self.active_catalog();
+        let mine = |key: &String| spg_sql::namespace::database_of(key) == Some(database);
+        let mut out: Vec<String> = cat.table_names().into_iter().filter(mine).collect();
+        out.extend(cat.sequences_all().keys().filter(|k| mine(k)).cloned());
+        out.extend(cat.views_all().keys().filter(|k| mine(k)).cloned());
+        out
+    }
+
     /// 9.0.0 (C9) — drop one relation by its key, whichever kind it is.
-    fn drop_relation_key(&mut self, key: &str) {
+    pub(crate) fn drop_relation_key(&mut self, key: &str) {
         let cat = self.active_catalog_mut();
         cat.drop_table(key);
         cat.drop_sequence(key);
