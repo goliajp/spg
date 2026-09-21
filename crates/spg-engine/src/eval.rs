@@ -3029,12 +3029,18 @@ fn eval_cast_arm(
             Value::BigInt(n) => Some(*n),
             _ => None,
         };
-        if let (Some(oid), Some(cat)) = (oid_in, ctx.catalog) {
-            if oid >= 16384 {
-                if let Some(name) = cat.table_names().into_iter().nth((oid - 16384) as usize) {
-                    return Ok(Value::RegClass(oid, name.into()));
-                }
-            }
+        // 9.0.0 (C8) — through `relation_name_for_oid`, which is the one
+        // that knows what a relation of ANOTHER database is, what a
+        // foreign session's temporary table is, and what a key's display
+        // name is. This was a second implementation — a bare positional
+        // `nth(oid - 16384)` over the raw list — and it answered the
+        // STORED KEY, so `16385::regclass` on a two-database server
+        // rendered `c8a`: the key `c8a\0public\0c8t` truncated at the
+        // separator on its way to the client.
+        if let (Some(oid), Some(cat)) = (oid_in, ctx.catalog)
+            && let Some(name) = crate::system_catalog::relation_name_for_oid(cat, oid)
+        {
+            return Ok(Value::RegClass(oid, name.into()));
         }
         if let (Value::Text(s), Some(cat)) = (&v, ctx.catalog) {
             let bare = s
@@ -3053,10 +3059,8 @@ fn eval_cast_arm(
                 && bare.bytes().all(|b| b.is_ascii_digit())
                 && let Ok(oid) = bare.parse::<i64>()
             {
-                let name = (oid >= 16384)
-                    .then(|| cat.table_names().into_iter().nth((oid - 16384) as usize))
-                    .flatten()
-                    .unwrap_or(bare);
+                // 9.0.0 (C8) — the same one resolver; see above.
+                let name = crate::system_catalog::relation_name_for_oid(cat, oid).unwrap_or(bare);
                 return Ok(Value::RegClass(oid, name.into()));
             }
             if let Some(oid) = regclass_name_to_oid(cat, &bare) {

@@ -8,6 +8,36 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+### Fixed — `pg_class` listed another database's relations, and `pg_dump` stopped
+
+**Shipped in 9.0.0 and found on the published image.** 9.0.0 gave a
+database its own relations, and `information_schema.tables` filtered by
+the session's database while `pg_class` did not: the two are built by
+different walks, and the filter reached one of them. `pg_class` walks
+the RAW relation list so a relation's oid stays tied to its catalog
+position, and that walk had no database in it.
+
+`pg_dump` reads `pg_class` to decide what to lock, so a dump of a server
+that had ever run `CREATE DATABASE` produced nothing at all:
+
+```text
+pg_dump: error: query failed: ERROR:  relation "c8t" does not exist
+  Query was: LOCK TABLE c9a.t, c9b.t, public.c8t IN ACCESS SHARE MODE
+```
+
+A numeric `::regclass` had the same gap through a SECOND implementation
+— a bare positional lookup over the raw list — which also answered the
+STORED KEY rather than the display name, so on a two-database server
+`16385::regclass` rendered `c8a`: the key truncated at its separator on
+the way to the client. Both directions go through the one resolver now,
+the one that knows about databases, temporary relations and keys.
+
+The 9.0.0 pin for this asked `information_schema.tables` and ran
+in-process, where the fault does not reproduce; the pin is on the WIRE
+now, which is where it was measured, and its three ablations bite there.
+
 ## [9.0.0] — 2026-09-22
 
 ### Breaking — why this is a major
