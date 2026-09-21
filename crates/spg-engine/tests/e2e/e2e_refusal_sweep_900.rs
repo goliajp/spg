@@ -149,6 +149,53 @@ fn s1_alter_function_rename_moves_it() {
     assert!(format!("{err}").contains("is not unique"), "{err}");
 }
 
+/// 9.0.0 — COPY may fill a `GENERATED ALWAYS AS IDENTITY` column and
+/// INSERT may not.
+///
+/// Measured on PostgreSQL 18.6: `COPY t (id, n) FROM stdin` into such a
+/// column takes the value, and the identical `INSERT` answers `cannot
+/// insert a non-DEFAULT value into column "id"`. `pg_dump` relies on
+/// that — it writes a table's data as COPY — and COPY rides the INSERT
+/// path here, so it inherited a refusal PostgreSQL does not make and a
+/// dump of an identity table did not restore. Caught by the dump-compat
+/// fixture panel, which is the only instrument that reads a whole dump
+/// back.
+#[test]
+fn s1_copy_may_fill_a_generated_always_identity_column() {
+    let sql = spg_engine::copy::build_copy_insert(
+        "t",
+        Some(&[alloc_string("id"), alloc_string("n")]),
+        &[Some(alloc_string("9")), Some(alloc_string("x"))],
+    );
+    assert!(
+        sql.contains("OVERRIDING SYSTEM VALUE"),
+        "COPY's insert carries PostgreSQL's own spelling for the          permission: {sql}"
+    );
+    // …and it round-trips through the engine.
+    let mut e = Engine::new();
+    run(
+        &mut e,
+        "CREATE TABLE ident9(id int GENERATED ALWAYS AS IDENTITY, n text)",
+    );
+    run(
+        &mut e,
+        &sql.replace("INSERT INTO t ", "INSERT INTO ident9 "),
+    );
+    assert_eq!(vals(&mut e, "SELECT id, n FROM ident9"), vec!["9|x"]);
+    // The plain INSERT is still refused, as PostgreSQL refuses it.
+    let err = e
+        .execute("INSERT INTO ident9(id, n) VALUES (8, 'y')")
+        .expect_err("PG refuses it");
+    assert!(
+        format!("{err}").contains("cannot insert a non-DEFAULT value into column \"id\""),
+        "{err}"
+    );
+}
+
+fn alloc_string(s: &str) -> String {
+    String::from(s)
+}
+
 /// Two refusals PostgreSQL also makes, in PostgreSQL's words.
 #[test]
 fn s1_the_shared_refusals_use_postgresqls_sentence() {
