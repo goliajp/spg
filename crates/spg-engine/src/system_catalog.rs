@@ -490,7 +490,7 @@ pub(crate) fn synth_information_schema_columns(
     // 34 rows for `WHERE table_name='pg_class'` and SPG answered none,
     // so a tool reflecting through `information_schema` was told the
     // catalogs have no columns — or do not exist.
-    for (name, _, relkind) in CATALOG_RELATIONS {
+    for (name, _, relkind, _) in CATALOG_RELATIONS {
         let Some(cols) = catalog_relation_columns(name, cat) else {
             continue;
         };
@@ -504,6 +504,27 @@ pub(crate) fn synth_information_schema_columns(
                 ordinal,
                 col,
                 updatable,
+                false,
+            ));
+        }
+    }
+    // 9.0.0 (N20) — and `information_schema`'s own columns. PG 18.6
+    // answers 696 rows for its own schema and SPG answered none, so a
+    // tool reflecting the whole database saw `information_schema` as
+    // empty — the same defect as the catalogs above, one schema over.
+    for name in crate::info_schema::info_schema_relation_names() {
+        let Some(cols) = crate::info_schema::info_schema_columns(name) else {
+            continue;
+        };
+        for (i, col) in cols.iter().enumerate() {
+            #[allow(clippy::cast_possible_wrap)]
+            let ordinal = (i + 1) as i32;
+            rows.push(info_column_row_in(
+                "information_schema",
+                name,
+                ordinal,
+                col,
+                Some(false),
                 false,
             ));
         }
@@ -880,6 +901,72 @@ fn mysql_column_collation(col: &ColumnSchema) -> Value<'static> {
 ///
 /// A column whose default NAMES a sequence (`DEFAULT nextval('s')`) is not
 /// one: its default is that text, and the sequence is its own object.
+/// 9.0.0 (N23) — `udt_name`: PostgreSQL's internal typname (`int4`,
+/// not `integer`). One mapping, because `information_schema.columns`
+/// and `column_udt_usage` answer the same question and a second copy
+/// is how they would come to disagree.
+pub(crate) fn udt_name_for(col: &ColumnSchema) -> &'static str {
+    match col.ty {
+        DataType::SmallInt => "int2",
+        DataType::Int => "int4",
+        DataType::BigInt => "int8",
+        DataType::Float => "float8",
+        DataType::Real => "float4",
+        DataType::Bool => "bool",
+        DataType::Text => "text",
+        DataType::Bytes => "bytea",
+        // v7.39 (round 620) — `Jsonb` is its OWN variant beside `Json`,
+        // and this table only had the latter, so every JSONB column
+        // reported itself as `text` here while `pg_attribute.atttypid`
+        // said 3802 right next to it. Two mappings for the same question,
+        // disagreeing. And `json` is `json`, not `jsonb`.
+        DataType::Json => "json",
+        DataType::Jsonb => "jsonb",
+        DataType::Uuid => "uuid",
+        DataType::Date => "date",
+        DataType::Timestamp => "timestamp",
+        // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
+        // and mis-reported themselves. PG18.4 udt_name, verified:
+        // timestamptz / time / interval / numeric.
+        DataType::Timestamptz => "timestamptz",
+        DataType::Time => "time",
+        DataType::Interval => "interval",
+        DataType::Numeric { .. } => "numeric",
+        // v7.39 (round 248) — varchar/char kept falling into the
+        // text catch-all, and an array's udt_name is PG's
+        // underscore-prefixed element name (`_text`).
+        DataType::Varchar(_) => "varchar",
+        DataType::Char(_) => "bpchar",
+        DataType::Char1 => "char",
+        DataType::TextArray => "_text",
+        DataType::IntArray => "_int4",
+        DataType::BigIntArray => "_int8",
+        // v7.40.0 — `oid[]` became a column type, and a column type
+        // that cannot name itself is the defect 7.39.13 closed for
+        // `year` and `timetz`. `ARRAY_TYPE_OIDS` already carried
+        // (1028, "_oid", 26); these two tables did not.
+        DataType::OidArray => "_oid",
+        DataType::SmallIntArray => "_int2",
+        DataType::FloatArray => "_float8",
+        DataType::NumericArray => "_numeric",
+        DataType::BoolArray => "_bool",
+        DataType::DateArray => "_date",
+        DataType::TimestampArray => "_timestamp",
+        DataType::TimestamptzArray => "_timestamptz",
+        DataType::RealArray => "_float4",
+        DataType::TimeArray => "_time",
+        DataType::TimeTzArray => "_timetz",
+        DataType::InetArray => "_inet",
+        DataType::XmlArray => "_xml",
+        DataType::UuidArray => "_uuid",
+        // v7.39 (round 620) — two more element types whose arrays fell
+        // into the text catch-all and named themselves `text`.
+        DataType::BytesArray => "_bytea",
+        DataType::JsonArray => "_json",
+        _ => "text",
+    }
+}
+
 pub(crate) fn is_serial(col: &ColumnSchema) -> bool {
     col.auto_increment && col.identity.is_none() && col.default_text.is_none()
 }
@@ -943,66 +1030,7 @@ fn info_column_row_in(
         ),
         _ => (Value::Null, Value::Null),
     };
-    // udt_name is PG's internal typname (int4, not integer).
-    let udt: &str = match col.ty {
-        DataType::SmallInt => "int2",
-        DataType::Int => "int4",
-        DataType::BigInt => "int8",
-        DataType::Float => "float8",
-        DataType::Real => "float4",
-        DataType::Bool => "bool",
-        DataType::Text => "text",
-        DataType::Bytes => "bytea",
-        // v7.39 (round 620) — `Jsonb` is its OWN variant beside `Json`,
-        // and this table only had the latter, so every JSONB column
-        // reported itself as `text` here while `pg_attribute.atttypid`
-        // said 3802 right next to it. Two mappings for the same question,
-        // disagreeing. And `json` is `json`, not `jsonb`.
-        DataType::Json => "json",
-        DataType::Jsonb => "jsonb",
-        DataType::Uuid => "uuid",
-        DataType::Date => "date",
-        DataType::Timestamp => "timestamp",
-        // v7.38 (T-tstz Phase 1) — these fell to the `text` catch-all
-        // and mis-reported themselves. PG18.4 udt_name, verified:
-        // timestamptz / time / interval / numeric.
-        DataType::Timestamptz => "timestamptz",
-        DataType::Time => "time",
-        DataType::Interval => "interval",
-        DataType::Numeric { .. } => "numeric",
-        // v7.39 (round 248) — varchar/char kept falling into the
-        // text catch-all, and an array's udt_name is PG's
-        // underscore-prefixed element name (`_text`).
-        DataType::Varchar(_) => "varchar",
-        DataType::Char(_) => "bpchar",
-        DataType::Char1 => "char",
-        DataType::TextArray => "_text",
-        DataType::IntArray => "_int4",
-        DataType::BigIntArray => "_int8",
-        // v7.40.0 — `oid[]` became a column type, and a column type
-        // that cannot name itself is the defect 7.39.13 closed for
-        // `year` and `timetz`. `ARRAY_TYPE_OIDS` already carried
-        // (1028, "_oid", 26); these two tables did not.
-        DataType::OidArray => "_oid",
-        DataType::SmallIntArray => "_int2",
-        DataType::FloatArray => "_float8",
-        DataType::NumericArray => "_numeric",
-        DataType::BoolArray => "_bool",
-        DataType::DateArray => "_date",
-        DataType::TimestampArray => "_timestamp",
-        DataType::TimestamptzArray => "_timestamptz",
-        DataType::RealArray => "_float4",
-        DataType::TimeArray => "_time",
-        DataType::TimeTzArray => "_timetz",
-        DataType::InetArray => "_inet",
-        DataType::XmlArray => "_xml",
-        DataType::UuidArray => "_uuid",
-        // v7.39 (round 620) — two more element types whose arrays fell
-        // into the text catch-all and named themselves `text`.
-        DataType::BytesArray => "_bytea",
-        DataType::JsonArray => "_json",
-        _ => "text",
-    };
+    let udt: &str = udt_name_for(col);
     // v7.39 (round 248) — datetime_precision: PG reports 6 for the
     // microsecond-carrying types and 0 for date.
     let dt_prec: Value<'static> = match col.ty {
@@ -1239,7 +1267,7 @@ pub(crate) fn synth_information_schema_tables(
     // `SELECT … WHERE table_name='pg_class'` answers one row there and
     // none here — so a tool that asks `information_schema` what the
     // database holds was told the catalogs do not exist.
-    for (name, _, relkind) in CATALOG_RELATIONS {
+    for (name, _, relkind, _) in CATALOG_RELATIONS {
         rows.push(Row::new(alloc::vec![
             Value::text("spg"),
             Value::text("pg_catalog"),
@@ -1249,6 +1277,28 @@ pub(crate) fn synth_information_schema_tables(
             } else {
                 "BASE TABLE"
             }),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::text("NO"),
+            Value::text("NO"),
+            Value::Null,
+        ]));
+    }
+    // 9.0.0 (N20) — and `information_schema`'s own relations, which it
+    // did not list. PostgreSQL 18.6 covers nine schemas here, its own
+    // among them; SPG covered `public` and `pg_catalog`, so a tool that
+    // asked what `information_schema` holds was told it holds nothing.
+    for name in crate::info_schema::info_schema_relation_names() {
+        rows.push(Row::new(alloc::vec![
+            Value::text("spg"),
+            Value::text("information_schema"),
+            Value::text(name),
+            // Every one of them is a VIEW on PostgreSQL, including the
+            // four `_pg_*` helpers.
+            Value::text("VIEW"),
             Value::Null,
             Value::Null,
             Value::Null,
@@ -1466,10 +1516,12 @@ pub(crate) fn synth_information_schema_views(
 ///   * heap_blks_total / heap_blks_scanned / heap_blks_vacuumed (BigInt)
 ///   * index_vacuum_count (BigInt)
 ///   * max_dead_tuples / num_dead_tuples (BigInt)
-pub(crate) fn synth_pg_stat_progress_vacuum(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_progress_vacuum_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("pid", DataType::Int, false),
         ColumnSchema::new("datid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
@@ -1481,7 +1533,13 @@ pub(crate) fn synth_pg_stat_progress_vacuum(
         ColumnSchema::new("index_vacuum_count", DataType::BigInt, false),
         ColumnSchema::new("max_dead_tuples", DataType::BigInt, false),
         ColumnSchema::new("num_dead_tuples", DataType::BigInt, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_progress_vacuum(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_progress_vacuum_schema();
     let rows: Vec<Row<'static>> = Vec::new();
     (schema, rows)
 }
@@ -1491,10 +1549,12 @@ pub(crate) fn synth_pg_stat_progress_vacuum(
 /// is synchronous and finishes inside the wire path; the view
 /// shape-stable empties so monitoring queries match PG's
 /// "no active build" case.
-pub(crate) fn synth_pg_stat_progress_create_index(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_progress_create_index_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("pid", DataType::Int, false),
         ColumnSchema::new("datid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
@@ -1511,7 +1571,13 @@ pub(crate) fn synth_pg_stat_progress_create_index(
         ColumnSchema::new("tuples_done", DataType::BigInt, false),
         ColumnSchema::new("partitions_total", DataType::BigInt, false),
         ColumnSchema::new("partitions_done", DataType::BigInt, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_progress_create_index(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_progress_create_index_schema();
     let rows: Vec<Row<'static>> = Vec::new();
     (schema, rows)
 }
@@ -1519,10 +1585,12 @@ pub(crate) fn synth_pg_stat_progress_create_index(
 /// v7.37.22 (22.22) — synthesise
 /// `pg_catalog.pg_stat_progress_analyze`. Empty until v7.37.22
 /// (22.3) autoanalyze_pass wires per-table progress reporting.
-pub(crate) fn synth_pg_stat_progress_analyze(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_progress_analyze_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("pid", DataType::Int, false),
         ColumnSchema::new("datid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
@@ -1535,7 +1603,13 @@ pub(crate) fn synth_pg_stat_progress_analyze(
         ColumnSchema::new("child_tables_total", DataType::BigInt, false),
         ColumnSchema::new("child_tables_done", DataType::BigInt, false),
         ColumnSchema::new("current_child_table_relid", DataType::BigInt, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_progress_analyze(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_progress_analyze_schema();
     let rows: Vec<Row<'static>> = Vec::new();
     (schema, rows)
 }
@@ -2654,8 +2728,12 @@ pub(crate) fn synth_pg_policy(
 ///
 /// PG columns: schemaname, tablename, policyname, permissive
 /// ('PERMISSIVE'|'RESTRICTIVE'), roles (name[]), cmd (word), qual, with_check.
-pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_policies_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("tablename", DataType::Name, false),
         ColumnSchema::new("policyname", DataType::Text, false),
@@ -2664,7 +2742,11 @@ pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("cmd", DataType::Text, false),
         ColumnSchema::new("qual", DataType::Text, true),
         ColumnSchema::new("with_check", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_policies(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_policies_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
@@ -2983,8 +3065,12 @@ pub(crate) fn synth_pg_statistic(
 ///     writeback_time / extends / extend_time / op_bytes /
 ///     hits / evictions / reuses / fsyncs / fsync_time (BigInt/Float)
 ///   * stats_reset (TIMESTAMPTZ)
-pub(crate) fn synth_pg_stat_io(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_io_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("backend_type", DataType::Text, false),
         ColumnSchema::new("object", DataType::Text, false),
         ColumnSchema::new("context", DataType::Text, false),
@@ -3003,7 +3089,11 @@ pub(crate) fn synth_pg_stat_io(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("fsyncs", DataType::BigInt, false),
         ColumnSchema::new("fsync_time", DataType::Float, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_io(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_io_schema();
     // Single aggregate row to keep the SELECT non-empty;
     // dashboards' SUM(reads) / AVG(read_time) queries return 0
     // rather than NULL.
@@ -3038,17 +3128,25 @@ pub(crate) fn synth_pg_stat_io(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// no rows (vs returning a parse error). Per-function wiring
 /// lands when PL/pgSQL (v7.37.20) ships and the call-site
 /// counter exists.
-pub(crate) fn synth_pg_stat_user_functions(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_user_functions_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("funcid", DataType::BigInt, false),
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("funcname", DataType::Text, false),
         ColumnSchema::new("calls", DataType::BigInt, false),
         ColumnSchema::new("total_time", DataType::Float, false),
         ColumnSchema::new("self_time", DataType::Float, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_user_functions(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_user_functions_schema();
     let rows: Vec<Row<'static>> = Vec::new();
     (schema, rows)
 }
@@ -3276,8 +3374,12 @@ pub(crate) fn synth_pg_collation(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
 ///   * last_failed_wal (Text)
 ///   * last_failed_time (TIMESTAMPTZ)
 ///   * stats_reset (TIMESTAMPTZ)
-pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_archiver_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("archived_count", DataType::BigInt, false),
         ColumnSchema::new("last_archived_wal", DataType::Text, true),
         ColumnSchema::new("last_archived_time", DataType::Timestamptz, true),
@@ -3285,7 +3387,11 @@ pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
         ColumnSchema::new("last_failed_wal", DataType::Text, true),
         ColumnSchema::new("last_failed_time", DataType::Timestamptz, true),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_archiver_schema();
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(0),
         Value::Null,
@@ -3313,8 +3419,12 @@ pub(crate) fn synth_pg_stat_archiver(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
 ///   * sent_lsn / write_lsn / flush_lsn / replay_lsn (Text, PG LSN format)
 ///   * sync_state (Text) — 'async' / 'potential' / 'sync' / 'quorum'
 ///   * reply_time (TIMESTAMPTZ)
-pub(crate) fn synth_pg_stat_replication(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_replication_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("pid", DataType::Int, false),
         ColumnSchema::new("usename", DataType::Text, true),
         ColumnSchema::new("application_name", DataType::Text, true),
@@ -3326,7 +3436,11 @@ pub(crate) fn synth_pg_stat_replication(_cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("replay_lsn", DataType::Text, true),
         ColumnSchema::new("sync_state", DataType::Text, false),
         ColumnSchema::new("reply_time", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_replication(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_replication_schema();
     let rows: Vec<Row<'static>> = Vec::new();
     (schema, rows)
 }
@@ -3348,8 +3462,12 @@ pub(crate) fn synth_pg_stat_replication(_cat: &Catalog) -> (Vec<ColumnSchema>, V
 /// v7.38 (read01 P3.15) — `pg_catalog.pg_stat_slru`. SPG has no SLRU
 /// caches (its tiered storage is a different subsystem), so the view is
 /// empty; the PG columns are present so monitoring queries parse.
-pub(crate) fn synth_pg_stat_slru(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_slru_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("blks_zeroed", DataType::BigInt, false),
         ColumnSchema::new("blks_hit", DataType::BigInt, false),
@@ -3359,17 +3477,23 @@ pub(crate) fn synth_pg_stat_slru(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("flushes", DataType::BigInt, false),
         ColumnSchema::new("truncates", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_slru(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_slru_schema();
     (schema, Vec::new())
 }
 
 /// v7.38 (read01 P3.15) — `pg_catalog.pg_stat_subscription_stats`. One
 /// row per subscription would carry apply/sync error + conflict counts;
 /// SPG doesn't track them yet, so this is an empty shape-stable shell.
-pub(crate) fn synth_pg_stat_subscription_stats(
-    _cat: &Catalog,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_subscription_stats_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("subid", DataType::BigInt, false),
         ColumnSchema::new("subname", DataType::Text, false),
         ColumnSchema::new("apply_error_count", DataType::BigInt, false),
@@ -3382,7 +3506,13 @@ pub(crate) fn synth_pg_stat_subscription_stats(
         ColumnSchema::new("confl_delete_missing", DataType::BigInt, false),
         ColumnSchema::new("confl_multiple_unique_conflicts", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_subscription_stats(
+    _cat: &Catalog,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_subscription_stats_schema();
     (schema, Vec::new())
 }
 
@@ -3390,8 +3520,12 @@ pub(crate) fn synth_pg_stat_subscription_stats(
 /// SPG checkpoints WAL/segments on its own schedule; the cumulative
 /// counters aren't wired yet, so this is a shape-stable single row of
 /// zeros so monitoring queries parse.
-pub(crate) fn synth_pg_stat_checkpointer(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_checkpointer_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("num_timed", DataType::BigInt, false),
         ColumnSchema::new("num_requested", DataType::BigInt, false),
         ColumnSchema::new("num_done", DataType::BigInt, false),
@@ -3403,7 +3537,11 @@ pub(crate) fn synth_pg_stat_checkpointer(_cat: &Catalog) -> (Vec<ColumnSchema>, 
         ColumnSchema::new("buffers_written", DataType::BigInt, false),
         ColumnSchema::new("slru_written", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_checkpointer(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_checkpointer_schema();
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(0),
         Value::BigInt(0),
@@ -3423,14 +3561,22 @@ pub(crate) fn synth_pg_stat_checkpointer(_cat: &Catalog) -> (Vec<ColumnSchema>, 
 /// v7.38 (read01 P3.14) — `pg_catalog.pg_stat_wal`. Shell view; the WAL
 /// throughput counters aren't wired yet, so a shape-stable single row of
 /// zeros (monitoring queries parse; `stats_reset` is NULL).
-pub(crate) fn synth_pg_stat_wal(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_wal_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("wal_records", DataType::BigInt, false),
         ColumnSchema::new("wal_fpi", DataType::BigInt, false),
         ColumnSchema::new("wal_bytes", DataType::BigInt, false),
         ColumnSchema::new("wal_buffers_full", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_wal(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_wal_schema();
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(0),
         Value::BigInt(0),
@@ -3441,8 +3587,12 @@ pub(crate) fn synth_pg_stat_wal(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     (schema, rows)
 }
 
-pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_bgwriter_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("checkpoints_timed", DataType::BigInt, false),
         ColumnSchema::new("checkpoints_req", DataType::BigInt, false),
         ColumnSchema::new("checkpoint_write_time", DataType::Float, false),
@@ -3454,7 +3604,11 @@ pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<
         ColumnSchema::new("buffers_backend_fsync", DataType::BigInt, false),
         ColumnSchema::new("buffers_alloc", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_bgwriter(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_bgwriter_schema();
     let rows = alloc::vec![Row::new(alloc::vec![
         Value::BigInt(0), // checkpoints_timed
         Value::BigInt(0), // checkpoints_req
@@ -3517,8 +3671,12 @@ pub(crate) fn synth_pg_tablespace(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
 ///   * indexrelname (Text)
 ///   * idx_scan / idx_tup_read / idx_tup_fetch (BigInt) —
 ///     usage counters
-pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_user_indexes_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("relid", DataType::BigInt, false),
         ColumnSchema::new("indexrelid", DataType::Oid, false),
         ColumnSchema::new("schemaname", DataType::Name, false),
@@ -3527,7 +3685,11 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("idx_scan", DataType::BigInt, false),
         ColumnSchema::new("idx_tup_read", DataType::BigInt, false),
         ColumnSchema::new("idx_tup_fetch", DataType::BigInt, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_user_indexes_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     // v7.39.13 — through the one enumeration, so `indexrelid` still
     // means the same object `pg_class.oid` and `pg_index.indexrelid` do.
@@ -3584,11 +3746,10 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
 ///     estimates (live = row_count; dead = 0 until v7.37.15
 ///     vacuum daemon tracks them)
 ///   * last_vacuum / last_analyze (TIMESTAMPTZ, NULL)
-pub(crate) fn synth_pg_stat_user_tables(
-    cat: &Catalog,
-    write_stats: &alloc::collections::BTreeMap<alloc::string::String, (u64, u64, u64)>,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows.
+pub(crate) fn pg_stat_user_tables_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("relid", DataType::BigInt, false),
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("relname", DataType::Name, false),
@@ -3605,7 +3766,14 @@ pub(crate) fn synth_pg_stat_user_tables(
         ColumnSchema::new("last_autovacuum", DataType::Timestamptz, true),
         ColumnSchema::new("last_analyze", DataType::Timestamptz, true),
         ColumnSchema::new("last_autoanalyze", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_user_tables(
+    cat: &Catalog,
+    write_stats: &alloc::collections::BTreeMap<alloc::string::String, (u64, u64, u64)>,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_user_tables_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     let mut relid: i64 = 16384; // PG user-relation OID floor
     for name in cat.visible_table_names() {
@@ -3694,13 +3862,12 @@ pub(crate) fn synth_pg_stat_user_tables(
 ///     file per sort run and the bytes they hold (round 884)
 ///   * blk_read_time / blk_write_time (Float) — accumulated
 ///     I/O wait time (0 until per-statement timing lands)
-pub(crate) fn synth_pg_stat_database(
-    eng: &Engine,
-    tup_inserted: u64,
-    tup_updated: u64,
-    tup_deleted: u64,
-) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_stat_database_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("datid", DataType::BigInt, false),
         ColumnSchema::new("datname", DataType::Text, false),
         ColumnSchema::new("numbackends", DataType::Int, false),
@@ -3734,7 +3901,16 @@ pub(crate) fn synth_pg_stat_database(
         ColumnSchema::new("parallel_workers_to_launch", DataType::BigInt, false),
         ColumnSchema::new("parallel_workers_launched", DataType::BigInt, false),
         ColumnSchema::new("stats_reset", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_stat_database(
+    eng: &Engine,
+    tup_inserted: u64,
+    tup_updated: u64,
+    tup_deleted: u64,
+) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_stat_database_schema();
     // Single-row, single-database; everything reads as 0 until
     // per-counter wiring lands (the shape is stable so monitoring
     // queries parse).
@@ -3854,8 +4030,12 @@ pub(crate) fn synth_pg_stat_database(
 ///   * subbinary (Bool) — false (SPG uses text wire); flips
 ///     when v7.38 adds binary subscriber wire
 ///   * substream (Bool) — false (no streaming in-progress txs yet)
-pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_subscription_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("subdbid", DataType::BigInt, false),
         ColumnSchema::new("subname", DataType::Text, false),
@@ -3890,7 +4070,11 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
         ColumnSchema::new("subfailover", DataType::Bool, false),
         ColumnSchema::new("subsynccommit", DataType::Text, false),
         ColumnSchema::new("suborigin", DataType::Text, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_subscription_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Subscription OID band starts at 80_000 (publications live
     // at 70_000+, so the two stay disjoint for sub-publication
@@ -3939,9 +4123,10 @@ pub(crate) fn synth_pg_subscription(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row
 ///     surface true to match PG's default scope
 ///   * pubviaroot (Bool) — partition-parent routing (PG 13+);
 ///     false for SPG since we route at the engine layer
-pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    use spg_sql::ast::PublicationScope;
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows.
+pub(crate) fn pg_publication_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("pubname", DataType::Text, false),
         ColumnSchema::new("pubowner", DataType::BigInt, false),
@@ -3954,7 +4139,12 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         // v7.39 (round 543) — PG18's generated-column mode. Measured on
         // a fresh `CREATE PUBLICATION … FOR ALL TABLES`: 'n' (none).
         ColumnSchema::new("pubgencols", DataType::Char1, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_sql::ast::PublicationScope;
+    let schema = pg_publication_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     // Synthetic OID band — pubs land above the table OID band
     // (16384..) and above pg_enum's user band (50_000..).
@@ -4007,8 +4197,12 @@ pub(crate) fn synth_pg_publication(eng: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
 ///   * confirmed_flush_lsn (Text)
 ///   * wal_status (Text) — `reserved` / `extended` / `unreserved` / `lost`
 ///   * safe_wal_size (BigInt) — bytes before the slot's WAL is reclaimed
-pub(crate) fn synth_pg_replication_slots(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_replication_slots_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("slot_name", DataType::Text, false),
         ColumnSchema::new("plugin", DataType::Text, true),
         ColumnSchema::new("slot_type", DataType::Text, false),
@@ -4023,7 +4217,11 @@ pub(crate) fn synth_pg_replication_slots(cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("confirmed_flush_lsn", DataType::Text, true),
         ColumnSchema::new("wal_status", DataType::Text, true),
         ColumnSchema::new("safe_wal_size", DataType::BigInt, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_replication_slots(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_replication_slots_schema();
     // v7.39 (round 550) — the slots the catalog actually holds. This
     // was pinned empty, and the create/drop functions answered NULL, so
     // a replication setup script ran clean and made nothing.
@@ -5268,7 +5466,7 @@ pub(crate) fn synth_pg_class(
     // namespace (pg_dump, psql \dt, and SPG's own pg_tables all do), and a
     // catalog landing in `public` would show up as a table the user owns.
     // relkind 'r' and relpersistence 'p', as PG reports for its own.
-    for (name, oid, relkind) in CATALOG_RELATIONS {
+    for (name, oid, relkind, _) in CATALOG_RELATIONS {
         let relnatts = catalog_relation_columns(name, cat)
             .map_or(0, |c| i16::try_from(c.len()).unwrap_or(i16::MAX));
         rows.push(Row::new(alloc::vec![
@@ -5809,7 +6007,7 @@ pub(crate) fn synth_pg_attribute(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
     // synth's schema, so a column added to a catalog shows up here without
     // anyone remembering to. `attnotnull` follows the schema's own
     // nullability; the rest is what a plain column reports.
-    for (name, oid, _) in CATALOG_RELATIONS {
+    for (name, oid, _, _) in CATALOG_RELATIONS {
         let Some(cols) = catalog_relation_columns(name, cat) else {
             continue;
         };
@@ -9566,8 +9764,12 @@ pub(crate) fn synth_info_routines() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 /// SEQUENCE, exposing PG's seqstart/seqincrement/seqmax/seqmin/seqcache/
 /// seqcycle columns from the catalog SequenceDef. Previously absent, so
 /// psql `\d <seq>` and ORMs that read pg_sequence saw nothing.
-pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_sequence_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("seqrelid", DataType::BigInt, false),
         ColumnSchema::new("seqtypid", DataType::BigInt, false),
         ColumnSchema::new("seqstart", DataType::BigInt, false),
@@ -9576,7 +9778,11 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("seqmin", DataType::BigInt, false),
         ColumnSchema::new("seqcache", DataType::BigInt, false),
         ColumnSchema::new("seqcycle", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_sequence_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     // v7.39 (round 338, V64) — seqrelid IS the sequence's pg_class oid, so
     // it reads from the shared allocator. It used to number sequences from
@@ -10009,15 +10215,10 @@ fn fk_action_char(action: spg_storage::FkAction) -> &'static str {
 /// SPG is single-database so we surface a single row keyed on the
 /// canonical `postgres` database name (matching what every PG
 /// admin tool's startup screen expects to find).
-pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    // v7.39 (round 474) — PG18's pg_database has eighteen columns; this had
-    // five, so `SELECT datfrozenxid FROM pg_database` — what a monitoring
-    // query asks to watch wraparound — failed outright with "column does
-    // not exist".
-    //
-    // It also named the database `postgres` while `current_database()`
-    // answers `spg`, so a client joining the two found no row at all.
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows.
+pub(crate) fn pg_database_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("datname", DataType::Text, false),
         ColumnSchema::new("datdba", DataType::BigInt, false),
@@ -10036,7 +10237,18 @@ pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<
         ColumnSchema::new("daticurules", DataType::Text, true),
         ColumnSchema::new("datcollversion", DataType::Text, true),
         ColumnSchema::new("datacl", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_database(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    // v7.39 (round 474) — PG18's pg_database has eighteen columns; this had
+    // five, so `SELECT datfrozenxid FROM pg_database` — what a monitoring
+    // query asks to watch wraparound — failed outright with "column does
+    // not exist".
+    //
+    // It also named the database `postgres` while `current_database()`
+    // answers `spg`, so a client joining the two found no row at all.
+    let schema = pg_database_schema();
     // v7.38.19 — every name this server answers to, not only the one the
     // asking session connected with.
     //
@@ -10241,8 +10453,12 @@ pub(crate) fn synth_pg_user(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'sta
 /// per role membership (`GRANT devs TO alice`). The oids agree with the ones
 /// `synth_pg_roles` hands out, so the canonical
 /// `pg_auth_members JOIN pg_roles ON roleid = oid` join resolves.
-pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_auth_members_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("roleid", DataType::BigInt, false),
         ColumnSchema::new("member", DataType::BigInt, false),
@@ -10252,7 +10468,11 @@ pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<
         // Measured true/true for a plain GRANT <role> TO <member>.
         ColumnSchema::new("inherit_option", DataType::Bool, false),
         ColumnSchema::new("set_option", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_auth_members(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_auth_members_schema();
     // The oid assignment synth_pg_roles publishes.
     let roles = crate::role_directory::RoleDirectory::of(engine);
     let oid_of = |name: &str| -> i64 {
@@ -10661,8 +10881,12 @@ pub(crate) fn synth_empty_pg_catalog(view: &str) -> Option<(Vec<ColumnSchema>, V
 /// privileges that SPG does not have, so publishing a SCRAM verifier
 /// here would put it within reach of any session. That is a deliberate
 /// divergence, recorded rather than silently taken.
-pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_authid_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("rolname", DataType::Name, false),
         ColumnSchema::new("rolsuper", DataType::Bool, false),
@@ -10675,7 +10899,11 @@ pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'s
         ColumnSchema::new("rolconnlimit", DataType::Int, false),
         ColumnSchema::new("rolpassword", DataType::Text, true),
         ColumnSchema::new("rolvaliduntil", DataType::Timestamptz, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_authid_schema();
     // pg_roles positions: 0 rolname, 1 rolsuper, 2 rolinherit,
     // 3 rolcreaterole, 4 rolcreatedb, 5 rolcanlogin, 6 rolreplication,
     // 7 rolconnlimit, 8 rolpassword, 9 rolvaliduntil, 10 rolbypassrls,
@@ -10704,12 +10932,20 @@ pub(crate) fn synth_pg_authid(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'s
 }
 
 /// `pg_group` — a role and the oids of its members.
-pub(crate) fn synth_pg_group(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_group_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("groname", DataType::Text, false),
         ColumnSchema::new("grosysid", DataType::BigInt, false),
         ColumnSchema::new("grolist", DataType::TextArray, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_group(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_group_schema();
     let (_, members) = synth_pg_auth_members(engine);
     let (_, roles) = synth_pg_roles(engine);
     let rows = roles
@@ -10762,12 +10998,20 @@ pub(crate) fn synth_pg_shadow(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// so `ALTER ROLE ALL SET` is (0, 0), `ALTER DATABASE d SET` is (d, 0),
 /// `ALTER ROLE r SET` is (0, r) and `ALTER ROLE r IN DATABASE d SET` is
 /// (d, r).
-pub(crate) fn synth_pg_db_role_setting(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_db_role_setting_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("setdatabase", DataType::BigInt, false),
         ColumnSchema::new("setrole", DataType::BigInt, false),
         ColumnSchema::new("setconfig", DataType::TextArray, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_db_role_setting(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_db_role_setting_schema();
     let (_, roles) = synth_pg_roles(engine);
     let role_oid = |name: &str| -> i64 {
         roles
@@ -10813,8 +11057,12 @@ pub(crate) fn synth_pg_db_role_setting(engine: &Engine) -> (Vec<ColumnSchema>, V
 /// for sql and plpgsql. The three handler oids are 0 — those functions
 /// are not catalogued here, the same reasoning round 543 applied to
 /// pg_type's typinput.
-pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_language_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("lanname", DataType::Text, false),
         ColumnSchema::new("lanowner", DataType::BigInt, false),
@@ -10824,7 +11072,11 @@ pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("laninline", DataType::BigInt, false),
         ColumnSchema::new("lanvalidator", DataType::BigInt, false),
         ColumnSchema::new("lanacl", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_language() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_language_schema();
     let row = |oid: i64, name: &'static str, ispl: bool, trusted: bool| {
         Row::new(alloc::vec![
             Value::BigInt(oid),
@@ -10907,8 +11159,12 @@ pub(crate) fn synth_pg_sequences(
 /// The three function columns and rngsubopc read 0: SPG has no
 /// pg_operator / pg_opclass to name, and no multirange types, which is
 /// what rngmultitypid would point at.
-pub(crate) fn synth_pg_range() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_range_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("rngtypid", DataType::BigInt, false),
         ColumnSchema::new("rngsubtype", DataType::BigInt, false),
         ColumnSchema::new("rngmultitypid", DataType::BigInt, false),
@@ -10916,7 +11172,11 @@ pub(crate) fn synth_pg_range() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
         ColumnSchema::new("rngsubopc", DataType::BigInt, false),
         ColumnSchema::new("rngcanonical", DataType::BigInt, false),
         ColumnSchema::new("rngsubdiff", DataType::BigInt, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_range() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_range_schema();
     // (range oid, subtype oid) — PG's own numbers, the ones pg_type
     // already publishes here.
     const RANGES: &[(i64, i64)] = &[
@@ -10950,9 +11210,10 @@ pub(crate) fn synth_pg_range() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 /// SPG has declarative partitioning, so this is real. partstrat is
 /// PG's single char — 'r' range, 'l' list, 'h' hash — and partattrs is
 /// the int2vector of key positions, 1-based as PG's attnums are.
-pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    use spg_storage::{PartitionKind, PartitionRole};
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows.
+pub(crate) fn pg_partitioned_table_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("partrelid", DataType::BigInt, false),
         ColumnSchema::new("partstrat", DataType::Text, false),
         ColumnSchema::new("partnatts", DataType::SmallInt, false),
@@ -10961,7 +11222,12 @@ pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, V
         ColumnSchema::new("partclass", DataType::BigIntArray, false),
         ColumnSchema::new("partcollation", DataType::Text, false),
         ColumnSchema::new("partexprs", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_partitioned_table(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    use spg_storage::{PartitionKind, PartitionRole};
+    let schema = pg_partitioned_table_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
@@ -11218,12 +11484,20 @@ pub(crate) fn synth_pg_cast() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
 /// what PG reports on a database that has none. A catalog that exists
 /// and is empty and a catalog that does not exist are different things
 /// to a tool: the second stops it.
-pub(crate) fn synth_pg_foreign_table() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_foreign_table_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("ftrelid", DataType::BigInt, false),
         ColumnSchema::new("ftserver", DataType::BigInt, false),
         ColumnSchema::new("ftoptions", DataType::TextArray, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_foreign_table() -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_foreign_table_schema();
     (schema, Vec::new())
 }
 
@@ -11803,8 +12077,12 @@ pub(crate) fn render_rule_def(
 /// v7.39 (round 312, V33) — `pg_catalog.pg_rewrite`. The rule catalogue
 /// itself, which `pg_get_ruledef(oid)` resolves against; without it there
 /// was no way to reach a rule by oid at all.
-pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_rewrite_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
         ColumnSchema::new("rulename", DataType::Text, false),
         ColumnSchema::new("ev_class", DataType::BigInt, false),
@@ -11813,7 +12091,11 @@ pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
         ColumnSchema::new("is_instead", DataType::Bool, false),
         ColumnSchema::new("ev_qual", DataType::Text, true),
         ColumnSchema::new("ev_action", DataType::Text, true),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_rewrite(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_rewrite_schema();
     // `ev_class` has to be the SAME oid pg_class / pg_constraint hand out
     // for that table, or a join against them silently returns nothing.
     let mut names: Vec<String> = cat.visible_table_names();
@@ -12289,13 +12571,21 @@ pub(crate) fn canonical_gucs() -> &'static [(
 ///
 /// The offsets are taken at NOW, exactly as PG does: a zone's offset and
 /// DST flag depend on the instant, and PG reports the current one.
-pub(crate) fn synth_pg_timezone_names(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_timezone_names_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("name", DataType::Text, false),
         ColumnSchema::new("abbrev", DataType::Text, false),
         ColumnSchema::new("utc_offset", DataType::Interval, false),
         ColumnSchema::new("is_dst", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_timezone_names(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_timezone_names_schema();
     // The clock is the engine's, so a test that froze it sees a stable
     // view; without one, epoch — the offsets barely move either way.
     let now = engine.clock.map_or(0, |f| f());
@@ -12323,12 +12613,20 @@ pub(crate) fn synth_pg_timezone_names(engine: &Engine) -> (Vec<ColumnSchema>, Ve
 /// keyed by designation. PG lists each abbreviation once; zones sharing
 /// one (every US Eastern zone reports `EST`) collapse, so this dedups on
 /// the abbreviation and keeps the first offset seen in name order.
-pub(crate) fn synth_pg_timezone_abbrevs(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let schema = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows. The rows and the
+/// columns come from one place, so `pg_attribute` cannot describe
+/// a relation differently from how it answers.
+pub(crate) fn pg_timezone_abbrevs_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("abbrev", DataType::Text, false),
         ColumnSchema::new("utc_offset", DataType::Interval, false),
         ColumnSchema::new("is_dst", DataType::Bool, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_timezone_abbrevs(engine: &Engine) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let schema = pg_timezone_abbrevs_schema();
     // The clock is the engine's, so a test that froze it sees a stable
     // view; without one, epoch — the offsets barely move either way.
     let now = engine.clock.map_or(0, |f| f());
@@ -12746,7 +13044,32 @@ pub(crate) fn synth_info_column_privileges(
     let mut rows: Vec<Row<'static>> = Vec::new();
     for tname in cat.visible_table_names() {
         let Some(t) = cat.get(&tname) else { continue };
+        // 9.0.0 (N23) — the OWNER's implicit column privileges, which
+        // PostgreSQL lists here and this did not: it reported explicit
+        // column GRANTs alone, so an un-granted database answered zero
+        // rows where PG 18.6 answers one per (column, privilege). The
+        // four are the ones PG's column-level set has — measured:
+        // INSERT, REFERENCES, SELECT, UPDATE.
+        let owner = t
+            .schema()
+            .owner
+            .clone()
+            .unwrap_or_else(|| alloc::string::String::from(crate::session::LOGIN_ROLE));
         for col in &t.schema().columns {
+            if col.acl.is_empty() {
+                for priv_word in ["INSERT", "REFERENCES", "SELECT", "UPDATE"] {
+                    rows.push(Row::new(alloc::vec![
+                        Value::text(owner.clone()),
+                        Value::text(owner.clone()),
+                        Value::text(alloc::string::String::from("app")),
+                        Value::text(alloc::string::String::from("public")),
+                        Value::text(tname.clone()),
+                        Value::text(col.name.clone()),
+                        Value::text(alloc::string::String::from(priv_word)),
+                        Value::text(alloc::string::String::from("YES")),
+                    ]));
+                }
+            }
             for a in &col.acl {
                 for bit in crate::acl::priv_iter(a.privs & !spg_storage::priv_bits::MAINTAIN) {
                     rows.push(Row::new(alloc::vec![
@@ -12774,13 +13097,19 @@ pub(crate) fn synth_info_column_privileges(
     (cols, rows)
 }
 
-pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
-    let cols = alloc::vec![
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without building its rows.
+pub(crate) fn pg_description_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
         ColumnSchema::new("objoid", DataType::Int, false),
         ColumnSchema::new("classoid", DataType::Int, false),
         ColumnSchema::new("objsubid", DataType::Int, false),
         ColumnSchema::new("description", DataType::Text, false),
-    ];
+    ]
+}
+
+pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
+    let cols = pg_description_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
     for (key, text) in cat.comments() {
         let Some((kind, name)) = key.split_once(':') else {
@@ -13813,154 +14142,14 @@ fn apply_information_schema_domains(view: &str, columns: &mut [ColumnSchema]) {
     }
 }
 
-/// v7.39 (round 540) — the oid a catalog relation reports as its
-/// `tableoid`. The synthetic name is the internal one (`__spg_pg_class`);
-/// PG's oid for the relation it stands for is what a caller expects.
-/// v7.39 (round 623, S05b) — the catalogs SPG publishes, and the oid PG
-/// gives each one.
+/// 9.0.0 (N19) — the ONE list, from `spg_sql::catalog_registry`.
 ///
-/// SPG's catalogs did not describe THEMSELVES. `SELECT count(*) FROM
-/// pg_class WHERE relname = 'pg_class'` answered 0 where PG answers 1, and
-/// `pg_attribute` had 2584 rows' worth of PG catalog columns and none of
-/// SPG's — so "what columns does pg_class have", which is how a tool learns
-/// what it may select, came back empty.
-///
-/// The oids are PG's own, read off PG18 (`pg_class.oid` for each name).
-/// They are a contract, not an implementation detail: `'pg_type'::regclass`
-/// answering 1247 is something any client can observe, and a stable catalog
-/// oid is what makes a cached lookup keep working. Only the relkind 'r'
-/// catalogs are listed — PG's `pg_stat_*` / `pg_tables` / `pg_policies` are
-/// VIEWS created by initdb, and their oids sit in the 12000s and vary by
-/// build, so there is nothing there to match.
-/// 8.0.3 — `pg_class.oid` of every PG 18.6 system catalog, measured with
-/// `SELECT relname, oid FROM pg_class WHERE relnamespace = 11 AND relkind = 'r'`.
-const PG_CATALOG_TABLE_OIDS: &[(&str, i64)] = &[
-    ("pg_aggregate", 2600),
-    ("pg_am", 2601),
-    ("pg_amop", 2602),
-    ("pg_amproc", 2603),
-    ("pg_attrdef", 2604),
-    ("pg_attribute", 1249),
-    ("pg_auth_members", 1261),
-    ("pg_authid", 1260),
-    ("pg_cast", 2605),
-    ("pg_class", 1259),
-    ("pg_collation", 3456),
-    ("pg_constraint", 2606),
-    ("pg_conversion", 2607),
-    ("pg_database", 1262),
-    ("pg_db_role_setting", 2964),
-    ("pg_default_acl", 826),
-    ("pg_depend", 2608),
-    ("pg_description", 2609),
-    ("pg_enum", 3501),
-    ("pg_event_trigger", 3466),
-    ("pg_extension", 3079),
-    ("pg_foreign_data_wrapper", 2328),
-    ("pg_foreign_server", 1417),
-    ("pg_foreign_table", 3118),
-    ("pg_index", 2610),
-    ("pg_inherits", 2611),
-    ("pg_init_privs", 3394),
-    ("pg_language", 2612),
-    ("pg_largeobject", 2613),
-    ("pg_largeobject_metadata", 2995),
-    ("pg_namespace", 2615),
-    ("pg_opclass", 2616),
-    ("pg_operator", 2617),
-    ("pg_opfamily", 2753),
-    ("pg_parameter_acl", 6243),
-    ("pg_partitioned_table", 3350),
-    ("pg_policy", 3256),
-    ("pg_proc", 1255),
-    ("pg_publication", 6104),
-    ("pg_publication_namespace", 6237),
-    ("pg_publication_rel", 6106),
-    ("pg_range", 3541),
-    ("pg_replication_origin", 6000),
-    ("pg_rewrite", 2618),
-    ("pg_seclabel", 3596),
-    ("pg_sequence", 2224),
-    ("pg_shdepend", 1214),
-    ("pg_shdescription", 2396),
-    ("pg_shseclabel", 3592),
-    ("pg_statistic", 2619),
-    ("pg_statistic_ext", 3381),
-    ("pg_statistic_ext_data", 3429),
-    ("pg_subscription", 6100),
-    ("pg_subscription_rel", 6102),
-    ("pg_tablespace", 1213),
-    ("pg_transform", 3576),
-    ("pg_trigger", 2620),
-    ("pg_ts_config", 3602),
-    ("pg_ts_config_map", 3603),
-    ("pg_ts_dict", 3600),
-    ("pg_ts_parser", 3601),
-    ("pg_ts_template", 3764),
-    ("pg_type", 1247),
-    ("pg_user_mapping", 1418),
-];
-
-/// 9.0.0 — and each one's `relkind`.
-///
-/// `pg_stats` is a VIEW on PostgreSQL 18.6 and was reported `r` here.
-/// Ten more catalog relations SPG ANSWERS queries for — `pg_views`,
-/// `pg_tables`, `pg_indexes`, `pg_matviews`, `pg_sequences`,
-/// `pg_settings`, `pg_roles`, `pg_user`, `pg_prepared_statements`,
-/// `pg_rules` — were in no catalog at all: `pg_class` had no row, so
-/// `information_schema` could not list them and a reflection tool
-/// asking what the database holds was told they do not exist. Their
-/// oids are PostgreSQL 18.6's.
-pub(crate) const CATALOG_RELATIONS: &[(&str, i64, &str)] = &[
-    ("pg_am", 2601, "r"),
-    ("pg_amop", 2602, "r"),
-    ("pg_amproc", 2603, "r"),
-    ("pg_attrdef", 2604, "r"),
-    ("pg_attribute", 1249, "r"),
-    ("pg_cast", 2605, "r"),
-    ("pg_class", 1259, "r"),
-    ("pg_collation", 3456, "r"),
-    ("pg_constraint", 2606, "r"),
-    ("pg_depend", 2608, "r"),
-    ("pg_enum", 3501, "r"),
-    ("pg_extension", 3079, "r"),
-    ("pg_index", 2610, "r"),
-    ("pg_inherits", 2611, "r"),
-    ("pg_ts_config", 3602, "r"),
-    ("pg_ts_config_map", 3603, "r"),
-    ("pg_ts_dict", 3600, "r"),
-    ("pg_ts_parser", 3601, "r"),
-    ("pg_ts_template", 3764, "r"),
-    ("pg_largeobject", 2613, "r"),
-    ("pg_largeobject_metadata", 2995, "r"),
-    ("pg_namespace", 2615, "r"),
-    ("pg_opclass", 2616, "r"),
-    ("pg_opfamily", 2753, "r"),
-    ("pg_operator", 2617, "r"),
-    ("pg_policy", 3256, "r"),
-    ("pg_proc", 1255, "r"),
-    ("pg_statistic", 2619, "r"),
-    // v7.38.18 — the readable view over `pg_statistic`, and the one a
-    // person actually types. OID from a PG 18.4 catalog.
-    ("pg_stats", 12053, "v"),
-    ("pg_statistic_ext", 3381, "r"),
-    ("pg_tablespace", 1213, "r"),
-    ("pg_trigger", 2620, "r"),
-    ("pg_type", 1247, "r"),
-    // 9.0.0 — the catalog VIEWS, which answered queries and appeared
-    // nowhere. `pg_locks` is not here: it is built by its own `exec_`
-    // and publishes no schema this file can read.
-    ("pg_views", 12028, "v"),
-    ("pg_tables", 12033, "v"),
-    ("pg_indexes", 12043, "v"),
-    ("pg_matviews", 12038, "v"),
-    ("pg_sequences", 12048, "v"),
-    ("pg_settings", 12104, "v"),
-    ("pg_roles", 12000, "v"),
-    ("pg_user", 12014, "v"),
-    ("pg_prepared_statements", 12095, "v"),
-    ("pg_rules", 12023, "v"),
-];
+/// This was a 43-name copy beside the parser's 107-name gate, and the
+/// difference was observable: 64 names answered a query and had no
+/// `pg_class` row. `SELECT count(*) FROM pg_database` answered 1 while
+/// `SELECT count(*) FROM pg_class WHERE relname = 'pg_database'`
+/// answered 0; PostgreSQL 18.6 answers 7 and 1.
+pub(crate) use spg_sql::catalog_registry::CATALOG_RELATIONS;
 
 /// The columns one of those relations has.
 ///
@@ -14047,7 +14236,52 @@ fn catalog_relation_columns(name: &str, cat: &Catalog) -> Option<Vec<ColumnSchem
         "pg_user" => pg_user_schema(),
         "pg_settings" => pg_settings_schema(),
         "pg_prepared_statements" => pg_prepared_statements_schema(),
-        _ => return None,
+        "pg_auth_members" => pg_auth_members_schema(),
+        "pg_authid" => pg_authid_schema(),
+        "pg_database" => pg_database_schema(),
+        "pg_db_role_setting" => pg_db_role_setting_schema(),
+        "pg_description" => pg_description_schema(),
+        "pg_foreign_table" => pg_foreign_table_schema(),
+        "pg_group" => pg_group_schema(),
+        "pg_language" => pg_language_schema(),
+        "pg_locks" => crate::spg_admin::pg_locks_schema(),
+        "pg_partitioned_table" => pg_partitioned_table_schema(),
+        "pg_policies" => pg_policies_schema(),
+        "pg_publication" => pg_publication_schema(),
+        "pg_range" => pg_range_schema(),
+        "pg_replication_slots" => pg_replication_slots_schema(),
+        "pg_rewrite" => pg_rewrite_schema(),
+        "pg_sequence" => pg_sequence_schema(),
+        // `pg_shadow` is `pg_user`'s shape, as PostgreSQL defines it.
+        "pg_shadow" => pg_user_schema(),
+        "pg_stat_activity" => crate::spg_admin::pg_stat_activity_schema(),
+        "pg_stat_archiver" => pg_stat_archiver_schema(),
+        "pg_stat_bgwriter" => pg_stat_bgwriter_schema(),
+        "pg_stat_checkpointer" => pg_stat_checkpointer_schema(),
+        "pg_stat_database" => pg_stat_database_schema(),
+        "pg_stat_io" => pg_stat_io_schema(),
+        "pg_stat_progress_analyze" => pg_stat_progress_analyze_schema(),
+        "pg_stat_progress_create_index" => pg_stat_progress_create_index_schema(),
+        "pg_stat_progress_vacuum" => pg_stat_progress_vacuum_schema(),
+        "pg_stat_replication" => pg_stat_replication_schema(),
+        "pg_stat_slru" => pg_stat_slru_schema(),
+        "pg_stat_subscription_stats" => pg_stat_subscription_stats_schema(),
+        "pg_stat_user_functions" => pg_stat_user_functions_schema(),
+        "pg_stat_user_indexes" => pg_stat_user_indexes_schema(),
+        "pg_stat_user_tables" => pg_stat_user_tables_schema(),
+        "pg_stat_wal" => pg_stat_wal_schema(),
+        "pg_statio_user_tables" => crate::spg_admin::pg_statio_user_tables_schema(),
+        "pg_subscription" => pg_subscription_schema(),
+        "pg_timezone_abbrevs" => pg_timezone_abbrevs_schema(),
+        "pg_timezone_names" => pg_timezone_names_schema(),
+        // 9.0.0 (N19) — the catalogs SPG is genuinely empty of carry
+        // their columns in `EMPTY_PG_CATALOGS`, and those columns were
+        // reaching the query path and not `pg_attribute`: the relation
+        // was published and not self-described.
+        other => match synth_empty_pg_catalog(&alloc::format!("__spg_{other}")) {
+            Some((cols, _)) => cols,
+            None => return None,
+        },
     })
 }
 
@@ -14069,10 +14303,10 @@ fn relation_oid_for_meta_view(name: &str) -> i64 {
     // `pg_dump`, which identifies each catalog object by
     // `(tableoid, oid)`, could not match a dependency to the object it was
     // about: a serial column's default went inline, ahead of its sequence.
-    PG_CATALOG_TABLE_OIDS
-        .iter()
-        .find(|(n, _)| *n == bare.as_str())
-        .map_or(0, |(_, oid)| *oid)
+    // 9.0.0 (N19) — the ONE list. This was a 64-name copy of it, and a
+    // catalog present in one and absent from the other reported
+    // `tableoid` 0.
+    spg_sql::catalog_registry::catalog_relation_oid(&bare).unwrap_or(0)
 }
 
 pub(crate) fn materialise_meta_view(

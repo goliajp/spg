@@ -390,30 +390,7 @@ impl Engine {
     /// columns, with the fields SPG doesn't track surfaced as NULL and
     /// `state` derived from the in-transaction / running-query flags.
     pub(crate) fn exec_pg_stat_activity(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("datid", DataType::BigInt, true),
-            ColumnSchema::new("datname", DataType::Text, true),
-            ColumnSchema::new("pid", DataType::Int, false),
-            ColumnSchema::new("leader_pid", DataType::Int, true),
-            ColumnSchema::new("usesysid", DataType::BigInt, true),
-            ColumnSchema::new("usename", DataType::Text, true),
-            ColumnSchema::new("application_name", DataType::Text, false),
-            ColumnSchema::new("client_addr", DataType::Text, true),
-            ColumnSchema::new("client_hostname", DataType::Text, true),
-            ColumnSchema::new("client_port", DataType::Int, true),
-            ColumnSchema::new("backend_start", DataType::Timestamptz, true),
-            ColumnSchema::new("xact_start", DataType::Timestamptz, true),
-            ColumnSchema::new("query_start", DataType::Timestamptz, true),
-            ColumnSchema::new("state_change", DataType::Timestamptz, true),
-            ColumnSchema::new("wait_event_type", DataType::Text, true),
-            ColumnSchema::new("wait_event", DataType::Text, true),
-            ColumnSchema::new("state", DataType::Text, true),
-            ColumnSchema::new("backend_xid", DataType::BigInt, true),
-            ColumnSchema::new("backend_xmin", DataType::BigInt, true),
-            ColumnSchema::new("query_id", DataType::BigInt, true),
-            ColumnSchema::new("query", DataType::Text, false),
-            ColumnSchema::new("backend_type", DataType::Text, false),
-        ];
+        let columns = pg_stat_activity_schema();
         let rows: Vec<Row<'static>> = self
             .activity_provider
             .map(|f| f())
@@ -810,19 +787,7 @@ impl Engine {
     ///   tidx_blks_read BIGINT NOT NULL  -- 0
     ///   tidx_blks_hit BIGINT NOT NULL   -- 0
     pub(crate) fn exec_pg_statio_user_tables(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("relid", DataType::BigInt, false),
-            ColumnSchema::new("schemaname", DataType::Text, false),
-            ColumnSchema::new("relname", DataType::Text, false),
-            ColumnSchema::new("heap_blks_read", DataType::BigInt, false),
-            ColumnSchema::new("heap_blks_hit", DataType::BigInt, false),
-            ColumnSchema::new("idx_blks_read", DataType::BigInt, false),
-            ColumnSchema::new("idx_blks_hit", DataType::BigInt, false),
-            ColumnSchema::new("toast_blks_read", DataType::BigInt, false),
-            ColumnSchema::new("toast_blks_hit", DataType::BigInt, false),
-            ColumnSchema::new("tidx_blks_read", DataType::BigInt, false),
-            ColumnSchema::new("tidx_blks_hit", DataType::BigInt, false),
-        ];
+        let columns = pg_statio_user_tables_schema();
         let mut rows: Vec<Row<'static>> = Vec::new();
         let mut relid: i64 = 16384; // PG starts user-relation OIDs above 16384
         for name in self.catalog.table_names() {
@@ -863,17 +828,7 @@ impl Engine {
     /// adopters can already write monitoring queries / dashboards
     /// against the stable column set.
     pub(crate) fn exec_pg_locks(&self) -> QueryResult {
-        let columns = alloc::vec![
-            ColumnSchema::new("locktype", DataType::Text, false),
-            ColumnSchema::new("database", DataType::Text, false),
-            ColumnSchema::new("relation", DataType::Text, false),
-            ColumnSchema::new("virtualtransaction", DataType::Text, false),
-            ColumnSchema::new("pid", DataType::Int, false),
-            ColumnSchema::new("mode", DataType::Text, false),
-            ColumnSchema::new("granted", DataType::Bool, false),
-            ColumnSchema::new("fastpath", DataType::Bool, false),
-            ColumnSchema::new("waitstart_us", DataType::BigInt, false),
-        ];
+        let columns = pg_locks_schema();
         // Empty row set until v7.37.15. Documented as the stable
         // SQL surface — the row content fills in once tuple locks
         // exist (B2.5 in AUDIT-3-categories).
@@ -1317,3 +1272,68 @@ impl Engine {
 /// same read-only diagnostic model as the Step-VM counters).
 pub static AUTOVACUUM_FIRE_COUNT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// 9.0.0 (N19) — `pg_locks`'s shape, so the catalog can list its
+/// columns without running the view. It was a static vec inside
+/// `exec_pg_locks`, which is why `pg_locks` answered a query and had
+/// no `pg_attribute` rows.
+pub(crate) fn pg_locks_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
+        ColumnSchema::new("locktype", DataType::Text, false),
+        ColumnSchema::new("database", DataType::Text, false),
+        ColumnSchema::new("relation", DataType::Text, false),
+        ColumnSchema::new("virtualtransaction", DataType::Text, false),
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("mode", DataType::Text, false),
+        ColumnSchema::new("granted", DataType::Bool, false),
+        ColumnSchema::new("fastpath", DataType::Bool, false),
+        ColumnSchema::new("waitstart_us", DataType::BigInt, false),
+    ]
+}
+
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without running the view.
+pub(crate) fn pg_stat_activity_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
+        ColumnSchema::new("datid", DataType::BigInt, true),
+        ColumnSchema::new("datname", DataType::Text, true),
+        ColumnSchema::new("pid", DataType::Int, false),
+        ColumnSchema::new("leader_pid", DataType::Int, true),
+        ColumnSchema::new("usesysid", DataType::BigInt, true),
+        ColumnSchema::new("usename", DataType::Text, true),
+        ColumnSchema::new("application_name", DataType::Text, false),
+        ColumnSchema::new("client_addr", DataType::Text, true),
+        ColumnSchema::new("client_hostname", DataType::Text, true),
+        ColumnSchema::new("client_port", DataType::Int, true),
+        ColumnSchema::new("backend_start", DataType::Timestamptz, true),
+        ColumnSchema::new("xact_start", DataType::Timestamptz, true),
+        ColumnSchema::new("query_start", DataType::Timestamptz, true),
+        ColumnSchema::new("state_change", DataType::Timestamptz, true),
+        ColumnSchema::new("wait_event_type", DataType::Text, true),
+        ColumnSchema::new("wait_event", DataType::Text, true),
+        ColumnSchema::new("state", DataType::Text, true),
+        ColumnSchema::new("backend_xid", DataType::BigInt, true),
+        ColumnSchema::new("backend_xmin", DataType::BigInt, true),
+        ColumnSchema::new("query_id", DataType::BigInt, true),
+        ColumnSchema::new("query", DataType::Text, false),
+        ColumnSchema::new("backend_type", DataType::Text, false),
+    ]
+}
+
+/// 9.0.0 (N19) — the shape alone, so the catalog can list this
+/// relation's columns without running the view.
+pub(crate) fn pg_statio_user_tables_schema() -> Vec<ColumnSchema> {
+    alloc::vec![
+        ColumnSchema::new("relid", DataType::BigInt, false),
+        ColumnSchema::new("schemaname", DataType::Text, false),
+        ColumnSchema::new("relname", DataType::Text, false),
+        ColumnSchema::new("heap_blks_read", DataType::BigInt, false),
+        ColumnSchema::new("heap_blks_hit", DataType::BigInt, false),
+        ColumnSchema::new("idx_blks_read", DataType::BigInt, false),
+        ColumnSchema::new("idx_blks_hit", DataType::BigInt, false),
+        ColumnSchema::new("toast_blks_read", DataType::BigInt, false),
+        ColumnSchema::new("toast_blks_hit", DataType::BigInt, false),
+        ColumnSchema::new("tidx_blks_read", DataType::BigInt, false),
+        ColumnSchema::new("tidx_blks_hit", DataType::BigInt, false),
+    ]
+}

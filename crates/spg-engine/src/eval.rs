@@ -1774,33 +1774,10 @@ pub(crate) fn regclass_name_to_oid(cat: &spg_storage::Catalog, bare: &str) -> Op
     if let Some(oid) = crate::system_catalog::relation_oid(cat, bare) {
         return Some(oid);
     }
-    Some(match bare {
-        "pg_type" => 1247,
-        "pg_attribute" => 1249,
-        "pg_proc" => 1255,
-        "pg_class" => 1259,
-        "pg_database" => 1262,
-        "pg_constraint" => 2606,
-        "pg_index" => 2610,
-        "pg_namespace" => 2615,
-        // v7.39 (round 650) — the text-search catalogs. This list is a
-        // hand-kept subset of `CATALOG_RELATIONS`, which is why adding a
-        // catalog there was not enough for `'pg_ts_config'::regclass`.
-        "pg_ts_config" => 3602,
-        "pg_ts_config_map" => 3603,
-        "pg_ts_dict" => 3600,
-        "pg_ts_parser" => 3601,
-        "pg_ts_template" => 3764,
-        // 7.38.1 S5.1 — stop hand-copying: anything CATALOG_RELATIONS
-        // publishes resolves here too (pg_dump's dependency pass casts
-        // 'pg_extension' / 'pg_amop' / 'pg_opfamily'::regclass).
-        other => {
-            return crate::system_catalog::CATALOG_RELATIONS
-                .iter()
-                .find(|(n, _, _)| other.eq_ignore_ascii_case(n))
-                .map(|(_, oid, _)| *oid);
-        }
-    })
+    // 9.0.0 (N19) — the ONE list. Thirteen of these names were spelled
+    // out here as well, which is why adding a catalog to the table was
+    // twice not enough for `::regclass` to resolve it.
+    spg_sql::catalog_registry::catalog_relation_oid(bare)
 }
 
 /// v7.39 (round 263) — crate-visible wrapper so the write path can

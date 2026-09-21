@@ -1518,7 +1518,10 @@ impl Engine {
                 // and .table_privileges. Both report the owner's seven implicit
                 // table privileges; SPG's single role owns everything.
                 // v7.39 (read01 round 59) — information_schema.column_privileges.
-                "__spg_info_column_privileges" => {
+                // 9.0.0 (N23) — `role_column_grants` is the same set
+                // seen from the grantee's side; PostgreSQL derives it
+                // from `column_privileges` and so does this.
+                "__spg_info_column_privileges" | "__spg_info_role_column_grants" => {
                     let (schema, rows) =
                         crate::system_catalog::synth_info_column_privileges(self.active_catalog());
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
@@ -1624,6 +1627,53 @@ impl Engine {
                 }
                 "__spg_mysql_db" => {
                     let (schema, rows) = synth_mysql_db();
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // 9.0.0 (N23) — `information_schema`, the 52 relations
+                // that answered `not yet materialisable`. The ones SPG
+                // is genuinely empty of get the right columns and no
+                // rows (which is what PostgreSQL answers for them too),
+                // and the ones whose content is FIXED — the SQL
+                // standard's feature and sizing tables — get PG 18.6's
+                // own rows.
+                other if crate::info_schema::synth_empty_info_schema(other).is_some() => {
+                    let (schema, rows) =
+                        crate::info_schema::synth_empty_info_schema(other).expect("just checked");
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                other
+                    if crate::info_schema::synth_static_info_schema(
+                        other,
+                        self.session_param("spg.database").unwrap_or("spg"),
+                    )
+                    .is_some() =>
+                {
+                    let (schema, rows) = crate::info_schema::synth_static_info_schema(
+                        other,
+                        self.session_param("spg.database").unwrap_or("spg"),
+                    )
+                    .expect("just checked");
+                    materialise_meta_view(&mut catalog, view, schema, rows)?;
+                }
+                // 9.0.0 (N23) — the ones derived from the catalog SPG
+                // already has: its collations, roles, domains and
+                // columns.
+                other
+                    if crate::info_schema::synth_derived_info_schema(
+                        other,
+                        self.active_catalog(),
+                        self.session_param("spg.database").unwrap_or("spg"),
+                        &enabled_role_names(self),
+                    )
+                    .is_some() =>
+                {
+                    let (schema, rows) = crate::info_schema::synth_derived_info_schema(
+                        other,
+                        self.active_catalog(),
+                        self.session_param("spg.database").unwrap_or("spg"),
+                        &enabled_role_names(self),
+                    )
+                    .expect("just checked");
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }
                 // v7.39 (round 541) — the catalogs PG has that SPG is
@@ -15952,6 +16002,20 @@ fn collect_literal_coercions(
         },
         &mut |_| Ok(()),
     );
+}
+
+/// 9.0.0 (N23) — the roles `information_schema.enabled_roles` lists.
+///
+/// PostgreSQL lists the current role and everything it inherits. SPG
+/// records no role membership, so every role the directory knows is
+/// enabled — the same set `pg_roles` answers from, which is what keeps
+/// the two surfaces from disagreeing.
+fn enabled_role_names(engine: &Engine) -> Vec<alloc::string::String> {
+    crate::role_directory::RoleDirectory::of(engine)
+        .entries()
+        .iter()
+        .map(|e| e.name.clone())
+        .collect()
 }
 
 /// [`Engine::validate_oid_comparisons`].

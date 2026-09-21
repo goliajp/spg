@@ -174,11 +174,22 @@ fn round623_pg_attribute_describes_the_catalogs() {
         // `pg_matviews`, `pg_sequences`, `pg_settings`, `pg_roles`,
         // `pg_user`, `pg_prepared_statements`, `pg_rules`). Each
         // answered queries and appeared in no catalog, so this count
-        // could not see them. PostgreSQL 18.6 answers 268 to the same
-        // query: SPG publishes a subset of the catalogs and always has,
-        // and what this pin holds is that every one it DOES publish is
-        // self-described.
-        vec!["43"]
+        // could not see them.
+        //
+        // 9.0.0 (N19) — 43 to 110, and the reason the number moves so
+        // far is the reason the pin exists. The set of relations SPG
+        // answers for was written in six places; the parser's gate held
+        // 107 names and the `pg_class` builder 43, so **64 relations
+        // answered a query and had no `pg_class` row**. They all have
+        // one now, and — this pin's own subject — every one of them
+        // describes its own columns, which took extracting each
+        // relation's shape out of the function that builds its rows so
+        // the two cannot disagree.
+        //
+        // PostgreSQL 18.6 answers 268 to the same query: SPG publishes
+        // a subset of the catalogs and always has, and what this pin
+        // holds is that every one it DOES publish is self-described.
+        vec!["110"]
     );
 }
 
