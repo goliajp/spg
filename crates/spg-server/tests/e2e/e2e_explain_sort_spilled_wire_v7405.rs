@@ -294,10 +294,25 @@ fn a_nested_sort_reports_the_rows_it_passed_through() {
     );
 }
 
-/// And NOT under a LIMIT, where a top-N sort emits fewer rows than it
-/// reads and the count in reach is the one it did not emit.
+/// And UNDER a LIMIT, where this used to say the count was not in reach.
+///
+/// 9.0.0 — it is, and it is the one PostgreSQL prints. The reasoning
+/// here was that a top-N sort reads 40,000 and emits 5, so neither
+/// number belongs on the line without instrumentation. PostgreSQL
+/// settles which one belongs: `actual rows` is what a node EMITTED, and
+/// what this sort emitted is what the Limit took — a number the Limit
+/// node has already counted. Measured on PG 18.6 over the same shape
+/// (40,000 rows, `ORDER BY … LIMIT 5`):
+///
+/// ```text
+///   Limit  (cost=1398.39..1398.40 rows=5 width=35) (actual rows=5.00 loops=1)
+///     ->  Sort  (cost=1398.39..1498.39 rows=40000 width=35) (actual rows=5.00 loops=1)
+///           Sort Key: pad, id
+///           Sort Method: top-N heapsort  Memory: 25kB
+///           ->  Seq Scan on tn  (actual rows=40000.00 loops=1)
+/// ```
 #[test]
-fn a_top_n_sort_is_left_un_annotated_rather_than_wrong() {
+fn a_top_n_sort_reports_the_rows_the_limit_took() {
     let (raw, mut s) = seeded();
     let _guard = common::ChildGuard(raw);
     let plan = rows(&mut s, "EXPLAIN ANALYZE SELECT t FROM s ORDER BY t LIMIT 5");
@@ -306,8 +321,13 @@ fn a_top_n_sort_is_left_un_annotated_rather_than_wrong() {
         .find(|l| l.trim_start().starts_with("->  Sort"))
         .unwrap_or_else(|| panic!("no Sort node in {plan:?}"));
     assert!(
-        !sort.contains("actual rows="),
-        "40,000 read and 5 emitted — neither number belongs on that line \
-         without instrumentation: {sort}"
+        sort.contains("actual rows=5") && sort.contains("loops=1"),
+        "the sort emitted what the Limit took: {sort}"
+    );
+    // And not the count it READ, which is the number that does not
+    // belong there.
+    assert!(
+        !sort.contains("actual rows=40000"),
+        "that is the scan's count, not the sort's: {sort}"
     );
 }

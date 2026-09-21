@@ -5254,6 +5254,12 @@ pub struct FromJoin {
     /// USING column-merge, and clears the flag. If there are no common
     /// columns PG treats it as a CROSS join.
     pub natural: bool,
+    /// 9.0.0 — this relation was written after a COMMA, not after a JOIN
+    /// keyword. The two mean the same thing to the executor, and
+    /// PostgreSQL's deparse spells them differently (`FROM a,\n    b`
+    /// against `FROM (a\n     CROSS JOIN b)`), so a view's definition
+    /// came back in the other spelling.
+    pub comma: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9223,6 +9229,20 @@ impl fmt::Display for FromClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.primary)?;
         for j in &self.joins {
+            // 9.0.0 — three spellings this used to flatten. A view's
+            // body is STORED as this rendering (`body_repr` in
+            // `exec_create_view`), so whatever it drops is gone from
+            // the definition the catalog reports: `FROM a, b` came back
+            // as `CROSS JOIN`, `JOIN … USING (id)` as an ON predicate,
+            // and a NATURAL join as a join with no condition at all —
+            // which is a different query.
+            if j.comma {
+                write!(f, ", {}", j.table)?;
+                continue;
+            }
+            if j.natural {
+                f.write_str(" NATURAL")?;
+            }
             match j.kind {
                 JoinKind::Inner => write!(f, " INNER JOIN {}", j.table)?,
                 JoinKind::Left => write!(f, " LEFT JOIN {}", j.table)?,
@@ -9230,6 +9250,11 @@ impl fmt::Display for FromClause {
                 JoinKind::Right => write!(f, " RIGHT JOIN {}", j.table)?,
                 JoinKind::FullOuter => write!(f, " FULL OUTER JOIN {}", j.table)?,
                 JoinKind::Semi => write!(f, " SEMI JOIN {}", j.table)?,
+            }
+            if let Some(cols) = &j.using_cols {
+                let names: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+                write!(f, " USING ({})", names.join(", "))?;
+                continue;
             }
             if let Some(on) = &j.on {
                 write!(f, " ON {on}")?;

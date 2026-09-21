@@ -6106,6 +6106,14 @@ pub(crate) fn coerce_value(
             }
             if ok { Some(Value::IntArray(out)) } else { None }
         }
+        // 9.0.0 — `oid[]` as a cast TARGET for a value that is already an
+        // array. The text form decoded (see the round-694 arm above), but
+        // `indclass::oid[]` — how `\d` and every schema-diff query joins an
+        // index to `pg_opclass` — answered "cannot cast bigint[] to oid[]".
+        (Value::IntArray(items), DataType::OidArray) => Some(Value::BigIntArray(
+            items.into_iter().map(|o| o.map(i64::from)).collect(),
+        )),
+        (Value::BigIntArray(items), DataType::OidArray) => Some(Value::BigIntArray(items)),
         (Value::IntArray(items), DataType::NumericArray) => Some(Value::NumericArray(
             items
                 .into_iter()

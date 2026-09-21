@@ -2419,6 +2419,7 @@ impl Engine {
             }),
             using_cols: None,
             natural: false,
+            comma: false,
         };
         let repl = ColumnName {
             token: spg_sql::ast::SrcToken::NONE,
@@ -2698,6 +2699,7 @@ impl Engine {
             on: Some(on),
             using_cols: None,
             natural: false,
+            comma: false,
         };
         let repl = ColumnName {
             token: spg_sql::ast::SrcToken::NONE,
@@ -3377,6 +3379,7 @@ impl Engine {
             on: Some(on),
             using_cols: None,
             natural: false,
+            comma: false,
         };
         let residual = if negated {
             // anti-join: pick the FIRST inner key as the IS NULL probe.

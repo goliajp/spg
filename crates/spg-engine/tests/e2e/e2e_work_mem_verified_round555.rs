@@ -159,11 +159,23 @@ fn round555_explain_names_the_sort_method() {
         full.iter().any(|l| l.contains("Sort Method: quicksort")),
         "{full:?}"
     );
-    // No invented Memory figure — SPG does not meter one.
-    assert!(
-        !bounded.iter().any(|l| l.contains("Memory:")),
-        "a number that was not measured is worse than none: {bounded:?}"
-    );
+    // 9.0.0 — and the memory, which IS metered now. The rule this
+    // assertion enforced — a number that was not measured is worse than
+    // none — is unchanged; what changed is that there is a measurement:
+    // the external sorter records its batch's high-water mark and the
+    // in-memory paths count what the sort ends up holding. PG's figure
+    // for the same query is its own tuplesort's accounting and is a
+    // different number; the LINE is what a client reads, and it is
+    // there, with a figure that came from somewhere.
+    let memory_line = bounded
+        .iter()
+        .find(|l| l.contains("Sort Method:"))
+        .unwrap_or_else(|| panic!("{bounded:?}"));
+    let kb: u64 = memory_line
+        .rsplit_once("Memory: ")
+        .and_then(|(_, m)| m.trim().trim_end_matches("kB").parse().ok())
+        .unwrap_or_else(|| panic!("no memory figure: {memory_line}"));
+    assert!(kb > 0, "a sort that held nothing: {memory_line}");
 }
 
 /// work_mem round-trips, and a bad value is still refused as PG refuses it.

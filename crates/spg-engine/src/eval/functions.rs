@@ -201,7 +201,7 @@ fn array_lower_bound(v: &Value) -> i32 {
 }
 
 pub(crate) fn pg_viewdef_render(body: &str, pretty: bool) -> String {
-    pg_viewdef_render_in(body, pretty, None)
+    pg_viewdef_render_in(body, pretty, None, None)
 }
 
 /// 8.0.3 — a body this renderer does not lay out, in the frame PG's
@@ -221,6 +221,7 @@ pub(crate) fn pg_viewdef_render_in(
     body: &str,
     pretty: bool,
     qualify_in: Option<&spg_storage::Catalog>,
+    cat: Option<&spg_storage::Catalog>,
 ) -> String {
     let Ok(spg_sql::ast::Statement::Select(mut stmt)) = spg_sql::parser::parse_statement(body)
     else {
@@ -247,8 +248,19 @@ pub(crate) fn pg_viewdef_render_in(
     let Some(from) = &stmt.from else {
         return viewdef_fallback(body);
     };
+    // 9.0.0 — a join is laid out. It used to send the whole definition
+    // to the fallback, which is the STORED text on one line: `INNER
+    // JOIN`, `AS` aliases and an untyped constant, where PostgreSQL
+    // writes the join tree over several lines and analyses the ON.
+    let join_relations = from.joins.iter().all(|j| {
+        j.table.lateral_subquery.is_none()
+            && j.table.unnest_expr.is_none()
+            && j.table.generate_series_args.is_none()
+            && j.table.jsonb_each_text_arg.is_none()
+            && j.table.table_fn_call.is_none()
+    });
     if !simple
-        || !from.joins.is_empty()
+        || !join_relations
         || from.primary.lateral_subquery.is_some()
         || from.primary.unnest_expr.is_some()
         || from.primary.generate_series_args.is_some()
@@ -258,41 +270,16 @@ pub(crate) fn pg_viewdef_render_in(
     let mut out = String::from(" SELECT ");
     let items: Vec<String> = stmt.items.iter().map(|i| viewdef_item_text(i)).collect();
     out.push_str(&items.join(",\n    "));
-    out.push_str("\n   FROM ");
-    out.push_str(&from.primary.name);
-    if let Some(a) = &from.primary.alias {
-        if *a != from.primary.name {
-            out.push(' ');
-            out.push_str(a);
-        }
-    }
+    out.push_str(&viewdef_from_text(from, cat, qualify_in, pretty));
+    // The columns every relation in the FROM brings, which is what types
+    // a constant in the predicate. A name that two relations share
+    // resolves to the first, which is enough: what is read off it is the
+    // TYPE, and a join whose two sides give one name two types is
+    // ambiguous in the query itself.
+    let cols = viewdef_columns(from, cat);
     if let Some(w) = &stmt.where_ {
         out.push_str("\n  WHERE ");
-        let mut pred = alloc::format!("{w}");
-        if pretty && pred.starts_with('(') && pred.ends_with(')') {
-            // Drop ONE redundant outer layer when it wraps the whole
-            // predicate (balanced check).
-            let inner = &pred[1..pred.len() - 1];
-            let mut depth = 0i32;
-            let mut balanced = true;
-            for c in inner.chars() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth < 0 {
-                            balanced = false;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if balanced && depth == 0 {
-                pred = inner.to_string();
-            }
-        }
-        out.push_str(&pred);
+        out.push_str(&viewdef_predicate_text(w, &cols, qualify_in, pretty));
     }
     // Measured on PG 18.4: `  GROUP BY v`, ` HAVING (count(*) > 1)`,
     // `  ORDER BY id` — HAVING sits one space in, the others two.
@@ -303,7 +290,7 @@ pub(crate) fn pg_viewdef_render_in(
     }
     if let Some(h) = &stmt.having {
         out.push_str("\n HAVING ");
-        out.push_str(&viewdef_expr_text(h));
+        out.push_str(&viewdef_predicate_text(h, &cols, qualify_in, pretty));
     }
     if !stmt.order_by.is_empty() {
         let keys: Vec<String> = stmt
@@ -322,6 +309,166 @@ pub(crate) fn pg_viewdef_render_in(
     }
     out.push(';');
     out
+}
+
+/// 9.0.0 — the FROM clause as PostgreSQL's deparse lays it out.
+///
+/// Measured on 18.6. Each comma-separated ITEM is a join tree of its
+/// own; a tree with `k` explicit joins opens with `k` parentheses and
+/// closes one after each join, and the relations of a tree sit five
+/// spaces in while a new item sits four:
+///
+/// ```text
+///    FROM ((d1a a
+///      JOIN d1b b ON ((a.id = b.id)))
+///      JOIN d1c c ON ((c.id = a.id)))
+///
+///    FROM d1a a,
+///     (d1b b
+///      JOIN d1c c ON ((b.id = c.id)))
+/// ```
+fn viewdef_from_text(
+    from: &spg_sql::ast::FromClause,
+    cat: Option<&spg_storage::Catalog>,
+    qualify_in: Option<&spg_storage::Catalog>,
+    pretty: bool,
+) -> String {
+    // The items: the primary, then one per comma.
+    let mut items: Vec<(&spg_sql::ast::TableRef, Vec<&spg_sql::ast::FromJoin>)> =
+        alloc::vec![(&from.primary, Vec::new())];
+    for j in &from.joins {
+        if j.comma {
+            items.push((&j.table, Vec::new()));
+        } else if let Some(last) = items.last_mut() {
+            last.1.push(j);
+        }
+    }
+    let cols = viewdef_columns(from, cat);
+    let rendered: Vec<String> = items
+        .iter()
+        .map(|(primary, joins)| {
+            let mut s = "(".repeat(joins.len());
+            s.push_str(&viewdef_relation_text(primary));
+            for j in joins {
+                s.push_str("\n     ");
+                s.push_str(viewdef_join_keyword(j.kind));
+                s.push(' ');
+                s.push_str(&viewdef_relation_text(&j.table));
+                match viewdef_join_using(j, from, cat) {
+                    Some(using) => {
+                        s.push_str(" USING (");
+                        s.push_str(&using.join(", "));
+                        s.push(')');
+                    }
+                    None => {
+                        if let Some(on) = &j.on {
+                            // PG wraps the ON in a pair of its own, on
+                            // top of the one the predicate carries.
+                            s.push_str(" ON (");
+                            s.push_str(&viewdef_predicate_text(on, &cols, qualify_in, pretty));
+                            s.push(')');
+                        }
+                    }
+                }
+                s.push(')');
+            }
+            s
+        })
+        .collect();
+    alloc::format!("\n   FROM {}", rendered.join(",\n    "))
+}
+
+/// `t alias`, the spelling PostgreSQL's deparse uses — no `AS`.
+fn viewdef_relation_text(r: &spg_sql::ast::TableRef) -> String {
+    match &r.alias {
+        Some(a) if *a != r.name => alloc::format!("{} {a}", r.name),
+        _ => r.name.clone(),
+    }
+}
+
+fn viewdef_join_keyword(kind: spg_sql::ast::JoinKind) -> &'static str {
+    use spg_sql::ast::JoinKind as K;
+    match kind {
+        K::Left => "LEFT JOIN",
+        K::Right => "RIGHT JOIN",
+        K::FullOuter => "FULL JOIN",
+        K::Cross => "CROSS JOIN",
+        // A semi join is not reachable from SQL; an inner one is `JOIN`.
+        K::Inner | K::Semi => "JOIN",
+    }
+}
+
+/// The USING column list this join prints, if any. A NATURAL join is
+/// deparsed by PostgreSQL as the USING it resolved to, so the common
+/// columns are worked out here the same way the executor works them out.
+fn viewdef_join_using(
+    j: &spg_sql::ast::FromJoin,
+    from: &spg_sql::ast::FromClause,
+    cat: Option<&spg_storage::Catalog>,
+) -> Option<Vec<String>> {
+    if let Some(cols) = &j.using_cols {
+        return Some(cols.clone());
+    }
+    if !j.natural {
+        return None;
+    }
+    let cat = cat?;
+    let right = cat.get(&j.table.name)?;
+    let right_names: Vec<&str> = right
+        .schema()
+        .columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
+    // Every relation to the LEFT of this one contributes.
+    let mut common: Vec<String> = Vec::new();
+    let mut left: Vec<&spg_sql::ast::TableRef> = alloc::vec![&from.primary];
+    for other in &from.joins {
+        if core::ptr::eq(other, j) {
+            break;
+        }
+        left.push(&other.table);
+    }
+    for l in left {
+        let Some(lt) = cat.get(&l.name) else { continue };
+        for c in &lt.schema().columns {
+            if right_names.contains(&c.name.as_str()) && !common.contains(&c.name) {
+                common.push(c.name.clone());
+            }
+        }
+    }
+    Some(common)
+}
+
+/// Every column the FROM's relations bring, for typing a constant.
+fn viewdef_columns(
+    from: &spg_sql::ast::FromClause,
+    cat: Option<&spg_storage::Catalog>,
+) -> Vec<spg_storage::ColumnSchema> {
+    let Some(cat) = cat else { return Vec::new() };
+    let mut out: Vec<spg_storage::ColumnSchema> = Vec::new();
+    for name in core::iter::once(&from.primary.name).chain(from.joins.iter().map(|j| &j.table.name))
+    {
+        if let Some(t) = cat.get(name) {
+            out.extend(t.schema().columns.iter().cloned());
+        }
+    }
+    out
+}
+
+/// A view's predicate in the catalog form — the same renderer a CHECK
+/// constraint and an index predicate use. It was `Display`, so a view
+/// read back `(name LIKE 'x%')` where PostgreSQL reads
+/// `(name ~~ 'x%'::text)`.
+fn viewdef_predicate_text(
+    e: &spg_sql::ast::Expr,
+    cols: &[spg_storage::ColumnSchema],
+    qualify_in: Option<&spg_storage::Catalog>,
+    pretty: bool,
+) -> String {
+    let src = alloc::format!("{e}");
+    crate::catalog_deparse::predicate_text_in(&src, cols, qualify_in, pretty)
+        .map_or_else(|| viewdef_expr_text(e), |s| viewdef_detokenize(&s))
 }
 
 /// v7.39 (round 336, V58) — one projection item as the view definition
@@ -499,6 +646,62 @@ pub(crate) fn probe_refuses_arity(name: &str, argc: usize) -> bool {
 }
 
 /// How many argument fillings [`probe_refuses_arity`] tries.
+/// 9.0.0 — whether the DISPATCH knows this name at all, at any arity.
+///
+/// A9b's first attempt asked three static lists whether a name was a
+/// function and over-refused 346 real ones, because three lists standing
+/// beside a dispatch do not describe it. This asks the dispatch: a name
+/// it does not know answers `function <name>(…) does not exist` to every
+/// filling at every count, and anything else — a value, a wrong-arity
+/// refusal, a type complaint — is the dispatch saying it knows the name.
+///
+/// The one shape this can still get wrong is a function that exists,
+/// refuses every probe filling on TYPE, and never reports a wrong arity;
+/// it would read as unknown. Under-refusal is the safe direction and
+/// this is the other one, which is why the answer is CHECKED IN and
+/// re-derived by a test rather than computed at runtime.
+pub(crate) fn probe_knows_name(name: &str) -> bool {
+    use spg_sql::ast::{CallSyntax, Expr, Literal};
+    let ctx_cols: alloc::vec::Vec<ColumnSchema> = alloc::vec::Vec::new();
+    let unknown_prefix = alloc::format!("function {name}(");
+    let row = spg_storage::Row::new(alloc::vec::Vec::new());
+    // Through `eval_expr`, not `apply_function`: several names are
+    // answered BEFORE the scalar dispatch (`coercibility` in `eval.rs`
+    // is one), and a probe that skips those layers calls a real
+    // function unknown. This asks the path a query takes.
+    for mysql in [false, true] {
+        let mut ctx = crate::eval::EvalContext::new(&ctx_cols, None);
+        ctx.mysql_dialect = mysql;
+        for argc in 0..=8 {
+            for fill in 0..PROBE_FILLINGS {
+                let args: alloc::vec::Vec<Expr> = (0..argc)
+                    .map(|i| match probe_arg(fill, i) {
+                        Value::Text(s) => Expr::Literal(Literal::String(s.into_owned())),
+                        Value::Int(n) => Expr::Literal(Literal::Integer(i64::from(n))),
+                        _ => Expr::Literal(Literal::Null),
+                    })
+                    .collect();
+                let call = Expr::FunctionCall {
+                    name: alloc::string::String::from(name),
+                    args,
+                    syntax: CallSyntax::Written,
+                };
+                match crate::eval::eval_expr(&call, &row, &ctx) {
+                    Ok(_) => return true,
+                    Err(EvalError::TypeMismatch { detail })
+                        if detail.starts_with(unknown_prefix.as_str())
+                            && detail.ends_with(") does not exist") =>
+                    {
+                        // The dispatch's own "no such name" sentence.
+                    }
+                    Err(_) => return true,
+                }
+            }
+        }
+    }
+    false
+}
+
 const PROBE_FILLINGS: usize = 4;
 
 /// One filling. `0` is all-NULL (what this probe used to be), `1` is a
@@ -15700,11 +15903,17 @@ fn apply_function_dispatch(
                     .get(n)
                     .map_or(Value::Null, |c| Value::text(c.clone())));
             }
-            Ok(Value::text(crate::system_catalog::catalog_indexdef(
+            // v7.39 (round 311) — the third argument asks for PG's
+            // pretty form. 9.0.0 — and it is answered; it used to be
+            // read and ignored, so `pg_get_indexdef(oid, 0, true)`
+            // returned the plain string.
+            let pretty = matches!(args.get(2), Some(Value::Bool(true)));
+            Ok(Value::text(crate::system_catalog::catalog_indexdef_in(
                 cat,
                 t,
                 &ci,
                 public_hidden_in(ctx).then_some(cat),
+                pretty,
             )))
         }
         // pg_get_constraintdef(conname [, pretty]) — REAL for
@@ -15885,17 +16094,16 @@ fn apply_function_dispatch(
                     // restore of a dump PG itself produced would fail on
                     // the very rows PG grandfathered in.
                     let suffix = if pred.validated { "" } else { " NOT VALID" };
-                    if pretty {
-                        if let Ok(ast) = spg_sql::parser::parse_expression(inner) {
-                            return Ok(Value::text(alloc::format!(
-                                "CHECK ({}){suffix}",
-                                spg_sql::ast::pretty_expr(&ast)
-                            )));
-                        }
-                    }
                     // 8.0.3 — in PG's catalog form; see `catalog_deparse`.
+                    // 9.0.0 — including the pretty form. It used to come
+                    // from `spg_sql::ast::pretty_expr`, a second deparser
+                    // that prints the expression as WRITTEN: the pretty
+                    // CHECK read `a <> 'q'` where PostgreSQL, which
+                    // prints the ANALYZED expression either way, reads
+                    // `a <> 'q'::text`. One renderer answers both forms
+                    // now, and `pretty` decides only the parentheses.
                     let qualify_in = ctx.catalog.filter(|_| public_hidden_in(ctx));
-                    let body = crate::catalog_deparse::predicate_text(inner, &t.schema().columns, qualify_in)
+                    let body = crate::catalog_deparse::predicate_text_in(inner, &t.schema().columns, qualify_in, pretty)
                         .unwrap_or_else(|| {
                             if inner.starts_with('(') && inner.ends_with(')') {
                                 inner.to_string()
@@ -16054,7 +16262,7 @@ fn apply_function_dispatch(
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             // 8.0.3 — names qualified as the session's search path needs.
             let render = |body: &str| {
-                pg_viewdef_render_in(body, pretty, public_hidden_in(ctx).then_some(cat))
+                pg_viewdef_render_in(body, pretty, public_hidden_in(ctx).then_some(cat), Some(cat))
             };
             if let Some(def) = cat.view(bare) {
                 return Ok(Value::text(render(&def.body)));
@@ -20757,6 +20965,10 @@ mod arity_table_generator {
             include_str!("values.rs"),
             include_str!("cast.rs"),
             include_str!("binop.rs"),
+            // 9.0.0 — the layers ABOVE the scalar dispatch. A name
+            // answered there (`coercibility`) is a function a query can
+            // call, and the known-name table is a whitelist.
+            include_str!("../eval.rs"),
         ] {
             for line in src.lines() {
                 let t = line.trim();
@@ -20771,12 +20983,24 @@ mod arity_table_generator {
                 // appear on an `=>` line somewhere else in the file.
                 // Under-refusal is the module's safe direction, but the tool
                 // was covering less than it looked like it did.
-                let head = match t.split_once("=>") {
-                    Some((h, _)) => h,
-                    None if t.starts_with('|') => t,
-                    None => continue,
-                };
-                let mut rest = head;
+                // 9.0.0 — the WHOLE line, not the part left of `=>`.
+                // A multi-line arm's FIRST alternative sits on a line
+                // with neither `=>` nor a leading `|`
+                // (`"xml_is_well_formed"` above
+                // `| "xml_is_well_formed_document" =>`), so it was
+                // invisible while its siblings were found. That is
+                // harmless for the arity table — a name it does not
+                // judge — and NOT harmless for the known-name table,
+                // which `validate_function_names` uses as a whitelist:
+                // 107 tests refused a real function.
+                //
+                // Widening to every line cannot over-collect either:
+                // the filter takes only identifier-shaped lowercase
+                // strings, and a string that is not a function answers
+                // "does not exist" to every probe, so it enters neither
+                // table.
+                let _ = t.split_once("=>");
+                let mut rest = t;
                 while let Some(i) = rest.find('"') {
                     rest = &rest[i + 1..];
                     let Some(j) = rest.find('"') else { break };
@@ -20828,6 +21052,46 @@ mod arity_table_generator {
             assert_eq!(dn.as_str(), *cn, "row order or membership changed");
             assert_eq!(dr.as_slice(), *cr, "{dn}: accepted counts changed");
         }
+    }
+
+    /// 9.0.0 — the names the dispatch KNOWS, re-derived.
+    ///
+    /// `validate_function_names` refuses a call before the scan, so this
+    /// table being wrong in the OVER direction refuses a real function.
+    /// It is checked in and re-derived here for that reason.
+    #[test]
+    fn known_names_table_is_current() {
+        let derived: alloc::vec::Vec<alloc::string::String> = dispatch_names()
+            .into_iter()
+            .filter(|n| super::probe_knows_name(n))
+            .collect();
+        let checked = crate::eval::arity::KNOWN_FUNCTION_NAMES;
+        assert_eq!(
+            derived.len(),
+            checked.len(),
+            "eval/arity.rs knows {} names, this dispatch derives {} — regenerate it",
+            checked.len(),
+            derived.len()
+        );
+        for (d, c) in derived.iter().zip(checked.iter()) {
+            assert_eq!(d.as_str(), *c, "membership or order changed");
+        }
+    }
+
+    /// Print the known-name table, so it can be checked in.
+    #[test]
+    #[ignore]
+    fn print_known_names_table() {
+        let rows: alloc::vec::Vec<alloc::string::String> = dispatch_names()
+            .into_iter()
+            .filter(|n| super::probe_knows_name(n))
+            .map(|n| alloc::format!("    \"{n}\","))
+            .collect();
+        panic!(
+            "KNOWN_NAMES_BEGIN\n{}\nKNOWN_NAMES_END rows={}",
+            rows.join("\n"),
+            rows.len()
+        );
     }
 
     /// Print the table this build derives, so it can be checked in.

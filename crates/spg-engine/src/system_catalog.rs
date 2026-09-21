@@ -1412,7 +1412,12 @@ pub(crate) fn synth_information_schema_views(
                 // body verbatim, which meant no layout and — worse — SPG's
                 // internal `count_star()` spelling reaching a client that
                 // introspects views (PG says `count(*)`).
-                Value::text(crate::eval::functions::pg_viewdef_render(&v.body, false)),
+                Value::text(crate::eval::functions::pg_viewdef_render_in(
+                    &v.body,
+                    false,
+                    None,
+                    Some(cat),
+                )),
                 // v7.39 (round 132) — WITH CHECK OPTION: 0=NONE, 1=LOCAL, 2=CASCADED.
                 Value::text(match v.check_option {
                     1 => "LOCAL",
@@ -1896,6 +1901,341 @@ pub(crate) fn synth_pg_inherits(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
 /// (20000 + position — `pg_index.indclass` currently reports 0s, so
 /// nothing joins against these yet), `opcmethod` is the real PG am
 /// oid via the pg_am mapping, namespace is pg_catalog (11), owner 10.
+/// 9.0.0 — PostgreSQL 18.6's own oid for every operator class, read
+/// off the live catalog. The rows carried `20000 + position` before,
+/// which joined to nothing: a client resolving `pg_index.indclass`
+/// against `pg_opclass` found no row, and `indclass` itself was all
+/// zeros. A class SPG has and PostgreSQL does not — the pg_trgm and
+/// pgvector ones — keeps a synthetic oid.
+///
+/// `(access method, class name, oid)`, sorted.
+const PG_OPCLASS_OIDS: &[(&str, &str, i64)] = &[
+    ("brin", "bit_minmax_ops", 10151),
+    ("brin", "box_inclusion_ops", 10163),
+    ("brin", "bpchar_bloom_ops", 10132),
+    ("brin", "bpchar_minmax_ops", 10131),
+    ("brin", "bytea_bloom_ops", 10093),
+    ("brin", "bytea_minmax_ops", 10092),
+    ("brin", "char_bloom_ops", 10095),
+    ("brin", "char_minmax_ops", 10094),
+    ("brin", "date_bloom_ops", 10138),
+    ("brin", "date_minmax_multi_ops", 10137),
+    ("brin", "date_minmax_ops", 10136),
+    ("brin", "float4_bloom_ops", 10117),
+    ("brin", "float4_minmax_multi_ops", 10116),
+    ("brin", "float4_minmax_ops", 10115),
+    ("brin", "float8_bloom_ops", 10120),
+    ("brin", "float8_minmax_multi_ops", 10119),
+    ("brin", "float8_minmax_ops", 10118),
+    ("brin", "inet_bloom_ops", 10129),
+    ("brin", "inet_inclusion_ops", 10130),
+    ("brin", "inet_minmax_multi_ops", 10128),
+    ("brin", "inet_minmax_ops", 10127),
+    ("brin", "int2_bloom_ops", 10103),
+    ("brin", "int2_minmax_multi_ops", 10102),
+    ("brin", "int2_minmax_ops", 10101),
+    ("brin", "int4_bloom_ops", 10106),
+    ("brin", "int4_minmax_multi_ops", 10105),
+    ("brin", "int4_minmax_ops", 10104),
+    ("brin", "int8_bloom_ops", 10100),
+    ("brin", "int8_minmax_multi_ops", 10099),
+    ("brin", "int8_minmax_ops", 10098),
+    ("brin", "interval_bloom_ops", 10147),
+    ("brin", "interval_minmax_multi_ops", 10146),
+    ("brin", "interval_minmax_ops", 10145),
+    ("brin", "macaddr8_bloom_ops", 10126),
+    ("brin", "macaddr8_minmax_multi_ops", 10125),
+    ("brin", "macaddr8_minmax_ops", 10124),
+    ("brin", "macaddr_bloom_ops", 10123),
+    ("brin", "macaddr_minmax_multi_ops", 10122),
+    ("brin", "macaddr_minmax_ops", 10121),
+    ("brin", "name_bloom_ops", 10097),
+    ("brin", "name_minmax_ops", 10096),
+    ("brin", "numeric_bloom_ops", 10155),
+    ("brin", "numeric_minmax_multi_ops", 10154),
+    ("brin", "numeric_minmax_ops", 10153),
+    ("brin", "oid_bloom_ops", 10111),
+    ("brin", "oid_minmax_multi_ops", 10110),
+    ("brin", "oid_minmax_ops", 10109),
+    ("brin", "pg_lsn_bloom_ops", 10162),
+    ("brin", "pg_lsn_minmax_multi_ops", 10161),
+    ("brin", "pg_lsn_minmax_ops", 10160),
+    ("brin", "range_inclusion_ops", 10159),
+    ("brin", "text_bloom_ops", 10108),
+    ("brin", "text_minmax_ops", 10107),
+    ("brin", "tid_bloom_ops", 10113),
+    ("brin", "tid_minmax_multi_ops", 10114),
+    ("brin", "tid_minmax_ops", 10112),
+    ("brin", "time_bloom_ops", 10135),
+    ("brin", "time_minmax_multi_ops", 10134),
+    ("brin", "time_minmax_ops", 10133),
+    ("brin", "timestamp_bloom_ops", 10141),
+    ("brin", "timestamp_minmax_multi_ops", 10140),
+    ("brin", "timestamp_minmax_ops", 10139),
+    ("brin", "timestamptz_bloom_ops", 10144),
+    ("brin", "timestamptz_minmax_multi_ops", 10143),
+    ("brin", "timestamptz_minmax_ops", 10142),
+    ("brin", "timetz_bloom_ops", 10150),
+    ("brin", "timetz_minmax_multi_ops", 10149),
+    ("brin", "timetz_minmax_ops", 10148),
+    ("brin", "uuid_bloom_ops", 10158),
+    ("brin", "uuid_minmax_multi_ops", 10157),
+    ("brin", "uuid_minmax_ops", 10156),
+    ("brin", "varbit_minmax_ops", 10152),
+    ("btree", "array_ops", 10000),
+    ("btree", "bit_ops", 10002),
+    ("btree", "bool_ops", 10003),
+    ("btree", "bpchar_ops", 10004),
+    ("btree", "bpchar_pattern_ops", 4219),
+    ("btree", "bytea_ops", 10006),
+    ("btree", "char_ops", 10007),
+    ("btree", "cidr_ops", 10009),
+    ("btree", "date_ops", 3122),
+    ("btree", "enum_ops", 10069),
+    ("btree", "float4_ops", 10012),
+    ("btree", "float8_ops", 3123),
+    ("btree", "inet_ops", 10015),
+    ("btree", "int2_ops", 1979),
+    ("btree", "int4_ops", 1978),
+    ("btree", "int8_ops", 3124),
+    ("btree", "interval_ops", 10022),
+    ("btree", "jsonb_ops", 10088),
+    ("btree", "macaddr8_ops", 10026),
+    ("btree", "macaddr_ops", 10024),
+    ("btree", "money_ops", 10047),
+    ("btree", "multirange_ops", 10080),
+    ("btree", "name_ops", 10028),
+    ("btree", "numeric_ops", 3125),
+    ("btree", "oid_ops", 1981),
+    ("btree", "oidvector_ops", 10032),
+    ("btree", "pg_lsn_ops", 10067),
+    ("btree", "range_ops", 10076),
+    ("btree", "record_image_ops", 10036),
+    ("btree", "record_ops", 10034),
+    ("btree", "text_ops", 3126),
+    ("btree", "text_pattern_ops", 4217),
+    ("btree", "tid_ops", 10050),
+    ("btree", "time_ops", 10038),
+    ("btree", "timestamp_ops", 3128),
+    ("btree", "timestamptz_ops", 3127),
+    ("btree", "timetz_ops", 10041),
+    ("btree", "tsquery_ops", 10074),
+    ("btree", "tsvector_ops", 10071),
+    ("btree", "uuid_ops", 10065),
+    ("btree", "varbit_ops", 10043),
+    ("btree", "varchar_ops", 10044),
+    ("btree", "varchar_pattern_ops", 4218),
+    ("btree", "xid8_ops", 10053),
+    ("gin", "array_ops", 10064),
+    ("gin", "gin_trgm_ops", 25844),
+    ("gin", "jsonb_ops", 10090),
+    ("gin", "jsonb_path_ops", 10091),
+    ("gin", "tsvector_ops", 10073),
+    ("gist", "box_ops", 10060),
+    ("gist", "circle_ops", 10063),
+    ("gist", "gist_trgm_ops", 25823),
+    ("gist", "inet_ops", 10017),
+    ("gist", "multirange_ops", 10082),
+    ("gist", "point_ops", 10061),
+    ("gist", "poly_ops", 10062),
+    ("gist", "range_ops", 10078),
+    ("gist", "tsquery_ops", 10075),
+    ("gist", "tsvector_ops", 10072),
+    ("hash", "aclitem_ops", 10059),
+    ("hash", "array_ops", 10001),
+    ("hash", "bool_ops", 10048),
+    ("hash", "bpchar_ops", 10005),
+    ("hash", "bpchar_pattern_ops", 10058),
+    ("hash", "bytea_ops", 10049),
+    ("hash", "char_ops", 10008),
+    ("hash", "cid_ops", 10054),
+    ("hash", "cidr_ops", 10010),
+    ("hash", "date_ops", 10011),
+    ("hash", "enum_ops", 10070),
+    ("hash", "float4_ops", 10013),
+    ("hash", "float8_ops", 10014),
+    ("hash", "inet_ops", 10016),
+    ("hash", "int2_ops", 10019),
+    ("hash", "int4_ops", 10020),
+    ("hash", "int8_ops", 10021),
+    ("hash", "interval_ops", 10023),
+    ("hash", "jsonb_ops", 10089),
+    ("hash", "macaddr8_ops", 10027),
+    ("hash", "macaddr_ops", 10025),
+    ("hash", "multirange_ops", 10081),
+    ("hash", "name_ops", 10029),
+    ("hash", "numeric_ops", 10030),
+    ("hash", "oid_ops", 10031),
+    ("hash", "oidvector_ops", 10033),
+    ("hash", "pg_lsn_ops", 10068),
+    ("hash", "range_ops", 10077),
+    ("hash", "record_ops", 10035),
+    ("hash", "text_ops", 10037),
+    ("hash", "text_pattern_ops", 10056),
+    ("hash", "tid_ops", 10055),
+    ("hash", "time_ops", 10039),
+    ("hash", "timestamp_ops", 10046),
+    ("hash", "timestamptz_ops", 10040),
+    ("hash", "timetz_ops", 10042),
+    ("hash", "uuid_ops", 10066),
+    ("hash", "varchar_ops", 10045),
+    ("hash", "varchar_pattern_ops", 10057),
+    ("hash", "xid8_ops", 10052),
+    ("hash", "xid_ops", 10051),
+    ("spgist", "box_ops", 10083),
+    ("spgist", "inet_ops", 10018),
+    ("spgist", "kd_point_ops", 10085),
+    ("spgist", "poly_ops", 10087),
+    ("spgist", "quad_point_ops", 10084),
+    ("spgist", "range_ops", 10079),
+    ("spgist", "text_ops", 10086),
+];
+
+/// 9.0.0 — the DEFAULT operator class for `(access method, type oid)`,
+/// read off PostgreSQL 18.6. `pg_index.indclass` names one per key
+/// part; the part with no `USING … (col opclass)` gets this one.
+/// An array type takes the `anyarray` row (2277), which is what PG
+/// answers for `USING gin (int_array_column)`.
+const PG_DEFAULT_OPCLASS_FOR_TYPE: &[(&str, i64, i64)] = &[
+    ("brin", 17, 10092),
+    ("brin", 18, 10094),
+    ("brin", 19, 10096),
+    ("brin", 20, 10098),
+    ("brin", 21, 10101),
+    ("brin", 23, 10104),
+    ("brin", 25, 10107),
+    ("brin", 26, 10109),
+    ("brin", 27, 10112),
+    ("brin", 603, 10163),
+    ("brin", 700, 10115),
+    ("brin", 701, 10118),
+    ("brin", 774, 10124),
+    ("brin", 829, 10121),
+    ("brin", 869, 10130),
+    ("brin", 1042, 10131),
+    ("brin", 1082, 10136),
+    ("brin", 1083, 10133),
+    ("brin", 1114, 10139),
+    ("brin", 1184, 10142),
+    ("brin", 1186, 10145),
+    ("brin", 1266, 10148),
+    ("brin", 1560, 10151),
+    ("brin", 1562, 10152),
+    ("brin", 1700, 10153),
+    ("brin", 2950, 10156),
+    ("brin", 3220, 10160),
+    ("brin", 3831, 10159),
+    ("btree", 16, 10003),
+    ("btree", 17, 10006),
+    ("btree", 18, 10007),
+    ("btree", 19, 10028),
+    ("btree", 20, 3124),
+    ("btree", 21, 1979),
+    ("btree", 23, 1978),
+    ("btree", 25, 3126),
+    ("btree", 26, 1981),
+    ("btree", 27, 10050),
+    ("btree", 30, 10032),
+    ("btree", 700, 10012),
+    ("btree", 701, 3123),
+    ("btree", 774, 10026),
+    ("btree", 790, 10047),
+    ("btree", 829, 10024),
+    ("btree", 869, 10015),
+    ("btree", 1042, 10004),
+    ("btree", 1082, 3122),
+    ("btree", 1083, 10038),
+    ("btree", 1114, 3128),
+    ("btree", 1184, 3127),
+    ("btree", 1186, 10022),
+    ("btree", 1266, 10041),
+    ("btree", 1560, 10002),
+    ("btree", 1562, 10043),
+    ("btree", 1700, 3125),
+    ("btree", 2249, 10034),
+    ("btree", 2277, 10000),
+    ("btree", 2950, 10065),
+    ("btree", 3220, 10067),
+    ("btree", 3500, 10069),
+    ("btree", 3614, 10071),
+    ("btree", 3615, 10074),
+    ("btree", 3802, 10088),
+    ("btree", 3831, 10076),
+    ("btree", 4537, 10080),
+    ("btree", 5069, 10053),
+    ("gin", 2277, 10064),
+    ("gin", 3614, 10073),
+    ("gin", 3802, 10090),
+    ("gist", 600, 10061),
+    ("gist", 603, 10060),
+    ("gist", 604, 10062),
+    ("gist", 718, 10063),
+    ("gist", 3614, 10072),
+    ("gist", 3615, 10075),
+    ("gist", 3831, 10078),
+    ("gist", 4537, 10082),
+    ("hash", 16, 10048),
+    ("hash", 17, 10049),
+    ("hash", 18, 10008),
+    ("hash", 19, 10029),
+    ("hash", 20, 10021),
+    ("hash", 21, 10019),
+    ("hash", 23, 10020),
+    ("hash", 25, 10037),
+    ("hash", 26, 10031),
+    ("hash", 27, 10055),
+    ("hash", 28, 10051),
+    ("hash", 29, 10054),
+    ("hash", 30, 10033),
+    ("hash", 700, 10013),
+    ("hash", 701, 10014),
+    ("hash", 774, 10027),
+    ("hash", 829, 10025),
+    ("hash", 869, 10016),
+    ("hash", 1033, 10059),
+    ("hash", 1042, 10005),
+    ("hash", 1082, 10011),
+    ("hash", 1083, 10039),
+    ("hash", 1114, 10046),
+    ("hash", 1184, 10040),
+    ("hash", 1186, 10023),
+    ("hash", 1266, 10042),
+    ("hash", 1700, 10030),
+    ("hash", 2249, 10035),
+    ("hash", 2277, 10001),
+    ("hash", 2950, 10066),
+    ("hash", 3220, 10068),
+    ("hash", 3500, 10070),
+    ("hash", 3802, 10089),
+    ("hash", 3831, 10077),
+    ("hash", 4537, 10081),
+    ("hash", 5069, 10052),
+    ("spgist", 25, 10086),
+    ("spgist", 600, 10084),
+    ("spgist", 603, 10083),
+    ("spgist", 604, 10087),
+    ("spgist", 869, 10018),
+    ("spgist", 3831, 10079),
+];
+
+/// The oid PostgreSQL gives this operator class, or `None` when it is one
+/// SPG has and PostgreSQL does not.
+fn pg_opclass_oid(am: &str, name: &str) -> Option<i64> {
+    PG_OPCLASS_OIDS
+        .iter()
+        .find(|(a, n, _)| *a == am && *n == name)
+        .map(|(_, _, oid)| *oid)
+}
+
+/// The oid of the operator class PostgreSQL picks for a key part of this
+/// type under this access method, when the index names none.
+fn pg_default_opclass_oid(am: &str, type_oid: i64) -> Option<i64> {
+    PG_DEFAULT_OPCLASS_FOR_TYPE
+        .iter()
+        .find(|(a, t, _)| *a == am && *t == type_oid)
+        .map(|(_, _, oid)| *oid)
+}
+
 pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = alloc::vec![
         ColumnSchema::new("oid", DataType::Oid, false),
@@ -1925,7 +2265,10 @@ pub(crate) fn synth_pg_opclass(_cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
     };
     let mut rows: Vec<Row<'static>> = Vec::new();
     for (i, (am, name)) in crate::opclass::all_opclasses().enumerate() {
-        let oid = 20000 + i as i64;
+        // 9.0.0 — PostgreSQL's oid when it has this class, so
+        // `pg_index.indclass` joins; the synthetic one only for a class
+        // PostgreSQL does not carry.
+        let oid = pg_opclass_oid(am, name).unwrap_or(20000 + i as i64);
         rows.push(Row::new(alloc::vec![
             Value::BigInt(oid),
             Value::BigInt(am_oid(am)),
@@ -2721,6 +3064,8 @@ pub(crate) fn am_oid_of_index(idx: &spg_storage::Index) -> i64 {
         Some("gist") => 783,
         Some("spgist") => 4000,
         Some("hash") => 405,
+        Some("gin") => 2742,
+        Some("brin") => 3580,
         _ => am_oid_of(&idx.kind),
     }
 }
@@ -4076,6 +4421,10 @@ pub(crate) struct CatalogIndex {
     /// 9.0.0 — each key part's `DESC` / `NULLS FIRST`, aligned with
     /// `columns`, for `indoption`.
     pub part_orders: Vec<spg_storage::KeyOrder>,
+    /// 9.0.0 — the operator class each key part was declared with,
+    /// aligned with `columns`; `None` where the index named none and
+    /// PostgreSQL picks the type's default. `indclass` reads it.
+    pub part_opclasses: Vec<Option<alloc::string::String>>,
 }
 
 /// PostgreSQL's own name for a constraint's index.
@@ -4185,6 +4534,12 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                         .map(|i| idx.extra_orders.get(i).copied().unwrap_or_default()),
                 )
                 .collect(),
+                part_opclasses: {
+                    let declared = cat.index_opclasses(&idx.name);
+                    (0..=idx.extra_column_positions.len())
+                        .map(|i| declared.get(i).cloned().flatten())
+                        .collect()
+                },
             });
         }
         // The constraints no storage index covers exactly. PostgreSQL
@@ -4218,6 +4573,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                 backs_constraint: Some(i),
                 part_expressions: alloc::vec![None; uc.columns.len()],
                 part_orders: alloc::vec![spg_storage::KeyOrder::default(); uc.columns.len()],
+                part_opclasses: alloc::vec![None; uc.columns.len()],
             });
         }
         // 9.0.0 — a partitioned parent's index DECLARATION. SPG keeps it
@@ -4255,6 +4611,7 @@ pub(crate) fn catalog_indexes(cat: &spg_storage::Catalog) -> Vec<CatalogIndex> {
                         spg_storage::KeyOrder::default();
                         positions.len()
                     ],
+                    part_opclasses: alloc::vec![None; positions.len()],
                     columns: positions,
                     included: Vec::new(),
                     is_unique: ci.is_unique,
@@ -12586,10 +12943,30 @@ pub(crate) fn catalog_indexdef(
     ci: &CatalogIndex,
     qualify_in: Option<&Catalog>,
 ) -> alloc::string::String {
+    catalog_indexdef_in(cat, t, ci, qualify_in, false)
+}
+
+/// [`catalog_indexdef`], in PostgreSQL's pretty form when `pretty` —
+/// `pg_get_indexdef(oid, 0, true)`. Measured on 18.6: the schema
+/// qualification goes, an operator-expression key loses the outer pair
+/// of parentheses, the predicate loses its own, and the expressions are
+/// printed by precedence.
+///
+/// ```text
+///   plain   CREATE INDEX i ON public.t USING btree (((a || 'x'::text))) WHERE (b > 0)
+///   pretty  CREATE INDEX i ON t USING btree ((a || 'x'::text)) WHERE b > 0
+/// ```
+pub(crate) fn catalog_indexdef_in(
+    cat: &Catalog,
+    t: &spg_storage::Table,
+    ci: &CatalogIndex,
+    qualify_in: Option<&Catalog>,
+    pretty: bool,
+) -> alloc::string::String {
     if ci.is_storage
         && let Some(idx) = t.indices().iter().find(|i| i.name == ci.name)
     {
-        return render_indexdef(t, idx, &ci.table, cat, qualify_in.is_some());
+        return render_indexdef_in(t, idx, &ci.table, cat, qualify_in.is_some(), pretty);
     }
     render_synthesised_indexdef(t, ci)
 }
@@ -12606,6 +12983,19 @@ pub(crate) fn render_index_part(
     qualify_in: Option<&Catalog>,
     i: usize,
     attrs_only: bool,
+) -> alloc::string::String {
+    render_index_part_in(t, idx, cat, qualify_in, i, attrs_only, false)
+}
+
+/// [`render_index_part`], in the pretty form when `pretty`.
+pub(crate) fn render_index_part_in(
+    t: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    cat: &Catalog,
+    qualify_in: Option<&Catalog>,
+    i: usize,
+    attrs_only: bool,
+    pretty: bool,
 ) -> alloc::string::String {
     let col_at = |pos: usize| -> alloc::string::String {
         t.schema()
@@ -12646,14 +13036,37 @@ pub(crate) fn render_index_part(
     let mut out = match crate::index_def::key_parts(idx).swap_remove(i) {
         crate::index_def::KeyPart::Column(p) => col_at(p),
         crate::index_def::KeyPart::Expression(expr) => {
-            let text =
-                crate::catalog_deparse::predicate_text(expr, &t.schema().columns, qualify_in)
-                    .unwrap_or_else(|| alloc::string::String::from(expr));
+            let text = crate::catalog_deparse::predicate_text_in(
+                expr,
+                &t.schema().columns,
+                qualify_in,
+                pretty,
+            )
+            .unwrap_or_else(|| alloc::string::String::from(expr));
             // v7.39 (read01 round 83) — PG double-parenthesises an
             // operator expression (`((a + b))`) but not a function
             // call (`lower(name)`); the stored form of the first
             // already opens with `(`.
-            if text.starts_with('(') {
+            // 9.0.0 — the pretty form keeps ONE pair: the expression
+            // comes back unparenthesised there, so this is where the
+            // pair a key expression always carries is put on.
+            if pretty {
+                // Measured on 18.6: the pretty key carries exactly one
+                // pair, and a call carries none — `(a || 'x'::text)`,
+                // `(b::text)`, `(- b)`, `(a IS NULL)`, but `abs(b)` and
+                // `COALESCE(a, 'z'::text)`. Decided from the node, not
+                // from the text: `lower('Q'::text || a)` is a call whose
+                // rendering looks like an operator expression.
+                let is_call = matches!(
+                    spg_sql::parser::parse_expression(expr),
+                    Ok(spg_sql::ast::Expr::FunctionCall { .. })
+                );
+                if is_call {
+                    text
+                } else {
+                    alloc::format!("({text})")
+                }
+            } else if text.starts_with('(') {
                 alloc::format!("({text})")
             } else {
                 text
@@ -12684,6 +13097,19 @@ pub(crate) fn render_indexdef(
     tname: &str,
     cat: &Catalog,
     qualify: bool,
+) -> alloc::string::String {
+    render_indexdef_in(t, idx, tname, cat, qualify, false)
+}
+
+/// [`render_indexdef`], in the pretty form when `pretty`. See
+/// [`catalog_indexdef_in`].
+pub(crate) fn render_indexdef_in(
+    t: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    tname: &str,
+    cat: &Catalog,
+    qualify: bool,
+    pretty: bool,
 ) -> alloc::string::String {
     let qualify_in = qualify.then_some(cat);
     let col_at = |pos: usize| -> alloc::string::String {
@@ -12761,7 +13187,7 @@ pub(crate) fn render_indexdef(
     // carry an expression, a collation or an operator class, so
     // `(p, lower(email) text_pattern_ops)` could not even be represented.
     let key = (0..positions.len())
-        .map(|i| render_index_part(t, idx, cat, qualify_in, i, false))
+        .map(|i| render_index_part_in(t, idx, cat, qualify_in, i, false, pretty))
         .collect::<Vec<_>>()
         .join(", ");
     // v7.39 (round 473) — `NULLS NOT DISTINCT` sits after the key list and
@@ -12796,27 +13222,34 @@ pub(crate) fn render_indexdef(
     // `USING btree`, so a dump restored into PostgreSQL as a different
     // index type. See `Index::declared_am`.
     let am: &str = idx.declared_am.as_deref().unwrap_or(am);
+    // 9.0.0 — the pretty form drops the schema qualification, as PG's
+    // does; the plain one always writes it.
+    let schema = if pretty { "" } else { "public." };
     match &idx.partial_predicate {
         Some(pred) => {
             // 8.0.3 — PG's catalog form (see `catalog_deparse`): a bare
             // boolean column is not parenthesised, a literal is typed.
-            let wrapped =
-                crate::catalog_deparse::predicate_text(pred, &t.schema().columns, qualify_in)
-                    .unwrap_or_else(|| {
-                        let p = pred.trim();
-                        if p.starts_with('(') && p.ends_with(')') {
-                            alloc::string::String::from(p)
-                        } else {
-                            alloc::format!("({p})")
-                        }
-                    });
+            let wrapped = crate::catalog_deparse::predicate_text_in(
+                pred,
+                &t.schema().columns,
+                qualify_in,
+                pretty,
+            )
+            .unwrap_or_else(|| {
+                let p = pred.trim();
+                if pretty || (p.starts_with('(') && p.ends_with(')')) {
+                    alloc::string::String::from(p)
+                } else {
+                    alloc::format!("({p})")
+                }
+            });
             alloc::format!(
-                "CREATE {unique_kw}INDEX {} ON public.{tname} USING {am} ({key}){nnd} WHERE {wrapped}",
+                "CREATE {unique_kw}INDEX {} ON {schema}{tname} USING {am} ({key}){nnd} WHERE {wrapped}",
                 idx.name,
             )
         }
         None => alloc::format!(
-            "CREATE {unique_kw}INDEX {} ON public.{tname} USING {am} ({key}){nnd}",
+            "CREATE {unique_kw}INDEX {} ON {schema}{tname} USING {am} ({key}){nnd}",
             idx.name,
         ),
     }
@@ -12959,7 +13392,6 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                         .map(|p| i16::try_from(p + 1).unwrap_or(0)),
                 )
                 .collect();
-            let indclass: Vec<u32> = alloc::vec![0; n_key];
             // 9.0.0 — 100 (`default`) for a part whose type collates, 0
             // otherwise; one entry per KEY part.
             let tschema = cat.get(&ci.table).map(|t| t.schema());
@@ -12972,10 +13404,13 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                         | spg_storage::DataType::Name
                 )
             };
-            let indcollation: Vec<u32> = (0..n_key)
+            // The type each key part indexes: the column's, or what the
+            // expression evaluates to. `indcollation` and `indclass` both
+            // answer from it.
+            let part_types: Vec<Option<spg_storage::DataType>> = (0..n_key)
                 .map(|i| {
-                    let Some(schema) = tschema else { return 0 };
-                    let ty = match ci.part_expressions.get(i).and_then(Option::as_deref) {
+                    let schema = tschema?;
+                    match ci.part_expressions.get(i).and_then(Option::as_deref) {
                         Some(src) => spg_sql::parser::parse_expression(src)
                             .ok()
                             .and_then(|e| {
@@ -12983,8 +13418,44 @@ pub(crate) fn synth_pg_index_raw(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'
                             })
                             .map(|shape| shape.ty),
                         None => schema.columns.get(ci.columns[i]).map(|c| c.ty),
-                    };
-                    if ty.is_some_and(collatable) { 100 } else { 0 }
+                    }
+                })
+                .collect();
+            // 9.0.0 — the operator class oid per KEY part, which is what a
+            // client joins to `pg_opclass` to learn how an index compares.
+            // These were all zero, so the join found nothing: `\d`'s
+            // opclass column, and every schema-diff tool that reads one,
+            // saw an index with no comparison semantics at all.
+            let am_name = am_name_of_oid(ci.am_oid);
+            let indclass: Vec<u32> = (0..n_key)
+                .map(|i| {
+                    let named = ci
+                        .part_opclasses
+                        .get(i)
+                        .and_then(Option::as_deref)
+                        .and_then(|name| pg_opclass_oid(am_name, name));
+                    let resolved = named.or_else(|| {
+                        let ty = part_types.get(i).copied().flatten()?;
+                        // A polymorphic default: PostgreSQL files one row
+                        // for `anyarray`, not one per element type, and
+                        // answers with it for an array column.
+                        let key = if crate::conversions::array_element_type(ty).is_some() {
+                            2277
+                        } else {
+                            pg_type_oid(ty)
+                        };
+                        pg_default_opclass_oid(am_name, key)
+                    });
+                    u32::try_from(resolved.unwrap_or(0)).unwrap_or(0)
+                })
+                .collect();
+            let indcollation: Vec<u32> = (0..n_key)
+                .map(|i| {
+                    if part_types.get(i).copied().flatten().is_some_and(collatable) {
+                        100
+                    } else {
+                        0
+                    }
                 })
                 .collect();
             // 9.0.0 — PG's per-part option bits: DESC is 1, NULLS FIRST 2

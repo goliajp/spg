@@ -522,6 +522,15 @@ impl<'a> ExternalSorter<'a> {
         // The meter is exact and O(1) now: what the batch holds IS the
         // arena, where it used to be a per-row walk over the values
         // estimating what their `String`s cost.
+        // 9.0.0 — the high-water mark, for `Sort Method: … Memory: NkB`.
+        // The meter is already computed here; recording its maximum
+        // costs one compare per row and is the only honest source for
+        // that line.
+        if let Some(stats) = self.stats {
+            use core::sync::atomic::Ordering;
+            let held = self.batch_bytes() as u64;
+            stats.peak_bytes.fetch_max(held, Ordering::Relaxed);
+        }
         if self.factory.is_some() && self.batch_bytes() >= self.budget_bytes {
             self.spill_batch()?;
         }

@@ -3189,6 +3189,8 @@ impl Engine {
         // `GROUP BY` and `HAVING`, which cannot take those routes, raised
         // — the same statement answering two ways depending on the plan.
         self.validate_clause_columns(stmt)?;
+        self.validate_function_names(stmt)?;
+        self.validate_literal_coercions(stmt)?;
         self.validate_function_arity(stmt)?;
         self.validate_cast_targets(stmt)?;
         self.validate_predicate_is_boolean(stmt)?;
@@ -8067,6 +8069,7 @@ impl Engine {
                     self.session_parallel_workers(),
                 );
             }
+            self.record_sort_memory(&tagged);
         }
 
         // v7.17.0 Phase 3.P0-49 — `FETCH FIRST … WITH TIES` extends
@@ -10507,6 +10510,28 @@ impl Engine {
         Ok(Some(count))
     }
 
+    /// 9.0.0 — record what an in-memory sort is holding, for
+    /// `EXPLAIN (ANALYZE)`'s `Sort Method: … Memory: NkB`.
+    ///
+    /// The external sorter reports its own batch; the in-memory paths
+    /// hold a `(keys, row)` vector instead, and the line was missing
+    /// wherever a sort took one of those — which is every sort small
+    /// enough not to spill, i.e. most of them. Counted once, over the
+    /// rows the sort ends up holding, so it costs O(rows) once rather
+    /// than per row.
+    fn record_sort_memory(&self, tagged: &[(Vec<crate::orderby::OrderKey>, Row<'_>)]) {
+        use core::sync::atomic::Ordering;
+        let mut held = 0usize;
+        for (keys, row) in tagged {
+            held = held.saturating_add(crate::bytebudget::approx_values_bytes(&row.values));
+            held =
+                held.saturating_add(keys.len() * core::mem::size_of::<crate::orderby::OrderKey>());
+        }
+        self.spill_stats
+            .peak_bytes
+            .fetch_max(held as u64, Ordering::Relaxed);
+    }
+
     fn exec_joined_select(
         &self,
         stmt: &SelectStatement,
@@ -10873,6 +10898,7 @@ impl Engine {
                 &colls,
                 self.session_parallel_workers(),
             );
+            self.record_sort_memory(&tagged);
         }
         let mut output_rows: Vec<Row<'static>> = tagged.into_iter().map(|(_, r)| r).collect();
         apply_offset_and_limit(
@@ -15105,6 +15131,200 @@ impl crate::Engine {
         Ok(())
     }
 
+    /// 9.0.0 — a function NAME nothing answers to, refused before the
+    /// scan.
+    ///
+    /// PostgreSQL analyses the statement: `SELECT nofn(id) FROM t` is
+    /// `function nofn(integer) does not exist` whether or not `t` holds
+    /// a row. SPG raised only when a row reached the call, so over an
+    /// empty table the query answered zero rows and no error — and a
+    /// prepared statement DESCRIBED successfully.
+    ///
+    /// The name is judged against `KNOWN_FUNCTION_NAMES`, which is
+    /// derived by asking the dispatch itself (see `probe_knows_name`).
+    /// A9b's first attempt asked three static lists and refused 346 real
+    /// functions; a list standing beside a dispatch does not describe
+    /// it.
+    ///
+    /// Only a call whose arguments ALL have a statically knowable type
+    /// is refused here, for the same reason the arity check gives: the
+    /// sentence names the signature, and a signature guessed from
+    /// nothing is worse than the row-time raise.
+    ///
+    /// # Errors
+    /// `function <name>(<types>) does not exist`, PostgreSQL's wording.
+    pub(crate) fn validate_function_names(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let mut calls: Vec<(alloc::string::String, Vec<Expr>)> = Vec::new();
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                collect_function_calls(expr, &mut calls);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            collect_function_calls(w, &mut calls);
+        }
+        if let Some(h) = &stmt.having {
+            collect_function_calls(h, &mut calls);
+        }
+        for o in &stmt.order_by {
+            collect_function_calls(&o.expr, &mut calls);
+        }
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let cat = self.active_catalog();
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if let Some(table) = cat.get(&t.name) {
+                    cols.extend(table.schema().columns.iter().cloned());
+                }
+            }
+        }
+        for (name, args) in calls {
+            let lowered = name.to_ascii_lowercase();
+            if crate::eval::arity::KNOWN_FUNCTION_NAMES
+                .binary_search(&lowered.as_str())
+                .is_ok()
+            {
+                continue;
+            }
+            // Everything else a call can resolve to, none of which the
+            // dispatch table describes: a user function, an aggregate,
+            // a window function, a table function, a type's
+            // constructor. Asking the catalog is cheap and asking it
+            // here keeps the refusal to names nothing at all answers.
+            if cat
+                .functions()
+                .values()
+                .any(|f| f.name.eq_ignore_ascii_case(&lowered))
+            {
+                continue;
+            }
+            if crate::aggregate::is_aggregate_name(&lowered) {
+                continue;
+            }
+            // An EXTENSION's function exists only once the extension
+            // is installed, which is exactly what PostgreSQL says too.
+            // The table is derived on an engine with none installed, so
+            // every pg_trgm and uuid-ossp name reads as unknown there;
+            // here the catalog knows.
+            if let Some(ext) = crate::extension::supplying_extension(&lowered)
+                && cat.extensions().keys().any(|k| k.eq_ignore_ascii_case(ext))
+            {
+                continue;
+            }
+            // The clock family never reaches the scalar dispatch either:
+            // `preprocess` folds `now()` and its siblings to an instant
+            // before anything dispatches, so the probe that built the
+            // table calls those names unknown too. Asked of the folder.
+            if crate::clock::folds_clock_call(
+                &Expr::FunctionCall {
+                    name: lowered.clone(),
+                    args: args.clone(),
+                    syntax: spg_sql::ast::CallSyntax::Written,
+                },
+                self.speaks_mysql,
+            ) {
+                continue;
+            }
+            // A set-returning call never reaches the scalar dispatch —
+            // the SRF machinery expands it — so the probe that built
+            // the table calls it unknown. `unnest`, `generate_series`
+            // and the jsonb element family are all here.
+            if top_level_srf_kind(&Expr::FunctionCall {
+                name: lowered.clone(),
+                args: args.clone(),
+                syntax: spg_sql::ast::CallSyntax::Written,
+            })
+            .is_some()
+            {
+                continue;
+            }
+            let mut types: Vec<alloc::string::String> = Vec::new();
+            for a in &args {
+                let Some(t) = static_arg_type(a, &cols) else {
+                    types.clear();
+                    break;
+                };
+                types.push(t);
+            }
+            if types.len() != args.len() {
+                continue;
+            }
+            return Err(EngineError::Eval(EvalError::TypeMismatch {
+                detail: alloc::format!("function {lowered}({}) does not exist", types.join(", ")),
+            }));
+        }
+        Ok(())
+    }
+
+    /// 9.0.0 — a string literal that cannot be read as the type it is
+    /// compared with, refused before the scan.
+    ///
+    /// PostgreSQL resolves `r = 'abc'` on a `real` column at ANALYSIS
+    /// time and answers `invalid input syntax for type real: "abc"`
+    /// whether or not the table holds a row. SPG coerced per row, so an
+    /// empty table answered `0` and no error — and the same statement
+    /// raised the moment a row arrived, which is the shape this release
+    /// has closed in four other places.
+    ///
+    /// Only an unknown STRING literal against a statically known type is
+    /// judged: that is the case PostgreSQL resolves with the type's own
+    /// input function, and the error is that function's. A literal of
+    /// any other kind, or an operand whose type needs a row, is left to
+    /// the row-time path.
+    ///
+    /// # Errors
+    /// The input function's, in PostgreSQL 18.6's words.
+    pub(crate) fn validate_literal_coercions(
+        &self,
+        stmt: &SelectStatement,
+    ) -> Result<(), EngineError> {
+        let cat = self.active_catalog();
+        let mut cols: Vec<ColumnSchema> = Vec::new();
+        if let Some(from) = &stmt.from {
+            for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
+                if let Some(table) = cat.get(&t.name) {
+                    cols.extend(table.schema().columns.iter().cloned());
+                }
+            }
+        }
+        if cols.is_empty() {
+            return Ok(());
+        }
+        let mut pairs: Vec<(spg_storage::DataType, alloc::string::String)> = Vec::new();
+        let mut collect =
+            |e: &Expr, out: &mut Vec<(spg_storage::DataType, alloc::string::String)>| {
+                collect_literal_coercions(e, &cols, out);
+            };
+        for it in &stmt.items {
+            if let spg_sql::ast::SelectItem::Expr { expr, .. } = it {
+                collect(expr, &mut pairs);
+            }
+        }
+        if let Some(w) = &stmt.where_ {
+            collect(w, &mut pairs);
+        }
+        if let Some(h) = &stmt.having {
+            collect(h, &mut pairs);
+        }
+        for o in &stmt.order_by {
+            collect(&o.expr, &mut pairs);
+        }
+        for (ty, lit) in pairs {
+            if let Err(EngineError::Eval(ev)) =
+                crate::conversions::coerce_value(spg_storage::Value::text(lit), ty, "", 0)
+            {
+                return Err(EngineError::Eval(ev));
+            }
+        }
+        Ok(())
+    }
+
     /// v7.40.11 — the DML half of [`Self::validate_from_relations`].
     ///
     /// PostgreSQL analyses an INSERT / UPDATE / DELETE at PREPARE the
@@ -15666,6 +15886,74 @@ fn collect_subqueries<'a>(e: &'a Expr, out: &mut Vec<&'a SelectStatement>) {
 
 /// 9.0.0 — the first comparison in `e` whose two operands have certain
 /// types, one of them oid-ish, that `types_unify` refuses. See
+/// 9.0.0 — every `(type, string literal)` pair a statement asks
+/// PostgreSQL to coerce: an unknown literal meeting an operand whose
+/// type is known without a row. See
+/// [`Engine::validate_literal_coercions`].
+fn collect_literal_coercions(
+    e: &Expr,
+    cols: &[ColumnSchema],
+    out: &mut Vec<(spg_storage::DataType, alloc::string::String)>,
+) {
+    use spg_sql::ast::{BinOp, Literal};
+    // The type an operand has without reading a row. A column or a cast
+    // only: a call's result type is knowable too, but PostgreSQL then
+    // resolves the OVERLOAD rather than the literal, which is a
+    // different question.
+    let certain = |x: &Expr| -> Option<spg_storage::DataType> {
+        match x {
+            Expr::Column(_) | Expr::Cast { .. } => crate::describe::describe_expr_type(x, cols),
+            _ => None,
+        }
+    };
+    // A string literal meeting a text-family type needs no coercion —
+    // it IS one — and a json column takes any text the parser accepts,
+    // which is the row-time path's question.
+    let text_like = |t: spg_storage::DataType| {
+        matches!(
+            t,
+            spg_storage::DataType::Text
+                | spg_storage::DataType::Varchar(_)
+                | spg_storage::DataType::Char(_)
+                | spg_storage::DataType::Name
+                | spg_storage::DataType::Json
+                | spg_storage::DataType::Jsonb
+        )
+    };
+    // The one walk, so a nested operand is reached the same way the top
+    // one is. `for_each_node_mut` hands over every node including this.
+    let mut walked = e.clone();
+    let Ok(()) = walked.for_each_node_mut::<core::convert::Infallible>(
+        &mut |node| {
+            if let Expr::Binary { lhs, op, rhs } = node
+                && matches!(
+                    op,
+                    BinOp::Eq
+                        | BinOp::NotEq
+                        | BinOp::Lt
+                        | BinOp::LtEq
+                        | BinOp::Gt
+                        | BinOp::GtEq
+                        | BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                )
+            {
+                for (a, b) in [(lhs.as_ref(), rhs.as_ref()), (rhs.as_ref(), lhs.as_ref())] {
+                    if let (Some(ty), Expr::Literal(Literal::String(s))) = (certain(a), b)
+                        && !text_like(ty)
+                    {
+                        out.push((ty, s.clone()));
+                    }
+                }
+            }
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    );
+}
+
 /// [`Engine::validate_oid_comparisons`].
 fn oid_comparison_mismatch(
     e: &Expr,
@@ -16900,6 +17188,7 @@ impl Engine {
                     on: None,
                     using_cols: None,
                     natural: false,
+                    comma: false,
                 }),
             }
         }
@@ -17654,6 +17943,7 @@ fn dml_shaped_select(
         on: None,
         using_cols: None,
         natural: false,
+        comma: false,
     };
     SelectStatement {
         from: Some(spg_sql::ast::FromClause {
