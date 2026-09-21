@@ -7,7 +7,7 @@ Per-corpus pass / fail / skip:
 | `15_regressions` | 367 | 0 | 0 | 100.0% | mysql × 2, postgres × 27 |
 | `duckdb` | 170 | 0 | 0 | 100.0% | postgres × 21 |
 | `mysql` | 451 | 0 | 0 | 100.0% | mysql × 27 |
-| `pg_regress` | 1508 | 0 | 0 | 100.0% | postgres × 89 |
+| `pg_regress` | 1512 | 0 | 0 | 100.0% | postgres × 89 |
 | `pgvector` | 76 | 0 | 0 | 100.0% | postgres × 9 |
 | `spg_baseline/01_basic_dml` | 127 | 0 | 0 | 100.0% | postgres × 15 |
 | `spg_baseline/02_data_types` | 116 | 0 | 0 | 100.0% | postgres × 18 |
@@ -144,7 +144,7 @@ Per-corpus pass / fail / skip:
 | `18_materialized_views.test` | 31 | 0 | 0 | postgres |
 | `19_enum_types.test` | 19 | 0 | 0 | postgres |
 | `20_domain_types.test` | 33 | 0 | 0 | postgres |
-| `21_schemas.test` | 19 | 0 | 0 | postgres |
+| `21_schemas.test` | 23 | 0 | 0 | postgres |
 | `22_fulltext_index.test` | 19 | 0 | 0 | postgres |
 | `23_statement_timeout.test` | 12 | 0 | 0 | postgres |
 | `24_application_name.test` | 7 | 0 | 0 | postgres |

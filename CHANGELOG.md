@@ -248,6 +248,17 @@ been masking the arity — so both are listed at PostgreSQL's oids, and
 PostgreSQL, which extends the array leftwards and gives it a new lower
 bound. SPG's arrays have none to give.
 
+### Fixed — a dump of an identity table did not restore
+
+`COPY t (id, n) FROM stdin` into a `GENERATED ALWAYS AS IDENTITY`
+column answered `cannot insert a non-DEFAULT value into column "id"`.
+PostgreSQL takes the value there and refuses the identical `INSERT`,
+which is what `pg_dump` relies on — it writes a table's data as COPY.
+COPY rides the INSERT path here, so it inherited a refusal PostgreSQL
+does not make, and the restore stopped on the first such table. Caught
+by the dump-compat fixture panel, which is the only instrument that
+reads a whole dump back.
+
 ### Fixed — one list of pre-scan checks, so the wire runs the same ones
 
 `SELECT o = n` with an `oid` and a `numeric` column answered `t` over

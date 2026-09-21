@@ -535,7 +535,17 @@ pub fn build_copy_insert(
         }
         sql.push_str(") ");
     }
-    sql.push_str("VALUES (");
+    // 9.0.0 — COPY may supply a value for a `GENERATED ALWAYS AS
+    // IDENTITY` column; INSERT may not. Measured on PostgreSQL 18.6:
+    // `COPY t (id, n) FROM stdin` into such a column takes the value,
+    // and the identical `INSERT` answers `cannot insert a non-DEFAULT
+    // value into column "id"`. That is what `pg_dump` relies on — it
+    // writes the data as COPY — and COPY rides the INSERT path here, so
+    // it inherited a refusal PostgreSQL does not make and a dump of an
+    // identity table would not restore. `OVERRIDING SYSTEM VALUE` is
+    // PostgreSQL's own spelling for exactly this permission, and both
+    // engines accept it on a table that has no identity column at all.
+    sql.push_str("OVERRIDING SYSTEM VALUE VALUES (");
     for (i, v) in values.iter().enumerate() {
         if i > 0 {
             sql.push_str(", ");
@@ -753,15 +763,18 @@ mod tests {
 
     #[test]
     fn builds_inserts_with_column_list() {
+        // 9.0.0 — `OVERRIDING SYSTEM VALUE` is here because COPY may
+        // fill a `GENERATED ALWAYS AS IDENTITY` column and INSERT may
+        // not; see `build_copy_insert`.
         let cols = vec!["id".to_string(), "note".to_string()];
         let row = vec![Some("7".to_string()), Some("it's".to_string())];
         assert_eq!(
             build_copy_insert("t", Some(&cols), &row),
-            "INSERT INTO t (id, note) VALUES (7, 'it''s')"
+            "INSERT INTO t (id, note) OVERRIDING SYSTEM VALUE VALUES (7, 'it''s')"
         );
         assert_eq!(
             build_copy_insert("t", None, &[None, Some("0042".to_string())]),
-            "INSERT INTO t VALUES (NULL, '0042')"
+            "INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (NULL, '0042')"
         );
     }
 

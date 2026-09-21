@@ -6738,7 +6738,9 @@ fn build_copy_insert_from_json(
         }
         sql.push_str(c);
     }
-    sql.push_str(") VALUES (");
+    // 9.0.0 — see `spg_engine::copy::build_copy_insert`: COPY may fill a
+    // `GENERATED ALWAYS AS IDENTITY` column and INSERT may not.
+    sql.push_str(") OVERRIDING SYSTEM VALUE VALUES (");
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
             sql.push(',');

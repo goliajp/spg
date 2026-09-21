@@ -163,7 +163,7 @@
         { "file": "v73814_setop_collation.test", "pass": 21, "fail": 0, "skip": 0, "dialect": "mysql",
           "fail_reasons": [] }
       ] },
-    { "name": "pg_regress", "pass": 1508, "fail": 0, "skip": 0,
+    { "name": "pg_regress", "pass": 1512, "fail": 0, "skip": 0,
       "files": [
         { "file": "01_create_table_shapes.test", "pass": 13, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
@@ -205,7 +205,7 @@
           "fail_reasons": [] },
         { "file": "20_domain_types.test", "pass": 33, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
-        { "file": "21_schemas.test", "pass": 19, "fail": 0, "skip": 0, "dialect": "postgres",
+        { "file": "21_schemas.test", "pass": 23, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },
         { "file": "22_fulltext_index.test", "pass": 19, "fail": 0, "skip": 0, "dialect": "postgres",
           "fail_reasons": [] },

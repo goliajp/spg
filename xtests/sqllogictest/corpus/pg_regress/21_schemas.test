@@ -55,7 +55,12 @@ DROP SCHEMA does_not_exist
 statement error
 DROP SCHEMA public
 
-# ---- prefix routing for schema-qualified tables ----
+# ---- 9.0.0 (C9): a relation belongs to its schema ----
+#
+# This section pinned PREFIX ROUTING: `app.users` and `analytics.users`
+# both resolved to a bare `users`, and a bare `users` found it too.
+# That was a silent wrong answer — a two-schema application read the
+# other schema's rows — and it is what C9 closed.
 
 statement ok
 CREATE TABLE app.users (id INT NOT NULL, name TEXT)
@@ -63,21 +68,37 @@ CREATE TABLE app.users (id INT NOT NULL, name TEXT)
 statement ok
 INSERT INTO app.users VALUES (1, 'alice'), (2, 'bob')
 
-# Bare-name lookup works (Phase 1.6 = prefix routing only).
-query IT rowsort
+# `app` is not on the default search path, so the bare name finds
+# nothing — PostgreSQL 18.6's answer.
+statement error
 SELECT id, name FROM users
+
+# …and a relation of the same name in another schema is another
+# relation, which this database does not have.
+statement error
+SELECT count(*) FROM analytics.users
+
+# Qualified, it answers.
+query IT rowsort
+SELECT id, name FROM app.users
 ----
 1
 alice
 2
 bob
 
-# A different schema prefix resolves to the same table.
+# The search path reaches it bare.
+statement ok
+SET search_path TO app
+
 query I
-SELECT count(*) FROM analytics.users
+SELECT count(*) FROM users
 ----
 2
 
+statement ok
+RESET search_path
+
 # 7.38.1 S4.2 — cleanup discipline: leave nothing behind.
 statement ok
-DROP TABLE IF EXISTS users CASCADE
+DROP TABLE IF EXISTS app.users CASCADE
