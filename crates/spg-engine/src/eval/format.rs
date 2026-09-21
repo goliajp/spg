@@ -987,6 +987,32 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
     parse_date_literal_ordered(s, DateOrder::Mdy)
 }
 
+/// 9.0.0 — PostgreSQL's `date` range, measured on 18.6: `4714-11-24 BC`
+/// through `5874897-12-31`, both accepted, and one day outside either end
+/// is `date out of range`. SPG stored anything an i32 day count could
+/// hold, so `'5874898-01-01'::date` answered where PostgreSQL refuses.
+#[must_use]
+pub fn date_days_in_pg_range(days: i32) -> bool {
+    // `infinity` / `-infinity` are the two values OUTSIDE the calendar
+    // that PostgreSQL accepts, carried here as the extremes of the day
+    // count. They are not dates and the range does not judge them.
+    if days == i32::MAX || days == i32::MIN {
+        return true;
+    }
+    let (y, m, d) = civil_from_days(days);
+    if y > 5_874_897 {
+        return false;
+    }
+    // 4714 BC is astronomical year -4713; there is no year zero.
+    if y < -4713 {
+        return false;
+    }
+    if y == -4713 {
+        return (m, d) >= (11, 24);
+    }
+    true
+}
+
 /// v7.39 (GUC knife 5) — DateOrder-aware date input. PG disambiguates
 /// a three-field numeric date (`01/02/2024`, `02.01.2024`, `1/2/24`)
 /// by the DateStyle field order: MDY reads month first (the default —
@@ -997,6 +1023,12 @@ pub fn parse_date_literal(s: &str) -> Option<i32> {
 /// PG does NOT auto-swap). ISO year-first four-digit forms parse the
 /// same under every order.
 pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
+    parse_date_literal_unranged(s, order).filter(|d| date_days_in_pg_range(*d))
+}
+
+/// The parse itself, without PostgreSQL's range. Split out so the BC
+/// branch can recurse without re-checking a partial result.
+fn parse_date_literal_unranged(s: &str, order: DateOrder) -> Option<i32> {
     let s = s.trim();
     // v7.39 (GUC knife 6, BC) — a trailing era marker: `NNNN-MM-DD BC`
     // maps year N to astronomical year 1-N (there is no year zero);
@@ -1006,7 +1038,7 @@ pub fn parse_date_literal_ordered(s: &str, order: DateOrder) -> Option<i32> {
         .or_else(|| s.strip_suffix(" bc"))
         .or_else(|| s.strip_suffix(" Bc"))
     {
-        let days = parse_date_literal_ordered(base, order)?;
+        let days = parse_date_literal_unranged(base, order)?;
         let (y, m, d) = civil_from_days(days);
         if y < 1 {
             return None;
@@ -1254,6 +1286,14 @@ pub fn parse_timestamp_literal_tz_ordered(s: &str, order: DateOrder) -> Option<(
         return Some((v, true));
     }
     let (days, day_micros, tz) = parse_timestamp_parts(s, order)?;
+    // 9.0.0 — PostgreSQL's timestamp range starts at the same instant its
+    // date range does: measured on 18.6, `'4714-11-23 BC'::timestamp` is
+    // `timestamp out of range` and `'4714-11-24 BC'` answers. SPG stored
+    // anything the arithmetic below did not overflow. The two infinities
+    // are handled by `timestamp_sentinel` above and never reach here.
+    if !date_days_in_pg_range(days) {
+        return None;
+    }
     let t = i64::from(days)
         .checked_mul(86_400_000_000)?
         .checked_add(day_micros)?
@@ -1373,6 +1413,10 @@ pub fn parse_timestamp_literal_wall_ordered(s: &str, order: DateOrder) -> Option
     // Ignoring the offset is simply not applying it: the parts reader
     // already reports the LOCAL clock separately.
     let (days, day_micros, _tz) = parse_timestamp_parts(s, order)?;
+    // 9.0.0 — the same lower bound the tz variant applies.
+    if !date_days_in_pg_range(days) {
+        return None;
+    }
     i64::from(days)
         .checked_mul(86_400_000_000)?
         .checked_add(day_micros)
@@ -1422,6 +1466,19 @@ fn timestamp_sentinel(s: &str) -> Option<i64> {
 /// The wire splits the `\nHINT:  ` tail into the ErrorResponse `H` field.
 #[must_use]
 pub(crate) fn datetime_input_error_text(text: &str, type_name: &str) -> alloc::string::String {
+    // 9.0.0 — a well-formed value outside the TYPE's range is its own
+    // sentence on PostgreSQL 18.6: `date out of range: "5874898-01-01"`
+    // and `timestamp out of range: "294277-01-01"`, where a bad FIELD
+    // (`'2020-13-01'`) stays `date/time field value out of range`. SPG
+    // answered one of the other two for all three.
+    if datetime_text_year_is_beyond(text, type_name) {
+        let ty = if type_name.starts_with("timestamp") {
+            "timestamp"
+        } else {
+            type_name
+        };
+        return alloc::format!("{ty} out of range: \"{}\"", text.trim());
+    }
     let (kind, hint) = classify_datetime_input(text);
     match kind {
         DatetimeInputProblem::Syntax => {
@@ -1435,6 +1492,45 @@ pub(crate) fn datetime_input_error_text(text: &str, type_name: &str) -> alloc::s
             m
         }
     }
+}
+
+/// 9.0.0 — is this text a well-formed calendar date that the TYPE cannot
+/// hold? PostgreSQL 18.6 gives those their own sentence (`date out of
+/// range`, `timestamp out of range`) and keeps `date/time field value out
+/// of range` for a bad FIELD (month 13, February 30).
+///
+/// Decided by PARSING rather than by reading the year off the text: the
+/// unranged parser answers exactly the question "would this be a date if
+/// the type were unbounded", which is what separates the two sentences.
+/// PostgreSQL's limits, measured: `date` spans `4714-11-24 BC` to
+/// `5874897-12-31`, `timestamp` the same start and `294276-12-31
+/// 23:59:59`.
+fn datetime_text_year_is_beyond(text: &str, type_name: &str) -> bool {
+    let t = text.trim();
+    // Split the era off first, then the time-of-day, then put the era
+    // back: `4714-01-01 00:00:00 BC` has to be read as the date
+    // `4714-01-01 BC`, which is what decides the range.
+    let (body, bc) = match t.strip_suffix(" BC").or_else(|| t.strip_suffix(" bc")) {
+        Some(b) => (b.trim_end(), true),
+        None => (t, false),
+    };
+    let date_part = body.split([' ', 'T']).next().unwrap_or(body);
+    let candidate = if bc {
+        alloc::format!("{date_part} BC")
+    } else {
+        alloc::string::String::from(date_part)
+    };
+    let Some(days) = parse_date_literal_unranged(&candidate, DateOrder::Mdy) else {
+        return false;
+    };
+    if !date_days_in_pg_range(days) {
+        return true;
+    }
+    if type_name == "date" {
+        return false;
+    }
+    let (y, _, _) = civil_from_days(days);
+    y > 294_276
 }
 
 enum DatetimeInputProblem {
