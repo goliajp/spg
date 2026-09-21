@@ -74,6 +74,17 @@ mod guc_catalog;
 mod immutable_fn;
 mod index_access;
 mod index_def;
+mod info_schema;
+
+/// 9.0.0 (N23) — every `information_schema` relation PostgreSQL 18.6
+/// publishes, for the pin that asks each one whether it answers.
+///
+/// Public because the pin lives in the e2e crate; the list itself is
+/// the module's, read off PG's own `information_schema.columns`.
+#[must_use]
+pub fn info_schema_relation_names_for_test() -> alloc::vec::Vec<&'static str> {
+    info_schema::info_schema_relation_names().collect()
+}
 mod join;
 mod join_using;
 mod joinfold;
