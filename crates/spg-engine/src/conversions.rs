@@ -4235,11 +4235,51 @@ fn datetime_parse_error(ty: &str, s: &str) -> EngineError {
             c.is_ascii_digit() || matches!(c, '-' | '/' | ':' | '.' | ' ' | '+' | 'T' | 't')
         });
     let detail = if date_shaped {
-        alloc::format!("date/time field value out of range: \"{t}\"")
+        // 9.0.0 — PostgreSQL splits this further: a FIELD out of range
+        // (month 13, February 30) is `date/time field value out of
+        // range`, while a well-formed date outside the type's own range
+        // is `<type> out of range`. Measured on 18.6:
+        //   '2020-13-01'::date     date/time field value out of range
+        //   '5874898-01-01'::date  date out of range
+        //   '294277-01-01'::ts     timestamp out of range
+        // SPG answered the first sentence for all three.
+        if datetime_text_is_beyond_range(ty, t) {
+            alloc::format!("{ty} out of range: \"{t}\"")
+        } else {
+            alloc::format!("date/time field value out of range: \"{t}\"")
+        }
     } else {
         alloc::format!("invalid input syntax for type {ty}: \"{t}\"")
     };
     EngineError::Eval(EvalError::TypeMismatch { detail })
+}
+
+/// 9.0.0 — is this date-shaped text out of the TYPE's range rather than
+/// carrying an out-of-range field? The year decides: every field-level
+/// failure PostgreSQL reports has a year inside the representable span,
+/// and every range failure has one outside it.
+///
+/// PostgreSQL's own limits, measured on 18.6: `date` accepts
+/// `4714-11-24 BC` through `5874897-12-31`, and `timestamp` accepts
+/// `4714-11-24 BC` through `294276-12-31 23:59:59`.
+fn datetime_text_is_beyond_range(ty: &str, t: &str) -> bool {
+    let body = t
+        .strip_suffix(" BC")
+        .or_else(|| t.strip_suffix(" bc"))
+        .unwrap_or(t);
+    let year: i64 = match body.split(['-', '/', ' ']).next() {
+        Some(first) if first.len() >= 4 => match first.parse() {
+            Ok(y) => y,
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    // The BC side is a field question in practice: `4714-11-23 BC` is one
+    // DAY past the limit and PostgreSQL still says `date out of range`,
+    // which the year alone cannot tell. Only the forward direction is
+    // decided here; the BC boundary keeps the field wording it has.
+    let limit = if ty == "date" { 5_874_897 } else { 294_276 };
+    year > limit
 }
 
 /// v7.39 (read01 round 113) — the underlying scalar of a `jsonb` value being

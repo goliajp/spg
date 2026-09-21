@@ -2307,15 +2307,27 @@ fn cast_to_date(v: Value) -> Result<Value, EvalError> {
             // floor to the date via the same path as the Timestamp arm.
             if let Some(t) = parse_timestamp_literal(&s) {
                 let days = t.div_euclid(86_400_000_000);
-                return i32::try_from(days)
-                    .map(Value::Date)
-                    .map_err(|_| EvalError::TypeMismatch {
-                        detail: "timestamp out of DATE range".into(),
-                    });
+                // 9.0.0 — this fallback bypassed the date range: a BC
+                // date one day past PostgreSQL's limit failed the date
+                // parser and then came back through the timestamp one.
+                if let Ok(d) = i32::try_from(days)
+                    && crate::eval::format::date_days_in_pg_range(d)
+                {
+                    return Ok(Value::Date(d));
+                }
+                return Err(EvalError::TypeMismatch {
+                    detail: alloc::format!("date out of range: \"{}\"", s.trim()),
+                });
             }
             // PG error split: numeric-shaped input whose field values
             // fail the calendar checks is "out of range" (plus PG's
             // DateStyle hint); anything else is an input-syntax error.
+            // 9.0.0 — and a well-formed date past the type's own range is
+            // a third sentence, which `datetime_input_error_text` picks.
+            let ranged = crate::eval::format::datetime_input_error_text(&s, "date");
+            if ranged.starts_with("date out of range") {
+                return Err(EvalError::TypeMismatch { detail: ranged });
+            }
             if super::format::date_text_is_field_shaped(&s) {
                 return Err(EvalError::TypeMismatch {
                     detail: format!(

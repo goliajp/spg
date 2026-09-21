@@ -1128,6 +1128,7 @@ mod e2e_composite_field;
 mod e2e_composite_index_v7381;
 mod e2e_correlated_order_by_v73912;
 mod e2e_date_trunc_units;
+mod e2e_datetime_range_900;
 mod e2e_default_expr_text;
 mod e2e_dml_row_locks_v7381;
 mod e2e_encode_bytea;
