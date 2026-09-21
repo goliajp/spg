@@ -1676,6 +1676,16 @@ pub struct Engine {
     /// callers can ignore or surface them). Cleared at the start of
     /// every statement so a notice never leaks into the next one.
     pending_notices: Vec<Notice>,
+    /// 9.0.0 (A4b) — the `CONTEXT:` line the last statement's error
+    /// carries, when it was raised inside a PL/pgSQL body.
+    ///
+    /// PostgreSQL ends such an error with
+    /// `CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE`
+    /// and SPG sent the ERROR alone, so a client could see that
+    /// something failed but not where inside the function. It rides here
+    /// rather than on `EngineError` for the same reason the NOTICEs do:
+    /// one channel per statement, read by the wire on its way out.
+    pending_error_context: Option<String>,
     /// v7.38 (read01 P3.12) — cumulative row-write counters feeding
     /// `pg_stat_database` (database-wide `tup_inserted` / `tup_updated` /
     /// `tup_deleted`). Bumped by the affected-row count of each successful
@@ -2061,6 +2071,7 @@ impl Engine {
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
+            pending_error_context: None,
             spill_stats: crate::tempstore::SpillStats::default(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -2586,6 +2597,7 @@ impl Engine {
             tx_pending_notifies: Vec::new(),
             delivered_notifies: Vec::new(),
             pending_notices: Vec::new(),
+            pending_error_context: None,
             spill_stats: crate::tempstore::SpillStats::default(),
             xact_commit: core::sync::atomic::AtomicU64::new(0),
             xact_rollback: core::sync::atomic::AtomicU64::new(0),
@@ -2734,6 +2746,7 @@ impl Engine {
                     tx_pending_notifies: Vec::new(),
                     delivered_notifies: Vec::new(),
                     pending_notices: Vec::new(),
+                    pending_error_context: None,
                     spill_stats: crate::tempstore::SpillStats::default(),
                     xact_commit: core::sync::atomic::AtomicU64::new(0),
                     xact_rollback: core::sync::atomic::AtomicU64::new(0),

@@ -25,7 +25,7 @@ use crate::ast::{
     FromClause, FromJoin, FunctionArg, FunctionArgMode, FunctionArgType, FunctionAttrs,
     FunctionBody, FunctionParallel, FunctionReturn, FunctionVolatility, GrantObject, GrantPriv,
     GrantStatement, IndexMethod, InsertStatement, IsolationLevel, JoinKind, Literal, MysqlIntWidth,
-    NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt,
+    NullTreatment, OrderBy, Overriding, PlPgSqlBlock, PlPgSqlDeclare, PlPgSqlStmt, PlPgSqlStmtKind,
     PublicationScope, RaiseLevel, RangeKindAst, ReturnTarget, SelectItem, SelectStatement,
     SrcToken, Statement, TableRef, TriggerEvent, TriggerForEach, TriggerTiming, UnOp, UnionKind,
     VecEncoding, WindowFrame,
@@ -129,42 +129,39 @@ fn is_dump_noise_statement(lc: &str) -> bool {
 /// generalisation applies everywhere an identifier may appear,
 /// not just in the contexts these tokens were introduced for.
 fn unreserved_keyword_text(tok: &Token) -> Option<String> {
-    let s = match tok {
-        // PG keyword class: unreserved or col_name.
-        //
-        Token::Release => "release",
-        Token::Savepoint => "savepoint",
-        Token::Show => "show",
-        Token::Index => "index",
-        Token::Begin => "begin",
-        Token::Commit => "commit",
-        Token::Rollback => "rollback",
-        Token::Drop => "drop",
-        Token::Insert => "insert",
-        Token::Values => "values",
-        Token::Limit => "limit",
-        Token::Partition => "partition",
-        Token::Tables => "tables",
-        Token::Connection => "connection",
-        Token::Publication => "publication",
-        Token::Subscription => "subscription",
-        Token::Interval => "interval",
-        // `extract` is non-reserved in PG too (it's a function the
-        // parser dispatches via context — outside that context it's
-        // a plain identifier).
-        Token::Extract => "extract",
-        Token::Offset => "offset",
-        // `to` is reserved in PG (used in many "AS … TO …" forms), so
-        // it is NOT relaxed here. Same for `from`, `where`, `as`,
-        // `select`, `not`, `and`, `or`, `null`, `true`, `false`,
-        // `create`, `table`, `into`, `on`, `order`, `by`, `having`,
-        // `group`, `distinct`, `union`, `all`, `join`, `inner`,
-        // `left`, `cross`, `outer`, `default`, `is`, `between`,
-        // `in`, `like`, `for`, `except`, `desc`, `asc`, `partition`
-        // (partial — keep partition as unreserved per modern PG).
-        _ => return None,
-    };
-    Some(s.to_string())
+    // 9.0.0 (N16) — the SPELLING comes from the lexer, which owns it.
+    // This list answers the other question, which is PostgreSQL's
+    // CLASSIFICATION: `to` is reserved there (it opens many `AS … TO …`
+    // forms), and so are `from`, `where`, `as`, `select`, `not`, `and`,
+    // `or`, `null`, `true`, `false`, `create`, `table`, `into`, `on`,
+    // `order`, `having`, `group`, `distinct`, `union`, `all`, `join`,
+    // `inner`, `left`, `cross`, `outer`, `default`, `is`, `between`,
+    // `in`, `like`, `for`, `except`, `desc`, `asc`.
+    const UNRESERVED: &[&str] = &[
+        "begin",
+        "commit",
+        "connection",
+        "drop",
+        "extract",
+        "index",
+        "insert",
+        "interval",
+        "limit",
+        "offset",
+        "partition",
+        "publication",
+        "release",
+        "rollback",
+        "savepoint",
+        "show",
+        "subscription",
+        "tables",
+        "values",
+    ];
+    let text = crate::lexer::keyword_text(tok)?;
+    UNRESERVED
+        .contains(&text)
+        .then(|| alloc::string::String::from(text))
 }
 
 /// v7.9.22 — recognise pgvector / SPG vector-index opclass names
@@ -504,6 +501,22 @@ pub struct ParseError {
     /// 1-based char position is recovered on the cold error path by
     /// [`syntax_error_position`], which re-tokenizes to map this token index.
     pub token_pos: usize,
+    /// 9.0.0 (N17) — the byte offset INSIDE a PL/pgSQL body, when the
+    /// error came from parsing one.
+    ///
+    /// A body is lexed in a context of its own — the outer statement
+    /// carries it as ONE dollar-quoted token — so `token_pos` indexes
+    /// the body's token stream and means nothing in the outer text.
+    /// PostgreSQL 18.6 draws its caret inside the body
+    /// (`LINE 4:   END LOOP zz;`) and SPG sent the sentence alone. With
+    /// the body's own offset here and the body TOKEN's index in
+    /// `token_pos`, the wire adds the two.
+    ///
+    /// It costs nothing on the recursive parse stack, which is what kept
+    /// a position off this struct: measured, `ParseError` is 32 bytes
+    /// against `Expr`'s 176, and `Result<Expr, ParseError>` is 176
+    /// either way.
+    pub body_pos: Option<u32>,
 }
 
 impl fmt::Display for ParseError {
@@ -524,6 +537,7 @@ impl From<LexError> for ParseError {
         Self {
             message: format!("lex: {e}"),
             token_pos: 0,
+            body_pos: None,
         }
     }
 }
@@ -588,6 +602,13 @@ pub fn parse_statement_with(input: &str, dialect: lexer::Dialect) -> Result<Stat
 /// `invalid input syntax for type bigint: "abc"`) are left alone — those
 /// are PG's own errors, not its syntax error.
 fn shape_syntax_error(e: ParseError, input: &str, offsets: &[usize]) -> ParseError {
+    // 9.0.0 (N17) — an error from inside a PL/pgSQL body was already
+    // shaped against the BODY's own text; the outer token it now points
+    // at is the dollar-quoted string, and naming that would answer
+    // `syntax error at or near "$$"` for a fault four lines inside it.
+    if e.body_pos.is_some() {
+        return e;
+    }
     if !(e.message.starts_with("expected ") || e.message.starts_with("unexpected token ")) {
         return e;
     }
@@ -598,6 +619,7 @@ fn shape_syntax_error(e: ParseError, input: &str, offsets: &[usize]) -> ParseErr
     ParseError {
         message,
         token_pos: e.token_pos,
+        body_pos: e.body_pos,
     }
 }
 
@@ -637,6 +659,7 @@ fn shape_lex_error(e: &lexer::LexError, input: &str) -> ParseError {
     ParseError {
         message,
         token_pos: 0,
+        body_pos: None,
     }
 }
 
@@ -777,6 +800,10 @@ pub fn syntax_error_position(
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// 9.0.0 (A4b) — the line each token sits on, when this parser is
+    /// reading a PL/pgSQL body. Empty otherwise, which is what makes
+    /// [`Parser::line_of_token`] answer 0 for every other parse.
+    body_lines: Vec<u32>,
     /// v7.39 (round 274) — the session's dialect, carried by the same
     /// signal that drives string-literal escaping: `SET sql_mode` (only
     /// MySQL clients and mysqldump preambles emit it) turns it on,
@@ -947,7 +974,27 @@ impl Parser {
             last_consumed: 0,
             src: None,
             merges: Vec::new(),
+            body_lines: Vec::new(),
         }
+    }
+
+    /// 9.0.0 (A4b) — record which line of `body` each token sits on, so
+    /// a statement can carry its line into `CONTEXT`.
+    fn with_body_lines(mut self, body: &str, offsets: &[usize]) -> Self {
+        let mut lines = Vec::with_capacity(offsets.len());
+        let mut line = 1u32;
+        let mut at = 0usize;
+        for &off in offsets {
+            while at < off && at < body.len() {
+                if body.as_bytes()[at] == b'\n' {
+                    line += 1;
+                }
+                at += 1;
+            }
+            lines.push(line);
+        }
+        self.body_lines = lines;
+        self
     }
 
     /// Hand the parser the text it is parsing, for [`Parser::source_span`].
@@ -1032,6 +1079,7 @@ impl Parser {
         ParseError {
             message,
             token_pos: self.pos,
+            body_pos: None,
         }
     }
 
@@ -1042,7 +1090,11 @@ impl Parser {
     /// sentence quotes the source from there to the end of the statement,
     /// so an error raised after the construct it is about quotes nothing.
     fn err_at(&self, token_pos: usize, message: String) -> ParseError {
-        ParseError { message, token_pos }
+        ParseError {
+            message,
+            token_pos,
+            body_pos: None,
+        }
     }
 
     fn expect_eof(&self) -> Result<(), ParseError> {
@@ -1115,6 +1167,7 @@ impl Parser {
                     return Err(ParseError {
                         message: alloc::format!("expected identifier, got {other:?}"),
                         token_pos: self.consumed_pos(),
+                        body_pos: None,
                     });
                 }
             }
@@ -2024,6 +2077,7 @@ impl Parser {
                 return Err(ParseError {
                     message: format!("expected identifier, got {other:?}"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
         };
@@ -2044,6 +2098,7 @@ impl Parser {
                     return Err(ParseError {
                         message: format!("expected identifier after '{first}.', got {other:?}"),
                         token_pos: self.consumed_pos(),
+                        body_pos: None,
                     });
                 }
             }
@@ -2087,6 +2142,32 @@ impl Parser {
         }
     }
 
+    /// 9.0.0 (N16) — one identifier in a PL/pgSQL body, where ANY
+    /// keyword is a legal name.
+    ///
+    /// PL/pgSQL's scanner is its own: PostgreSQL 18.6 accepts
+    /// `DO $$ <<inner>> DECLARE x int := 1; BEGIN … END $$` and a
+    /// `DECLARE inner int`, where SPG answered `expected identifier, got
+    /// Inner` and refused the whole block. The spelling comes from
+    /// [`crate::lexer::keyword_text`], so no list is repeated here.
+    ///
+    /// Referring to such a variable unquoted in an expression is a
+    /// syntax error on PostgreSQL too — the SQL scanner reads that half
+    /// — so this accepts the declaration without promising more.
+    fn expect_plpgsql_ident(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(s) | Token::QuotedIdent(s) => Ok(s),
+            ref other => match crate::lexer::keyword_text(other) {
+                Some(s) => Ok(alloc::string::String::from(s)),
+                None => Err(ParseError {
+                    message: format!("expected identifier, got {other:?}"),
+                    token_pos: self.consumed_pos(),
+                    body_pos: None,
+                }),
+            },
+        }
+    }
+
     /// One identifier, keyword-or-not, with no qualifier handling. The
     /// inner half of [`Parser::expect_ident_like`], so the two agree on
     /// what an identifier is.
@@ -2099,6 +2180,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("expected identifier, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -2287,6 +2369,7 @@ impl Parser {
             // level, not inside a trigger row-write loop).
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("do") => {
                 self.advance();
+                let body_token = self.pos;
                 let body_text = match self.advance() {
                     Token::String(s) => s,
                     other => {
@@ -2304,7 +2387,14 @@ impl Parser {
                 // uses for trigger function bodies. If the body
                 // doesn't parse cleanly we surface the error
                 // (better than silent no-op).
-                let block = parse_plpgsql_body(&body_text)?;
+                // 9.0.0 (N17) — the body token's index, so the wire can
+                // add the body's own offset to where the body starts.
+                let block = parse_plpgsql_body(&body_text).map_err(|mut e| {
+                    if e.body_pos.is_some() {
+                        e.token_pos = body_token;
+                    }
+                    e
+                })?;
                 Ok(Statement::DoBlock(block))
             }
             // v4.11: `WITH name AS (SELECT ...) [, ...] SELECT ...`.
@@ -7420,7 +7510,7 @@ impl Parser {
             return Ok(None);
         }
         self.advance();
-        let name = self.expect_ident_like()?;
+        let name = self.expect_plpgsql_ident()?;
         if !matches!(self.peek(), Token::InetContains) {
             return Err(self.err(alloc::format!(
                 "expected >> after label, got {:?}",
@@ -7474,16 +7564,24 @@ impl Parser {
         }
         if let Token::Ident(end_label) | Token::QuotedIdent(end_label) = self.peek().clone() {
             self.advance();
+            // 9.0.0 (N17) — the caret goes under the LABEL, which is the
+            // token just consumed, not under whatever follows it.
+            // PostgreSQL 18.6 draws it there.
+            let at = self.consumed_pos();
             match label {
                 None => {
-                    return Err(self.err(alloc::format!(
-                        "end label \"{end_label}\" specified for unlabeled block"
-                    )));
+                    return Err(self.err_at(
+                        at,
+                        alloc::format!("end label \"{end_label}\" specified for unlabeled block"),
+                    ));
                 }
                 Some(l) if !l.eq_ignore_ascii_case(&end_label) => {
-                    return Err(self.err(alloc::format!(
-                        "end label \"{end_label}\" differs from block's label \"{l}\""
-                    )));
+                    return Err(self.err_at(
+                        at,
+                        alloc::format!(
+                            "end label \"{end_label}\" differs from block's label \"{l}\""
+                        ),
+                    ));
                 }
                 Some(_) => {}
             }
@@ -7546,16 +7644,22 @@ impl Parser {
         self.advance();
         if let Token::Ident(end_label) | Token::QuotedIdent(end_label) = self.peek().clone() {
             self.advance();
+            // 9.0.0 (N17) — see the loop's END, above.
+            let at = self.consumed_pos();
             match &label {
                 None => {
-                    return Err(self.err(alloc::format!(
-                        "end label \"{end_label}\" specified for unlabeled block"
-                    )));
+                    return Err(self.err_at(
+                        at,
+                        alloc::format!("end label \"{end_label}\" specified for unlabeled block"),
+                    ));
                 }
                 Some(l) if !l.eq_ignore_ascii_case(&end_label) => {
-                    return Err(self.err(alloc::format!(
-                        "end label \"{end_label}\" differs from block's label \"{l}\""
-                    )));
+                    return Err(self.err_at(
+                        at,
+                        alloc::format!(
+                            "end label \"{end_label}\" differs from block's label \"{l}\""
+                        ),
+                    ));
                 }
                 Some(_) => {}
             }
@@ -7633,7 +7737,7 @@ impl Parser {
             if matches!(self.peek(), Token::Begin) {
                 return Ok(out);
             }
-            let name = self.expect_ident_like()?;
+            let name = self.expect_plpgsql_ident()?;
             // v7.37.20 (20.7) — type inference: if the next token is
             // `:=` or `=` (no explicit type), infer from the default
             // expression. Otherwise the ident that follows is the
@@ -7748,7 +7852,24 @@ impl Parser {
         }
     }
 
+    /// 9.0.0 (A4b) — one statement of a body, with the LINE it was
+    /// written on. PostgreSQL ends an error raised inside a body with
+    /// `CONTEXT:  PL/pgSQL function <name> line N at <KIND>`, and the N
+    /// is the innermost statement's, so it is recorded per statement
+    /// rather than per block.
     fn parse_plpgsql_stmt(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+        let line = self.line_of_token(self.pos);
+        let kind = self.parse_plpgsql_stmt_kind()?;
+        Ok(PlPgSqlStmt { line, kind })
+    }
+
+    /// The line a token sits on inside the PL/pgSQL body being parsed,
+    /// or 0 when this parser is not parsing one.
+    fn line_of_token(&self, token: usize) -> u32 {
+        self.body_lines.get(token).copied().unwrap_or(0)
+    }
+
+    fn parse_plpgsql_stmt_kind(&mut self) -> Result<PlPgSqlStmtKind, ParseError> {
         // 9.0.0 — the optional `<<label>>` that may precede a nested
         // block or any of the five loop shapes.
         let label = self.parse_plpgsql_opt_label()?;
@@ -7761,7 +7882,7 @@ impl Parser {
                 if s.eq_ignore_ascii_case("declare"))
         {
             let block = self.parse_plpgsql_block_labeled(label)?;
-            return Ok(PlPgSqlStmt::Block(alloc::boxed::Box::new(block)));
+            return Ok(PlPgSqlStmtKind::Block(alloc::boxed::Box::new(block)));
         }
         if label.is_some()
             && !matches!(self.peek(), Token::For)
@@ -7781,7 +7902,7 @@ impl Parser {
             && matches!(self.tokens.get(self.pos + 1), Some(Token::Semicolon))
         {
             self.advance();
-            return Ok(PlPgSqlStmt::If {
+            return Ok(PlPgSqlStmtKind::If {
                 branches: Vec::new(),
                 else_branch: Vec::new(),
             });
@@ -7853,7 +7974,7 @@ impl Parser {
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
             self.expect_end_loop(label.as_deref(), "FOR IN EXECUTE")?;
-            return Ok(PlPgSqlStmt::ForExecute {
+            return Ok(PlPgSqlStmtKind::ForExecute {
                 var,
                 sql_expr,
                 body,
@@ -7952,7 +8073,7 @@ impl Parser {
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
             self.expect_end_loop(label.as_deref(), "FOR IN SELECT")?;
-            return Ok(PlPgSqlStmt::ForQuery {
+            return Ok(PlPgSqlStmtKind::ForQuery {
                 var,
                 query: Box::new(query),
                 body,
@@ -8001,7 +8122,7 @@ impl Parser {
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
             self.expect_end_loop(label.as_deref(), "FOR")?;
-            return Ok(PlPgSqlStmt::ForRange {
+            return Ok(PlPgSqlStmtKind::ForRange {
                 var,
                 start,
                 end,
@@ -8016,7 +8137,7 @@ impl Parser {
             self.advance();
             let body = self.parse_plpgsql_stmt_list_until_end()?;
             self.expect_end_loop(label.as_deref(), "LOOP")?;
-            return Ok(PlPgSqlStmt::Loop { body, label });
+            return Ok(PlPgSqlStmtKind::Loop { body, label });
         }
         // v7.37.20 (20.2) — `EXIT [<label>] [WHEN <cond>]`.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("exit"))
@@ -8024,7 +8145,7 @@ impl Parser {
             self.advance();
             let target = self.parse_plpgsql_jump_label();
             let when = self.parse_plpgsql_opt_when()?;
-            return Ok(PlPgSqlStmt::Exit {
+            return Ok(PlPgSqlStmtKind::Exit {
                 when,
                 label: target,
             });
@@ -8039,7 +8160,7 @@ impl Parser {
         {
             self.advance();
             let sql = self.parse_expr(0)?;
-            return Ok(PlPgSqlStmt::ExecuteDynamic { sql });
+            return Ok(PlPgSqlStmtKind::ExecuteDynamic { sql });
         }
         // v7.37.20 (20.2) — `CONTINUE [<label>] [WHEN <cond>]`.
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("continue"))
@@ -8047,7 +8168,7 @@ impl Parser {
             self.advance();
             let target = self.parse_plpgsql_jump_label();
             let when = self.parse_plpgsql_opt_when()?;
-            return Ok(PlPgSqlStmt::Continue {
+            return Ok(PlPgSqlStmtKind::Continue {
                 when,
                 label: target,
             });
@@ -8065,7 +8186,7 @@ impl Parser {
             }
             let body = self.parse_plpgsql_stmt_list_until_end()?;
             self.expect_end_loop(label.as_deref(), "WHILE")?;
-            return Ok(PlPgSqlStmt::While {
+            return Ok(PlPgSqlStmtKind::While {
                 condition,
                 body,
                 label,
@@ -8088,7 +8209,7 @@ impl Parser {
             } else {
                 None
             };
-            return Ok(PlPgSqlStmt::Assert { condition, message });
+            return Ok(PlPgSqlStmtKind::Assert { condition, message });
         }
         // v7.37.20 (20.12) — PERFORM <select>. Per PG docs:
         //   "PERFORM is equivalent to SELECT but discards the
@@ -8115,7 +8236,7 @@ impl Parser {
                     self.peek()
                 )));
             };
-            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(Statement::Select(s))));
+            return Ok(PlPgSqlStmtKind::EmbeddedSql(Box::new(Statement::Select(s))));
         }
         // v7.16.2 — `SELECT <projection> INTO <var> [FROM …]`
         // plpgsql-specific shape (mailrs round-10 migrate-042).
@@ -8130,7 +8251,7 @@ impl Parser {
         if matches!(self.peek(), Token::Select)
             && let Some((select_body, var_name)) = self.try_parse_plpgsql_select_into()?
         {
-            return Ok(PlPgSqlStmt::SelectInto {
+            return Ok(PlPgSqlStmtKind::SelectInto {
                 var: var_name,
                 body: Box::new(select_body),
             });
@@ -8154,7 +8275,7 @@ impl Parser {
                     || s.eq_ignore_ascii_case("alter"))
         {
             let stmt = self.parse_one_statement()?;
-            return Ok(PlPgSqlStmt::EmbeddedSql(Box::new(stmt)));
+            return Ok(PlPgSqlStmtKind::EmbeddedSql(Box::new(stmt)));
         }
         // Otherwise: assignment. `NEW.col` / `OLD.col` / `var`
         // followed by `:=` and an expression.
@@ -8182,12 +8303,12 @@ impl Parser {
             }
         }
         let value = self.parse_expr(0)?;
-        Ok(PlPgSqlStmt::Assign { target, value })
+        Ok(PlPgSqlStmtKind::Assign { target, value })
     }
 
     /// v7.12.6 — `IF cond THEN body [ELSIF cond THEN body]*
     /// [ELSE body] END IF`. `IF` keyword already consumed.
-    fn parse_plpgsql_if(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+    fn parse_plpgsql_if(&mut self) -> Result<PlPgSqlStmtKind, ParseError> {
         let mut branches: Vec<(Expr, Vec<PlPgSqlStmt>)> = Vec::new();
         let mut else_branch: Vec<PlPgSqlStmt> = Vec::new();
         loop {
@@ -8234,7 +8355,7 @@ impl Parser {
         if !if_kw.eq_ignore_ascii_case("if") {
             return Err(self.err(alloc::format!("expected END IF, got END {if_kw:?}")));
         }
-        Ok(PlPgSqlStmt::If {
+        Ok(PlPgSqlStmtKind::If {
             branches,
             else_branch,
         })
@@ -8264,7 +8385,7 @@ impl Parser {
     /// legal. SPG read a level word unconditionally and then demanded a
     /// string, so every spelling but `RAISE <level> '…'` was a syntax
     /// error (sentori, 8.0.4 CHANGELOG).
-    fn parse_plpgsql_raise(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+    fn parse_plpgsql_raise(&mut self) -> Result<PlPgSqlStmtKind, ParseError> {
         let level = match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) => {
                 match s.to_ascii_lowercase().as_str() {
@@ -8369,7 +8490,7 @@ impl Parser {
             }
         }
 
-        Ok(PlPgSqlStmt::Raise {
+        Ok(PlPgSqlStmtKind::Raise {
             level,
             message,
             args,
@@ -8526,25 +8647,25 @@ impl Parser {
         Ok(AssignTarget::Local(head))
     }
 
-    fn parse_plpgsql_return(&mut self) -> Result<PlPgSqlStmt, ParseError> {
+    fn parse_plpgsql_return(&mut self) -> Result<PlPgSqlStmtKind, ParseError> {
         // RETURN NEW / OLD / NULL — bare-ident forms.
         match self.peek() {
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("new") => {
                 self.advance();
-                return Ok(PlPgSqlStmt::Return(ReturnTarget::New));
+                return Ok(PlPgSqlStmtKind::Return(ReturnTarget::New));
             }
             Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("old") => {
                 self.advance();
-                return Ok(PlPgSqlStmt::Return(ReturnTarget::Old));
+                return Ok(PlPgSqlStmtKind::Return(ReturnTarget::Old));
             }
             Token::Null => {
                 self.advance();
-                return Ok(PlPgSqlStmt::Return(ReturnTarget::Null));
+                return Ok(PlPgSqlStmtKind::Return(ReturnTarget::Null));
             }
             // Bare `RETURN;` (no value) — treated as `RETURN NULL`
             // per PL/pgSQL convention.
             Token::Semicolon => {
-                return Ok(PlPgSqlStmt::Return(ReturnTarget::Null));
+                return Ok(PlPgSqlStmtKind::Return(ReturnTarget::Null));
             }
             _ => {}
         }
@@ -8562,7 +8683,7 @@ impl Parser {
         {
             self.advance();
             let e = self.parse_expr(0)?;
-            return Ok(PlPgSqlStmt::ReturnNext(e));
+            return Ok(PlPgSqlStmtKind::ReturnNext(e));
         }
         if matches!(self.peek(), Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("query"))
         {
@@ -8574,7 +8695,7 @@ impl Parser {
             {
                 self.advance();
                 let sql = self.parse_expr(0)?;
-                return Ok(PlPgSqlStmt::ReturnQueryExecute { sql });
+                return Ok(PlPgSqlStmtKind::ReturnQueryExecute { sql });
             }
             // Bare RETURN QUERY <select>. If the current token is
             // not already SELECT (e.g., the user wrote `RETURN QUERY
@@ -8594,11 +8715,11 @@ impl Parser {
             // v7.39 (read01 round 66) — a REAL statement now. It used to desugar
             // to an embedded side-effect SELECT whose rows were DISCARDED, which
             // in a SETOF function is the entire answer thrown away.
-            return Ok(PlPgSqlStmt::ReturnQuery(Box::new(s)));
+            return Ok(PlPgSqlStmtKind::ReturnQuery(Box::new(s)));
         }
         // Fall through: parse a full expression.
         let e = self.parse_expr(0)?;
-        Ok(PlPgSqlStmt::Return(ReturnTarget::Expr(e)))
+        Ok(PlPgSqlStmtKind::Return(ReturnTarget::Expr(e)))
     }
 
     fn parse_trigger_event(&mut self) -> Result<TriggerEvent, ParseError> {
@@ -8833,6 +8954,7 @@ impl Parser {
                     return Err(ParseError {
                         message: format!("expected parameter name, got {other:?}"),
                         token_pos: self.consumed_pos(),
+                        body_pos: None,
                     });
                 }
             };
@@ -9073,10 +9195,12 @@ impl Parser {
             Token::Integer(n) => Err(ParseError {
                 message: format!("expected non-negative integer, got {n}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
             other => Err(ParseError {
                 message: format!("expected integer literal, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -13205,6 +13329,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("expected {kw:?}, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -13218,6 +13343,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("expected identifier or string, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -13228,6 +13354,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("expected quoted string, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -13749,16 +13876,19 @@ impl Parser {
             Some(Ok(v)) if v < 0 => Err(ParseError {
                 message: alloc::format!("{neg_label} must not be negative"),
                 token_pos: start,
+                body_pos: None,
             }),
             Some(Ok(v)) => u32::try_from(v)
                 .map(crate::ast::LimitExpr::Literal)
                 .map_err(|_| ParseError {
                     message: alloc::format!("{label} value too large: {v}"),
                     token_pos: start,
+                    body_pos: None,
                 }),
             Some(Err(message)) => Err(ParseError {
                 message: message.replace("{L}", neg_label),
                 token_pos: start,
+                body_pos: None,
             }),
             // v7.39 (round 305, V23) — not foldable at parse time
             // (`LIMIT (SELECT 4)`, `LIMIT greatest(2,3)`). Carry the
@@ -13780,6 +13910,7 @@ impl Parser {
         let err_at = |message: alloc::string::String, pos: usize| ParseError {
             message,
             token_pos: pos,
+            body_pos: None,
         };
         match self.advance() {
             Token::Integer(n) if n >= 0 => u32::try_from(n)
@@ -13787,6 +13918,7 @@ impl Parser {
                 .map_err(|_| ParseError {
                     message: alloc::format!("{label} value too large: {n}"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 }),
             Token::Integer(_) => Err(err_at(
                 alloc::format!("{neg_label} must not be negative"),
@@ -13855,6 +13987,7 @@ impl Parser {
                     "expected non-negative integer or $N placeholder after {label}, got {other:?}"
                 ),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -17582,6 +17715,7 @@ impl Parser {
                 return Err(ParseError {
                     message: format!("expected column type, got {other:?}"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
         };
@@ -18942,6 +19076,7 @@ impl Parser {
                 return Err(ParseError {
                     message: format!("NUMERIC precision {n} must be between 1 and 1000"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
             other => {
@@ -18950,6 +19085,7 @@ impl Parser {
                         "NUMERIC precision must be an integer in 1..=1000, got {other:?}"
                     ),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
         };
@@ -18973,6 +19109,7 @@ impl Parser {
                                 "NUMERIC scale {signed} must be between -1000 and 1000"
                             ),
                             token_pos: self.consumed_pos(),
+                            body_pos: None,
                         });
                     }
                     i16::try_from(signed).expect("range-checked")
@@ -18981,6 +19118,7 @@ impl Parser {
                     return Err(ParseError {
                         message: format!("NUMERIC scale must be an integer, got {other:?}"),
                         token_pos: self.consumed_pos(),
+                        body_pos: None,
                     });
                 }
             }
@@ -19133,11 +19271,13 @@ impl Parser {
             Token::Integer(n) if n > 0 => u32::try_from(n).map_err(|_| ParseError {
                 message: format!("{label} size too large: {n}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             })?,
             other => {
                 return Err(ParseError {
                     message: format!("expected positive integer {label} size, got {other:?}"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
         };
@@ -23483,6 +23623,7 @@ impl Parser {
                     return Err(ParseError {
                         message: "scalar subquery body must be a SELECT".into(),
                         token_pos: self.consumed_pos(),
+                        body_pos: None,
                     });
                 };
                 Ok(Expr::ScalarSubquery(Box::new(s)))
@@ -23490,6 +23631,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("expected ')' after scalar subquery, got {other:?}"),
                 token_pos: self.consumed_pos(),
+                body_pos: None,
             }),
         }
     }
@@ -23698,6 +23840,7 @@ impl Parser {
                         other => Err(ParseError {
                             message: format!("expected ')', got {other:?}"),
                             token_pos: self.consumed_pos(),
+                            body_pos: None,
                         }),
                     }
                 }
@@ -23851,6 +23994,7 @@ impl Parser {
             other => Err(ParseError {
                 message: format!("unexpected token {other:?} in expression"),
                 token_pos: tok_pos,
+                body_pos: None,
             }),
         }
         // After parsing the atom, fold any postfix `::vector` casts.
@@ -24101,6 +24245,7 @@ impl Parser {
                 return Err(ParseError {
                     message: format!("expected type ident after `::`, got {other:?}"),
                     token_pos: self.consumed_pos(),
+                    body_pos: None,
                 });
             }
         };
@@ -26340,6 +26485,7 @@ impl Parser {
                      hour[s], day[s], week[s], month[s], year[s]"
             ),
             token_pos: self.consumed_pos(),
+            body_pos: None,
         })?;
         Ok(Expr::Literal(Literal::Interval {
             months,
@@ -26391,6 +26537,7 @@ impl Parser {
             let x = extract_numeric_literal(&e).ok_or_else(|| ParseError {
                 message: format!("vector element must be a numeric literal, got {e:?}"),
                 token_pos: self.pos,
+                body_pos: None,
             })?;
             elems.push(x);
             match self.peek() {
@@ -28921,12 +29068,32 @@ fn parse_plpgsql_body(body: &str) -> Result<PlPgSqlBlock, ParseError> {
     // Use the regular lexer on the body text. The trailing
     // `END;` may or may not have a semicolon; the lexer treats
     // both forms identically.
-    let tokens = lexer::tokenize(body).map_err(|e| ParseError {
-        message: alloc::format!("plpgsql body lex error: {e}"),
-        token_pos: 0,
-    })?;
-    let mut parser = Parser::new(tokens);
-    parser.parse_plpgsql_block()
+    //
+    // 9.0.0 (N17) — with offsets, so an error inside the body can say
+    // WHERE inside the body. The body's token indices mean nothing to
+    // the outer statement; its byte offsets, added to where the body
+    // starts, are what PostgreSQL's caret points at.
+    let (tokens, offsets) =
+        lexer::tokenize_with_offsets(body, lexer::Dialect::PG).map_err(|e| ParseError {
+            message: alloc::format!("plpgsql body lex error: {e}"),
+            token_pos: 0,
+            body_pos: None,
+        })?;
+    let mut parser = Parser::new(tokens).with_body_lines(body, &offsets);
+    parser.parse_plpgsql_block().map_err(|e| {
+        // Shaped against the BODY's own text, so `syntax error at or
+        // near "<token>"` names a token of the body and not the
+        // dollar-quoted string that carries it.
+        let mut e = shape_syntax_error(e, body, &offsets);
+        // An index past the last token is "end of input", which is where
+        // PostgreSQL points for that message too.
+        let byte = offsets
+            .get(e.token_pos)
+            .copied()
+            .unwrap_or_else(|| body.len());
+        e.body_pos = Some(u32::try_from(byte).unwrap_or(u32::MAX));
+        e
+    })
 }
 
 /// v7.39 (GUC) — the textual body of a SET value, for list joining.
@@ -30840,8 +31007,8 @@ mod tests {
         };
         assert_eq!(block.statements.len(), 1);
         assert!(matches!(
-            block.statements[0],
-            PlPgSqlStmt::Return(ReturnTarget::New)
+            block.statements[0].kind,
+            PlPgSqlStmtKind::Return(ReturnTarget::New)
         ));
     }
 
@@ -30888,7 +31055,7 @@ $$";
         };
         assert_eq!(block.statements.len(), 2);
         // First statement: NEW.search_vector := to_tsvector(...)
-        let PlPgSqlStmt::Assign { target, .. } = &block.statements[0] else {
+        let PlPgSqlStmtKind::Assign { target, .. } = &block.statements[0].kind else {
             panic!("expected Assign as first stmt");
         };
         match target {
@@ -30897,8 +31064,8 @@ $$";
         }
         // Second statement: RETURN NEW
         assert!(matches!(
-            block.statements[1],
-            PlPgSqlStmt::Return(ReturnTarget::New)
+            block.statements[1].kind,
+            PlPgSqlStmtKind::Return(ReturnTarget::New)
         ));
     }
 

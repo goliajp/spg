@@ -800,6 +800,7 @@ mod e2e_plpgsql_for_execute;
 mod e2e_plpgsql_for_query;
 mod e2e_plpgsql_for_range;
 mod e2e_plpgsql_found;
+mod e2e_plpgsql_keywords_900;
 mod e2e_plpgsql_loop_exit;
 mod e2e_plpgsql_nested_blocks_900;
 mod e2e_plpgsql_perform;

@@ -1356,6 +1356,83 @@ fn single(out: &mut Vec<Token>, tok: Token, i: &mut usize) {
 /// byte (cheap dispatch) or a small set of disambiguating
 /// trailing-byte comparisons. All comparisons are ASCII-CI (XOR
 /// 0x20 on each byte before the compare).
+/// 9.0.0 (N16) — the spelling a keyword token was lexed from.
+///
+/// The inverse of the `kw_len*` tables: exactly one entry per
+/// `eq_ci(b, b"…") -> Token::…` there, which
+/// [`tests::keyword_text_covers_every_keyword`] checks by reading this
+/// file. It exists because PL/pgSQL's scanner is its own — a block
+/// label `<<inner>>` and a `DECLARE inner int` are legal there, where
+/// SPG answered `expected identifier, got Inner` — and because the
+/// parser's `unreserved_keyword_text` should not carry a second copy of
+/// the spellings.
+///
+/// Whether a keyword may be used as an identifier is a DIFFERENT
+/// question, answered by PostgreSQL's classification and kept where it
+/// belongs, in the parser.
+#[must_use]
+pub fn keyword_text(tok: &Token) -> Option<&'static str> {
+    Some(match tok {
+        Token::All => "all",
+        Token::And => "and",
+        Token::As => "as",
+        Token::Asc => "asc",
+        Token::Begin => "begin",
+        Token::Between => "between",
+        Token::Commit => "commit",
+        Token::Connection => "connection",
+        Token::Create => "create",
+        Token::Cross => "cross",
+        Token::Default => "default",
+        Token::Desc => "desc",
+        Token::Distinct => "distinct",
+        Token::Drop => "drop",
+        Token::Except => "except",
+        Token::Extract => "extract",
+        Token::False => "false",
+        Token::For => "for",
+        Token::From => "from",
+        Token::Full => "full",
+        Token::Group => "group",
+        Token::Having => "having",
+        Token::In => "in",
+        Token::Index => "index",
+        Token::Inner => "inner",
+        Token::Insert => "insert",
+        Token::Interval => "interval",
+        Token::Into => "into",
+        Token::Is => "is",
+        Token::Join => "join",
+        Token::Left => "left",
+        Token::Like => "like",
+        Token::Limit => "limit",
+        Token::Not => "not",
+        Token::Null => "null",
+        Token::Offset => "offset",
+        Token::On => "on",
+        Token::Or => "or",
+        Token::Order => "order",
+        Token::Outer => "outer",
+        Token::Partition => "partition",
+        Token::Publication => "publication",
+        Token::Release => "release",
+        Token::Right => "right",
+        Token::Rollback => "rollback",
+        Token::Savepoint => "savepoint",
+        Token::Select => "select",
+        Token::Show => "show",
+        Token::Subscription => "subscription",
+        Token::Table => "table",
+        Token::Tables => "tables",
+        Token::To => "to",
+        Token::True => "true",
+        Token::Union => "union",
+        Token::Values => "values",
+        Token::Where => "where",
+        _ => return None,
+    })
+}
+
 fn keyword_or_ident_raw(raw: &str) -> Token {
     let b = raw.as_bytes();
     let tok = match b.len() {
@@ -2303,6 +2380,39 @@ mod tests {
     #[test]
     fn whitespace_only_yields_only_eof() {
         assert_eq!(lex("   \t\n  "), vec![Token::Eof]);
+    }
+
+    /// 9.0.0 (N16) — every keyword the `kw_len*` tables lex has an entry
+    /// in [`keyword_text`]. Read out of this file's own source, so a
+    /// keyword added to a table without an entry here goes red.
+    ///
+    /// The floor is what keeps the check from passing on an empty scan:
+    /// if the pattern ever stops matching, the assertion fails rather
+    /// than reporting that all zero keywords are covered.
+    #[test]
+    fn keyword_text_covers_every_keyword() {
+        let src = include_str!("lexer.rs");
+        let mut seen = 0usize;
+        let mut missing: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+        for (i, line) in src.lines().enumerate() {
+            let Some(rest) = line.trim().strip_prefix("if eq_ci(b, b\"") else {
+                continue;
+            };
+            let Some((word, _)) = rest.split_once('"') else {
+                continue;
+            };
+            seen += 1;
+            let tok = keyword_or_ident_raw(word);
+            match keyword_text(&tok) {
+                Some(back) if back == word => {}
+                other => missing.push(alloc::format!("{}: {word} -> {other:?}", i + 1)),
+            }
+        }
+        assert!(
+            seen >= 50,
+            "the scan found {seen} keyword arms, not the table"
+        );
+        assert!(missing.is_empty(), "{missing:?}");
     }
 
     #[test]

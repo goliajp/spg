@@ -189,6 +189,121 @@ fn a_predicate_that_is_not_boolean_names_its_type_class_and_place() {
     }
 }
 
+/// 9.0.0 (A4b) — an error raised inside a PL/pgSQL body carried no
+/// `CONTEXT:` line.
+///
+/// Measured 2026-09-19 and again 2026-09-21 against PG 18.6:
+///
+/// ```text
+///   DO $$ BEGIN\n  RAISE EXCEPTION 'boom';\nEND $$
+///     PG:  ERROR: boom
+///          CONTEXT:  PL/pgSQL function inline_code_block line 2 at RAISE
+///     SPG: ERROR: boom          (and nothing else)
+/// ```
+///
+/// A client could see that something failed and not where inside the
+/// function. The line is the INNERMOST statement's, which is what
+/// PostgreSQL reports.
+///
+/// **Residual, measured:** PostgreSQL names a `PERFORM` as `at PERFORM`
+/// and prints extra `QUERY:` / `SQL statement "…"` lines for an error
+/// raised inside an embedded statement. SPG lowers PERFORM to a SELECT,
+/// so it says `at SQL statement`, and prints the one CONTEXT line.
+#[test]
+fn a_plpgsql_error_carries_postgresqls_context_line() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-errctx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    // PostgreSQL's own line, byte for byte.
+    let msgs = query(&mut s, "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom';\nEND $$");
+    let e = msgs.iter().find(|m| m.ty == b'E').expect("refused");
+    assert_eq!(field(&e.body, b'M').as_deref(), Some("boom"));
+    assert_eq!(
+        field(&e.body, b'W').as_deref(),
+        Some("PL/pgSQL function inline_code_block line 3 at RAISE")
+    );
+
+    // The INNERMOST statement, not the block it is in.
+    let msgs = query(
+        &mut s,
+        "DO $$\nBEGIN\n  IF true THEN\n    RAISE EXCEPTION 'nested';\n  END IF;\nEND $$",
+    );
+    let e = msgs.iter().find(|m| m.ty == b'E').expect("refused");
+    assert_eq!(
+        field(&e.body, b'W').as_deref(),
+        Some("PL/pgSQL function inline_code_block line 4 at RAISE")
+    );
+
+    // An embedded statement that fails names its own line.
+    let msgs = query(
+        &mut s,
+        "DO $$\nDECLARE x int;\nBEGIN\n  x := 1;\n  INSERT INTO nosuch_ctx VALUES (1);\nEND $$",
+    );
+    let e = msgs.iter().find(|m| m.ty == b'E').expect("refused");
+    assert_eq!(
+        field(&e.body, b'W').as_deref(),
+        Some("PL/pgSQL function inline_code_block line 5 at SQL statement")
+    );
+
+    // …and the line does not leak into the NEXT statement's error.
+    let msgs = query(&mut s, "SELECT * FROM nosuch_plain");
+    let e = msgs.iter().find(|m| m.ty == b'E').expect("refused");
+    assert_eq!(
+        field(&e.body, b'W'),
+        None,
+        "a plain statement has no CONTEXT"
+    );
+}
+
+/// 9.0.0 (N17) — a PL/pgSQL body's parse error carries no POSITION.
+///
+/// Measured 2026-09-20 on `… END LOOP zz;` inside a DO block: PG 18.6
+/// draws `LINE 4:   END LOOP zz;` with the caret under `zz`, SPG sent
+/// the sentence alone. The body is lexed in a context of its own — the
+/// statement carries it as ONE dollar-quoted token — so the offset the
+/// parser knew was the body's, not the statement's. It carries both
+/// now, and the wire adds them.
+#[test]
+fn a_plpgsql_body_error_points_inside_the_body() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-errpos-pl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    // PostgreSQL's own caret, measured: under the `zz` of `END LOOP zz`.
+    let sql = "DO $$ BEGIN\n  FOR i IN 1..2 LOOP\n    NULL;\n  END LOOP zz;\nEND $$";
+    let (code, msg, pos) = refused(&mut s, sql);
+    assert_eq!(msg, "end label \"zz\" specified for unlabeled block");
+    assert_eq!(code, "42601", "{msg}");
+    assert_eq!(pos.as_deref(), Some(at(sql, "zz").as_str()), "{sql}");
+
+    // A longer `$tag$` moves the body along, and the caret with it.
+    let tagged = "DO $body$ BEGIN\n  FOR i IN 1..2 LOOP\n    NULL;\n  END LOOP zz;\nEND $body$";
+    let (_c, _m, pos) = refused(&mut s, tagged);
+    assert_eq!(pos.as_deref(), Some(at(tagged, "zz").as_str()), "{tagged}");
+
+    // And the MESSAGE names a token of the BODY. It used to be shaped
+    // against the outer statement, where the only token the offset could
+    // reach is the dollar-quoted string itself — `syntax error at or
+    // near "$$"` for a fault four lines inside it.
+    let sql = "DO $$ DECLARE x int := 1; BEGIN RAISE NOTICE '%', ; END $$";
+    let (_c, msg, _p) = refused(&mut s, sql);
+    assert!(
+        !msg.contains("$$"),
+        "the message names a token of the body: {msg}"
+    );
+}
+
 #[test]
 fn a_using_index_refusal_points_at_the_constraint_not_the_index() {
     let dir = crate::common::tmp_base().join(format!("spg-e2e-errpos-c-{}", std::process::id()));

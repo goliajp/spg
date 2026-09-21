@@ -19992,8 +19992,8 @@ fn plpgsql_is_single_return(def: &spg_storage::FunctionDef) -> bool {
         && block.exception_handlers.is_empty()
         && block.statements.len() == 1
         && matches!(
-            &block.statements[0],
-            spg_sql::ast::PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(_))
+            &block.statements[0].kind,
+            spg_sql::ast::PlPgSqlStmtKind::Return(spg_sql::ast::ReturnTarget::Expr(_))
         )
 }
 
@@ -20052,8 +20052,8 @@ fn user_fn_body_expr(def: &spg_storage::FunctionDef) -> Result<Expr, EvalError> 
             ));
         }
         if block.statements.len() == 1
-            && let spg_sql::ast::PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(e)) =
-                &block.statements[0]
+            && let spg_sql::ast::PlPgSqlStmtKind::Return(spg_sql::ast::ReturnTarget::Expr(e)) =
+                &block.statements[0].kind
         {
             return Ok(e.clone());
         }
