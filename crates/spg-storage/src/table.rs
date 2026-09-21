@@ -1994,6 +1994,7 @@ impl Table {
             }
         })?;
         self.indices.push(Index {
+            declared_am: None,
             name,
             column_position,
             kind: IndexKind::BTree(map),
@@ -2035,6 +2036,7 @@ impl Table {
             }
         })?;
         self.indices.push(Index {
+            declared_am: None,
             kind: IndexKind::BTreeMulti(map),
             ..Index::new_btree(name, column_position)
         });
@@ -4155,6 +4157,7 @@ impl Table {
                 // `Index` does not compile here until the rebuild says
                 // what happens to it.
                 let Index {
+                    declared_am,
                     name,
                     column_position,
                     kind: _,
@@ -4481,6 +4484,7 @@ impl Table {
         }
         if let Some(graph) = restore {
             self.indices.push(Index {
+                declared_am: None,
                 name,
                 column_position,
                 kind: IndexKind::Nsw(graph),

@@ -1403,7 +1403,12 @@ pub(crate) fn implicit_sequences(
                 cache: 1,
                 cycle: false,
                 owned_by: Some((tname.clone(), col.name.clone())),
-                last_value: last.max(0),
+                // 9.0.0 — a sequence nobody has called yet answers its
+                // START, and PostgreSQL's is 1. This said `0` for an
+                // empty table, which was invisible while the insert path
+                // derived ids from the table's max and became `id = 0`
+                // the moment the sequence became the counter.
+                last_value: if last > 0 { last } else { 1 },
                 is_called: last > 0,
                 owner: None,
                 acl: alloc::vec::Vec::new(),

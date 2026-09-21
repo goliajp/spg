@@ -3603,6 +3603,18 @@ impl Engine {
                     .map(|e| e.as_ref().map(alloc::string::ToString::to_string))
                     .collect();
                 idx.extra_collations.clone_from(&stmt.extra_collations);
+                // 9.0.0 — the access method the statement ASKED for, when
+                // SPG backs it with another. `USING gist / spgist / hash`
+                // load as a B-tree, and reporting `btree` made a dump
+                // write `USING btree` where the source said `USING gist`:
+                // restoring into PostgreSQL then silently changed the
+                // index type. Every query those AMs exist for is answered
+                // by scan either way, so the name is all that was lost.
+                idx.declared_am = stmt
+                    .method_name
+                    .as_deref()
+                    .filter(|m| matches!(*m, "gist" | "spgist" | "hash"))
+                    .map(alloc::string::String::from);
                 // v7.39.11 — and each extra's ordering clause, which the
                 // parser used to drop. See `Index::extra_orders`.
                 idx.extra_orders = stmt

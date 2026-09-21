@@ -177,10 +177,16 @@ fn implicit_serial_sequence_addressable_after_import() {
         other => panic!("{other:?}"),
     }
     // currval/nextval address the implicit sequence directly.
+    //
+    // 9.0.0 — 24306, not 24305. The INSERT above CONSUMED 24305 from the
+    // sequence; it used to derive its id from the table's max and leave
+    // the sequence where setval had put it, so the next nextval handed
+    // out a value the table already held. Measured on PG 18.6, the same
+    // three statements answer 24305 then 24306.
     let r = db.execute("SELECT nextval('messages_id_seq')").unwrap();
     match r {
         spg_embedded::QueryResult::Rows { rows, .. } => {
-            assert_eq!(rows[0].values[0], spg_embedded::Value::Int(24305));
+            assert_eq!(rows[0].values[0], spg_embedded::Value::Int(24306));
         }
         other => panic!("{other:?}"),
     }
