@@ -194,20 +194,42 @@ fn round654_overloads_match_what_the_engine_accepts() {
     assert_eq!(vals(&mut e, "SELECT avg(iv) FROM ov"), vec!["1 day"]);
 }
 
-/// The overloads PG has that the engine REFUSED are deliberately not
-/// listed: they are capability gaps (C09), and a catalog row would be the
-/// catalog lying on the implementation's behalf.
+/// 9.0.0 (S1) — the three-argument `lag` / `lead` ARE listed now.
+///
+/// This test used to assert the opposite, on the evidence that
+/// `SELECT lag(1, 1, 1) OVER ()` was refused: a signature the engine
+/// could not answer, so a catalog row would have been the catalog
+/// lying. The refusal was real and the reason was not — a window
+/// function with NO FROM was refused outright, whatever it was. With
+/// that closed, `lag(5,1,99) OVER (ORDER BY x)` over two rows answers
+/// `99, 5` here and on PostgreSQL 18.6, and the missing rows were the
+/// catalog understating the engine.
 #[test]
-fn round654_refused_overloads_are_not_papered_over() {
+fn round654_the_three_argument_window_forms_are_listed() {
     let mut e = Engine::new();
-    // Three arguments is PG's `lag(value, offset, default)`.
-    assert!(e.execute("SELECT lag(1, 1, 1) OVER ()").is_err());
+    assert_eq!(vals(&mut e, "SELECT lag(1, 1, 1) OVER ()"), vec!["1"]);
     assert_eq!(
         vals(
             &mut e,
-            "SELECT count(*) FROM pg_proc WHERE proname = 'lag' AND pronargs = 3"
+            "SELECT lag(5,1,99) OVER (ORDER BY x) FROM (VALUES (1),(2)) v(x)"
         ),
-        vec!["0"],
-        "no row for a signature the engine cannot answer"
+        vec!["99", "5"]
+    );
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT lead(5,1,99) OVER (ORDER BY x) FROM (VALUES (1),(2)) v(x)"
+        ),
+        vec!["5", "99"]
+    );
+    // PostgreSQL's own oids and return type for the three-argument
+    // forms (`anycompatible`, 5077, where the one- and two-argument
+    // forms answer `anyelement`).
+    assert_eq!(
+        vals(
+            &mut e,
+            "SELECT oid, proname, pronargs, prorettype FROM pg_proc              WHERE proname IN ('lag','lead') AND pronargs = 3 ORDER BY oid"
+        ),
+        vec!["3108|lag|3|5077", "3111|lead|3|5077"]
     );
 }

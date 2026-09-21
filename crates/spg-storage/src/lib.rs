@@ -6631,6 +6631,40 @@ impl Catalog {
         hit
     }
 
+    /// 9.0.0 (S1) — rename every overload of a function, keeping each
+    /// one's signature key in step with its new name. Returns how many
+    /// moved; 0 means the name was not there.
+    ///
+    /// `ALTER FUNCTION f() RENAME TO g` was refused outright ("not
+    /// supported"), on the reasoning that the statement names one
+    /// SIGNATURE and SPG carried only a bare name. The registry has been
+    /// keyed by signature since round 62, so the reasoning went stale;
+    /// the caller refuses the ambiguous case the way `DROP FUNCTION`
+    /// does, and this moves what is left.
+    pub fn rename_function(&mut self, name: &str, new_name: &str) -> usize {
+        let keys: Vec<String> = self
+            .functions
+            .iter()
+            .filter(|(_, f)| f.name.eq_ignore_ascii_case(name))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut moved = 0;
+        for k in keys {
+            let Some(mut def) = self.functions.remove(&k) else {
+                continue;
+            };
+            // The key is `<name>(<argtypes>)`; only the name part moves.
+            let new_key = match k.split_once('(') {
+                Some((_, args)) => alloc::format!("{new_name}({args}"),
+                None => String::from(new_name),
+            };
+            def.name = String::from(new_name);
+            self.functions.insert(new_key, def);
+            moved += 1;
+        }
+        moved
+    }
+
     /// v7.17.0 — read-only handle to catalogued sequences.
     /// v7.39 (read01 round 60) — the `public` schema's ACL (PG nspacl).
     #[must_use]

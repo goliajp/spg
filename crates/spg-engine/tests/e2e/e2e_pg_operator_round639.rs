@@ -84,12 +84,13 @@ fn round639_pg_operator_lists_what_the_engine_evaluates() {
 #[test]
 fn round639_only_the_unary_rows_have_no_left_type() {
     let mut e = Engine::new();
-    // 654 rows carry three non-zero type ends; 570 of them resolve. The
-    // other 84 name a type `pg_type` does not list — `anyarray`,
-    // `anyrange`, `anymultirange`, `record`, `anyenum`, `aclitem`,
-    // `jsonpath`. The operator rows are PG's, so they name PG's operand
-    // types whether or not `pg_type` reaches that far; the gap is
-    // `pg_type`'s, and it is the one round 639 measured and left open.
+    // 654 rows carry three non-zero type ends; 572 of them resolve. The
+    // other 82 name a type `pg_type` does not list — `anyrange`,
+    // `anymultirange`, `record`, `anyenum`, `aclitem`, `jsonpath`. The
+    // operator rows are PG's, so they name PG's operand types whether or
+    // not `pg_type` reaches that far; the gap is `pg_type`'s, and it is
+    // the one round 639 measured and left open. It narrowed by two when
+    // 9.0.0 (S1) gave `pg_type` its `anycompatible` row.
     assert_eq!(
         vals(
             &mut e,
@@ -97,7 +98,7 @@ fn round639_only_the_unary_rows_have_no_left_type() {
              JOIN pg_type l ON l.oid = o.oprleft JOIN pg_type r ON r.oid = o.oprright \
              JOIN pg_type t ON t.oid = o.oprresult"
         ),
-        vec!["570"]
+        vec!["572"]
     );
     assert_eq!(
         vals(&mut e, "SELECT count(*) FROM pg_operator WHERE oprleft = 0"),

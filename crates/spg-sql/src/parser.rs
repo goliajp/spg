@@ -27068,6 +27068,20 @@ impl Parser {
                 })?;
                 return Ok(Some(parts));
             }
+            // 9.0.0 (S1) — Shape C, `'1 day' PRECEDING`: a bare string,
+            // which PostgreSQL coerces to the ORDER BY column's offset
+            // type. It is what `RANGE BETWEEN '1 day' PRECEDING AND
+            // '1 day' FOLLOWING` over a `date` column is written as, and
+            // SPG answered `syntax error at or near "'1 day'"`.
+            let next_is_direction = matches!(
+                self.tokens.get(self.pos + 1),
+                Some(Token::Ident(s) | Token::QuotedIdent(s))
+                    if s.eq_ignore_ascii_case("preceding") || s.eq_ignore_ascii_case("following")
+            );
+            if next_is_direction && let Some(parts) = parse_interval_text(text) {
+                self.advance(); // string
+                return Ok(Some(parts));
+            }
         }
         Ok(None)
     }

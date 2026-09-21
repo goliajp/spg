@@ -223,9 +223,31 @@ impl Engine {
         stmt: &SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        let from = stmt.from.as_ref().ok_or_else(|| {
-            EngineError::Unsupported("window functions require a FROM clause".into())
-        })?;
+        // 9.0.0 (S1) — a window function with no FROM runs over the one
+        // virtual row every FROM-less SELECT has: PostgreSQL 18.6
+        // answers `SELECT count(*) OVER ()` with 1, and SPG refused the
+        // statement. The row comes from a one-element `generate_series`,
+        // which this pipeline already knows how to read, so the whole
+        // window machinery works unchanged rather than growing a second
+        // path for the no-row case.
+        let synthetic_from;
+        let from = match stmt.from.as_ref() {
+            Some(f) => f,
+            None => {
+                synthetic_from = spg_sql::ast::FromClause {
+                    primary: spg_sql::ast::TableRef {
+                        name: alloc::string::String::from("generate_series"),
+                        generate_series_args: Some(alloc::vec![
+                            spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Integer(1)),
+                            spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Integer(1)),
+                        ]),
+                        ..Default::default()
+                    },
+                    joins: Vec::new(),
+                };
+                &synthetic_from
+            }
+        };
         // v7.17.0 Phase 3.P0-43 — JOIN + window functions. Phase
         // 3.6 rejected this combination outright ("queued for
         // v5.x"); P0-43 materialises the join + WHERE through the
@@ -12165,12 +12187,49 @@ pub(crate) fn value_to_order_key(v: &Value) -> Result<OrderKey, EngineError> {
         // Callers without NULLS FIRST/LAST context (array elements,
         // histogram sampling) put NULL last, as before.
         Value::Null => return Ok(OrderKey::NullBig),
-        // v7.17.0 Phase 3.P0-38 — range ordering is not supported
-        // in v7.17.0 (needs lex-then-inclusivity tiebreak).
-        Value::Range { .. } => {
-            return Err(EngineError::Unsupported(
-                "ORDER BY of a range value is not supported in v7.17.0".into(),
-            ));
+        // 9.0.0 (S1) — a range orders the way PostgreSQL orders one.
+        // It was refused ("not supported in v7.17.0"), while PG 18.6
+        // sorts them; measured there over eight `int4range` values:
+        //
+        // ```text
+        //   empty · (,5) · [1,4) · [1,5) · [1,6) · [1,) · [2,3) · [2,5)
+        // ```
+        //
+        // Empty first, then the lower bound with `-infinity` before
+        // every value, then the upper bound with `+infinity` after
+        // every value. Inclusivity breaks the tie on each end and in
+        // opposite directions: an inclusive LOWER sorts before an
+        // exclusive one (`[1,` before `(1,`), an exclusive UPPER before
+        // an inclusive one (`,5)` before `,5]`). The element-wise
+        // `Array` key already compares exactly like that.
+        Value::Range {
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+            empty,
+            ..
+        } => {
+            let mut parts = alloc::vec![OrderKey::Int(i128::from(!*empty))];
+            if !*empty {
+                match lower {
+                    None => parts.push(OrderKey::Int(0)),
+                    Some(v) => {
+                        parts.push(OrderKey::Int(1));
+                        parts.push(value_to_order_key(v)?);
+                        parts.push(OrderKey::Int(i128::from(!*lower_inc)));
+                    }
+                }
+                match upper {
+                    None => parts.push(OrderKey::Int(2)),
+                    Some(v) => {
+                        parts.push(OrderKey::Int(1));
+                        parts.push(value_to_order_key(v)?);
+                        parts.push(OrderKey::Int(i128::from(*upper_inc)));
+                    }
+                }
+            }
+            return Ok(OrderKey::Array(parts));
         }
         // v7.17.0 Phase 3.P0-39 — hstore is not orderable.
         Value::Hstore(_) => {

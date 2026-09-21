@@ -4786,7 +4786,7 @@ pub enum SelectItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TableRef {
     /// 9.0.0 — where this relation is named; see [`SrcToken`].
     pub token: SrcToken,

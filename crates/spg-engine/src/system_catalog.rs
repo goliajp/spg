@@ -6326,6 +6326,10 @@ const PG_SCALAR_TYPES: &[(i64, &str, i16, &str, &str, i64, i64)] = &[
     (2249, "record", -1, "p", "P", 0, 0),
     (2277, "anyarray", -1, "p", "P", 0, 0),
     (2283, "anyelement", 4, "p", "P", 0, 0),
+    // 9.0.0 (S1) — `anycompatible`, which the three-argument `lag` and
+    // `lead` return. Same reason as `anyelement` above: a `pg_proc` row
+    // may not point at a type `pg_type` does not carry.
+    (5077, "anycompatible", 4, "p", "P", 0, 0),
     (4451, "int4multirange", -1, "m", "R", 0, 0),
     (4532, "nummultirange", -1, "m", "R", 0, 0),
     (4533, "tsmultirange", -1, "m", "R", 0, 0),
@@ -17000,8 +17004,18 @@ pub(crate) const PG_PROC_FUNCS: &[(i64, &str, &str, i32, i64)] = &[
     (3104, "cume_dist", "w", 0, 701),
     (3106, "lag", "w", 1, 2283),
     (3107, "lag", "w", 2, 2283),
+    // 9.0.0 (S1) — the three-argument forms. They were left out on the
+    // reasoning that the engine could not answer them, and `SELECT
+    // lag(1, 1, 1) OVER ()` did refuse — but for the FROM clause, not
+    // the arity: a window function with no FROM was refused outright.
+    // With that closed, both answer exactly what PostgreSQL 18.6
+    // answers (`lag(5,1,99) OVER (ORDER BY x)` over two rows is
+    // `99, 5`), so the missing rows were the catalog understating what
+    // the engine does.
+    (3108, "lag", "w", 3, 5077),
     (3109, "lead", "w", 1, 2283),
     (3110, "lead", "w", 2, 2283),
+    (3111, "lead", "w", 3, 5077),
     (3112, "first_value", "w", 1, 2283),
     (3113, "last_value", "w", 1, 2283),
     (3114, "nth_value", "w", 2, 2283),

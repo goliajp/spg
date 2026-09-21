@@ -126,7 +126,12 @@ fn unsupported_rule_forms_are_rejected_not_swallowed() {
         Err(x) => format!("{x}"),
         Ok(_) => panic!("expected error"),
     };
-    assert!(m.contains("ON SELECT rules are not supported"), "{m}");
+    // 9.0.0 (S1) — PostgreSQL 18.6's own sentence, measured. SPG's was
+    // its own, and named no relation.
+    assert!(
+        m.contains("relation \"u\" cannot have ON SELECT rules"),
+        "{m}"
+    );
     // A rule on a non-existent relation is refused.
     let m = match e.execute("CREATE RULE rn AS ON DELETE TO nope DO INSTEAD NOTHING") {
         Err(x) => format!("{x}"),
