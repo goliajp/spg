@@ -323,11 +323,13 @@ impl Engine {
             .expect("streaming shape requires FROM (detector enforces)");
         let primary = &from.primary;
         let catalog = self.active_catalog();
-        let table = catalog.get(&primary.name).ok_or_else(|| {
-            EngineError::Storage(StorageError::TableNotFound {
-                name: primary.name.clone(),
-            })
-        })?;
+        let table = catalog
+            .get_written(&primary.name, primary.qualified)
+            .ok_or_else(|| {
+                EngineError::Storage(StorageError::TableNotFound {
+                    name: primary.name.clone(),
+                })
+            })?;
         let schema_cols = &table.schema().columns;
         let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
         let ctx = self.ev_ctx(schema_cols, Some(alias));

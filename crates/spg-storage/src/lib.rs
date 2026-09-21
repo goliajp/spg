@@ -6728,7 +6728,16 @@ impl Catalog {
         {
             return Some(def);
         }
-        self.sequences.get(name)
+        if let Some(def) = self.sequences.get(name) {
+            return Some(def);
+        }
+        // 9.0.0 (C9) — and along the search path, the way a table and a
+        // view are resolved. `pg_get_sequence_data(oid)` resolves the
+        // oid to the name a client reads and then asks here, so a
+        // sequence in a schema answered NO row — and `pg_dump` joins
+        // `pg_sequence` against that function, finds a sequence in
+        // `pg_class` with no data row, and SEGFAULTS.
+        self.sequences.get(self.resolved_key(name).as_ref())
     }
 
     /// Does a sequence of this logical name exist for this session?
@@ -6948,7 +6957,95 @@ impl Catalog {
         {
             return Some(def);
         }
-        self.views.get(name)
+        if let Some(def) = self.views.get(name) {
+            return Some(def);
+        }
+        // 9.0.0 (C9) — and along the search path, the way a table is
+        // resolved. A view in a schema is keyed by its key, so a caller
+        // holding the bare name — `pg_get_viewdef`, which resolves an
+        // oid to the name a client reads — found nothing and answered
+        // an EMPTY definition, which `pg_dump` reports as
+        // `definition of view "v" appears to be empty (length zero)`.
+        self.views.get(self.resolved_key(name).as_ref())
+    }
+
+    /// 9.0.1 (C9) — the key the SEARCH PATH alone resolves `name` to,
+    /// with no last-resort sweep behind it. This is the question
+    /// "would a client writing this bare name reach that relation",
+    /// which is how PostgreSQL decides whether `::regclass` prints a
+    /// qualifier (measured on 18.6: `'q1.only_here'::regclass::text`
+    /// prints `q1.only_here` until `q1` joins the path, then
+    /// `only_here`).
+    #[must_use]
+    pub fn path_key(&self, name: &str) -> Option<String> {
+        // The same order [`Self::resolve_index`] walks, and the same
+        // database scoping — the answer IS what that resolver would
+        // reach, so a key it agrees with needs no qualifier written.
+        //
+        // The session's temporary namespace comes first, as it does in
+        // every resolver: `mytmp` reaches the caller's own temporary
+        // table, whose stored key is the mangled one.
+        if let Some(mangled) = self.temp_name_for(name) {
+            let key = self.in_this_database(&mangled).into_owned();
+            if self.holds_key(&key) {
+                return Some(key);
+            }
+        }
+        for schema in &self.search_path {
+            let qualified = spg_sql::namespace::qualified_key(schema, name);
+            let key = self.in_this_database(&qualified).into_owned();
+            if self.holds_key(&key) {
+                return Some(key);
+            }
+        }
+        // …and then the bare key, which is where a session that never
+        // set a path resolves. Leaving this out made every relation in
+        // `public` print as `public.t`.
+        let key = self.in_this_database(name).into_owned();
+        self.holds_key(&key).then_some(key)
+    }
+
+    /// Any registry keyed the way `by_name` is holds this exact key.
+    fn holds_key(&self, key: &str) -> bool {
+        self.views.contains_key(key)
+            || self.sequences.contains_key(key)
+            || self.by_name.contains_key(key)
+    }
+
+    /// 9.0.0 (C9) — the key a bare name resolves to for THIS session:
+    /// the first schema on the search path that holds it, else the name
+    /// itself. Shared by the registries that are keyed the way
+    /// `by_name` is.
+    fn resolved_key<'a>(&self, name: &'a str) -> alloc::borrow::Cow<'a, str> {
+        if spg_sql::namespace::is_qualified(name) {
+            return alloc::borrow::Cow::Borrowed(name);
+        }
+        // NOTE — `resolved_key` answers a key in the SESSION's own
+        // keyspace, so the database prefix `path_key` applies is taken
+        // back off here; its callers add it themselves.
+        for schema in &self.search_path {
+            let key = spg_sql::namespace::qualified_key(schema, name);
+            if self.holds_key(self.in_this_database(&key).as_ref()) {
+                return alloc::borrow::Cow::Owned(key);
+            }
+        }
+        // 9.0.0 — and, failing the path, the ONE schema that holds it.
+        // An oid resolved to a bare name arrives with no path context;
+        // PostgreSQL's own `pg_get_viewdef(oid)` answers whatever that
+        // oid names, whichever schema it is in.
+        let mut found: Option<String> = None;
+        for key in self.views.keys().chain(self.sequences.keys()) {
+            if spg_sql::namespace::bare_of(key) == name {
+                if found.is_some() {
+                    return alloc::borrow::Cow::Borrowed(name);
+                }
+                found = Some(key.clone());
+            }
+        }
+        found.map_or(
+            alloc::borrow::Cow::Borrowed(name),
+            alloc::borrow::Cow::Owned,
+        )
     }
 
     /// Does a view of this logical name exist for this session?
@@ -7976,9 +8073,41 @@ impl Catalog {
             .map(|p| alloc::format!("{p}{name}"))
     }
 
+    /// 9.0.1 (C9) — the table a relation REFERENCE names, honouring a
+    /// qualifier the client wrote.
+    ///
+    /// `public`'s relations are keyed by their bare names, so the key
+    /// alone cannot say `public.t` from `t`, and the search path was
+    /// walked for both: with `search_path = sa, public`, `SELECT a FROM
+    /// public.t` read `sa`'s table and answered `column "a" does not
+    /// exist`. PostgreSQL 18.6 reads `public`'s (measured).
+    #[must_use]
+    pub fn get_written(&self, name: &str, written_qualified: bool) -> Option<&Table> {
+        if written_qualified {
+            let key = self.in_this_database(name);
+            let idx = *self.by_name.get(key.as_ref())?;
+            return self.tables.get(idx);
+        }
+        self.get(name)
+    }
+
     pub fn get(&self, name: &str) -> Option<&Table> {
         let idx = self.resolve_index(name)?;
         self.tables.get(idx)
+    }
+
+    /// 9.0.1 (C9) — the mutable twin of [`Self::get_written`]: a
+    /// qualifier the client wrote is not the search path's to
+    /// reinterpret. `INSERT INTO public.t` wrote `sa`'s table whenever
+    /// `sa` sat ahead of `public`.
+    pub fn get_written_mut(&mut self, name: &str, written_qualified: bool) -> Option<&mut Table> {
+        if written_qualified {
+            let key = self.in_this_database(name).into_owned();
+            let idx = *self.by_name.get(&key)?;
+            self.dirty_tables.insert(key);
+            return self.tables.get_mut(idx);
+        }
+        self.get_mut(name)
     }
 
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Table> {

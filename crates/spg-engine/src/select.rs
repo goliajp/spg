@@ -236,6 +236,7 @@ impl Engine {
             None => {
                 synthetic_from = spg_sql::ast::FromClause {
                     primary: spg_sql::ast::TableRef {
+                        qualified: false,
                         name: alloc::string::String::from("generate_series"),
                         generate_series_args: Some(alloc::vec![
                             spg_sql::ast::Expr::Literal(spg_sql::ast::Literal::Integer(1)),
@@ -312,11 +313,12 @@ impl Engine {
                 owned_rows = owned;
                 rows_are_owned = true;
             } else {
-                let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
-                    StorageError::TableNotFound {
+                let table = self
+                    .active_catalog()
+                    .get_written(&primary.name, primary.qualified)
+                    .ok_or_else(|| StorageError::TableNotFound {
                         name: primary.name.clone(),
-                    }
-                })?;
+                    })?;
                 let alias = primary.alias.as_deref().unwrap_or(primary.name.as_str());
                 schema_cols_owned = table.schema().columns.clone();
                 alias_opt = Some(alias);
@@ -2672,7 +2674,12 @@ impl Engine {
     /// already have in hand.
     pub(crate) fn admin_view_catalog(&self, stmt: &SelectStatement) -> Option<Catalog> {
         let from = stmt.from.as_ref()?;
-        if !from.joins.is_empty() || self.active_catalog().get(&from.primary.name).is_some() {
+        if !from.joins.is_empty()
+            || self
+                .active_catalog()
+                .get_written(&from.primary.name, from.primary.qualified)
+                .is_some()
+        {
             return None;
         }
         let lower = from.primary.name.to_ascii_lowercase();
@@ -2759,7 +2766,10 @@ impl Engine {
         }
         // A row-security policy filters rows, so the header count is not
         // the answer; the ordinary path applies the policy.
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         if table.schema().row_security {
@@ -2845,7 +2855,9 @@ impl Engine {
         {
             return None;
         }
-        let table = self.active_catalog().get(&from.primary.name)?;
+        let table = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)?;
         if table.schema().row_security {
             return None;
         }
@@ -3666,7 +3678,10 @@ impl Engine {
         // from recursing back into meta-view detection.
         if let Some(from) = &stmt.from
             && from.joins.is_empty()
-            && self.active_catalog().get(&from.primary.name).is_none()
+            && self
+                .active_catalog()
+                .get_written(&from.primary.name, from.primary.qualified)
+                .is_none()
         {
             let lower = from.primary.name.to_ascii_lowercase();
             if let Some(result) = self.meta_view_result(&lower) {
@@ -4907,7 +4922,10 @@ impl Engine {
         primary: &spg_sql::ast::TableRef,
         cancel: CancelToken<'_>,
     ) -> Result<Option<QueryResult>, EngineError> {
-        if self.active_catalog().get(&primary.name).is_none()
+        if self
+            .active_catalog()
+            .get_written(&primary.name, primary.qualified)
+            .is_none()
             && let Some(seq) = self.active_catalog().sequence(&primary.name)
         {
             let rows = alloc::vec![Row::new(alloc::vec![
@@ -5052,11 +5070,12 @@ impl Engine {
         if let Some(done) = self.try_sequence_relation(stmt, primary, cancel)? {
             return Ok(done);
         }
-        let table = self.active_catalog().get(&primary.name).ok_or_else(|| {
-            StorageError::TableNotFound {
+        let table = self
+            .active_catalog()
+            .get_written(&primary.name, primary.qualified)
+            .ok_or_else(|| StorageError::TableNotFound {
                 name: primary.name.clone(),
-            }
-        })?;
+            })?;
         let schema_cols = &table.schema().columns;
         // The qualifier accepted on column refs is the alias (if any) else the
         // bare table name.
@@ -6490,7 +6509,9 @@ impl Engine {
         }
         // Outer column must be a single-column PK on integer family.
         let catalog = self.active_catalog();
-        let Some(outer_table) = catalog.get(from.primary.name.as_str()) else {
+        let Some(outer_table) =
+            catalog.get_written(from.primary.name.as_str(), from.primary.qualified)
+        else {
             return Ok(None);
         };
         let outer_schema = outer_table.schema();
@@ -6586,7 +6607,10 @@ impl Engine {
             {
                 return false;
             }
-            let Some(inner_table) = catalog.get(inner_from.primary.name.as_str()) else {
+            let Some(inner_table) = catalog.get_written(
+                inner_from.primary.name.as_str(),
+                inner_from.primary.qualified,
+            ) else {
                 return false;
             };
             let isch = inner_table.schema();
@@ -8317,7 +8341,10 @@ impl Engine {
         {
             return Ok(None);
         }
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         // Cold-tier rows live outside `rows()`; this walk would drop
@@ -8632,7 +8659,9 @@ impl Engine {
         if stmt.order_by.len() != 1 || stmt.distinct {
             return None;
         }
-        let table = self.active_catalog().get(&from.primary.name)?;
+        let table = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)?;
         let alias = from
             .primary
             .alias
@@ -8828,7 +8857,10 @@ impl Engine {
         {
             return true;
         }
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return true;
         };
         if table.has_cold_rows_fast() {
@@ -8867,7 +8899,9 @@ impl Engine {
         if self.walk_shape_refused(stmt, from) {
             return None;
         }
-        let table = self.active_catalog().get(&from.primary.name)?;
+        let table = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)?;
         let alias = from
             .primary
             .alias
@@ -9068,7 +9102,10 @@ impl Engine {
                 None => return Ok(None),
             },
         };
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         let alias = from
@@ -9467,7 +9504,10 @@ impl Engine {
         crate::orderby::check_order_by_legality(stmt)?;
         crate::orderby::check_order_by_positions(stmt)?;
         crate::window::reject_window_in_row_clauses(stmt)?;
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         if table.has_cold_rows_fast() {
@@ -9790,7 +9830,10 @@ impl Engine {
         {
             return Ok(None);
         }
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         // Cold-tier rows live outside `rows()`; this walk would drop
@@ -10084,7 +10127,10 @@ impl Engine {
     where
         F: FnMut(crate::StreamItem<'_>) -> Result<(), EngineError>,
     {
-        let Some(table) = self.active_catalog().get(&from.primary.name) else {
+        let Some(table) = self
+            .active_catalog()
+            .get_written(&from.primary.name, from.primary.qualified)
+        else {
             return Ok(None);
         };
         // Cold-tier rows live outside `rows()`; the materialising fallback
@@ -11015,7 +11061,7 @@ impl Engine {
         }
         let table = self
             .active_catalog()
-            .get(&from.primary.name)
+            .get_written(&from.primary.name, from.primary.qualified)
             .ok_or_else(|| StorageError::TableNotFound {
                 name: from.primary.name.clone(),
             })?;
@@ -11347,6 +11393,7 @@ fn rewrite_agg_before_window(stmt: &SelectStatement) -> Option<SelectStatement> 
         ..stmt.clone()
     };
     let derived = TableRef {
+        qualified: false,
         token: spg_sql::ast::SrcToken::NONE,
         name: "__aggwin".into(),
         alias: Some("__aggwin".into()),
@@ -14952,7 +14999,7 @@ impl crate::Engine {
                     plain = false;
                     break;
                 }
-                let Some(table) = cat.get(&t.name) else {
+                let Some(table) = cat.get_written(&t.name, t.qualified) else {
                     plain = false;
                     break;
                 };
@@ -15046,7 +15093,7 @@ impl crate::Engine {
         let mut cols: Vec<ColumnSchema> = Vec::new();
         if let Some(from) = &stmt.from {
             for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
-                if let Some(table) = cat.get(&t.name) {
+                if let Some(table) = cat.get_written(&t.name, t.qualified) {
                     cols.extend(table.schema().columns.iter().cloned());
                 }
             }
@@ -15149,7 +15196,7 @@ impl crate::Engine {
         let mut cols: Vec<ColumnSchema> = Vec::new();
         if let Some(from) = &stmt.from {
             for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
-                if let Some(table) = cat.get(&t.name) {
+                if let Some(table) = cat.get_written(&t.name, t.qualified) {
                     cols.extend(table.schema().columns.iter().cloned());
                 }
             }
@@ -15213,7 +15260,7 @@ impl crate::Engine {
         let mut cols: Vec<ColumnSchema> = Vec::new();
         if let Some(from) = &stmt.from {
             for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
-                if let Some(table) = cat.get(&t.name) {
+                if let Some(table) = cat.get_written(&t.name, t.qualified) {
                     cols.extend(table.schema().columns.iter().cloned());
                 }
             }
@@ -15305,7 +15352,7 @@ impl crate::Engine {
         let mut cols: Vec<ColumnSchema> = Vec::new();
         if let Some(from) = &stmt.from {
             for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
-                if let Some(table) = cat.get(&t.name) {
+                if let Some(table) = cat.get_written(&t.name, t.qualified) {
                     cols.extend(table.schema().columns.iter().cloned());
                 }
             }
@@ -15414,7 +15461,7 @@ impl crate::Engine {
         let mut cols: Vec<ColumnSchema> = Vec::new();
         if let Some(from) = &stmt.from {
             for t in core::iter::once(&from.primary).chain(from.joins.iter().map(|j| &j.table)) {
-                if let Some(table) = cat.get(&t.name) {
+                if let Some(table) = cat.get_written(&t.name, t.qualified) {
                     cols.extend(table.schema().columns.iter().cloned());
                 }
             }
@@ -15503,7 +15550,12 @@ impl crate::Engine {
                     self.check_select_relations(sel, cat, &mut scope)?;
                 }
                 if let Some(cols) = &ins.columns {
-                    self.require_target_columns(cat, &ins.table, cols.iter().map(String::as_str))?;
+                    self.require_target_columns(
+                        cat,
+                        &ins.table,
+                        ins.table_qualified,
+                        cols.iter().map(String::as_str),
+                    )?;
                 }
                 Ok(())
             }
@@ -15522,6 +15574,7 @@ impl crate::Engine {
                 self.require_target_columns(
                     cat,
                     &upd.table,
+                    upd.table_qualified,
                     upd.assignments.iter().map(|(c, _)| c.as_str()),
                 )?;
                 // An extra source (UPDATE … FROM) or a CTE puts names in
@@ -15611,9 +15664,10 @@ impl crate::Engine {
         &self,
         cat: &spg_storage::Catalog,
         table: &str,
+        written_qualified: bool,
         columns: impl Iterator<Item = &'n str>,
     ) -> Result<(), EngineError> {
-        let Some(t) = cat.get(table) else {
+        let Some(t) = cat.get_written(table, written_qualified) else {
             return Ok(());
         };
         for c in columns {
@@ -15792,7 +15846,7 @@ impl crate::Engine {
             if !plain(t) {
                 return Ok(());
             }
-            let Some(table) = cat.get(&t.name) else {
+            let Some(table) = cat.get_written(&t.name, t.qualified) else {
                 return Ok(());
             };
             sources.push((t.alias.clone().unwrap_or_else(|| t.name.clone()), table));
@@ -17441,6 +17495,7 @@ fn value_to_json_value(v: &Value<'_>) -> crate::json::JsonValue {
 
 fn bare_table_ref_named(name: &str) -> TableRef {
     TableRef {
+        qualified: false,
         token: spg_sql::ast::SrcToken::NONE,
         name: name.to_string(),
         alias: None,

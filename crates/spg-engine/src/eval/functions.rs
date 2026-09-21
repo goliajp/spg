@@ -380,9 +380,15 @@ fn viewdef_from_text(
 
 /// `t alias`, the spelling PostgreSQL's deparse uses — no `AS`.
 fn viewdef_relation_text(r: &spg_sql::ast::TableRef) -> String {
+    // 9.0.0 (C9) — the relation is written the way SQL spells it. The
+    // name is a KEY, and its separator is not a character that can
+    // travel to a client: `pg_get_viewdef` on a view over `sa.t` came
+    // back as `SELECT id\n   FROM sa`, truncated there, and `pg_dump`
+    // reported `definition of view "v" appears to be empty`.
+    let name = spg_sql::namespace::display_key(&r.name);
     match &r.alias {
-        Some(a) if *a != r.name => alloc::format!("{} {a}", r.name),
-        _ => r.name.clone(),
+        Some(a) if *a != r.name => alloc::format!("{name} {a}"),
+        _ => name,
     }
 }
 
@@ -3469,10 +3475,11 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::BigInt(0));
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(name_arg);
+            let bare = bare.as_str();
             match cat.get(bare) {
                 Some(t) => {
                     Ok(Value::BigInt(t.hot_bytes().div_ceil(8192) as i64))
@@ -15840,10 +15847,11 @@ fn apply_function_dispatch(
                 }
                 Some(_) => return Ok(Value::Null),
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(name_arg);
+            let bare = bare.as_str();
             let col_no = match args.get(1) {
                 Some(Value::Int(n)) => i64::from(*n),
                 Some(Value::BigInt(n)) => *n,
@@ -16255,10 +16263,11 @@ fn apply_function_dispatch(
             let Some(name_arg) = name_arg else {
                 return Ok(Value::Null);
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(&name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(&name_arg);
+            let bare = bare.as_str();
             let pretty = matches!(args.get(1), Some(Value::Bool(true)));
             // 8.0.3 — names qualified as the session's search path needs.
             let render = |body: &str| {
@@ -16554,10 +16563,11 @@ fn apply_function_dispatch(
                     }
                 },
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(&name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(&name_arg);
+            let bare = bare.as_str();
             let Some(t) = cat.get(bare) else {
                 // A relation that exists but stores nothing here — a view,
                 // or a synthesised catalog relation — weighs 0. A name that
@@ -17294,8 +17304,8 @@ fn apply_function_dispatch(
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(v) => match regclass_name_of(v) {
                     Some(n) => {
-                        bare_owned =
-                            n.strip_prefix("public.").unwrap_or(&n).trim_matches('"').to_string();
+                        // 9.0.1 (C9) — the KEY, so `sa.v` is reached.
+                        bare_owned = spg_sql::namespace::key_from_text(&n);
                         &bare_owned
                     }
                     // Numeric oid input — assume a known relation
@@ -17318,11 +17328,8 @@ fn apply_function_dispatch(
             let bare: &str = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(Value::Text(s)) => {
-                    bare_owned = s
-                        .strip_prefix("public.")
-                        .unwrap_or(s)
-                        .trim_matches('"')
-                        .to_string();
+                    // 9.0.1 (C9) — the KEY, so `sa.v` is reached.
+                    bare_owned = spg_sql::namespace::key_from_text(s);
                     &bare_owned
                 }
                 Some(_) => return Ok(Value::Bool(true)),
@@ -17918,15 +17925,21 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(name_arg);
+            let bare = bare.as_str();
             // v7.39 (read01 ruleutils.c) — to_regclass returns a DUAL-shape
             // regclass (oid + name); unknown system views keep the plain
             // name form (no oid space) and misses are NULL.
             if let Some(oid) = crate::eval::regclass_name_to_oid(cat, bare) {
-                return Ok(Value::RegClass(oid, bare.into()));
+                // 9.0.1 (C9) — written the way PostgreSQL writes it, by
+                // the one rule. `bare` is a KEY, and its NUL separator
+                // truncated `to_regclass('sa.t')::text` to `sa`.
+                let shown = crate::system_catalog::relation_display_for_oid(cat, oid)
+                    .unwrap_or_else(|| spg_sql::namespace::display_key(bare));
+                return Ok(Value::RegClass(oid, shown.into()));
             }
             const SYSTEM_RELS: &[&str] = &[
                 "pg_roles", "pg_user", "pg_tables", "pg_views", "pg_settings",
@@ -19433,10 +19446,11 @@ fn apply_function_dispatch(
             let Some(cat) = ctx.catalog else {
                 return Ok(Value::Null);
             };
-            let bare = name_arg
-                .strip_prefix("public.")
-                .unwrap_or(name_arg)
-                .trim_matches('"');
+            // 9.0.1 (C9) — a written name becomes the KEY the registries are
+            // keyed by. Stripping only a leading `public.` is the
+            // single-schema rule, under which every `sa.x` missed.
+            let bare = spg_sql::namespace::key_from_text(name_arg);
+            let bare = bare.as_str();
             match cat.sequence_current_value(bare) {
                 Ok(v) => Ok(Value::BigInt(v)),
                 Err(_) => Ok(Value::Null),
