@@ -10,6 +10,256 @@ the current build; this file is a release-organized view.
 
 ## [Unreleased]
 
+### Breaking — why this is a major
+
+**Behaviour.** A relation belongs to a schema and to a database. Two
+schemas that each held a `t` shared one relation before this, and a
+table made in one database was visible from another; both now answer
+the way PostgreSQL answers. A deployment that never named a schema or
+ran `CREATE DATABASE` is unaffected — those relations are keyed
+exactly as they were — but an application that RELIED on the old
+collapsing will see its two relations come apart.
+
+**On-disk.** Catalog FILE_VERSION 105. A 9.0 image is refused by an
+8.x binary, by its version rather than by misreading a key as a name.
+9.0 reads every older image.
+
+**API** (the published crates, for callers that build against them):
+
+* `spg_sql::ast::PlPgSqlStmt` is a struct carrying `line` and `kind`;
+  the enum is now `PlPgSqlStmtKind`.
+* `Statement::DropSchema` gains `cascade`; `AlterTableTarget` gains
+  `SetSchema`; `FromJoin` gains `comma`.
+* `spg_sql::parser::ParseError` gains `body_pos`.
+* `spg_storage::Catalog::visible_table_names` is
+  `visible_relation_keys` and answers stored KEYS, not display names —
+  the rename is deliberate, so every caller had to be looked at.
+* `OnConflictClause`, `ColumnName` and `CatalogIndex` changed shape,
+  and `CATALOG_RELATIONS` carries a fourth field.
+
+The AST enums are deliberately NOT `#[non_exhaustive]`: that would
+force a catch-all arm on every downstream match, and a catch-all is
+exactly what lets a new variant compile silently — which this project
+treats as a defect, not a convenience.
+
+### Fixed — one list of catalog relations, and an `information_schema` that answers
+
+The set of catalog relations SPG answers for was written in six places
+— the parser gate that decides whether `pg_catalog.x` is rewritten
+(107 names), the `pg_class` row builder (43), the empty-catalog table
+(30), the meta-view dispatch (17), a catalog-oid table (64) and a
+hand-copied 13-name subset in the evaluator. They disagreed, and the
+disagreement was observable: **64 relations answered a query and had
+no `pg_class` row**. `SELECT count(*) FROM pg_database` answered 1
+while `SELECT count(*) FROM pg_class WHERE relname='pg_database'`
+answered 0; PostgreSQL 18.6 answers 7 and 1. One registry now, in the
+lowest layer that needs it.
+
+Publishing a relation without its columns was the next defect, and the
+repository's own pin said so. Closing it meant extracting 37
+relations' SHAPE out of the function that builds their rows, so the
+two cannot describe a relation differently.
+
+Asked for each of PostgreSQL's 69 `information_schema` relations by
+name, **52 answered `meta view … is not yet materialisable`** — an
+ERROR where PostgreSQL answers rows or an empty set, in the schema
+every ORM reflects through. All 69 answer now: 15 SPG is genuinely
+empty of, with the right columns and no rows; 6 whose content is fixed
+carrying PostgreSQL 18.6's own rows (`sql_features` 755 rows
+byte-identical, `sql_sizing` 23, `sql_parts` 11,
+`sql_implementation_info` 12, `character_sets`,
+`information_schema_catalog_name`); and 31 derived from the catalog
+SPG already has.
+
+### Fixed — say what PostgreSQL says, before the scan
+
+`pg_index.indclass` was a row of zeros and every operator class
+carried a made-up oid, so the join a client uses to learn how an index
+compares found nothing on either side. All 179 `pg_opclass` rows carry
+PostgreSQL 18.6's own oid now, a key part uses the class the statement
+named else the default for its (access method, type), and `USING
+gin/brin` on a shape SPG backs with a B-tree reports gin/brin.
+
+The PRETTY deparse was a second deparser: `pg_get_constraintdef(oid,
+true)` printed the expression as WRITTEN, so it lost the type the
+plain form gives a literal. One renderer answers both forms now, and
+`pretty` decides only the parentheses — 14 CHECK shapes and 10 view
+shapes match byte for byte. Two holes surfaced doing it, both worse
+than the layout: `extract_first_column` refused every index key
+outside six node kinds, and the AST's `Display`, which is what a
+view's body is STORED as, dropped three spellings — `FROM a, b` came
+back as `CROSS JOIN`, `USING (id)` as an ON predicate, and a NATURAL
+join as a join with NO condition, which is a different query that a
+restore ran.
+
+EXPLAIN: a Sort under a Limit reports the rows the Limit took, `Sort
+Method` carries a measured `Memory: NkB`, and a sort key is qualified
+only when more than one relation is in scope. The `Buffers:` line SPG
+printed is gone — `hot_rows=N cold_rows=0 cache_hit_ratio=100.00` was
+its own vocabulary on a PostgreSQL surface, and every query answered
+100.00.
+
+Three semantic faults are refused before the scan, in PostgreSQL's
+exact sentences. The name check asks the DISPATCH which names it
+knows, through a table derived by calling the evaluator — not static
+lists, which is what an earlier attempt did and why it refused 346
+real functions.
+
+A view's `*` is expanded when the view is CREATED, as PostgreSQL
+expands it, which makes the columns a view reads readable — so `DROP
+COLUMN` is column-precise now and refuses in PostgreSQL's words.
+
+### Fixed — a relation belongs to a schema
+
+`CREATE SCHEMA` recorded a NAME and nothing else. The qualifier on
+`sa.t` was dropped at parse time, so `sa.t` and `sb.t` were one
+relation: the second `CREATE TABLE` answered `relation "t" already
+exists`, and a two-schema application read the other schema's rows.
+The code said so out loud — the registry's own comment called it
+"prefix routing, not isolation".
+
+The schema travels with the name as one key, with NUL between them.
+NUL cannot occur in an identifier — PostgreSQL rejects it because its
+identifiers are C strings, and the lexer rejects it here now for the
+same reason — so every map that is keyed by a relation name carries
+the schema for free. A relation in `public` keeps the bare name, so an
+existing catalog file is keyed exactly as it was.
+
+`search_path` decides what an unqualified name reaches; an unqualified
+`CREATE` puts the relation in `current_schema()`; `DROP TABLE` follows
+the same path; `ALTER TABLE … SET SCHEMA` moves the relation, where it
+used to be consumed and ignored; `DROP SCHEMA` refuses a schema that
+still owns relations, and `CASCADE` takes them. `pg_namespace` and
+`information_schema.schemata` list every schema `CREATE SCHEMA` made —
+the registry had held the names since v7.17.0 and nothing published
+them, so a client asking whether its schema existed was told no while
+`CREATE SCHEMA … IF NOT EXISTS` said it already did.
+
+Measured over the wire against PostgreSQL 18.6: the two-schema script
+answers identically on both legs, and `pg_dump` of a two-schema
+database restores into PostgreSQL with the right rows in each schema
+and into a fresh SPG as a fixed point. Three paths besides the parser
+had to stop dropping the qualifier: `LOCK TABLE`, which `pg_dump`
+issues for every table it is about to read, and the two COPY paths,
+which rebuild SQL from the key.
+
+Catalog FILE_VERSION 105, so an older binary refuses a 9.0 image by
+its version rather than reading a key as a name.
+
+### Fixed — a database made here owns its relations
+
+`CREATE DATABASE` made a name and nothing else, so a table made in one
+database was visible from another: measured against PostgreSQL 18.6,
+a table in `c8a` answered 1 from `c8b`, where PostgreSQL answers 0.
+
+The same shape as the schemas one level up, on the same key. The
+datadir's own database keeps the shorter key, so a deployment that
+never ran `CREATE DATABASE` — which is every deployment today —
+reaches its tables exactly as before. `DROP DATABASE` takes its
+relations; before this the statement could only refuse, because the
+name was the whole of it.
+
+**Known difference:** a connection to a database name nobody created
+is the datadir's own database, where PostgreSQL answers `FATAL:
+database "x" does not exist`. Refusing would break every existing
+deployment, none of which created the name its application connects
+with.
+
+The `CREATE DATABASE` warning said "SPG serves one database and
+answers to any name". That is no longer true; what is still one per
+datadir is the COLLATION, and the warning says that instead.
+
+### Fixed — `pg_operator` carried oids nobody could resolve
+
+The table was generated: 330 rows, oids counting up from 70,000,
+`oprcom` and `oprnegate` pointing at those invented oids, and
+`oprcode` plus both selectivity estimators the literal `-`. Every row
+was internally consistent and externally useless — a client that reads
+`oprnegate` to turn `NOT (a = b)` into `a <> b` got an oid PostgreSQL
+has never issued.
+
+It carries PostgreSQL 18.6's own rows now, 690 of them, one per
+operator a probe showed the engine evaluates. 503 commutators and 360
+negators land on rows of this same table, and `=` between two `int4`
+is oid 96 / `int4eq`.
+
+Which rows to carry was measured, with PostgreSQL as the control leg,
+and the measurement went wrong twice. The first cut probed with NULL
+operands and came out at 689 different rows, because the engine
+answers NULL for a NULL operand before it checks the types. The second
+left every polymorphic operand type unprobed for want of a literal,
+which dropped `&&` over arrays and the whole range, multirange, record
+and enum comparison family. Array overlap had been listed against
+`int4[]`, which is not where PostgreSQL declares it.
+
+### Fixed — a keyword as a PL/pgSQL name, a caret inside the body, and the `CONTEXT:` line
+
+Three things a PL/pgSQL body could not say.
+
+PL/pgSQL's scanner is its own, so PostgreSQL accepts a block label
+`<<inner>>` and a `DECLARE inner int`; what it then refuses is the
+unquoted reference in an expression. SPG refused at the declaration,
+and the refusal took the whole DO block with it.
+
+A parse error inside the body carried no position, because the body is
+lexed in a context of its own and the statement carries it as one
+dollar-quoted token. The caret lands where PostgreSQL's does now
+(`LINE 4:   END LOOP zz;`), tag length included. Two defects turned up
+under it: the message was shaped against the OUTER statement, so a
+fault four lines inside answered `syntax error at or near "$$"`; and
+the end-label refusal pointed at the token after the label.
+
+An error raised inside a body ended without `CONTEXT:  PL/pgSQL
+function inline_code_block line 3 at RAISE`, so a client could see
+that something failed and not where. Each statement records its line,
+and the innermost one wins, which is what PostgreSQL reports.
+
+**Residual:** PostgreSQL names a `PERFORM` as `at PERFORM` and adds
+`QUERY:` / `SQL statement "…"` lines for a failure inside an embedded
+statement; SPG lowers PERFORM to a SELECT, so it says `at SQL
+statement`, and prints the one CONTEXT line.
+
+### Fixed — six refusals of things PostgreSQL does
+
+The refusal sweep, run as one corpus on both legs.
+
+An expression key on BRIN (`USING brin ((a+1))`, `USING brin
+(lower(b))`) — ordinary PostgreSQL, and a schema that had one did not
+load here. `ORDER BY` of a range, refused as "not supported in
+v7.17.0" while PostgreSQL sorts them. A bare-string frame offset
+(`RANGE BETWEEN '1 day' PRECEDING`), which PostgreSQL coerces to the
+ORDER BY column's type and SPG answered with a syntax error. `ALTER
+FUNCTION f() RENAME TO g`, refused on reasoning that went stale when
+the function registry became signature-keyed. And a window function
+with no FROM: `SELECT count(*) OVER ()` is 1 there and was refused
+here.
+
+Two more refusals PostgreSQL also makes now use PostgreSQL's sentence:
+`access method "gin" does not support included columns`, and `relation
+"x" cannot have ON SELECT rules`.
+
+Closing the window one uncovered another: the three-argument `lag` and
+`lead` were left out of `pg_proc` on the recorded reasoning that the
+engine could not answer them. It could — the FROM-less refusal had
+been masking the arity — so both are listed at PostgreSQL's oids, and
+`pg_type` gained the `anycompatible` row they return.
+
+**Known difference:** `UPDATE t SET e[-1] = 9` is accepted by
+PostgreSQL, which extends the array leftwards and gives it a new lower
+bound. SPG's arrays have none to give.
+
+### Fixed — one list of pre-scan checks, so the wire runs the same ones
+
+`SELECT o = n` with an `oid` and a `numeric` column answered `t` over
+the PostgreSQL wire. PostgreSQL refuses it — `operator does not exist:
+oid = numeric` — and so did the engine, in process and on the MySQL
+wire and for any shape that needs a GROUP BY.
+
+An autocommit SELECT takes a read-only streaming route that runs below
+the executor's gate, so each of those entry points carried its own
+copy of the pre-scan check list. There were three lists, and the
+oid-pair check had reached exactly one. There is one list now.
+
 ### Fixed — pg_trgm's `%` worked in a select list and not in a `WHERE`
 
 `SELECT id FROM t WHERE txt % 'needle'` answered `operator does not
