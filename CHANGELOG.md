@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [9.0.1] — 2026-09-22
 
 ### Fixed — pg_dump SEGFAULTED on a sequence outside `public`
 
