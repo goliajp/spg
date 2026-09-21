@@ -160,6 +160,10 @@ impl Engine {
         // nothing behind. See the CHANGELOG for the measurement: a body whose
         // second INSERT failed kept its first, in memory and not in the WAL.
         let before = engine_cell.borrow().active_catalog().clone();
+        // 9.0.0 (A4b) — where the walker leaves the statement it is on,
+        // so an error can end with PostgreSQL's `CONTEXT:  PL/pgSQL
+        // function inline_code_block line N at <KIND>`.
+        let at: core::cell::Cell<(u32, &'static str)> = core::cell::Cell::new((0, ""));
         let outcome = triggers::execute_do_block_live(
             &body,
             dts.as_deref(),
@@ -168,6 +172,7 @@ impl Engine {
             Some(&raise_sink),
             &write_fn,
             &savepoint_fn,
+            Some(&at),
         );
         // v7.39 (round 757, F31-B3) — deliver the body's RAISE messages
         // even when it errored afterwards (PG sends the notices raised
@@ -175,6 +180,15 @@ impl Engine {
         engine_cell.borrow_mut().drain_raise_sink(raise_sink);
         if let Err(e) = outcome {
             *engine_cell.borrow_mut().active_catalog_mut() = before;
+            // 9.0.0 (A4b) — PostgreSQL's CONTEXT line, from the
+            // statement the walker was on. `inline_code_block` is the
+            // name PG gives a DO block's anonymous function.
+            let (line, kind) = at.get();
+            if line > 0 {
+                engine_cell.borrow_mut().set_error_context(alloc::format!(
+                    "PL/pgSQL function inline_code_block line {line} at {kind}"
+                ));
+            }
             if let Some(engine_err) = failed_with.into_inner() {
                 return Err(engine_err);
             }
@@ -235,28 +249,28 @@ impl Engine {
         stmts: &mut [spg_sql::ast::PlPgSqlStmt],
         cancel: CancelToken<'_>,
     ) -> Result<(), EngineError> {
-        use spg_sql::ast::PlPgSqlStmt;
+        use spg_sql::ast::PlPgSqlStmtKind;
         for stmt in stmts {
-            match stmt {
-                PlPgSqlStmt::Block(b) => {
+            match &mut stmt.kind {
+                PlPgSqlStmtKind::Block(b) => {
                     self.resolve_plpgsql_block_subqueries(b, cancel)?;
                 }
-                PlPgSqlStmt::Assign { value, .. } => {
+                PlPgSqlStmtKind::Assign { value, .. } => {
                     self.resolve_expr_subqueries(value, cancel)?;
                 }
-                PlPgSqlStmt::Return(spg_sql::ast::ReturnTarget::Expr(e)) => {
+                PlPgSqlStmtKind::Return(spg_sql::ast::ReturnTarget::Expr(e)) => {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
-                PlPgSqlStmt::Return(_) => {}
+                PlPgSqlStmtKind::Return(_) => {}
                 // v7.39 (read01 round 66) — the set-building statements.
-                PlPgSqlStmt::ReturnNext(e) => {
+                PlPgSqlStmtKind::ReturnNext(e) => {
                     self.resolve_expr_subqueries(e, cancel)?;
                 }
-                PlPgSqlStmt::ReturnQuery(_) => {}
-                PlPgSqlStmt::ReturnQueryExecute { sql } => {
+                PlPgSqlStmtKind::ReturnQuery(_) => {}
+                PlPgSqlStmtKind::ReturnQueryExecute { sql } => {
                     self.resolve_expr_subqueries(sql, cancel)?;
                 }
-                PlPgSqlStmt::If {
+                PlPgSqlStmtKind::If {
                     branches,
                     else_branch,
                 } => {
@@ -266,60 +280,60 @@ impl Engine {
                     }
                     self.resolve_plpgsql_stmts_subqueries(else_branch, cancel)?;
                 }
-                PlPgSqlStmt::Raise { args, .. } => {
+                PlPgSqlStmtKind::Raise { args, .. } => {
                     for a in args {
                         self.resolve_expr_subqueries(a, cancel)?;
                     }
                 }
-                PlPgSqlStmt::Assert { condition, message } => {
+                PlPgSqlStmtKind::Assert { condition, message } => {
                     self.resolve_expr_subqueries(condition, cancel)?;
                     if let Some(m) = message {
                         self.resolve_expr_subqueries(m, cancel)?;
                     }
                 }
-                PlPgSqlStmt::While {
+                PlPgSqlStmtKind::While {
                     condition, body, ..
                 } => {
                     self.resolve_expr_subqueries(condition, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::ForRange {
+                PlPgSqlStmtKind::ForRange {
                     start, end, body, ..
                 } => {
                     self.resolve_expr_subqueries(start, cancel)?;
                     self.resolve_expr_subqueries(end, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::Loop { body, .. } => {
+                PlPgSqlStmtKind::Loop { body, .. } => {
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::Exit { when, label } => {
+                PlPgSqlStmtKind::Exit { when, label } => {
                     if let Some(cond) = when {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }
                 }
-                PlPgSqlStmt::Continue { when, label } => {
+                PlPgSqlStmtKind::Continue { when, label } => {
                     if let Some(cond) = when {
                         self.resolve_expr_subqueries(cond, cancel)?;
                     }
                 }
-                PlPgSqlStmt::ExecuteDynamic { sql } => {
+                PlPgSqlStmtKind::ExecuteDynamic { sql } => {
                     self.resolve_expr_subqueries(sql, cancel)?;
                 }
-                PlPgSqlStmt::ForQuery { query, body, .. } => {
+                PlPgSqlStmtKind::ForQuery { query, body, .. } => {
                     self.resolve_select_subqueries(query, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::ForExecute { sql_expr, body, .. } => {
+                PlPgSqlStmtKind::ForExecute { sql_expr, body, .. } => {
                     self.resolve_expr_subqueries(sql_expr, cancel)?;
                     self.resolve_plpgsql_stmts_subqueries(body, cancel)?;
                 }
-                PlPgSqlStmt::EmbeddedSql(_) => {
+                PlPgSqlStmtKind::EmbeddedSql(_) => {
                     // Embedded SQL goes back through execute_stmt
                     // _with_cancel which runs the SELECT-side
                     // resolver itself; nothing to do here.
                 }
-                PlPgSqlStmt::SelectInto { body, .. } => {
+                PlPgSqlStmtKind::SelectInto { body, .. } => {
                     // SELECT INTO runs through Engine::execute
                     // when reached, so subquery resolution
                     // happens via the normal SELECT-side path.

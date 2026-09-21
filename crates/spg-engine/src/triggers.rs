@@ -33,7 +33,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use spg_sql::ast::{AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, RaiseLevel, ReturnTarget};
+use spg_sql::ast::{
+    AssignTarget, Expr, PlPgSqlDeclare, PlPgSqlStmt, PlPgSqlStmtKind, RaiseLevel, ReturnTarget,
+};
 use spg_storage::{ColumnSchema, FunctionDef, Row, StorageError, TriggerDef, Value};
 
 use crate::eval::{self, EvalContext, EvalError};
@@ -309,6 +311,7 @@ pub fn fire_row_trigger(
         set_sink: None,
         write_resolver: None,
         savepoint: None,
+        at: None,
     };
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
     let outcome = match execute_stmts(
@@ -397,6 +400,45 @@ struct BodyCtx<'a> {
     /// way the outermost one already did. `None` on the trigger and
     /// scalar-function paths, which have no savepoint of their own.
     savepoint: Option<&'a dyn Fn(BlockSavepoint)>,
+    /// 9.0.0 (A4b) — where the walker records the statement it is on, so
+    /// an error can end with PostgreSQL's `CONTEXT:  PL/pgSQL function
+    /// <name> line N at <KIND>`. The innermost statement wins, which is
+    /// what PostgreSQL names; recursion gives that for free.
+    at: Option<&'a core::cell::Cell<(u32, &'static str)>>,
+}
+
+impl BodyCtx<'_> {
+    /// 9.0.0 (A4b) — record the statement about to run.
+    fn note_statement(&self, stmt: &PlPgSqlStmt) {
+        if let Some(cell) = self.at {
+            cell.set((stmt.line, plpgsql_stmt_kind_name(&stmt.kind)));
+        }
+    }
+}
+
+/// 9.0.0 (A4b) — the word PostgreSQL puts after `at` in a `CONTEXT`
+/// line. Measured on 18.6: `line 2 at RAISE`, `line 3 at assignment`,
+/// `line 4 at SQL statement`, `line 2 at IF`.
+fn plpgsql_stmt_kind_name(kind: &PlPgSqlStmtKind) -> &'static str {
+    match kind {
+        PlPgSqlStmtKind::Block(_) => "block",
+        PlPgSqlStmtKind::Assign { .. } => "assignment",
+        PlPgSqlStmtKind::SelectInto { .. } => "SQL statement",
+        PlPgSqlStmtKind::If { .. } => "IF",
+        PlPgSqlStmtKind::Raise { .. } => "RAISE",
+        PlPgSqlStmtKind::Return(_) => "RETURN",
+        PlPgSqlStmtKind::ReturnNext(_) => "RETURN NEXT",
+        PlPgSqlStmtKind::ReturnQuery(_) => "RETURN QUERY",
+        PlPgSqlStmtKind::EmbeddedSql(_) => "SQL statement",
+        PlPgSqlStmtKind::Loop { .. }
+        | PlPgSqlStmtKind::ForRange { .. }
+        | PlPgSqlStmtKind::ForQuery { .. }
+        | PlPgSqlStmtKind::ForExecute { .. }
+        | PlPgSqlStmtKind::While { .. } => "loop",
+        PlPgSqlStmtKind::Exit { .. } => "EXIT",
+        PlPgSqlStmtKind::Continue { .. } => "CONTINUE",
+        _ => "statement",
+    }
 }
 
 /// 8.0.3 — callback a DO block registers so its writes run in place.
@@ -563,16 +605,20 @@ fn execute_stmts(
     deferred: &mut Vec<DeferredEmbeddedStmt>,
 ) -> Result<BodyOutcome, TriggerError> {
     for stmt in stmts {
-        match stmt {
+        // 9.0.0 (A4b) — the statement PostgreSQL names in `CONTEXT`. The
+        // innermost one wins, which recursion gives for free: a nested
+        // block's statements overwrite this on their way in.
+        ctx.note_statement(stmt);
+        match &stmt.kind {
             // 9.0.0 — a nested `[<<label>>] [DECLARE …] BEGIN … END`.
-            PlPgSqlStmt::Block(inner) => {
+            PlPgSqlStmtKind::Block(inner) => {
                 let outcome =
                     execute_nested_block(inner, current_new, old_row, locals, ctx, deferred)?;
                 if !matches!(outcome, BodyOutcome::FellThrough) {
                     return Ok(outcome);
                 }
             }
-            PlPgSqlStmt::Assign { target, value } => {
+            PlPgSqlStmtKind::Assign { target, value } => {
                 let evaluated = eval_with_new_old_and_locals(
                     value,
                     current_new.as_ref(),
@@ -642,12 +688,12 @@ fn execute_stmts(
                     }
                 }
             }
-            PlPgSqlStmt::Return(target) => {
+            PlPgSqlStmtKind::Return(target) => {
                 return Ok(BodyOutcome::Return(target.clone()));
             }
             // v7.39 (read01 round 66) — `RETURN NEXT <expr>`: append one row and
             // KEEP GOING. It is not a return.
-            PlPgSqlStmt::ReturnNext(e) => {
+            PlPgSqlStmtKind::ReturnNext(e) => {
                 let sink = ctx
                     .set_sink
                     .ok_or_else(|| TriggerError::UnsupportedConstruct {
@@ -677,7 +723,7 @@ fn execute_stmts(
             // `RETURN QUERY <select>`: append every row it yields, and keep
             // going. This used to desugar to a side-effect SELECT whose rows
             // were DISCARDED — the whole answer, thrown away.
-            PlPgSqlStmt::ReturnQuery(query) => {
+            PlPgSqlStmtKind::ReturnQuery(query) => {
                 let sink = ctx
                     .set_sink
                     .ok_or_else(|| TriggerError::UnsupportedConstruct {
@@ -709,7 +755,7 @@ fn execute_stmts(
                 let (_cols, rows) = resolver(&stmt)?;
                 sink.borrow_mut().extend(rows);
             }
-            PlPgSqlStmt::If {
+            PlPgSqlStmtKind::If {
                 branches,
                 else_branch,
             } => {
@@ -746,7 +792,7 @@ fn execute_stmts(
                     }
                 }
             }
-            PlPgSqlStmt::Raise {
+            PlPgSqlStmtKind::Raise {
                 level,
                 message,
                 args,
@@ -872,7 +918,7 @@ fn execute_stmts(
                     sink.borrow_mut().push((sev, resolved));
                 }
             }
-            PlPgSqlStmt::SelectInto { var, body } => {
+            PlPgSqlStmtKind::SelectInto { var, body } => {
                 // v7.16.2 — execute via the engine callback the
                 // caller (Engine::exec_do_block) registered on
                 // ctx, assign the result to the local. Trigger
@@ -912,7 +958,7 @@ fn execute_stmts(
                 );
                 locals.insert(var.clone(), value);
             }
-            PlPgSqlStmt::ForRange {
+            PlPgSqlStmtKind::ForRange {
                 var,
                 start,
                 end,
@@ -1002,7 +1048,7 @@ fn execute_stmts(
                     iter += 1;
                 }
             }
-            PlPgSqlStmt::Loop { body, label } => {
+            PlPgSqlStmtKind::Loop { body, label } => {
                 // v7.37.20 (20.2) — bare LOOP: iterate body until an
                 // EXIT bubbles up, or the budget is exhausted.
                 const LOOP_BUDGET: u64 = 1_000_000;
@@ -1027,7 +1073,7 @@ fn execute_stmts(
                     iter += 1;
                 }
             }
-            PlPgSqlStmt::Exit { when, label } => {
+            PlPgSqlStmtKind::Exit { when, label } => {
                 // v7.37.20 (20.2) — EXIT [WHEN <cond>]. Unconditional
                 // exit or conditional (only breaks when truthy).
                 let should_break = match when {
@@ -1055,7 +1101,7 @@ fn execute_stmts(
                     return Ok(BodyOutcome::Break(label.clone()));
                 }
             }
-            PlPgSqlStmt::ForExecute {
+            PlPgSqlStmtKind::ForExecute {
                 var,
                 sql_expr,
                 body,
@@ -1144,7 +1190,7 @@ fn execute_stmts(
                     }
                 }
             }
-            PlPgSqlStmt::ForQuery {
+            PlPgSqlStmtKind::ForQuery {
                 var,
                 query,
                 body,
@@ -1212,7 +1258,7 @@ fn execute_stmts(
             // the expression to a SQL string, run it through the same query
             // runner the static form uses, and append the rows to the set. It
             // used to run and DISCARD them.
-            PlPgSqlStmt::ReturnQueryExecute { sql } => {
+            PlPgSqlStmtKind::ReturnQueryExecute { sql } => {
                 let sink = ctx
                     .set_sink
                     .ok_or_else(|| TriggerError::UnsupportedConstruct {
@@ -1262,7 +1308,7 @@ fn execute_stmts(
                 let (_cols, rows) = resolver(&stmt)?;
                 sink.borrow_mut().extend(rows);
             }
-            PlPgSqlStmt::ExecuteDynamic { sql } => {
+            PlPgSqlStmtKind::ExecuteDynamic { sql } => {
                 // v7.37.20 (20.13) — EXECUTE <string_expr>. Evaluate
                 // the expression at runtime to obtain a SQL string,
                 // parse it, and queue for post-body execution the
@@ -1313,7 +1359,7 @@ fn execute_stmts(
                     });
                 }
             }
-            PlPgSqlStmt::Continue { when, label } => {
+            PlPgSqlStmtKind::Continue { when, label } => {
                 // v7.37.20 (20.2) — CONTINUE [WHEN <cond>]. Same shape
                 // as EXIT but signals BodyOutcome::Continue.
                 let should_continue = match when {
@@ -1341,7 +1387,7 @@ fn execute_stmts(
                     return Ok(BodyOutcome::Continue(label.clone()));
                 }
             }
-            PlPgSqlStmt::While {
+            PlPgSqlStmtKind::While {
                 condition,
                 body,
                 label,
@@ -1399,7 +1445,7 @@ fn execute_stmts(
                     iter += 1;
                 }
             }
-            PlPgSqlStmt::Assert { condition, message } => {
+            PlPgSqlStmtKind::Assert { condition, message } => {
                 // v7.37.20 (20.14) — ASSERT <cond> [, <msg>]. If
                 // the condition evaluates to a falsy Value (NULL or
                 // BOOL(false)), raise the same EngineError shape as
@@ -1453,7 +1499,7 @@ fn execute_stmts(
                     });
                 }
             }
-            PlPgSqlStmt::EmbeddedSql(boxed_stmt) => {
+            PlPgSqlStmtKind::EmbeddedSql(boxed_stmt) => {
                 // v7.12.7 — substitute NEW/OLD/locals into every
                 // Expr field of the statement, then queue for
                 // post-DML execution. The trigger interpreter
@@ -1546,7 +1592,7 @@ fn check_nested_exception_conditions(
     stmts: &[PlPgSqlStmt],
 ) -> Result<(), TriggerError> {
     for s in stmts {
-        if let PlPgSqlStmt::Block(b) = s {
+        if let PlPgSqlStmtKind::Block(b) = &s.kind {
             check_exception_conditions(function, b)?;
         }
     }
@@ -1893,6 +1939,7 @@ pub fn execute_do_block_top_level<'a>(
         notice_sink,
         None,
         None,
+        None,
     )
 }
 
@@ -1907,6 +1954,7 @@ pub(crate) fn execute_do_block_live<'a>(
     notice_sink: Option<&'a NoticeSink>,
     write_resolver: &'a WriteResolver<'a>,
     savepoint: &'a dyn Fn(BlockSavepoint),
+    at: Option<&'a core::cell::Cell<(u32, &'static str)>>,
 ) -> Result<(), TriggerError> {
     do_block(
         block,
@@ -1916,6 +1964,7 @@ pub(crate) fn execute_do_block_live<'a>(
         notice_sink,
         Some(write_resolver),
         Some(savepoint),
+        at,
     )
     .map(|_| ())
 }
@@ -1929,6 +1978,7 @@ fn do_block<'a>(
     notice_sink: Option<&'a NoticeSink>,
     write_resolver: Option<&'a WriteResolver<'a>>,
     savepoint: Option<&'a dyn Fn(BlockSavepoint)>,
+    at: Option<&'a core::cell::Cell<(u32, &'static str)>>,
 ) -> Result<Vec<spg_sql::ast::Statement>, TriggerError> {
     // A DO block returns nothing, so RETURN NEXT / RETURN QUERY have nowhere to
     // go — PG rejects them there too.
@@ -1961,6 +2011,7 @@ fn do_block<'a>(
         set_sink,
         write_resolver,
         savepoint,
+        at,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();
@@ -2069,6 +2120,7 @@ pub fn call_plpgsql_scalar<'a>(
         set_sink,
         write_resolver: None,
         savepoint: None,
+        at: None,
     };
     let mut current_new: Option<Row> = None;
     let mut deferred: Vec<DeferredEmbeddedStmt> = Vec::new();

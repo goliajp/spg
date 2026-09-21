@@ -1117,7 +1117,13 @@ fn handle_pg_simple_query(
                 // a wire error so the client doesn't see a torn row.
                 wbuf.truncate(pre_len);
                 let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-                send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
+                send_error_full(
+                    wbuf,
+                    &sqlstate,
+                    &msg,
+                    parse_error_position(&e, sql),
+                    engine_error_context(state).as_deref(),
+                )?;
                 send_ready_for_query(wbuf, *tx_state)?;
                 stream.write_all(wbuf)?;
                 wbuf.clear();
@@ -1237,7 +1243,13 @@ fn handle_pg_simple_query(
             // surface it as a statement-timeout, not a
             // generic `42000` syntax / access error.
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
+            send_error_full(
+                wbuf,
+                &sqlstate,
+                &msg,
+                parse_error_position(&e, sql),
+                engine_error_context(state).as_deref(),
+            )?;
             // After an error inside a TX, PG goes to 'E'
             // and stays there until ROLLBACK. We track
             // best-effort: if engine still in TX, mark
@@ -1496,7 +1508,13 @@ fn handle_pg_simple_query_one_into_wbuf(
         }
         Err(e) => {
             let (sqlstate, msg) = engine_error_to_wire_conn(&e, conn_state);
-            send_error_pos(wbuf, &sqlstate, &msg, parse_error_position(&e, sql))?;
+            send_error_full(
+                wbuf,
+                &sqlstate,
+                &msg,
+                parse_error_position(&e, sql),
+                engine_error_context(state).as_deref(),
+            )?;
             *tx_state = if state
                 .engine
                 .read()
@@ -5242,7 +5260,40 @@ fn engine_error_to_wire_conn(
     engine_error_to_wire(e)
 }
 
+/// 9.0.0 (N17) — PostgreSQL's 1-based character position for an error
+/// raised while parsing a PL/pgSQL body.
+///
+/// `body_token` indexes the dollar-quoted token in `sql`; `body_off` is
+/// a byte offset inside the body's TEXT, which starts after the opening
+/// `$…$` tag.
+fn plpgsql_body_position(sql: &str, body_token: usize, body_off: usize) -> Option<usize> {
+    let (_, offsets) =
+        spg_sql::lexer::tokenize_with_offsets(sql, spg_sql::lexer::Dialect::PG).ok()?;
+    let tag_start = *offsets.get(body_token)?;
+    let rest = sql.get(tag_start..)?;
+    if !rest.starts_with('$') {
+        return None;
+    }
+    // `$$` or `$tag$`: the text begins after the second `$`.
+    let tag_len = rest.get(1..)?.find('$')? + 2;
+    let byte = tag_start + tag_len + body_off;
+    if byte > sql.len() || !sql.is_char_boundary(byte) {
+        return None;
+    }
+    Some(sql[..byte].chars().count() + 1)
+}
+
 fn parse_error_position(e: &EngineError, sql: &str) -> Option<usize> {
+    // 9.0.0 (N17) — an error from inside a PL/pgSQL body. `token_pos` is
+    // the body TOKEN in this statement and `body_pos` the byte offset
+    // inside the body, so the caret lands where PostgreSQL's does:
+    // measured on 18.6, `DO $$ … END LOOP zz; END $$` draws
+    // `LINE 4:   END LOOP zz;` under the `zz`.
+    if let EngineError::Parse(pe) = e
+        && let Some(body_off) = pe.body_pos
+    {
+        return plpgsql_body_position(sql, pe.token_pos, body_off as usize);
+    }
     // 9.0.0 — a name the engine could not resolve carries the token of the
     // reference that named it, so it gets a `Position` too. PostgreSQL
     // reports one for every such error and psql draws its caret there;
@@ -7593,6 +7644,12 @@ fn send_command_complete_select_count(out: &mut Vec<u8>, n: usize) -> std::io::R
 /// raised and send one NoticeResponse each, ahead of the row / command reply
 /// (PG's order). Called on every simple-query path, unconditionally, so a
 /// failed statement can't leak its notices into the next one.
+/// 9.0.0 (A4b) — the `CONTEXT:` line the engine recorded for the error
+/// just raised, if any. Taken, so it cannot reach a later statement.
+fn engine_error_context(state: &ServerState) -> Option<String> {
+    state.engine.write().ok()?.take_error_context()
+}
+
 fn drain_notices(state: &ServerState, wbuf: &mut Vec<u8>) -> std::io::Result<()> {
     // v7.39 (round 621) — `client_min_messages` decides which of these the
     // client is told about. It used to decide nothing: the GUC was validated
@@ -7754,6 +7811,19 @@ fn send_error_pos(
     msg: &str,
     position: Option<usize>,
 ) -> std::io::Result<()> {
+    send_error_full(stream, sqlstate, msg, position, None)
+}
+
+/// 9.0.0 (A4b) — the same, plus PostgreSQL's `W` (Where) field, which
+/// psql prints as the `CONTEXT:` line. An error raised inside a
+/// PL/pgSQL body carries one there and SPG sent none.
+fn send_error_full(
+    stream: &mut dyn Write,
+    sqlstate: &str,
+    msg: &str,
+    position: Option<usize>,
+    context: Option<&str>,
+) -> std::io::Result<()> {
     // ErrorResponse: each field is `[fieldcode byte][value][\0]`,
     // terminated by a single `\0`. Base set: S (severity), C
     // (sqlstate), M (message). v7.39 (SQLSTATE fidelity) — when the
@@ -7842,6 +7912,11 @@ fn send_error_pos(
     if let Some(p) = position {
         body.push(b'P');
         body.extend_from_slice(p.to_string().as_bytes());
+        body.push(0);
+    }
+    if let Some(c) = context {
+        body.push(b'W');
+        body.extend_from_slice(c.as_bytes());
         body.push(0);
     }
     body.push(0);

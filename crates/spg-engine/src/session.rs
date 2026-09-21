@@ -762,6 +762,20 @@ impl Engine {
         core::mem::take(&mut self.pending_notices)
     }
 
+    /// 9.0.0 (A4b) — the `CONTEXT:` line of the last statement's error,
+    /// when it came from inside a PL/pgSQL body. Taken, so it cannot be
+    /// attached to a later statement's error.
+    #[must_use]
+    pub fn take_error_context(&mut self) -> Option<String> {
+        self.pending_error_context.take()
+    }
+
+    /// 9.0.0 (A4b) — record the `CONTEXT:` line for the error about to
+    /// be returned.
+    pub(crate) fn set_error_context(&mut self, context: String) {
+        self.pending_error_context = Some(context);
+    }
+
     /// v7.37.7 — PG `statement_timeout` GUC read accessor. Returns the
     /// session-set value in **milliseconds**, parsed from the raw
     /// `SET statement_timeout = N` string. Returns `None` when:

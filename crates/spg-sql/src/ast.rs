@@ -2183,8 +2183,33 @@ pub struct PlPgSqlDeclare {
     pub default: Option<Expr>,
 }
 
+/// 9.0.0 (A4b) — a statement of a PL/pgSQL body, and the LINE of the
+/// body it was written on.
+///
+/// PostgreSQL ends an error raised inside a body with
+/// `CONTEXT:  PL/pgSQL function inline_code_block line 3 at RAISE`, and
+/// SPG sent the ERROR alone: a client could see that something failed
+/// but not where in the function. The line has to be recorded where the
+/// statement is, because PostgreSQL reports the INNERMOST statement's —
+/// a RAISE inside an IF inside a LOOP names the RAISE's line.
 #[derive(Debug, Clone, PartialEq)]
-pub enum PlPgSqlStmt {
+pub struct PlPgSqlStmt {
+    /// 1-based, counted in the body's own text.
+    pub line: u32,
+    pub kind: PlPgSqlStmtKind,
+}
+
+impl PlPgSqlStmt {
+    /// A statement with no line recorded — for a body built by hand
+    /// rather than parsed.
+    #[must_use]
+    pub const fn new(kind: PlPgSqlStmtKind) -> Self {
+        Self { line: 0, kind }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlPgSqlStmtKind {
     /// 9.0.0 — a nested `[<<label>>] [DECLARE …] BEGIN … END` block.
     /// Any statement position in PL/pgSQL may hold one, which is how a
     /// body scopes a variable or catches an exception around part of
@@ -7865,6 +7890,14 @@ fn write_end_loop(f: &mut fmt::Formatter<'_>, label: Option<&str>) -> fmt::Resul
 }
 
 impl fmt::Display for PlPgSqlStmt {
+    /// A statement renders as its kind; the line is for diagnostics, not
+    /// for the source text `prosrc` answers with.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.kind)
+    }
+}
+
+impl fmt::Display for PlPgSqlStmtKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Block(b) => write!(f, "{b}"),
