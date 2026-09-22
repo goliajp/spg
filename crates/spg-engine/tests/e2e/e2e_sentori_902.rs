@@ -183,3 +183,33 @@ fn drop_schema_restrict_names_each_dependent() {
         "{err}"
     );
 }
+
+// pg_dump's serial spelling in a schema: the sequence stays in its schema.
+#[test]
+fn a_set_default_nextval_keeps_the_sequences_schema() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE SCHEMA n902");
+    run(&mut e, "CREATE TABLE n902.s (id integer NOT NULL, v text)");
+    run(
+        &mut e,
+        "CREATE SEQUENCE n902.s_id_seq AS integer START WITH 1",
+    );
+    run(&mut e, "ALTER SEQUENCE n902.s_id_seq OWNED BY n902.s.id");
+    run(
+        &mut e,
+        "ALTER TABLE ONLY n902.s ALTER COLUMN id SET DEFAULT nextval('n902.s_id_seq'::regclass)",
+    );
+    run(&mut e, "SELECT pg_catalog.setval('n902.s_id_seq', 7, true)");
+    run(&mut e, "INSERT INTO n902.s (v) VALUES ('x')");
+    // Restoring SPG's own dump created this sequence in `public` too:
+    // the schema was dropped from the name the default carries.
+    assert_eq!(
+        cells(
+            &mut e,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind = 'S' AND n.nspname = 'public'"
+        ),
+        "0"
+    );
+    assert_eq!(cells(&mut e, "SELECT id FROM n902.s"), "8");
+}
