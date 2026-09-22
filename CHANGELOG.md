@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [Unreleased]
+## [9.0.2] — 2026-09-22
 
 Everything below was reported by sentori against the published 9.0.1
 (`sentori/tmp/spg-repro/REPLY-2026-09-22-v9.0.1.md`) or found by
