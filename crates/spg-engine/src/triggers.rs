@@ -190,6 +190,32 @@ impl fmt::Display for TriggerError {
     }
 }
 
+/// 9.0.3 — what a trigger's failure looks like to a client.
+///
+/// Every call site wrapped this in `EngineError::Storage(Corrupt(…))`,
+/// whose Display is this error's, so a `RAISE EXCEPTION 'boom on 2'` in a
+/// trigger reached the client as `42000 trigger function "boom": RAISE
+/// EXCEPTION "boom on 2"` where PostgreSQL 18.6 sends `P0001 boom on 2`.
+/// A PL/pgSQL `DO` block already answered PostgreSQL's way (8.0.3,
+/// `EngineError::Raised`); a trigger body is the same language.
+#[must_use]
+pub fn trigger_error_to_engine(e: TriggerError) -> crate::EngineError {
+    match e {
+        TriggerError::RaiseException {
+            message, sqlstate, ..
+        } => crate::EngineError::Raised {
+            sqlstate: sqlstate.map_or(alloc::borrow::Cow::Borrowed("P0001"), |s| {
+                alloc::borrow::Cow::Owned(s)
+            }),
+            message,
+        },
+        TriggerError::Sql {
+            sqlstate, message, ..
+        } => crate::EngineError::Raised { sqlstate, message },
+        other => crate::EngineError::Unsupported(alloc::format!("{other}")),
+    }
+}
+
 /// v7.39 (read01 round 82) — the firing trigger's identity, for the TG_* magic
 /// variables. `op` is `INSERT` / `UPDATE` / `DELETE`; `level` is `ROW` (SPG
 /// fires row-level triggers only). `TG_WHEN` derives from `is_after`.
