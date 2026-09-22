@@ -309,40 +309,17 @@ impl Engine {
                     // works (the setval arm receives a literal).
                     let lit = |e: &Expr| -> Option<String> {
                         match e {
-                            Expr::Literal(spg_sql::ast::Literal::String(v)) => {
-                                // 9.0.1 (C9) — the KEY, so
-                                // `pg_get_serial_sequence('sa.t','id')`
-                                // finds the table in `sa`.
-                                Some(spg_sql::namespace::key_from_text(v))
-                            }
+                            Expr::Literal(spg_sql::ast::Literal::String(v)) => Some(v.clone()),
                             _ => None,
                         }
                     };
                     if let (Some(t), Some(c)) = (lit(&args[0]), lit(&args[1])) {
-                        let table_opt = self.active_catalog().get(&t);
-                        // v7.37.17 (17.6 siblings) — if the table isn't
-                        // in the active catalog, leave the call alone
-                        // so the scalar arm in eval::functions handles
-                        // it (returns the synthetic sequence name).
-                        // ORMs (SQLAlchemy, Django) call this against
-                        // arbitrary tables at introspection time — we
-                        // want to answer with a plausible sequence
-                        // name rather than NULL.
-                        let Some(tb_ref) = table_opt else {
-                            return Ok(());
-                        };
-                        let is_serial = tb_ref
-                            .schema()
-                            .columns
-                            .iter()
-                            .any(|col| col.name == c && col.auto_increment);
-                        *expr = if is_serial {
-                            Expr::Literal(spg_sql::ast::Literal::String(alloc::format!(
-                                "public.{t}_{c}_seq"
-                            )))
-                        } else {
-                            Expr::Literal(spg_sql::ast::Literal::Null)
-                        };
+                        let seq = serial_sequence_of(self.active_catalog(), &t, &c)
+                            .map_err(EngineError::Unsupported)?;
+                        *expr = Expr::Literal(match seq {
+                            Some(name) => spg_sql::ast::Literal::String(name),
+                            None => spg_sql::ast::Literal::Null,
+                        });
                     }
                 }
                 Ok(())
@@ -1428,6 +1405,49 @@ pub(crate) fn implicit_sequences(
         }
     }
     out
+}
+
+/// 9.0.3 — `pg_get_serial_sequence(table, column)`: the sequence the
+/// column OWNS — a serial column's own, an identity's, or one given
+/// `OWNED BY` it — written with its schema, as PostgreSQL 18.6 writes it
+/// (`public.t_id_seq`, `sa.x_id_seq`). `None` for a column that owns no
+/// sequence.
+///
+/// There were two implementations, and both dropped the table's schema
+/// (`pg_get_serial_sequence('sa.x', 'id')` answered `relation "x" does
+/// not exist`) and made the answer up as `public.<table>_<column>_seq`,
+/// whatever the sequence is really called and wherever it lives.
+///
+/// # Errors
+/// PostgreSQL's words for a relation or column that does not exist.
+pub(crate) fn serial_sequence_of(
+    cat: &spg_storage::Catalog,
+    table: &str,
+    column: &str,
+) -> Result<Option<String>, String> {
+    let qualified = table.trim().rsplit_once('.').is_some();
+    let key = spg_sql::namespace::key_from_text(table);
+    let Some(t) = cat.get_written(&key, qualified) else {
+        return Err(alloc::format!(
+            "relation \"{}\" does not exist",
+            table.trim()
+        ));
+    };
+    let table_key = t.schema().name.clone();
+    if !t.schema().columns.iter().any(|c| c.name == column) {
+        return Err(alloc::format!(
+            "column \"{column}\" of relation \"{}\" does not exist",
+            spg_sql::namespace::bare_of(&table_key)
+        ));
+    }
+    Ok(catalog_sequences(cat)
+        .into_iter()
+        .find(|(_, def)| {
+            def.owned_by
+                .as_ref()
+                .is_some_and(|(t, c)| *t == table_key && c == column)
+        })
+        .map(|(seq_key, _)| spg_sql::namespace::written_sql(&seq_key, true)))
 }
 
 /// 8.0.3 — every sequence a catalog lists, in the order oids are assigned:

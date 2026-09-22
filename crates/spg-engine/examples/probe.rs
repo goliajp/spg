@@ -102,7 +102,9 @@ fn main() {
         // engine and writes the file itself.
         if let Some(spec) = spg_engine::copy::parse_copy_to_file(stmt) {
             match e.copy_to_buffer(
+                spg_engine::IMPLICIT_TX,
                 &spec.table,
+                spec.table_qualified,
                 spec.columns.as_deref(),
                 spec.query.as_deref(),
                 &spec.options,
@@ -127,7 +129,7 @@ fn main() {
         if let Some(spec) = spg_engine::copy::parse_copy_from_file(stmt) {
             match std::fs::read_to_string(&spec.path) {
                 Ok(data) => match e.copy_from_buffer(
-                    &spec.table,
+                    &spg_sql::namespace::written_sql(&spec.table, spec.table_qualified),
                     spec.columns.as_deref(),
                     &spec.options,
                     &data,

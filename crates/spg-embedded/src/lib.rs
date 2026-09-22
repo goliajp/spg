@@ -3705,7 +3705,9 @@ impl Database {
             && let Some(spec) = spg_engine::copy::parse_copy_to_file(sql)
         {
             let (payload, n) = self.engine.copy_to_buffer(
+                spg_engine::IMPLICIT_TX,
                 &spec.table,
+                spec.table_qualified,
                 spec.columns.as_deref(),
                 spec.query.as_deref(),
                 &spec.options,
@@ -3765,10 +3767,16 @@ impl Database {
         if sql_head_is_copy(sql)
             && let Some(spec) = spg_engine::copy::parse_copy_from_file(sql)
         {
-            let target = self
-                .engine
-                .copy_target_columns(&spec.table, spec.columns.as_deref())?;
-            let data = std::fs::read_to_string(&spec.path).map_err(|e| {
+            // PG's order: relation, columns and options are checked before
+            // the file is opened.
+            let target = self.engine.copy_target(
+                spg_engine::IMPLICIT_TX,
+                &spec.table,
+                spec.table_qualified,
+                spec.columns.as_deref(),
+            )?;
+            let mut reader = spg_engine::copy_from::CopyFromReader::new(&spec.options, &target)?;
+            let data = std::fs::read(&spec.path).map_err(|e| {
                 // PG's wording, without std's " (os error N)" suffix.
                 let os = e.to_string();
                 let os = os.split(" (os error").next().unwrap_or(&os).to_string();
@@ -3777,37 +3785,8 @@ impl Database {
                     path = spec.path
                 ))
             })?;
-            let inserts = spg_engine::copy::copy_buffer_inserts(
-                &spec.table,
-                spec.columns.as_deref(),
-                &target,
-                &spec.options,
-                &data,
-            )?;
-            let wrap = !self.engine.in_transaction();
-            if wrap {
-                self.execute("BEGIN")?;
-            }
-            let mut affected: usize = 0;
-            for insert in &inserts {
-                match self.execute(insert) {
-                    Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
-                    Ok(_) => affected += 1,
-                    Err(e) => {
-                        if wrap {
-                            let _ = self.execute("ROLLBACK");
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-            if wrap {
-                self.execute("COMMIT")?;
-            }
-            return Ok(QueryResult::CommandOk {
-                affected,
-                modified_catalog: false,
-            });
+            let rows = reader.read_all(&data)?;
+            return self.copy_rows_in(&target, &spec.options, &rows);
         }
         let (result, ticket) = self.execute_buffered(sql)?;
         if let Some(t) = ticket {
@@ -3819,6 +3798,69 @@ impl Database {
             }
         }
         Ok(result)
+    }
+
+    /// 9.0.3 — store decoded COPY FROM rows through [`Self::execute`], so
+    /// each row gets its WAL record, inside one transaction unless the
+    /// caller already opened one: PG's COPY is all-or-nothing. The engine
+    /// decides what each row becomes (`copy_row`); `ON_ERROR ignore`'s
+    /// notices are queued for [`Self::take_notices`].
+    fn copy_rows_in(
+        &mut self,
+        target: &spg_engine::copy_from::CopyTarget,
+        options: &spg_engine::copy_from::CopyOptions,
+        rows: &[(u64, Vec<Option<String>>)],
+    ) -> Result<QueryResult, EngineError> {
+        use spg_engine::copy_from::CopyRowAction;
+        let mut errors = spg_engine::copy_from::CopyRowErrors::new(options);
+        let wrap = !errors.drops_any_failure() && !self.engine.in_transaction();
+        if wrap {
+            self.execute("BEGIN")?;
+        }
+        let mut affected: usize = 0;
+        let mut notices: Vec<String> = Vec::new();
+        let mut store = |db: &mut Self| -> Result<(), EngineError> {
+            for (line, values) in rows {
+                let sql = match db.engine.copy_row(
+                    spg_engine::IMPLICIT_TX,
+                    target,
+                    &mut errors,
+                    *line,
+                    values,
+                )? {
+                    CopyRowAction::Insert(sql) => sql,
+                    CopyRowAction::Skip(notice) => {
+                        notices.extend(notice);
+                        continue;
+                    }
+                };
+                match db.execute(&sql) {
+                    Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
+                    Ok(_) => affected += 1,
+                    // SPG's `ON_ERROR set_null`: the row is dropped.
+                    Err(_) if errors.drops_any_failure() => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            notices.extend(errors.closing_notice());
+            Ok(())
+        };
+        if let Err(e) = store(self) {
+            if wrap {
+                // The row's error is the one the caller needs; a failed
+                // ROLLBACK leaves nothing further to undo.
+                let _ = self.execute("ROLLBACK");
+            }
+            return Err(e);
+        }
+        if wrap {
+            self.execute("COMMIT")?;
+        }
+        self.engine.queue_notices(notices);
+        Ok(QueryResult::CommandOk {
+            affected,
+            modified_catalog: false,
+        })
     }
 
     /// v7.39 (round 171) — session-level `synchronous_commit` (the PG
@@ -4538,33 +4580,21 @@ impl Database {
             .get(..4)
             .is_some_and(|p| p.eq_ignore_ascii_case("copy"));
         if head_is_copy
-            && let Some((head, data)) = stmt_clean.split_once(';')
-            && let Some(spec) = spg_engine::copy::parse_copy_from_stdin_head(head)
+            && let Some((head, data)) = split_statement_head(stmt_clean)
+            && let Some(spec) = spg_engine::copy::parse_copy_from_stdin(head)?
         {
-            let mut affected: usize = 0;
-            for line in data.lines() {
-                // Empty fragments only occur at the chunk boundary
-                // (the remainder of the COPY line right after `;`);
-                // data rows are whole non-empty lines.
-                let line = line.strip_suffix('\r').unwrap_or(line);
-                if line.is_empty() {
-                    continue;
-                }
-                let values = spg_engine::copy::decode_copy_text_row(line);
-                let insert = spg_engine::copy::build_copy_insert(
-                    &spec.table,
-                    spec.columns.as_deref(),
-                    &values,
-                );
-                match self.execute(&insert)? {
-                    QueryResult::CommandOk { affected: n, .. } => affected += n,
-                    _ => affected += 1,
-                }
-            }
-            return Ok(QueryResult::CommandOk {
-                affected,
-                modified_catalog: false,
-            });
+            let target = self.engine.copy_target(
+                spg_engine::IMPLICIT_TX,
+                &spec.table,
+                spec.table_qualified,
+                spec.columns.as_deref(),
+            )?;
+            // The data starts on the line after the statement; what is
+            // left of the statement's own line is not a row.
+            let data = data.split_once('\n').map_or("", |(_, rows)| rows);
+            let rows = spg_engine::copy_from::CopyFromReader::new(&spec.options, &target)?
+                .read_all(data.as_bytes())?;
+            return self.copy_rows_in(&target, &spec.options, &rows);
         }
         self.execute(stmt)
     }
@@ -5811,6 +5841,24 @@ fn note_dialect_signals(chunk: &str, mysql_escapes: &mut bool) {
     }
 }
 
+/// 9.0.3 — a statement and what follows it, split at its terminating
+/// `;`: the first one outside a quoted string or identifier. Splitting at
+/// the first `;` anywhere cut `COPY t FROM stdin (DELIMITER ';');` inside
+/// its own option.
+fn split_statement_head(s: &str) -> Option<(&str, &str)> {
+    let mut quote: Option<u8> = None;
+    for (i, b) in s.bytes().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'\'' || b == b'"' => quote = Some(b),
+            None if b == b';' => return Some((&s[..i], &s[i + 1..])),
+            None => {}
+        }
+    }
+    None
+}
+
 fn strip_leading_sql_noise(mut s: &str) -> &str {
     loop {
         let t = s.trim_start();
@@ -5979,7 +6027,12 @@ pub fn split_statements(sql: &str) -> Vec<&str> {
                     let is_copy_head = head_clean
                         .get(..4)
                         .is_some_and(|p| p.eq_ignore_ascii_case("copy"))
-                        && spg_engine::copy::parse_copy_from_stdin_head(head_clean).is_some();
+                        // A malformed option list is still a COPY that owns
+                        // its data block; executing it reports the error.
+                        && !matches!(
+                            spg_engine::copy::parse_copy_from_stdin(head_clean),
+                            Ok(None)
+                        );
                     if is_copy_head {
                         // Scan whole lines after the ';' until the
                         // `\.` terminator (or EOF — torn dumps lose

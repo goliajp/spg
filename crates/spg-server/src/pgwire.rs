@@ -622,69 +622,43 @@ fn handle_pg_simple_query(
             wbuf.clear();
         }
         match copy {
-            CopyIntent::From(table, cols, opts) => {
-                handle_copy_from_stdin(
-                    stream,
-                    state,
-                    role,
-                    &table,
-                    cols.as_deref(),
-                    &opts,
-                    tx_state,
-                    conn_state.tx_id,
-                )?;
+            CopyIntent::From(spec) => {
+                handle_copy_from_stdin(stream, state, role, &spec, tx_state, conn_state.tx_id)?;
             }
             CopyIntent::FromFile(spec) => {
                 handle_copy_from_file(stream, state, role, &spec, tx_state, conn_state.tx_id)?;
             }
             CopyIntent::ToFile(spec) => {
-                handle_copy_to_file(stream, state, role, &spec)?;
+                handle_copy_to_file(stream, state, role, &spec, conn_state.tx_id)?;
             }
-            CopyIntent::BadOption(name) => {
-                // 9.0.2 — no ReadyForQuery here: the one after this match
-                // closes every COPY, and a second one reached the client
-                // while it was idle (`message type 0x5a arrived from server
-                // while idle`), desynchronising the session.
-                send_error(
-                    stream,
-                    "42601",
-                    &format!("option \"{name}\" not recognized"),
-                )?;
-            }
-            CopyIntent::To(table, columns, opts) => {
-                // 9.0.0 (C9) — the relation is read back as SQL, so the
-                // key goes back to the spelling a parser accepts: the
-                // separator it carries the schema with is not a
-                // character an identifier may contain.
-                let projection = match &columns {
-                    Some(cols) => cols
-                        .iter()
-                        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    None => "*".to_string(),
+            CopyIntent::To {
+                table,
+                table_qualified,
+                columns,
+                options,
+            } => {
+                let source = CopyToSource::Table {
+                    table: &table,
+                    qualified: table_qualified,
+                    columns: columns.as_deref(),
                 };
-                let sql = format!(
-                    "SELECT {projection} FROM {}",
-                    spg_sql::namespace::display_key(&table)
-                );
                 handle_copy_to_stdout(
                     stream,
                     state,
                     role,
-                    &sql,
-                    &opts,
+                    &source,
+                    &options,
                     tx_state,
                     conn_state.tx_id,
                 )?;
             }
-            CopyIntent::ToQuery(query, opts) => {
+            CopyIntent::ToQuery(query, options) => {
                 handle_copy_to_stdout(
                     stream,
                     state,
                     role,
-                    &query,
-                    &opts,
+                    &CopyToSource::Query(&query),
+                    &options,
                     tx_state,
                     conn_state.tx_id,
                 )?;
@@ -5635,385 +5609,111 @@ mod engine_error_sqlstate_tests {
 
 #[derive(Debug)]
 enum CopyIntent {
-    // v7.39 (read01 round 91) — the explicit `(col, …)` list, captured (was
-    // parsed-and-discarded) so the row-arity check knows how many values each
-    // COPY row must carry and can name a missing column.
-    From(String, Option<Vec<String>>, CopyOptions),
-    // v7.39 (read01 round 94) — `To` now carries the parsed options (was
-    // silently dropped: `COPY t TO STDOUT WITH (FORMAT csv, HEADER)` streamed
-    // plain text). `ToQuery` is the `COPY (<query>) TO STDOUT` form — the
-    // inner SQL is run and its result set streamed in COPY format.
-    // 9.0.2 — and the column list, which was parsed and dropped: `COPY
-    // t (a, b) TO STDOUT` streamed every column of `t`.
-    To(String, Option<Vec<String>>, CopyOptions),
-    ToQuery(String, CopyOptions),
+    /// `COPY <table> [(cols)] FROM STDIN [options]`.
+    From(spg_engine::copy::CopyFromStdinSpec),
+    /// `COPY <table> [(cols)] TO STDOUT [options]`.
+    To {
+        table: String,
+        table_qualified: bool,
+        columns: Option<Vec<String>>,
+        options: spg_sql::ast::CopyOptions,
+    },
+    /// `COPY (<query>) TO STDOUT [options]` — the query's result set is
+    /// streamed in COPY format.
+    ToQuery(String, spg_sql::ast::CopyOptions),
     // v7.39 (round 251) — `COPY t FROM '<file>'`: the SERVER process
-    // reads the file, PG semantics. Parsed by the engine's SQL parser
-    // (spg_engine::copy::parse_copy_from_file), not the hand parser, so
-    // the r247 option grammar (one-byte checks, mode refusals) applies.
+    // reads the file, PG semantics.
     FromFile(spg_engine::copy::CopyFromFileSpec),
     // v7.39 (round 252) — `COPY … TO '<file>'`: the SERVER renders via
     // the engine and writes the file (PG semantics, pg_write_server_files
     // analog: admin only).
     ToFile(spg_engine::copy::CopyToFileSpec),
-    /// v7.39 (round 265) — an unrecognized option name. Carried as an
-    /// intent so the COPY dispatch can raise PG's `option "x" not
-    /// recognized` instead of the previous silent accept, which made the
-    /// statement report success while the option did nothing.
-    BadOption(String),
 }
 
-/// v6.4.7 — `COPY FROM STDIN WITH (...)` option parser. PG-style
-/// comma-separated `key value` pairs inside parens.
-#[derive(Debug, Clone, Default)]
-struct CopyOptions {
-    /// `SKIP n` — drop the first N data rows (typically the CSV
-    /// header row).
-    pub skip: u64,
-    /// `ON_ERROR SET_NULL` — on per-cell parse failure, replace the
-    /// failed cell with NULL instead of aborting the COPY. The row
-    /// is still rejected (with a clear message) if the failed cell
-    /// targets a NOT NULL column.
-    pub on_error_set_null: bool,
-    /// `FORMAT JSON` — each input line is a JSON object whose keys
-    /// match the target table's column names. Missing columns become
-    /// NULL; extra keys are ignored. Default (no FORMAT) is the
-    /// existing tab-delimited text mode.
-    pub format_json: bool,
-    /// `FORMAT CSV` — RFC-4180-style records: quoted fields, doubled
-    /// quotes, embedded delimiters/newlines inside quotes, and an
-    /// unquoted empty field reads as NULL while `""` is the empty
-    /// string. Mutually exclusive with `format_json`.
-    pub format_csv: bool,
-    /// CSV `DELIMITER 'c'` (default `,`).
-    pub csv_delimiter: Option<char>,
-    /// CSV `QUOTE 'c'` (default `"`).
-    pub csv_quote: Option<char>,
-    /// `NULL 'token'` — the text that decodes to NULL. CSV default is the
-    /// empty unquoted field; text default is `\N`. v7.39 (read01 round 91).
-    pub null_string: Option<String>,
-    /// `HEADER` on the `TO STDOUT` direction — emit a leading row of column
-    /// names (the FROM direction reuses `skip` to drop it instead). v7.39
-    /// (read01 round 94). Kept separate from `skip` because the same option
-    /// word means "emit" going out and "drop" coming in.
-    pub header: bool,
-}
-
-/// Detects `COPY <table> [(col1, col2, …)] FROM STDIN [WITH
-/// (options)]` and `COPY <table> [(…)] TO STDOUT`
-/// (case-insensitive). Anything else (e.g. `COPY ... FROM
-/// '/path'`) falls through to the regular engine path, which
-/// will report a parse error — file-based COPY is intentionally
-/// not supported (no filesystem access from the server in the
-/// docker-compose deployment shape).
+/// A COPY statement the wire handles itself, read by the statement
+/// grammar.
 ///
-/// v7.15.0 — the column-list form `COPY t (a, b, c) FROM STDIN`
-/// is recognised. pg_dump emits this for every table with data
-/// (the default output, not just `--column-inserts`), so without
-/// this we mis-classify any `pg_dump` (no `--schema-only`) →
-/// `psql -f` flow as a normal SQL statement and report a parse
-/// error.
+/// 9.0.3 — the head used to be read by hand from LOWERCASED text: a
+/// quoted mixed-case table (`COPY "MixedCase" …`) was looked up as
+/// `mixedcase`; `public.t` resolved along the search path, so with
+/// `search_path = sa, public` a `COPY public.t FROM STDIN` wrote `sa.t`;
+/// and the options were searched for with `rfind("with")`, which found
+/// none when the optional `WITH` was left out (`COPY t TO STDOUT (FORMAT
+/// csv)` streamed text) and never read the legacy `CSV HEADER` spelling
+/// at all. The grammar the engine parses every other statement with
+/// reads all of it now.
+///
+/// A COPY that does not parse is `None`: it falls through to the normal
+/// statement path, which reports the syntax error with its position.
 fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
-    let trimmed = sql.trim();
-    if !ci_starts_with(trimmed.as_bytes(), b"copy ") {
+    if !ci_starts_with(sql.trim_start().as_bytes(), b"copy") {
         return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("copy ")?;
-    // Walk the prefix manually so we can skip an optional
-    // parenthesised column list between the table name and the
-    // FROM/TO keyword. Token splitting on whitespace alone
-    // mistakes `(col1,` for the FROM direction word.
-    let bytes = rest.as_bytes();
-    let mut i = skip_ws_bytes(bytes, 0);
-    // v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`. When the first
-    // token after COPY is `(` there is no table name; the parens wrap a
-    // SELECT/VALUES/WITH whose result set is streamed. (The `COPY t (a,b)`
-    // column-list form has a table name first, so it never lands here.)
-    if bytes.get(i) == Some(&b'(') {
-        return parse_copy_query_intent(trimmed, rest, i);
-    }
-    // Table name (may be schema-qualified `s.t`, MySQL-style
-    // backtick-quoted, or PG double-quoted). Read until the next
-    // whitespace OR `(`.
-    let table_start = i;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_ascii_whitespace() || c == '(' {
-            break;
-        }
-        i += 1;
-    }
-    if i == table_start {
-        return None;
-    }
-    // 9.0.0 (C9) — keep the `<schema>.` qualifier pg_dump emits, as the
-    // SQL parser now does: `COPY c9a.t (id) TO stdout` names the relation
-    // in `c9a`, and stripping it looked up a bare `t` that a two-schema
-    // database does not have. `public.posts` still reduces to `posts`,
-    // which is the key a relation in `public` is stored under.
-    let raw = &rest[table_start..i];
-    let table = match raw.rsplit_once('.') {
-        Some((schema, bare)) => {
-            spg_sql::namespace::qualified_key(schema.trim_matches('"'), bare.trim_matches('"'))
-        }
-        None => raw.to_string(),
-    };
-    // Skip an optional `(col, col, …)` column list. v7.15.0
-    // doesn't need the column names — the COPY data path
-    // builds INSERTs against the table's full column list (or
-    // a JSON-keyed subset) by default. Recording the column
-    // list per-COPY is a v7.15.x follow-up if mismatched-arity
-    // dumps surface.
-    i = skip_ws_bytes(bytes, i);
-    let mut column_list: Option<Vec<String>> = None;
-    if bytes.get(i) == Some(&b'(') {
-        let list_start = i + 1;
-        let mut depth = 1usize;
-        i += 1;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        // `i-1` is the matching ')'. Take the names from the ORIGINAL-case SQL.
-        // `rest` is the lowercased tail after "copy "; map the offsets onto the
-        // trimmed original by the same prefix length.
-        let prefix = trimmed.len() - rest.len();
-        let names: Vec<String> = trimmed[prefix + list_start..prefix + i - 1]
-            .split(',')
-            .map(|c| c.trim().trim_matches('"').to_string())
-            .filter(|c| !c.is_empty())
-            .collect();
-        if !names.is_empty() {
-            column_list = Some(names);
-        }
-        i = skip_ws_bytes(bytes, i);
-    }
-    // dir + endpoint, whitespace-separated.
-    let dir_start = i;
-    while i < bytes.len() && !(bytes[i] as char).is_ascii_whitespace() {
-        i += 1;
-    }
-    if i == dir_start {
-        return None;
-    }
-    let dir = &rest[dir_start..i];
-    i = skip_ws_bytes(bytes, i);
-    let ep_start = i;
-    while i < bytes.len() && !(bytes[i] as char).is_ascii_whitespace() && bytes[i] != b';' {
-        i += 1;
-    }
-    if i == ep_start {
-        return None;
-    }
-    let endpoint = &rest[ep_start..i];
-    // 9.0.2 — the OPTIONS follow the endpoint, and only there may they be
-    // looked for. The search ran over the whole statement, so a table or
-    // column whose name contains `with` — `withcheck`, `width`, `without`
-    // — had its column list read as the option group: `COPY sa.withcheck
-    // (id, u) TO stdout`, which is what `pg_dump` sends for every table,
-    // answered `option "id" not recognized` and the dump stopped.
-    let options_tail = &trimmed[trimmed.len() - rest.len() + i..];
-    // v7.39 (round 251/252) — a quoted endpoint is the file form; the
-    // engine's SQL parser owns the grammar.
-    if dir == "from" && endpoint.starts_with('\'') {
-        return spg_engine::copy::parse_copy_from_file(trimmed).map(CopyIntent::FromFile);
-    }
-    if dir == "to" && endpoint.starts_with('\'') {
-        return spg_engine::copy::parse_copy_to_file(trimmed).map(CopyIntent::ToFile);
-    }
-    match (dir, endpoint) {
-        ("from", "stdin") => {
-            // v7.39 (read01 round 91) — parse options from the ORIGINAL-case
-            // SQL: option VALUES like `NULL 'NULLTOKEN'` / DELIMITER '|' are
-            // case-sensitive (the null token must match the data byte-for-byte),
-            // so only KEYS get lowercased inside the parser.
-            match parse_copy_options_checked(options_tail) {
-                Ok(opts) => Some(CopyIntent::From(table, column_list, opts)),
-                Err(bad) => Some(CopyIntent::BadOption(bad)),
-            }
-        }
-        ("to", "stdout") => match parse_copy_options_checked(options_tail) {
-            Ok(opts) => Some(CopyIntent::To(table, column_list, opts)),
-            Err(bad) => Some(CopyIntent::BadOption(bad)),
-        },
+    match spg_sql::parser::parse_statement(sql).ok()? {
+        spg_sql::ast::Statement::CopyFromStdin {
+            table,
+            table_qualified,
+            columns,
+            options,
+        } => Some(CopyIntent::From(spg_engine::copy::CopyFromStdinSpec {
+            table,
+            table_qualified,
+            columns,
+            options,
+        })),
+        spg_sql::ast::Statement::CopyTo {
+            query: Some(query),
+            options,
+            ..
+        } => Some(CopyIntent::ToQuery(query.to_string(), options)),
+        spg_sql::ast::Statement::CopyTo {
+            table,
+            table_qualified,
+            columns,
+            query: None,
+            options,
+        } => Some(CopyIntent::To {
+            table,
+            table_qualified,
+            columns,
+            options,
+        }),
+        spg_sql::ast::Statement::CopyFromFile {
+            table,
+            table_qualified,
+            columns,
+            path,
+            options,
+        } => Some(CopyIntent::FromFile(spg_engine::copy::CopyFromFileSpec {
+            table,
+            table_qualified,
+            columns,
+            path,
+            options,
+        })),
+        spg_sql::ast::Statement::CopyToFile {
+            table,
+            table_qualified,
+            columns,
+            query,
+            path,
+            options,
+        } => Some(CopyIntent::ToFile(spg_engine::copy::CopyToFileSpec {
+            table,
+            table_qualified,
+            columns,
+            query,
+            path,
+            options,
+        })),
         _ => None,
     }
 }
 
-/// v7.39 (read01 round 94) — parse `COPY (<query>) TO STDOUT [WITH (…)]`.
-/// `lparen` is the byte offset of the opening `(` within `rest` (the
-/// lower-cased tail after `copy `); `trimmed` is the original-case SQL so
-/// the inner query keeps its case. Returns `None` (falls through to the
-/// normal parse-error path) if the parens are unbalanced or `TO STDOUT`
-/// doesn't follow.
-fn parse_copy_query_intent(trimmed: &str, rest: &str, lparen: usize) -> Option<CopyIntent> {
-    let bytes = rest.as_bytes();
-    // Find the matching close paren for the wrapping `(`.
-    let mut depth = 0usize;
-    let mut j = lparen;
-    let mut close = None;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close = Some(j);
-                    break;
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    let close = close?;
-    // Inner query, taken from the ORIGINAL-case SQL (offsets map through the
-    // shared `copy ` prefix length).
-    let prefix = trimmed.len() - rest.len();
-    let query = trimmed[prefix + lparen + 1..prefix + close]
-        .trim()
-        .to_string();
-    if query.is_empty() {
-        return None;
-    }
-    // After the `)` we require `TO STDOUT`; anything else (e.g. `TO '/file'`)
-    // falls through to the engine, which reports it honestly.
-    let after = &rest[close + 1..];
-    let lower_after = after.trim_start();
-    let mut it = lower_after.split_ascii_whitespace();
-    if !matches!(it.next(), Some("to")) {
-        return None;
-    }
-    // `stdout` may be trailed by `;` or a `WITH (...)` clause.
-    let ep = it.next().unwrap_or("");
-    // v7.39 (round 252) — a quoted endpoint is the file form; the
-    // engine's SQL parser owns the grammar (options included).
-    if ep.starts_with('\'') {
-        return spg_engine::copy::parse_copy_to_file(trimmed).map(CopyIntent::ToFile);
-    }
-    if ep.trim_end_matches(';') != "stdout" {
-        return None;
-    }
-    // Options come from the tail after the wrapping `)` so the query's own
-    // parens/`WITH` CTE can't be mistaken for the COPY option list.
-    let opts = parse_copy_options(&trimmed[prefix + close + 1..]);
-    Some(CopyIntent::ToQuery(query, opts))
-}
-
-fn skip_ws_bytes(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
-        i += 1;
-    }
-    i
-}
-
-/// Find a `WITH (...)` chunk in the SQL and decode the options.
-/// v7.39 (round 265) — returns the parsed options, or the name of the
-/// first UNRECOGNIZED one. The catch-all used to swallow anything it did
-/// not know, so `COPY … WITH (NOSUCHOPT true)` reported success and the
-/// option simply did nothing — the same silent-accept shape round 260
-/// closed for ALTER DOMAIN. PG raises `option "x" not recognized`.
-fn parse_copy_options(sql: &str) -> CopyOptions {
-    parse_copy_options_checked(sql).unwrap_or_else(|_| CopyOptions::default())
-}
-
-fn parse_copy_options_checked(sql: &str) -> Result<CopyOptions, String> {
-    let mut opts = CopyOptions::default();
-    // Find the WITH (...) group. A `NULL '('`-style token could contain a paren,
-    // but PG's option grammar keeps these simple; the outer WITH ( … ) is what
-    // we split. Find the LAST '(' after "with" to skip a table column list.
-    // v7.39 (round 265) — NO `WITH` means no options at all. This used to
-    // fall back to position 0 and pick up the TABLE's column list
-    // (`COPY t (a,b) FROM STDIN`) as if it were an option group; the old
-    // catch-all silently ignored the resulting garbage, so it went
-    // unnoticed until unknown options started being rejected.
-    let Some(search_from) = sql.to_ascii_lowercase().rfind("with") else {
-        return Ok(opts);
-    };
-    let Some(open) = sql[search_from..].find('(').map(|p| search_from + p) else {
-        return Ok(opts);
-    };
-    let Some(close) = sql[open..].rfind(')').map(|p| open + p) else {
-        return Ok(opts);
-    };
-    let inner = &sql[open + 1..close];
-    for pair in inner.split(',') {
-        let pair = pair.trim();
-        if pair.is_empty() {
-            continue;
-        }
-        let mut it = pair.split_ascii_whitespace();
-        let key = it.next().unwrap_or("").to_ascii_lowercase();
-        let val_raw = it.next().unwrap_or("");
-        let val_lc = val_raw.to_ascii_lowercase();
-        let (key, val) = (key.as_str(), val_lc.as_str());
-        match key {
-            "skip" => {
-                opts.skip = val.parse().unwrap_or(0);
-            }
-            "on_error" => {
-                if val == "set_null" {
-                    opts.on_error_set_null = true;
-                }
-            }
-            "format" => match val {
-                "json" => opts.format_json = true,
-                "csv" => opts.format_csv = true,
-                _ => {}
-            },
-            // `HEADER [true|on]` (or bare `HEADER`) skips the first data
-            // row — the CSV header line. Reuses the SKIP machinery.
-            "header" => {
-                if val.is_empty() || val == "true" || val == "on" {
-                    opts.skip = opts.skip.max(1);
-                    opts.header = true;
-                }
-            }
-            "delimiter" => {
-                opts.csv_delimiter = unquote_copy_char(val_raw);
-            }
-            "quote" => {
-                opts.csv_quote = unquote_copy_char(val_raw);
-            }
-            // v7.39 (read01 round 91) — `NULL 'token'`: the string that reads as
-            // NULL. Ignored before, so `WITH (NULL 'X')` left the literal "X" in
-            // the column instead of a NULL.
-            "null" => {
-                let t = val_raw.trim_matches(|c| c == '\'' || c == '"');
-                if !t.is_empty() {
-                    opts.null_string = Some(t.to_string());
-                }
-            }
-            // r1066 (7.38 S5.1) — pgbench 14+ loads with
-            // `COPY … WITH (FREEZE ON)`; the hint is vacuum
-            // bookkeeping PG-side and a faithful no-op here, and
-            // rejecting it aborted `pgbench -i` against the drop-in.
-            "freeze" => {}
-            other => {
-                return Err(other.to_ascii_lowercase());
-            }
-        }
-    }
-    Ok(opts)
-}
-
-/// Strip the surrounding quotes from a COPY option value like `','` or
-/// `'#'` and return the single character. Returns `None` if the value
-/// is not exactly one character (PG requires single-character DELIMITER
-/// / QUOTE).
-fn unquote_copy_char(val: &str) -> Option<char> {
-    let s = val.trim_matches(|c| c == '\'' || c == '"');
-    let mut chars = s.chars();
-    let c = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-    Some(c)
+/// An engine error on a COPY path, with its SQLSTATE.
+fn send_engine_error(stream: &mut dyn Write, e: &EngineError) -> std::io::Result<()> {
+    let (code, msg) = engine_error_to_wire(e);
+    send_error(stream, &code, &msg)
 }
 
 /// COPY FROM STDIN — server sends CopyInResponse, reads CopyData
@@ -6056,6 +5756,7 @@ fn handle_copy_to_file(
     state: &Arc<ServerState>,
     role: Role,
     spec: &spg_engine::copy::CopyToFileSpec,
+    tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
     if role != Role::Admin {
         send_error(
@@ -6073,7 +5774,9 @@ fn handle_copy_to_file(
         .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
         .map(|mut e| {
             e.copy_to_buffer(
+                tx_id,
                 &spec.table,
+                spec.table_qualified,
                 spec.columns.as_deref(),
                 spec.query.as_deref(),
                 &spec.options,
@@ -6082,15 +5785,7 @@ fn handle_copy_to_file(
     let (payload, n) = match rendered {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("{e}");
-            let code = if msg.contains("relation") && msg.contains("does not exist") {
-                "42P01"
-            } else if msg.contains("does not exist") || msg.contains("column") {
-                "42703"
-            } else {
-                "0A000"
-            };
-            send_error(stream, code, &msg)?;
+            send_engine_error(stream, &e)?;
             return Ok(());
         }
     };
@@ -6220,32 +5915,34 @@ fn handle_copy_from_file(
         return Ok(());
     }
     // PG's pre-file check order: relation / column existence /
-    // duplicate column, all before the file is opened (probed r249).
+    // duplicate column, then the options, all before the file is opened
+    // (probed r249).
     let target = match state
         .engine
         .read()
         .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
-        .map(|e| e.copy_target_columns(&spec.table, spec.columns.as_deref()))
-    {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            let msg = format!("{e}");
-            let code = if msg.contains("does not exist")
-                && msg.contains("relation")
-                && !msg.contains("column")
-            {
-                "42P01"
-            } else if msg.contains("specified more than once") {
-                "42701"
-            } else {
-                "42703"
-            };
-            send_error(stream, code, &msg)?;
+        .map(|e| {
+            e.copy_target(
+                tx_id,
+                &spec.table,
+                spec.table_qualified,
+                spec.columns.as_deref(),
+            )
+        })? {
+        Ok(t) => t,
+        Err(e) => {
+            send_engine_error(stream, &e)?;
             return Ok(());
         }
-        Err(e) => return Err(e),
     };
-    let data = match std::fs::read_to_string(&spec.path) {
+    let mut reader = match spg_engine::copy_from::CopyFromReader::new(&spec.options, &target) {
+        Ok(r) => r,
+        Err(e) => {
+            send_engine_error(stream, &e)?;
+            return Ok(());
+        }
+    };
+    let data = match std::fs::read(&spec.path) {
         Ok(d) => d,
         Err(e) => {
             // PG's wording, without std's " (os error N)" suffix.
@@ -6264,77 +5961,48 @@ fn handle_copy_from_file(
             return Ok(());
         }
     };
-    let inserts = match spg_engine::copy::copy_buffer_inserts(
-        &spec.table,
-        spec.columns.as_deref(),
-        &target,
-        &spec.options,
-        &data,
-    ) {
-        Ok(i) => i,
+    let rows = match reader.read_all(&data) {
+        Ok(r) => r,
         Err(e) => {
-            let msg = format!("{e}");
-            let code = if msg.contains("missing data for column")
-                || msg.contains("extra data after last expected column")
-            {
-                "22P04"
-            } else {
-                "22P02"
-            };
-            send_error(stream, code, &msg)?;
+            send_engine_error(stream, &e)?;
             return Ok(());
         }
     };
+    let mut errors = spg_engine::copy_from::CopyRowErrors::new(&spec.options);
     // Same transaction + WAL discipline as the STDIN path (round 250).
-    let wrap = !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
-    let run = |state: &Arc<ServerState>, sql: &str| -> Result<(), String> {
-        state
-            .engine
-            .write()
-            .map_err(|_| "engine rwlock poisoned".to_string())
-            .and_then(|mut e| {
-                e.execute_in(sql, tx_id)
-                    .map(|_| ())
-                    .map_err(|err| format!("{err}"))
-            })
-    };
-    if wrap {
-        if let Err(e) = run(state, "BEGIN") {
-            send_error(stream, "XX000", &format!("COPY: {e}"))?;
-            return Ok(());
-        }
-        if let Err(e) = crate::append_wal(state, "BEGIN", false) {
-            let _ = run(state, "ROLLBACK");
-            send_error(stream, "53100", &format!("{e}"))?;
-            return Ok(());
-        }
+    let wrap =
+        !errors.drops_any_failure() && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
+    if wrap && let Err(f) = copy_in_begin(state, tx_id) {
+        return send_copy_in_failure(stream, &f);
     }
     let mut inserted: u64 = 0;
-    for insert in &inserts {
-        let step = run(state, insert)
-            .and_then(|()| crate::append_wal(state, insert, false).map_err(|e| format!("{e}")));
-        match step {
-            Ok(()) => inserted += 1,
-            Err(msg) => {
-                if wrap {
-                    let _ = run(state, "ROLLBACK");
-                    let _ = crate::append_wal(state, "ROLLBACK", false);
-                }
-                send_error(stream, "22P02", &msg)?;
-                return Ok(());
+    let mut notices: Vec<String> = Vec::new();
+    for (line, values) in &rows {
+        if let Err(f) = copy_in_row(
+            state,
+            &target,
+            &mut errors,
+            tx_id,
+            (*line, values),
+            &mut notices,
+            &mut inserted,
+        ) {
+            if wrap {
+                copy_in_rollback(state, tx_id);
             }
+            return send_copy_in_failure(stream, &f);
         }
     }
     if wrap {
-        if let Err(e) = run(state, "COMMIT") {
-            let _ = crate::append_wal(state, "ROLLBACK", false);
-            send_error(stream, "XX000", &format!("COPY: {e}"))?;
-            return Ok(());
+        if let Err(f) = copy_in_commit(state, tx_id) {
+            return send_copy_in_failure(stream, &f);
         }
-        if let Err(e) = crate::append_wal(state, "COMMIT", crate::session_sync_commit(state)) {
-            send_error(stream, "53100", &format!("{e}"))?;
-            return Ok(());
-        }
+    } else if let Err(e) = copy_in_fsync_unwrapped(state, &errors, inserted) {
+        return send_error(stream, "53100", &format!("{e}"));
+    }
+    notices.extend(errors.closing_notice());
+    for n in &notices {
+        send_notice(stream, spg_engine::NoticeSeverity::Notice, n)?;
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
     *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id)) {
@@ -6345,15 +6013,114 @@ fn handle_copy_from_file(
     Ok(())
 }
 
+/// Why a COPY FROM stopped while storing rows.
+enum CopyInFailure {
+    /// The engine refused (a row, a conversion, a constraint).
+    Engine(EngineError),
+    /// The write-ahead log could not take the record.
+    Wal(String),
+}
+
+fn send_copy_in_failure(stream: &mut dyn Write, f: &CopyInFailure) -> std::io::Result<()> {
+    match f {
+        CopyInFailure::Engine(e) => send_engine_error(stream, e),
+        CopyInFailure::Wal(msg) => send_error(stream, "53100", msg),
+    }
+}
+
+/// Run `sql` on this connection's slot.
+fn copy_in_execute(
+    state: &Arc<ServerState>,
+    tx_id: spg_engine::TxId,
+    sql: &str,
+) -> Result<(), EngineError> {
+    state
+        .engine
+        .write()
+        .map_err(|_| EngineError::Unsupported("engine rwlock poisoned".into()))?
+        .execute_in(sql, tx_id)
+        .map(|_| ())
+}
+
+/// v7.39 (round 250) — COPY is ONE command: the rows go in inside one
+/// transaction (engine AND WAL) unless the client already opened one, so
+/// a bad row leaves nothing — including on replay after a crash, where a
+/// BEGIN without its COMMIT is rolled back.
+fn copy_in_begin(state: &Arc<ServerState>, tx_id: spg_engine::TxId) -> Result<(), CopyInFailure> {
+    copy_in_execute(state, tx_id, "BEGIN").map_err(CopyInFailure::Engine)?;
+    if let Err(e) = crate::append_wal(state, "BEGIN", false) {
+        copy_in_rollback(state, tx_id);
+        return Err(CopyInFailure::Wal(format!("{e}")));
+    }
+    Ok(())
+}
+
+fn copy_in_rollback(state: &Arc<ServerState>, tx_id: spg_engine::TxId) {
+    // The COPY's own error is the one the client needs; a ROLLBACK that
+    // fails leaves nothing further to undo.
+    let _ = copy_in_execute(state, tx_id, "ROLLBACK");
+    let _ = crate::append_wal(state, "ROLLBACK", false);
+}
+
+/// The COMMIT is the durability point: one fsync covers every row
+/// (session `synchronous_commit` honoured, like the normal statement
+/// path).
+fn copy_in_commit(state: &Arc<ServerState>, tx_id: spg_engine::TxId) -> Result<(), CopyInFailure> {
+    if let Err(e) = copy_in_execute(state, tx_id, "COMMIT") {
+        // Nothing reached the engine, so the log closes the transaction
+        // the same way.
+        let _ = crate::append_wal(state, "ROLLBACK", false);
+        return Err(CopyInFailure::Engine(e));
+    }
+    crate::append_wal(state, "COMMIT", crate::session_sync_commit(state))
+        .map_err(|e| CopyInFailure::Wal(format!("{e}")))
+}
+
+/// Store one decoded COPY FROM row. The engine decides what the row
+/// becomes (`copy_row`: the INSERT, or a skip under `ON_ERROR`); the wire
+/// runs the INSERT on this connection's slot and logs it.
+fn copy_in_row(
+    state: &Arc<ServerState>,
+    target: &spg_engine::copy_from::CopyTarget,
+    errors: &mut spg_engine::copy_from::CopyRowErrors,
+    tx_id: spg_engine::TxId,
+    (line, values): (u64, &[Option<String>]),
+    notices: &mut Vec<String>,
+    inserted: &mut u64,
+) -> Result<(), CopyInFailure> {
+    let action = state
+        .engine
+        .read()
+        .map_err(|_| {
+            CopyInFailure::Engine(EngineError::Unsupported("engine rwlock poisoned".into()))
+        })?
+        .copy_row(tx_id, target, errors, line, values)
+        .map_err(CopyInFailure::Engine)?;
+    let sql = match action {
+        spg_engine::copy_from::CopyRowAction::Insert(sql) => sql,
+        spg_engine::copy_from::CopyRowAction::Skip(notice) => {
+            notices.extend(notice);
+            return Ok(());
+        }
+    };
+    match copy_in_execute(state, tx_id, &sql) {
+        Ok(()) => {}
+        // SPG's `ON_ERROR set_null`: the row is dropped, the COPY goes on.
+        Err(_) if errors.drops_any_failure() => return Ok(()),
+        Err(e) => return Err(CopyInFailure::Engine(e)),
+    }
+    // v7.39 (round 250) — the row is in the wrapping transaction; its WAL
+    // record must be too (no fsync — COMMIT covers).
+    crate::append_wal(state, &sql, false).map_err(|e| CopyInFailure::Wal(format!("{e}")))?;
+    *inserted += 1;
+    Ok(())
+}
+
 fn handle_copy_from_stdin(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
-    table: &str,
-    // v7.39 (read01 round 91) — the explicit `(col, …)` list, or None for the
-    // whole-row form. Drives the per-row arity check and the INSERT mapping.
-    column_list: Option<&[String]>,
-    opts: &CopyOptions,
+    spec: &spg_engine::copy::CopyFromStdinSpec,
     tx_state: &mut u8,
     tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
@@ -6365,41 +6132,55 @@ fn handle_copy_from_stdin(
         )?;
         return Ok(());
     }
-    // Look up the column count so we can size the CopyInResponse
-    // and validate row arity.
-    let table_col_names: Vec<String> = state
+    // Everything PostgreSQL checks before it asks for data: the relation,
+    // the columns, the options.
+    let target = match state
         .engine
         .read()
-        .ok()
-        .and_then(|e| {
-            e.catalog()
-                .get(table)
-                .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
-        })
-        .unwrap_or_default();
-    // v7.39 (read01 round 91) — the columns each row must fill: the explicit
-    // list when given, else the whole table. Used to name a missing column.
-    let expected_names: Vec<String> = match column_list {
-        Some(cols) => cols.to_vec(),
-        None => table_col_names.clone(),
+        .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+        .map(|e| {
+            e.copy_target(
+                tx_id,
+                &spec.table,
+                spec.table_qualified,
+                spec.columns.as_deref(),
+            )
+        })? {
+        Ok(t) => t,
+        Err(e) => {
+            send_engine_error(stream, &e)?;
+            return Ok(());
+        }
     };
-    let Some(col_count) = state
-        .engine
-        .read()
-        .ok()
-        .and_then(|e| e.catalog().get(table).map(|t| t.schema().columns.len()))
-    else {
+    let json = spec.options.format == spg_sql::ast::CopyFormat::Json;
+    let mut reader = if json {
+        if let Err(e) = spg_engine::copy::validate_copy_option_direction(&spec.options, false) {
+            send_engine_error(stream, &e)?;
+            return Ok(());
+        }
+        None
+    } else {
+        match spg_engine::copy_from::CopyFromReader::new(&spec.options, &target) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                send_engine_error(stream, &e)?;
+                return Ok(());
+            }
+        }
+    };
+    let mut errors = spg_engine::copy_from::CopyRowErrors::new(&spec.options);
+    if json && errors.checks_input() {
         send_error(
             stream,
-            "42P01",
-            &format!("relation {table:?} does not exist"),
+            "0A000",
+            "COPY ON_ERROR ignore cannot be used with FORMAT json",
         )?;
         return Ok(());
-    };
-    // CopyInResponse 'G' body:
-    //   [u8 overall_format = 0=text]
-    //   [u16 col_count]
-    //   per-col [u16 format = 0=text]
+    }
+    // CopyInResponse 'G' body: [u8 overall format = 0 text] [u16 column
+    // count] [u16 per-column format = 0 text]. The count is the columns
+    // the COPY fills, as PostgreSQL sends it.
+    let col_count = target.names.len();
     let mut body = Vec::with_capacity(3 + col_count * 2);
     body.push(0);
     body.extend_from_slice(&u16::try_from(col_count).unwrap_or(0).to_be_bytes());
@@ -6408,66 +6189,83 @@ fn handle_copy_from_stdin(
     }
     send_msg(stream, b'G', &body)?;
 
-    // v7.39 (round 250) — COPY is ONE command: wrap the per-row INSERTs
-    // in a transaction (engine AND WAL) unless the client already opened
-    // one. Pre-r250 the rows went through `engine.execute` alone — never
-    // WAL-appended (acknowledged rows vanished on kill -9: the r178/r180
-    // lesson, wire-COPY spelling) and never rolled back on a bad row
-    // (PG's COPY is all-or-nothing). A crash mid-COPY now replays
-    // BEGIN + rows with no COMMIT, which the end-of-WAL auto-rollback
-    // discards — exactly what the client observed (no success).
-    // `ON_ERROR SET_NULL` (an SPG extension) is explicitly per-row:
-    // a bad row must not poison the rest, but an error inside an engine
-    // transaction aborts it (PG semantics) — so that mode keeps the
-    // pre-r250 per-row autocommit shape (rows WAL-append per row, one
-    // fsync at CommandComplete).
-    // v7.39 (round 283) — ask about THIS connection's slot, not "is any
-    // transaction open anywhere", which with one shared engine was every
-    // other client's transaction too.
-    let wrap = !opts.on_error_set_null && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
-    if wrap {
-        if let Err(e) = state
-            .engine
-            .write()
-            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
-            .and_then(|mut e| {
-                e.execute_in("BEGIN", tx_id)
-                    .map(|_| ())
-                    .map_err(|err| std::io::Error::other(format!("{err}")))
-            })
-        {
-            send_error(stream, "XX000", &format!("COPY: {e}"))?;
-            drain_copy_in_frames(stream)?;
-            return Ok(());
-        }
-        if let Err(e) = crate::append_wal(state, "BEGIN", false) {
-            let _ = state
-                .engine
-                .write()
-                .map(|mut en| en.execute_in("ROLLBACK", tx_id));
-            send_error(stream, "53100", &format!("{e}"))?;
-            drain_copy_in_frames(stream)?;
-            return Ok(());
-        }
+    // `ON_ERROR set_null` (an SPG extension) is per-row: a bad row must
+    // not poison the rest, and an error inside an engine transaction
+    // aborts it — so that mode keeps per-row autocommit. Round 283: the
+    // question is THIS connection's slot, not any open transaction.
+    let wrap =
+        !errors.drops_any_failure() && !state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id));
+    if wrap && let Err(f) = copy_in_begin(state, tx_id) {
+        send_copy_in_failure(stream, &f)?;
+        return drain_copy_in_frames(stream);
     }
-    // Roll the wrapping transaction back (engine + WAL) on any error
-    // below, so the failed COPY leaves nothing — including on replay.
-    let rollback_wrap = |state: &Arc<ServerState>| {
-        if wrap {
-            let _ = state
-                .engine
-                .write()
-                .map(|mut e| e.execute_in("ROLLBACK", tx_id));
-            let _ = crate::append_wal(state, "ROLLBACK", false);
-        }
-    };
-
-    // Stream loop: keep reading frames; each CopyData ('d') frame
-    // may carry partial / multiple / no rows. Buffer bytes, split
-    // on \n. CopyDone ('c') ends the input.
     let mut buf: Vec<u8> = Vec::new();
     let mut inserted: u64 = 0;
-    let mut skipped: u64 = 0;
+    let mut notices: Vec<String> = Vec::new();
+    // `\.` ends the data; whatever follows it up to CopyDone is ignored.
+    let mut ended = false;
+    let mut json_line: u64 = 0;
+    let splitter = reader
+        .as_ref()
+        .map(spg_engine::copy_from::CopyFromReader::splitter);
+    let mut store = |record: &[u8],
+                     ended: &mut bool,
+                     notices: &mut Vec<String>,
+                     inserted: &mut u64|
+     -> Result<(), CopyInFailure> {
+        let text = std::str::from_utf8(record).map_err(|_| {
+            CopyInFailure::Engine(EngineError::Unsupported(
+                "invalid byte sequence for encoding \"UTF8\"".into(),
+            ))
+        })?;
+        let Some(reader) = reader.as_mut() else {
+            // SPG's FORMAT json: one object per line.
+            json_line += 1;
+            let line = text.strip_suffix('\r').unwrap_or(text);
+            if line == "\\." {
+                *ended = true;
+                return Ok(());
+            }
+            if line.is_empty() {
+                return Ok(());
+            }
+            let sql = match build_copy_insert_from_json(&target, line) {
+                Ok(sql) => sql,
+                Err(_) if errors.drops_any_failure() => return Ok(()),
+                Err(e) => {
+                    return Err(CopyInFailure::Engine(EngineError::Unsupported(format!(
+                        "COPY FORMAT JSON: {e} (line {json_line})"
+                    ))));
+                }
+            };
+            return match copy_in_execute(state, tx_id, &sql) {
+                Ok(()) => {
+                    crate::append_wal(state, &sql, false)
+                        .map_err(|e| CopyInFailure::Wal(format!("{e}")))?;
+                    *inserted += 1;
+                    Ok(())
+                }
+                Err(_) if errors.drops_any_failure() => Ok(()),
+                Err(e) => Err(CopyInFailure::Engine(e)),
+            };
+        };
+        match reader.read(text).map_err(CopyInFailure::Engine)? {
+            spg_engine::copy_from::CopyRecord::Row { line, values } => copy_in_row(
+                state,
+                &target,
+                &mut errors,
+                tx_id,
+                (line, &values),
+                notices,
+                inserted,
+            ),
+            spg_engine::copy_from::CopyRecord::Consumed => Ok(()),
+            spg_engine::copy_from::CopyRecord::End => {
+                *ended = true;
+                Ok(())
+            }
+        }
+    };
     loop {
         let mut header = [0u8; 5];
         stream.read_exact(&mut header)?;
@@ -6478,20 +6276,25 @@ fn handle_copy_from_stdin(
         if body_len > 0 {
             stream.read_exact(&mut body)?;
         }
-        match ty {
-            b'd' => buf.extend_from_slice(&body),
-            b'c' => {
-                // Drain remaining bytes as a final row (if any).
-                if !buf.is_empty() && !buf.ends_with(b"\n") {
-                    buf.push(b'\n');
+        let done = match ty {
+            b'd' => {
+                if !ended {
+                    buf.extend_from_slice(&body);
                 }
-                break;
+                false
             }
+            b'c' => true,
             b'f' => {
+                if wrap {
+                    copy_in_rollback(state, tx_id);
+                }
                 send_error(stream, "57014", "client aborted COPY")?;
                 return Ok(());
             }
             other => {
+                if wrap {
+                    copy_in_rollback(state, tx_id);
+                }
                 send_error(
                     stream,
                     "08P01",
@@ -6499,88 +6302,49 @@ fn handle_copy_from_stdin(
                 )?;
                 return Ok(());
             }
-        }
-        // Process whatever full lines we have.
-        if let Err(msg) = process_copy_chunk(
-            state,
-            table,
-            column_list,
-            &expected_names,
-            &mut buf,
-            &mut inserted,
-            &mut skipped,
-            opts,
-            tx_id,
-        ) {
-            let code = if msg.contains("missing data for column")
-                || msg.contains("extra data after last expected column")
-            {
-                "22P04"
-            } else {
-                "22P02"
-            };
-            rollback_wrap(state);
-            send_error(stream, code, &msg)?;
-            drain_copy_in_frames(stream)?;
-            return Ok(());
-        }
-    }
-    // Final drain.
-    if let Err(msg) = process_copy_chunk(
-        state,
-        table,
-        column_list,
-        &expected_names,
-        &mut buf,
-        &mut inserted,
-        &mut skipped,
-        opts,
-        tx_id,
-    ) {
-        let code = if msg.contains("missing data for column")
-            || msg.contains("extra data after last expected column")
-        {
-            "22P04"
-        } else {
-            "22P02"
         };
-        rollback_wrap(state);
-        send_error(stream, code, &msg)?;
-        return Ok(());
-    }
-    // v7.39 (round 250) — the COMMIT is the durability point: one fsync
-    // covers every row (session synchronous_commit honoured, like the
-    // normal statement path).
-    if !wrap && crate::session_sync_commit(state) {
-        // Unwrapped path (ON_ERROR SET_NULL / client transaction): the
-        // client-tx case fsyncs at its COMMIT; SET_NULL anchors here.
-        if opts.on_error_set_null
-            && inserted > 0
-            && let Err(e) = crate::wal_fsync_now(state)
-        {
-            send_error(stream, "53100", &format!("{e}"))?;
+        let mut outcome = Ok(());
+        while !ended && outcome.is_ok() {
+            let end = match &splitter {
+                Some(s) => s.end(&buf),
+                None => buf.iter().position(|&b| b == b'\n').map(|i| i + 1),
+            };
+            let Some(end) = end else { break };
+            let record: Vec<u8> = buf.drain(..end).collect();
+            outcome = store(&record[..end - 1], &mut ended, &mut notices, &mut inserted);
+        }
+        // At CopyDone a last record without its newline is a row too.
+        if done && outcome.is_ok() && !ended && !buf.is_empty() {
+            let record = std::mem::take(&mut buf);
+            outcome = store(&record, &mut ended, &mut notices, &mut inserted);
+        }
+        if ended {
+            buf.clear();
+        }
+        if let Err(f) = outcome {
+            if wrap {
+                copy_in_rollback(state, tx_id);
+            }
+            send_copy_in_failure(stream, &f)?;
+            if !done {
+                drain_copy_in_frames(stream)?;
+            }
             return Ok(());
+        }
+        if done {
+            break;
         }
     }
     if wrap {
-        if let Err(e) = state
-            .engine
-            .write()
-            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
-            .and_then(|mut e| {
-                e.execute_in("COMMIT", tx_id)
-                    .map(|_| ())
-                    .map_err(|err| std::io::Error::other(format!("{err}")))
-            })
-        {
-            let _ = crate::append_wal(state, "ROLLBACK", false);
-            send_error(stream, "XX000", &format!("COPY: {e}"))?;
-            return Ok(());
+        if let Err(f) = copy_in_commit(state, tx_id) {
+            return send_copy_in_failure(stream, &f);
         }
-        if let Err(e) = crate::append_wal(state, "COMMIT", crate::session_sync_commit(state)) {
-            send_error(stream, "53100", &format!("{e}"))?;
-            return Ok(());
-        }
+    } else if let Err(e) = copy_in_fsync_unwrapped(state, &errors, inserted) {
+        return send_error(stream, "53100", &format!("{e}"));
+    }
+    notices.extend(errors.closing_notice());
+    for n in &notices {
+        send_notice(stream, spg_engine::NoticeSeverity::Notice, n)?;
     }
     send_command_complete(stream, &format!("COPY {inserted}"))?;
     *tx_state = if state.engine.read().is_ok_and(|e| e.is_tx_open(tx_id)) {
@@ -6591,186 +6355,37 @@ fn handle_copy_from_stdin(
     Ok(())
 }
 
-/// Split the buffer into newline-terminated rows, INSERT each one
-/// via the regular engine path. Leftover bytes (partial row) stay
-/// in `buf` for the next call.
-fn process_copy_chunk(
+/// Rows stored outside a wrapping transaction: inside the client's own,
+/// its COMMIT is the durability point; under `ON_ERROR set_null`'s
+/// per-row autocommit, one fsync here anchors them all.
+fn copy_in_fsync_unwrapped(
     state: &Arc<ServerState>,
-    table: &str,
-    column_list: Option<&[String]>,
-    expected_names: &[String],
-    buf: &mut Vec<u8>,
-    inserted: &mut u64,
-    skipped: &mut u64,
-    opts: &CopyOptions,
-    // v7.39 (round 283) — the rows must land in the SAME slot as the
-    // wrapping BEGIN/COMMIT. Routing them through `execute()` while the
-    // transaction lived on the connection's slot meant COMMIT installed
-    // the BEGIN-time shadow over them and every copied row vanished.
-    tx_id: spg_engine::TxId,
-) -> Result<(), String> {
-    // FORMAT CSV: records are delimited by a newline that is NOT inside
-    // a quoted field, so split with the quote-aware boundary scanner
-    // rather than the plain `\n` split the text/JSON path uses.
-    if opts.format_csv {
-        let delim = opts.csv_delimiter.unwrap_or(',') as u8;
-        let quote = opts.csv_quote.unwrap_or('"') as u8;
-        while let Some(end) = spg_engine::copy::csv_record_end(buf, delim, quote) {
-            let record: Vec<u8> = buf.drain(..end).collect();
-            // Drop the terminating '\n' and an optional preceding '\r'.
-            let mut rec = &record[..record.len() - 1];
-            if rec.last() == Some(&b'\r') {
-                rec = &rec[..rec.len() - 1];
-            }
-            if rec == b"\\." {
-                return Ok(());
-            }
-            if rec.is_empty() {
-                continue;
-            }
-            let row_text =
-                std::str::from_utf8(rec).map_err(|_| "COPY row not valid UTF-8".to_string())?;
-            if *skipped < opts.skip {
-                *skipped += 1;
-                continue;
-            }
-            let values = spg_engine::copy::decode_copy_csv_record(
-                row_text,
-                delim as char,
-                quote as char,
-                opts.null_string.as_deref().unwrap_or(""),
-            );
-            if let Err(msg) = copy_row_arity(&values, expected_names) {
-                if opts.on_error_set_null {
-                    continue;
-                }
-                return Err(msg);
-            }
-            let sql = spg_engine::copy::build_copy_insert(table, column_list, &values);
-            {
-                let mut engine = state
-                    .engine
-                    .write()
-                    .map_err(|_| "engine rwlock poisoned".to_string())?;
-                match engine.execute_in(&sql, tx_id) {
-                    Ok(_) => *inserted += 1,
-                    Err(e) => {
-                        if opts.on_error_set_null {
-                            continue;
-                        }
-                        // Bare engine error — PG reports the cell error
-                        // itself, not an internal wrapper.
-                        return Err(format!("{e}"));
-                    }
-                }
-            }
-            // v7.39 (round 250) — the row is in the wrapping transaction;
-            // its WAL record must be too (no fsync — COMMIT covers).
-            crate::append_wal(state, &sql, false).map_err(|e| format!("{e}"))?;
-        }
-        return Ok(());
-    }
-    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-        let line: Vec<u8> = buf.drain(..=nl).collect();
-        let line = &line[..line.len() - 1]; // strip the '\n'
-        // PG's COPY text format treats a single '.' on a line as
-        // end-of-data (legacy psql). Honour it.
-        if line == b"\\." {
-            return Ok(());
-        }
-        if line.is_empty() {
-            continue;
-        }
-        let row_text =
-            std::str::from_utf8(line).map_err(|_| "COPY row not valid UTF-8".to_string())?;
-        // v6.4.7 — SKIP N drops the first N data rows (typically a
-        // CSV header row). `skipped` counts independently of
-        // `inserted` so the final tag reports only successful
-        // inserts.
-        if *skipped < opts.skip {
-            *skipped += 1;
-            continue;
-        }
-        // v6.4.7 — FORMAT JSON decodes the line as a JSON object
-        // and maps keys to column names. Default is the existing
-        // tab-text format.
-        let sql = if opts.format_json {
-            match build_copy_insert_from_json(state, table, row_text, opts.on_error_set_null) {
-                Ok(s) => s,
-                Err(e) => {
-                    if opts.on_error_set_null {
-                        // Skip the bad row entirely under ON_ERROR.
-                        continue;
-                    }
-                    return Err(format!("COPY FORMAT JSON: {e}"));
-                }
-            }
-        } else {
-            let values = decode_copy_text_row(row_text, opts);
-            if let Err(msg) = copy_row_arity(&values, expected_names) {
-                if opts.on_error_set_null {
-                    continue;
-                }
-                return Err(msg);
-            }
-            spg_engine::copy::build_copy_insert(table, column_list, &values)
-        };
-        {
-            let mut engine = state
-                .engine
-                .write()
-                .map_err(|_| "engine rwlock poisoned".to_string())?;
-            match engine.execute_in(&sql, tx_id) {
-                Ok(_) => *inserted += 1,
-                Err(e) => {
-                    if opts.on_error_set_null {
-                        // Best-effort: skip the row but keep going.
-                        continue;
-                    }
-                    // Bare engine error — PG reports the cell error
-                    // itself, not an internal wrapper.
-                    return Err(format!("{e}"));
-                }
-            }
-        }
-        // v7.39 (round 250) — WAL record inside the wrapping transaction.
-        crate::append_wal(state, &sql, false).map_err(|e| format!("{e}"))?;
+    errors: &spg_engine::copy_from::CopyRowErrors,
+    inserted: u64,
+) -> std::io::Result<()> {
+    if errors.drops_any_failure() && inserted > 0 && crate::session_sync_commit(state) {
+        crate::wal_fsync_now(state)?;
     }
     Ok(())
 }
 
-/// v6.4.7 — `FORMAT JSON`: decode the line as a JSON object, map
-/// keys to the target table's column names (case-sensitive), and
-/// build a positional INSERT.
+/// SPG's `FORMAT json`: an INSERT for one object line, keys naming the
+/// target's columns; a column the object leaves out is NULL.
 fn build_copy_insert_from_json(
-    state: &Arc<ServerState>,
-    table: &str,
+    target: &spg_engine::copy_from::CopyTarget,
     line: &str,
-    _on_error: bool,
 ) -> Result<String, String> {
-    // Pull the column list from the catalog.
-    let cols: Vec<String> = state
-        .engine
-        .read()
-        .ok()
-        .and_then(|e| {
-            e.catalog()
-                .get(table)
-                .map(|t| t.schema().columns.iter().map(|c| c.name.clone()).collect())
-        })
-        .ok_or_else(|| format!("relation {table:?} does not exist"))?;
-    // Hand-rolled minimal JSON-object parse: find each "key": value
-    // pair at the top level. SPG's engine already has a JSON
-    // parser, but pgwire.rs doesn't depend on spg-engine internals
-    // for this path — we keep the parse local.
     let pairs = parse_json_object_top_level(line)?;
-    // 9.0.0 (C9) — see `spg_engine::copy::build_copy_insert`.
-    let mut sql = format!("INSERT INTO {} (", spg_sql::namespace::display_key(table));
+    let cols = &target.table_columns;
+    let mut sql = format!(
+        "INSERT INTO {} (",
+        spg_sql::namespace::written_sql(&target.table, target.qualified)
+    );
     for (i, c) in cols.iter().enumerate() {
         if i > 0 {
             sql.push(',');
         }
-        sql.push_str(c);
+        sql.push_str(&spg_sql::namespace::written_sql(c, false));
     }
     // 9.0.0 — see `spg_engine::copy::build_copy_insert`: COPY may fill a
     // `GENERATED ALWAYS AS IDENTITY` column and INSERT may not.
@@ -6918,65 +6533,74 @@ fn read_json_value_as_sql(
 /// backslash escapes \\b \f \n \r \t \v. v7.22 — delegates to the
 /// shared `spg_engine::copy` helper (single home with the embed
 /// import path).
-fn decode_copy_text_row(line: &str, opts: &CopyOptions) -> Vec<Option<String>> {
-    // v7.40.12 — DELIMITER and NULL apply to the TEXT format too, and
-    // this path used the built-in defaults whatever the client asked
-    // for. The COPY TO side above has read them since round 94.
-    spg_engine::copy::decode_copy_text_row_opts(
-        line,
-        opts.csv_delimiter.unwrap_or('\t'),
-        opts.null_string.as_deref().unwrap_or("\\N"),
-    )
+/// Where a COPY TO STDOUT reads its rows.
+enum CopyToSource<'a> {
+    /// `COPY <table> [(cols)] TO STDOUT`.
+    Table {
+        table: &'a str,
+        qualified: bool,
+        columns: Option<&'a [String]>,
+    },
+    /// `COPY (<query>) TO STDOUT`.
+    Query(&'a str),
 }
 
-/// Build `INSERT INTO <table> VALUES (...)` from a decoded row.
-/// v7.22 — delegates to `spg_engine::copy` (shared with the embed
-/// import path; the stricter numeric check there also keeps
-/// leading-zero codes ("0042") and float-ish words ("inf") quoted
-/// instead of lossy bare literals). The wire path carries no
-/// per-COPY column list (v7.15 scope note) — `None` emits the
-/// positional form.
-fn build_copy_insert(table: &str, values: &[Option<String>]) -> String {
-    spg_engine::copy::build_copy_insert(table, None, values)
-}
-
-/// v7.39 (read01 round 91) — PG rejects a COPY row that does not carry exactly
-/// one value per expected column: `missing data for column "X"` (naming the
-/// first column left without data) for too few, `extra data after last expected
-/// column` for too many. SPG used to feed a short row straight into an INSERT,
-/// which quietly filled the trailing columns with NULL — silent data loss.
-fn copy_row_arity(values: &[Option<String>], expected_names: &[String]) -> Result<(), String> {
-    if values.len() < expected_names.len() {
-        let missing = &expected_names[values.len()];
-        return Err(format!("missing data for column \"{missing}\""));
-    }
-    if values.len() > expected_names.len() {
-        return Err("extra data after last expected column".to_string());
-    }
-    Ok(())
-}
-
-/// COPY TO STDOUT — server runs `SELECT * FROM <table>`, sends
-/// CopyOutResponse, streams each row as one CopyData frame (text
-/// format), then CopyDone + CommandComplete.
+/// COPY TO STDOUT — the rows come from a SELECT run under the session's
+/// role (so privileges and row security apply as they do to the SELECT
+/// itself), then CopyOutResponse, one CopyData frame per line, CopyDone
+/// and CommandComplete. The lines are the engine's: one cell renderer and
+/// one encoder for every COPY TO.
 fn handle_copy_to_stdout(
     stream: &mut dyn ReadWrite,
     state: &Arc<ServerState>,
     role: Role,
-    sql: &str,
-    opts: &CopyOptions,
+    source: &CopyToSource<'_>,
+    opts: &spg_sql::ast::CopyOptions,
     tx_state: &mut u8,
     tx_id: spg_engine::TxId,
 ) -> std::io::Result<()> {
-    let _ = role.can_read(); // every role can read
+    let target = match source {
+        CopyToSource::Table {
+            table,
+            qualified,
+            columns,
+        } => match state
+            .engine
+            .read()
+            .map_err(|_| std::io::Error::other("engine rwlock poisoned"))
+            .map(|e| e.copy_target(tx_id, table, *qualified, *columns))?
+        {
+            Ok(t) => Some(t),
+            Err(e) => {
+                send_engine_error(stream, &e)?;
+                return Ok(());
+            }
+        },
+        CopyToSource::Query(_) => None,
+    };
+    // 9.0.0 (C9) / 9.0.3 — the SELECT names the relation the way the COPY
+    // did, so `public.t` stays public's table and `"MixedCase"` its case.
+    let sql = match (&target, source) {
+        (Some(t), _) => format!(
+            "SELECT {} FROM {}",
+            t.names
+                .iter()
+                .map(|c| spg_sql::namespace::written_sql(c, false))
+                .collect::<Vec<_>>()
+                .join(", "),
+            spg_sql::namespace::written_sql(&t.table, t.qualified)
+        ),
+        (None, CopyToSource::Query(q)) => (*q).to_string(),
+        (None, CopyToSource::Table { .. }) => {
+            unreachable!("a table source resolved its target above")
+        }
+    };
     // v7.17.0 Phase 2.3 — COPY TO STDOUT does not honor
-    // `statement_timeout` in this phase (the existing settings map
-    // does not cross the COPY boundary); bulk-export paths get
-    // `CancelToken::none()`. SPG_QUERY_TIMEOUT_MS / server-wide cap
-    // still applies via the server-state watchdog.
+    // `statement_timeout` (the settings map does not cross the COPY
+    // boundary); the server-wide cap still applies via the watchdog.
     let result = execute_with_role(
         state,
-        sql,
+        &sql,
         role,
         CancelToken::none(),
         matches!(*tx_state, b'T' | b'E'),
@@ -6990,12 +6614,20 @@ fn handle_copy_to_stdout(
             return Ok(());
         }
         Err(e) => {
-            send_error(stream, "42000", &e.to_string())?;
+            send_engine_error(stream, &e)?;
             return Ok(());
         }
         // v7.5.0 — QueryResult is #[non_exhaustive].
         Ok(_) => {
             send_error(stream, "XX000", "unexpected QueryResult variant")?;
+            return Ok(());
+        }
+    };
+    let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let encoder = match spg_engine::copy::CopyToEncoder::new(opts, &names, target.as_ref()) {
+        Ok(enc) => enc,
+        Err(e) => {
+            send_engine_error(stream, &e)?;
             return Ok(());
         }
     };
@@ -7008,144 +6640,34 @@ fn handle_copy_to_stdout(
         body.extend_from_slice(&0u16.to_be_bytes());
     }
     send_msg(stream, b'H', &body)?;
-    let n = rows.len();
-    let (wire_style, wire_tz) = state
+    let (style, tz) = state
         .engine
         .read()
         .map(|e| (e.render_style(), e.session_tz()))
-        .unwrap_or((Default::default(), spg_engine::SessionTz::Utc));
-    // v7.39 (read01 round 94) — honor WITH (FORMAT csv, HEADER, DELIMITER,
-    // NULL). Format-specific escaping lives in the engine's copy encoders so
-    // the TO path can't drift from the FROM path; the wire only builds the
-    // per-cell Option<String> (None = SQL NULL) and picks text vs csv.
-    let is_csv = opts.format_csv;
-    let delimiter = opts
-        .csv_delimiter
-        .unwrap_or(if is_csv { ',' } else { '\t' });
-    let quote = opts.csv_quote.unwrap_or('"');
-    let null_str = opts.null_string.clone().unwrap_or_else(|| {
-        if is_csv {
-            String::new()
-        } else {
-            "\\N".to_string()
-        }
-    });
-    let encode_line = |cells: &[Option<String>]| -> String {
-        if is_csv {
-            spg_engine::copy::encode_copy_csv_cells(cells, delimiter, quote, &null_str)
-        } else {
-            spg_engine::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
-        }
+        .map_err(|_| std::io::Error::other("engine rwlock poisoned"))?;
+    let mut send_line = |stream: &mut dyn ReadWrite, cells: &[Option<String>]| {
+        let mut line = encoder.encode(cells);
+        line.push('\n');
+        send_msg(stream, b'd', line.as_bytes())
     };
-    let mut send_line =
-        |stream: &mut dyn ReadWrite, cells: &[Option<String>]| -> std::io::Result<()> {
-            let mut line = encode_line(cells);
-            line.push('\n');
-            send_msg(stream, b'd', line.as_bytes())
-        };
     if opts.header {
-        let names: Vec<Option<String>> = columns.iter().map(|c| Some(c.name.clone())).collect();
-        send_line(stream, &names)?;
+        let header: Vec<Option<String>> = names.iter().cloned().map(Some).collect();
+        send_line(stream, &header)?;
     }
     for row in &rows {
         let cells: Vec<Option<String>> = row
             .values
             .iter()
             .enumerate()
-            .map(|(i, v)| copy_cell_raw(v, columns.get(i).map(|c| c.ty), &wire_style, &wire_tz))
+            .map(|(i, v)| {
+                spg_engine::copy::copy_cell_text(v, columns.get(i).map(|c| c.ty), &style, &tz)
+            })
             .collect();
         send_line(stream, &cells)?;
     }
     send_msg(stream, b'c', &[])?; // CopyDone
-    send_command_complete(stream, &format!("COPY {n}"))?;
-    // No TX state change.
-    let _ = tx_state;
+    send_command_complete(stream, &format!("COPY {}", rows.len()))?;
     Ok(())
-}
-
-/// v7.39 (read01 round 94) — render a value as the RAW COPY cell text
-/// (`None` for SQL NULL), BEFORE any format-specific escaping. The engine's
-/// `encode_copy_{text,csv}_cells` apply the delimiter/quote/null escaping on
-/// top, so keeping escaping out of here is what lets the same cell feed both
-/// the text and csv encoders without double-escaping.
-///
-/// `ty` exists only to tell `timestamptz` from `timestamp`: PG's COPY renders
-/// the former with its offset (`2024-01-15 10:30:00+00`), the latter without.
-fn copy_cell_raw(
-    v: &spg_storage::Value,
-    ty: Option<spg_storage::DataType>,
-    style: &spg_engine::eval::RenderStyle,
-    tz: &spg_engine::SessionTz,
-) -> Option<String> {
-    use spg_storage::Value;
-    let s = match v {
-        Value::Null => return None,
-        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
-        Value::SmallInt(n) => n.to_string(),
-        Value::Int(n) => n.to_string(),
-        Value::BigInt(n) => n.to_string(),
-        Value::Float(x) => spg_engine::eval::format_float_styled(*x, style),
-        Value::Real(x) => spg_engine::eval::format_real_styled(*x, style),
-        Value::Text(s) | Value::Json(s) => s.to_string(),
-        // v7.39 (bpchar epic) — COPY emits the padded stored form.
-        Value::BpChar(s) => s.to_string(),
-        // v7.39 (FTS) — canonical text forms for COPY too.
-        Value::TsVector(lexs) => spg_engine::eval::format_tsvector(lexs),
-        Value::TsQuery(ast) => spg_engine::eval::format_tsquery(ast),
-        Value::Numeric {
-            scaled,
-            scale,
-            kind,
-        } => spg_engine::eval::format_numeric_kind(*kind, *scaled, *scale),
-        Value::Date(d) => spg_engine::eval::format_date_styled(*d, style),
-        Value::Timestamp(t) => {
-            if matches!(ty, Some(DataType::Timestamptz)) {
-                let abbr = tz.abbrev_at(*t);
-                spg_engine::eval::format_timestamptz_tz(
-                    *t,
-                    style,
-                    tz.offset_at(*t),
-                    abbr.as_deref(),
-                )
-            } else {
-                spg_engine::eval::format_timestamp_styled(*t, style)
-            }
-        }
-        Value::Interval {
-            months,
-            days,
-            micros,
-            kind,
-        } if kind.is_finite() => {
-            spg_engine::eval::format_interval_styled(*months, *days, *micros, style)
-        }
-        Value::Interval { kind, .. } => spg_engine::eval::format_interval_kinded(0, 0, 0, *kind),
-        Value::Vector(v) => {
-            let parts: Vec<String> = v.iter().map(std::string::ToString::to_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column — dequantise to f32
-        // so the COPY text stream stays pgvector-compatible.
-        Value::Sq8Vector(q) => {
-            let parts: Vec<String> = spg_storage::quantize::dequantize(q)
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            format!("[{}]", parts.join(","))
-        }
-        // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact dequantise.
-        Value::HalfVector(h) => {
-            let parts: Vec<String> = h
-                .to_f32_vec()
-                .iter()
-                .map(std::string::ToString::to_string)
-                .collect();
-            format!("[{}]", parts.join(","))
-        }
-        // v7.5.0 — Value is #[non_exhaustive].
-        other => spg_engine::eval::value_to_text(other),
-    };
-    Some(s)
 }
 
 // ---- Auth helpers (cleartext + SCRAM) ----
@@ -9542,35 +9064,59 @@ mod tests {
     }
 
     /// v7.15.0 — pg_dump's default output emits `COPY t (col, col)
-    /// FROM stdin;` for every table with data. The old whitespace-
-    /// split parser mistook `(col,` for the FROM direction word and
-    /// missed the COPY entirely; the new bytes-walk skips the
-    /// parenthesised column list.
+    /// FROM stdin;` for every table with data.
     #[test]
     fn parse_copy_with_column_list() {
-        let sql = "COPY posts (id, title, body) FROM stdin;";
-        match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _, _)) => assert_eq!(table, "posts"),
+        match parse_copy_intent("COPY posts (id, title, body) FROM stdin;") {
+            Some(CopyIntent::From(spec)) => {
+                assert_eq!(spec.table, "posts");
+                assert_eq!(spec.columns.map(|c| c.len()), Some(3));
+            }
             other => panic!("expected From(posts), got {other:?}"),
         }
     }
 
     #[test]
     fn parse_copy_without_column_list() {
-        let sql = "COPY accounts FROM STDIN";
-        match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _, _)) => assert_eq!(table, "accounts"),
+        match parse_copy_intent("COPY accounts FROM STDIN") {
+            Some(CopyIntent::From(spec)) => assert_eq!(spec.table, "accounts"),
             other => panic!("expected From(accounts), got {other:?}"),
+        }
+    }
+
+    /// 9.0.3 — the head keeps a quoted name's case and whether a schema was
+    /// written.
+    #[test]
+    fn parse_copy_keeps_case_and_written_schema() {
+        match parse_copy_intent("COPY public.\"MixedCase\" (\"Id\") TO STDOUT") {
+            Some(CopyIntent::To {
+                table,
+                table_qualified,
+                columns,
+                ..
+            }) => {
+                assert_eq!(table, "MixedCase");
+                assert!(table_qualified);
+                assert_eq!(columns, Some(vec!["Id".to_string()]));
+            }
+            other => panic!("expected To, got {other:?}"),
         }
     }
 
     #[test]
     fn parse_copy_to_stdout_with_column_list() {
-        let sql = "COPY t (a, b) TO STDOUT";
-        match parse_copy_intent(sql) {
-            Some(CopyIntent::To(table, _, _)) => assert_eq!(table, "t"),
+        match parse_copy_intent("COPY t (a, b) TO STDOUT") {
+            Some(CopyIntent::To { table, .. }) => assert_eq!(table, "t"),
             other => panic!("expected To(t), got {other:?}"),
         }
+    }
+
+    /// The query of `COPY (<query>) TO STDOUT` reaches the engine as SQL
+    /// that parses back to the same statement.
+    fn assert_same_query(got: &str, want: &str) {
+        let got = spg_sql::parser::parse_statement(got).expect("rendered query parses");
+        let want = spg_sql::parser::parse_statement(want).expect("original query parses");
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -9580,8 +9126,8 @@ mod tests {
             "COPY (SELECT a, b FROM t WHERE a > 1 ORDER BY a) TO STDOUT WITH (FORMAT csv, HEADER)";
         match parse_copy_intent(sql) {
             Some(CopyIntent::ToQuery(query, opts)) => {
-                assert_eq!(query, "SELECT a, b FROM t WHERE a > 1 ORDER BY a");
-                assert!(opts.format_csv);
+                assert_same_query(&query, "SELECT a, b FROM t WHERE a > 1 ORDER BY a");
+                assert_eq!(opts.format, spg_sql::ast::CopyFormat::Csv);
                 assert!(opts.header);
             }
             other => panic!("expected ToQuery, got {other:?}"),
@@ -9594,9 +9140,8 @@ mod tests {
         let sql = "COPY (WITH x AS (SELECT 1 AS n) SELECT n FROM x) TO STDOUT";
         match parse_copy_intent(sql) {
             Some(CopyIntent::ToQuery(query, opts)) => {
-                assert_eq!(query, "WITH x AS (SELECT 1 AS n) SELECT n FROM x");
-                assert!(!opts.format_csv);
-                assert!(!opts.header);
+                assert_same_query(&query, "WITH x AS (SELECT 1 AS n) SELECT n FROM x");
+                assert_eq!(opts, spg_sql::ast::CopyOptions::default());
             }
             other => panic!("expected ToQuery, got {other:?}"),
         }
@@ -9604,13 +9149,32 @@ mod tests {
 
     #[test]
     fn parse_copy_with_with_options() {
-        let sql = "COPY t FROM stdin WITH (format json)";
-        match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _, opts)) => {
-                assert_eq!(table, "t");
-                assert!(opts.format_json);
+        match parse_copy_intent("COPY t FROM stdin WITH (format json)") {
+            Some(CopyIntent::From(spec)) => {
+                assert_eq!(spec.table, "t");
+                assert_eq!(spec.options.format, spg_sql::ast::CopyFormat::Json);
             }
-            other => panic!("expected From(t) with format_json, got {other:?}"),
+            other => panic!("expected From(t) with json, got {other:?}"),
+        }
+    }
+
+    /// 9.0.3 — `WITH` is optional before the parenthesised list, and the
+    /// legacy space-separated spelling is read too.
+    #[test]
+    fn parse_copy_options_without_with_and_legacy() {
+        for sql in [
+            "COPY t TO STDOUT (FORMAT csv, HEADER)",
+            "COPY t TO STDOUT WITH (FORMAT csv, HEADER)",
+            "COPY t TO STDOUT CSV HEADER",
+            "COPY t TO STDOUT WITH CSV HEADER",
+        ] {
+            match parse_copy_intent(sql) {
+                Some(CopyIntent::To { options, .. }) => {
+                    assert_eq!(options.format, spg_sql::ast::CopyFormat::Csv, "{sql}");
+                    assert!(options.header, "{sql}");
+                }
+                other => panic!("{sql}: expected To, got {other:?}"),
+            }
         }
     }
 
@@ -9628,9 +9192,11 @@ mod tests {
     #[test]
     fn parse_non_copy_returns_none() {
         assert!(parse_copy_intent("SELECT 1").is_none());
-        // v7.39 (round 251) — file-based COPY is now a real intent: the
-        // SERVER reads the file (PG semantics; admin-gated in the
-        // handler, 42501 for everyone else).
+        // A COPY that does not parse goes to the statement path, which
+        // reports the syntax error with its position.
+        assert!(parse_copy_intent("COPY t FROM stdin (NOSUCH 1)").is_none());
+        // v7.39 (round 251) — file-based COPY is a real intent: the SERVER
+        // reads the file (PG semantics; admin-gated in the handler).
         match parse_copy_intent("COPY t FROM '/etc/passwd'") {
             Some(CopyIntent::FromFile(spec)) => {
                 assert_eq!(spec.table, "t");
@@ -9644,28 +9210,14 @@ mod tests {
     fn parse_copy_from_csv_options() {
         let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER true, DELIMITER ';', QUOTE '#')";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::From(table, _, opts)) => {
-                assert_eq!(table, "t");
-                assert!(opts.format_csv);
-                assert!(!opts.format_json);
-                assert_eq!(opts.skip, 1); // HEADER → skip the header row
-                assert_eq!(opts.csv_delimiter, Some(';'));
-                assert_eq!(opts.csv_quote, Some('#'));
+            Some(CopyIntent::From(spec)) => {
+                assert_eq!(spec.table, "t");
+                assert_eq!(spec.options.format, spg_sql::ast::CopyFormat::Csv);
+                assert!(spec.options.header);
+                assert_eq!(spec.options.delimiter, Some(';'));
+                assert_eq!(spec.options.quote, Some('#'));
             }
             other => panic!("expected From(t) csv opts, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_copy_from_bare_csv_header() {
-        // Bare HEADER (no boolean) still skips the header row.
-        let sql = "COPY t FROM stdin WITH (FORMAT csv, HEADER)";
-        match parse_copy_intent(sql) {
-            Some(CopyIntent::From(_, _, opts)) => {
-                assert!(opts.format_csv);
-                assert_eq!(opts.skip, 1);
-            }
-            other => panic!("expected csv, got {other:?}"),
         }
     }
 

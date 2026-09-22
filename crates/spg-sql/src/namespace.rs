@@ -130,6 +130,19 @@ pub fn display_key(key: &str) -> String {
     out
 }
 
+/// A relation key as SQL a parser reads back to the same relation, the
+/// way the client wrote it: with its schema when one was written (so
+/// `public.t` stays `public`'s table whatever the search path says), bare
+/// when none was (so it resolves along the path, as the original did).
+/// Quoted where the name needs it, so `"MixedCase"` keeps its case.
+#[must_use]
+pub fn written_sql(key: &str, written_qualified: bool) -> String {
+    if written_qualified && !is_qualified(key) {
+        return alloc::format!("{PUBLIC}.{}", crate::ast::quote_ident(key));
+    }
+    crate::ast::quote_ident(key)
+}
+
 /// The key a relation name WRITTEN IN A STRING resolves to: the inverse
 /// of [`display_key`], for the places a client hands over a spelling
 /// rather than an identifier — `nextval('sa.s')`, `'sa.t'::regclass`,
