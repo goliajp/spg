@@ -2691,6 +2691,7 @@ impl Engine {
         if let Some(seq) = seq_name {
             let _ = self.exec_create_sequence(spg_sql::ast::CreateSequenceStatement {
                 name: seq,
+                name_qualified: false,
                 if_not_exists: true,
                 temporary: false,
                 data_type: None,
@@ -3359,7 +3360,7 @@ impl Engine {
         // a same-column repeat collides, matching PG's observable output.
         let existing: Vec<String> = self
             .active_catalog()
-            .get(&stmt.table)
+            .get_written(&stmt.table, stmt.table_qualified)
             .map(|t| t.indices().iter().map(|i| i.name.clone()).collect())
             .unwrap_or_default();
         if !existing.iter().any(|n| *n == base) {
@@ -3399,7 +3400,9 @@ impl Engine {
             // constraint and answers to the same rule, measured on PG
             // 18.6: it must include every partition-key column.
             if stmt.is_unique
-                && let Some(t) = self.active_catalog().get(&stmt.table)
+                && let Some(t) = self
+                    .active_catalog()
+                    .get_written(&stmt.table, stmt.table_qualified)
             {
                 let mut positions: Vec<usize> = Vec::new();
                 for col in core::iter::once(&stmt.column).chain(stmt.extra_columns.iter()) {
@@ -3421,12 +3424,14 @@ impl Engine {
         // INDEX consumes them). `iter_cold_rows_of_parent` borrows
         // the catalog immutably so it would conflict with the
         // `active_catalog_mut` borrow below.
-        let cold_rows_for_unique_scan: alloc::vec::Vec<spg_storage::Row> =
-            if let Some(t) = self.active_catalog().get(&stmt.table) {
-                crate::constraints::iter_cold_rows_of_parent(self.active_catalog(), t)
-            } else {
-                alloc::vec::Vec::new()
-            };
+        let cold_rows_for_unique_scan: alloc::vec::Vec<spg_storage::Row> = if let Some(t) = self
+            .active_catalog()
+            .get_written(&stmt.table, stmt.table_qualified)
+        {
+            crate::constraints::iter_cold_rows_of_parent(self.active_catalog(), t)
+        } else {
+            alloc::vec::Vec::new()
+        };
         // The index being created is not on the table yet; its own
         // expression is the one that may call a user function.
         let functions = crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.table))
@@ -3443,7 +3448,7 @@ impl Engine {
             });
         let table = self
             .active_catalog_mut()
-            .get_mut(&stmt.table)
+            .get_written_mut(&stmt.table, stmt.table_qualified)
             .ok_or_else(|| {
                 EngineError::Storage(StorageError::TableNotFound {
                     name: stmt.table.clone(),
@@ -4136,7 +4141,41 @@ impl Engine {
             // tables, forget it too, so a permanent namesake becomes visible
             // again and `end_session` does not chase a gone table.
             let was_temp = self.temp_tables.contains(&name);
+            let dropped_key = self
+                .active_catalog()
+                .get(&name)
+                .map(|t| t.schema().name.clone());
             let dropped = self.active_catalog_mut().drop_table(&name);
+            // 9.0.2 — a sequence a column OWNS goes with its table, as it
+            // does in PostgreSQL. A `serial` column's sequence is created
+            // at the first insert that needs it, and nothing removed it:
+            // after `DROP TABLE t` it stayed in `pg_class`, a dump wrote
+            // it out, and a new `t` of the same shape carried on numbering
+            // from where the old one stopped (found while re-measuring
+            // sentori's 9.0.1 repros).
+            if dropped && let Some(key) = &dropped_key {
+                let owned: Vec<String> = self
+                    .active_catalog()
+                    .sequences_all()
+                    .iter()
+                    .filter(|(_, d)| {
+                        d.owned_by.as_ref().is_some_and(|(tbl, _)| {
+                            // The owner is recorded as a key, or — from a
+                            // written `OWNED BY t.col` — as the bare name
+                            // of a relation in `public`.
+                            tbl == key
+                                || (!spg_sql::namespace::is_qualified(tbl)
+                                    && spg_sql::namespace::bare_of(key) == tbl.as_str()
+                                    && spg_sql::namespace::schema_of(key)
+                                        == spg_sql::namespace::PUBLIC)
+                        })
+                    })
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for s in owned {
+                    self.active_catalog_mut().drop_sequence(&s);
+                }
+            }
             if dropped && was_temp {
                 self.temp_tables.remove(&name);
                 self.refresh_temp_prefix();
@@ -4215,7 +4254,7 @@ impl Engine {
     /// which is what `current_schema()` answers and where PostgreSQL
     /// puts it. A name that already carries a schema is left alone, and
     /// so is a temporary one, which has a namespace of its own.
-    pub(crate) fn creation_key(&self, name: &str) -> String {
+    pub(crate) fn creation_key(&self, name: &str, written_qualified: bool) -> String {
         // A temporary relation has a namespace of its own, and an
         // internally synthesised one belongs to no database.
         if name.starts_with(spg_storage::Catalog::TEMP_NAME_MARKER)
@@ -4224,7 +4263,13 @@ impl Engine {
             return String::from(name);
         }
         let cat = self.active_catalog();
-        let key = if spg_sql::namespace::is_qualified(name) {
+        // 9.0.2 (C9) — a schema the client WROTE is final. A relation in
+        // `public` is keyed by its bare name, so `public.t2` arrives here
+        // looking exactly like `t2`, and was created in the first schema
+        // on the path: sentori measured `CREATE TABLE / INDEX / VIEW /
+        // SEQUENCE public.x` under `search_path = sa, public` all landing
+        // in `sa` on 9.0.1. PostgreSQL 18.6 puts every one in `public`.
+        let key = if written_qualified || spg_sql::namespace::is_qualified(name) {
             String::from(name)
         } else {
             match cat
@@ -4262,7 +4307,7 @@ impl Engine {
         mut stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         self.ensure_schema_exists(&stmt.name)?;
-        stmt.name = self.creation_key(&stmt.name);
+        stmt.name = self.creation_key(&stmt.name, stmt.name_qualified);
         // v7.39 — an ENGINE MySQL does not know is refused, as MySQL does.
         // The clause was consumed and dropped, so `ENGINE=NONSUCH` built a
         // table while `sql_mode` claimed `NO_ENGINE_SUBSTITUTION` — a typo
@@ -6392,7 +6437,7 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         self.ensure_schema_exists(&s.name)?;
         let mut s = s;
-        s.name = self.creation_key(&s.name);
+        s.name = self.creation_key(&s.name, s.name_qualified);
         // v7.39 (round 469) — a TEMPORARY sequence lives in the calling
         // session's namespace, exactly as round 436 put temporary tables
         // there. Until this round the keyword parsed and was dropped, so
@@ -6572,7 +6617,7 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         self.ensure_schema_exists(&s.name)?;
         let mut s = s;
-        s.name = self.creation_key(&s.name);
+        s.name = self.creation_key(&s.name, s.name_qualified);
         // v7.39.2 — a name twice in the view's own column list. Both
         // engines refuse it; SPG built the view and every reference to
         // the name after that was ambiguous.
@@ -6657,6 +6702,9 @@ impl Engine {
         // and a join qualifies by the alias.
         let mut body = s.body;
         self.expand_view_wildcards(&mut body)?;
+        // 9.0.2 (C9) — and every relation it names is BOUND here, the way
+        // PostgreSQL binds a view at CREATE; see `qualify::bind_relations`.
+        crate::qualify::bind_relations(&mut body, self.active_catalog());
         let body_repr = alloc::format!("{}", spg_sql::ast::Statement::Select(body));
         let def = spg_storage::ViewDef {
             name,
@@ -7478,6 +7526,19 @@ impl Engine {
                         ),
                     )));
                 }
+                // 9.0.2 — PostgreSQL says what CASCADE took, and sentori
+                // measured SPG saying nothing: `DROP SCHEMA sa CASCADE`
+                // over a table and two views answers, on 18.6,
+                //
+                //   NOTICE:  drop cascades to 3 other objects
+                //   DETAIL:  drop cascades to table sa.t
+                //   drop cascades to view sa.v1
+                //   drop cascades to view sa.v3
+                //
+                // A sequence a column OWNS goes with its table silently, as
+                // an index does, so it is not listed.
+                let listed = self.cascade_listing(&owned);
+                self.notice_cascade(&listed);
                 for key in owned {
                     self.drop_relation_key(&key);
                 }
@@ -7521,6 +7582,52 @@ impl Engine {
 
     /// 9.0.0 (C9) — every relation key this schema owns: tables,
     /// sequences and views alike, since all three are keyed the same way.
+    /// 9.0.2 — the objects a CASCADE names, as `(kind, name)`, in the
+    /// order PostgreSQL lists them for the shapes measured: tables, then
+    /// views, then the sequences no column owns.
+    fn cascade_listing(&self, keys: &[String]) -> Vec<(&'static str, String)> {
+        let cat = self.active_catalog();
+        let shown = |k: &str| spg_sql::namespace::display_key(k);
+        let mut out = Vec::new();
+        for k in keys {
+            if cat.materialized_views().contains_key(k) {
+                out.push(("materialized view", shown(k)));
+            } else if cat.get_written(k, true).is_some() {
+                out.push(("table", shown(k)));
+            }
+        }
+        for k in keys {
+            if cat.views_all().contains_key(k) {
+                out.push(("view", shown(k)));
+            }
+        }
+        for k in keys {
+            if let Some(def) = cat.sequences_all().get(k)
+                && def.owned_by.is_none()
+            {
+                out.push(("sequence", shown(k)));
+            }
+        }
+        out
+    }
+
+    /// PostgreSQL's CASCADE notice: one object on one line, more than one
+    /// behind a count with the list in DETAIL.
+    fn notice_cascade(&mut self, objects: &[(&'static str, String)]) {
+        match objects {
+            [] => {}
+            [(kind, name)] => self.notice(alloc::format!("drop cascades to {kind} {name}")),
+            many => {
+                let mut msg = alloc::format!("drop cascades to {} other objects", many.len());
+                for (i, (kind, name)) in many.iter().enumerate() {
+                    let head = if i == 0 { "\nDETAIL:  " } else { "\n" };
+                    msg.push_str(&alloc::format!("{head}drop cascades to {kind} {name}"));
+                }
+                self.notice(msg);
+            }
+        }
+    }
+
     fn relations_in_schema(&self, schema: &str) -> Vec<String> {
         let cat = self.active_catalog();
         let mine = |key: &String| spg_sql::namespace::schema_of(key) == schema;
@@ -7599,7 +7706,7 @@ impl Engine {
     ) -> Result<QueryResult, EngineError> {
         self.ensure_schema_exists(&s.name)?;
         let mut s = s;
-        s.name = self.creation_key(&s.name);
+        s.name = self.creation_key(&s.name, s.name_qualified);
         // v7.39 (round 436) — `CREATE TEMPORARY TABLE x AS <select>` arrives
         // here (CTAS lowers to this node with `as_plain_table`). Same
         // treatment as the column-list form: build it under the session's

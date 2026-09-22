@@ -6238,7 +6238,7 @@ impl Parser {
     /// consumed.
     fn parse_create_materialized_view_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_relation_name()?;
+        let (name, name_qualified) = self.expect_relation_ref()?;
         let mut columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
             self.advance();
@@ -6286,6 +6286,7 @@ impl Parser {
         let with_data = self.parse_optional_with_data(true)?;
         Ok(Statement::CreateMaterializedView(
             crate::ast::CreateMaterializedViewStatement {
+                name_qualified,
                 temporary: false,
                 name,
                 if_not_exists,
@@ -6349,7 +6350,7 @@ impl Parser {
         temporary: bool,
     ) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_relation_name()?;
+        let (name, name_qualified) = self.expect_relation_ref()?;
         // Optional `(col, col, …)` rename list.
         let mut columns: Vec<String> = Vec::new();
         if matches!(self.peek(), Token::LParen) {
@@ -6438,6 +6439,7 @@ impl Parser {
         };
         Ok(Statement::CreateView(crate::ast::CreateViewStatement {
             name,
+            name_qualified,
             or_replace,
             if_not_exists,
             temporary,
@@ -6455,7 +6457,7 @@ impl Parser {
         temporary: bool,
     ) -> Result<Statement, ParseError> {
         let if_not_exists = self.parse_if_not_exists();
-        let name = self.expect_relation_name()?;
+        let (name, name_qualified) = self.expect_relation_ref()?;
         // Optional `AS data_type`.
         let data_type = if matches!(self.peek(), Token::As) {
             self.advance();
@@ -6467,6 +6469,7 @@ impl Parser {
         Ok(Statement::CreateSequence(
             crate::ast::CreateSequenceStatement {
                 name,
+                name_qualified,
                 if_not_exists,
                 temporary,
                 data_type,
@@ -6881,9 +6884,15 @@ impl Parser {
                                     )));
                                 }
                             };
-                            let _ = first; // schema prefix discarded
+                            // 9.0.2 (C9) — the schema is part of the
+                            // table's identity. Discarding it made
+                            // `OWNED BY sa.t.id` own `public.t`'s column.
                             opts.owned_by = Some(SequenceOwnedBy::Column {
-                                table: second,
+                                table: if self.mysql_dialect {
+                                    second
+                                } else {
+                                    crate::namespace::qualified_key(&first, &second)
+                                },
                                 column: third,
                             });
                         } else {
@@ -13400,6 +13409,7 @@ impl Parser {
         if let Some((name, temporary)) = into {
             return Ok(Statement::CreateMaterializedView(
                 crate::ast::CreateMaterializedViewStatement {
+                    name_qualified: false,
                     temporary,
                     name,
                     if_not_exists: false,
@@ -15586,7 +15596,7 @@ impl Parser {
         debug_assert!(matches!(self.peek(), Token::Table));
         self.advance();
         let if_not_exists = self.consume_if_not_exists();
-        let name = self.expect_relation_name()?;
+        let (name, name_qualified) = self.expect_relation_ref()?;
         // v7.37.6-B — `CREATE TABLE c PARTITION OF parent <bounds>`
         // child shape has no column list; the child inherits its
         // columns from the parent at engine-DDL time. Detect it
@@ -15598,6 +15608,7 @@ impl Parser {
             self.advance(); // of
             let partition_of = self.parse_partition_of_tail()?;
             return Ok(Statement::CreateTable(CreateTableStatement {
+                name_qualified,
                 temporary: false,
                 name,
                 engine: None,
@@ -15627,6 +15638,7 @@ impl Parser {
             let with_data = self.parse_optional_with_data(true)?;
             return Ok(Statement::CreateMaterializedView(
                 crate::ast::CreateMaterializedViewStatement {
+                    name_qualified,
                     temporary: false,
                     name,
                     if_not_exists,
@@ -15662,6 +15674,7 @@ impl Parser {
                 ..spec
             };
             return Ok(Statement::CreateTable(CreateTableStatement {
+                name_qualified,
                 temporary: false,
                 name,
                 engine: None,
@@ -15868,6 +15881,7 @@ impl Parser {
             None
         };
         Ok(Statement::CreateTable(CreateTableStatement {
+            name_qualified,
             temporary: false,
             name,
             engine,
@@ -17379,7 +17393,7 @@ impl Parser {
         if only {
             self.advance();
         }
-        let table = self.expect_relation_name()?;
+        let (table, table_qualified) = self.expect_relation_ref()?;
         // Optional `USING <method>` — only recognised method in v2.0 is
         // `hnsw` (a single-layer NSW graph for kNN). `USING` is the bare
         // ident `using` (we don't promote it to a reserved keyword
@@ -17585,6 +17599,7 @@ impl Parser {
             key_order,
             key_collation,
             table,
+            table_qualified,
             only,
             column,
             nulls_not_distinct,
@@ -27186,7 +27201,12 @@ impl Parser {
         }
         if matches!(self.peek(), Token::Dot) {
             self.advance();
-            let name = self.expect_ident_like()?;
+            // 9.0.2 (C9) — ONE identifier. `expect_ident_like` strips a
+            // qualifier it finds, so `y.z` came back as `z` and a
+            // three-part `public.t.who` became the column `who` of a
+            // relation called `public` — `missing FROM-clause entry for
+            // table "public"` (sentori, 9.0.1).
+            let name = self.expect_one_ident()?;
             // v7.14.0 — schema-qualified function call
             // `<schema>.<fn>(args)`. PG dumps emit
             // `pg_catalog.set_config(...)` in the preamble. SPG
@@ -27194,6 +27214,26 @@ impl Parser {
             // route the dispatch on the bare function name.
             if matches!(self.peek(), Token::LParen) {
                 return self.finish_ident_atom(name, token);
+            }
+            // 9.0.2 (C9) — `schema.table.column`. The relation is the
+            // MIDDLE part; the first names its schema, which a FROM
+            // item's own name already carries. Taking the first part as
+            // the qualifier answered `missing FROM-clause entry for table
+            // "public"` to `SELECT public.t.who FROM public.t` (sentori,
+            // 9.0.1), which PostgreSQL 18.6 answers.
+            if matches!(self.peek(), Token::Dot)
+                && matches!(
+                    self.tokens.get(self.pos + 1),
+                    Some(Token::Ident(_) | Token::QuotedIdent(_))
+                )
+            {
+                self.advance();
+                let column = self.expect_ident_like()?;
+                return Ok(Expr::Column(ColumnName {
+                    qualifier: Some(name),
+                    name: column,
+                    token: crate::ast::SrcToken::at(token),
+                }));
             }
             return Ok(Expr::Column(ColumnName {
                 qualifier: Some(first),

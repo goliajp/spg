@@ -1391,13 +1391,27 @@ pub(crate) fn implicit_sequences(
                 continue;
             }
             let last = table.next_auto_value(i).unwrap_or(1) - 1;
+            // 9.0.2 — the sequence takes the COLUMN's type, as
+            // PostgreSQL 18.6 creates it (measured): `smallserial` is
+            // `smallint` to 32767, `serial` is `integer` to 2147483647,
+            // `bigserial` is `bigint`. Every one was `bigint`, so a dump
+            // lost `AS integer` and a restore made a `bigint` sequence.
+            let (data_type, max_value) = match col.ty {
+                spg_storage::DataType::SmallInt => {
+                    (spg_storage::SequenceDataType::SmallInt, i64::from(i16::MAX))
+                }
+                spg_storage::DataType::Int => {
+                    (spg_storage::SequenceDataType::Int, i64::from(i32::MAX))
+                }
+                _ => (spg_storage::SequenceDataType::BigInt, i64::MAX),
+            };
             out.push(spg_storage::SequenceDef {
                 name,
-                data_type: spg_storage::SequenceDataType::BigInt,
+                data_type,
                 start: 1,
                 increment: 1,
                 min_value: 1,
-                max_value: i64::MAX,
+                max_value,
                 cache: 1,
                 cycle: false,
                 owned_by: Some((tname.clone(), col.name.clone())),

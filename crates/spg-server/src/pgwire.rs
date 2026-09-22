@@ -2364,7 +2364,8 @@ fn run_pg_session(
             // statement; reply ParseComplete (no ReadyForQuery — that
             // waits for Sync).
             b'P' => {
-                match handle_parse(body, &mut prepared, state) {
+                let mut error_position = None;
+                match handle_parse(body, &mut prepared, state, &mut error_position) {
                     Ok(()) => send_msg(&mut wbuf, b'1', &[])?,
                     // v7.40.11 — the SQLSTATE travels with the message.
                     // Parse now raises the analysis errors PG raises here
@@ -2373,7 +2374,7 @@ fn run_pg_session(
                     // (syntax error) would tell a driver the statement
                     // could never be valid.
                     Err((sqlstate, msg)) => {
-                        send_error(&mut wbuf, &sqlstate, &msg)?;
+                        send_error_pos(&mut wbuf, &sqlstate, &msg, error_position)?;
                         ext_error = true;
                     }
                 }
@@ -3719,6 +3720,12 @@ fn handle_parse(
     body: &[u8],
     prepared: &mut std::collections::HashMap<String, PreparedStmt>,
     state: &Arc<ServerState>,
+    // 9.0.2 — where in the statement the error is, for PG's `P` field.
+    // The simple protocol has always sent it; Parse turned the engine's
+    // error into a sentence and dropped the position with it, so the
+    // same mistake had a caret under `psql` and none under `\gdesc`,
+    // `\bind` or any driver (sentori §3.27, 9.0.1).
+    error_position: &mut Option<usize>,
 ) -> Result<(), (std::borrow::Cow<'static, str>, String)> {
     let mut cur = 0;
     let name = read_cstring(body, &mut cur)
@@ -3784,7 +3791,10 @@ fn handle_parse(
         // client. The wording after it is still narrower than PG's —
         // that is the same gap as the missing error POSITION and needs
         // the parser to carry spans, which is not a patch.
-        .map_err(|e| (std::borrow::Cow::Borrowed("42601"), format!("{e}")))?;
+        .map_err(|e| {
+            *error_position = parse_error_position(&EngineError::Parse(e.clone()), &sql);
+            (std::borrow::Cow::Borrowed("42601"), format!("{e}"))
+        })?;
     // v7.37 (SPGS small-query bar) — describe at Parse time and
     // cache the wire-format RowDescription body. For repeated
     // executions of the same prepared statement (the sqlx hot
@@ -3796,9 +3806,10 @@ fn handle_parse(
     // shape — for `SELECT nosuchcol FROM pg_class`, an invented column
     // with a type — and a client that only ever Describes was never
     // corrected.
-    let (inferred_oids, columns) = eng
-        .describe_prepared_checked(&ast)
-        .map_err(|e| engine_error_to_wire(&e))?;
+    let (inferred_oids, columns) = eng.describe_prepared_checked(&ast).map_err(|e| {
+        *error_position = parse_error_position(&e, &sql);
+        engine_error_to_wire(&e)
+    })?;
     drop(eng);
     let row_desc_body: Option<Vec<u8>> = if columns.is_empty() {
         None

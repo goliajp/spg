@@ -70,26 +70,22 @@ fn a_create_table_nextval_default_fills_the_column() {
     }
 }
 
-/// An explicit value is accepted and kept, and the numbering carries on
-/// ABOVE it.
+/// An explicit value is accepted and kept, and the named sequence goes on
+/// counting where it stood.
 ///
-/// This is where we differ from PostgreSQL, and the difference is older
-/// than this change -- it belongs to the auto-increment machinery the
-/// ALTER spelling has used since v7.22, and this only routes a second
-/// spelling into it. Measured against PostgreSQL 18.4 on the same three
-/// inserts:
+/// 9.0.2 — this pinned a recorded delta (RD-12): SPG numbered the column
+/// from the table's maximum and answered `1, 50, 51`. The DEFAULT names a
+/// sequence the schema created, and PostgreSQL 18.6 reads THAT sequence,
+/// which knows nothing about the table:
 ///
 /// ```text
-///   PostgreSQL 18.4   1, 2, 50
-///   SPG               1, 50, 51
+///   PostgreSQL 18.6   1, 2, 50      (measured, the same three inserts)
 /// ```
 ///
-/// PostgreSQL's sequence is a counter that knows nothing about the
-/// table, so an explicit 50 does not move it and the next row is 2 --
-/// which means the sequence will eventually reach 50 and collide. Ours
-/// is the table's maximum plus one, so it never hands out a value the
-/// table already holds, and never goes back. Recorded as RD-12 rather
-/// than quietly pinned as correct.
+/// SPG now reads the sequence the DEFAULT names (sentori, 9.0.1: a
+/// `START 100` sequence gave ids 1, 2 and two tables sharing one sequence
+/// collided on their first row). So the delta is closed for this shape,
+/// and the pin asserts PostgreSQL's answer.
 #[test]
 fn an_explicit_value_is_kept_and_the_numbering_follows_it() {
     let mut e = seeded("nextval('zs')");
@@ -98,7 +94,7 @@ fn an_explicit_value_is_kept_and_the_numbering_follows_it() {
     e.execute("INSERT INTO z (k) VALUES ('c')").unwrap();
     assert_eq!(
         rows(&mut e, "SELECT id FROM z ORDER BY id"),
-        ["BigInt(1)", "BigInt(50)", "BigInt(51)"]
+        ["BigInt(1)", "BigInt(2)", "BigInt(50)"]
     );
 }
 

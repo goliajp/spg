@@ -1248,6 +1248,12 @@ pub struct CreateSubscriptionStatement {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateSequenceStatement {
     pub name: String,
+    /// 9.0.2 (C9) — the client WROTE a schema in front of the name. A
+    /// relation in `public` is keyed by its bare name, so without this a
+    /// written `public.x` was created in the first schema on the
+    /// `search_path` (sentori, measured on 9.0.1: `CREATE TABLE
+    /// public.t2` under `search_path = sa, public` made `sa.t2`).
+    pub name_qualified: bool,
     pub if_not_exists: bool,
     pub temporary: bool,
     /// Optional `AS data_type`. Default in PG is BIGINT; SPG matches.
@@ -1298,6 +1304,12 @@ pub enum SequenceOwnedBy {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMaterializedViewStatement {
     pub name: String,
+    /// 9.0.2 (C9) — the client WROTE a schema in front of the name. A
+    /// relation in `public` is keyed by its bare name, so without this a
+    /// written `public.x` was created in the first schema on the
+    /// `search_path` (sentori, measured on 9.0.1: `CREATE TABLE
+    /// public.t2` under `search_path = sa, public` made `sa.t2`).
+    pub name_qualified: bool,
     pub if_not_exists: bool,
     /// Optional `(col, col, …)` rename list. Applies to the
     /// backing table at CREATE / REFRESH time.
@@ -1333,6 +1345,12 @@ pub enum ViewCheckOption {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateViewStatement {
     pub name: String,
+    /// 9.0.2 (C9) — the client WROTE a schema in front of the name. A
+    /// relation in `public` is keyed by its bare name, so without this a
+    /// written `public.x` was created in the first schema on the
+    /// `search_path` (sentori, measured on 9.0.1: `CREATE TABLE
+    /// public.t2` under `search_path = sa, public` made `sa.t2`).
+    pub name_qualified: bool,
     pub or_replace: bool,
     pub if_not_exists: bool,
     pub temporary: bool,
@@ -2572,6 +2590,10 @@ pub struct CreateIndexStatement {
     /// the one a column inherits are different objects.
     pub key_collation: Option<String>,
     pub table: String,
+    /// 9.0.2 (C9) — the client wrote a schema in front of the TABLE.
+    /// `CREATE INDEX i ON public.t` must index `public`'s `t` whatever
+    /// the search path holds; see [`TableRef::qualified`].
+    pub table_qualified: bool,
     /// 9.0.0 — `CREATE INDEX … ON ONLY <partitioned parent>`: declare the
     /// index on the parent WITHOUT building it on the partitions.
     ///
@@ -2734,6 +2756,12 @@ pub struct CreateTableStatement {
     /// session ends. A `bool` here lands in the struct's existing padding.
     pub temporary: bool,
     pub name: String,
+    /// 9.0.2 (C9) — the client WROTE a schema in front of the name. A
+    /// relation in `public` is keyed by its bare name, so without this a
+    /// written `public.x` was created in the first schema on the
+    /// `search_path` (sentori, measured on 9.0.1: `CREATE TABLE
+    /// public.t2` under `search_path = sa, public` made `sa.t2`).
+    pub name_qualified: bool,
     /// v7.39 — the `ENGINE=` a MySQL dump names. Consumed and discarded
     /// before, so `ENGINE=NONSUCH` built a table where MySQL 9.7.2
     /// answers `ERROR 1286`, and `sql_mode` claimed
@@ -9518,6 +9546,17 @@ impl fmt::Display for TableRef {
             Some((schema @ ("public" | "pg_catalog" | "information_schema"), rest)) => {
                 write!(f, "{schema}.{}", quote_ident(rest))?;
             }
+            // 9.0.2 (C9) — a relation in `public` is keyed by its bare
+            // name, so a reference the client QUALIFIED (or a view body
+            // bound at CREATE) must write the qualifier back out, or the
+            // re-parsed text is an unqualified name the search path
+            // reinterprets. An internal relation has no schema to write.
+            _ if self.qualified
+                && !crate::namespace::is_qualified(&self.name)
+                && !self.name.starts_with("__spg_") =>
+            {
+                write!(f, "public.{}", quote_ident(&self.name))?;
+            }
             _ => write!(f, "{}", quote_ident(&self.name))?,
         }
         if let Some(seg) = self.as_of_segment {
@@ -9751,6 +9790,11 @@ fn figure_name_inner(expr: &Expr) -> (Option<String>, NameStrength) {
             // `CAST(7 AS bigint)`, which answers `int8` too.
             _ => (Some(cast_target_typname(target)), NameStrength::Weak),
         },
+        // 9.0.2 — `x COLLATE "C"` is named for `x`: a collation changes
+        // how the value orders, not what the column is called. It had no
+        // arm, so `SELECT s COLLATE "C" FROM w` named its column
+        // `?column?` where PostgreSQL 18.6 names it `s` (sentori, 9.0.1).
+        Expr::Collate { expr: inner, .. } => figure_name_inner(inner),
         // A scalar subquery reports whatever its single output column
         // reports: `(SELECT max(b) …)` is `max`, `(SELECT a+b …)` is not.
         Expr::ScalarSubquery(sel) => scalar_subquery_name(sel),

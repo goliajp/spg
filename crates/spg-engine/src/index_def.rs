@@ -105,6 +105,9 @@ pub(crate) fn create_index_statement_of(
     }
     Ok(CreateIndexStatement {
         name: idx.name.clone(),
+        // A STORED table key names one relation; it is not the search
+        // path's to reinterpret when the index is rebuilt.
+        table_qualified: true,
         concurrently: false,
         key_order: IndexColumnOrder {
             descending: idx.descending,

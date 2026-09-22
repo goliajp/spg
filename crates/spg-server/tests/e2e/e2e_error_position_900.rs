@@ -368,3 +368,65 @@ fn a_using_index_refusal_points_at_the_constraint_not_the_index() {
         "ALTER TABLE u9 ADD CONSTRAINT c_ok UNIQUE USING INDEX u9ok",
     );
 }
+
+/// 9.0.2 — the extended protocol's Parse, refused: `(SQLSTATE, position)`.
+fn refused_at_parse(s: &mut TcpStream, sql: &str) -> (String, Option<String>) {
+    let mut body = Vec::new();
+    body.push(0); // unnamed statement
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&0u16.to_be_bytes()); // no parameter types
+    send_msg(s, b'P', &body);
+    send_msg(s, b'S', &[]);
+    let msgs = read_until_ready(s);
+    let e = msgs
+        .iter()
+        .find(|m| m.ty == b'E')
+        .unwrap_or_else(|| panic!("{sql}: Parse answered instead of refusing"));
+    (
+        field(&e.body, b'C').unwrap_or_default(),
+        field(&e.body, b'P'),
+    )
+}
+
+/// 9.0.2 — Parse carries the position the simple protocol always did.
+///
+/// sentori §3.27, measured on 9.0.1: over the simple protocol a relation
+/// error has its `LINE`/caret, and the same statement through Parse — what
+/// every driver sends, and what psql's `\gdesc` and `\bind` send — had
+/// none. The engine's error was turned into a sentence and its position
+/// dropped with it. PostgreSQL 18.6 puts the caret at the same place both
+/// ways.
+#[test]
+fn an_error_at_parse_carries_its_position() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-errpos-x-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    for (sql, needle, state) in [
+        (
+            "SELECT version FROM nosuch_migrations",
+            "nosuch_migrations",
+            "42P01",
+        ),
+        ("SELECT nosuchcol FROM pg_class", "nosuchcol", "42703"),
+        ("SHOW $1", "$1", "42601"),
+    ] {
+        assert_eq!(
+            refused_at_parse(&mut s, sql),
+            (state.to_string(), Some(at(sql, needle))),
+            "{sql}"
+        );
+        // …the same place the simple protocol reports.
+        assert_eq!(
+            refused(&mut s, sql).2,
+            Some(at(sql, needle)),
+            "{sql} (simple)"
+        );
+    }
+}

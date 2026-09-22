@@ -228,13 +228,21 @@ pub(crate) fn pg_viewdef_render_in(
         return viewdef_fallback(body);
     };
     let qualified_body;
-    let body = match qualify_in {
-        Some(cat) => {
+    let body = match (qualify_in, cat) {
+        (Some(cat), _) => {
             crate::qualify::qualify_select(&mut stmt, cat, &[]);
             qualified_body = alloc::format!("{}", spg_sql::ast::Statement::Select(stmt.clone()));
             qualified_body.as_str()
         }
-        None => body,
+        // 9.0.2 (C9) — a body is BOUND at CREATE, so it names every
+        // relation exactly; under a path that reaches them it is written
+        // bare, the way PostgreSQL writes `FROM t`.
+        (None, Some(cat)) => {
+            crate::qualify::write_relations_for_path(&mut stmt, cat, false);
+            qualified_body = alloc::format!("{}", spg_sql::ast::Statement::Select(stmt.clone()));
+            qualified_body.as_str()
+        }
+        (None, None) => body,
     };
     // v7.39 (round 336, V58) — GROUP BY / HAVING / ORDER BY are laid out
     // now, each on its own line at PG's own indent (measured on 18.4:
@@ -15800,6 +15808,13 @@ fn apply_function_dispatch(
             // running index count over table_names()), so the reverse
             // tracks the forward exactly. A name arg is used directly.
             let resolved: String;
+            // 9.0.2 (C9) — an OID names one index; keep the entry it names
+            // instead of turning it into a name and searching again. Two
+            // schemas can each hold an index called `t_v`, and the search
+            // by name found `public`'s for both: `pg_dump` wrote `CREATE
+            // INDEX t_v ON public.t` twice and the restore stopped on
+            // `relation "t_v" already exists` (sentori, 9.0.1).
+            let mut by_oid: Option<crate::system_catalog::CatalogIndex> = None;
             let name_arg: &str = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(Value::Text(s)) => s.as_ref(),
@@ -15835,13 +15850,18 @@ fn apply_function_dispatch(
                     else {
                         return Ok(Value::Null);
                     };
-                    resolved = entry.name;
+                    resolved = entry.name.clone();
+                    by_oid = Some(entry);
                     resolved.as_str()
                 }
                 // v7.39 (round 337, V62) — an index name now resolves to a
                 // real oid, so `'ix'::regclass` arrives as RegClass rather
                 // than falling through as text. It carries the name.
-                Some(Value::RegClass(_, n)) => {
+                Some(Value::RegClass(oid, n)) => {
+                    // 9.0.2 — and its OID, which names it exactly.
+                    by_oid = crate::system_catalog::catalog_indexes(cat)
+                        .into_iter()
+                        .find(|ci| ci.oid == *oid);
                     resolved = n.to_string();
                     resolved.as_str()
                 }
@@ -15870,13 +15890,14 @@ fn apply_function_dispatch(
             // search found nothing and the function answered NULL for
             // every table-level UNIQUE. One enumeration answers both
             // which object this is and how to spell it.
-            let Some(ci) = crate::system_catalog::catalog_indexes(cat)
-                .into_iter()
-                .find(|ci| ci.name == bare)
-            else {
+            let Some(ci) = by_oid.or_else(|| {
+                crate::system_catalog::catalog_indexes(cat)
+                    .into_iter()
+                    .find(|ci| ci.name == bare)
+            }) else {
                 return Ok(Value::Null);
             };
-            let Some(t) = cat.get(&ci.table) else {
+            let Some(t) = cat.get_written(&ci.table, true) else {
                 return Ok(Value::Null);
             };
             if col_no > 0 {
@@ -16251,14 +16272,21 @@ fn apply_function_dispatch(
             // synths' own reverse), and pg_dump reads views through
             // `pg_get_viewdef(oid)` — a NULL here made every dumped
             // view "appear to be empty".
-            let name_arg = match args.first() {
-                Some(Value::Int(n)) => {
-                    crate::system_catalog::relation_name_for_oid(cat, i64::from(*n))
-                }
-                Some(Value::BigInt(n)) => {
-                    crate::system_catalog::relation_name_for_oid(cat, *n)
-                }
-                other => other.and_then(|v| regclass_name_of(v)),
+            // 9.0.2 (C9) — an OID names one relation: take its stored KEY
+            // and look the view up by that, exactly. This turned the oid
+            // into the name a client reads and searched again, so `sa.tv`
+            // answered `public.tv`'s body — and `pg_dump`, which reads
+            // every view through this, wrote `CREATE VIEW sa.tv … FROM
+            // public.t` (sentori, 9.0.1).
+            let oid_arg = match args.first() {
+                Some(Value::Int(n)) => Some(i64::from(*n)),
+                Some(Value::BigInt(n)) => Some(*n),
+                Some(Value::RegClass(oid, _)) => Some(*oid),
+                _ => None,
+            };
+            let name_arg = match oid_arg {
+                Some(oid) => crate::system_catalog::relation_key_for_oid(cat, oid),
+                None => args.first().and_then(|v| regclass_name_of(v)),
             };
             let Some(name_arg) = name_arg else {
                 return Ok(Value::Null);
@@ -16273,7 +16301,7 @@ fn apply_function_dispatch(
             let render = |body: &str| {
                 pg_viewdef_render_in(body, pretty, public_hidden_in(ctx).then_some(cat), Some(cat))
             };
-            if let Some(def) = cat.view(bare) {
+            if let Some(def) = cat.views_all().get(bare).or_else(|| cat.view(bare)) {
                 return Ok(Value::text(render(&def.body)));
             }
             // 7.38.1 S5.1 — materialized views answer too: pg_dump
@@ -16294,11 +16322,20 @@ fn apply_function_dispatch(
             // path needs (a serial default's `'t_id_seq'::regclass`, a user
             // function); re-rendered only when one was.
             Some(Value::Text(s)) => {
-                if let (true, Some(cat)) = (public_hidden_in(ctx), ctx.catalog)
+                if let Some(cat) = ctx.catalog
                     && let Ok(mut e) = spg_sql::parser::parse_expression(s)
-                    && crate::qualify::qualify_expr(&mut e, cat, &[])
                 {
-                    return Ok(Value::text(crate::qualify::render_qualified_expr(&e)));
+                    // 9.0.2 (C9) — a relation in another schema is written
+                    // by ITS schema's visibility under every path, not only
+                    // under `pg_dump`'s empty one.
+                    let changed = if public_hidden_in(ctx) {
+                        crate::qualify::qualify_expr(&mut e, cat, &[])
+                    } else {
+                        crate::qualify::write_regclass_for_path(&mut e, cat)
+                    };
+                    if changed {
+                        return Ok(Value::text(crate::qualify::render_qualified_expr(&e)));
+                    }
                 }
                 Ok(Value::text(s.clone()))
             }

@@ -1042,9 +1042,14 @@ fn info_column_row_in(
     let default_text: Value<'static> = if let Some(txt) = &col.default_text {
         Value::text(txt.clone())
     } else if is_serial(col) {
+        // 9.0.2 (C9) — in the table's own schema; see `synth_pg_attrdef`.
+        let seq = spg_sql::namespace::qualified_key(
+            table_schema,
+            &alloc::format!("{rel}_{}_seq", col.name),
+        );
         Value::text(alloc::format!(
-            "nextval('{rel}_{}_seq'::regclass)",
-            col.name
+            "nextval('{}'::regclass)",
+            spg_sql::namespace::display_key(&seq)
         ))
     } else {
         Value::Null
@@ -2683,8 +2688,8 @@ fn attrdef_rows(cat: &Catalog) -> Vec<(i64, i64, i32, String)> {
         .collect()
 }
 
-/// The sequence a `nextval('s')` default reads, schema prefix dropped.
-fn nextval_target(default_text: &str) -> Option<String> {
+/// The sequence a `nextval('s')` default reads, as a key.
+pub(crate) fn nextval_target(default_text: &str) -> Option<String> {
     let Ok(spg_sql::ast::Expr::FunctionCall { name, args, .. }) =
         spg_sql::parser::parse_expression(default_text)
     else {
@@ -2749,8 +2754,21 @@ pub(crate) fn synth_pg_attrdef(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'st
             let txt = match &col.default_text {
                 Some(txt) => txt,
                 None if is_serial(col) => {
-                    serial_default =
-                        alloc::format!("nextval('{tname}_{}_seq'::regclass)", col.name);
+                    // 9.0.2 (C9) — the sequence lives in the TABLE's schema,
+                    // and the default names it there. It named the bare
+                    // `s_id_seq`, which a deparse under `pg_dump`'s empty
+                    // path then qualified with `public.` — a sequence that
+                    // does not exist — and the restore stopped on it
+                    // (sentori, 9.0.1). `pg_get_expr` writes it bare again
+                    // when the path reaches it, as PostgreSQL does.
+                    let seq = spg_sql::namespace::qualified_key(
+                        cat.listed_schema(&key),
+                        &alloc::format!("{tname}_{}_seq", col.name),
+                    );
+                    serial_default = alloc::format!(
+                        "nextval('{}'::regclass)",
+                        spg_sql::namespace::display_key(&seq)
+                    );
                     &serial_default
                 }
                 None => continue,
@@ -5160,6 +5178,13 @@ fn relation_entry_for_oid(cat: &Catalog, oid: i64) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// 9.0.2 (C9) — the stored KEY an oid names. A caller that goes on to
+/// LOOK THE RELATION UP wants this, not the readable name: two schemas can
+/// hold one name, and searching again by it finds the first one.
+pub(crate) fn relation_key_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
+    relation_entry_for_oid(cat, oid).map(|(key, _)| key)
 }
 
 pub(crate) fn relation_name_for_oid(cat: &Catalog, oid: i64) -> Option<String> {
@@ -19106,7 +19131,13 @@ pub(crate) fn synth_pg_sequence(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'s
         };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(seq_oid),
-            Value::BigInt(20), // seqtypid — bigint (OID 20)
+            // seqtypid — the sequence's own type. 9.0.2: it was always
+            // bigint (20), so `pg_dump` never wrote `AS integer`.
+            Value::BigInt(match def.data_type {
+                spg_storage::SequenceDataType::SmallInt => 21,
+                spg_storage::SequenceDataType::Int => 23,
+                spg_storage::SequenceDataType::BigInt => 20,
+            }),
             Value::BigInt(def.start),
             Value::BigInt(def.increment),
             Value::BigInt(def.max_value),

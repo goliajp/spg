@@ -69,6 +69,7 @@ pub(crate) fn compare(collation: &str, a: &str, b: &str) -> Option<Ordering> {
     Some(
         collator
             .compare(a, b)
+            .then_with(|| variable_tiebreak(a, b))
             .then_with(|| a.as_bytes().cmp(b.as_bytes())),
     )
 }
@@ -198,6 +199,10 @@ impl Collated {
         let mut key: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         c.write_sort_key_to(s, &mut key).ok()?;
         key.push(0);
+        // 9.0.2 — the punctuation level, between the collation and the
+        // bytes, exactly as `compare` orders; see `variable_tiebreak`.
+        key.extend_from_slice(&variable_tiebreak_key(s));
+        key.push(0);
         key.extend_from_slice(s.as_bytes());
         Some(key)
     }
@@ -229,11 +234,98 @@ impl Collated {
                 // `is_ascii_alnum_lower`'s own note.
                 // PG's locale collations are deterministic, so a collation
                 // tie is broken by the bytes — see `compare`.
-                c.compare(a, b).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+                c.compare(a, b)
+                    .then_with(|| variable_tiebreak(a, b))
+                    .then_with(|| a.as_bytes().cmp(b.as_bytes()))
             }
             None => a.as_bytes().cmp(b.as_bytes()),
         }
     }
+}
+
+/// 9.0.2 — the level that decides between two values the collation
+/// calls equal, before their bytes do.
+///
+/// PostgreSQL's `en_US.utf8` is glibc's, where punctuation and spaces are
+/// ignored at the first three levels and ordered at a fourth by where they
+/// stand. ICU with [`pg_options`] agrees on the first three and has no
+/// fourth, so the BYTES decided, and `_` (0x5F) sits between the capital
+/// letters and the small ones. sentori measured the result on every build
+/// from 7.38.6 to 9.0.1, against PostgreSQL 18.6:
+///
+/// ```text
+///   '_Z' < 'Z'     PG t   SPG f          '_z' < 'z'   both t (by luck)
+///   '_A' < 'A'     PG t   SPG f          '-Z' < 'Z'   both t
+///   'A_B' < 'AB'   PG t   SPG f          'A B' < 'AB' both t
+///   ORDER BY over _Y,Y,_Z,Z    PG _Y,Y,_Z,Z    SPG Y,_Y,Z,_Z
+/// ```
+///
+/// The rule that reproduces every row above: walk both strings, a
+/// punctuation or space character standing for its own bytes and any
+/// other character for a weight above all of them, and compare those.
+/// Two strings of punctuation alone still order by their bytes, which is
+/// PostgreSQL's answer for that shape (measured, round 690).
+fn variable_tiebreak(a: &str, b: &str) -> Ordering {
+    variable_tiebreak_key(a).cmp(&variable_tiebreak_key(b))
+}
+
+/// The bytes [`variable_tiebreak`] compares: never a zero byte, so a sort
+/// key can carry it between NUL separators.
+fn variable_tiebreak_key(s: &str) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        if is_variable_weight(ch) {
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        } else if !is_combining_mark(ch) {
+            out.push(0xFF);
+        }
+        // A combining mark is part of the letter before it, not a place
+        // of its own: `e` + U+0301 and U+00E9 are one letter each, and
+        // counting the mark made the decomposed form LONGER here, where
+        // PostgreSQL leaves the tie to the bytes (decomposed first).
+    }
+    out
+}
+
+/// The combining-mark blocks: marks that attach to the character before.
+fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F
+    )
+}
+
+/// A character ICU treats as variable under `MaxVariable::Punctuation`:
+/// white space and punctuation, not symbols (`$ + < = > ^ ` | ~` carry a
+/// primary weight of their own).
+fn is_variable_weight(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '!' | '"'
+                | '#'
+                | '%'
+                | '&'
+                | '\''
+                | '('
+                | ')'
+                | '*'
+                | ','
+                | '-'
+                | '.'
+                | '/'
+                | ':'
+                | ';'
+                | '?'
+                | '@'
+                | '['
+                | '\\'
+                | ']'
+                | '_'
+                | '{'
+                | '}'
+        )
 }
 
 /// The options PG's collations behave under.
@@ -661,6 +753,17 @@ pub(crate) const fn is_collatable(t: &spg_storage::DataType) -> bool {
 #[must_use]
 pub(crate) const fn type_collates_as_c(t: &spg_storage::DataType) -> bool {
     matches!(t, spg_storage::DataType::Name)
+}
+
+/// 9.0.2 — the collation a column brings into an expression: the one it
+/// DECLARES, else its type's own when that type has one. A `name` column
+/// brings `C`, and it rides through operators as PostgreSQL derives it:
+/// `nspname || '.' || relname` orders by bytes on 18.6 (measured; SPG
+/// ordered it by the locale, because only a bare `name` term was known).
+pub(crate) fn column_implicit_collation(col: &spg_storage::ColumnSchema) -> Option<String> {
+    col.collation_name
+        .clone()
+        .or_else(|| type_collates_as_c(&col.ty).then(|| String::from("C")))
 }
 
 /// PostgreSQL's own wording for the refusal, so a driver reading the
