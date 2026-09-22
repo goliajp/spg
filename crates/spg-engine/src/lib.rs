@@ -310,7 +310,10 @@ pub use readonly::PreparedSelect;
 use bytebudget::*;
 pub(crate) use clock::{rewrite_clock_calls, value_to_literal};
 use constraints::*;
-pub use constraints::{UNIQ_FOLD_CHOSEN, UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS};
+pub use constraints::{
+    ON_CONFLICT_ROW_SCANS, UNIQ_FOLD_CHOSEN, UNIQ_PROBE_CALLS, UNIQ_PROBE_LOCATORS,
+    UNIQ_TABLE_FOLDS,
+};
 use conversions::*;
 pub use conversions::{
     format_bigint_2d_text_pub, format_bit_string, format_circle, format_hstore_text, format_inet,
@@ -324,6 +327,7 @@ pub(crate) use ddl::{
 };
 pub(crate) use envelope::{EnvelopeParse, build_envelope, split_envelope};
 use expr_analysis::*;
+pub use expr_index::INDEX_REBUILDS;
 use index_access::*;
 pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
 pub(crate) use orderby::{

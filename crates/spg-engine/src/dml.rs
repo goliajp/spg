@@ -2054,6 +2054,11 @@ impl Engine {
                 return Err(e);
             }
         }
+        // 9.0.3 — the function scope an expression index may call, read
+        // before the table is borrowed for the apply; see
+        // `ExprKeyPlan::row_keys`.
+        let key_functions =
+            crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.table));
         // Stage 3b — apply the original UPDATE.
         let table = self
             .active_catalog_mut()
@@ -2063,6 +2068,8 @@ impl Engine {
                     name: stmt.table.clone(),
                 })
             })?;
+        let expr_plan = crate::expr_index::ExprKeyPlan::for_table(table)?;
+        let key_columns = expr_plan.as_ref().map(|_| table.schema().columns.clone());
         // v7.12.5 — fire BEFORE/AFTER UPDATE row-level triggers
         // around the apply loop. BEFORE sees NEW=candidate +
         // OLD=current; may rewrite NEW or RETURN NULL to skip.
@@ -2193,8 +2200,14 @@ impl Engine {
                 // physical positions, so later `pos` values stay valid.
                 let old_rid = table.rowids().get(pos).copied();
                 let _ = table.mark_row_deleted(pos, v);
+                let keys = match (&expr_plan, &key_columns) {
+                    (Some(plan), Some(cols)) => {
+                        Some(plan.row_keys(cols, &new_row.values, key_functions.as_ref())?)
+                    }
+                    _ => None,
+                };
                 table
-                    .insert_with_xmin(Row::new(new_row.values.clone()), v)
+                    .insert_with_xmin_keyed(Row::new(new_row.values.clone()), v, keys.as_deref())
                     .map_err(EngineError::Storage)?;
                 if let (Some(o), Some(n)) = (
                     old_rid,
@@ -3119,6 +3132,10 @@ impl Engine {
         // new version (both stamped with the shared `xmin`) instead of
         // an in-place replace. Default OFF → legacy update_row.
         let inplace = self.mvcc_inplace();
+        // 9.0.3 — see `ExprKeyPlan::row_keys`: every row MERGE writes
+        // carries the keys of the indexes storage cannot key itself.
+        let key_functions =
+            crate::expr_index::function_scope(self.active_catalog(), Some(&stmt.target));
         // Apply the plan to the target table.
         let table = self
             .active_catalog_mut()
@@ -3128,6 +3145,17 @@ impl Engine {
                     name: stmt.target.clone(),
                 })
             })?;
+        let expr_plan = crate::expr_index::ExprKeyPlan::for_table(table)?;
+        let key_columns = expr_plan.as_ref().map(|_| table.schema().columns.clone());
+        let row_keys =
+            |vals: &[Value<'static>]| -> Result<Option<Vec<Option<Value<'static>>>>, EngineError> {
+                match (&expr_plan, &key_columns) {
+                    (Some(plan), Some(cols)) => {
+                        Ok(Some(plan.row_keys(cols, vals, key_functions.as_ref())?))
+                    }
+                    _ => Ok(None),
+                }
+            };
         // Apply updates first (in-place), then deletes (one batch),
         // then inserts. The storage API uses `update_row(pos,
         // new_values)`, `delete_rows(&[positions])`, and `insert(row)`.
@@ -3137,8 +3165,9 @@ impl Engine {
                 // version (xmin). Appending keeps earlier positions valid,
                 // so the remaining `idx` values in this loop stay correct.
                 let _ = table.mark_row_deleted(*idx, xmin);
+                let keys = row_keys(new_vals)?;
                 table
-                    .insert_with_xmin(Row::new(new_vals.clone()), xmin)
+                    .insert_with_xmin_keyed(Row::new(new_vals.clone()), xmin, keys.as_deref())
                     .map_err(EngineError::Storage)?;
             } else {
                 table
@@ -3152,8 +3181,9 @@ impl Engine {
         // v7.37.15 Phase C — MERGE inserts share the pre-fetched
         // writer version (xmin captured above).
         for vals in inserts {
+            let keys = row_keys(&vals)?;
             table
-                .insert_with_xmin(Row::new(vals), xmin)
+                .insert_with_xmin_keyed(Row::new(vals), xmin, keys.as_deref())
                 .map_err(EngineError::Storage)?;
         }
         let _ = table; // drop the mut borrow before building RETURNING.
@@ -8271,8 +8301,17 @@ fn insert_parsed_rows(
             // + append the DO UPDATE result as a new version (xmin).
             let old_rid = table.rowids().get(pos).copied();
             let _ = table.mark_row_deleted(pos, xmin);
+            // 9.0.3 — the new version carries the keys the fresh rows
+            // above carry; see `ExprKeyPlan::row_keys`.
+            let keys = match &expr_plan {
+                Some(plan) => {
+                    let columns = table.schema().columns.clone();
+                    Some(plan.row_keys(&columns, &new_row, functions)?)
+                }
+                None => None,
+            };
             table
-                .insert_with_xmin(Row::new(new_row), xmin)
+                .insert_with_xmin_keyed(Row::new(new_row), xmin, keys.as_deref())
                 .map_err(EngineError::Storage)?;
             if let (Some(o), Some(n)) = (
                 old_rid,

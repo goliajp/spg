@@ -671,20 +671,19 @@ fn on_conflict_key_exists(
             // "only ACCEPTS more"; here it accepted the statement and
             // then silently dropped the row, which is the opposite.
             && idx.expression.is_none()
-            // v7.40.11 — not a locale-collated index. Its tree is keyed
-            // by ICU sort keys, so `lookup_eq` of a RAW value answers
-            // "no locators" whatever is stored, and this reads that as
-            // "no conflict". See the twin rule in `uc_probe_choice` and
-            // in `enforce_unique_index_inserts`.
-            && table.index_collation(idx).is_none()
+            // v7.40.11 / 9.0.3 — asked in the tree's own key space: a
+            // locale-collated tree is keyed by sort keys, and `lookup_eq`
+            // of the RAW value answered "no locators" whatever was
+            // stored. `unique_probe_key` declines a tree it cannot ask.
             // v7.37.15 (Phase C.3) — a tombstoned index hit is not a
             // live conflict: the key was freed by a gate-on DELETE, so
             // re-inserting it must NOT trip ON CONFLICT. Gate-off has no
             // tombstones → every locator counts → unchanged.
-            && idx
-                .lookup_eq(&idx_key)
-                .iter()
-                .any(|loc| !locator_is_tombstoned(table, loc))
+            && unique_probe_key(table, idx, column_pos, false, key).is_some_and(|ik| {
+                idx.lookup_eq(&ik)
+                    .iter()
+                    .any(|loc| !locator_is_tombstoned(table, loc))
+            })
     });
     if probed {
         return true;
@@ -730,13 +729,20 @@ fn on_conflict_key_exists(
     // answers `INSERT 0 0` to all three. Reported by sentori as §3.22
     // at a fifth site; this is what made that site different from the
     // four v8.0.1 taught.
+    // 9.0.3 — "could not be probed" means exactly that: a collated tree
+    // that `unique_probe_key` can ask has answered above, and reading
+    // every row after a miss made each non-conflicting insert O(table).
+    let unprobable = |idx: &spg_storage::Index| {
+        table.index_collation(idx).is_some()
+            && unique_probe_key(table, idx, column_pos, false, key).is_none()
+    };
     let collated_btree_on_col = |pos: usize| {
         table.indices().iter().any(|idx| {
             idx.column_position == pos
                 && idx.extra_column_positions.is_empty()
                 && idx.partial_predicate.is_none()
                 && idx.expression.is_none()
-                && table.index_collation(idx).is_some()
+                && unprobable(idx)
         })
     };
     let has_unprobable_unique = table.indices().iter().any(|idx| {
@@ -745,7 +751,7 @@ fn on_conflict_key_exists(
             && idx.extra_column_positions.is_empty()
             && idx.partial_predicate.is_none()
             && idx.expression.is_none()
-            && table.index_collation(idx).is_some()
+            && unprobable(idx)
     }) || table
         .schema()
         .uniqueness_constraints
@@ -754,6 +760,7 @@ fn on_conflict_key_exists(
     if !has_unprobable_unique {
         return false;
     }
+    crate::bump_counter!(crate::constraints::ON_CONFLICT_ROW_SCANS);
     let schema = table.schema();
     let want = collated_key_cell(key, column_pos, schema, false);
     table.rows().iter().enumerate().any(|(row_idx, r)| {
@@ -764,11 +771,95 @@ fn on_conflict_key_exists(
     })
 }
 
+/// 9.0.3 — the live hot rows whose `columns` hold exactly `key`, found
+/// through an index. `None` when no index on these columns can answer,
+/// and the caller reads the rows.
+///
+/// ON CONFLICT found its conflict, and the row DO UPDATE rewrites, by
+/// reading every row of the table: sentori's ingest upserts
+/// `issue_user_hits` on its primary key `(issue_id, user_key)` for every
+/// event, and on a 100,000-row table that one statement took 48 ms where
+/// PostgreSQL 18.6 takes about 1 ms — growing with the table for as long
+/// as the product runs.
+///
+/// Every candidate an index returns is checked here against `key` with
+/// the same raw equality the scan used, so an index only decides which
+/// rows get looked at. The composite tree is asked in its own key space
+/// (`Index::multi_key_for_row`, the function its entries were built
+/// with); a single-column tree through `unique_probe_key`.
+fn hot_rows_with_key(
+    table: &spg_storage::Table,
+    columns: &[usize],
+    key: &[&Value],
+    mysql: bool,
+) -> Option<Vec<usize>> {
+    let live_match = |ri: usize| {
+        !table.headers().get(ri).is_some_and(|h| h.is_deleted())
+            && table.rows().get(ri).is_some_and(|r| {
+                columns
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
+            })
+    };
+    let plain_tree = |idx: &spg_storage::Index| {
+        matches!(idx.kind, spg_storage::IndexKind::BTree(_))
+            && idx.partial_predicate.is_none()
+            && idx.expression.is_none()
+    };
+    for idx in table.indices() {
+        if !plain_tree(idx) || idx.extra_column_positions.is_empty() {
+            continue;
+        }
+        let tuple: Vec<usize> = core::iter::once(idx.column_position)
+            .chain(idx.extra_column_positions.iter().copied())
+            .collect();
+        if tuple != columns {
+            continue;
+        }
+        let width = columns.iter().copied().max().map_or(0, |m| m + 1);
+        let mut row = alloc::vec![Value::Null; width];
+        for (i, &pos) in columns.iter().enumerate() {
+            row[pos] = key[i].clone().into_owned();
+        }
+        let Some(probe) = idx.multi_key_for_row(&row) else {
+            continue;
+        };
+        return Some(
+            idx.lookup_eq_multi(&probe)
+                .iter()
+                .filter_map(|l| l.as_hot())
+                .filter(|&ri| live_match(ri))
+                .collect(),
+        );
+    }
+    for (i, &col) in columns.iter().enumerate() {
+        for idx in table.indices() {
+            if !plain_tree(idx)
+                || idx.column_position != col
+                || !idx.extra_column_positions.is_empty()
+            {
+                continue;
+            }
+            let Some(ik) = unique_probe_key(table, idx, col, mysql, key[i]) else {
+                continue;
+            };
+            return Some(
+                idx.lookup_eq(&ik)
+                    .iter()
+                    .filter_map(|l| l.as_hot())
+                    .filter(|&ri| live_match(ri))
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
 /// v7.9.9 / v7.9.10 — look up an existing row's position by
 /// matching all `column_positions` against the incoming `key`
-/// tuple. Single-column shape (one column) reduces to the
-/// canonical PK lookup; composite shapes scan linearly until
-/// every position matches.
+/// tuple: through an index on those columns when one can answer
+/// (9.0.3, `hot_rows_with_key`), by reading the rows otherwise.
 pub(crate) fn lookup_row_position_by_keys(
     catalog: &Catalog,
     table_name: &str,
@@ -776,6 +867,11 @@ pub(crate) fn lookup_row_position_by_keys(
     key: &[&Value],
 ) -> Option<usize> {
     let table = catalog.get(table_name)?;
+    // 9.0.3 — through an index when one can answer.
+    if let Some(hits) = hot_rows_with_key(table, column_positions, key, false) {
+        return hits.into_iter().min();
+    }
+    crate::bump_counter!(crate::constraints::ON_CONFLICT_ROW_SCANS);
     // v7.37.15 (Phase C.3) — skip gate-on tombstones: a DELETE-
     // tombstoned row is not a live conflict target, so ON CONFLICT DO
     // UPDATE must not resolve onto it (it would resurrect a dead row).
@@ -792,9 +888,8 @@ pub(crate) fn lookup_row_position_by_keys(
 }
 
 /// v7.9.10 — does the table already contain a row whose
-/// `column_positions` tuple equals `key`? Single-column shape
-/// uses the existing BTree fast path; composite shapes fall
-/// back to a row scan.
+/// `column_positions` tuple equals `key`? Through an index when one
+/// can answer (9.0.3); a row scan otherwise.
 pub(crate) fn on_conflict_keys_exist(
     catalog: &Catalog,
     table_name: &str,
@@ -818,9 +913,16 @@ pub(crate) fn on_conflict_keys_exist(
     // key would falsely trip ON CONFLICT). Cold rows below cannot be
     // tombstoned in place. `is_deleted()` is never true under the
     // default gate → gate-off path byte-for-byte unchanged.
-    let hot_hit = table.rows().iter().enumerate().any(|(row_idx, r)| {
-        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
-    });
+    // 9.0.3 — through an index when one can answer; the rows otherwise.
+    let hot_hit = match hot_rows_with_key(table, column_positions, key, false) {
+        Some(hits) => !hits.is_empty(),
+        None => {
+            crate::bump_counter!(crate::constraints::ON_CONFLICT_ROW_SCANS);
+            table.rows().iter().enumerate().any(|(row_idx, r)| {
+                !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
+            })
+        }
+    };
     if hot_hit {
         return true;
     }
@@ -879,9 +981,16 @@ pub(crate) fn on_conflict_keys_exist_where(
             .all(|(i, &pos)| r.values.get(pos) == Some(key[i]))
             && row_satisfies_index_predicate(catalog, table_name, pred, r)
     };
-    let hot_hit = table.rows().iter().enumerate().any(|(row_idx, r)| {
-        !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
-    });
+    // 9.0.3 — through an index when one can answer; the rows otherwise.
+    let hot_hit = match hot_rows_with_key(table, column_positions, key, false) {
+        Some(hits) => !hits.is_empty(),
+        None => {
+            crate::bump_counter!(crate::constraints::ON_CONFLICT_ROW_SCANS);
+            table.rows().iter().enumerate().any(|(row_idx, r)| {
+                !table.headers().get(row_idx).is_some_and(|h| h.is_deleted()) && matches(r)
+            })
+        }
+    };
     if hot_hit {
         return true;
     }
@@ -1204,10 +1313,16 @@ fn uc_probe_choice<'t>(
         // This is the same rule the read paths already keep in
         // `Table::index_for_column`: an index whose keys cannot answer
         // the question must not stand in for one that can.
-        if table.index_collation(idx).is_some() {
-            continue;
-        }
-        let Some(ik) = sample.get(col).and_then(spg_storage::IndexKey::from_value) else {
+        // 9.0.3 — a tree built under a locale collation is probed with
+        // the sample's sort key, and only once it is filled
+        // (`unique_probe_key`). v7.39.4 declined such a tree outright:
+        // probed with the RAW value, an unfilled or sort-keyed tree
+        // answers "no locators", the chooser took that as the most
+        // selective candidate, and a duplicate `'a'` was admitted.
+        let Some(ik) = sample
+            .get(col)
+            .and_then(|v| unique_probe_key(table, idx, col, mysql, v))
+        else {
             continue;
         };
         let n = idx.lookup_eq(&ik).len();
@@ -1302,6 +1417,15 @@ pub static UNIQ_PROBE_LOCATORS: core::sync::atomic::AtomicU64 =
 /// indistinguishable from the outside, and a regression that silently put the
 /// unselective probe back would read as a slowdown with no cause attached.
 pub static UNIQ_FOLD_CHOSEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 9.0.3 — uniqueness checks that folded the WHOLE table, one per
+/// constraint per statement. On a shipped image every text UNIQUE and
+/// PRIMARY KEY landed here on every INSERT, which is what an INSERT's cost
+/// growing with its table looked like from the outside.
+pub static UNIQ_TABLE_FOLDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// 9.0.3 — ON CONFLICT lookups that read the rows because no index could
+/// answer: the conflict check and the row DO UPDATE rewrites.
+pub static ON_CONFLICT_ROW_SCANS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// The row already carrying `key` in an expression index, if any.
 ///
@@ -1359,20 +1483,44 @@ pub(crate) fn probe_parts_conflict(
     Ok(None)
 }
 
+/// 9.0.3 — the key that finds `value`'s candidates in `idx`, in the
+/// index's own key space: the value for a byte-keyed tree, its sort key
+/// for a tree built under a locale collation. `None` when the tree
+/// cannot be probed at all (not yet filled, or keyed in a space the value
+/// cannot be put into), and the caller folds the table instead.
+///
+/// Uniqueness here only ever uses the tree to find CANDIDATES: each one
+/// is compared on its folded key before it counts. A byte-equal value has
+/// the same sort key, so a locale-collated tree finds every duplicate.
+/// Declining such a tree outright sent every text UNIQUE / PRIMARY KEY on
+/// a shipped image — whose database collation is `en_US.utf8` — down the
+/// whole-table fold, so each INSERT cost time in proportion to the table:
+/// 44 ms for one row into a 100,000-row table (PostgreSQL 18.6: ~1 ms).
+fn unique_probe_key(
+    table: &spg_storage::Table,
+    idx: &spg_storage::Index,
+    col: usize,
+    mysql: bool,
+    value: &Value<'_>,
+) -> Option<spg_storage::IndexKey> {
+    let column = table.schema().columns.get(col)?;
+    let space = crate::index_access::probe_space(table, idx, column, mysql)?;
+    crate::index_access::probe_in_space(&space, column, value)
+}
+
 fn probe_key_conflict(
     table: &spg_storage::Table,
     idx: &spg_storage::Index,
-    leading_val: &Value<'static>,
+    ik: &spg_storage::IndexKey,
     key: &[Value<'static>],
     fold: &dyn Fn(&[Value<'static>]) -> Vec<Value<'static>>,
 ) -> Option<usize> {
-    let ik = spg_storage::IndexKey::from_value(leading_val)?;
     crate::bump_counter!(crate::constraints::UNIQ_PROBE_CALLS);
     crate::bump_counter!(
         crate::constraints::UNIQ_PROBE_LOCATORS,
-        idx.lookup_eq(&ik).len() as u64
+        idx.lookup_eq(ik).len() as u64
     );
-    for loc in idx.lookup_eq(&ik) {
+    for loc in idx.lookup_eq(ik) {
         let spg_storage::RowLocator::Hot(ri) = loc else {
             continue;
         };
@@ -1396,7 +1544,11 @@ pub(crate) fn enforce_uniqueness_inserts(
     rows: &[Vec<Value<'static>>],
     mysql: bool,
 ) -> Result<(), EngineError> {
-    if constraints.is_empty() {
+    // 9.0.3 — no rows, nothing to check. ON CONFLICT drops the rows that
+    // conflicted before this runs, and an empty batch has no sample to
+    // choose a probe with, so every `DO NOTHING` that hit folded the
+    // whole table for nothing: 38 ms on 100,000 rows.
+    if constraints.is_empty() || rows.is_empty() {
         return Ok(());
     }
     let table = catalog.get(child_table).ok_or_else(|| {
@@ -1447,16 +1599,13 @@ pub(crate) fn enforce_uniqueness_inserts(
                     continue;
                 }
                 let leading = row_values.get(probe_col).cloned().unwrap_or(Value::Null);
-                if spg_storage::IndexKey::from_value(&leading).is_none() {
-                    // A value the btree can't key (shouldn't happen for
-                    // the whitelisted types) — fall back to the fold.
+                let Some(ik) = unique_probe_key(table, idx, probe_col, mysql, &leading) else {
+                    // A value the tree can't key — fall back to the fold.
                     probe_ok = false;
                     break;
-                }
+                };
                 let dup_in_batch = !batch_seen.insert(aggregate::encode_key(&key));
-                if dup_in_batch
-                    || probe_key_conflict(table, idx, &leading, &key, &fold_key).is_some()
-                {
+                if dup_in_batch || probe_key_conflict(table, idx, &ik, &key, &fold_key).is_some() {
                     let conname = crate::system_catalog::pg_unique_conname(table, uc, child_table);
                     return Err(unique_violation(
                         &conname,
@@ -1475,6 +1624,7 @@ pub(crate) fn enforce_uniqueness_inserts(
                 continue;
             }
         }
+        crate::bump_counter!(crate::constraints::UNIQ_TABLE_FOLDS);
         let mut seen: hashbrown::HashSet<String> =
             hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
         for (row_idx, prow) in table.rows().iter().enumerate() {
@@ -2293,6 +2443,10 @@ pub(crate) fn enforce_unique_index_inserts(
     rows: &[alloc::vec::Vec<spg_storage::Value<'static>>],
     mysql: bool,
 ) -> Result<(), EngineError> {
+    // 9.0.3 — see `enforce_uniqueness_inserts`: an empty batch.
+    if rows.is_empty() {
+        return Ok(());
+    }
     let table = catalog.get(table_name).ok_or_else(|| {
         EngineError::Storage(StorageError::TableNotFound {
             name: table_name.into(),
@@ -2379,19 +2533,15 @@ pub(crate) fn enforce_unique_index_inserts(
         // ONE statement were refused by the batch set beside this probe.
         // Only rows already committed slipped through.
         //
-        // `enforce_uniqueness_inserts` — the CONSTRAINT path, in this
-        // same file — already declines such an index for exactly this
-        // reason and folds the whole table instead. One rule, two sites,
-        // and only one of them had heard it. That is why every UNIQUE
-        // constraint spelling enforced and the commonest index spelling
-        // did not.
-        //
-        // Declining sends this index down the O(table) fold below, which
-        // goes through `collated_key_cell` and is answerable.
+        // 9.0.3 — the question is now asked in the tree's own key space
+        // (`unique_probe_key`): the value's sort key, once the tree is
+        // filled. That answers it; declining the tree instead sent every
+        // text unique index on a shipped image down the O(table) fold
+        // below, one whole-table pass per inserted row. The fold remains
+        // for a tree that cannot be probed yet.
         if !idx.has_expression_part()
             && idx.partial_predicate.is_none()
             && !idx.nulls_not_distinct
-            && table.index_collation(idx).is_none()
             && matches!(idx.kind, spg_storage::IndexKind::BTree(_))
         {
             let positions = unique_key_positions(idx);
@@ -2428,12 +2578,14 @@ pub(crate) fn enforce_unique_index_inserts(
                         .get(idx.column_position)
                         .cloned()
                         .unwrap_or(spg_storage::Value::Null);
-                    if spg_storage::IndexKey::from_value(&leading).is_none() {
+                    let Some(ik) =
+                        unique_probe_key(table, idx, idx.column_position, mysql, &leading)
+                    else {
                         probe_ok = false;
                         break;
-                    }
+                    };
                     if !batch_seen.insert(aggregate::encode_key(&key))
-                        || probe_key_conflict(table, idx, &leading, &key, &fold).is_some()
+                        || probe_key_conflict(table, idx, &ik, &key, &fold).is_some()
                     {
                         // v7.39 (round 473) — a unique INDEX is a unique
                         // constraint to a client, and PG gives it the same
@@ -2502,6 +2654,7 @@ pub(crate) fn enforce_unique_index_inserts(
         // (predicate evaluated once per existing row instead of once
         // per row PAIR), then probe per batch row. The previous
         // nested scans made bulk import O(n²).
+        crate::bump_counter!(crate::constraints::UNIQ_TABLE_FOLDS);
         let mut seen: hashbrown::HashSet<String> =
             hashbrown::HashSet::with_capacity(table.rows().len() + rows.len());
         for (row_idx, prow) in table.rows().iter().enumerate() {
@@ -2832,10 +2985,10 @@ fn probe_replay(
             if !removed.contains(&nk) {
                 let key_vec = fold(new_vals);
                 let leading = new_vals.get(probe_col).cloned().unwrap_or(Value::Null);
-                if spg_storage::IndexKey::from_value(&leading).is_none() {
+                let Some(ik) = unique_probe_key(table, idx, probe_col, mysql, &leading) else {
                     return Ok(false);
-                }
-                if let Some(ri) = probe_key_conflict(table, idx, &leading, &key_vec, &fold)
+                };
+                if let Some(ri) = probe_key_conflict(table, idx, &ik, &key_vec, &fold)
                     && ri != *pos
                 {
                     return Err(on_conflict(*pos));
