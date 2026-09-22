@@ -30,7 +30,7 @@ fn import_csv(e: &mut Engine, table: &str, mut buf: Vec<u8>) -> u64 {
         }
         let row_text = std::str::from_utf8(rec).unwrap();
         let values = decode_copy_csv_record(row_text, ',', '"', "");
-        let sql = build_copy_insert(table, None, &values);
+        let sql = build_copy_insert(table, false, None, &values);
         e.execute(&sql)
             .unwrap_or_else(|err| panic!("{sql}: {err:?}"));
         inserted += 1;

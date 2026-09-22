@@ -20,6 +20,37 @@ pub enum CopyFormat {
     #[default]
     Text,
     Csv,
+    /// SPG extension, `COPY … FROM STDIN` only: one JSON object per line,
+    /// keys naming columns.
+    Json,
+}
+
+/// `ON_ERROR` of `COPY … FROM`. PG's `stop` (the default) and `ignore`,
+/// plus SPG's own `set_null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CopyOnError {
+    #[default]
+    Stop,
+    /// Skip a row whose data a column's type cannot read (a class-22
+    /// error); any other error still ends the COPY.
+    Ignore,
+    /// SPG extension: skip a row that fails for any reason.
+    SetNull,
+}
+
+/// `LOG_VERBOSITY` of `COPY … FROM`: how many notices `ON_ERROR ignore`
+/// sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CopyLogVerbosity {
+    /// One closing notice with the number of rows skipped.
+    #[default]
+    Default,
+    /// A notice per skipped row as well.
+    Verbose,
+    /// No notices.
+    Silent,
 }
 
 /// Options for `COPY … TO STDOUT [WITH] (…)`. Defaults reproduce the
@@ -31,6 +62,9 @@ pub enum CopyFormat {
 pub struct CopyOptions {
     pub format: CopyFormat,
     pub header: bool,
+    /// `HEADER match` (COPY FROM only): the header line must name the
+    /// target columns, in order.
+    pub header_match: bool,
     pub delimiter: Option<char>,
     pub null_str: Option<String>,
     pub quote: Option<char>,
@@ -50,6 +84,92 @@ pub struct CopyOptions {
     /// a QUOTED empty field (`""`) also reads as NULL (probed). COPY
     /// FROM only.
     pub force_null: Option<Vec<String>>,
+    /// `ON_ERROR` (COPY FROM only); `None` when the statement did not
+    /// write it — PostgreSQL refuses even `ON_ERROR stop` on a COPY TO.
+    pub on_error: Option<CopyOnError>,
+    /// `REJECT_LIMIT n` — with `ON_ERROR ignore`, the most rows that may
+    /// be skipped (COPY FROM only).
+    pub reject_limit: Option<u64>,
+    /// `LOG_VERBOSITY`.
+    pub log_verbosity: CopyLogVerbosity,
+    /// SPG extension `SKIP n` (COPY FROM only): drop the first `n` data
+    /// rows.
+    pub skip: u64,
+}
+
+/// Renders the parenthesised option list, `WITH (…)` included, or
+/// nothing when every option is at its default — the spelling the parser
+/// reads back into an equal value.
+impl fmt::Display for CopyOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let quoted = |s: &str| format!("'{}'", s.replace('\'', "''"));
+        let cols = |c: &[String]| {
+            if c.is_empty() {
+                "*".to_string()
+            } else {
+                format!(
+                    "({})",
+                    c.iter()
+                        .map(|n| quote_ident(n))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        };
+        let mut parts: Vec<String> = Vec::new();
+        match self.format {
+            CopyFormat::Text => {}
+            CopyFormat::Csv => parts.push("FORMAT csv".to_string()),
+            CopyFormat::Json => parts.push("FORMAT json".to_string()),
+        }
+        if self.header_match {
+            parts.push("HEADER match".to_string());
+        } else if self.header {
+            parts.push("HEADER true".to_string());
+        }
+        if let Some(d) = self.delimiter {
+            parts.push(format!("DELIMITER {}", quoted(&d.to_string())));
+        }
+        if let Some(n) = &self.null_str {
+            parts.push(format!("NULL {}", quoted(n)));
+        }
+        if let Some(q) = self.quote {
+            parts.push(format!("QUOTE {}", quoted(&q.to_string())));
+        }
+        if let Some(e) = self.escape {
+            parts.push(format!("ESCAPE {}", quoted(&e.to_string())));
+        }
+        if let Some(c) = &self.force_quote {
+            parts.push(format!("FORCE_QUOTE {}", cols(c)));
+        }
+        if let Some(c) = &self.force_not_null {
+            parts.push(format!("FORCE_NOT_NULL {}", cols(c)));
+        }
+        if let Some(c) = &self.force_null {
+            parts.push(format!("FORCE_NULL {}", cols(c)));
+        }
+        match self.on_error {
+            None => {}
+            Some(CopyOnError::Stop) => parts.push("ON_ERROR stop".to_string()),
+            Some(CopyOnError::Ignore) => parts.push("ON_ERROR ignore".to_string()),
+            Some(CopyOnError::SetNull) => parts.push("ON_ERROR set_null".to_string()),
+        }
+        if let Some(n) = self.reject_limit {
+            parts.push(format!("REJECT_LIMIT {n}"));
+        }
+        match self.log_verbosity {
+            CopyLogVerbosity::Default => {}
+            CopyLogVerbosity::Verbose => parts.push("LOG_VERBOSITY verbose".to_string()),
+            CopyLogVerbosity::Silent => parts.push("LOG_VERBOSITY silent".to_string()),
+        }
+        if self.skip > 0 {
+            parts.push(format!("SKIP {}", self.skip));
+        }
+        if parts.is_empty() {
+            return Ok(());
+        }
+        write!(f, " WITH ({})", parts.join(", "))
+    }
 }
 
 /// v7.39 (round 218) — FETCH / MOVE cursor direction. PG grammar: single-row
@@ -498,6 +618,10 @@ pub enum Statement {
     /// set; the wire layer streams CopyData from it.
     CopyTo {
         table: String,
+        /// 9.0.3 — whether the client wrote a schema in front of the
+        /// table: `public.t` names public's table whatever the search path
+        /// says, `t` is looked for along it.
+        table_qualified: bool,
         columns: Option<Vec<String>>,
         /// v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`: an
         /// arbitrary SELECT/VALUES/CTE (a whole [`Statement`], so set-ops and
@@ -517,8 +641,27 @@ pub enum Statement {
     /// the engine reports that contract.
     CopyFromFile {
         table: String,
+        /// 9.0.3 — whether the client wrote a schema in front of the
+        /// table: `public.t` names public's table whatever the search path
+        /// says, `t` is looked for along it.
+        table_qualified: bool,
         columns: Option<Vec<String>>,
         path: String,
+        options: CopyOptions,
+    },
+    /// 9.0.3 — `COPY table [(cols)] FROM STDIN [options]`. The rows arrive
+    /// out of band (CopyData frames on the wire, the lines after the
+    /// statement in a dump), so a host streams them; dispatching this
+    /// statement to the engine reports that contract. Parsed here so every
+    /// host reads the head — the table's case, its schema, the column
+    /// list, the options — with one grammar.
+    CopyFromStdin {
+        table: String,
+        /// 9.0.3 — whether the client wrote a schema in front of the
+        /// table: `public.t` names public's table whatever the search path
+        /// says, `t` is looked for along it.
+        table_qualified: bool,
+        columns: Option<Vec<String>>,
         options: CopyOptions,
     },
     /// v7.39 (round 249/252) — `COPY <table> [(cols)] TO '<file>'` (and
@@ -527,6 +670,10 @@ pub enum Statement {
     /// `Engine::copy_to_buffer` and writes the path.
     CopyToFile {
         table: String,
+        /// 9.0.3 — whether the client wrote a schema in front of the
+        /// table: `public.t` names public's table whatever the search path
+        /// says, `t` is looked for along it.
+        table_qualified: bool,
         columns: Option<Vec<String>>,
         query: Option<Box<Statement>>,
         path: String,
@@ -4086,7 +4233,7 @@ impl Statement {
             Self::Delete { .. } => Some("DELETE"),
             Self::Merge { .. } => Some("MERGE"),
             Self::Truncate { .. } => Some("TRUNCATE TABLE"),
-            Self::CopyFromFile { .. } => Some("COPY FROM"),
+            Self::CopyFromFile { .. } | Self::CopyFromStdin { .. } => Some("COPY FROM"),
 
             // A SELECT that takes row locks writes lock state, and PG
             // names the strength it was asked for.
@@ -6495,6 +6642,7 @@ impl Statement {
             | Statement::Notify { .. }
             | Statement::Unlisten(_)
             | Statement::CopyFromFile { .. }
+            | Statement::CopyFromStdin { .. }
             | Statement::AlterDomain { .. } => false,
         }
     }
@@ -6911,108 +7059,55 @@ impl fmt::Display for Statement {
             },
             Self::CopyTo {
                 table,
+                table_qualified,
                 columns,
                 query,
                 options,
             } => {
-                if let Some(q) = query {
-                    write!(f, "COPY ({q})")?;
-                } else {
-                    write!(f, "COPY {table}")?;
-                    if let Some(cols) = columns {
-                        write!(f, " ({})", cols.join(", "))?;
-                    }
-                }
-                write!(f, " TO STDOUT")?;
-                let mut parts: Vec<String> = Vec::new();
-                if options.format == CopyFormat::Csv {
-                    parts.push("FORMAT csv".to_string());
-                }
-                if options.header {
-                    parts.push("HEADER true".to_string());
-                }
-                if let Some(d) = options.delimiter {
-                    parts.push(alloc::format!("DELIMITER '{d}'"));
-                }
-                if let Some(n) = &options.null_str {
-                    parts.push(alloc::format!("NULL '{n}'"));
-                }
-                if let Some(q) = options.quote {
-                    parts.push(alloc::format!("QUOTE '{q}'"));
-                }
-                if !parts.is_empty() {
-                    write!(f, " WITH ({})", parts.join(", "))?;
-                }
-                Ok(())
+                write_copy_source(
+                    f,
+                    table,
+                    *table_qualified,
+                    columns.as_deref(),
+                    query.as_deref(),
+                )?;
+                write!(f, " TO STDOUT{options}")
             }
             Self::CopyFromFile {
                 table,
+                table_qualified,
                 columns,
                 path,
                 options,
             } => {
-                write!(f, "COPY {table}")?;
-                if let Some(cols) = columns {
-                    write!(f, " ({})", cols.join(", "))?;
-                }
-                write!(f, " FROM '{path}'")?;
-                let mut parts: Vec<String> = Vec::new();
-                if options.format == CopyFormat::Csv {
-                    parts.push("FORMAT csv".to_string());
-                }
-                if options.header {
-                    parts.push("HEADER true".to_string());
-                }
-                if let Some(d) = options.delimiter {
-                    parts.push(alloc::format!("DELIMITER '{d}'"));
-                }
-                if let Some(n) = &options.null_str {
-                    parts.push(alloc::format!("NULL '{n}'"));
-                }
-                if let Some(q) = options.quote {
-                    parts.push(alloc::format!("QUOTE '{q}'"));
-                }
-                if !parts.is_empty() {
-                    write!(f, " WITH ({})", parts.join(", "))?;
-                }
-                Ok(())
+                write_copy_source(f, table, *table_qualified, columns.as_deref(), None)?;
+                write!(f, " FROM {}{options}", quote_copy_path(path))
+            }
+            Self::CopyFromStdin {
+                table,
+                table_qualified,
+                columns,
+                options,
+            } => {
+                write_copy_source(f, table, *table_qualified, columns.as_deref(), None)?;
+                write!(f, " FROM STDIN{options}")
             }
             Self::CopyToFile {
                 table,
+                table_qualified,
                 columns,
                 query,
                 path,
                 options,
             } => {
-                if let Some(q) = query {
-                    write!(f, "COPY ({q})")?;
-                } else {
-                    write!(f, "COPY {table}")?;
-                    if let Some(cols) = columns {
-                        write!(f, " ({})", cols.join(", "))?;
-                    }
-                }
-                write!(f, " TO '{path}'")?;
-                let mut parts: Vec<String> = Vec::new();
-                if options.format == CopyFormat::Csv {
-                    parts.push("FORMAT csv".to_string());
-                }
-                if options.header {
-                    parts.push("HEADER true".to_string());
-                }
-                if let Some(d) = options.delimiter {
-                    parts.push(alloc::format!("DELIMITER '{d}'"));
-                }
-                if let Some(n) = &options.null_str {
-                    parts.push(alloc::format!("NULL '{n}'"));
-                }
-                if let Some(q) = options.quote {
-                    parts.push(alloc::format!("QUOTE '{q}'"));
-                }
-                if !parts.is_empty() {
-                    write!(f, " WITH ({})", parts.join(", "))?;
-                }
-                Ok(())
+                write_copy_source(
+                    f,
+                    table,
+                    *table_qualified,
+                    columns.as_deref(),
+                    query.as_deref(),
+                )?;
+                write!(f, " TO {}{options}", quote_copy_path(path))
             }
             Self::AlterDomain { name, action } => {
                 write!(f, "ALTER DOMAIN {name} ")?;
@@ -10546,6 +10641,34 @@ impl fmt::Display for BinOp {
 /// `pg_views.definition` as `SELECT id FROM "sa`.
 ///
 /// Each half is quoted on its own, as PostgreSQL quotes them.
+fn quote_copy_path(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
+}
+
+/// `COPY <relation> [(cols)]` or `COPY (<query>)`, the relation written
+/// the way the client wrote it.
+fn write_copy_source(
+    f: &mut fmt::Formatter<'_>,
+    table: &str,
+    table_qualified: bool,
+    columns: Option<&[String]>,
+    query: Option<&Statement>,
+) -> fmt::Result {
+    if let Some(q) = query {
+        return write!(f, "COPY ({q})");
+    }
+    write!(
+        f,
+        "COPY {}",
+        crate::namespace::written_sql(table, table_qualified)
+    )?;
+    if let Some(cols) = columns {
+        let cols: Vec<String> = cols.iter().map(|c| quote_ident(c)).collect();
+        write!(f, " ({})", cols.join(", "))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn quote_ident(s: &str) -> String {
     // 9.0.0 (C9) — a relation's name is a KEY: `public` keeps the bare
     // name and any other schema travels with it, separated by a byte no

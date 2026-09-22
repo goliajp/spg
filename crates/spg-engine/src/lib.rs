@@ -50,6 +50,7 @@ mod constfold;
 mod constraints;
 mod conversions;
 pub mod copy;
+pub mod copy_from;
 mod cursor;
 mod ddl;
 pub mod describe;
@@ -3810,6 +3811,18 @@ impl Engine {
             )));
         }
         Ok(self.catalog.declare_db_collation(name))
+    }
+
+    /// 9.0.3 — the catalog `tx_id`'s statements see: its transaction's
+    /// shadow while one is open, the committed catalog otherwise. For work
+    /// a host drives BETWEEN statements — a COPY whose rows it stores —
+    /// when `current_tx` names nobody. `active_catalog` there answered from
+    /// the committed catalog, so a table created earlier in the same
+    /// transaction did not exist: `psql -1` restored no COPY at all.
+    pub(crate) fn catalog_of_tx(&self, tx_id: TxId) -> &Catalog {
+        self.tx_catalogs
+            .get(&tx_id)
+            .map_or(&self.catalog, |s| &s.catalog)
     }
 
     pub(crate) fn active_catalog(&self) -> &Catalog {

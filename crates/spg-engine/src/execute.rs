@@ -2838,13 +2838,20 @@ impl Engine {
             Statement::CopyFromFile { path, .. } => Err(EngineError::Unsupported(alloc::format!(
                 "COPY FROM file: the host must read {path:?} and call copy_from_buffer"
             ))),
+            // 9.0.3 — the rows arrive out of band; the host streams them
+            // through `copy_target` / `copy_row`.
+            Statement::CopyFromStdin { .. } => Err(EngineError::Unsupported(
+                "COPY FROM STDIN: the host must stream the rows".into(),
+            )),
             Statement::CopyTo {
                 table,
+                table_qualified,
                 columns,
                 query,
                 options,
             } => self.exec_copy_to(
                 &table,
+                table_qualified,
                 columns.as_deref(),
                 query.as_deref(),
                 &options,
@@ -3468,55 +3475,6 @@ impl Engine {
 }
 
 impl Engine {
-    /// v7.39 (round 247) — resolve the CSV-only extras. QUOTE / ESCAPE /
-    /// FORCE_QUOTE outside CSV mode are PG's 0A000 refusals (SPG used to
-    /// ignore a text-mode QUOTE silently); the returned mask marks the
-    /// force-quoted columns of `column_names`.
-    fn resolve_copy_csv_extras(
-        options: &spg_sql::ast::CopyOptions,
-        is_csv: bool,
-        quote: char,
-        column_names: &[alloc::string::String],
-    ) -> Result<(char, Option<alloc::vec::Vec<bool>>), EngineError> {
-        if !is_csv {
-            if options.quote.is_some() {
-                return Err(EngineError::Unsupported(
-                    "COPY QUOTE requires CSV mode".into(),
-                ));
-            }
-            if options.escape.is_some() {
-                return Err(EngineError::Unsupported(
-                    "COPY ESCAPE requires CSV mode".into(),
-                ));
-            }
-        }
-        // v7.39 (round 265) — the direction-dependent rules (FORCE_QUOTE is
-        // TO-only, FORCE_NOT_NULL / FORCE_NULL are FROM-only), sharing one
-        // validator with the FROM path.
-        crate::copy::validate_copy_option_direction(options, true)?;
-        let escape = options.escape.unwrap_or(quote);
-        let force = match &options.force_quote {
-            None => None,
-            Some(cols) if cols.is_empty() => Some(alloc::vec![true; column_names.len()]),
-            Some(cols) => {
-                let mut mask = alloc::vec![false; column_names.len()];
-                for c in cols {
-                    let pos = column_names
-                        .iter()
-                        .position(|n| n.eq_ignore_ascii_case(c))
-                        .ok_or_else(|| {
-                            EngineError::Unsupported(alloc::format!(
-                                "column \"{c}\" does not exist"
-                            ))
-                        })?;
-                    mask[pos] = true;
-                }
-                Some(mask)
-            }
-        };
-        Ok((escape, force))
-    }
-
     /// v7.39 (round 249) — resolve the effective COPY FROM target column
     /// list, running PG's pre-file checks in PG's order: the relation
     /// must exist, an explicit column must exist on it, and no column
@@ -3551,19 +3509,35 @@ impl Engine {
             })
     }
 
-    pub fn copy_target_columns(
+    /// 9.0.3 — the relation a COPY FROM fills and the columns each row
+    /// carries, checked in PostgreSQL's order before a data row is looked
+    /// at: the relation exists, every written column exists on it, and no
+    /// column is written twice. A written schema is final
+    /// ([`spg_storage::Catalog::get_written`]): `COPY public.t` filled the
+    /// search path's `t` when another schema ahead of `public` had one.
+    ///
+    /// # Errors
+    /// `relation "t" does not exist`, `column "x" of relation "t" does
+    /// not exist` (42703), `column "x" specified more than once` (42701).
+    pub fn copy_target(
         &self,
+        tx_id: TxId,
         table: &str,
+        qualified: bool,
         columns: Option<&[alloc::string::String]>,
-    ) -> Result<alloc::vec::Vec<alloc::string::String>, EngineError> {
-        let table_ref = self.active_catalog().get(table).ok_or_else(|| {
-            EngineError::Storage(spg_storage::StorageError::TableNotFound {
-                name: alloc::string::String::from(table),
-            })
-        })?;
+    ) -> Result<crate::copy_from::CopyTarget, EngineError> {
+        let shown = spg_sql::namespace::display_key(table);
+        let table_ref = self
+            .catalog_of_tx(tx_id)
+            .get_written(table, qualified)
+            .ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                    name: shown.clone(),
+                })
+            })?;
         let schema_cols = &table_ref.schema().columns;
-        match columns {
-            None => Ok(schema_cols.iter().map(|c| c.name.clone()).collect()),
+        let names = match columns {
+            None => schema_cols.iter().map(|c| c.name.clone()).collect(),
             Some(cols) => {
                 for (i, name) in cols.iter().enumerate() {
                     if !schema_cols
@@ -3571,7 +3545,7 @@ impl Engine {
                         .any(|c| c.name.eq_ignore_ascii_case(name))
                     {
                         return Err(EngineError::Unsupported(alloc::format!(
-                            "column \"{name}\" of relation \"{table}\" does not exist"
+                            "column \"{name}\" of relation \"{shown}\" does not exist"
                         )));
                     }
                     if cols[..i].iter().any(|p| p.eq_ignore_ascii_case(name)) {
@@ -3580,17 +3554,93 @@ impl Engine {
                         )));
                     }
                 }
-                Ok(cols.to_vec())
+                cols.to_vec()
+            }
+        };
+        Ok(crate::copy_from::CopyTarget {
+            table: alloc::string::String::from(table),
+            qualified,
+            columns: columns.map(<[alloc::string::String]>::to_vec),
+            names,
+            table_columns: schema_cols.iter().map(|c| c.name.clone()).collect(),
+        })
+    }
+
+    /// 9.0.3 — what becomes of one decoded COPY FROM row: the INSERT to
+    /// run, or a skip under `ON_ERROR`.
+    ///
+    /// PostgreSQL runs each column's input function before the row is
+    /// stored, and `ON_ERROR ignore` skips exactly the rows where one
+    /// fails; a row that converts but breaks a constraint still ends the
+    /// COPY. So under `ignore` each cell is read as its column's type
+    /// first — the same conversion the INSERT's string literal goes
+    /// through — and the first cell that fails names the column and value
+    /// the notice reports.
+    ///
+    /// # Errors
+    /// A row with the wrong number of values; more rows skipped than
+    /// `REJECT_LIMIT` allows.
+    pub fn copy_row(
+        &self,
+        tx_id: TxId,
+        target: &crate::copy_from::CopyTarget,
+        errors: &mut crate::copy_from::CopyRowErrors,
+        line: u64,
+        values: &[Option<alloc::string::String>],
+    ) -> Result<crate::copy_from::CopyRowAction, EngineError> {
+        use crate::copy_from::CopyRowAction;
+        if let Err(e) = target.check_arity(values) {
+            if errors.drops_any_failure() {
+                return Ok(CopyRowAction::Skip(None));
+            }
+            return Err(e);
+        }
+        if errors.checks_input()
+            && let Some((column, value)) = self.copy_input_failure(tx_id, target, values)
+        {
+            return errors.skip(line, &column, &value).map(CopyRowAction::Skip);
+        }
+        Ok(CopyRowAction::Insert(target.insert_sql(values)))
+    }
+
+    /// The first cell its column's type cannot read, as (column, value).
+    fn copy_input_failure(
+        &self,
+        tx_id: TxId,
+        target: &crate::copy_from::CopyTarget,
+        values: &[Option<alloc::string::String>],
+    ) -> Option<(alloc::string::String, alloc::string::String)> {
+        let table = self
+            .catalog_of_tx(tx_id)
+            .get_written(&target.table, target.qualified)?;
+        let cols = &table.schema().columns;
+        for (name, cell) in target.names.iter().zip(values) {
+            let Some(text) = cell else { continue };
+            let Some((pos, col)) = cols
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if crate::conversions::coerce_value(Value::text(text.clone()), col.ty, &col.name, pos)
+                .is_err()
+            {
+                return Some((col.name.clone(), text.clone()));
             }
         }
+        None
     }
 
     /// v7.39 (round 249) — execute a parsed `COPY … FROM '<file>'` whose
     /// file contents the HOST has already read (the engine is no_std and
-    /// performs no I/O). Lowers to per-row INSERTs via
-    /// [`crate::copy::copy_buffer_inserts`]; outside an explicit
-    /// transaction the rows are wrapped in one, so a bad row aborts the
-    /// whole COPY exactly as in PG.
+    /// performs no I/O). Outside an explicit transaction the rows are
+    /// wrapped in one, so a bad row aborts the whole COPY exactly as in PG.
+    ///
+    /// `table` is the relation as SQL writes it: `t` is looked for along
+    /// the search path, `public.t` / `sa.t` name that schema's. The
+    /// notices `ON_ERROR ignore` raises are queued for
+    /// [`Self::take_notices`].
     ///
     /// # Errors
     /// The failing row's INSERT error propagates (after rollback).
@@ -3599,30 +3649,52 @@ impl Engine {
         table: &str,
         columns: Option<&[alloc::string::String]>,
         options: &spg_sql::ast::CopyOptions,
-        data: &str,
+        data: impl AsRef<[u8]>,
     ) -> Result<QueryResult, EngineError> {
-        let target = self.copy_target_columns(table, columns)?;
-        let inserts = crate::copy::copy_buffer_inserts(table, columns, &target, options, data)?;
-        let wrap = !self.in_transaction();
+        let qualified = table.trim().rsplit_once('.').is_some();
+        let key = spg_sql::namespace::key_from_text(table);
+        let target = self.copy_target(crate::IMPLICIT_TX, &key, qualified, columns)?;
+        let rows =
+            crate::copy_from::CopyFromReader::new(options, &target)?.read_all(data.as_ref())?;
+        let mut errors = crate::copy_from::CopyRowErrors::new(options);
+        let mut notices = alloc::vec::Vec::new();
+        let wrap = !errors.drops_any_failure() && !self.in_transaction();
         if wrap {
             self.execute("BEGIN")?;
         }
         let mut affected: usize = 0;
-        for insert in &inserts {
-            match self.execute(insert) {
-                Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
-                Ok(_) => affected += 1,
-                Err(e) => {
-                    if wrap {
-                        let _ = self.execute("ROLLBACK");
-                    }
-                    return Err(e);
+        let outcome = (|| {
+            for (line, values) in &rows {
+                let insert =
+                    match self.copy_row(crate::IMPLICIT_TX, &target, &mut errors, *line, values)? {
+                        crate::copy_from::CopyRowAction::Insert(sql) => sql,
+                        crate::copy_from::CopyRowAction::Skip(notice) => {
+                            notices.extend(notice);
+                            continue;
+                        }
+                    };
+                match self.execute(&insert) {
+                    Ok(QueryResult::CommandOk { affected: n, .. }) => affected += n,
+                    Ok(_) => affected += 1,
+                    Err(_) if errors.drops_any_failure() => {}
+                    Err(e) => return Err(e),
                 }
             }
+            Ok(())
+        })();
+        if let Err(e) = outcome {
+            if wrap {
+                // The row's error is the one the client needs; a failed
+                // ROLLBACK leaves nothing further to undo.
+                let _ = self.execute("ROLLBACK");
+            }
+            return Err(e);
         }
         if wrap {
             self.execute("COMMIT")?;
         }
+        notices.extend(errors.closing_notice());
+        self.queue_notices(notices);
         Ok(QueryResult::CommandOk {
             affected,
             modified_catalog: false,
@@ -3640,12 +3712,27 @@ impl Engine {
     /// CSV-mode option refusals).
     pub fn copy_to_buffer(
         &mut self,
+        tx_id: TxId,
         table: &str,
+        table_qualified: bool,
         columns: Option<&[alloc::string::String]>,
         query: Option<&Statement>,
         options: &spg_sql::ast::CopyOptions,
     ) -> Result<(alloc::string::String, usize), EngineError> {
-        let result = self.exec_copy_to(table, columns, query, options, CancelToken::none())?;
+        // 9.0.3 — read as `tx_id`'s statements do, so a table created
+        // earlier in the same transaction is there.
+        let saved = self.current_tx;
+        self.current_tx = Some(tx_id);
+        let result = self.exec_copy_to(
+            table,
+            table_qualified,
+            columns,
+            query,
+            options,
+            CancelToken::none(),
+        );
+        self.current_tx = saved;
+        let result = result?;
         let QueryResult::Rows { rows, .. } = result else {
             return Err(EngineError::Unsupported(
                 "COPY TO rendered a non-row result".into(),
@@ -3670,111 +3757,65 @@ impl Engine {
     fn exec_copy_to(
         &mut self,
         table_name: &str,
+        table_qualified: bool,
         columns: Option<&[String]>,
         query: Option<&Statement>,
         options: &spg_sql::ast::CopyOptions,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        use spg_sql::ast::CopyFormat;
         // v7.39 (read01 round 94) — `COPY (<query>) TO STDOUT`: run the inner
         // statement and render its result set with the same per-format cell
-        // encoder the table form uses. Kept as an early branch so the
-        // battle-tested table path below is untouched.
+        // encoder the table form uses.
         if let Some(q) = query {
             return self.exec_copy_to_query(q, options, cancel);
         }
-        let table = self.active_catalog().get(table_name).ok_or_else(|| {
-            EngineError::Storage(spg_storage::StorageError::TableNotFound {
-                name: alloc::string::String::from(table_name),
-            })
-        })?;
-        let schema_cols = table.schema().columns.clone();
-        let positions: alloc::vec::Vec<usize> = match columns {
-            Some(cols) => cols
-                .iter()
-                .map(|c| {
-                    schema_cols
-                        .iter()
-                        .position(|s| s.name.eq_ignore_ascii_case(c))
-                        .ok_or_else(|| {
-                            EngineError::Eval(crate::eval::EvalError::ColumnNotFound {
-                                token: spg_sql::ast::SrcToken::NONE,
-                                name: c.clone(),
-                            })
-                        })
+        let tx = self.current_tx.unwrap_or(crate::IMPLICIT_TX);
+        let target = self.copy_target(tx, table_name, table_qualified, columns)?;
+        let encoder = crate::copy::CopyToEncoder::new(options, &target.names, Some(&target))?;
+        let style = self.render_style();
+        let tz = self.session_tz();
+        let table = self
+            .active_catalog()
+            .get_written(table_name, table_qualified)
+            .ok_or_else(|| {
+                EngineError::Storage(spg_storage::StorageError::TableNotFound {
+                    name: spg_sql::namespace::display_key(table_name),
                 })
-                .collect::<Result<_, _>>()?,
-            None => (0..schema_cols.len()).collect(),
-        };
-        // Per-format defaults: text = tab / `\N`; csv = comma / `` / `"`.
-        let is_csv = options.format == CopyFormat::Csv;
-        let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
-        let quote = options.quote.unwrap_or('"');
-        let null_str = options
-            .null_str
-            .clone()
-            .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
-        // v7.39 (round 247) — the FORCE_QUOTE mask follows the emitted
-        // column order (the projection), not the table order.
-        let out_names: alloc::vec::Vec<alloc::string::String> = positions
+            })?;
+        let schema_cols = &table.schema().columns;
+        // The FORCE_QUOTE mask, like every cell, follows the emitted column
+        // order (the projection), not the table order.
+        let positions: alloc::vec::Vec<(usize, spg_storage::DataType)> = target
+            .names
             .iter()
-            .filter_map(|&p| schema_cols.get(p).map(|c| c.name.clone()))
+            .filter_map(|n| {
+                schema_cols
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(n))
+                    .map(|p| (p, schema_cols[p].ty))
+            })
             .collect();
-        let (escape, force_mask) =
-            Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
-        let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
-            if is_csv {
-                crate::copy::encode_copy_csv_cells_opts(
-                    cells,
-                    delimiter,
-                    quote,
-                    escape,
-                    force_mask.as_deref(),
-                    &null_str,
-                )
-            } else {
-                crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
-            }
-        };
         let snap = self.current_snapshot();
         let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
         // HEADER: the selected column names as the first line, encoded
         // per the same format rules (a name is never NULL).
         if options.header {
-            let names: alloc::vec::Vec<Option<alloc::string::String>> = positions
-                .iter()
-                .map(|&p| Some(schema_cols[p].name.clone()))
-                .collect();
+            let names: alloc::vec::Vec<Option<String>> =
+                target.names.iter().cloned().map(Some).collect();
             out_rows.push(spg_storage::Row::new(alloc::vec![Value::text(
-                encode_cells(&names)
+                encoder.encode(&names)
             )]));
         }
-        // COPY renders each value with its type's output function, the
-        // same as the wire — notably bool as `t` / `f`, not the engine's
-        // debug-ish `true` / `false`.
-        // v7.38 (T-tstz Phase 1) — `ty` is the column's declared type, needed
-        // only to tell timestamptz from timestamp: PG's COPY renders the former
-        // with its offset. Everything else renders identically either way.
-        let cell_text = |v: &Value, ty: spg_storage::DataType| -> Option<alloc::string::String> {
-            match v {
-                Value::Null => None,
-                Value::Bool(b) => Some(alloc::string::String::from(if *b { "t" } else { "f" })),
-                Value::Timestamp(t) if matches!(ty, spg_storage::DataType::Timestamptz) => {
-                    Some(crate::eval::format_timestamptz(*t))
-                }
-                other => Some(crate::eval::values::value_to_text(other)),
-            }
-        };
-        let encode = |row: &spg_storage::Row<'static>| {
-            let cells: alloc::vec::Vec<Option<alloc::string::String>> = positions
+        let encode = |row: &spg_storage::Row<'_>| {
+            let cells: alloc::vec::Vec<Option<String>> = positions
                 .iter()
-                .map(|&p| {
+                .map(|&(p, ty)| {
                     row.values
                         .get(p)
-                        .and_then(|v| cell_text(v, schema_cols[p].ty))
+                        .and_then(|v| crate::copy::copy_cell_text(v, Some(ty), &style, &tz))
                 })
                 .collect();
-            encode_cells(&cells)
+            encoder.encode(&cells)
         };
         for (_, row) in table.scan_visible(&snap) {
             cancel.check()?;
@@ -3788,7 +3829,7 @@ impl Engine {
         }
         Ok(QueryResult::Rows {
             columns: alloc::vec![spg_storage::ColumnSchema::new(
-                alloc::string::String::from("copy"),
+                String::from("copy"),
                 spg_storage::DataType::Text,
                 false,
             )],
@@ -3807,7 +3848,6 @@ impl Engine {
         options: &spg_sql::ast::CopyOptions,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
-        use spg_sql::ast::CopyFormat;
         let (result_cols, result_rows) = match self.dispatch_stmt_inner(query.clone(), cancel)? {
             QueryResult::Rows { columns, rows } => (columns, rows),
             _ => {
@@ -3816,40 +3856,14 @@ impl Engine {
                 ));
             }
         };
-        let is_csv = options.format == CopyFormat::Csv;
-        let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
-        let quote = options.quote.unwrap_or('"');
-        let null_str = options
-            .null_str
-            .clone()
-            .unwrap_or_else(|| alloc::string::String::from(if is_csv { "" } else { "\\N" }));
+        let style = self.render_style();
+        let tz = self.session_tz();
         let out_names: alloc::vec::Vec<alloc::string::String> =
             result_cols.iter().map(|c| c.name.clone()).collect();
-        let (escape, force_mask) =
-            Self::resolve_copy_csv_extras(options, is_csv, quote, &out_names)?;
-        let encode_cells = |cells: &[Option<alloc::string::String>]| -> alloc::string::String {
-            if is_csv {
-                crate::copy::encode_copy_csv_cells_opts(
-                    cells,
-                    delimiter,
-                    quote,
-                    escape,
-                    force_mask.as_deref(),
-                    &null_str,
-                )
-            } else {
-                crate::copy::encode_copy_text_cells_opts(cells, delimiter, &null_str)
-            }
-        };
-        let cell_text = |v: &Value, ty: spg_storage::DataType| -> Option<alloc::string::String> {
-            match v {
-                Value::Null => None,
-                Value::Bool(b) => Some(alloc::string::String::from(if *b { "t" } else { "f" })),
-                Value::Timestamp(t) if matches!(ty, spg_storage::DataType::Timestamptz) => {
-                    Some(crate::eval::format_timestamptz(*t))
-                }
-                other => Some(crate::eval::values::value_to_text(other)),
-            }
+        let encoder = crate::copy::CopyToEncoder::new(options, &out_names, None)?;
+        let encode_cells = |cells: &[Option<alloc::string::String>]| encoder.encode(cells);
+        let cell_text = |v: &Value, ty: spg_storage::DataType| {
+            crate::copy::copy_cell_text(v, Some(ty), &style, &tz)
         };
         let mut out_rows: alloc::vec::Vec<spg_storage::Row<'static>> = alloc::vec::Vec::new();
         if options.header {

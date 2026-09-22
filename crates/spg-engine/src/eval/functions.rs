@@ -16212,15 +16212,9 @@ fn apply_function_dispatch(
             }
             Ok(Value::Null)
         }
-        // v7.37.17 (17.6 siblings) — pg_get_serial_sequence returns
-        // the OID name of the underlying sequence for an implicit
-        // SERIAL / BIGSERIAL column. ORMs (SQLAlchemy, Django,
-        // ActiveRecord) call it to detect auto-increment columns.
-        // Real impl: parse `(schema.)?table` + column string, and
-        // synthesize the PG-conventional sequence name form
-        // `public.table_column_seq`. SPG uses AUTO_INCREMENT rather
-        // than named sequences, so this returns a synthetic name
-        // that at least never NULLs out.
+        // v7.37.17 (17.6 siblings) — pg_get_serial_sequence: ORMs
+        // (SQLAlchemy, Django, ActiveRecord) call it to detect
+        // auto-increment columns.
         "pg_get_serial_sequence" => {
             if args.len() != 2 {
                 return Err(EvalError::WrongArity { name: alloc::string::String::from("pg_get_serial_sequence"), types: arg_type_list(args) });
@@ -16249,37 +16243,16 @@ fn apply_function_dispatch(
                     });
                 }
             };
-            // Strip any leading "schema." from table part.
-            let table_short = table
-                .rsplit_once('.')
-                .map(|(_schema, t)| t)
-                .unwrap_or(&table);
-            // v7.39 (read01 ruleutils.c) — PG errors on a missing relation
-            // or column, returns NULL for a non-sequence-backed column, and
-            // synthesizes the conventional name only for serial/identity.
-            if let Some(cat) = ctx.catalog {
-                let Some(t) = cat.get(table_short) else {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "relation \"{table_short}\" does not exist"
-                        ),
-                    });
-                };
-                let Some(c) = t.schema().columns.iter().find(|c| c.name == col)
-                else {
-                    return Err(EvalError::TypeMismatch {
-                        detail: alloc::format!(
-                            "column \"{col}\" of relation \"{table_short}\" does not exist"
-                        ),
-                    });
-                };
-                if !c.auto_increment {
-                    return Ok(Value::Null);
-                }
+            // 9.0.3 — one implementation, which keeps the schema and
+            // answers the sequence the column really owns.
+            let Some(cat) = ctx.catalog else {
+                return Ok(Value::Null);
+            };
+            match crate::sequence::serial_sequence_of(cat, &table, &col) {
+                Ok(Some(name)) => Ok(Value::text(name)),
+                Ok(None) => Ok(Value::Null),
+                Err(detail) => Err(EvalError::TypeMismatch { detail }),
             }
-            Ok(Value::text(alloc::format!(
-                "public.{table_short}_{col}_seq"
-            )))
         }
         // v7.37.17 (17.6 siblings) — additional pg_catalog probe
         // helpers that ORMs / migration tools emit. All return

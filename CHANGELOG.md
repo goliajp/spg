@@ -8,6 +8,88 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [9.0.3] — 2026-09-22
+
+COPY, re-measured against PostgreSQL 18.6 while checking the 9.0.2
+notes on the published 9.0.2 image. Every row below was measured on the
+published images 7.40.11, 8.0.4, 9.0.0, 9.0.1 and 9.0.2 and is present
+in all five, unless it says otherwise.
+
+### Fixed — a COPY inside a transaction could not see the transaction's tables
+
+`BEGIN; CREATE TABLE x …; COPY x FROM STDIN` answered `relation "x" does
+not exist`. So a dump restored with `psql -1` / `--single-transaction`
+loaded no data at all. COPY now looks the table up in the caller's
+transaction, as every other statement does.
+
+### Fixed — a value is read by its column's type
+
+COPY wrote cells that looked numeric into its INSERT as bare numbers, so
+the INSERT converted a number rather than reading the text: an `integer`
+column stored `1.5` as 2 where PostgreSQL refuses it, and a `text`
+column refused `+5`, which PostgreSQL stores as written. Every value is
+now read by the column's type, as PostgreSQL's input functions do.
+
+### Fixed — an empty line is a row
+
+An empty line in the data was skipped. PostgreSQL reads it as a row: an
+empty string in the text format, NULL in CSV. A one-column table's empty
+strings were lost on every restore.
+
+### Fixed — the COPY statement is read by the statement grammar
+
+The head of a COPY was read by hand from lowercased text, and its
+options by searching for the word `with`:
+
+* `COPY t TO STDOUT (FORMAT csv, HEADER)` — `WITH` is optional — was
+  streamed as plain text. So was the legacy `COPY t TO STDOUT CSV
+  HEADER`, and `DELIMITER AS '|'`, `FORCE QUOTE col`.
+* `COPY "MixedCase" …` answered `relation "mixedcase" does not exist`.
+* With `search_path = sa, public`, `COPY public.t TO STDOUT` read
+  `sa.t`, and `COPY public.t FROM STDIN` wrote into `sa.t` (9.0.0 on).
+* The embedded dump import dropped the schema from `COPY sa.t (…) FROM
+  stdin`, loading `sa`'s rows into `public.t`, ignored the COPY's
+  options, and cut `COPY t FROM stdin (DELIMITER ';');` at the `;`
+  inside its own option.
+* A COPY FROM a file in the text format ignored `DELIMITER` and `NULL`.
+
+The wire, the embedded host and the engine read a COPY with one grammar
+now, the one every other statement is parsed with.
+
+### Fixed — options PostgreSQL has and SPG ignored or refused
+
+* `ON_ERROR ignore` was accepted and then behaved as `stop`. It skips a
+  row whose value a column's type cannot read, and says so as
+  PostgreSQL does (`1 row was skipped due to data type incompatibility`,
+  one notice per row under `LOG_VERBOSITY verbose`, none under
+  `silent`); `REJECT_LIMIT` bounds it. A row that converts but breaks a
+  constraint still ends the COPY.
+* `HEADER match` checks the header line's names.
+* `ESCAPE`, `FORCE_QUOTE`, `FORCE_NOT_NULL` and `FORCE_NULL` work on
+  COPY FROM STDIN / TO STDOUT, not only on files; CSV reads honour
+  `ESCAPE`.
+* An option given twice, or used in the wrong direction, is refused in
+  PostgreSQL's words and with its SQLSTATE.
+
+### Fixed — COPY TO a file ignored the session's time zone
+
+A file written under `SET TimeZone = 'Asia/Tokyo'` held `timestamptz`
+values in UTC (`10:30:00+00` for PostgreSQL's `19:30:00+09`). Every
+COPY TO renders cells the way COPY TO STDOUT already did.
+
+### Fixed — `pg_get_serial_sequence` and a serial sequence's name
+
+* `pg_get_serial_sequence('sa.x', 'id')` answered `relation "x" does not
+  exist` (9.0.0 on). It also made up `public.<table>_<column>_seq`
+  instead of naming the sequence the column owns: a sequence attached
+  with `OWNED BY` was not found. It names the owned sequence, with its
+  schema, now.
+* A serial column's sequence printed as a regclass carried its schema
+  where the bare name reaches it (`public.st_id_seq` for PostgreSQL's
+  `st_id_seq`).
+
+---
+
 ## [9.0.2] — 2026-09-22
 
 Everything below was reported by sentori against the published 9.0.1

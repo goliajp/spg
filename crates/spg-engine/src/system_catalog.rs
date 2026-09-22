@@ -5212,6 +5212,26 @@ fn index_key_on_path(cat: &Catalog, listed: &str) -> Option<String> {
         .map(|ci| ci.name.clone())
 }
 
+/// 9.0.3 — the sequence a bare name reaches, serial columns' own
+/// included: the first schema on the search path that holds one of that
+/// name. An empty path means `public` alone.
+fn sequence_key_on_path(cat: &Catalog, listed: &str) -> Option<String> {
+    let keys: alloc::vec::Vec<String> = crate::sequence::catalog_sequences(cat)
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| cat.listed_name(key) == Some(listed))
+        .collect();
+    let in_schema = |schema: &str| {
+        keys.iter()
+            .find(|key| spg_sql::namespace::schema_of(key) == schema)
+            .cloned()
+    };
+    if cat.search_path().is_empty() {
+        return in_schema(spg_sql::namespace::PUBLIC);
+    }
+    cat.search_path().iter().find_map(|s| in_schema(s))
+}
+
 /// 9.0.1 (C9) — how PostgreSQL WRITES the relation an oid names: bare
 /// when a client writing that bare name would reach this very relation,
 /// qualified otherwise. Measured on 18.6 — `'q1.only_here'::regclass`
@@ -5228,7 +5248,10 @@ pub(crate) fn relation_display_for_oid(cat: &Catalog, oid: i64) -> Option<String
         // An INDEX is in no registry the catalog path-resolves, so its
         // own walk answers: the first schema on the path that holds an
         // index of this name.
-        .or_else(|| index_key_on_path(cat, &listed));
+        .or_else(|| index_key_on_path(cat, &listed))
+        // 9.0.3 — nor is a serial column's own sequence: printed
+        // `public.st_id_seq` where PostgreSQL prints `st_id_seq`.
+        .or_else(|| sequence_key_on_path(cat, &listed));
     if reached.as_deref() == Some(key.as_str()) {
         return Some(listed);
     }

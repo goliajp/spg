@@ -564,6 +564,31 @@ pub fn parse_statement(input: &str) -> Result<Statement, ParseError> {
     parse_statement_with(input, lexer::Dialect::PG)
 }
 
+/// 9.0.3 — the option trailer of a COPY statement, alone: whatever
+/// follows the endpoint (`STDIN` / `STDOUT` / the file name). Hosts that
+/// take a COPY apart themselves read the options with the same grammar
+/// the statement parser uses.
+///
+/// # Errors
+/// PG's wording for a malformed or conflicting option list.
+pub fn parse_copy_options(tail: &str) -> Result<crate::ast::CopyOptions, ParseError> {
+    let (tokens, offsets, merges) = lexer::tokenize_with_merges(tail, lexer::Dialect::PG)
+        .map_err(|e| shape_lex_error(&e, tail))?;
+    let mut p = Parser::new_with_dialect(tokens, false)
+        .with_source(tail, &offsets)
+        .with_merges(merges);
+    let opts = (|| {
+        let opts = p.parse_copy_to_options()?;
+        if matches!(p.peek(), Token::Semicolon) {
+            p.advance();
+        }
+        p.expect_eof()?;
+        Ok(opts)
+    })()
+    .map_err(|e: ParseError| shape_syntax_error(e, tail, &offsets))?;
+    Ok(opts)
+}
+
 /// v7.22 (round-13 T3) — dialect-aware entry: `backslash_escapes`
 /// selects MySQL-style string lexing (see `lexer::tokenize_with`).
 /// The engine threads its session flag through here.
@@ -948,6 +973,12 @@ const MAX_BINARY_CHAIN: usize = 256;
 /// v7.22 (round-13 gap 5) — the kind keyword after `CONSTRAINT
 /// <name>` in a CREATE TABLE column list. FOREIGN KEY is not here:
 /// it keeps its dedicated path (`parse_table_level_fk`).
+/// A COPY option value that is a Boolean or, for `HEADER`, a word.
+enum CopyBoolOrWord {
+    Bool(bool),
+    Word(String),
+}
+
 enum NamedTableConstraintKind {
     Check,
     Unique,
@@ -2356,19 +2387,8 @@ impl Parser {
             // statement (`VALUES (1), (2) [ORDER BY …] [LIMIT …]`).
             // Lowers to the same UNION ALL chain the FROM-position
             // form uses, then reuses the shared SELECT tail.
-            Token::Values => {
-                self.advance(); // VALUES
-                let mut head = self.parse_values_rows_body()?;
-                // v7.40.11 — and it may HEAD a set-operation chain:
-                // `VALUES (1) UNION ALL SELECT 2`. The CTE-body form has
-                // done this since the recursive-seed work; the top-level
-                // statement went straight to the tail and reported
-                // `syntax error at or near "UNION"`.
-                self.parse_setop_chain_into(&mut head)?;
-                self.parse_select_tail_into(&mut head)?;
-                Ok(Statement::Select(head))
-            }
-            // SQL-standard `TABLE name` shorthand for
+            Token::Values => self.parse_values_statement(),
+                        // SQL-standard `TABLE name` shorthand for
             // `SELECT * FROM name` — pg_dump never emits it, but
             // psql users and PG docs use it constantly. Set-op
             // chains and the ORDER BY/LIMIT tail compose like any
@@ -2740,7 +2760,7 @@ impl Parser {
                     ) =>
             {
                 self.advance(); // COPY
-                let table = self.expect_relation_name()?;
+                let (table, table_qualified) = self.expect_relation_ref()?;
                 let columns = if matches!(self.peek(), Token::LParen) {
                     self.advance();
                     let mut cols = alloc::vec![self.expect_ident_like()?];
@@ -2772,15 +2792,29 @@ impl Parser {
                     let options = self.parse_copy_to_options()?;
                     return Ok(Statement::CopyFromFile {
                         table,
+                        table_qualified,
                         columns,
                         path,
                         options,
                     });
                 }
+                if matches!(self.peek(), Token::From)
+                    && matches!(self.tokens.get(self.pos + 1),
+                        Some(Token::Ident(s)) if s.eq_ignore_ascii_case("stdin"))
+                {
+                    self.advance(); // FROM
+                    self.advance(); // STDIN
+                    let options = self.parse_copy_to_options()?;
+                    return Ok(Statement::CopyFromStdin {
+                        table,
+                        table_qualified,
+                        columns,
+                        options,
+                    });
+                }
                 if !matches!(self.peek(), Token::To) {
                     return Err(self.err(format!(
-                        "COPY: only TO STDOUT is supported here (FROM stdin \
-                         rides the import path); got {:?}",
+                        "COPY: expected FROM or TO, got {:?}",
                         self.peek()
                     )));
                 }
@@ -2790,6 +2824,7 @@ impl Parser {
                     let options = self.parse_copy_to_options()?;
                     return Ok(Statement::CopyToFile {
                         table,
+                        table_qualified,
                         columns,
                         query: None,
                         path,
@@ -2806,6 +2841,7 @@ impl Parser {
                 let options = self.parse_copy_to_options()?;
                 Ok(Statement::CopyTo {
                     table,
+                    table_qualified,
                     columns,
                     query: None,
                     options,
@@ -2820,7 +2856,7 @@ impl Parser {
             {
                 self.advance(); // COPY
                 self.advance(); // (
-                let query = self.parse_select_stmt()?;
+                let query = self.parse_copy_query_body()?;
                 if !matches!(self.peek(), Token::RParen) {
                     return Err(self.err(format!(
                         "expected ')' after COPY query, got {:?}",
@@ -2840,6 +2876,7 @@ impl Parser {
                     let options = self.parse_copy_to_options()?;
                     return Ok(Statement::CopyToFile {
                         table: String::new(),
+                        table_qualified: false,
                         columns: None,
                         query: Some(alloc::boxed::Box::new(query)),
                         path,
@@ -2856,6 +2893,7 @@ impl Parser {
                 let options = self.parse_copy_to_options()?;
                 Ok(Statement::CopyTo {
                     table: String::new(),
+                    table_qualified: false,
                     columns: None,
                     query: Some(alloc::boxed::Box::new(query)),
                     options,
@@ -12890,22 +12928,21 @@ impl Parser {
         }
     }
 
-    /// Parse the optional trailer of `COPY … TO STDOUT`: nothing (text
-    /// format, no header), the modern `[WITH] ( opt [, opt]* )` list, or
-    /// the legacy space-separated `[WITH] CSV|TEXT [HEADER] [DELIMITER
-    /// 'c'] [NULL 'str'] [QUOTE 'c']` spelling.
+    /// Parse the option trailer of a COPY statement: nothing, the
+    /// parenthesised `[WITH] ( name [value] [, …] )` list, or the legacy
+    /// space-separated `[WITH] CSV HEADER DELIMITER [AS] 'c' …` spelling
+    /// (`WITH` is optional in both, and a bare `WITH` is no options). An
+    /// option given twice is PG's `conflicting or redundant options`.
     fn parse_copy_to_options(&mut self) -> Result<crate::ast::CopyOptions, ParseError> {
         let mut opts = crate::ast::CopyOptions::default();
-        if matches!(self.peek(), Token::Eof | Token::Semicolon) {
-            return Ok(opts);
-        }
+        let mut seen: Vec<&'static str> = Vec::new();
         if matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("with")) {
             self.advance();
         }
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             loop {
-                self.parse_one_copy_option(&mut opts)?;
+                self.parse_copy_option_item(&mut opts, &mut seen)?;
                 match self.peek() {
                     Token::Comma => {
                         self.advance();
@@ -12923,7 +12960,7 @@ impl Parser {
             }
         } else {
             while !matches!(self.peek(), Token::Eof | Token::Semicolon) {
-                self.parse_one_copy_option(&mut opts)?;
+                self.parse_legacy_copy_option(&mut opts, &mut seen)?;
             }
         }
         if !matches!(self.peek(), Token::Eof | Token::Semicolon) {
@@ -12932,19 +12969,39 @@ impl Parser {
                 self.peek()
             )));
         }
+        // PG checks these once the whole list is read, whatever the order
+        // the options came in.
+        if opts.reject_limit.is_some() && opts.on_error != Some(crate::ast::CopyOnError::Ignore) {
+            return Err(self.err(String::from(
+                "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE",
+            )));
+        }
         Ok(opts)
     }
 
-    fn parse_one_copy_option(
+    /// Record `name` as given; a second time is PG's refusal.
+    fn claim_copy_option(
+        &self,
+        seen: &mut Vec<&'static str>,
+        name: &'static str,
+    ) -> Result<(), ParseError> {
+        if seen.contains(&name) {
+            return Err(self.err(String::from("conflicting or redundant options")));
+        }
+        seen.push(name);
+        Ok(())
+    }
+
+    /// One `name [value]` of the parenthesised list.
+    fn parse_copy_option_item(
         &mut self,
         opts: &mut crate::ast::CopyOptions,
+        seen: &mut Vec<&'static str>,
     ) -> Result<(), ParseError> {
-        use crate::ast::CopyFormat;
-        // The option keyword. NULL lexes as its own token; the rest are
-        // bare identifiers.
+        use crate::ast::{CopyLogVerbosity, CopyOnError};
         let kw = match self.advance() {
-            Token::Null => alloc::string::String::from("NULL"),
-            Token::Ident(s) => s.to_uppercase(),
+            Token::Null => String::from("null"),
+            Token::Ident(s) => s.to_ascii_lowercase(),
             other => {
                 return Err(self.err(alloc::format!(
                     "expected a COPY option keyword, got {other:?}"
@@ -12952,154 +13009,344 @@ impl Parser {
             }
         };
         match kw.as_str() {
-            "FORMAT" => {
-                let fmt = self.expect_ident_like()?;
-                match fmt.to_ascii_uppercase().as_str() {
-                    "CSV" => opts.format = CopyFormat::Csv,
-                    "TEXT" => opts.format = CopyFormat::Text,
+            "format" => {
+                self.claim_copy_option(seen, "format")?;
+                let fmt = self.copy_option_word()?;
+                self.set_copy_format(opts, &fmt)?;
+            }
+            "header" => {
+                self.claim_copy_option(seen, "header")?;
+                match self.copy_option_bool_or_word()? {
+                    CopyBoolOrWord::Bool(b) => opts.header = b,
+                    CopyBoolOrWord::Word(w) if w == "match" => {
+                        opts.header = true;
+                        opts.header_match = true;
+                    }
+                    CopyBoolOrWord::Word(_) => {
+                        return Err(
+                            self.err(String::from("header requires a Boolean value or \"match\""))
+                        );
+                    }
+                }
+            }
+            "freeze" => {
+                self.claim_copy_option(seen, "freeze")?;
+                // r1066 (7.38 S5.1) — pgbench 14+ loads with `COPY … WITH
+                // (FREEZE ON)`. The hint's PG effect is vacuum bookkeeping
+                // on a freshly created/truncated table; SPG's per-statement
+                // visibility makes it a faithful no-op.
+                self.copy_option_bool_or_word()?;
+            }
+            "delimiter" => {
+                self.claim_copy_option(seen, "delimiter")?;
+                opts.delimiter = Some(self.copy_option_char("delimiter")?);
+            }
+            "quote" => {
+                self.claim_copy_option(seen, "quote")?;
+                opts.quote = Some(self.copy_option_char("quote")?);
+            }
+            "escape" => {
+                self.claim_copy_option(seen, "escape")?;
+                opts.escape = Some(self.copy_option_char("escape")?);
+            }
+            "null" => {
+                self.claim_copy_option(seen, "null")?;
+                opts.null_str = Some(self.copy_option_string("NULL")?);
+            }
+            "force_quote" => {
+                self.claim_copy_option(seen, "force_quote")?;
+                opts.force_quote = Some(self.parse_copy_column_list("FORCE_QUOTE")?);
+            }
+            "force_not_null" => {
+                self.claim_copy_option(seen, "force_not_null")?;
+                opts.force_not_null = Some(self.parse_copy_column_list("FORCE_NOT_NULL")?);
+            }
+            "force_null" => {
+                self.claim_copy_option(seen, "force_null")?;
+                opts.force_null = Some(self.parse_copy_column_list("FORCE_NULL")?);
+            }
+            "on_error" => {
+                self.claim_copy_option(seen, "on_error")?;
+                let v = self.copy_option_word()?;
+                opts.on_error = Some(match v.as_str() {
+                    "stop" => CopyOnError::Stop,
+                    "ignore" => CopyOnError::Ignore,
+                    "set_null" => CopyOnError::SetNull,
                     other => {
-                        return Err(self.err(alloc::format!(
-                            "COPY format \"{}\" not recognized",
-                            other.to_ascii_lowercase()
-                        )));
-                    }
-                }
-            }
-            // Legacy bare format keywords.
-            "CSV" => opts.format = CopyFormat::Csv,
-            "TEXT" => opts.format = CopyFormat::Text,
-            "HEADER" => {
-                opts.header = match self.peek() {
-                    Token::True => {
-                        self.advance();
-                        true
-                    }
-                    Token::False => {
-                        self.advance();
-                        false
-                    }
-                    Token::Ident(s) if s.eq_ignore_ascii_case("on") => {
-                        self.advance();
-                        true
-                    }
-                    Token::Ident(s) if s.eq_ignore_ascii_case("off") => {
-                        self.advance();
-                        false
-                    }
-                    // Bare HEADER (no boolean) means HEADER true.
-                    _ => true,
-                };
-            }
-            // r1066 (7.38 S5.1) — pgbench 14+ loads with
-            // `COPY … WITH (FREEZE ON)`. The hint's PG effect is
-            // vacuum bookkeeping on a freshly created/truncated
-            // table; SPG's per-statement visibility makes it a
-            // faithful no-op, and rejecting it aborted `pgbench -i`
-            // against the drop-in. Accept ON/OFF/bare, change nothing.
-            "FREEZE" => match self.peek() {
-                Token::True | Token::False => {
-                    self.advance();
-                }
-                Token::Ident(s)
-                    if s.eq_ignore_ascii_case("on") || s.eq_ignore_ascii_case("off") =>
-                {
-                    self.advance();
-                }
-                _ => {}
-            },
-            "DELIMITER" | "QUOTE" | "ESCAPE" => {
-                let s = match self.advance() {
-                    Token::String(s) => s,
-                    other => {
-                        return Err(self.err(alloc::format!(
-                            "COPY {kw} expects a single-character string, got {other:?}"
-                        )));
-                    }
-                };
-                // v7.39 (round 247) — PG's wording (0A000), keyword in
-                // lowercase: "COPY delimiter must be a single one-byte
-                // character".
-                let one_byte_err = || {
-                    self.err(alloc::format!(
-                        "COPY {} must be a single one-byte character",
-                        kw.to_ascii_lowercase()
-                    ))
-                };
-                let mut chars = s.chars();
-                let c = chars.next().ok_or_else(one_byte_err)?;
-                if chars.next().is_some() || c.len_utf8() != 1 {
-                    return Err(one_byte_err());
-                }
-                match kw.as_str() {
-                    "DELIMITER" => opts.delimiter = Some(c),
-                    "QUOTE" => opts.quote = Some(c),
-                    _ => opts.escape = Some(c),
-                }
-            }
-            // v7.39 (round 247) — `FORCE_QUOTE (col, …)` / `FORCE_QUOTE *`.
-            "FORCE_QUOTE" => {
-                if matches!(self.peek(), Token::Star) {
-                    self.advance();
-                    opts.force_quote = Some(Vec::new());
-                } else {
-                    if !matches!(self.peek(), Token::LParen) {
-                        return Err(self.err(alloc::format!(
-                            "expected '(' or '*' after FORCE_QUOTE, got {:?}",
-                            self.peek()
-                        )));
-                    }
-                    self.advance();
-                    let mut cols = Vec::new();
-                    loop {
-                        cols.push(self.expect_ident_like()?);
-                        match self.peek() {
-                            Token::Comma => {
-                                self.advance();
-                            }
-                            Token::RParen => {
-                                self.advance();
-                                break;
-                            }
-                            other => {
-                                return Err(self.err(alloc::format!(
-                                    "expected ',' or ')' in FORCE_QUOTE list, got {other:?}"
-                                )));
-                            }
-                        }
-                    }
-                    opts.force_quote = Some(cols);
-                }
-            }
-            "NULL" => {
-                opts.null_str = Some(match self.advance() {
-                    Token::String(s) => s,
-                    other => {
-                        return Err(self.err(alloc::format!(
-                            "COPY NULL expects a quoted string, got {other:?}"
-                        )));
+                        return Err(
+                            self.err(alloc::format!("COPY ON_ERROR \"{other}\" not recognized"))
+                        );
                     }
                 });
             }
-            // v7.39 (round 265) — the two CSV FROM-side column lists. Same
-            // grammar as FORCE_QUOTE; PG accepts `*` for FORCE_NOT_NULL /
-            // FORCE_NULL too.
-            "FORCE_NOT_NULL" | "FORCE_NULL" => {
-                let cols = self.parse_copy_column_list(&kw)?;
-                if kw == "FORCE_NOT_NULL" {
-                    opts.force_not_null = Some(cols);
-                } else {
-                    opts.force_null = Some(cols);
+            "reject_limit" => {
+                self.claim_copy_option(seen, "reject_limit")?;
+                let n = self.copy_option_integer("REJECT_LIMIT")?;
+                if n <= 0 {
+                    return Err(self.err(alloc::format!(
+                        "REJECT_LIMIT ({n}) must be greater than zero"
+                    )));
                 }
+                opts.reject_limit = Some(n.unsigned_abs());
+            }
+            "log_verbosity" => {
+                self.claim_copy_option(seen, "log_verbosity")?;
+                let v = self.copy_option_word()?;
+                opts.log_verbosity = match v.as_str() {
+                    "default" => CopyLogVerbosity::Default,
+                    "verbose" => CopyLogVerbosity::Verbose,
+                    "silent" => CopyLogVerbosity::Silent,
+                    other => {
+                        return Err(self.err(alloc::format!(
+                            "COPY LOG_VERBOSITY \"{other}\" not recognized"
+                        )));
+                    }
+                };
+            }
+            // SPG extension: drop the first n data rows.
+            "skip" => {
+                self.claim_copy_option(seen, "skip")?;
+                let n = self.copy_option_integer("SKIP")?;
+                opts.skip = u64::try_from(n)
+                    .map_err(|_| self.err(alloc::format!("SKIP ({n}) must not be negative")))?;
             }
             other => {
                 // PG's wording, lowercased option name.
-                return Err(self.err(alloc::format!(
-                    "option \"{}\" not recognized",
-                    other.to_ascii_lowercase()
-                )));
+                return Err(self.err(alloc::format!("option \"{other}\" not recognized")));
             }
         }
         Ok(())
+    }
+
+    /// One item of the legacy space-separated spelling. `AS` may sit
+    /// between an option and its string here (and only here), and the
+    /// FORCE lists are bare column names.
+    fn parse_legacy_copy_option(
+        &mut self,
+        opts: &mut crate::ast::CopyOptions,
+        seen: &mut Vec<&'static str>,
+    ) -> Result<(), ParseError> {
+        let kw = match self.advance() {
+            Token::Null => String::from("null"),
+            Token::Ident(s) => s.to_ascii_lowercase(),
+            other => {
+                return Err(self.err(alloc::format!(
+                    "expected a COPY option keyword, got {other:?}"
+                )));
+            }
+        };
+        match kw.as_str() {
+            "csv" => {
+                self.claim_copy_option(seen, "format")?;
+                opts.format = crate::ast::CopyFormat::Csv;
+            }
+            "binary" => {
+                self.claim_copy_option(seen, "format")?;
+                self.set_copy_format(opts, "binary")?;
+            }
+            "header" => {
+                self.claim_copy_option(seen, "header")?;
+                opts.header = true;
+            }
+            "freeze" => {
+                self.claim_copy_option(seen, "freeze")?;
+            }
+            "delimiter" | "quote" | "escape" | "null" => {
+                if matches!(self.peek(), Token::As) {
+                    self.advance();
+                }
+                let name: &'static str = match kw.as_str() {
+                    "delimiter" => "delimiter",
+                    "quote" => "quote",
+                    "escape" => "escape",
+                    _ => "null",
+                };
+                self.claim_copy_option(seen, name)?;
+                match name {
+                    "delimiter" => opts.delimiter = Some(self.copy_option_char(name)?),
+                    "quote" => opts.quote = Some(self.copy_option_char(name)?),
+                    "escape" => opts.escape = Some(self.copy_option_char(name)?),
+                    _ => opts.null_str = Some(self.copy_option_string("NULL")?),
+                }
+            }
+            "force" => {
+                let name: &'static str = match self.advance() {
+                    Token::Ident(s) if s.eq_ignore_ascii_case("quote") => "force_quote",
+                    Token::Not if matches!(self.peek(), Token::Null) => {
+                        self.advance();
+                        "force_not_null"
+                    }
+                    Token::Null => "force_null",
+                    other => {
+                        return Err(
+                            self.err(alloc::format!("unexpected token after FORCE: {other:?}"))
+                        );
+                    }
+                };
+                self.claim_copy_option(seen, name)?;
+                let cols = self.parse_legacy_copy_column_list()?;
+                match name {
+                    "force_quote" => opts.force_quote = Some(cols),
+                    "force_not_null" => opts.force_not_null = Some(cols),
+                    _ => opts.force_null = Some(cols),
+                }
+            }
+            other => {
+                return Err(self.err(alloc::format!("option \"{other}\" not recognized")));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_copy_format(
+        &self,
+        opts: &mut crate::ast::CopyOptions,
+        fmt: &str,
+    ) -> Result<(), ParseError> {
+        use crate::ast::CopyFormat;
+        opts.format = match fmt {
+            "csv" => CopyFormat::Csv,
+            "text" => CopyFormat::Text,
+            "json" => CopyFormat::Json,
+            "binary" => {
+                return Err(self.err(String::from("COPY format \"binary\" is not supported")));
+            }
+            other => {
+                return Err(self.err(alloc::format!("COPY format \"{other}\" not recognized")));
+            }
+        };
+        Ok(())
+    }
+
+    /// An option's word value — a bare word or a quoted string, lowercased.
+    fn copy_option_word(&mut self) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::Ident(s) | Token::String(s) => Ok(s.to_ascii_lowercase()),
+            Token::Null => Ok(String::from("null")),
+            other => Err(self.err(alloc::format!(
+                "expected a COPY option value, got {other:?}"
+            ))),
+        }
+    }
+
+    /// A Boolean option's value; absent means true.
+    fn copy_option_bool_or_word(&mut self) -> Result<CopyBoolOrWord, ParseError> {
+        let v = match self.peek() {
+            Token::Comma | Token::RParen => return Ok(CopyBoolOrWord::Bool(true)),
+            Token::True => {
+                self.advance();
+                return Ok(CopyBoolOrWord::Bool(true));
+            }
+            Token::False => {
+                self.advance();
+                return Ok(CopyBoolOrWord::Bool(false));
+            }
+            Token::Integer(n) => {
+                let n = *n;
+                self.advance();
+                return match n {
+                    0 => Ok(CopyBoolOrWord::Bool(false)),
+                    1 => Ok(CopyBoolOrWord::Bool(true)),
+                    _ => Err(self.err(String::from("requires a Boolean value"))),
+                };
+            }
+            _ => self.copy_option_word()?,
+        };
+        Ok(match v.as_str() {
+            "on" | "true" => CopyBoolOrWord::Bool(true),
+            "off" | "false" => CopyBoolOrWord::Bool(false),
+            _ => CopyBoolOrWord::Word(v),
+        })
+    }
+
+    fn copy_option_integer(&mut self, kw: &str) -> Result<i64, ParseError> {
+        match self.advance() {
+            Token::Integer(n) => Ok(n),
+            Token::Minus => match self.advance() {
+                Token::Integer(n) => Ok(-n),
+                other => Err(self.err(alloc::format!("{kw} requires an integer, got {other:?}"))),
+            },
+            other => Err(self.err(alloc::format!("{kw} requires an integer, got {other:?}"))),
+        }
+    }
+
+    fn copy_option_string(&mut self, kw: &str) -> Result<String, ParseError> {
+        match self.advance() {
+            Token::String(s) => Ok(s),
+            other => Err(self.err(alloc::format!(
+                "COPY {kw} expects a quoted string, got {other:?}"
+            ))),
+        }
+    }
+
+    /// DELIMITER / QUOTE / ESCAPE: exactly one one-byte character. PG's
+    /// wording (0A000), keyword in lowercase.
+    fn copy_option_char(&mut self, kw: &str) -> Result<char, ParseError> {
+        let s = self.copy_option_string(&kw.to_ascii_uppercase())?;
+        let one_byte_err = || {
+            self.err(alloc::format!(
+                "COPY {kw} must be a single one-byte character"
+            ))
+        };
+        let mut chars = s.chars();
+        let c = chars.next().ok_or_else(one_byte_err)?;
+        if chars.next().is_some() || c.len_utf8() != 1 {
+            return Err(one_byte_err());
+        }
+        Ok(c)
+    }
+
+    /// The legacy FORCE lists: `*` or bare comma-separated column names.
+    fn parse_legacy_copy_column_list(&mut self) -> Result<Vec<String>, ParseError> {
+        if matches!(self.peek(), Token::Star) {
+            self.advance();
+            return Ok(Vec::new());
+        }
+        let mut cols = alloc::vec![self.expect_ident_like()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            cols.push(self.expect_ident_like()?);
+        }
+        Ok(cols)
+    }
+
+    /// A top-level `VALUES (…), (…) [set-op …] [ORDER BY …] [LIMIT …]`,
+    /// with its `VALUES` still to be read. Lowers to the same UNION ALL
+    /// chain the FROM-position form uses, then the shared SELECT tail.
+    fn parse_values_statement(&mut self) -> Result<Statement, ParseError> {
+        self.advance(); // VALUES
+        let mut head = self.parse_values_rows_body()?;
+        // v7.40.11 — and it may HEAD a set-operation chain:
+        // `VALUES (1) UNION ALL SELECT 2`. The CTE-body form has done this
+        // since the recursive-seed work; the top-level statement went
+        // straight to the tail and reported `syntax error at or near
+        // "UNION"`.
+        self.parse_setop_chain_into(&mut head)?;
+        self.parse_select_tail_into(&mut head)?;
+        Ok(Statement::Select(head))
+    }
+
+    /// 9.0.3 — the query of `COPY (<query>) TO …`: what PostgreSQL takes
+    /// there — a SELECT, a VALUES list, a WITH query, or a data-modifying
+    /// statement with RETURNING.
+    fn parse_copy_query_body(&mut self) -> Result<Statement, ParseError> {
+        match self.peek().clone() {
+            Token::Ident(s) if s.eq_ignore_ascii_case("with") => {
+                self.advance();
+                self.parse_with_cte_then_select()
+            }
+            Token::Values => self.parse_values_statement(),
+            Token::Insert => self.parse_insert_stmt(false),
+            Token::Ident(s) if s.eq_ignore_ascii_case("update") => {
+                self.advance();
+                self.parse_update_after_keyword()
+            }
+            Token::Ident(s) if s.eq_ignore_ascii_case("delete") => {
+                self.advance();
+                self.parse_delete_after_keyword()
+            }
+            _ => self.parse_select_stmt(),
+        }
     }
 
     /// v7.39 (round 265) — `( col, … )` or `*` after a COPY column-list

@@ -24,7 +24,14 @@ fn text_and_csv_payloads_match_pg_byte_for_byte() {
     let mut e = seeded();
     // Bare text: tab-separated, \N null, embedded tab escaped.
     let (payload, n) = e
-        .copy_to_buffer("ct", None, None, &CopyOptions::default())
+        .copy_to_buffer(
+            spg_engine::IMPLICIT_TX,
+            "ct",
+            false,
+            None,
+            None,
+            &CopyOptions::default(),
+        )
         .unwrap();
     assert_eq!(payload, "1\ta\t10\n2\tb\t\\N\n3\tc\\ttab\t30\n");
     assert_eq!(n, 3);
@@ -35,13 +42,22 @@ fn text_and_csv_payloads_match_pg_byte_for_byte() {
         header: true,
         ..CopyOptions::default()
     };
-    let (payload, n) = e.copy_to_buffer("ct", None, None, &opts).unwrap();
+    let (payload, n) = e
+        .copy_to_buffer(spg_engine::IMPLICIT_TX, "ct", false, None, None, &opts)
+        .unwrap();
     assert_eq!(payload, "id,name,v\n1,a,10\n2,b,\n3,c\ttab,30\n");
     assert_eq!(n, 3);
     // Column-list form.
     let cols = ["name".to_string()];
     let (payload, n) = e
-        .copy_to_buffer("ct", Some(&cols), None, &CopyOptions::default())
+        .copy_to_buffer(
+            spg_engine::IMPLICIT_TX,
+            "ct",
+            false,
+            Some(&cols),
+            None,
+            &CopyOptions::default(),
+        )
         .unwrap();
     assert_eq!(payload, "a\nb\nc\\ttab\n");
     assert_eq!(n, 3);
@@ -55,7 +71,16 @@ fn the_query_form_renders_through_the_same_encoder() {
         format: CopyFormat::Csv,
         ..CopyOptions::default()
     };
-    let (payload, n) = e.copy_to_buffer("", None, Some(&inner), &opts).unwrap();
+    let (payload, n) = e
+        .copy_to_buffer(
+            spg_engine::IMPLICIT_TX,
+            "",
+            false,
+            None,
+            Some(&inner),
+            &opts,
+        )
+        .unwrap();
     assert_eq!(payload, "1,a\n2,b\n3,c\ttab\n");
     assert_eq!(n, 3);
 }

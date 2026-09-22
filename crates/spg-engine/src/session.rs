@@ -702,6 +702,16 @@ impl Engine {
         });
     }
 
+    /// 9.0.3 — queue NOTICEs a host raised while running a statement it
+    /// drives itself (a COPY whose rows it stores: `ON_ERROR ignore`'s
+    /// skipped-row notices). Taken with [`Self::take_notices`] like the
+    /// engine's own.
+    pub fn queue_notices(&mut self, texts: alloc::vec::Vec<alloc::string::String>) {
+        for text in texts {
+            self.notice(text);
+        }
+    }
+
     /// v7.39 (round 320, V53) — `RESET ALL` / the reset half of
     /// `DISCARD ALL`: drop every GUC override, keeping the internal keys
     /// that are not GUCs at all (the connection's login identity and its

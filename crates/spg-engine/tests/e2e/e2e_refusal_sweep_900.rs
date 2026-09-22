@@ -164,6 +164,7 @@ fn s1_alter_function_rename_moves_it() {
 fn s1_copy_may_fill_a_generated_always_identity_column() {
     let sql = spg_engine::copy::build_copy_insert(
         "t",
+        false,
         Some(&[alloc_string("id"), alloc_string("n")]),
         &[Some(alloc_string("9")), Some(alloc_string("x"))],
     );

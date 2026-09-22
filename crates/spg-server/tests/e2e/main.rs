@@ -619,3 +619,4 @@ mod chaos_wal_compression_torn_write;
     unused_variables
 )]
 mod cross_version_compat;
+mod e2e_copy_903;

@@ -179,23 +179,37 @@ fn pre_file_checks_run_in_pgs_order() {
     let mut e = seeded();
     // Relation existence, explicit-column existence, duplicate column —
     // all validated by copy_target_columns before any data (or file).
-    let got = format!("{}", e.copy_target_columns("nope", None).unwrap_err());
+    let got = format!(
+        "{}",
+        e.copy_target(spg_engine::IMPLICIT_TX, "nope", false, None)
+            .unwrap_err()
+    );
     assert!(got.contains("relation \"nope\" does not exist"), "{got}");
     let cols = ["id".to_string(), "nope".to_string()];
-    let got = format!("{}", e.copy_target_columns("ct", Some(&cols)).unwrap_err());
+    let got = format!(
+        "{}",
+        e.copy_target(spg_engine::IMPLICIT_TX, "ct", false, Some(&cols))
+            .unwrap_err()
+    );
     assert!(
         got.contains("column \"nope\" of relation \"ct\" does not exist"),
         "{got}"
     );
     let cols = ["id".to_string(), "id".to_string()];
-    let got = format!("{}", e.copy_target_columns("ct", Some(&cols)).unwrap_err());
+    let got = format!(
+        "{}",
+        e.copy_target(spg_engine::IMPLICIT_TX, "ct", false, Some(&cols))
+            .unwrap_err()
+    );
     assert!(
         got.contains("column \"id\" specified more than once"),
         "{got}"
     );
     // The happy path resolves the schema order.
     assert_eq!(
-        e.copy_target_columns("ct", None).unwrap(),
+        e.copy_target(spg_engine::IMPLICIT_TX, "ct", false, None)
+            .unwrap()
+            .names,
         ["id", "name", "v"]
     );
 }
@@ -227,4 +241,29 @@ fn the_raw_statement_parses_and_the_engine_names_the_host_contract() {
     // Non-file COPY shapes are not this statement.
     assert!(spg_engine::copy::parse_copy_from_file("COPY ct TO STDOUT").is_none());
     assert!(spg_engine::copy::parse_copy_from_file("SELECT 1").is_none());
+}
+
+/// 9.0.3 — a file in the text format was split at tabs whatever
+/// `DELIMITER` said: on the published 9.0.2 `COPY t FROM '<file>'
+/// (DELIMITER '|')` answered `extra data after last expected column`
+/// for a line PostgreSQL 18.6 loads.
+#[test]
+fn a_text_file_is_split_at_its_delimiter() {
+    let mut e = seeded();
+    let opts = CopyOptions {
+        delimiter: Some('|'),
+        null_str: Some("NIL".into()),
+        ..CopyOptions::default()
+    };
+    let r = e.copy_from_buffer("ct", None, &opts, "7|g|NIL\n").unwrap();
+    assert!(matches!(r, QueryResult::CommandOk { affected: 1, .. }));
+    let QueryResult::Rows { rows, .. } = e
+        .execute("SELECT name, v IS NULL FROM ct WHERE id = 7")
+        .unwrap()
+    else {
+        panic!("rows");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], spg_storage::Value::text("g"));
+    assert_eq!(rows[0].values[1], spg_storage::Value::Bool(true));
 }

@@ -79,6 +79,40 @@ fn window_sqlstate(msg: &str) -> Option<&'static str> {
 /// v7.39 (round 429) — crate-visible so the MySQL wire can derive its own
 /// errno from the SAME classification: the two protocols disagree only on
 /// the code's spelling, never on which failure it was.
+/// The SQLSTATE PostgreSQL 18.6 gives each COPY refusal. The codes do
+/// not follow one rule — FORCE_QUOTE on a COPY FROM is 0A000 while
+/// FORCE_NULL on a COPY TO is 22023 — so each is listed as measured.
+fn copy_sqlstate(msg: &str) -> Option<&'static str> {
+    if msg.contains("missing data for column")
+        || msg.contains("extra data after last expected column")
+        || msg.contains("in header line")
+    {
+        return Some("22P04");
+    }
+    if msg.contains("rows due to data type incompatibility") {
+        return Some("22P02");
+    }
+    if msg.contains("not referenced by COPY") {
+        return Some("42P10");
+    }
+    if msg.contains("cannot be used with COPY TO")
+        || msg.contains("requires ON_ERROR to be set to IGNORE")
+        || (msg.contains("REJECT_LIMIT (") && msg.contains("must be greater than zero"))
+        || (msg.contains("COPY ON_ERROR \"") && msg.contains("not recognized"))
+        || (msg.contains("COPY LOG_VERBOSITY \"") && msg.contains("not recognized"))
+        || (msg.contains("COPY format \"") && msg.contains("not recognized"))
+    {
+        return Some("22023");
+    }
+    if msg.contains("cannot be used with COPY FROM")
+        || msg.contains("with HEADER in COPY TO")
+        || msg.contains("COPY format \"binary\" is not supported")
+    {
+        return Some("0A000");
+    }
+    None
+}
+
 pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, String) {
     // 9.0.0 — a positioned error is classified by what it wraps; the
     // position rides its own wire field.
@@ -135,6 +169,15 @@ pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, Stri
         let msg = e.to_string();
         if msg.contains("could not obtain lock on row in relation") {
             return (alloc::borrow::Cow::Borrowed("55P03"), msg);
+        }
+    }
+    // 9.0.3 — COPY's refusals, measured one by one on PostgreSQL 18.6.
+    // Many arrive from the option grammar, so ahead of the Parse→42601
+    // short-circuit below.
+    {
+        let msg = e.to_string();
+        if let Some(code) = copy_sqlstate(&msg) {
+            return (alloc::borrow::Cow::Borrowed(code), msg);
         }
     }
     {

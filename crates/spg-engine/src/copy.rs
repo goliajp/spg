@@ -14,104 +14,60 @@
 //! concerns (CopyData framing, SKIP/ON_ERROR/JSON options) stay in
 //! pgwire.
 
-use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-/// The head of an embed-path `COPY … FROM stdin;` statement.
-#[derive(Debug, PartialEq, Eq)]
-pub struct CopyFromSpec {
-    /// Bare table name (any `schema.` qualifier stripped — same
-    /// treatment the SQL parser gives table names).
+/// 9.0.3 — a parsed `COPY <table> [(cols)] FROM STDIN [options]`: the
+/// head of a COPY whose rows follow out of band (CopyData frames on the
+/// wire, the lines after the statement in a dump).
+///
+/// It was read by hand from lowercased text, which dropped the schema
+/// (`COPY sa.t (…) FROM stdin`, pg_dump's spelling for every table, loaded
+/// `sa`'s rows into `public.t`), lost a quoted name's case, and ignored
+/// every option. The statement grammar reads it now.
+#[derive(Debug)]
+pub struct CopyFromStdinSpec {
     pub table: String,
-    /// Explicit column list when the statement carries one
-    /// (pg_dump always emits it). `None` = positional against the
-    /// table's full column order.
+    pub table_qualified: bool,
     pub columns: Option<Vec<String>>,
+    pub options: spg_sql::ast::CopyOptions,
 }
 
-/// Parse the head of a `COPY <table> [(cols)] FROM stdin` statement
-/// (text format). Returns `None` when the statement is not that
-/// shape — including `COPY … TO stdout` and file endpoints. A
-/// trailing `WITH (…)` options tail is accepted and ignored except
-/// that a non-text `FORMAT` makes this return `None` (the embed
-/// path only lowers the text format; callers surface a clear
-/// error).
-#[must_use]
-pub fn parse_copy_from_stdin_head(sql: &str) -> Option<CopyFromSpec> {
-    let trimmed = sql.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    let rest = lower.strip_prefix("copy")?;
-    if !rest.starts_with(char::is_whitespace) {
-        return None;
+/// Parse `sql` as `COPY … FROM STDIN`; any other statement is `None`.
+///
+/// # Errors
+/// A COPY FROM STDIN whose option list is malformed, in PostgreSQL's
+/// words — so a bad option is reported rather than the statement being
+/// taken for something else.
+pub fn parse_copy_from_stdin(sql: &str) -> Result<Option<CopyFromStdinSpec>, crate::EngineError> {
+    match spg_sql::parser::parse_statement(sql) {
+        Ok(spg_sql::ast::Statement::CopyFromStdin {
+            table,
+            table_qualified,
+            columns,
+            options,
+        }) => Ok(Some(CopyFromStdinSpec {
+            table,
+            table_qualified,
+            columns,
+            options,
+        })),
+        Ok(_) => Ok(None),
+        Err(e) if head_is_copy_from_stdin(sql) => Err(crate::EngineError::Parse(e)),
+        Err(_) => Ok(None),
     }
-    let rest_orig = &trimmed[trimmed.len() - rest.len()..];
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    // Table name: read to whitespace or '('.
-    let t0 = i;
-    while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'(' {
-        i += 1;
-    }
-    if i == t0 {
-        return None;
-    }
-    let raw_table = &rest_orig[t0..i];
-    let table = match raw_table.rsplit_once('.') {
-        Some((_, bare)) => bare,
-        None => raw_table,
-    }
-    .trim_matches('"')
-    .to_string();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-        i += 1;
-    }
-    // Optional column list.
-    let mut columns = None;
-    if bytes.get(i) == Some(&b'(') {
-        let cols_start = i + 1;
-        let mut depth = 1usize;
-        i += 1;
-        while i < bytes.len() && depth > 0 {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        let cols_str = &rest_orig[cols_start..i.saturating_sub(1)];
-        columns = Some(
-            cols_str
-                .split(',')
-                .map(|c| c.trim().trim_matches('"').to_string())
-                .filter(|c| !c.is_empty())
-                .collect::<Vec<_>>(),
-        );
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-    }
-    // `FROM stdin` (case-folded via `lower`).
-    let tail = &rest[i..];
-    let tail = tail.trim_start();
-    let tail = tail.strip_prefix("from")?;
-    if !tail.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let tail = tail.trim_start();
-    if !(tail == "stdin" || tail.starts_with("stdin")) {
-        return None;
-    }
-    let after = tail["stdin".len()..].trim();
-    // Options tail: only the default text format lowers here.
-    if after.contains("format") && !after.contains("text") {
-        return None;
-    }
-    Some(CopyFromSpec { table, columns })
+}
+
+/// `COPY … FROM STDIN` by its words alone, so a malformed option list is
+/// reported as such.
+fn head_is_copy_from_stdin(sql: &str) -> bool {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    lower.starts_with("copy")
+        && lower
+            .split_ascii_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] == "from" && w[1].starts_with("stdin"))
 }
 
 /// v7.39 (round 252) — a parsed `COPY … TO '<file>'` (table or query
@@ -120,6 +76,7 @@ pub fn parse_copy_from_stdin_head(sql: &str) -> Option<CopyFromSpec> {
 #[derive(Debug)]
 pub struct CopyToFileSpec {
     pub table: String,
+    pub table_qualified: bool,
     pub columns: Option<Vec<String>>,
     pub query: Option<alloc::boxed::Box<spg_sql::ast::Statement>>,
     pub path: String,
@@ -133,12 +90,14 @@ pub fn parse_copy_to_file(sql: &str) -> Option<CopyToFileSpec> {
     match spg_sql::parser::parse_statement(sql) {
         Ok(spg_sql::ast::Statement::CopyToFile {
             table,
+            table_qualified,
             columns,
             query,
             path,
             options,
         }) => Some(CopyToFileSpec {
             table,
+            table_qualified,
             columns,
             query,
             path,
@@ -191,15 +150,161 @@ pub fn validate_copy_option_direction(
             return Err(wrong_way(name));
         }
     }
+    // 9.0.3 — the options that only make sense while reading rows in.
+    // PostgreSQL 18.6: `ON_ERROR` names itself; `HEADER match` answers
+    // `cannot use "match" with HEADER in COPY TO`. `SKIP` and `FORMAT
+    // json` are SPG's own and follow the same rule.
+    if to_direction {
+        if options.on_error.is_some() {
+            return Err(wrong_way("ON_ERROR"));
+        }
+        if options.header_match {
+            return Err(crate::EngineError::Unsupported(
+                "cannot use \"match\" with HEADER in COPY TO".into(),
+            ));
+        }
+        if options.skip > 0 {
+            return Err(wrong_way("SKIP"));
+        }
+        if options.format == spg_sql::ast::CopyFormat::Json {
+            return Err(crate::EngineError::Unsupported(
+                "COPY FORMAT json cannot be used with COPY TO".into(),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// A column a COPY option lists (`FORCE_QUOTE`, `FORCE_NULL`, …) must be
+/// one of the relation's, and one the COPY moves. PostgreSQL checks in
+/// that order: `column "x" of relation "t" does not exist` (42703), then
+/// `<OPTION> column "x" not referenced by COPY` (42P10).
+///
+/// # Errors
+/// Whichever of the two the column fails.
+pub fn check_listed_column(
+    option: &str,
+    column: &str,
+    target: &crate::copy_from::CopyTarget,
+) -> Result<(), crate::EngineError> {
+    if !target
+        .table_columns
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(column))
+    {
+        return Err(crate::EngineError::Unsupported(alloc::format!(
+            "column \"{column}\" of relation \"{}\" does not exist",
+            spg_sql::namespace::display_key(&target.table)
+        )));
+    }
+    if !target.names.iter().any(|c| c.eq_ignore_ascii_case(column)) {
+        return Err(crate::EngineError::Unsupported(alloc::format!(
+            "{option} column \"{column}\" not referenced by COPY"
+        )));
+    }
+    Ok(())
+}
+
+/// 9.0.3 — how a COPY TO writes its lines, set up once from the options:
+/// the engine's own COPY TO and the wire's both encode through it.
+#[derive(Debug)]
+pub struct CopyToEncoder {
+    csv: bool,
+    delimiter: char,
+    quote: char,
+    escape: char,
+    force: Option<Vec<bool>>,
+    null_str: String,
+}
+
+impl CopyToEncoder {
+    /// `out_names` are the columns in the order they are written; `target`
+    /// is the relation a table COPY reads (none for `COPY (query)`), which
+    /// the `FORCE_QUOTE` columns are checked against.
+    ///
+    /// # Errors
+    /// PostgreSQL's refusals for an option COPY TO cannot take.
+    pub fn new(
+        options: &spg_sql::ast::CopyOptions,
+        out_names: &[String],
+        target: Option<&crate::copy_from::CopyTarget>,
+    ) -> Result<Self, crate::EngineError> {
+        validate_copy_option_direction(options, true)?;
+        let csv = options.format == spg_sql::ast::CopyFormat::Csv;
+        if !csv {
+            if options.quote.is_some() {
+                return Err(crate::EngineError::Unsupported(
+                    "COPY QUOTE requires CSV mode".into(),
+                ));
+            }
+            if options.escape.is_some() {
+                return Err(crate::EngineError::Unsupported(
+                    "COPY ESCAPE requires CSV mode".into(),
+                ));
+            }
+        }
+        let quote = options.quote.unwrap_or('"');
+        let force = match &options.force_quote {
+            None => None,
+            Some(cols) if cols.is_empty() => Some(alloc::vec![true; out_names.len()]),
+            Some(cols) => {
+                let mut mask = alloc::vec![false; out_names.len()];
+                for c in cols {
+                    if let Some(t) = target {
+                        check_listed_column("FORCE_QUOTE", c, t)?;
+                    }
+                    let pos = out_names
+                        .iter()
+                        .position(|n| n.eq_ignore_ascii_case(c))
+                        .ok_or_else(|| {
+                            crate::EngineError::Unsupported(alloc::format!(
+                                "FORCE_QUOTE column \"{c}\" not referenced by COPY"
+                            ))
+                        })?;
+                    mask[pos] = true;
+                }
+                Some(mask)
+            }
+        };
+        Ok(Self {
+            csv,
+            delimiter: options.delimiter.unwrap_or(if csv { ',' } else { '\t' }),
+            quote,
+            escape: options.escape.unwrap_or(quote),
+            force,
+            null_str: options
+                .null_str
+                .clone()
+                .unwrap_or_else(|| String::from(if csv { "" } else { "\\N" })),
+        })
+    }
+
+    /// One line, without its newline.
+    #[must_use]
+    pub fn encode(&self, cells: &[Option<String>]) -> String {
+        if self.csv {
+            encode_copy_csv_cells_opts(
+                cells,
+                self.delimiter,
+                self.quote,
+                self.escape,
+                self.force.as_deref(),
+                &self.null_str,
+            )
+        } else {
+            encode_copy_text_cells_opts(cells, self.delimiter, &self.null_str)
+        }
+    }
 }
 
 /// v7.39 (round 249) — a parsed `COPY <table> [(cols)] FROM '<path>'`.
 /// The engine is no_std: the HOST reads `path` and hands the bytes to
-/// [`copy_buffer_inserts`] / `Engine::copy_from_buffer`.
+/// `Engine::copy_from_buffer` (or reads them with
+/// [`crate::copy_from::CopyFromReader`] itself).
 #[derive(Debug)]
 pub struct CopyFromFileSpec {
     pub table: String,
+    pub table_qualified: bool,
     pub columns: Option<Vec<String>>,
     pub path: String,
     pub options: spg_sql::ast::CopyOptions,
@@ -214,11 +319,13 @@ pub fn parse_copy_from_file(sql: &str) -> Option<CopyFromFileSpec> {
     match spg_sql::parser::parse_statement(sql) {
         Ok(spg_sql::ast::Statement::CopyFromFile {
             table,
+            table_qualified,
             columns,
             path,
             options,
         }) => Some(CopyFromFileSpec {
             table,
+            table_qualified,
             columns,
             path,
             options,
@@ -227,130 +334,6 @@ pub fn parse_copy_from_file(sql: &str) -> Option<CopyFromFileSpec> {
     }
 }
 
-/// v7.39 (round 249) — decode a whole `COPY … FROM '<file>'` buffer
-/// (the HOST read the file; the engine is no_std and performs no I/O)
-/// into the per-row INSERT statements both hosts drive. Text and CSV
-/// formats honour DELIMITER / NULL / HEADER / QUOTE; the text-format
-/// `\.` terminator ends the data early, as in PG.
-///
-/// # Errors
-/// Non-UTF-8 CSV input is refused (the text path takes `&str` too, so
-/// it can't arise there).
-pub fn copy_buffer_inserts(
-    table: &str,
-    columns: Option<&[String]>,
-    target_cols: &[String],
-    options: &spg_sql::ast::CopyOptions,
-    data: &str,
-) -> Result<Vec<String>, crate::EngineError> {
-    // PG validates each row's field count against the target column
-    // list before any type conversion: too many fields is "extra data
-    // after last expected column", too few names the first column left
-    // unfilled (both 22P04).
-    let check_row = |values: &Vec<Option<String>>| -> Result<(), crate::EngineError> {
-        if values.len() > target_cols.len() {
-            return Err(crate::EngineError::Unsupported(String::from(
-                "extra data after last expected column",
-            )));
-        }
-        if values.len() < target_cols.len() {
-            return Err(crate::EngineError::Unsupported(format!(
-                "missing data for column \"{}\"",
-                target_cols[values.len()]
-            )));
-        }
-        Ok(())
-    };
-    use spg_sql::ast::CopyFormat;
-    let is_csv = options.format == CopyFormat::Csv;
-    let delimiter = options.delimiter.unwrap_or(if is_csv { ',' } else { '\t' });
-    let quote = options.quote.unwrap_or('"');
-    let null_str = options
-        .null_str
-        .clone()
-        .unwrap_or_else(|| String::from(if is_csv { "" } else { "\\N" }));
-    // v7.39 (round 265) — the direction rules, then the two CSV column
-    // lists. `*` (an empty vec) means every column.
-    validate_copy_option_direction(options, false)?;
-    let in_list = |list: &Option<alloc::vec::Vec<String>>, idx: usize| -> bool {
-        match list {
-            None => false,
-            Some(cols) if cols.is_empty() => true,
-            Some(cols) => target_cols
-                .get(idx)
-                .is_some_and(|c| cols.iter().any(|w| w.eq_ignore_ascii_case(c))),
-        }
-    };
-    let mut inserts = Vec::new();
-    let mut first = true;
-    if is_csv {
-        let mut buf: Vec<u8> = data.as_bytes().to_vec();
-        if !buf.is_empty() && !buf.ends_with(b"\n") {
-            buf.push(b'\n');
-        }
-        let d8 = u8::try_from(delimiter as u32).unwrap_or(b',');
-        let q8 = u8::try_from(quote as u32).unwrap_or(b'"');
-        let mut start = 0;
-        while let Some(len) = csv_record_end(&buf[start..], d8, q8) {
-            let mut rec = &buf[start..start + len - 1];
-            start += len;
-            if rec.last() == Some(&b'\r') {
-                rec = &rec[..rec.len() - 1];
-            }
-            if rec.is_empty() {
-                continue;
-            }
-            if first && options.header {
-                first = false;
-                continue;
-            }
-            first = false;
-            let rec_str = core::str::from_utf8(rec).map_err(|_| {
-                crate::EngineError::Unsupported("COPY FROM: non-UTF-8 input".into())
-            })?;
-            let mut values = decode_copy_csv_record(rec_str, delimiter, quote, &null_str);
-            // v7.39 (round 265) — FORCE_NOT_NULL turns a field that decoded
-            // as NULL into the empty string; FORCE_NULL turns one that
-            // decoded as the null token's text (a QUOTED empty under the
-            // CSV default) into NULL. Probed: with neither, `1,` is NULL
-            // and `2,""` is the empty string; FORCE_NOT_NULL makes both
-            // non-NULL and FORCE_NULL makes both NULL.
-            if options.force_not_null.is_some() || options.force_null.is_some() {
-                for (idx, cell) in values.iter_mut().enumerate() {
-                    if in_list(&options.force_not_null, idx) && cell.is_none() {
-                        *cell = Some(String::new());
-                    }
-                    if in_list(&options.force_null, idx)
-                        && cell.as_deref() == Some(null_str.as_str())
-                    {
-                        *cell = None;
-                    }
-                }
-            }
-            check_row(&values)?;
-            inserts.push(build_copy_insert(table, columns, &values));
-        }
-    } else {
-        for line in data.lines() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            if line.is_empty() {
-                continue;
-            }
-            if first && options.header {
-                first = false;
-                continue;
-            }
-            first = false;
-            if line == "\\." {
-                break;
-            }
-            let values = decode_copy_text_row(line);
-            check_row(&values)?;
-            inserts.push(build_copy_insert(table, columns, &values));
-        }
-    }
-    Ok(inserts)
-}
 /// Decode one COPY text-format data row: tab-separated cells,
 /// `\N` = NULL, C-style backslash escapes.
 #[must_use]
@@ -420,6 +403,18 @@ pub fn decode_copy_csv_record(
     quote: char,
     null_str: &str,
 ) -> Vec<Option<String>> {
+    decode_copy_csv_record_escaped(record, delimiter, quote, quote, null_str)
+}
+
+/// [`decode_copy_csv_record`] with PostgreSQL's `ESCAPE` character.
+#[must_use]
+pub fn decode_copy_csv_record_escaped(
+    record: &str,
+    delimiter: char,
+    quote: char,
+    escape: char,
+    null_str: &str,
+) -> Vec<Option<String>> {
     let chars: Vec<char> = record.chars().collect();
     let n = chars.len();
     let mut fields: Vec<Option<String>> = Vec::new();
@@ -431,14 +426,12 @@ pub fn decode_copy_csv_record(
             let mut content = String::new();
             while i < n {
                 let c = chars[i];
-                if c == quote {
-                    if i + 1 < n && chars[i + 1] == quote {
-                        content.push(quote);
-                        i += 2;
-                    } else {
-                        i += 1; // closing quote
-                        break;
-                    }
+                if c == escape && i + 1 < n && (chars[i + 1] == quote || chars[i + 1] == escape) {
+                    content.push(chars[i + 1]);
+                    i += 2;
+                } else if c == quote {
+                    i += 1; // closing quote
+                    break;
                 } else {
                     content.push(c);
                     i += 1;
@@ -483,17 +476,25 @@ pub fn decode_copy_csv_record(
 /// multi-byte continuation byte (which is always ≥ 0x80).
 #[must_use]
 pub fn csv_record_end(buf: &[u8], delimiter: u8, quote: u8) -> Option<usize> {
+    csv_record_end_escaped(buf, delimiter, quote, quote)
+}
+
+/// [`csv_record_end`] with PostgreSQL's `ESCAPE`: inside a quoted field
+/// the escape byte takes the next quote or escape byte literally (the
+/// default escape is the quote itself — a doubled quote).
+#[must_use]
+pub fn csv_record_end_escaped(buf: &[u8], delimiter: u8, quote: u8, escape: u8) -> Option<usize> {
     let mut in_quote = false;
     let mut at_field_start = true;
     let mut i = 0;
     while i < buf.len() {
         let b = buf[i];
         if in_quote {
+            if b == escape && matches!(buf.get(i + 1), Some(&n) if n == quote || n == escape) {
+                i += 2; // escaped byte, still inside the field
+                continue;
+            }
             if b == quote {
-                if buf.get(i + 1) == Some(&quote) {
-                    i += 2; // escaped quote, still inside the field
-                    continue;
-                }
                 in_quote = false; // closing quote
             }
             // Any other byte (including '\n') stays inside the field.
@@ -510,28 +511,35 @@ pub fn csv_record_end(buf: &[u8], delimiter: u8, quote: u8) -> Option<usize> {
     None
 }
 
-/// Build `INSERT INTO <table> [(cols)] VALUES (…)` from a decoded
-/// row. Numeric-looking and boolean cells go in bare so the engine
-/// sees typed literals; everything else is single-quoted with SQL
-/// escaping.
+/// Build `INSERT INTO <table> [(cols)] VALUES (…)` from a decoded row.
+///
+/// 9.0.3 — every value is a string literal, so the column's own type
+/// reads it the way PostgreSQL's input function does. Cells that looked
+/// numeric went in bare, and the INSERT then converted a NUMBER: an
+/// `integer` column stored `1.5` as 2 where PostgreSQL refuses it, and a
+/// `text` column refused `+5`, which PostgreSQL stores as written.
+///
+/// The relation is written the way the COPY wrote it (`written_sql`):
+/// `public.t` stays public's table whatever the search path says, and a
+/// quoted mixed-case name keeps its case.
 #[must_use]
 pub fn build_copy_insert(
     table: &str,
+    table_qualified: bool,
     columns: Option<&[String]>,
     values: &[Option<String>],
 ) -> String {
-    // 9.0.0 (C9) — the row is inserted by re-parsing SQL, so the key
-    // goes back to the spelling a parser accepts (`c9a.t`): the
-    // separator it carries the schema with is not a character an
-    // identifier may contain.
-    let mut sql = alloc::format!("INSERT INTO {} ", spg_sql::namespace::display_key(table));
+    let mut sql = alloc::format!(
+        "INSERT INTO {} ",
+        spg_sql::namespace::written_sql(table, table_qualified)
+    );
     if let Some(cols) = columns {
         sql.push('(');
         for (i, c) in cols.iter().enumerate() {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(c);
+            sql.push_str(&spg_sql::namespace::written_sql(c, false));
         }
         sql.push_str(") ");
     }
@@ -553,20 +561,14 @@ pub fn build_copy_insert(
         match v {
             None => sql.push_str("NULL"),
             Some(s) => {
-                if copy_cell_looks_numeric(s)
-                    || matches!(s.as_str(), "true" | "false" | "TRUE" | "FALSE")
-                {
-                    sql.push_str(s);
-                } else {
-                    sql.push('\'');
-                    for ch in s.chars() {
-                        if ch == '\'' {
-                            sql.push('\'');
-                        }
-                        sql.push(ch);
+                sql.push('\'');
+                for ch in s.chars() {
+                    if ch == '\'' {
+                        sql.push('\'');
                     }
-                    sql.push('\'');
+                    sql.push(ch);
                 }
+                sql.push('\'');
             }
         }
     }
@@ -574,40 +576,90 @@ pub fn build_copy_insert(
     sql
 }
 
-/// True when the cell can ride into the INSERT as a bare numeric
-/// literal. Deliberately conservative — anything ambiguous goes
-/// quoted and lets column-type coercion decide.
-fn copy_cell_looks_numeric(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let b = s.as_bytes();
-    let mut i = 0;
-    if b[0] == b'-' || b[0] == b'+' {
-        if b.len() == 1 {
-            return false;
+/// v7.39 (read01 round 94) — render a value as the RAW COPY cell text
+/// (`None` for SQL NULL), BEFORE any format-specific escaping. The engine's
+/// `encode_copy_{text,csv}_cells` apply the delimiter/quote/null escaping on
+/// top, so keeping escaping out of here is what lets the same cell feed both
+/// the text and csv encoders without double-escaping.
+///
+/// 9.0.3 — one renderer for every COPY TO: the wire's, which reads the
+/// session's render style and time zone, moved here so the engine's own
+/// COPY TO (a file endpoint, the embedded host) renders the same cells.
+///
+/// `ty` exists only to tell `timestamptz` from `timestamp`: PG's COPY renders
+/// the former with its offset (`2024-01-15 10:30:00+00`), the latter without.
+#[must_use]
+pub fn copy_cell_text(
+    v: &spg_storage::Value<'_>,
+    ty: Option<spg_storage::DataType>,
+    style: &crate::eval::RenderStyle,
+    tz: &crate::SessionTz,
+) -> Option<String> {
+    use spg_storage::Value;
+    let s = match v {
+        Value::Null => return None,
+        Value::Bool(b) => if *b { "t" } else { "f" }.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(x) => crate::eval::format_float_styled(*x, style),
+        Value::Real(x) => crate::eval::format_real_styled(*x, style),
+        Value::Text(s) | Value::Json(s) => s.to_string(),
+        // v7.39 (bpchar epic) — COPY emits the padded stored form.
+        Value::BpChar(s) => s.to_string(),
+        // v7.39 (FTS) — canonical text forms for COPY too.
+        Value::TsVector(lexs) => crate::eval::format_tsvector(lexs),
+        Value::TsQuery(ast) => crate::eval::format_tsquery(ast),
+        Value::Numeric {
+            scaled,
+            scale,
+            kind,
+        } => crate::eval::format_numeric_kind(*kind, *scaled, *scale),
+        Value::Date(d) => crate::eval::format_date_styled(*d, style),
+        Value::Timestamp(t) => {
+            if matches!(ty, Some(spg_storage::DataType::Timestamptz)) {
+                let abbr = tz.abbrev_at(*t);
+                crate::eval::format_timestamptz_tz(*t, style, tz.offset_at(*t), abbr.as_deref())
+            } else {
+                crate::eval::format_timestamp_styled(*t, style)
+            }
         }
-        i = 1;
-    }
-    let mut seen_dot = false;
-    let mut seen_digit = false;
-    while i < b.len() {
-        match b[i] {
-            b'0'..=b'9' => seen_digit = true,
-            b'.' if !seen_dot => seen_dot = true,
-            _ => return false,
+        Value::Interval {
+            months,
+            days,
+            micros,
+            kind,
+        } if kind.is_finite() => {
+            crate::eval::format_interval_styled(*months, *days, *micros, style)
         }
-        i += 1;
-    }
-    // Leading-zero integers ("0042") stay quoted: they're usually
-    // identifiers/codes, and PG would render them back differently.
-    if !seen_dot && s.trim_start_matches(['-', '+']).len() > 1 {
-        let digits = s.trim_start_matches(['-', '+']);
-        if digits.starts_with('0') {
-            return false;
+        Value::Interval { kind, .. } => crate::eval::format_interval_kinded(0, 0, 0, *kind),
+        Value::Vector(v) => {
+            let parts: Vec<alloc::string::String> =
+                v.iter().map(alloc::string::ToString::to_string).collect();
+            alloc::format!("[{}]", parts.join(","))
         }
-    }
-    seen_digit
+        // v6.0.1: COPY OUT a `VECTOR(N) USING SQ8` column — dequantise to f32
+        // so the COPY text stream stays pgvector-compatible.
+        Value::Sq8Vector(q) => {
+            let parts: Vec<alloc::string::String> = spg_storage::quantize::dequantize(q)
+                .iter()
+                .map(alloc::string::ToString::to_string)
+                .collect();
+            alloc::format!("[{}]", parts.join(","))
+        }
+        // v6.0.3: COPY OUT for `VECTOR(N) USING HALF` — bit-exact dequantise.
+        Value::HalfVector(h) => {
+            let parts: Vec<alloc::string::String> = h
+                .to_f32_vec()
+                .iter()
+                .map(alloc::string::ToString::to_string)
+                .collect();
+            alloc::format!("[{}]", parts.join(","))
+        }
+        // v7.5.0 — Value is #[non_exhaustive].
+        other => crate::eval::value_to_text(other),
+    };
+    Some(s)
 }
 
 /// Encode one row's selected cells as a COPY text-format line —
@@ -730,22 +782,39 @@ mod tests {
 
     #[test]
     fn parses_pg_dump_copy_head() {
-        let spec =
-            parse_copy_from_stdin_head("COPY public.messages (id, subject, body) FROM stdin")
-                .unwrap();
+        let spec = parse_copy_from_stdin("COPY public.messages (id, subject, body) FROM stdin")
+            .unwrap()
+            .unwrap();
         assert_eq!(spec.table, "messages");
+        assert!(spec.table_qualified);
         assert_eq!(
             spec.columns.as_deref(),
             Some(&["id".to_string(), "subject".to_string(), "body".to_string()][..])
         );
+        // A schema other than public stays in the key.
+        let sa = parse_copy_from_stdin("COPY sa.t (id) FROM stdin")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sa.table, spg_sql::namespace::qualified_key("sa", "t"));
         // No column list.
-        let bare = parse_copy_from_stdin_head("copy t from stdin").unwrap();
+        let bare = parse_copy_from_stdin("copy t from stdin").unwrap().unwrap();
         assert_eq!(bare.table, "t");
+        assert!(!bare.table_qualified);
         assert_eq!(bare.columns, None);
-        // Not the embed shape.
-        assert!(parse_copy_from_stdin_head("COPY t TO stdout").is_none());
-        assert!(parse_copy_from_stdin_head("COPY t FROM '/tmp/f.csv'").is_none());
-        assert!(parse_copy_from_stdin_head("COPY t FROM stdin WITH (FORMAT csv)").is_none());
+        // Options are read, not refused.
+        let csv = parse_copy_from_stdin("COPY t FROM stdin WITH (FORMAT csv)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(csv.options.format, spg_sql::ast::CopyFormat::Csv);
+        // Not this shape.
+        assert!(parse_copy_from_stdin("COPY t TO stdout").unwrap().is_none());
+        assert!(
+            parse_copy_from_stdin("COPY t FROM '/tmp/f.csv'")
+                .unwrap()
+                .is_none()
+        );
+        // A malformed option list is reported, not taken for another statement.
+        assert!(parse_copy_from_stdin("COPY t FROM stdin (NOSUCH 1)").is_err());
     }
 
     #[test]
@@ -765,16 +834,22 @@ mod tests {
     fn builds_inserts_with_column_list() {
         // 9.0.0 — `OVERRIDING SYSTEM VALUE` is here because COPY may
         // fill a `GENERATED ALWAYS AS IDENTITY` column and INSERT may
-        // not; see `build_copy_insert`.
+        // not; see `build_copy_insert`. 9.0.3 — every value is a string
+        // literal the column's type reads.
         let cols = vec!["id".to_string(), "note".to_string()];
         let row = vec![Some("7".to_string()), Some("it's".to_string())];
         assert_eq!(
-            build_copy_insert("t", Some(&cols), &row),
-            "INSERT INTO t (id, note) OVERRIDING SYSTEM VALUE VALUES (7, 'it''s')"
+            build_copy_insert("t", false, Some(&cols), &row),
+            "INSERT INTO t (id, note) OVERRIDING SYSTEM VALUE VALUES ('7', 'it''s')"
         );
         assert_eq!(
-            build_copy_insert("t", None, &[None, Some("0042".to_string())]),
-            "INSERT INTO t OVERRIDING SYSTEM VALUE VALUES (NULL, '0042')"
+            build_copy_insert("t", true, None, &[None, Some("0042".to_string())]),
+            "INSERT INTO public.t OVERRIDING SYSTEM VALUE VALUES (NULL, '0042')"
+        );
+        let mixed = vec!["Id".to_string()];
+        assert_eq!(
+            build_copy_insert("MixedCase", false, Some(&mixed), &[Some("1".to_string())]),
+            "INSERT INTO \"MixedCase\" (\"Id\") OVERRIDING SYSTEM VALUE VALUES ('1')"
         );
     }
 
