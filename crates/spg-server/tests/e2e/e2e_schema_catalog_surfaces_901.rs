@@ -502,6 +502,9 @@ fn every_statement_that_names_a_relation_keeps_its_schema() {
         "INSERT INTO public.t VALUES (1, 'p')",
         "INSERT INTO sw.t VALUES (1, 's')",
         "CREATE TABLE sw.child (id int PRIMARY KEY, pid int REFERENCES public.t(id))",
+        // A parent OUTSIDE `public`: with a parent in `public` the old
+        // single-schema prefix happens to write the same text.
+        "CREATE TABLE public.child2 (id int PRIMARY KEY, sid int REFERENCES sw.t(id))",
         "CREATE VIEW sw.v AS SELECT id FROM sw.t",
         "CREATE SEQUENCE sw.q",
         "CREATE INDEX ix ON sw.t (v)",
@@ -555,19 +558,22 @@ fn every_statement_that_names_a_relation_keeps_its_schema() {
     let mut defs = rows(
         &mut c,
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
-         WHERE conrelid IN ('sw.t'::regclass, 'sw.child'::regclass) AND contype IN ('c', 'f')",
+         WHERE conrelid IN ('sw.t'::regclass, 'sw.child'::regclass, 'public.child2'::regclass) \
+         AND contype IN ('c', 'f')",
     );
     defs.sort();
     assert_eq!(
         defs,
         [
             "CHECK ((id > 0))",
-            "FOREIGN KEY (pid) REFERENCES public.t(id)"
+            "FOREIGN KEY (pid) REFERENCES public.t(id)",
+            "FOREIGN KEY (sid) REFERENCES sw.t(id)",
         ]
     );
     assert_eq!(one(&mut c, "RESET search_path"), "");
 
     // The statements that name a relation, each with its schema.
+    assert_eq!(one(&mut c, "DROP TABLE public.child2"), "");
     for sql in [
         "ALTER INDEX sw.ix RENAME TO ix2",
         "ALTER VIEW sw.v RENAME TO v2",
