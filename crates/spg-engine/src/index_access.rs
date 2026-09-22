@@ -566,6 +566,7 @@ pub(crate) fn try_index_seek_positions(
         // v7.38.1 (L12) — keep every equality's probe key so composite
         // indexes can compose them below.
         let mut eq_keys: Vec<(usize, IndexKey)> = Vec::new();
+        let mut eq_raw: Vec<(usize, IndexKey)> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -579,6 +580,16 @@ pub(crate) fn try_index_seek_positions(
             {
                 if !eq_cols.contains(&col_pos) {
                     eq_keys.push((col_pos, key.clone()));
+                    // 9.0.3 — the RAW key as well: a composite tree holds
+                    // tuples of raw cells, so it is probed with the value
+                    // and not with the sort key the single-column trees
+                    // are built from.
+                    if let Some(raw) = schema_cols
+                        .get(col_pos)
+                        .and_then(|c| IndexKey::from_value_for_column(&value, c.ty))
+                    {
+                        eq_raw.push((col_pos, raw));
+                    }
                 }
                 eq_cols.push(col_pos);
                 if let Some(idx) = table.index_on(col_pos) {
@@ -609,27 +620,28 @@ pub(crate) fn try_index_seek_positions(
             for pos in core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
             {
-                // v7.38.18 (G3) — a component whose column collates by a
-                // locale stops the prefix HERE, rather than
-                // disqualifying the whole index.
+                // 9.0.3 — a composite tree holds tuples of RAW cells, so
+                // its components are probed with the value. Under a
+                // deterministic collation — every collation SPG has —
+                // `=` on text IS byte equality, so the raw probe answers
+                // the question exactly; a folding collation (MySQL's
+                // default, a `CaseInsensitive` column) is where it does
+                // not, and there the prefix still stops here.
                 //
-                // A composite tree holds tuples of raw cells, built by
-                // storage, while `probe_key` encodes such a column's
-                // probe as an ICU sort key: two spaces, and the seek
-                // looks in the wrong one. This version first declined
-                // the index outright, which cost a full scan for `WHERE
-                // id = 7 AND s = 'row7'` when `id` alone narrows it to
-                // one row. Seeking the components that CAN be probed and
-                // letting the caller re-check the rest is what
-                // PostgreSQL does with a component it cannot use.
-                if schema_cols
+                // Stopping at every locale-collated component cost
+                // sentori's ingest a full scan of `issues` on its first
+                // statement: `WHERE project_id = $1 AND fingerprint = $2`
+                // over `UNIQUE (project_id, fingerprint)`, 10 ms at 20,000
+                // rows against PostgreSQL 18.6's 0.1 ms, growing with the
+                // table.
+                if !schema_cols
                     .get(pos)
-                    .is_some_and(|c| collated_column(c, db_coll).is_some())
+                    .is_some_and(|c| crate::collate::column_key_is_bytewise(c, mysql))
                 {
                     cut_by_collation = true;
                     break;
                 }
-                match eq_keys.iter().find(|(c, _)| *c == pos) {
+                match eq_raw.iter().find(|(c, _)| *c == pos) {
                     Some((_, k)) => prefix.push(k.clone()),
                     None => break,
                 }
@@ -646,6 +658,7 @@ pub(crate) fn try_index_seek_positions(
             // whole tuple, however many components it holds.
             let locs = if !cut_by_collation && prefix.len() == 1 + idx.extra_column_positions.len()
             {
+                crate::bump_counter!(crate::index_access::MULTI_EQ_PROBES);
                 Some(idx.lookup_eq_multi(&prefix).to_vec())
             } else {
                 let multi_cap = best
@@ -1779,6 +1792,7 @@ pub(crate) fn try_index_seek<'a>(
         // v7.38.1 (L12) — keep every equality's probe key so composite
         // indexes can compose them below.
         let mut eq_keys: Vec<(usize, IndexKey)> = Vec::new();
+        let mut eq_raw: Vec<(usize, IndexKey)> = Vec::new();
         for c in &conjuncts {
             if let Expr::Binary {
                 lhs: cl,
@@ -1792,6 +1806,16 @@ pub(crate) fn try_index_seek<'a>(
             {
                 if !eq_cols.contains(&col_pos) {
                     eq_keys.push((col_pos, key.clone()));
+                    // 9.0.3 — the RAW key as well: a composite tree holds
+                    // tuples of raw cells, so it is probed with the value
+                    // and not with the sort key the single-column trees
+                    // are built from.
+                    if let Some(raw) = schema_cols
+                        .get(col_pos)
+                        .and_then(|c| IndexKey::from_value_for_column(&value, c.ty))
+                    {
+                        eq_raw.push((col_pos, raw));
+                    }
                 }
                 eq_cols.push(col_pos);
                 if let Some(idx) = table.index_on(col_pos) {
@@ -1822,27 +1846,28 @@ pub(crate) fn try_index_seek<'a>(
             for pos in core::iter::once(idx.column_position)
                 .chain(idx.extra_column_positions.iter().copied())
             {
-                // v7.38.18 (G3) — a component whose column collates by a
-                // locale stops the prefix HERE, rather than
-                // disqualifying the whole index.
+                // 9.0.3 — a composite tree holds tuples of RAW cells, so
+                // its components are probed with the value. Under a
+                // deterministic collation — every collation SPG has —
+                // `=` on text IS byte equality, so the raw probe answers
+                // the question exactly; a folding collation (MySQL's
+                // default, a `CaseInsensitive` column) is where it does
+                // not, and there the prefix still stops here.
                 //
-                // A composite tree holds tuples of raw cells, built by
-                // storage, while `probe_key` encodes such a column's
-                // probe as an ICU sort key: two spaces, and the seek
-                // looks in the wrong one. This version first declined
-                // the index outright, which cost a full scan for `WHERE
-                // id = 7 AND s = 'row7'` when `id` alone narrows it to
-                // one row. Seeking the components that CAN be probed and
-                // letting the caller re-check the rest is what
-                // PostgreSQL does with a component it cannot use.
-                if schema_cols
+                // Stopping at every locale-collated component cost
+                // sentori's ingest a full scan of `issues` on its first
+                // statement: `WHERE project_id = $1 AND fingerprint = $2`
+                // over `UNIQUE (project_id, fingerprint)`, 10 ms at 20,000
+                // rows against PostgreSQL 18.6's 0.1 ms, growing with the
+                // table.
+                if !schema_cols
                     .get(pos)
-                    .is_some_and(|c| collated_column(c, db_coll).is_some())
+                    .is_some_and(|c| crate::collate::column_key_is_bytewise(c, mysql))
                 {
                     cut_by_collation = true;
                     break;
                 }
-                match eq_keys.iter().find(|(c, _)| *c == pos) {
+                match eq_raw.iter().find(|(c, _)| *c == pos) {
                     Some((_, k)) => prefix.push(k.clone()),
                     None => break,
                 }
@@ -1859,6 +1884,7 @@ pub(crate) fn try_index_seek<'a>(
             // whole tuple, however many components it holds.
             let locs = if !cut_by_collation && prefix.len() == 1 + idx.extra_column_positions.len()
             {
+                crate::bump_counter!(crate::index_access::MULTI_EQ_PROBES);
                 Some(idx.lookup_eq_multi(&prefix).to_vec())
             } else {
                 let multi_cap = best
@@ -3102,6 +3128,15 @@ pub(crate) fn probe_key_for_index(
     let space = probe_space(table, idx, col, mysql)?;
     probe_in_space(&space, col, value)
 }
+
+/// 9.0.3 — full-tuple equality probes of a composite B-tree.
+///
+/// The defect this counts is its absence: a composite index with a text
+/// component was declined on a locale-collated database — every shipped
+/// image — and the seek became a scan. sentori's ingest opens with
+/// `WHERE project_id = $1 AND fingerprint = $2` over
+/// `UNIQUE (project_id, fingerprint)`.
+pub static MULTI_EQ_PROBES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The space one index's entries live in. Decided per INDEX, so a
 /// caller probing in a loop asks once — the join peel probes once per

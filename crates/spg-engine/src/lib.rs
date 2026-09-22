@@ -328,6 +328,7 @@ pub(crate) use ddl::{
 pub(crate) use envelope::{EnvelopeParse, build_envelope, split_envelope};
 use expr_analysis::*;
 pub use expr_index::INDEX_REBUILDS;
+pub use index_access::MULTI_EQ_PROBES;
 use index_access::*;
 pub use join::{ANTI_JOIN_FAST_PATH_FIRED, ANTI_JOIN_FAST_PATH_TRIED};
 pub(crate) use orderby::{
