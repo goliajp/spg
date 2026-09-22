@@ -8,7 +8,7 @@ the current build; this file is a release-organized view.
 
 ---
 
-## [9.0.3] — 2026-09-22
+## [9.0.3] — 2026-09-23
 
 COPY, re-measured against PostgreSQL 18.6 while checking the 9.0.2
 notes on the published 9.0.2 image. Every row below was measured on the
