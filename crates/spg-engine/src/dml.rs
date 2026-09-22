@@ -4218,17 +4218,17 @@ impl Engine {
         if !self.speaks_mysql {
             for col in pre_borrow_column_meta.iter() {
                 if col.auto_increment {
-                    let seq_name = alloc::format!("{}_{}_seq", table_name, col.name);
+                    let seq_name = column_counter_sequence(self.active_catalog(), table_name, col);
                     self.ensure_implicit_sequence(&seq_name);
                 }
             }
         }
         for (i, col) in pre_borrow_column_meta.iter().enumerate() {
             if col.auto_increment
-                && let Some(sd) = self.active_catalog().sequence(&alloc::format!(
-                    "{}_{}_seq",
+                && let Some(sd) = self.active_catalog().sequence(&column_counter_sequence(
+                    self.active_catalog(),
                     table_name,
-                    col.name
+                    col,
                 ))
             {
                 // is_called=false (fresh RESTART / setval(_, false))
@@ -5122,7 +5122,7 @@ impl Engine {
         if !self.speaks_mysql {
             for (i, next) in &auto_cursors_out {
                 if let Some(col) = column_meta.get(*i) {
-                    let seq_name = alloc::format!("{}_{}_seq", stmt.table, col.name);
+                    let seq_name = column_counter_sequence(self.active_catalog(), &stmt.table, col);
                     if self.active_catalog().has_sequence(&seq_name) {
                         let _ =
                             self.active_catalog_mut()
@@ -7050,6 +7050,29 @@ fn explicit_auto_value(raw: &Value<'_>) -> Option<i64> {
         Value::Text(s) => s.trim().parse::<i64>().ok(),
         _ => None,
     }
+}
+
+/// 9.0.2 — the sequence a numbered column draws from.
+///
+/// A `DEFAULT nextval('s')` naming a sequence the schema CREATED draws
+/// from THAT sequence; only a column with no such sequence (a `serial`,
+/// or a default naming its own implicit one) counts in `<table>_<col>_seq`.
+/// Every such column counted in the implicit one, so the named sequence
+/// was never read and never moved. sentori, measured on every build from
+/// 7.40.11 to 9.0.1: `CREATE SEQUENCE s START 100` and a column
+/// `DEFAULT nextval('s')` gave ids 1, 2 where PostgreSQL 18.6 gives
+/// 100, 101 — and two tables sharing `s` collided on their first row.
+pub(crate) fn column_counter_sequence(
+    cat: &spg_storage::Catalog,
+    table: &str,
+    col: &ColumnSchema,
+) -> String {
+    let implicit = alloc::format!("{table}_{}_seq", col.name);
+    col.default_text
+        .as_deref()
+        .and_then(crate::system_catalog::nextval_target)
+        .filter(|named| cat.has_sequence(named))
+        .unwrap_or(implicit)
 }
 
 /// v7.39 (round 433) — the statement-local AUTO_INCREMENT cursor's starting

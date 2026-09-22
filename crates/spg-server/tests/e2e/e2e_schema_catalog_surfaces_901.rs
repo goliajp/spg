@@ -367,3 +367,117 @@ fn a_written_qualifier_beats_the_search_path() {
     // the rule the qualifier is an exception to.
     assert_eq!(one(&mut c, "SELECT b FROM t"), "sa");
 }
+
+/// 9.0.2 — sentori's reply to 9.0.1 §2: a written schema was still the
+/// search path's to reinterpret OUTSIDE DML — in DDL, in a view's body
+/// and in what `pg_dump` reads back. Each expectation is PostgreSQL 18.6's
+/// answer on the same statements.
+#[test]
+fn a_written_schema_is_final_in_ddl_views_and_deparse() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-c9ddl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut c = open(addrs.pgwire.as_ref().unwrap());
+    for sql in [
+        "CREATE SCHEMA sa",
+        "CREATE TABLE public.t (id int PRIMARY KEY, who text)",
+        "CREATE TABLE sa.t (id int PRIMARY KEY, who text)",
+        "INSERT INTO public.t VALUES (1, 'public')",
+        "INSERT INTO sa.t VALUES (1, 'sa')",
+        "CREATE INDEX t_v ON public.t (who)",
+        "CREATE INDEX t_v ON sa.t (who)",
+        "CREATE TABLE sa.s (id serial PRIMARY KEY, v text)",
+        "SET search_path = sa, public",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+
+    // A qualified CREATE lands where it says. 9.0.1 put all four in `sa`.
+    for sql in [
+        "CREATE TABLE public.t2 (i int)",
+        "CREATE INDEX t2_i ON public.t2 (i)",
+        "CREATE VIEW public.v2 AS SELECT who FROM public.t",
+        "CREATE SEQUENCE public.q2",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+    let mut placed = rows(
+        &mut c,
+        "SELECT n.nspname::text || '.' || c.relname::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname IN ('t2', 't2_i', 'v2', 'q2')",
+    );
+    placed.sort();
+    assert_eq!(
+        placed,
+        ["public.q2", "public.t2", "public.t2_i", "public.v2"]
+    );
+
+    // A view's names are bound when it is CREATED. v1 names `public.` and
+    // must read public's row; v3 names nothing and must keep the `sa.t`
+    // the path gave it at CREATE, whatever the reader's path is.
+    assert_eq!(
+        one(&mut c, "CREATE VIEW sa.v1 AS SELECT who FROM public.t"),
+        ""
+    );
+    assert_eq!(one(&mut c, "CREATE VIEW sa.v3 AS SELECT who FROM t"), "");
+    assert_eq!(one(&mut c, "SELECT who FROM sa.v1"), "public");
+    assert_eq!(one(&mut c, "SELECT who FROM sa.v3"), "sa");
+    assert_eq!(one(&mut c, "SET search_path = public"), "");
+    assert_eq!(one(&mut c, "SELECT who FROM sa.v1"), "public");
+    assert_eq!(
+        one(&mut c, "SELECT who FROM sa.v3"),
+        "sa",
+        "bound at CREATE, not at read"
+    );
+
+    // A three-part column reference names the middle part's relation.
+    assert_eq!(one(&mut c, "SELECT public.t.who FROM public.t"), "public");
+
+    // What `pg_dump` reads, under its empty path. Each of these named
+    // `public`'s object for `sa`'s — the oid was turned into a name and
+    // searched again — or wrote `public.sa.t`, which is no name at all.
+    assert_eq!(one(&mut c, "SET search_path = ''"), "");
+    let sa_view = one(
+        &mut c,
+        "SELECT pg_get_viewdef(c.oid) FROM pg_class c JOIN pg_namespace n \
+         ON n.oid = c.relnamespace WHERE n.nspname = 'sa' AND c.relname = 'v3'",
+    );
+    assert!(sa_view.contains("FROM sa.t"), "{sa_view}");
+    let mut defs = rows(
+        &mut c,
+        "SELECT pg_get_indexdef(indexrelid) FROM pg_index i JOIN pg_class c \
+         ON c.oid = i.indexrelid WHERE c.relname = 't_v'",
+    );
+    defs.sort();
+    assert_eq!(
+        defs,
+        [
+            "CREATE INDEX t_v ON public.t USING btree (who)",
+            "CREATE INDEX t_v ON sa.t USING btree (who)",
+        ]
+    );
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'sa.s'::regclass"
+        ),
+        "nextval('sa.s_id_seq'::regclass)"
+    );
+    // …and bare again once the path reaches the sequence, as PostgreSQL
+    // writes it.
+    assert_eq!(one(&mut c, "SET search_path = sa, public"), "");
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef \
+             WHERE adrelid = 'sa.s'::regclass"
+        ),
+        "nextval('s_id_seq'::regclass)"
+    );
+}

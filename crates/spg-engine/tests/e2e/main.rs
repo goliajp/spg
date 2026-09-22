@@ -909,6 +909,7 @@ mod e2e_scan_memory_round656;
 mod e2e_security_definer_round334;
 mod e2e_seek_exactness;
 mod e2e_seek_skips_dead_round490;
+mod e2e_sentori_902;
 mod e2e_sequence_counter_900;
 mod e2e_sequence_functions_round244;
 mod e2e_sequence_last_value;

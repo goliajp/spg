@@ -1167,7 +1167,7 @@ pub(crate) fn run(
                 schema_cols
                     .iter()
                     .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
-                    .and_then(|sc| sc.collation_name.clone())
+                    .and_then(crate::collate::column_implicit_collation)
             });
             // …and a `name` COLUMN takes no database collation: its
             // type's own is `C`. A cast to `name` does NOT suppress it
@@ -1226,7 +1226,7 @@ pub(crate) fn run(
                 schema_cols
                     .iter()
                     .find(|sc| sc.name.eq_ignore_ascii_case(&c.name))
-                    .and_then(|sc| sc.collation_name.clone())
+                    .and_then(crate::collate::column_implicit_collation)
                     .or_else(|| db_collation.map(alloc::string::String::from))
                     .filter(|n| crate::collate::is_supported(n))
             })

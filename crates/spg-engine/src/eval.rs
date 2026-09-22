@@ -2377,7 +2377,7 @@ fn collate_compare_hook(
     };
     let resolve = |c: &spg_sql::ast::ColumnName| -> Option<alloc::string::String> {
         let pos = find_column_pos(c, ctx)?;
-        ctx.columns.get(pos)?.collation_name.clone()
+        crate::collate::column_implicit_collation(ctx.columns.get(pos)?)
     };
     let derived = crate::collate_derive::derive(lhs, &resolve)
         .combine_pub(crate::collate_derive::derive(rhs, &resolve));
@@ -2476,7 +2476,7 @@ fn collate_compare_hook(
 fn greatest_least_collation(args: &[Expr], ctx: &EvalContext<'_>) -> Option<alloc::string::String> {
     let resolve = |c: &spg_sql::ast::ColumnName| -> Option<alloc::string::String> {
         let pos = find_column_pos(c, ctx)?;
-        ctx.columns.get(pos)?.collation_name.clone()
+        crate::collate::column_implicit_collation(ctx.columns.get(pos)?)
     };
     let derived = args
         .iter()

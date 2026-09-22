@@ -1408,7 +1408,10 @@ pub(crate) enum OrderKey {
 /// the ordinary key comparison, which is what it did before this
 /// existed.
 fn original_after_key(key: &[u8]) -> Option<&str> {
-    let nul = key.iter().position(|b| *b == 0)?;
+    // 9.0.2 — the LAST NUL: a key now carries the punctuation level
+    // between two separators, and the original string (which cannot hold
+    // a NUL) follows the second.
+    let nul = key.iter().rposition(|b| *b == 0)?;
     core::str::from_utf8(key.get(nul + 1..)?).ok()
 }
 
@@ -2070,7 +2073,7 @@ pub(crate) fn order_by_collations(
             // that is a property of the expression, not of the key's shape.
             let derived = crate::collate_derive::derive(&o.expr, &|c| {
                 let pos = eval::find_column_pos(c, ctx)?;
-                ctx.columns.get(pos)?.collation_name.clone()
+                crate::collate::column_implicit_collation(ctx.columns.get(pos)?)
             });
             // Two different implicit collations do not silently pick a
             // winner. PG: `collation mismatch between implicit collations`.
