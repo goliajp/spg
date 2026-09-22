@@ -1984,6 +1984,18 @@ impl Engine {
                 self.abort_writer_version(v);
             }
         }
+        // 9.0.3 — an autocommit statement's row locks end with it, as its
+        // implicit transaction does in PostgreSQL. Only the UPDATE and
+        // DELETE paths released them, so `SELECT … FOR UPDATE` outside a
+        // transaction left the row locked and the SAME connection's next
+        // statement waited for a lock nobody would release:
+        //
+        //   SELECT id FROM t WHERE id = 1 FOR UPDATE;   1
+        //   UPDATE t SET v = v + 1 WHERE id = 1;        canceling statement
+        //                                               due to statement timeout
+        //
+        // PostgreSQL 18.6 answers `UPDATE 1`.
+        self.release_autocommit_stmt_locks();
         if result.is_ok() {
             self.record_tx_stmt(&tx_class, takes_snapshot);
             self.record_tx_reads(read_tables);
