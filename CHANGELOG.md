@@ -8,6 +8,86 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [Unreleased]
+
+Everything below was reported by sentori against the published 9.0.1
+(`sentori/tmp/spg-repro/REPLY-2026-09-22-v9.0.1.md`) or found by
+widening their probes one axis, and every row was measured against
+PostgreSQL 18.6 before and after. On the candidate image, sentori's own
+`schema-dump-probe.sh` and `our-schema-dump-probe.sh` pass end to end,
+and `run-all.sh` is green except the two repros they file as known
+(one database per datadir; EXPLAIN's `Buffers` line).
+
+**Correction to 9.0.1's notes.** 9.0.1 said a two-schema dump "restores
+clean into PostgreSQL". It did not: the check compared SPG's dump with a
+re-dump of a restore of that same dump, which only proves PostgreSQL can
+repeat what SPG wrote. The reference is PostgreSQL's dump of the same
+source SQL, and against it the 9.0.1 dump differed.
+
+### Fixed — a written schema was still overridden by `search_path`
+
+9.0.1 fixed this for DML. With `search_path = sa, public`, and on 9.0.1:
+
+* `CREATE TABLE / INDEX / VIEW / SEQUENCE public.x` created the object
+  in `sa`.
+* A view's names were bound when the view was READ: `CREATE VIEW sa.v1
+  AS … FROM public.t` read `sa`'s table, and an unqualified view body
+  changed with the reader's path. Views are bound at CREATE now, as in
+  PostgreSQL.
+* `pg_dump` wrote `sa`'s view body, index and serial default into
+  `public` (`pg_get_viewdef(oid)` / `pg_get_indexdef(oid)` turned the
+  oid into a name and searched again), so the dump did not restore.
+* `SELECT public.t.who` answered `missing FROM-clause entry`.
+* REFRESH, DROP MATERIALIZED VIEW / VIEW / SEQUENCE / INDEX, CLUSTER,
+  REINDEX, ALTER INDEX, ALTER VIEW, ALTER SEQUENCE and COMMENT ON each
+  lost or misread the schema; `ALTER VIEW sa.v RENAME TO` reported
+  success and renamed nothing; `ALTER TABLE sa.t RENAME TO` moved the
+  table into `public`.
+* A materialized view in a schema was listed as a table; constraint
+  definitions of a table in a schema came back empty or broken; the
+  sequence a serial column uses in `sa` was recreated in `public` when
+  SPG restored its own dump.
+
+SPG now restores its own dump of a two-schema database, and the result
+dumps identically.
+
+### Fixed — a column `DEFAULT nextval('s')` ignored `s`
+
+Every build since 7.40.11: the column counted from its own counter, so
+a `START 100` sequence gave ids 1, 2, and two tables sharing one
+sequence collided on their first row. It now draws from the sequence it
+names (PostgreSQL's 1, 2, 50 after an explicit 50, where SPG gave 1, 50,
+51 — recorded delta RD-12 is closed for this shape).
+
+### Fixed — COPY read its options out of table and column names
+
+The option group was searched for across the whole statement, so a
+table or column whose name contains `with` (`withcheck`, `width`) had
+its column list read as options: `COPY t (id, width) TO STDOUT`
+answered `option "id" not recognized`. A refused option also sent
+ReadyForQuery twice, which desynchronises a client. `COPY t (a, b) TO
+STDOUT` ignored its column list.
+
+### Fixed — ordering
+
+* `_` before a capital letter collated unlike glibc: `'_Z' < 'Z'` was
+  false (every build since 7.38.6).
+* `name || text` ordered by the locale; a `name` column brings `C`.
+
+### Fixed — smaller
+
+* An error at Parse carried no position (every driver, `\gdesc`,
+  `\bind`).
+* `SELECT s COLLATE "C"` named its column `?column?`.
+* `DROP SCHEMA … CASCADE` now names what it dropped; without CASCADE
+  the refusal lists each dependent, in PostgreSQL's words.
+* A `serial` column's sequence is `integer` (it was always `bigint`,
+  so a dump lost `AS integer`).
+* `DROP TABLE` left a serial column's sequence behind, and a new table
+  of the same shape went on numbering from it.
+* A table rename changed derived constraint names (`t_pkey` became
+  `t3_pkey`); PostgreSQL keeps them.
+
 ## [9.0.1] — 2026-09-22
 
 ### Fixed — pg_dump SEGFAULTED on a sequence outside `public`
