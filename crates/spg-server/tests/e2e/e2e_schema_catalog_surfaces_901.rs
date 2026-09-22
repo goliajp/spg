@@ -481,3 +481,202 @@ fn a_written_schema_is_final_in_ddl_views_and_deparse() {
         "nextval('s_id_seq'::regclass)"
     );
 }
+
+/// 9.0.2 — the same question one axis wider than sentori asked it: every
+/// statement a migration or `pg_dump` sends that NAMES a relation, with a
+/// schema written in front of it. Each expectation is PostgreSQL 18.6's.
+#[test]
+fn every_statement_that_names_a_relation_keeps_its_schema() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-c9all-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut c = open(addrs.pgwire.as_ref().unwrap());
+    for sql in [
+        "CREATE SCHEMA sw",
+        "CREATE TABLE public.t (id int PRIMARY KEY, v text)",
+        "CREATE TABLE sw.t (id int PRIMARY KEY, v text, CHECK (id > 0))",
+        "INSERT INTO public.t VALUES (1, 'p')",
+        "INSERT INTO sw.t VALUES (1, 's')",
+        "CREATE TABLE sw.child (id int PRIMARY KEY, pid int REFERENCES public.t(id))",
+        "CREATE VIEW sw.v AS SELECT id FROM sw.t",
+        "CREATE SEQUENCE sw.q",
+        "CREATE INDEX ix ON sw.t (v)",
+        "CREATE INDEX ix ON public.t (v)",
+        "CREATE MATERIALIZED VIEW sw.m AS SELECT id FROM sw.t",
+        "COMMENT ON TABLE sw.t IS 'sw table'",
+        "COMMENT ON TABLE public.t IS 'public table'",
+        "COMMENT ON INDEX sw.ix IS 'sw index'",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+
+    // A materialized view in a schema is one (it was `relkind r`).
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT relkind::text FROM pg_class WHERE oid = 'sw.m'::regclass"
+        ),
+        "m"
+    );
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT schemaname FROM pg_matviews WHERE matviewname = 'm'"
+        ),
+        "sw"
+    );
+
+    // A comment lands on the object it names, not on `public`'s namesake.
+    assert_eq!(
+        one(&mut c, "SELECT obj_description('sw.t'::regclass)"),
+        "sw table"
+    );
+    assert_eq!(
+        one(&mut c, "SELECT obj_description('public.t'::regclass)"),
+        "public table"
+    );
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT d.description FROM pg_description d JOIN pg_class c ON c.oid = d.objoid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relname = 'ix' AND n.nspname = 'sw'"
+        ),
+        "sw index"
+    );
+
+    // A constraint of a table in a schema deparses whole: the CHECK was
+    // empty and the foreign key read `REFERENCES public.sa`.
+    assert_eq!(one(&mut c, "SET search_path = ''"), "");
+    let mut defs = rows(
+        &mut c,
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conrelid IN ('sw.t'::regclass, 'sw.child'::regclass) AND contype IN ('c', 'f')",
+    );
+    defs.sort();
+    assert_eq!(
+        defs,
+        [
+            "CHECK ((id > 0))",
+            "FOREIGN KEY (pid) REFERENCES public.t(id)"
+        ]
+    );
+    assert_eq!(one(&mut c, "RESET search_path"), "");
+
+    // The statements that name a relation, each with its schema.
+    for sql in [
+        "ALTER INDEX sw.ix RENAME TO ix2",
+        "ALTER VIEW sw.v RENAME TO v2",
+        "ALTER SEQUENCE sw.q RESTART WITH 5",
+        "REFRESH MATERIALIZED VIEW sw.m",
+        "CLUSTER sw.t USING t_pkey",
+        "REINDEX TABLE sw.t",
+        "ALTER TABLE sw.t RENAME TO t3",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+    assert_eq!(one(&mut c, "SELECT nextval('sw.q')"), "5");
+    let mut listed = rows(
+        &mut c,
+        "SELECT c.relname::text FROM pg_class c JOIN pg_namespace n \
+         ON n.oid = c.relnamespace WHERE n.nspname = 'sw'",
+    );
+    listed.sort();
+    // `t_pkey` keeps its name through the table's rename, as it does in
+    // PostgreSQL; `ix` in `public` is not the one renamed.
+    assert_eq!(
+        listed,
+        ["child", "child_pkey", "ix2", "m", "q", "t3", "t_pkey", "v2"]
+    );
+    assert_eq!(
+        one(&mut c, "SELECT count(*) FROM pg_class WHERE relname = 'ix'"),
+        "1"
+    );
+    for sql in [
+        "DROP MATERIALIZED VIEW sw.m",
+        "DROP VIEW sw.v2",
+        "DROP SEQUENCE sw.q",
+        "DROP INDEX sw.ix2",
+        "DROP TABLE sw.child",
+        "DROP TABLE sw.t3",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+    assert_eq!(
+        one(
+            &mut c,
+            "SELECT count(*) FROM pg_class c JOIN pg_namespace n \
+             ON n.oid = c.relnamespace WHERE n.nspname = 'sw'"
+        ),
+        "0"
+    );
+    assert_eq!(one(&mut c, "SELECT count(*) FROM public.t"), "1");
+}
+
+/// 9.0.2 — `COPY … TO STDOUT` with a column list, over the wire.
+///
+/// The option group was searched for across the WHOLE statement, so a
+/// table or column whose name contains `with` had its column list read as
+/// options — `COPY sw.withcheck (id, u) TO stdout`, which is what `pg_dump`
+/// sends, answered `option "id" not recognized` — and a refused option
+/// then sent ReadyForQuery twice. A TO column list was also ignored.
+#[test]
+fn copy_to_reads_its_own_column_list_and_nothing_else() {
+    let dir = crate::common::tmp_base().join(format!("spg-e2e-c9copy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (raw, addrs) = common::ServerBuilder::new()
+        .arg_path(&dir.join("spg.db"))
+        .with_pgwire()
+        .spawn();
+    let _child = common::ChildGuard(raw);
+    let mut c = open(addrs.pgwire.as_ref().unwrap());
+    for sql in [
+        "CREATE TABLE withcheck (id int, width int, extra int)",
+        "INSERT INTO withcheck VALUES (1, 2, 3)",
+    ] {
+        assert_eq!(one(&mut c, sql), "", "{sql}");
+    }
+    let out = copy_out(&mut c, "COPY withcheck (id, width) TO stdout");
+    assert_eq!(out, Ok("1\t2\n".to_string()));
+    // A refused option is one error and one ReadyForQuery: the next
+    // statement on the same connection answers normally.
+    assert!(
+        copy_out(&mut c, "COPY withcheck (id) TO stdout WITH (BOGUS 1)")
+            .is_err_and(|e| e.contains("option \"bogus\" not recognized"))
+    );
+    assert_eq!(one(&mut c, "SELECT 42"), "42");
+}
+
+/// A simple-query COPY TO: the data it streamed, or the error message.
+fn copy_out(s: &mut TcpStream, sql: &str) -> Result<String, String> {
+    let mut body = Vec::new();
+    body.extend_from_slice(sql.as_bytes());
+    body.push(0);
+    send_msg(s, b'Q', &body);
+    let mut data = String::new();
+    let mut err = None;
+    let mut readies = 0;
+    loop {
+        let m = read_message(s);
+        match m.ty {
+            b'd' => data.push_str(&String::from_utf8_lossy(&m.body)),
+            b'E' => {
+                err = Some(String::from_utf8_lossy(&m.body).into_owned());
+            }
+            b'Z' => {
+                readies += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(readies, 1, "{sql}: exactly one ReadyForQuery");
+    match err {
+        Some(e) => Err(e),
+        None => Ok(data),
+    }
+}

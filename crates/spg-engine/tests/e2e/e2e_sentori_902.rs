@@ -161,3 +161,25 @@ fn dropping_a_table_drops_the_sequence_its_column_owns() {
     run(&mut e, "INSERT INTO d902 (v) VALUES ('c')");
     assert_eq!(cells(&mut e, "SELECT id FROM d902"), "1");
 }
+
+// DROP SCHEMA without CASCADE names each dependent, in PostgreSQL's words.
+#[test]
+fn drop_schema_restrict_names_each_dependent() {
+    let mut e = Engine::new();
+    run(&mut e, "CREATE SCHEMA r902");
+    run(&mut e, "CREATE TABLE r902.t (id int)");
+    run(&mut e, "CREATE VIEW r902.v AS SELECT id FROM r902.t");
+    let err = e
+        .execute("DROP SCHEMA r902")
+        .expect_err("dependents")
+        .to_string();
+    assert!(
+        err.contains(
+            "cannot drop schema r902 because other objects depend on it\n\
+             DETAIL:  table r902.t depends on schema r902\n\
+             view r902.v depends on schema r902\n\
+             HINT:  Use DROP ... CASCADE to drop the dependent objects too."
+        ),
+        "{err}"
+    );
+}

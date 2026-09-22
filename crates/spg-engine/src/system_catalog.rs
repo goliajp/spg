@@ -5539,7 +5539,11 @@ pub(crate) fn synth_pg_class(
         // table in SPG, and that showed through: it reported relkind 'r',
         // so a tool listing `WHERE relkind = 'm'` found none of them and a
         // migration tool would recreate it as a plain table.
-        let relkind: &'static str = if cat.materialized_views().contains_key(&tname) {
+        // 9.0.2 (C9) — by the KEY, which is what the registry is keyed by:
+        // asking with the readable name reported a materialized view in a
+        // schema as an ordinary table (`relkind = r`), so `pg_dump` wrote
+        // `CREATE TABLE sa.mv` and no REFRESH.
+        let relkind: &'static str = if cat.materialized_views().contains_key(&stored) {
             "m"
         } else {
             match &schema_ref.partition_role {
@@ -21604,7 +21608,8 @@ pub(crate) fn synth_pg_matviews(
             continue;
         };
         let Some(t) = cat.get(&stored) else { continue };
-        let Some(body) = cat.materialized_views().get(&name) else {
+        // 9.0.2 (C9) — by the key; see `synth_pg_class`.
+        let Some(body) = cat.materialized_views().get(&stored) else {
             continue;
         };
         rows.push(Row::new(alloc::vec![
@@ -22503,6 +22508,17 @@ pub(crate) fn pg_description_schema() -> Vec<ColumnSchema> {
     ]
 }
 
+/// 9.0.2 (C9) — the index a written `schema.name` names. An index's name
+/// is unique only inside its schema, and it lives in its TABLE's schema,
+/// so `t_v` in `public` and `t_v` in `sa` are told apart by their tables.
+pub(crate) fn index_for_key(cat: &Catalog, key: &str) -> Option<CatalogIndex> {
+    let (schema, bare) = spg_sql::namespace::split_key(key);
+    catalog_indexes(cat).into_iter().find(|ci| {
+        cat.listed_name(&ci.name) == Some(bare)
+            && spg_sql::namespace::schema_of(&ci.table) == schema
+    })
+}
+
 pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let cols = pg_description_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -22530,7 +22546,11 @@ pub(crate) fn synth_pg_description(cat: &Catalog) -> (Vec<ColumnSchema>, Vec<Row
             (name, 0)
         };
         let is_relation = matches!(kind, "table" | "view" | "index" | "sequence" | "column");
-        let objoid = if is_relation {
+        let objoid = if kind == "index" {
+            index_for_key(cat, relname)
+                .and_then(|ci| i32::try_from(ci.oid).ok())
+                .unwrap_or(0)
+        } else if is_relation {
             crate::eval::regclass_name_to_oid(cat, relname)
                 .and_then(|o| i32::try_from(o).ok())
                 .unwrap_or(0)

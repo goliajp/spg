@@ -641,19 +641,33 @@ fn handle_pg_simple_query(
                 handle_copy_to_file(stream, state, role, &spec)?;
             }
             CopyIntent::BadOption(name) => {
+                // 9.0.2 — no ReadyForQuery here: the one after this match
+                // closes every COPY, and a second one reached the client
+                // while it was idle (`message type 0x5a arrived from server
+                // while idle`), desynchronising the session.
                 send_error(
                     stream,
                     "42601",
                     &format!("option \"{name}\" not recognized"),
                 )?;
-                send_ready_for_query(stream, *tx_state)?;
             }
-            CopyIntent::To(table, opts) => {
+            CopyIntent::To(table, columns, opts) => {
                 // 9.0.0 (C9) — the relation is read back as SQL, so the
                 // key goes back to the spelling a parser accepts: the
                 // separator it carries the schema with is not a
                 // character an identifier may contain.
-                let sql = format!("SELECT * FROM {}", spg_sql::namespace::display_key(&table));
+                let projection = match &columns {
+                    Some(cols) => cols
+                        .iter()
+                        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    None => "*".to_string(),
+                };
+                let sql = format!(
+                    "SELECT {projection} FROM {}",
+                    spg_sql::namespace::display_key(&table)
+                );
                 handle_copy_to_stdout(
                     stream,
                     state,
@@ -5629,7 +5643,9 @@ enum CopyIntent {
     // silently dropped: `COPY t TO STDOUT WITH (FORMAT csv, HEADER)` streamed
     // plain text). `ToQuery` is the `COPY (<query>) TO STDOUT` form — the
     // inner SQL is run and its result set streamed in COPY format.
-    To(String, CopyOptions),
+    // 9.0.2 — and the column list, which was parsed and dropped: `COPY
+    // t (a, b) TO STDOUT` streamed every column of `t`.
+    To(String, Option<Vec<String>>, CopyOptions),
     ToQuery(String, CopyOptions),
     // v7.39 (round 251) — `COPY t FROM '<file>'`: the SERVER process
     // reads the file, PG semantics. Parsed by the engine's SQL parser
@@ -5795,6 +5811,13 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
         return None;
     }
     let endpoint = &rest[ep_start..i];
+    // 9.0.2 — the OPTIONS follow the endpoint, and only there may they be
+    // looked for. The search ran over the whole statement, so a table or
+    // column whose name contains `with` — `withcheck`, `width`, `without`
+    // — had its column list read as the option group: `COPY sa.withcheck
+    // (id, u) TO stdout`, which is what `pg_dump` sends for every table,
+    // answered `option "id" not recognized` and the dump stopped.
+    let options_tail = &trimmed[trimmed.len() - rest.len() + i..];
     // v7.39 (round 251/252) — a quoted endpoint is the file form; the
     // engine's SQL parser owns the grammar.
     if dir == "from" && endpoint.starts_with('\'') {
@@ -5809,13 +5832,13 @@ fn parse_copy_intent(sql: &str) -> Option<CopyIntent> {
             // SQL: option VALUES like `NULL 'NULLTOKEN'` / DELIMITER '|' are
             // case-sensitive (the null token must match the data byte-for-byte),
             // so only KEYS get lowercased inside the parser.
-            match parse_copy_options_checked(trimmed) {
+            match parse_copy_options_checked(options_tail) {
                 Ok(opts) => Some(CopyIntent::From(table, column_list, opts)),
                 Err(bad) => Some(CopyIntent::BadOption(bad)),
             }
         }
-        ("to", "stdout") => match parse_copy_options_checked(trimmed) {
-            Ok(opts) => Some(CopyIntent::To(table, opts)),
+        ("to", "stdout") => match parse_copy_options_checked(options_tail) {
+            Ok(opts) => Some(CopyIntent::To(table, column_list, opts)),
             Err(bad) => Some(CopyIntent::BadOption(bad)),
         },
         _ => None,
@@ -9545,7 +9568,7 @@ mod tests {
     fn parse_copy_to_stdout_with_column_list() {
         let sql = "COPY t (a, b) TO STDOUT";
         match parse_copy_intent(sql) {
-            Some(CopyIntent::To(table, _)) => assert_eq!(table, "t"),
+            Some(CopyIntent::To(table, _, _)) => assert_eq!(table, "t"),
             other => panic!("expected To(t), got {other:?}"),
         }
     }
