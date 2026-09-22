@@ -1179,8 +1179,22 @@ impl Parser {
         }
         // COLUMN wants `table.column`; every other kind wants a bare name.
         let want = if kind == "column" { 2 } else { 1 };
+        // 9.0.2 (C9) — a RELATION's schema is part of its identity, so it
+        // is kept as a key rather than dropped: `COMMENT ON TABLE sa.t`
+        // landed on `public.t` (overwriting its comment), and every
+        // comment on an index, view, sequence or column in `sa` read back
+        // under `public`'s object of the same name.
+        let relation_kind = matches!(
+            kind.as_str(),
+            "table" | "view" | "sequence" | "index" | "column" | "materialized" | "foreign"
+        );
+        let schema = (relation_kind && !self.mysql_dialect && parts.len() > want)
+            .then(|| parts[parts.len() - want - 1].clone());
         while parts.len() > want {
             parts.remove(0);
+        }
+        if let Some(schema) = schema {
+            parts[0] = crate::namespace::qualified_key(&schema, &parts[0]);
         }
         let name = parts.join(".");
         // v7.39 (round 710) — `COMMENT ON FUNCTION f(int, text) IS …`.
@@ -1984,15 +1998,23 @@ impl Parser {
                     if after_name_kw && seq.is_none() {
                         self.advance();
                         let mut name = s;
-                        // `SEQUENCE NAME public.groups_id_seq` — keep
-                        // the bare name, drop qualifiers.
+                        let mut schema: Option<String> = None;
+                        // `SEQUENCE NAME public.groups_id_seq`.
+                        // 9.0.2 (C9) — the schema is kept: it is part of
+                        // the sequence's identity, and dropping it created
+                        // `sa`'s serial sequence in `public` on restore.
                         while matches!(self.peek(), Token::Dot) {
                             self.advance();
                             if let Token::Ident(n) | Token::QuotedIdent(n) = self.advance() {
-                                name = n;
+                                schema = Some(core::mem::replace(&mut name, n));
                             }
                         }
-                        seq = Some(name);
+                        seq = Some(match schema {
+                            Some(sch) if !self.mysql_dialect => {
+                                crate::namespace::qualified_key(&sch, &name)
+                            }
+                            _ => name,
+                        });
                         after_name_kw = false;
                         continue;
                     }
@@ -2007,10 +2029,8 @@ impl Parser {
                 Token::String(s) => {
                     if seq.is_none() {
                         // `nextval('public.groups_id_seq'::regclass)`
-                        let bare = s
-                            .rsplit_once('.')
-                            .map_or_else(|| s.clone(), |(_, b)| b.to_string());
-                        seq = Some(bare);
+                        // 9.0.2 (C9) — as a key, schema kept; see above.
+                        seq = Some(crate::namespace::key_from_text(&s));
                     }
                     self.advance();
                 }
@@ -3356,7 +3376,7 @@ impl Parser {
                         self.advance();
                         let if_exists_at = self.pos;
                         let if_exists = self.consume_if_exists();
-                        let name = self.expect_ident_like()?;
+                        let name = self.expect_relation_name()?;
                         // v7.39.7 — MySQL's own spelling, which SPG
                         // refused.
                         //
@@ -3486,10 +3506,10 @@ impl Parser {
                         }
                         self.advance();
                         let if_exists = self.consume_if_exists();
-                        let mut names = vec![self.expect_ident_like()?];
+                        let mut names = vec![self.expect_relation_name()?];
                         while matches!(self.peek(), Token::Comma) {
                             self.advance();
-                            names.push(self.expect_ident_like()?);
+                            names.push(self.expect_relation_name()?);
                         }
                         if matches!(
                             self.peek(),
@@ -3505,10 +3525,10 @@ impl Parser {
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("view") => {
                         self.advance();
                         let if_exists = self.consume_if_exists();
-                        let mut names = vec![self.expect_ident_like()?];
+                        let mut names = vec![self.expect_relation_name()?];
                         while matches!(self.peek(), Token::Comma) {
                             self.advance();
-                            names.push(self.expect_ident_like()?);
+                            names.push(self.expect_relation_name()?);
                         }
                         let cascade = self.consume_cascade_or_restrict();
                         Ok(Statement::DropView {
@@ -3523,10 +3543,10 @@ impl Parser {
                     Token::Ident(s) | Token::QuotedIdent(s) if s.eq_ignore_ascii_case("sequence") => {
                         self.advance();
                         let if_exists = self.consume_if_exists();
-                        let mut names = vec![self.expect_ident_like()?];
+                        let mut names = vec![self.expect_relation_name()?];
                         while matches!(self.peek(), Token::Comma) {
                             self.advance();
-                            names.push(self.expect_ident_like()?);
+                            names.push(self.expect_relation_name()?);
                         }
                         if matches!(
                             self.peek(),
@@ -3806,7 +3826,7 @@ impl Parser {
                 {
                     self.advance();
                 }
-                let name = self.expect_ident_like()?;
+                let name = self.expect_relation_name()?;
                 let with_data = self.parse_optional_with_data(true)?;
                 Ok(Statement::RefreshMaterializedView { name, with_data })
             }
@@ -6634,6 +6654,18 @@ impl Parser {
         }
         // The object name, then a function's argument list.
         i += 1;
+        // 9.0.2 (C9) — a QUALIFIED name is three tokens, and the lookahead
+        // stepped over one: `ALTER VIEW sw.v RENAME TO v2` missed this arm
+        // and fell into the pg_dump no-op tail, which reported success and
+        // renamed nothing.
+        while matches!(self.tokens.get(i), Some(Token::Dot))
+            && matches!(
+                self.tokens.get(i + 1),
+                Some(Token::Ident(_) | Token::QuotedIdent(_))
+            )
+        {
+            i += 2;
+        }
         if matches!(self.tokens.get(i), Some(Token::LParen)) {
             let mut depth = 0i32;
             while let Some(t) = self.tokens.get(i) {
@@ -6699,7 +6731,12 @@ impl Parser {
 
     fn parse_alter_sequence_after_keyword(&mut self) -> Result<Statement, ParseError> {
         let if_exists = self.parse_if_exists();
-        let name = self.expect_ident_like()?;
+        // 9.0.2 (C9) — a RELATION name: the schema is part of it.
+        // `expect_ident_like` strips it, so `pg_dump`'s `ALTER SEQUENCE
+        // sa.s_id_seq OWNED BY sa.s.id` looked for `s_id_seq` on the path
+        // and a dump of a serial in `sa` did not restore into SPG
+        // (sentori's schema-dump-probe, 9.0.2 candidate).
+        let name = self.expect_relation_name()?;
         // 8.0.3 — `OWNER TO <role>`, which every `pg_dump` of a table with a
         // serial column writes. It was a syntax error, so such a dump did
         // not restore. The role must exist; the owner itself is not
@@ -11430,7 +11467,13 @@ impl Parser {
                         crate::ast::AlterObjectKind::MaterializedView
                     }
                 };
-                let name = self.expect_ident_like()?;
+                // 9.0.2 (C9) — a view's name is a relation name; its
+                // schema is kept. A function keeps the older reading.
+                let name = if matches!(kind, crate::ast::AlterObjectKind::Function) {
+                    self.expect_ident_like()?
+                } else {
+                    self.expect_relation_name()?
+                };
                 if matches!(self.peek(), Token::LParen) {
                     self.skip_balanced_parens();
                 }
@@ -11504,7 +11547,8 @@ impl Parser {
         } else {
             false
         };
-        let name = self.expect_ident_like()?;
+        // 9.0.2 (C9) — a relation name: the schema picks the index.
+        let name = self.expect_relation_name()?;
         // v7.16.2 — RENAME TO new_name shape (mailrs migrate-042).
         // Detect BEFORE the REBUILD path so the existing REBUILD
         // arm stays untouched.
@@ -15501,10 +15545,10 @@ impl Parser {
     /// The next token as a relation / schema name, when there is one.
     fn take_optional_maintain_name(&mut self) -> Option<alloc::string::String> {
         match self.peek() {
-            Token::Ident(_) | Token::QuotedIdent(_) => match self.advance() {
-                Token::Ident(n) | Token::QuotedIdent(n) => Some(n),
-                _ => None,
-            },
+            // 9.0.2 (C9) — a relation name, schema kept. One token was
+            // read, so `CLUSTER sw.t` / `REINDEX TABLE sw.t` named a
+            // relation called `sw` and answered that it did not exist.
+            Token::Ident(_) | Token::QuotedIdent(_) => self.expect_relation_name().ok(),
             _ => None,
         }
     }

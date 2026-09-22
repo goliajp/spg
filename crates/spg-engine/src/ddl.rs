@@ -2782,13 +2782,12 @@ impl Engine {
                 }
             }
             "index" => {
-                let found = cat.table_names().iter().any(|tn| {
-                    cat.get(tn)
-                        .is_some_and(|t| t.indices().iter().any(|i| i.name == name))
-                });
-                if !found {
+                // 9.0.2 (C9) — by the index's own schema; see
+                // `system_catalog::index_for_key`.
+                if crate::system_catalog::index_for_key(cat, name).is_none() {
                     return Err(EngineError::Unsupported(alloc::format!(
-                        "relation {name:?} does not exist"
+                        "relation {:?} does not exist",
+                        spg_sql::namespace::display_key(name)
                     )));
                 }
             }
@@ -3058,11 +3057,60 @@ impl Engine {
         // helper updates the schema + by_name index +
         // dangling FK / trigger references in one
         // atomic step.
-        let old = tbl.to_string();
+        // 9.0.2 (C9) — a rename keeps the relation in its schema: `ALTER
+        // TABLE sw.t RENAME TO t3` names `sw.t3` in PostgreSQL 18.6. The
+        // new name went in bare, which moved the table into `public`
+        // (measured: `DROP TABLE sw.t3` then answered that it did not
+        // exist). The new key is the old one with its last part replaced,
+        // so the schema — and the database, when there is one — stay.
+        let old = self
+            .active_catalog()
+            .get(tbl)
+            .map_or_else(|| tbl.to_string(), |t| t.schema().name.clone());
+        let new = match old.rfind(spg_sql::namespace::SEP) {
+            Some(i) => alloc::format!("{}{new}", &old[..=i]),
+            None => new,
+        };
         // v7.39 (read01 round 47) — PG rejects a rename onto a name that
         // already names a relation (42P07), including a rename onto the
         // table's own name. SPG used to accept both silently.
-        if self.active_catalog().get(&new).is_some() {
+        // 9.0.2 — a constraint keeps its name through a table rename, as
+        // PostgreSQL's does: `ALTER TABLE t RENAME TO t3` leaves `t_pkey`
+        // called `t_pkey`. SPG derives an undeclared constraint's name
+        // from the table's, so the key became `t3_pkey` — a different
+        // name for the same object, which a later `ALTER TABLE … DROP
+        // CONSTRAINT t_pkey` could not find. The derived names are written
+        // down before the table's name changes.
+        if let Some(tbl) = self.active_catalog().get_written(&old, true) {
+            let bare_old = spg_sql::namespace::bare_of(&old).to_string();
+            let uniq: Vec<String> = tbl
+                .schema()
+                .uniqueness_constraints
+                .iter()
+                .map(|uc| crate::system_catalog::pg_unique_conname(tbl, uc, &bare_old))
+                .collect();
+            let fks: Vec<String> = tbl
+                .schema()
+                .foreign_keys
+                .iter()
+                .map(|fk| crate::system_catalog::pg_fk_conname(tbl, fk, &bare_old))
+                .collect();
+            let checks =
+                crate::system_catalog::pg_check_connames(tbl, &bare_old, &tbl.schema().checks);
+            if let Some(tbl) = self.active_catalog_mut().get_written_mut(&old, true) {
+                let sch = tbl.schema_mut();
+                for (uc, n) in sch.uniqueness_constraints.iter_mut().zip(uniq) {
+                    uc.name.get_or_insert(n);
+                }
+                for (fk, n) in sch.foreign_keys.iter_mut().zip(fks) {
+                    fk.name.get_or_insert(n);
+                }
+                for (ck, n) in sch.checks.iter_mut().zip(checks) {
+                    ck.name.get_or_insert(n);
+                }
+            }
+        }
+        if self.active_catalog().get_written(&new, true).is_some() {
             return Err(EngineError::Unsupported(alloc::format!(
                 "relation {new:?} already exists"
             )));
@@ -3222,7 +3270,27 @@ impl Engine {
         // v7.16.2 — RENAME TO branch (mailrs round-10 migrate-042).
         // IF EXISTS makes a missing index a no-op rather than an
         // error, mirroring PG semantics.
+        // 9.0.2 (C9) — `ALTER INDEX sa.ix …`: the written schema picks the
+        // index's TABLE, and the index is addressed there by its bare name.
+        let (idx_name, on_table) = if spg_sql::namespace::is_qualified(&idx_name) {
+            match crate::system_catalog::index_for_key(self.active_catalog(), &idx_name) {
+                Some(ci) => (
+                    String::from(spg_sql::namespace::bare_of(&idx_name)),
+                    Some(ci.table),
+                ),
+                None => (spg_sql::namespace::display_key(&idx_name), None),
+            }
+        } else {
+            (idx_name, None)
+        };
         if let spg_sql::ast::AlterIndexTarget::Rename { new, if_exists } = target {
+            if let Some(tbl) = &on_table {
+                self.alter_rename_index(tbl, &idx_name, &new)?;
+                return Ok(QueryResult::CommandOk {
+                    affected: 0,
+                    modified_catalog: self.catalog_change_is_committed(),
+                });
+            }
             let renamed = self.active_catalog_mut().rename_index(&idx_name, &new);
             return match renamed {
                 Ok(()) => Ok(QueryResult::CommandOk {
@@ -4220,6 +4288,20 @@ impl Engine {
         // 'ix'` (1091), the same answer as no such index, and a missing
         // TABLE is 1146 — a different error, so the two are kept apart
         // here.
+        // 9.0.2 (C9) — `DROP INDEX sa.ix`: an index lives in its table's
+        // schema, so the written schema picks the TABLE, and the index is
+        // dropped there under its own bare name.
+        let (name, table) = if table.is_none() && spg_sql::namespace::is_qualified(&name) {
+            match crate::system_catalog::index_for_key(self.active_catalog(), &name) {
+                Some(ci) => (
+                    String::from(spg_sql::namespace::bare_of(&name)),
+                    Some(ci.table),
+                ),
+                None => (spg_sql::namespace::display_key(&name), None),
+            }
+        } else {
+            (name, table)
+        };
         let dropped = if let Some(t) = &table {
             match self.active_catalog_mut().drop_named_index_on(t, &name) {
                 Some(d) => d,
@@ -7046,6 +7128,35 @@ impl Engine {
         new_name: &str,
     ) -> Result<(), EngineError> {
         use spg_sql::ast::AlterObjectKind as K;
+        // 9.0.2 (C9) — a relation keeps its schema through a rename: the
+        // new key is the stored key with its last part replaced.
+        let relation_key = |cat: &spg_storage::Catalog| -> Option<String> {
+            match kind {
+                K::View => cat.view(name).map(|v| v.name.clone()),
+                K::MaterializedView => cat
+                    .materialized_views()
+                    .contains_key(name)
+                    .then(|| String::from(name)),
+                K::Sequence => cat.path_key(name).or_else(|| {
+                    cat.sequences_all()
+                        .contains_key(name)
+                        .then(|| String::from(name))
+                }),
+                _ => None,
+            }
+        };
+        let renamed_key = |stored: &str| match stored.rfind(spg_sql::namespace::SEP) {
+            Some(i) => alloc::format!("{}{new_name}", &stored[..=i]),
+            None => String::from(new_name),
+        };
+        let (name, new_name_owned) = match relation_key(self.active_catalog()) {
+            Some(stored) => {
+                let to = renamed_key(&stored);
+                (stored, to)
+            }
+            None => (String::from(name), String::from(new_name)),
+        };
+        let (name, new_name) = (name.as_str(), new_name_owned.as_str());
         let cat = self.active_catalog_mut();
         match kind {
             K::View => cat.rename_view(name, new_name)?,
@@ -7519,11 +7630,21 @@ impl Engine {
             let owned = self.relations_in_schema(name);
             if !owned.is_empty() {
                 if !cascade {
-                    return Err(EngineError::Storage(spg_storage::StorageError::Corrupt(
-                        alloc::format!(
-                            "cannot drop schema {name} because other objects depend on it                              DETAIL: {} objects in schema {name} HINT: Use DROP ... CASCADE                              to drop the dependent objects too.",
-                            owned.len()
-                        ),
+                    // 9.0.2 — PostgreSQL 18.6's own sentence, each dependent
+                    // on its own DETAIL line (measured). The message was a
+                    // Rust string continuation that kept its indentation, so
+                    // it arrived with thirty spaces in the middle and a count
+                    // where PostgreSQL names the objects.
+                    let detail: Vec<String> = self
+                        .cascade_listing(&owned)
+                        .into_iter()
+                        .map(|(kind, obj)| alloc::format!("{kind} {obj} depends on schema {name}"))
+                        .collect();
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "cannot drop schema {name} because other objects depend on it\n\
+                         DETAIL:  {}\n\
+                         HINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                        detail.join("\n")
                     )));
                 }
                 // 9.0.2 — PostgreSQL says what CASCADE took, and sentori

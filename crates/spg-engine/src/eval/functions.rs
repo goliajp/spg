@@ -15965,6 +15965,11 @@ fn apply_function_dispatch(
             // assignment is the single source of truth, so the reverse
             // can never drift from the forward.
             let resolved: String;
+            // 9.0.2 (C9) — an OID names one constraint of ONE table; the
+            // search below is confined to that table. It searched every
+            // table by the constraint's name, and two schemas can each
+            // hold a `t_pkey`.
+            let mut only_table: Option<String> = None;
             let name_arg: &str = match args.first() {
                 None | Some(Value::Null) => return Ok(Value::Null),
                 Some(Value::Text(s)) => s.as_ref(),
@@ -15999,13 +16004,27 @@ fn apply_function_dispatch(
                         Some(Value::Text(s)) => resolved = s.to_string(),
                         _ => return Ok(Value::Null),
                     }
+                    if let Some(Value::BigInt(conrelid)) = row.values.get(8) {
+                        only_table =
+                            crate::system_catalog::relation_key_for_oid(cat, *conrelid);
+                    }
                     resolved.as_str()
                 }
                 Some(_) => return Ok(Value::Null),
             };
             let bare = name_arg.trim_matches('"');
-            for tname in cat.table_names() {
-                let Some(t) = cat.get(&tname) else { continue };
+            for key in cat.table_names() {
+                if only_table.as_ref().is_some_and(|k| *k != key) {
+                    continue;
+                }
+                let Some(t) = cat.get_written(&key, true) else { continue };
+                // 9.0.2 (C9) — a constraint is named after the table's
+                // BARE name, as `synth_pg_constraint` names it; building
+                // it from the key matched nothing for a table in a schema,
+                // and its definition came back empty.
+                let Some(tname) = cat.listed_name(&key).map(String::from) else {
+                    continue;
+                };
                 let cols = &t.schema().columns;
                 let col_name_at = |pos: usize| -> String {
                     cols.get(pos).map_or_else(
@@ -16074,7 +16093,22 @@ fn apply_function_dispatch(
                     let mut def = alloc::format!(
                         "FOREIGN KEY ({}) REFERENCES {}({})",
                         local.join(", "),
-                        crate::qualify::user_object_name(&fk.parent_table, public_hidden_in(ctx)),
+                        // 9.0.2 (C9) — the parent written by its OWN schema:
+                        // prefixing `public.` onto its key wrote
+                        // `REFERENCES public.sa`.
+                        crate::qualify::written_relation_name(
+                            cat,
+                            &fk.parent_table,
+                            true,
+                            public_hidden_in(ctx),
+                        )
+                        .map_or_else(
+                            || crate::qualify::user_object_name(
+                                &fk.parent_table,
+                                public_hidden_in(ctx),
+                            ),
+                            |w| spg_sql::namespace::display_key(&w),
+                        ),
                         parent_names.join(", ")
                     );
                     use spg_storage::FkAction;
@@ -17734,18 +17768,16 @@ fn apply_function_dispatch(
                 });
                 return Ok(found.map_or(Value::Null, |r| r.values[3].clone()));
             }
-            let Some(name) = regclass_name_of(first) else {
+            // 9.0.2 (C9) — a relation's comment is read by its OID, from
+            // `pg_description`, which already maps each stored comment to
+            // the relation it names. Probing the comment store by the NAME
+            // a regclass carries found nothing for a relation in a schema
+            // (the store is keyed by the relation's key, and the name is
+            // `sw.t`) — `obj_description('sw.t'::regclass)` was NULL.
+            let Some(oid) = relation_oid_of_arg(cat, first) else {
                 return Ok(Value::Null);
             };
-            // The catalog arg ('pg_class') distinguishes relations from other
-            // object classes; SPG keys relations as table / view / index /
-            // sequence, so probe each.
-            for kind in ["table", "view", "index", "sequence"] {
-                if let Some(t) = cat.comment(&alloc::format!("{kind}:{name}")) {
-                    return Ok(Value::text::<alloc::string::String>(t.into()));
-                }
-            }
-            Ok(Value::Null)
+            Ok(description_of(cat, oid, 1259, 0))
         }
         "col_description" => {
             let Some(cat) = ctx.catalog else {
@@ -17754,7 +17786,9 @@ fn apply_function_dispatch(
             if args.len() != 2 {
                 return Ok(Value::Null);
             }
-            let Some(tname) = regclass_name_of(&args[0]) else {
+            // 9.0.2 (C9) — by OID, from `pg_description`; see
+            // `obj_description`.
+            let Some(oid) = relation_oid_of_arg(cat, &args[0]) else {
                 return Ok(Value::Null);
             };
             let attnum = match &args[1] {
@@ -17763,22 +17797,10 @@ fn apply_function_dispatch(
                 Value::BigInt(n) => *n,
                 _ => return Ok(Value::Null),
             };
-            let Some(t) = cat.get(&tname) else {
+            let Ok(subid) = i32::try_from(attnum) else {
                 return Ok(Value::Null);
             };
-            // attnum is 1-based over the schema's column order.
-            let Ok(idx) = usize::try_from(attnum - 1) else {
-                return Ok(Value::Null);
-            };
-            let Some(col) = t.schema().columns.get(idx) else {
-                return Ok(Value::Null);
-            };
-            Ok(
-                match cat.comment(&alloc::format!("column:{tname}.{}", col.name)) {
-                    Some(txt) => Value::text::<alloc::string::String>(txt.into()),
-                    None => Value::Null,
-                },
-            )
+            Ok(description_of(cat, oid, 1259, subid))
         }
         "shobj_description" => Ok(Value::Null),
         // acldefault(objtype, owner_oid) — the ACL an object of that
@@ -20972,6 +20994,42 @@ pub(crate) fn returns_void(name: &str) -> bool {
             | "pg_xlog_replay_resume"
             | "setseed"
     )
+}
+
+/// 9.0.2 (C9) — the relation a description function's first argument
+/// names, as an OID: a regclass carries it, a number is it, and a name is
+/// resolved the way `::regclass` resolves one.
+fn relation_oid_of_arg(cat: &spg_storage::Catalog, v: &Value) -> Option<i64> {
+    match v {
+        Value::RegClass(oid, _) => Some(*oid),
+        Value::Int(n) => Some(i64::from(*n)),
+        Value::BigInt(n) => Some(*n),
+        Value::Text(s) => crate::eval::regclass_oid_for(
+            cat,
+            &spg_sql::namespace::key_from_text(s),
+            s.contains('.'),
+        ),
+        _ => None,
+    }
+}
+
+/// The `pg_description` text for `(objoid, classoid, objsubid)`, or NULL.
+fn description_of(
+    cat: &spg_storage::Catalog,
+    oid: i64,
+    classoid: i64,
+    subid: i32,
+) -> Value<'static> {
+    let (_, rows) = crate::system_catalog::synth_pg_description(cat);
+    rows.iter()
+        .find(|r| {
+            matches!(
+                (&r.values[0], &r.values[1], &r.values[2]),
+                (Value::Int(o), Value::Int(c), Value::Int(s))
+                    if i64::from(*o) == oid && i64::from(*c) == classoid && *s == subid
+            )
+        })
+        .map_or(Value::Null, |r| r.values[3].clone())
 }
 
 #[cfg(test)]
