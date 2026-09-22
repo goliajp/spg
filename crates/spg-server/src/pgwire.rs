@@ -3845,26 +3845,27 @@ fn handle_parse(
 /// Count distinct `$N` placeholders by scanning. PG numbers them
 /// 1..=N; we just want the max N.
 fn count_placeholders(sql: &str) -> u16 {
-    let bytes = sql.as_bytes();
-    let mut max: u32 = 0;
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'$' && bytes[i + 1].is_ascii_digit() {
-            let mut j = i + 1;
-            let mut n: u32 = 0;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                n = n * 10 + u32::from(bytes[j] - b'0');
-                j += 1;
-            }
-            if n > max {
-                max = n;
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
-    }
-    u16::try_from(max).unwrap_or(u16::MAX)
+    // 9.0.3 — the LEXER's placeholders, not every `$n` in the text.
+    //
+    // Scanning the text counted a `$3` inside a string literal, a comment
+    // or a dollar-quoted body as a parameter. A statement carrying a
+    // literal like `'$10'` therefore demanded parameters its client
+    // rightly never sends, and the Bind that PostgreSQL accepts was
+    // refused with `parameter count mismatch`; the same count let a Bind
+    // with too MANY parameters through, which PostgreSQL refuses
+    // (`bind message supplies 5 parameters, but prepared statement "P_6"
+    // requires 2`). Measured with pgbench, whose `:name` substitution put
+    // `$3` inside a JSON string literal.
+    spg_sql::lexer::tokenize(sql).map_or(0, |tokens| {
+        tokens
+            .iter()
+            .filter_map(|t| match t {
+                spg_sql::lexer::Token::Placeholder(n) => Some(*n),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    })
 }
 
 fn handle_bind(
@@ -3902,9 +3903,12 @@ fn handle_bind(
     let param_count = u16::from_be_bytes([body[cur], body[cur + 1]]) as usize;
     cur += 2;
     if usize::from(stmt.placeholder_count) != param_count {
+        // 9.0.3 — PostgreSQL 18.6's sentence, measured: `bind message
+        // supplies 5 parameters, but prepared statement "P_6" requires 2`.
+        // SPG wrote its own, which no client recognises.
         return Err(format!(
-            "Bind: parameter count mismatch (SQL has {}, Bind has {param_count})",
-            stmt.placeholder_count
+            "bind message supplies {param_count} parameters, but prepared statement \"{}\" requires {}",
+            stmt_name, stmt.placeholder_count
         ));
     }
     // v6.1.1: decode text params into typed `Value`s on the spot.

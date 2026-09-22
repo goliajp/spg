@@ -1112,9 +1112,15 @@ impl Engine {
         let tx_id = self
             .current_tx
             .ok_or_else(|| EngineError::NoActiveTransaction)?;
-        if self.tx_catalogs.remove(&tx_id).is_none() {
+        let Some(discarded) = self.tx_catalogs.remove(&tx_id) else {
             return Err(EngineError::NoActiveTransaction);
-        }
+        };
+        // 9.0.3 — the counters the rolled-back transaction moved stay
+        // moved, as they do in PostgreSQL: `BEGIN; INSERT; ROLLBACK;`
+        // then INSERT gave a serial column id 1 twice where PostgreSQL
+        // 18.6 gives 1 then 2. An explicit sequence was already right,
+        // because `nextval` writes the base catalog.
+        self.catalog.carry_counters_from(&discarded.catalog);
         // v7.37.15 Phase C.2 — mark the writer version ABORTED. Under
         // today's catalog-COW model the shadow catalog never reached
         // self.catalog so the tx's rows never hit storage, making this

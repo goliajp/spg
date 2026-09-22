@@ -1939,7 +1939,51 @@ impl Engine {
         {
             return Err(EngineError::DeferrableWouldBlock);
         }
+        // 9.0.3 — a statement is all-or-nothing, in autocommit too.
+        //
+        // A statement that failed AFTER writing left what it had written.
+        // Measured on the published 9.0.3 against PostgreSQL 18.6, with an
+        // AFTER trigger that raises on the second row:
+        //
+        //   INSERT INTO t VALUES (1, 10), (2, 20)   SPG: both rows stay
+        //                                           PG:  no row
+        //   UPDATE t SET v = v + 1                  SPG: every row changed
+        //                                           PG:  none
+        //
+        // And the halves disagreed with the log: a failed statement's redo
+        // is discarded, so the rows a running server showed were not in the
+        // WAL and vanished on restart.
+        //
+        // Inside an explicit transaction the failure aborts the block and
+        // its ROLLBACK undoes the writes, which is PostgreSQL's rule and was
+        // already SPG's. This is the autocommit half of the same rule: the
+        // catalog before the statement is kept (a clone is structural
+        // sharing, which is what BEGIN already relies on) and put back if
+        // the statement returns an error.
+        let undo = (!self.current_tx.is_some_and(|tx| self.is_tx_open(tx))
+            && !stmt.is_readonly()
+            && !matches!(
+                stmt,
+                Statement::Begin { .. }
+                    | Statement::Commit
+                    | Statement::Rollback
+                    | Statement::Savepoint(_)
+                    | Statement::ReleaseSavepoint(_)
+                    | Statement::RollbackToSavepoint(_)
+            ))
+        .then(|| self.catalog.clone());
         let result = self.dispatch_stmt_inner(stmt, cancel);
+        if result.is_err()
+            && let Some(before) = undo
+        {
+            let discarded = core::mem::replace(&mut self.catalog, before);
+            // PostgreSQL hands no sequence value out twice, whatever
+            // became of the statement that drew it.
+            self.catalog.carry_counters_from(&discarded);
+            if let Some(v) = self.stmt_writer_version {
+                self.abort_writer_version(v);
+            }
+        }
         if result.is_ok() {
             self.record_tx_stmt(&tx_class, takes_snapshot);
             self.record_tx_reads(read_tables);

@@ -1104,6 +1104,236 @@ impl Engine {
         })
     }
 
+    /// 9.0.3 — one row through one list of row triggers.
+    ///
+    /// The `UPDATE OF (cols)` and `WHEN` filters, the firing, the notices
+    /// a body raised and the SQL it embedded — the loop every DML path
+    /// writes around `fire_row_trigger`. `Ok(None)` is a BEFORE trigger
+    /// that returned NULL: the row is skipped.
+    ///
+    /// MERGE fired no row triggers at all for its UPDATE and DELETE
+    /// actions; PostgreSQL 18.6 fires them, and an audit trigger is the
+    /// ordinary reason a table has one.
+    ///
+    /// # Errors
+    /// Whatever the trigger body raised, with its SQLSTATE.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fire_row_trigger_list(
+        &mut self,
+        table_name: &str,
+        schema_cols: &[ColumnSchema],
+        list: &[(
+            spg_storage::FunctionDef,
+            Vec<alloc::string::String>,
+            alloc::string::String,
+            alloc::string::String,
+        )],
+        op: &str,
+        is_after: bool,
+        new_row: Option<Row<'static>>,
+        old_row: Option<&Row<'static>>,
+        trigger_session_cfg: Option<&str>,
+        deferred: &mut Vec<triggers::DeferredEmbeddedStmt>,
+        notices: &mut Vec<(crate::NoticeSeverity, alloc::string::String)>,
+    ) -> Result<Option<Row<'static>>, EngineError> {
+        let mut row = new_row;
+        for (fd, filter, when, tgname) in list {
+            if !filter.is_empty()
+                && let (Some(new), Some(old)) = (row.as_ref(), old_row)
+                && !any_column_changed(filter, schema_cols, old, new)
+            {
+                continue;
+            }
+            if !triggers::trigger_when_holds(when, row.as_ref(), old_row, schema_cols)? {
+                continue;
+            }
+            let raise_sink = triggers::NoticeSink::default();
+            let fired = triggers::fire_row_trigger(
+                fd,
+                row.clone(),
+                old_row,
+                table_name,
+                schema_cols,
+                &[],
+                trigger_session_cfg,
+                is_after,
+                &triggers::TgMeta {
+                    op,
+                    name: tgname,
+                    level: "ROW",
+                },
+                Some(&raise_sink),
+            );
+            notices.extend(raise_sink.into_inner());
+            let (outcome, embedded) = fired.map_err(crate::triggers::trigger_error_to_engine)?;
+            deferred.extend(embedded);
+            match outcome {
+                triggers::TriggerOutcome::Row(r) => row = Some(r),
+                triggers::TriggerOutcome::Skip => return Ok(None),
+            }
+        }
+        Ok(row)
+    }
+
+    /// 9.0.3 — every check an UPDATE makes between choosing its rows and
+    /// writing them, in PostgreSQL's order: stored generated columns
+    /// recomputed, outbound foreign keys, NOT NULL, CHECK, row security,
+    /// a view's WITH CHECK OPTION, uniqueness, exclusion, and the
+    /// inbound foreign-key actions on children.
+    ///
+    /// Its own method because MERGE's UPDATE action ran none of them:
+    /// `MERGE … WHEN MATCHED THEN UPDATE SET v = -1` stored -1 through a
+    /// `CHECK (v >= 0)` that PostgreSQL 18.6 refuses. One statement kind
+    /// with its own copy of a pipeline is how that happened.
+    ///
+    /// Returns the rows paired with their pre-update values, which the
+    /// caller needs for RETURNING and for the FK passes.
+    ///
+    /// # Errors
+    /// Whichever check the rows break, in PostgreSQL's words.
+    fn check_update_plan(
+        &mut self,
+        table_name: &str,
+        qualified: bool,
+        schema_cols: &[ColumnSchema],
+        planned: &mut Vec<(usize, Vec<Value<'static>>)>,
+        sess: &crate::eval::DmlSession,
+        view_check: Option<&ViewCheck>,
+    ) -> Result<Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)>, EngineError> {
+        // v7.37.7(sentori Epic 3 P1)— recompute stored generated
+        // columns against each post-UPDATE candidate row, BEFORE
+        // FK / CHECK / trigger passes so guards reason about the
+        // computed value the same way they would for a literal cell.
+        {
+            let mut staged: Vec<Vec<Value<'static>>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            apply_generated_stored_columns(schema_cols, &mut staged, self.speaks_mysql)?;
+            for ((_pos, new_vals), recomputed) in planned.iter_mut().zip(staged) {
+                *new_vals = recomputed;
+            }
+        }
+        // v7.6.6 — capture pre-update row values for the FK
+        // enforcement passes below. `planned` carries new values
+        // only; pair them with the old row.
+        let (plan_with_old, self_fks) = {
+            let table = self
+                .active_catalog()
+                .get_written(table_name, qualified)
+                .ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: table_name.into(),
+                    })
+                })?;
+            let with_old: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)> = planned
+                .iter()
+                .map(|(pos, new_vals)| (*pos, table.rows()[*pos].values.clone(), new_vals.clone()))
+                .collect();
+            (with_old, table.schema().foreign_keys.clone())
+        };
+        // v7.6.6 — Stage 2a: outbound FK check. For every row whose
+        // local FK columns changed, the new value must exist in the
+        // parent.
+        if !self_fks.is_empty() {
+            let new_rows: Vec<Vec<Value<'static>>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            // v7.39 (round 288) — a DEFERRED constraint is not checked
+            // here; COMMIT (or SET CONSTRAINTS IMMEDIATE) runs it.
+            let now = self.immediate_fks(&self_fks);
+            if !now.is_empty() {
+                enforce_fk_inserts(
+                    self.active_catalog(),
+                    table_name,
+                    &now,
+                    &new_rows,
+                    self.speaks_mysql,
+                )?;
+            }
+        }
+        // v7.13.0 — CHECK constraint enforcement on UPDATE
+        // (mailrs round-5 G3). Predicates evaluated against the
+        // candidate post-UPDATE row; false rejects the UPDATE.
+        {
+            let new_rows: Vec<Vec<Value<'static>>> = planned
+                .iter()
+                .map(|(_pos, new_vals)| new_vals.clone())
+                .collect();
+            // v7.39 (read01 round 117) — NOT NULL on the post-update rows,
+            // pre-write with PG's `DETAIL: Failing row contains (...)`. Before
+            // CHECK, matching PG's ordering.
+            enforce_not_null(self.active_catalog(), table_name, &new_rows)?;
+            enforce_check_constraints(self.active_catalog(), table_name, &new_rows, Some(sess))?;
+            // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
+            let cols = self
+                .active_catalog()
+                .get_written(table_name, qualified)
+                .map(|t| t.schema().columns.clone())
+                .unwrap_or_default();
+            self.rls_check_new_rows(table_name, spg_storage::PolicyCmd::Update, &cols, &new_rows)?;
+            // v7.39 (round 132) — WITH CHECK OPTION on the post-update rows.
+            if let Some(check) = view_check {
+                self.enforce_view_check(check, &new_rows, &cols, table_name)?;
+            }
+        }
+        // 8.0.3 — an UPDATE that moves a row onto a key another
+        // transaction holds uncommitted waits for it, as an INSERT does.
+        // Measured with two sessions, A inserting (2, 20) and holding,
+        // B running `UPDATE uw SET k = 20 WHERE id = 1`:
+        //   PG 18.6   B waits 1.1 s, then 23505; both rows survive
+        //   SPG       B updates at once, A's COMMIT fails with 40001
+        {
+            let new_rows: Vec<Vec<Value<'static>>> =
+                planned.iter().map(|(_, v)| v.clone()).collect();
+            self.wait_for_uncommitted_unique_keys(table_name, &new_rows)?;
+        }
+        // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
+        // enforcement on UPDATE. The pre-image of each updated row is
+        // excluded from the existing-key set (see enforce_unique_updates),
+        // and only keys whose columns actually changed are scanned.
+        {
+            let mut changed_cols: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
+            for (_pos, old_vals, new_vals) in &plan_with_old {
+                for (i, (o, n)) in old_vals.iter().zip(new_vals.iter()).enumerate() {
+                    if o != n {
+                        changed_cols.insert(i);
+                    }
+                }
+            }
+            enforce_unique_updates(
+                self.active_catalog(),
+                table_name,
+                planned,
+                &changed_cols,
+                self.speaks_mysql,
+            )?;
+            // v7.39 (round 210) — EXCLUDE constraints on the post-update rows;
+            // each updated row's pre-image is excluded from the scan.
+            let exclusions = self
+                .active_catalog()
+                .get_written(table_name, qualified)
+                .map(|t| t.schema().exclusion_constraints.clone())
+                .unwrap_or_default();
+            crate::constraints::enforce_exclusion_updates(
+                self.active_catalog(),
+                table_name,
+                &exclusions,
+                planned,
+            )?;
+        }
+        // v7.6.6 — Stage 2b: inbound FK check. For every row that
+        // changed value in a column that *some other table* uses as
+        // a FK parent column, react per `on_update` action.
+        let child_plan = plan_fk_parent_updates(self.active_catalog(), table_name, &plan_with_old)?;
+        // Stage 3a — apply each child-side action.
+        for step in &child_plan {
+            apply_fk_child_step(self.active_catalog_mut(), step)?;
+        }
+        Ok(plan_with_old)
+    }
+
     fn exec_update_cancel_inner(
         &mut self,
         stmt: &spg_sql::ast::UpdateStatement,
@@ -1870,138 +2100,14 @@ impl Engine {
         // assuming ascending row order, which the full-scan path
         // guaranteed implicitly.
         planned.sort_by_key(|(i, _)| *i);
-        // v7.37.7(sentori Epic 3 P1)— recompute stored generated
-        // columns against each post-UPDATE candidate row, BEFORE
-        // FK / CHECK / trigger passes so guards reason about the
-        // computed value the same way they would for a literal cell.
-        {
-            let mut staged: Vec<Vec<Value<'static>>> = planned
-                .iter()
-                .map(|(_pos, new_vals)| new_vals.clone())
-                .collect();
-            apply_generated_stored_columns(&schema_cols, &mut staged, mysql_dialect)?;
-            for ((_pos, new_vals), recomputed) in planned.iter_mut().zip(staged) {
-                *new_vals = recomputed;
-            }
-        }
-        // v7.6.6 — capture pre-update row values for the FK
-        // enforcement passes below. `planned` carries new values
-        // only; pair them with the old row.
-        let plan_with_old: Vec<(usize, Vec<Value<'static>>, Vec<Value<'static>>)> = planned
-            .iter()
-            .map(|(pos, new_vals)| (*pos, table.rows()[*pos].values.clone(), new_vals.clone()))
-            .collect();
-        let self_fks = table.schema().foreign_keys.clone();
-        // v7.12.5 — `affected` is computed post-BEFORE-trigger
-        // below (triggers may RETURN NULL to skip individual
-        // rows). The pre-trigger len shape is no longer accurate.
-        // Release mutable borrow on `table` for the FK passes.
-        let _ = table;
-        // v7.6.6 — Stage 2a: outbound FK check. For every row whose
-        // local FK columns changed, the new value must exist in the
-        // parent.
-        if !self_fks.is_empty() {
-            let new_rows: Vec<Vec<Value<'static>>> = planned
-                .iter()
-                .map(|(_pos, new_vals)| new_vals.clone())
-                .collect();
-            // v7.39 (round 288) — a DEFERRED constraint is not checked
-            // here; COMMIT (or SET CONSTRAINTS IMMEDIATE) runs it.
-            let now = self.immediate_fks(&self_fks);
-            if !now.is_empty() {
-                enforce_fk_inserts(
-                    self.active_catalog(),
-                    &stmt.table,
-                    &now,
-                    &new_rows,
-                    self.speaks_mysql,
-                )?;
-            }
-        }
-        // v7.13.0 — CHECK constraint enforcement on UPDATE
-        // (mailrs round-5 G3). Predicates evaluated against the
-        // candidate post-UPDATE row; false rejects the UPDATE.
-        {
-            let new_rows: Vec<Vec<Value<'static>>> = planned
-                .iter()
-                .map(|(_pos, new_vals)| new_vals.clone())
-                .collect();
-            // v7.39 (read01 round 117) — NOT NULL on the post-update rows,
-            // pre-write with PG's `DETAIL: Failing row contains (...)`. Before
-            // CHECK, matching PG's ordering.
-            enforce_not_null(self.active_catalog(), &stmt.table, &new_rows)?;
-            enforce_check_constraints(self.active_catalog(), &stmt.table, &new_rows, Some(&sess))?;
-            // v7.39 (RLS) Phase 2 — UPDATE WITH CHECK on the post-update rows.
-            let cols = self
-                .active_catalog()
-                .get_written(&stmt.table, stmt.table_qualified)
-                .map(|t| t.schema().columns.clone())
-                .unwrap_or_default();
-            self.rls_check_new_rows(
-                &stmt.table,
-                spg_storage::PolicyCmd::Update,
-                &cols,
-                &new_rows,
-            )?;
-            // v7.39 (round 132) — WITH CHECK OPTION on the post-update rows.
-            if let Some(check) = &view_check {
-                self.enforce_view_check(check, &new_rows, &cols, &stmt.table)?;
-            }
-        }
-        // 8.0.3 — an UPDATE that moves a row onto a key another
-        // transaction holds uncommitted waits for it, as an INSERT does.
-        // Measured with two sessions, A inserting (2, 20) and holding,
-        // B running `UPDATE uw SET k = 20 WHERE id = 1`:
-        //   PG 18.6   B waits 1.1 s, then 23505; both rows survive
-        //   SPG       B updates at once, A's COMMIT fails with 40001
-        {
-            let new_rows: Vec<Vec<Value<'static>>> =
-                planned.iter().map(|(_, v)| v.clone()).collect();
-            self.wait_for_uncommitted_unique_keys(&stmt.table, &new_rows)?;
-        }
-        // v7.38 (read01 U1) — UNIQUE / PRIMARY KEY + unique-index
-        // enforcement on UPDATE. The pre-image of each updated row is
-        // excluded from the existing-key set (see enforce_unique_updates),
-        // and only keys whose columns actually changed are scanned.
-        {
-            let mut changed_cols: hashbrown::HashSet<usize> = hashbrown::HashSet::new();
-            for (_pos, old_vals, new_vals) in &plan_with_old {
-                for (i, (o, n)) in old_vals.iter().zip(new_vals.iter()).enumerate() {
-                    if o != n {
-                        changed_cols.insert(i);
-                    }
-                }
-            }
-            enforce_unique_updates(
-                self.active_catalog(),
-                &stmt.table,
-                &planned,
-                &changed_cols,
-                self.speaks_mysql,
-            )?;
-            // v7.39 (round 210) — EXCLUDE constraints on the post-update rows;
-            // each updated row's pre-image is excluded from the scan.
-            let exclusions = self
-                .active_catalog()
-                .get_written(&stmt.table, stmt.table_qualified)
-                .map(|t| t.schema().exclusion_constraints.clone())
-                .unwrap_or_default();
-            crate::constraints::enforce_exclusion_updates(
-                self.active_catalog(),
-                &stmt.table,
-                &exclusions,
-                &planned,
-            )?;
-        }
-        // v7.6.6 — Stage 2b: inbound FK check. For every row that
-        // changed value in a column that *some other table* uses as
-        // a FK parent column, react per `on_update` action.
-        let child_plan =
-            plan_fk_parent_updates(self.active_catalog(), &stmt.table, &plan_with_old)?;
-        // Stage 3a — apply each child-side action.
-        for step in &child_plan {
-            apply_fk_child_step(self.active_catalog_mut(), step)?;
-        }
+        let plan_with_old = self.check_update_plan(
+            &stmt.table,
+            stmt.table_qualified,
+            &schema_cols,
+            &mut planned,
+            &sess,
+            view_check.as_ref(),
+        )?;
         // v7.37.15 (Phase C.3, step 4b) — read the in-place kill switch
         // and the writer version BEFORE the table mut borrow. When on,
         // UPDATE tombstones the old row version (xmax = v) and appends
@@ -2124,9 +2230,8 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| {
-                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                })?;
+                let (outcome, deferred) =
+                    fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                 deferred_embedded.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => new_row = r,
@@ -2254,9 +2359,8 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (_outcome, deferred) = fired.map_err(|e| {
-                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                })?;
+                let (_outcome, deferred) =
+                    fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                 deferred_embedded.extend(deferred);
             }
         }
@@ -2796,8 +2900,18 @@ impl Engine {
         // Resolve INSERT column positions once (validate names).
         // For each clause that's an INSERT, map column names → target positions.
         let mut delete_indices: Vec<usize> = Vec::new();
+        // 9.0.3 — the rows a DELETE action removes, for its AFTER triggers.
+        let mut deleted_old_rows: Vec<(usize, Row)> = Vec::new();
         let mut updates: Vec<(usize, Vec<Value<'static>>)> = Vec::new();
-        let mut inserts: Vec<Vec<Value<'static>>> = Vec::new();
+        // 9.0.3 — an INSERT action carries the columns it WROTE, because
+        // it is applied as an INSERT: the ones it leaves out take their
+        // defaults, as they do in PostgreSQL, and every check an INSERT
+        // makes is made here too. Writing the row straight to storage
+        // skipped all of it — a table with a `serial` id could not be
+        // MERGE-inserted at all (`null value in column "id"`), and a
+        // UNIQUE column took a duplicate without a word.
+        // `(written positions, the row so far, index into ret_records)`.
+        let mut inserts: Vec<(Vec<usize>, Vec<Value<'static>>, Option<usize>)> = Vec::new();
         let mut affected: usize = 0;
         // v7.39 (round 130) — RETURNING records, collected only when the
         // statement has a RETURNING clause.
@@ -2944,6 +3058,7 @@ impl Engine {
                     let synth_row = Row::new(vals);
                     let mut new_row_values: Vec<Value<'static>> =
                         (0..target_arity).map(|_| Value::Null).collect();
+                    let mut written: Vec<usize> = Vec::new();
                     // v7.39 (read01 round 123) — an omitted column list (`INSERT
                     // VALUES (…)`) maps the values positionally to every column
                     // in declaration order, like a plain INSERT.
@@ -2963,6 +3078,7 @@ impl Engine {
                                 pos,
                             )?;
                             new_row_values[pos] = coerced;
+                            written.push(pos);
                         }
                     } else {
                         for (col, expr) in columns.iter().zip(values.iter()) {
@@ -2982,6 +3098,7 @@ impl Engine {
                                 pos,
                             )?;
                             new_row_values[pos] = coerced;
+                            written.push(pos);
                         }
                     }
                     if want_returning {
@@ -2993,7 +3110,8 @@ impl Engine {
                             source: src_row.values.clone(),
                         });
                     }
-                    inserts.push(new_row_values);
+                    let ret_slot = want_returning.then(|| ret_records.len() - 1);
+                    inserts.push((written, new_row_values, ret_slot));
                     affected += 1;
                 }
             }
@@ -3116,7 +3234,7 @@ impl Engine {
             for (_, new_vals) in &updates {
                 pending.push(new_vals.clone());
             }
-            for vals in &inserts {
+            for (_, vals, _) in &inserts {
                 pending.push(vals.clone());
             }
             self.enforce_view_check(check, &pending, &target_cols, &stmt.target)?;
@@ -3132,6 +3250,112 @@ impl Engine {
         // new version (both stamped with the shared `xmin`) instead of
         // an in-place replace. Default OFF → legacy update_row.
         let inplace = self.mvcc_inplace();
+        // 9.0.3 — MERGE's UPDATE action makes every check an UPDATE
+        // makes. It made none: `WHEN MATCHED THEN UPDATE SET v = -1`
+        // stored -1 through a `CHECK (v >= 0)`, and a key change through
+        // a UNIQUE. The WITH CHECK OPTION pass above already covered the
+        // view, so it is not repeated here.
+        let mut updates = updates;
+        if !updates.is_empty() {
+            let cols = target_cols.clone();
+            self.check_update_plan(&stmt.target, false, &cols, &mut updates, &merge_sess, None)?;
+        }
+        // 9.0.3 — and MERGE fires the row triggers of the action it took,
+        // as PostgreSQL 18.6 does. It fired none: an audit trigger saw a
+        // MERGE's UPDATE and DELETE as if they had not happened.
+        let mut merge_deferred: Vec<triggers::DeferredEmbeddedStmt> = Vec::new();
+        let mut merge_notices: Vec<(crate::NoticeSeverity, alloc::string::String)> = Vec::new();
+        let merge_trigger_cfg: Option<String> = self
+            .session_params
+            .get("default_text_search_config")
+            .cloned();
+        let (before_update_trg, after_update_trg) = (
+            self.snapshot_update_row_triggers(&stmt.target, "BEFORE"),
+            self.snapshot_update_row_triggers(&stmt.target, "AFTER"),
+        );
+        // A DELETE trigger has no `UPDATE OF` column filter; the shared
+        // firing loop takes one list shape.
+        let delete_trg = |e: &mut Self, timing: &str| {
+            e.snapshot_row_triggers(&stmt.target, "DELETE", timing)
+                .into_iter()
+                .map(|(fd, when, name)| (fd, Vec::new(), when, name))
+                .collect::<Vec<_>>()
+        };
+        let (before_delete_trg, after_delete_trg) =
+            (delete_trg(self, "BEFORE"), delete_trg(self, "AFTER"));
+        let mut update_old_rows: Vec<Row> = Vec::new();
+        if !before_update_trg.is_empty() || !after_update_trg.is_empty() {
+            let cols = target_cols.clone();
+            let olds: Vec<Row> = {
+                let t = self.active_catalog().get(&stmt.target).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.target.clone(),
+                    })
+                })?;
+                updates
+                    .iter()
+                    .map(|(pos, _)| t.rows()[*pos].clone())
+                    .collect()
+            };
+            let mut kept: Vec<(usize, Vec<Value<'static>>)> = Vec::with_capacity(updates.len());
+            let mut kept_olds: Vec<Row> = Vec::with_capacity(updates.len());
+            for ((pos, new_vals), old_row) in updates.iter().zip(olds.iter()) {
+                let fired = self.fire_row_trigger_list(
+                    &stmt.target,
+                    &cols,
+                    &before_update_trg,
+                    "UPDATE",
+                    false,
+                    Some(Row::new(new_vals.clone())),
+                    Some(old_row),
+                    merge_trigger_cfg.as_deref(),
+                    &mut merge_deferred,
+                    &mut merge_notices,
+                )?;
+                if let Some(row) = fired {
+                    kept.push((*pos, row.values));
+                    kept_olds.push(old_row.clone());
+                }
+            }
+            affected -= updates.len() - kept.len();
+            updates = kept;
+            update_old_rows = kept_olds;
+        }
+        if !before_delete_trg.is_empty() || !after_delete_trg.is_empty() {
+            let cols = target_cols.clone();
+            let olds: Vec<(usize, Row)> = {
+                let t = self.active_catalog().get(&stmt.target).ok_or_else(|| {
+                    EngineError::Storage(StorageError::TableNotFound {
+                        name: stmt.target.clone(),
+                    })
+                })?;
+                delete_indices
+                    .iter()
+                    .map(|pos| (*pos, t.rows()[*pos].clone()))
+                    .collect()
+            };
+            let mut kept: Vec<usize> = Vec::with_capacity(olds.len());
+            for (pos, old_row) in &olds {
+                let fired = self.fire_row_trigger_list(
+                    &stmt.target,
+                    &cols,
+                    &before_delete_trg,
+                    "DELETE",
+                    false,
+                    None,
+                    Some(old_row),
+                    merge_trigger_cfg.as_deref(),
+                    &mut merge_deferred,
+                    &mut merge_notices,
+                )?;
+                if fired.is_some() || before_delete_trg.is_empty() {
+                    kept.push(*pos);
+                }
+            }
+            affected -= delete_indices.len() - kept.len();
+            delete_indices = kept;
+            deleted_old_rows = olds;
+        }
         // 9.0.3 — see `ExprKeyPlan::row_keys`: every row MERGE writes
         // carries the keys of the indexes storage cannot key itself.
         let key_functions =
@@ -3178,15 +3402,88 @@ impl Engine {
         if !delete_indices.is_empty() {
             table.delete_rows(&delete_indices);
         }
-        // v7.37.15 Phase C — MERGE inserts share the pre-fetched
-        // writer version (xmin captured above).
-        for vals in inserts {
-            let keys = row_keys(&vals)?;
-            table
-                .insert_with_xmin_keyed(Row::new(vals), xmin, keys.as_deref())
-                .map_err(EngineError::Storage)?;
+        let _ = table; // drop the mut borrow before the INSERTs and RETURNING.
+        // 9.0.3 — the AFTER triggers of the rows this MERGE changed, now
+        // that they are written. (An INSERT action's fire inside the
+        // INSERT executor below.)
+        if !after_update_trg.is_empty() {
+            let cols = target_cols.clone();
+            for ((_, new_vals), old_row) in updates.iter().zip(update_old_rows.iter()) {
+                self.fire_row_trigger_list(
+                    &stmt.target,
+                    &cols,
+                    &after_update_trg,
+                    "UPDATE",
+                    true,
+                    Some(Row::new(new_vals.clone())),
+                    Some(old_row),
+                    merge_trigger_cfg.as_deref(),
+                    &mut merge_deferred,
+                    &mut merge_notices,
+                )?;
+            }
         }
-        let _ = table; // drop the mut borrow before building RETURNING.
+        if !after_delete_trg.is_empty() {
+            let cols = target_cols.clone();
+            for (pos, old_row) in &deleted_old_rows {
+                if !delete_indices.contains(pos) {
+                    continue;
+                }
+                self.fire_row_trigger_list(
+                    &stmt.target,
+                    &cols,
+                    &after_delete_trg,
+                    "DELETE",
+                    true,
+                    None,
+                    Some(old_row),
+                    merge_trigger_cfg.as_deref(),
+                    &mut merge_deferred,
+                    &mut merge_notices,
+                )?;
+            }
+        }
+        self.queue_raised(merge_notices);
+        self.execute_deferred_trigger_stmts(merge_deferred, cancel)?;
+        // 9.0.3 — the INSERT actions, through the INSERT executor: their
+        // omitted columns take defaults (including a `serial`'s next id
+        // and a STORED generated column), and every constraint and
+        // trigger an INSERT fires fires here. They were written straight
+        // to storage, which checked only NOT NULL and the column types.
+        for (written, vals, ret_slot) in inserts {
+            let columns: Vec<String> = written
+                .iter()
+                .filter_map(|&p| target_cols.get(p).map(|c| c.name.clone()))
+                .collect();
+            let row: Vec<Expr> = written
+                .iter()
+                .map(|&p| Expr::Literal(crate::clock::value_to_literal(vals[p].clone())))
+                .collect();
+            let insert = spg_sql::ast::InsertStatement {
+                ctes: Vec::new(),
+                table: stmt.target.clone(),
+                table_qualified: false,
+                alias: None,
+                columns: (!columns.is_empty()).then_some(columns),
+                rows: alloc::vec![row],
+                select_source: None,
+                on_conflict: None,
+                // Its RETURNING is the record MERGE's own RETURNING reads.
+                returning: ret_slot.map(|_| alloc::vec![spg_sql::ast::SelectItem::Wildcard]),
+                overriding: spg_sql::ast::Overriding::None,
+                mysql_ignore: false,
+            };
+            let done = self.exec_insert_inner(insert)?;
+            // PostgreSQL's MERGE … RETURNING shows the row as stored, so
+            // the record carries what the INSERT made of it.
+            if let Some(slot) = ret_slot
+                && let QueryResult::Rows { rows, .. } = done
+                && let Some(stored) = rows.first()
+            {
+                ret_records[slot].target_final = stored.values.clone();
+                ret_records[slot].new = Some(stored.values.clone());
+            }
+        }
         if let Some(items) = &stmt.returning {
             return self.build_merge_returning(
                 &target_alias,
@@ -3957,9 +4254,8 @@ impl Engine {
                         Some(&raise_sink),
                     );
                     raised_notices.extend(raise_sink.into_inner());
-                    let (outcome, deferred) = fired.map_err(|e| {
-                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                    })?;
+                    let (outcome, deferred) =
+                        fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                     deferred_embedded.extend(deferred);
                     if matches!(outcome, triggers::TriggerOutcome::Skip) {
                         cancel_this = true;
@@ -4103,9 +4399,8 @@ impl Engine {
                         Some(&raise_sink),
                     );
                     raised_notices.extend(raise_sink.into_inner());
-                    let (_outcome, deferred) = fired.map_err(|e| {
-                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                    })?;
+                    let (_outcome, deferred) =
+                        fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                     deferred_embedded.extend(deferred);
                 }
             }
@@ -4379,9 +4674,8 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| {
-                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                })?;
+                let (outcome, deferred) =
+                    fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -4672,9 +4966,8 @@ impl Engine {
                         Some(&raise_sink),
                     );
                     raised_notices.extend(raise_sink.into_inner());
-                    let (outcome, deferred) = fired.map_err(|e| {
-                        EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                    })?;
+                    let (outcome, deferred) =
+                        fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                     deferred_all.extend(deferred);
                     match outcome {
                         triggers::TriggerOutcome::Row(r) => current = r,
@@ -4746,9 +5039,8 @@ impl Engine {
                     Some(&raise_sink),
                 );
                 raised_notices.extend(raise_sink.into_inner());
-                let (outcome, deferred) = fired.map_err(|e| {
-                    EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}")))
-                })?;
+                let (outcome, deferred) =
+                    fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
                 deferred_all.extend(deferred);
                 match outcome {
                     triggers::TriggerOutcome::Row(r) => current = r,
@@ -8204,8 +8496,8 @@ fn insert_parsed_rows(
                 Some(&raise_sink),
             );
             raised_notices.extend(raise_sink.into_inner());
-            let (outcome, deferred) = fired
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            let (outcome, deferred) =
+                fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
             deferred_embedded.extend(deferred);
             match outcome {
                 triggers::TriggerOutcome::Row(r) => row = r,
@@ -8274,8 +8566,8 @@ fn insert_parsed_rows(
                 Some(&raise_sink),
             );
             raised_notices.extend(raise_sink.into_inner());
-            let (_outcome, deferred) = fired
-                .map_err(|e| EngineError::Storage(StorageError::Corrupt(alloc::format!("{e}"))))?;
+            let (_outcome, deferred) =
+                fired.map_err(|e| crate::triggers::trigger_error_to_engine(e))?;
             deferred_embedded.extend(deferred);
         }
     }

@@ -6686,6 +6686,62 @@ impl Catalog {
         &mut self.database_acl
     }
 
+    /// 9.0.3 — take the counters forward from a catalog that is being
+    /// thrown away: the sequences a rolled-back statement or transaction
+    /// advanced, and the floor a serial column reached.
+    ///
+    /// PostgreSQL never hands a sequence value out twice, whether or not
+    /// the statement that drew it succeeded. A statement whose writes are
+    /// undone (9.0.3 gave autocommit statements that undo) must not hand
+    /// the same ids out again — and a transaction's ROLLBACK already did
+    /// so for a serial column: `BEGIN; INSERT; ROLLBACK;` then INSERT
+    /// gave id 1 twice where PostgreSQL 18.6 gives 1 then 2.
+    ///
+    /// A serial column keeps no counter of its own — its next value is
+    /// the highest key plus one — so what carries forward is the RESTART
+    /// floor, which is what `ALTER … RESTART WITH` sets and what
+    /// `next_auto_value` already reads.
+    pub fn carry_counters_from(&mut self, discarded: &Self) {
+        for (name, gone) in discarded.sequences_all() {
+            if let Some(kept) = self.sequence_mut(name)
+                && (gone.is_called && (!kept.is_called || gone.last_value > kept.last_value))
+            {
+                kept.last_value = gone.last_value;
+                kept.is_called = true;
+            }
+        }
+        for name in discarded.table_names() {
+            let floors: Vec<(String, i64)> = {
+                let Some(gone) = discarded.get(&name) else {
+                    continue;
+                };
+                gone.schema()
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.auto_increment)
+                    .filter_map(|(pos, c)| gone.next_auto_value(pos).map(|n| (c.name.clone(), n)))
+                    .collect()
+            };
+            if floors.is_empty() {
+                continue;
+            }
+            let Some(kept) = self.get_mut(&name) else {
+                continue;
+            };
+            for (col_name, floor) in floors {
+                if let Some(col) = kept
+                    .schema_mut()
+                    .columns
+                    .iter_mut()
+                    .find(|c| c.name == col_name)
+                {
+                    col.auto_restart = Some(col.auto_restart.unwrap_or(i64::MIN).max(floor));
+                }
+            }
+        }
+    }
+
     /// v7.39 (read01 round 60) — mutable sequence access, for GRANT.
     /// v7.39 (round 469) — resolves the session's temporary sequence
     /// first, like its read-only twin. `nextval` and `setval` reach the

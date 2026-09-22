@@ -413,3 +413,66 @@ fn binary_result_format_encodes_pg_binary() {
     // NULL — len -1 (decoded as None).
     assert_eq!(row[8], None);
 }
+
+/// 9.0.3 — the parameters of a prepared statement are its `$n` TOKENS,
+/// not every `$n` in its text.
+///
+/// The count came from scanning the SQL, so a `$3` inside a string
+/// literal counted: a statement carrying `'$10 fee'` demanded parameters
+/// its client never sends, and a Bind PostgreSQL accepts was refused.
+/// The same count admitted a Bind with too MANY parameters, which
+/// PostgreSQL refuses — measured with pgbench, whose `:name`
+/// substitution puts `$3` inside a literal, where SPG ran 1,677
+/// transactions that PostgreSQL 18.6 rejected.
+#[test]
+fn a_dollar_inside_a_literal_is_not_a_parameter() {
+    let dir = unique_tmpdir();
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let mut child = common::ChildGuard(raw);
+    let mut s = open(addrs.pgwire.as_ref().unwrap());
+
+    send_query(&mut s, "CREATE TABLE ph (id INT, note TEXT)");
+    let _ = read_until_ready(&mut s);
+    send_query(&mut s, "INSERT INTO ph VALUES (1, '$10 fee')");
+    let _ = read_until_ready(&mut s);
+
+    // One parameter, whatever the literal looks like.
+    send_parse(
+        &mut s,
+        "p1",
+        "SELECT note, '$3 and more' FROM ph WHERE id = $1",
+    );
+    send_bind_text(&mut s, "", "p1", &["1"]);
+    send_execute(&mut s, "");
+    send_sync(&mut s);
+    let msgs = read_until_ready(&mut s);
+    assert!(
+        msgs.iter().all(|m| m.ty != b'E'),
+        "one parameter must be enough: {:?}",
+        msgs.iter()
+            .find(|m| m.ty == b'E')
+            .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+    );
+    let row = msgs.iter().find(|m| m.ty == b'D').expect("a DataRow");
+    assert!(String::from_utf8_lossy(&row.body).contains("$10 fee"));
+
+    // …and one parameter too many is PostgreSQL's refusal, in its words.
+    send_parse(&mut s, "p2", "SELECT note FROM ph WHERE id = $1");
+    send_bind_text(&mut s, "", "p2", &["1", "2"]);
+    send_execute(&mut s, "");
+    send_sync(&mut s);
+    let msgs = read_until_ready(&mut s);
+    let err = msgs
+        .iter()
+        .find(|m| m.ty == b'E')
+        .map(|m| String::from_utf8_lossy(&m.body).into_owned())
+        .expect("an ErrorResponse");
+    assert!(
+        err.contains(
+            "bind message supplies 2 parameters, but prepared statement \"p2\" requires 1"
+        ),
+        "{err}"
+    );
+    child.0.kill().ok();
+}
