@@ -72,6 +72,30 @@ impl ExprKeyPlan {
         }))
     }
 
+    /// 9.0.3 — [`Self::keys_for`] with its evaluation context built from
+    /// the table's columns and the statement's function scope: the keys a
+    /// new row VERSION must carry.
+    ///
+    /// Under in-place MVCC an UPDATE (and an ON CONFLICT DO UPDATE, and
+    /// MERGE's update) appends the new version as an insert. Those
+    /// inserts carried no keys, so every expression index and every
+    /// locale-collated column index — which is every text index on a
+    /// shipped image — dropped out of service on the table's first
+    /// UPDATE, and the statement's end rebuilt it from every row. One
+    /// `UPDATE … SET hit_count = hit_count + 1 WHERE pk = …` on a
+    /// 100,000-row table cost 85 ms, nearly all of it re-deriving ICU
+    /// sort keys for rows it did not touch.
+    pub(crate) fn row_keys(
+        &self,
+        columns: &[spg_storage::ColumnSchema],
+        values: &[Value<'static>],
+        functions: Option<&spg_storage::Catalog>,
+    ) -> Result<Vec<Option<Value<'static>>>, EngineError> {
+        let mut ctx = eval::EvalContext::new(columns, None);
+        ctx.catalog = functions;
+        self.keys_for(values, &ctx)
+    }
+
     /// The expression values for one row, slot-parallel to
     /// `table.indices()`.
     ///
@@ -256,6 +280,11 @@ pub(crate) fn function_scope_all(cat: &spg_storage::Catalog) -> spg_storage::Cat
     scope
 }
 
+/// 9.0.3 — whole-index rebuilds of an expression or locale-collated
+/// index. A write that carries its keys needs none; before 9.0.3 every
+/// UPDATE, ON CONFLICT DO UPDATE and MERGE on such a table ended in one.
+pub static INDEX_REBUILDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn refresh(
     table: &mut Table,
     functions: Option<&spg_storage::Catalog>,
@@ -277,6 +306,7 @@ pub(crate) fn refresh(
         }
         table
             .rebuild_expression_index(&name, &keys)
+            .inspect(|_| crate::bump_counter!(crate::expr_index::INDEX_REBUILDS))
             .map_err(EngineError::Storage)?;
     }
     let stale = table.stale_expression_indices();
@@ -306,6 +336,7 @@ pub(crate) fn refresh(
         }
         table
             .rebuild_expression_index(&name, &keys)
+            .inspect(|_| crate::bump_counter!(crate::expr_index::INDEX_REBUILDS))
             .map_err(EngineError::Storage)?;
     }
     Ok(())

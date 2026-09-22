@@ -50,7 +50,7 @@ fn send_msg(s: &mut TcpStream, ty: u8, body: &[u8]) {
     s.write_all(&out).expect("write");
 }
 
-fn open(addr: &str) -> TcpStream {
+pub(crate) fn open(addr: &str) -> TcpStream {
     let mut s = TcpStream::connect(addr).expect("connect");
     s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
     let mut startup = Vec::new();
@@ -93,20 +93,20 @@ fn field(body: &[u8], code: u8) -> Option<String> {
 
 /// What one COPY answered.
 #[derive(Debug, Default)]
-struct Copied {
+pub(crate) struct Copied {
     /// The CopyData PostgreSQL would print, concatenated.
-    data: String,
+    pub(crate) data: String,
     /// `SQLSTATE: message` of the error, if any.
-    error: Option<String>,
-    notices: Vec<String>,
-    tag: Option<String>,
+    pub(crate) error: Option<String>,
+    pub(crate) notices: Vec<String>,
+    pub(crate) tag: Option<String>,
     /// DataRows, columns joined by `|`, NULL as empty, one per line.
-    rows: String,
+    pub(crate) rows: String,
 }
 
 /// Run a simple-protocol statement; a COPY FROM STDIN is fed `input`
 /// as one CopyData frame and CopyDone.
-fn run(s: &mut TcpStream, sql: &str, input: &str) -> Copied {
+pub(crate) fn run(s: &mut TcpStream, sql: &str, input: &str) -> Copied {
     let mut body = sql.as_bytes().to_vec();
     body.push(0);
     send_msg(s, b'Q', &body);
@@ -171,13 +171,13 @@ fn run(s: &mut TcpStream, sql: &str, input: &str) -> Copied {
     out
 }
 
-fn ok(s: &mut TcpStream, sql: &str) {
+pub(crate) fn ok(s: &mut TcpStream, sql: &str) {
     let r = run(s, sql, "");
     assert!(r.error.is_none(), "{sql}: {:?}", r.error);
 }
 
 /// The rows of a query, read as DataRows — a path independent of COPY.
-fn rows(s: &mut TcpStream, sql: &str) -> String {
+pub(crate) fn rows(s: &mut TcpStream, sql: &str) -> String {
     let r = run(s, sql, "");
     assert!(r.error.is_none(), "{sql}: {:?}", r.error);
     r.rows
