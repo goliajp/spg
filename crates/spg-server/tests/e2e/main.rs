@@ -619,6 +619,7 @@ mod chaos_wal_compression_torn_write;
     unused_variables
 )]
 mod cross_version_compat;
+mod e2e_autocommit_row_locks_903;
 mod e2e_copy_903;
 mod e2e_merge_pipeline_903;
 mod e2e_statement_atomicity_903;

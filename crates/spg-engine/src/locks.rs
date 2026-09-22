@@ -351,6 +351,12 @@ impl crate::Engine {
             return Ok(());
         }
         let tname = from.primary.name.clone();
+        // Taken before the catalog borrow below: it may allocate this
+        // statement's writer version.
+        let stmt_version = self
+            .current_tx
+            .and_then(|tx| self.tx_writer_versions.get(&tx).copied())
+            .unwrap_or_else(|| self.writer_version_for_current_stmt());
         let Some(table) = self.active_catalog().get(&tname) else {
             return Ok(()); // a missing relation is the SELECT's error to raise
         };
@@ -365,10 +371,17 @@ impl crate::Engine {
             LW::NoWait => WaitPolicy::NoWait,
             LW::SkipLocked => WaitPolicy::SkipLocked,
         };
-        let version = self
-            .current_tx
-            .and_then(|tx| self.tx_writer_versions.get(&tx).copied())
-            .unwrap_or(0);
+        // 9.0.3 — an autocommit `SELECT … FOR UPDATE` locks under ITS
+        // statement's writer version, not under 0.
+        //
+        // Version 0 is nobody: `release_autocommit_stmt_locks` frees the
+        // statement's own version and left these behind, so the SAME
+        // connection's next statement waited for a lock nothing would
+        // release (`canceling statement due to statement timeout` where
+        // PostgreSQL 18.6 answers `UPDATE 1`). And every autocommit
+        // statement shared the one version, so two connections locking
+        // the same row did not conflict with each other either.
+        let version = stmt_version;
         let rel = table.rel_id();
         // Reproduce the row choice: visible rows, WHERE, ORDER BY.
         let snap = self.current_snapshot();
