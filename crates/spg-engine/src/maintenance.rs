@@ -133,6 +133,10 @@ impl Engine {
             {
                 t.stamp_analyze(us);
             }
+            // 9.0.5 — the count PostgreSQL 18 reports beside the stamp,
+            // and the reset of `n_mod_since_analyze` that gives it
+            // meaning.
+            self.note_analyze(table_name, 0, false);
             analysed += 1;
         }
         // v6.3.1 — plan cache invalidation. Bump stats version so

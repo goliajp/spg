@@ -1351,6 +1351,30 @@ pub static MATVIEW_DELTA_BAILED: core::sync::atomic::AtomicU64 =
 pub static PARALLEL_AGG_FIRED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// 9.0.5 — what PostgreSQL 18's `pg_stat_user_tables` reports about
+/// maintenance, per table.
+///
+/// Engine-side and non-transactional, like the DML counters beside it:
+/// these describe what the server did, not what a transaction did, and
+/// a rolled-back transaction's ANALYZE still happened.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MaintenanceStats {
+    pub(crate) vacuum_count: u64,
+    pub(crate) autovacuum_count: u64,
+    pub(crate) analyze_count: u64,
+    pub(crate) autoanalyze_count: u64,
+    /// Milliseconds are what PostgreSQL reports; microseconds are what
+    /// is measured, and the view divides.
+    pub(crate) total_vacuum_us: u64,
+    pub(crate) total_autovacuum_us: u64,
+    pub(crate) total_analyze_us: u64,
+    pub(crate) total_autoanalyze_us: u64,
+    /// An operator's VACUUM; the daemon's stamp lives on the table.
+    pub(crate) last_vacuum_us: Option<i64>,
+    pub(crate) mod_since_analyze: u64,
+    pub(crate) ins_since_vacuum: u64,
+}
+
 // The engine carries several independent session/capture flags (dialect,
 // FK-checks, meta-view materialisation, redo capture); they're orthogonal
 // switches, not a state enum begging to be modelled.
@@ -1740,6 +1764,10 @@ pub struct Engine {
     /// on the shadow — the r192 probe's tx-wrapped inserts read 0).
     /// Keyed by table name; DROP TABLE clears, RENAME re-keys.
     pub(crate) table_write_stats: alloc::collections::BTreeMap<String, (u64, u64, u64)>,
+    /// 9.0.5 — the per-table maintenance counters PostgreSQL 18 reports
+    /// in `pg_stat_user_tables`. Engine-side and non-transactional, for
+    /// the same reason `table_write_stats` is.
+    pub(crate) table_maintenance_stats: alloc::collections::BTreeMap<String, MaintenanceStats>,
     /// v7.39 (round 196) — bumped after every completed statement that
     /// ran OUTSIDE a transaction block (any autocommit statement, plus
     /// COMMIT itself via the post-statement check). An open tx whose
@@ -2106,6 +2134,7 @@ impl Engine {
             tz_all_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
+            table_maintenance_stats: alloc::collections::BTreeMap::new(),
             commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -2632,6 +2661,7 @@ impl Engine {
             tz_all_fn: None,
             stat_tup_inserted: 0,
             table_write_stats: alloc::collections::BTreeMap::new(),
+            table_maintenance_stats: alloc::collections::BTreeMap::new(),
             commit_epoch: 0,
             stat_tup_updated: 0,
             stat_tup_deleted: 0,
@@ -2781,6 +2811,7 @@ impl Engine {
                     tz_all_fn: None,
                     stat_tup_inserted: 0,
                     table_write_stats: alloc::collections::BTreeMap::new(),
+                    table_maintenance_stats: alloc::collections::BTreeMap::new(),
                     commit_epoch: 0,
                     stat_tup_updated: 0,
                     stat_tup_deleted: 0,

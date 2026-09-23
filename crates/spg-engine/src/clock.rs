@@ -929,7 +929,12 @@ impl StatementClock {
         if prev == UNSET
             && let Some(f) = clock
         {
-            store_stmt_start(f());
+            let us = f();
+            store_stmt_start(us);
+            // 9.0.5 — mirror it where the scan paths can read it, so
+            // `pg_stat_user_tables.last_seq_scan` costs a relaxed store
+            // per scan rather than a clock call.
+            spg_storage::set_statement_micros(us);
             store_stmt_random(crate::eval::math::random_state());
         }
         Self { prev, prev_random }
@@ -943,6 +948,7 @@ impl StatementClock {
         let prev_random = load_stmt_random();
         if prev == UNSET {
             store_stmt_start(micros);
+            spg_storage::set_statement_micros(micros);
             crate::eval::math::restore_random_state(random);
             store_stmt_random(random);
         }

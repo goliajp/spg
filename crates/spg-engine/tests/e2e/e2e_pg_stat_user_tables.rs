@@ -53,19 +53,39 @@ fn pg_stat_user_tables_lists_user_tables_with_live_tup_row_count() {
     e.execute("CREATE TABLE bar (id INT)").unwrap();
     e.execute("INSERT INTO foo VALUES (1), (2), (3)").unwrap();
     e.execute("INSERT INTO bar VALUES (1)").unwrap();
+
+    // 9.1.0 — by NAME. This read `r[10]` for `n_live_tup`, which is
+    // where it sat when the view had sixteen columns; adding the
+    // fourteen PostgreSQL 18 also has moved it to 14, and the assertion
+    // then compared the wrong column. A position is a claim about the
+    // layout, and the layout is not what this test is about.
+    let name_of = |e: &mut Engine| -> Vec<String> {
+        let QueryResult::Rows { columns, .. } = e
+            .execute("SELECT * FROM pg_catalog.pg_stat_user_tables")
+            .unwrap()
+        else {
+            panic!("Rows");
+        };
+        columns.iter().map(|c| c.name.clone()).collect()
+    };
+    let names = name_of(&mut e);
+    let at = |c: &str| {
+        names
+            .iter()
+            .position(|n| n == c)
+            .unwrap_or_else(|| panic!("pg_stat_user_tables has no {c}: {names:?}"))
+    };
+    let (relname, live) = (at("relname"), at("n_live_tup"));
+
     let rs = rows(&mut e, "SELECT * FROM pg_catalog.pg_stat_user_tables");
     assert_eq!(rs.len(), 2);
-    // Position 10 = n_live_tup.
-    let foo = rs
-        .iter()
-        .find(|r| matches!(&r[2], Value::Text(s) if s.as_ref() == "foo"))
-        .unwrap();
-    let bar = rs
-        .iter()
-        .find(|r| matches!(&r[2], Value::Text(s) if s.as_ref() == "bar"))
-        .unwrap();
-    assert!(matches!(foo[10], Value::BigInt(3)));
-    assert!(matches!(bar[10], Value::BigInt(1)));
+    let find = |t: &str| {
+        rs.iter()
+            .find(|r| matches!(&r[relname], Value::Text(s) if s.as_ref() == t))
+            .unwrap_or_else(|| panic!("no row for {t}"))
+    };
+    assert!(matches!(find("foo")[live], Value::BigInt(3)));
+    assert!(matches!(find("bar")[live], Value::BigInt(1)));
 }
 
 #[test]

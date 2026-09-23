@@ -1222,6 +1222,10 @@ impl Engine {
                 crate::bump_counter!(AUTOVACUUM_FIRE_COUNT);
                 vacuumed += 1;
             }
+            // 9.0.5 — PostgreSQL 18 reports how MANY times the daemon
+            // ran, not just when it last did; a dashboard alarms on the
+            // count standing still.
+            self.note_vacuum(&name, now_us.unwrap_or(0), 0, true);
         }
         vacuumed
     }
@@ -1249,10 +1253,12 @@ impl Engine {
         let now_us = self.clock.map(|f| f());
         if let Some(t) = self.active_catalog_mut().get_mut(table_name) {
             let _report = t.vacuum(oldest_active, false);
-            if let Some(us) = now_us {
-                t.stamp_autovacuum(us);
-            }
         }
+        // 9.0.5 — this is `VACUUM <table>`, which only an operator
+        // issues: it reached here stamping `last_autovacuum`, so a
+        // manual VACUUM was reported as the daemon's work and
+        // `last_vacuum` was NULL whatever anyone did.
+        self.note_vacuum(table_name, now_us.unwrap_or(0), 0, false);
     }
 
     pub(crate) fn maybe_autovacuum(&mut self, table_name: &str) {
@@ -1288,6 +1294,7 @@ impl Engine {
             }
             crate::bump_counter!(AUTOVACUUM_FIRE_COUNT);
         }
+        self.note_vacuum(table_name, now_us.unwrap_or(0), 0, true);
     }
 
     /// `dry_run = true` counts the reclaimable rows without mutating.

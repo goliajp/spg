@@ -1161,6 +1161,7 @@ impl Engine {
                     let (schema, rows) = crate::system_catalog::synth_pg_stat_user_tables(
                         self.active_catalog(),
                         &self.table_write_stats,
+                        &self.table_maintenance_stats,
                     );
                     materialise_meta_view(&mut catalog, view, schema, rows)?;
                 }

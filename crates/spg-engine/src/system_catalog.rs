@@ -3928,29 +3928,49 @@ pub(crate) fn synth_pg_stat_user_indexes(cat: &Catalog) -> (Vec<ColumnSchema>, V
 /// 9.0.0 (N19) — the shape alone, so the catalog can list this
 /// relation's columns without building its rows.
 pub(crate) fn pg_stat_user_tables_schema() -> Vec<ColumnSchema> {
+    // 9.0.5 — PostgreSQL 18's thirty columns, in its order. There were
+    // sixteen, and the fourteen missing ones did not read as zero: a
+    // dashboard query naming `autovacuum_count` or `n_mod_since_analyze`
+    // was REFUSED, so Datadog / pganalyze / a hand-written Grafana panel
+    // got an error rather than a number.
     alloc::vec![
         ColumnSchema::new("relid", DataType::BigInt, false),
         ColumnSchema::new("schemaname", DataType::Name, false),
         ColumnSchema::new("relname", DataType::Name, false),
         ColumnSchema::new("seq_scan", DataType::BigInt, false),
+        ColumnSchema::new("last_seq_scan", DataType::Timestamptz, true),
         ColumnSchema::new("seq_tup_read", DataType::BigInt, false),
         ColumnSchema::new("idx_scan", DataType::BigInt, false),
+        ColumnSchema::new("last_idx_scan", DataType::Timestamptz, true),
         ColumnSchema::new("idx_tup_fetch", DataType::BigInt, false),
         ColumnSchema::new("n_tup_ins", DataType::BigInt, false),
         ColumnSchema::new("n_tup_upd", DataType::BigInt, false),
         ColumnSchema::new("n_tup_del", DataType::BigInt, false),
+        ColumnSchema::new("n_tup_hot_upd", DataType::BigInt, false),
+        ColumnSchema::new("n_tup_newpage_upd", DataType::BigInt, false),
         ColumnSchema::new("n_live_tup", DataType::BigInt, false),
         ColumnSchema::new("n_dead_tup", DataType::BigInt, false),
+        ColumnSchema::new("n_mod_since_analyze", DataType::BigInt, false),
+        ColumnSchema::new("n_ins_since_vacuum", DataType::BigInt, false),
         ColumnSchema::new("last_vacuum", DataType::Timestamptz, true),
         ColumnSchema::new("last_autovacuum", DataType::Timestamptz, true),
         ColumnSchema::new("last_analyze", DataType::Timestamptz, true),
         ColumnSchema::new("last_autoanalyze", DataType::Timestamptz, true),
+        ColumnSchema::new("vacuum_count", DataType::BigInt, false),
+        ColumnSchema::new("autovacuum_count", DataType::BigInt, false),
+        ColumnSchema::new("analyze_count", DataType::BigInt, false),
+        ColumnSchema::new("autoanalyze_count", DataType::BigInt, false),
+        ColumnSchema::new("total_vacuum_time", DataType::Float, false),
+        ColumnSchema::new("total_autovacuum_time", DataType::Float, false),
+        ColumnSchema::new("total_analyze_time", DataType::Float, false),
+        ColumnSchema::new("total_autoanalyze_time", DataType::Float, false),
     ]
 }
 
 pub(crate) fn synth_pg_stat_user_tables(
     cat: &Catalog,
     write_stats: &alloc::collections::BTreeMap<alloc::string::String, (u64, u64, u64)>,
+    maint: &alloc::collections::BTreeMap<alloc::string::String, crate::MaintenanceStats>,
 ) -> (Vec<ColumnSchema>, Vec<Row<'static>>) {
     let schema = pg_stat_user_tables_schema();
     let mut rows: Vec<Row<'static>> = Vec::new();
@@ -3989,23 +4009,49 @@ pub(crate) fn synth_pg_stat_user_tables(
         let as_big = |a: &core::sync::atomic::AtomicU64| {
             Value::BigInt(i64::try_from(a.load(Ordering::Relaxed)).unwrap_or(i64::MAX))
         };
+        let m = maint.get(&key).copied().unwrap_or_default();
+        let big = |n: u64| Value::BigInt(i64::try_from(n).unwrap_or(i64::MAX));
+        // PostgreSQL reports these four in MILLISECONDS, as a float.
+        #[allow(clippy::cast_precision_loss)]
+        let ms = |us: u64| Value::Float(us as f64 / 1000.0);
+        let stamp = |us: i64| {
+            if us == 0 {
+                Value::Null
+            } else {
+                Value::Timestamp(us)
+            }
+        };
         rows.push(Row::new(alloc::vec![
             Value::BigInt(relid),
             Value::text(nsp.clone()),
             Value::Text(alloc::borrow::Cow::Owned(name)),
             as_big(&sc.seq_scan),
+            stamp(sc.last_seq_scan_us.load(Ordering::Relaxed)),
             as_big(&sc.seq_tup_read),
             as_big(&sc.idx_scan),
+            stamp(sc.last_idx_scan_us.load(Ordering::Relaxed)),
             as_big(&sc.idx_tup_fetch),
             Value::BigInt(i64::try_from(ins).unwrap_or(i64::MAX)),
             Value::BigInt(i64::try_from(upd).unwrap_or(i64::MAX)),
             Value::BigInt(i64::try_from(del).unwrap_or(i64::MAX)),
+            // 9.0.5 — a heap-only-tuple update is a PostgreSQL storage
+            // optimisation: a new row version on the same page, with no
+            // index entry. SPG's storage has no such path, so the true
+            // count of them is zero — this is the number, not a
+            // placeholder. `n_tup_newpage_upd` is the same story.
+            Value::BigInt(0),
+            Value::BigInt(0),
             Value::BigInt(live_rows),
             Value::BigInt(dead),
+            big(m.mod_since_analyze),
+            big(m.ins_since_vacuum),
             // v7.39 (pg_stat knife C) — PG's four maintenance stamps.
-            // SPG has no manual-VACUUM statement and no autoanalyze
-            // daemon, so those two stay NULL.
-            Value::Null, // last_vacuum
+            // 9.0.5 — `last_vacuum` is an operator's `VACUUM <table>`,
+            // which used to stamp `last_autovacuum` instead, so a
+            // manual vacuum was reported as the daemon's work and this
+            // column was NULL whatever anyone did. SPG runs no
+            // autoanalyze daemon, so that one stays NULL.
+            m.last_vacuum_us.map_or(Value::Null, Value::Timestamp),
             t.maintenance_stamps()
                 .0
                 .map_or(Value::Null, Value::Timestamp),
@@ -4013,6 +4059,14 @@ pub(crate) fn synth_pg_stat_user_tables(
                 .1
                 .map_or(Value::Null, Value::Timestamp),
             Value::Null, // last_autoanalyze
+            big(m.vacuum_count),
+            big(m.autovacuum_count),
+            big(m.analyze_count),
+            big(m.autoanalyze_count),
+            ms(m.total_vacuum_us),
+            ms(m.total_autovacuum_us),
+            ms(m.total_analyze_us),
+            ms(m.total_autoanalyze_us),
         ]));
         relid = relid.saturating_add(1);
     }
