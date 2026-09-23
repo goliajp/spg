@@ -2958,6 +2958,7 @@ fn drain_connections(state: &ServerState) {
         state.active_connections.load(Ordering::Acquire),
         deadline_sec,
     );
+    tell_connections_we_are_stopping(state);
     loop {
         let active = state.active_connections.load(Ordering::Acquire);
         if active == 0 {
@@ -2971,6 +2972,36 @@ fn drain_connections(state: &ServerState) {
             return;
         }
         thread::sleep(SHUTDOWN_POLL);
+    }
+}
+
+/// 9.0.4 — tell every live connection that the server is stopping,
+/// before waiting for them to go.
+///
+/// The drain used to be silent: it stopped accepting, waited for the
+/// sessions to end on their own, and exited. A client writing through
+/// a deploy therefore saw its socket disappear — psql reports
+/// `SSL error: unexpected eof while reading`, and a pool sees an I/O
+/// error, which is the one thing it cannot tell apart from the network
+/// failing mid-COMMIT. PostgreSQL's fast shutdown names itself:
+/// `FATAL 57P01 terminating connection due to administrator command`.
+///
+/// Latching `terminate` and shutting the read half down is the path
+/// `pg_terminate_backend` already takes, so the sentence and the
+/// SQLSTATE are the ones that are already pinned. The cancel flag is
+/// deliberately NOT set: a statement already under way finishes, and
+/// the session says its FATAL at the next message boundary — a drain
+/// that interrupts a COMMIT would be trading one defect for a worse
+/// one.
+fn tell_connections_we_are_stopping(state: &ServerState) {
+    let Ok(conns) = state.connections.read() else {
+        return;
+    };
+    for c in conns.iter() {
+        c.terminate.store(true, Ordering::Relaxed);
+        if let Some(sock) = &c.sock {
+            let _ = sock.shutdown(std::net::Shutdown::Read);
+        }
     }
 }
 
