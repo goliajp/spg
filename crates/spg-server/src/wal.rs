@@ -1024,8 +1024,13 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                 }
                 return;
             };
-            // O(1) Arc-bump clone (v4.39/v4.40 persistent
-            // backing). Stays cheap regardless of row count.
+            // A pointer copy per table. Until 9.1.0 this comment said
+            // "O(1)", which was true of the ROWS (persistent backing
+            // since v4.39) and not of the tables around them: each
+            // clone deep-copied every table's schema and index
+            // definitions, and on a 26-table schema that clone was the
+            // largest single cost of a one-row UPDATE (~110 µs of
+            // ~280). Tables are copy-on-write now; see `Catalog::tables`.
             let pre = engine.catalog().clone();
             for task in group {
                 // 9.0.4 — the statement starts HERE, on the leader's

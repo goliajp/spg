@@ -74,7 +74,8 @@ pub(crate) fn deserialize_table(
     // Vec<Table> with insertion-order semantics — the just-pushed
     // table is at the end. Sidecar `by_name` is already wired up but
     // we skip the map lookup here since we know the position.
-    let t = cat.tables.last_mut().expect("create_table just pushed");
+    // Freshly built: nothing else holds it, so this copies nothing.
+    let t = alloc::sync::Arc::make_mut(cat.tables.last_mut().expect("create_table just pushed"));
     deserialize_rows(cur, t, n_cols)?;
     deserialize_indices(cur, t, version)?;
     // v6.7.2 — per-table hot_tier_bytes appendix. v11+ writes

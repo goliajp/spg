@@ -738,6 +738,36 @@ impl Table {
         self.redo_log.take().unwrap_or_default()
     }
 
+    /// 9.1.0 — is redo capture on for this table. Read-only, so a sweep
+    /// over every table can ask it without taking the table for writing
+    /// — which, since tables became copy-on-write, would copy each one.
+    #[must_use]
+    pub fn redo_capturing(&self) -> bool {
+        self.redo_log.is_some()
+    }
+
+    /// 9.1.0 — has this table captured anything since the last drain.
+    #[must_use]
+    pub fn has_pending_redo(&self) -> bool {
+        self.redo_log.as_ref().is_some_and(|l| !l.is_empty())
+    }
+
+    /// 9.1.0 — take what was captured and keep capturing. The per-
+    /// statement sweep drains only the tables that captured something,
+    /// so every other one is left untouched rather than switched off and
+    /// back on — the switch alone was a write to every table.
+    pub fn drain_pending_redo(&mut self) -> Vec<RowChange> {
+        self.redo_log
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// 9.1.0 — stop capturing.
+    pub fn disable_redo(&mut self) {
+        self.redo_log = None;
+    }
+
     /// Record one captured change when redo capture is on. The table name
     /// rides on the change (taken from the schema) so a drained log is
     /// self-describing against the whole catalog.

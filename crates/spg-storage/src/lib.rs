@@ -5603,7 +5603,20 @@ pub enum NonTableKind {
 pub struct Catalog {
     /// v7.39 (pg_stat blks knife) — see [`ColdReadStats`].
     pub cold_read_stats: ColdReadStats,
-    tables: Vec<Table>,
+    /// 9.1.0 — `Arc`, written through `Arc::make_mut`.
+    ///
+    /// A catalog is cloned on every write: the commit round keeps a
+    /// pre-image to roll back to if the fsync fails, and a statement
+    /// keeps one to undo itself. The row storage inside a table was
+    /// already persistent, so those clones were described as O(1) —
+    /// but each one still deep-copied every table's SCHEMA and index
+    /// definitions, every column name a fresh String. On sentori's 26
+    /// tables that was the largest thing a single-row UPDATE did:
+    /// removing just the commit round's clone took the statement from
+    /// ~280 µs to ~170 µs. Behind an `Arc`, cloning the catalog copies
+    /// pointers, and a write copies only the table it writes, and only
+    /// if someone else still holds it.
+    tables: Vec<Arc<Table>>,
     /// `name → tables[index]`. Kept in lock-step with `tables`.
     /// `create_table` is the only write path.
     by_name: BTreeMap<String, usize>,
@@ -8050,7 +8063,7 @@ impl Catalog {
         // v7.38.18 (S2) — the table inherits the database's collation,
         // which is what its undeclared text columns compare under.
         t.set_db_collation(self.db_collation());
-        self.tables.push(t);
+        self.tables.push(Arc::new(t));
         self.by_name.insert(name.clone(), idx);
         // v7.39 (round 496) — see `dirty_tables`.
         self.dirty_tables.insert(name);
@@ -8060,7 +8073,7 @@ impl Catalog {
         // the id.
         self.next_rel_id += 1;
         let rid = row_header::RelId(self.next_rel_id);
-        self.tables[idx].set_rel_id(rid);
+        Arc::make_mut(&mut self.tables[idx]).set_rel_id(rid);
         Ok(())
     }
 
@@ -8185,14 +8198,14 @@ impl Catalog {
         if written_qualified {
             let key = self.in_this_database(name);
             let idx = *self.by_name.get(key.as_ref())?;
-            return self.tables.get(idx);
+            return self.tables.get(idx).map(|t| &**t);
         }
         self.get(name)
     }
 
     pub fn get(&self, name: &str) -> Option<&Table> {
         let idx = self.resolve_index(name)?;
-        self.tables.get(idx)
+        self.tables.get(idx).map(|t| &**t)
     }
 
     /// 9.0.1 (C9) — the mutable twin of [`Self::get_written`]: a
@@ -8204,7 +8217,7 @@ impl Catalog {
             let key = self.in_this_database(name).into_owned();
             let idx = *self.by_name.get(&key)?;
             self.dirty_tables.insert(key);
-            return self.tables.get_mut(idx);
+            return self.tables.get_mut(idx).map(Arc::make_mut);
         }
         self.get_mut(name)
     }
@@ -8219,7 +8232,7 @@ impl Catalog {
         if let Some(n) = recorded {
             self.dirty_tables.insert(n);
         }
-        self.tables.get_mut(idx)
+        self.tables.get_mut(idx).map(Arc::make_mut)
     }
 
     /// v7.39 (round 496) — the tables changed through this handle since
@@ -8345,10 +8358,10 @@ impl Catalog {
     /// transaction changed.
     pub fn install_table(&mut self, name: &str, table: Table) {
         match self.by_name.get(name).copied() {
-            Some(idx) => self.tables[idx] = table,
+            Some(idx) => self.tables[idx] = Arc::new(table),
             None => {
                 let idx = self.tables.len();
-                self.tables.push(table);
+                self.tables.push(Arc::new(table));
                 self.by_name.insert(name.into(), idx);
             }
         }
@@ -8369,7 +8382,7 @@ impl Catalog {
     /// `idx` must come from `tables_position_of` against the same catalog
     /// snapshot — out-of-range returns `None`.
     pub fn tables_at(&self, idx: usize) -> Option<&Table> {
-        self.tables.get(idx)
+        self.tables.get(idx).map(|t| &**t)
     }
 
     /// v7.34 (crash-recovery P0 #2) — replay a row-level redo log onto
@@ -8760,8 +8773,31 @@ impl Catalog {
     /// every table (the engine calls this before a mutating statement
     /// when persistence is on; idempotent, keeps any in-flight capture).
     pub fn enable_redo_all(&mut self) {
+        // 9.1.0 — only the tables not already capturing are written: a
+        // table is copy-on-write, and taking every one for writing on
+        // every statement would copy each shared one every time.
         for t in &mut self.tables {
-            t.enable_redo();
+            if !t.redo_capturing() {
+                Arc::make_mut(t).enable_redo();
+            }
+        }
+    }
+
+    /// 9.1.0 — is any table capturing redo. Read-only, so a caller can
+    /// decide whether `disable_redo_all` has anything to do BEFORE it
+    /// takes the catalog for writing.
+    #[must_use]
+    pub fn any_redo_capturing(&self) -> bool {
+        self.tables.iter().any(|t| t.redo_capturing())
+    }
+
+    /// 9.1.0 — the counterpart, for a statement that captures nothing.
+    /// A no-op once every table is off, which is the steady state.
+    pub fn disable_redo_all(&mut self) {
+        for t in &mut self.tables {
+            if t.redo_capturing() {
+                Arc::make_mut(t).disable_redo();
+            }
         }
     }
 
@@ -8770,9 +8806,14 @@ impl Catalog {
     /// engine calls this after a successful mutating statement and writes
     /// the returned [`RowChange`]s to the WAL in place of the SQL text.
     pub fn drain_redo(&mut self) -> Vec<RowChange> {
+        // 9.1.0 — from the tables that captured something, and capture
+        // stays on: see `drain_pending_redo`. A statement that runs with
+        // capture off turns it off first (`disable_redo_all`).
         let mut all = Vec::new();
         for t in &mut self.tables {
-            all.extend(t.take_redo());
+            if t.has_pending_redo() {
+                all.extend(Arc::make_mut(t).drain_pending_redo());
+            }
         }
         all
     }
@@ -8856,9 +8897,9 @@ impl Catalog {
             .by_name
             .remove(old)
             .ok_or_else(|| StorageError::TableNotFound { name: old.into() })?;
-        self.tables[idx].schema.name = new.to_string();
+        Arc::make_mut(&mut self.tables[idx]).schema.name = new.to_string();
         self.by_name.insert(new.to_string(), idx);
-        for t in &mut self.tables {
+        for t in self.tables.iter_mut().map(Arc::make_mut) {
             for fk in &mut t.schema.foreign_keys {
                 if fk.parent_table == old {
                     fk.parent_table = new.to_string();
@@ -8889,7 +8930,7 @@ impl Catalog {
                 )));
             }
         }
-        for t in &mut self.tables {
+        for t in self.tables.iter_mut().map(Arc::make_mut) {
             for i in &mut t.indices {
                 if i.name == old {
                     i.name = new.to_string();
@@ -8911,7 +8952,13 @@ impl Catalog {
     /// v7.14.0 — remove a named index across the catalog.
     /// Returns `true` when found + dropped.
     pub fn drop_named_index(&mut self, name: &str) -> bool {
-        for t in &mut self.tables {
+        for t in self.tables.iter_mut() {
+            // Only the table that carries the index is written: every
+            // other one stays shared with whoever else holds it.
+            if !t.indices.iter().any(|i| i.name == name) {
+                continue;
+            }
+            let t = Arc::make_mut(t);
             let before = t.indices.len();
             t.indices.retain(|i| i.name != name);
             if t.indices.len() != before {
@@ -8931,7 +8978,8 @@ impl Catalog {
         let t = self
             .tables
             .iter_mut()
-            .find(|t| t.schema.name.eq_ignore_ascii_case(table))?;
+            .find(|t| t.schema.name.eq_ignore_ascii_case(table))
+            .map(Arc::make_mut)?;
         let before = t.indices.len();
         t.indices.retain(|i| i.name != name);
         Some(t.indices.len() != before)
@@ -9180,7 +9228,7 @@ impl Catalog {
     pub fn hot_tier_bytes(&self) -> u64 {
         self.tables
             .iter()
-            .map(Table::hot_bytes)
+            .map(|t| t.hot_bytes())
             .fold(0u64, u64::saturating_add)
     }
 
@@ -12378,7 +12426,7 @@ impl Catalog {
         // envelope, Phase C.6, will round-trip real ids). Sets the
         // allocator above the loaded ids so a post-load CREATE TABLE
         // never collides.
-        for (i, t) in cat.tables.iter_mut().enumerate() {
+        for (i, t) in cat.tables.iter_mut().map(Arc::make_mut).enumerate() {
             t.set_rel_id(row_header::RelId((i as u64) + 1));
         }
         // v7.39.13 — a pre-v97 catalog's TIMETZ index entries are keyed
@@ -12390,7 +12438,7 @@ impl Catalog {
         // Only timetz, and only from below v97: `rebuild_indices_pub`
         // rebuilds every index on the table, so this asks first.
         if version < 97 {
-            for t in cat.tables.iter_mut() {
+            for t in cat.tables.iter_mut().map(Arc::make_mut) {
                 let cols = &t.schema().columns;
                 let touched = t.indices().iter().any(|idx| {
                     core::iter::once(idx.column_position)
@@ -12964,7 +13012,8 @@ impl Catalog {
         // collation. Done here rather than per-table in the loop above
         // because the byte that says so is written after the tables.
         let db_coll = cat.db_collation().to_string();
-        for t in &mut cat.tables {
+        // Freshly decoded: nothing shares these, so make_mut copies nothing.
+        for t in cat.tables.iter_mut().map(Arc::make_mut) {
             t.set_db_collation(&db_coll);
         }
         // v7.38 (read01 P5.05) — v54+ images end with a CRC32C over every
