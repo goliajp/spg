@@ -26,8 +26,14 @@ boot() {
   local img=$1 port=$2 name=$3; shift 3
   docker rm -f "$name" >/dev/null 2>&1
   # shellcheck disable=SC2086
+  # `BOOT_CMD` is the command the image runs, appended AFTER the image
+  # name — where a `postgres -c name=value` setting has to go. Docker
+  # reads anything before the image as its own flag, and `-c` there is
+  # `--cpu-shares`.
+  # shellcheck disable=SC2086
   docker run -d --name "$name" $LIMITS -p "$port":5432 \
-    -e POSTGRES_PASSWORD=p -e POSTGRES_USER=u -e POSTGRES_DB=d "$@" "$img" >/dev/null || return 2
+    -e POSTGRES_PASSWORD=p -e POSTGRES_USER=u -e POSTGRES_DB=d "$@" "$img" \
+    ${BOOT_CMD:-} >/dev/null || return 2
   wait_up "$port" || { echo "✗ $img on :$port never answered"; docker logs --tail 20 "$name" 2>&1 | sed 's/^/    /'; return 2; }
 }
 
