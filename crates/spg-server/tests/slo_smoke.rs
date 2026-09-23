@@ -874,7 +874,30 @@ const SLO_V5_4_ASYNC_SMOKE_SPEEDUP_FLOOR: f64 = 1.5;
 const SLO_V5_4_ASYNC_SMOKE_ROWS: usize = 200;
 
 fn run_insert_workload(commit_env: &str, rows: usize, warmup: usize) -> Duration {
-    let dir = unique_tmpdir();
+    // 9.1.0 — on a disk, not in the host's `/tmp`.
+    //
+    // This workload's question is whether async commit skips the fsync
+    // that sync commit pays, and that question has no answer where an
+    // fsync costs nothing. On a Linux runner whose `/tmp` is tmpfs it
+    // costs nothing: measured on the same host with the same binary,
+    // 200 synced INSERTs took 16 ms there and 560 ms on ext4, so the
+    // ratio read 1.04x in one run and 1.69x in the next — noise — while
+    // on ext4 it read 63x. The test went red on a runner, not on a
+    // regression.
+    //
+    // `CARGO_TARGET_TMPDIR` is cargo's scratch directory for
+    // integration tests, inside `target/`, which is always on the
+    // repository's own filesystem.
+    let dir = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("slo-async-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    };
     let db = dir.join("slo_async.db");
     let wal = dir.join("slo_async.wal");
     let env: Vec<(&str, &str)> = if commit_env.is_empty() {

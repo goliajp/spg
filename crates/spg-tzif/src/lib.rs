@@ -763,7 +763,14 @@ mod tests {
         let off = tz_offset_at("Asia/Tokyo", utc_micros(2024, 3, 15, 10, 20)).unwrap();
         assert_eq!(off, 9 * 3_600_000_000);
         // Kathmandu +05:45 — sub-hour offsets survive.
-        let off = tz_offset_at("Asia/Katmandu", utc_micros(2024, 3, 15, 10, 20)).unwrap();
+        //
+        // 9.1.0 — by its CANONICAL name. This read `Asia/Katmandu`, the
+        // deprecated alias, which lives in tzdata's `backward` file; a
+        // minimal Linux install ships `Asia/Kathmandu` and not the
+        // alias, so the test went red on a runner while the zone
+        // resolved fine. What it asks is whether a sub-hour offset
+        // survives, and the alias is not part of that question.
+        let off = tz_offset_at("Asia/Kathmandu", utc_micros(2024, 3, 15, 10, 20)).unwrap();
         assert_eq!(off, (5 * 3600 + 45 * 60) * 1_000_000);
     }
 
