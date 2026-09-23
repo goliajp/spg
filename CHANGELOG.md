@@ -8,6 +8,142 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [9.0.4] — 2026-09-24
+
+Two surfaces a production database is judged on that nothing here had
+ever asked about — a deploy, and a schema change over data that already
+exists — plus the way a cancelled statement is reported. Every row
+below was measured against PostgreSQL 18.6 and reproduced on the
+published 9.0.3 image.
+
+### Fixed — a cancelled statement is reported in PostgreSQL's terms
+
+A statement asleep in `pg_sleep` is served by the server's own slicing
+loop rather than the engine, and that loop raised the cancellation as a
+spelled-out sentence rather than as the variant the SQLSTATE mapping
+reads. So both the class and the reason were wrong:
+
+```text
+  SET statement_timeout='300ms'; SELECT pg_sleep(3)
+    PG 18.6   ERROR:  57014: canceling statement due to statement timeout
+    9.0.3     ERROR:  42000: canceling statement due to statement timeout
+  pg_cancel_backend(<a sleeping statement>)
+    PG 18.6   ERROR:  57014: canceling statement due to user request
+    9.0.3     ERROR:  42000: canceling statement due to statement timeout
+```
+
+`42000` is the catch-all, and the frameworks that branch on SQLSTATE
+read class 42 as a programming error — not retryable, not a
+cancellation.
+
+### Fixed — `pg_terminate_backend` ends the statement, not just the session
+
+Terminate trips the cancel flag too, so the victim was answered with an
+ordinary `57014` error. A client running a single statement acts on
+that and disconnects, and the `57P01` sent at the next message boundary
+reaches a socket nobody is reading. PostgreSQL answers the statement
+itself with `FATAL 57P01 terminating connection due to administrator
+command`, and so does this now.
+
+The severity of an error now follows its SQLSTATE: class 57's shutdown
+codes end the connection, and reporting them as `ERROR` tells a pool
+the session is still usable. The non-localised `V` severity field is
+sent with every error, as it already was on every other error path.
+
+### Fixed — a graceful stop tells the sessions it ends
+
+`SIGTERM` stopped the accept loop and then waited silently for the live
+connections to finish. A client writing through a rolling deploy saw
+only its socket disappear:
+
+```text
+  PG 18.6   FATAL:  57P01: terminating connection due to administrator command
+  9.0.3     psql: SSL error: unexpected eof while reading
+            psql: error: connection to server was lost
+```
+
+A pool has to tell those apart: a named administrative shutdown means
+"reconnect", while an I/O error is the one case a client cannot resolve
+by itself — it cannot distinguish it from the network failing between
+its COMMIT and the answer. The drain now tells every connection first,
+which also wakes the ones parked in `read` instead of waiting out the
+full deadline on them.
+
+A statement already under way is allowed to finish. Interrupting a
+COMMIT to shut down would trade one defect for a worse one.
+
+### Fixed — a constraint added to a populated table is checked against its rows
+
+```text
+  ALTER TABLE m ADD CONSTRAINT mu UNIQUE (v)   -- v already repeats
+    PG 18.6   ERROR: could not create unique index "mu"
+              DETAIL: Key (v)=(2) is duplicated.            [23505]
+    9.0.3     ALTER TABLE  -- and both rows stay
+  ALTER TABLE b ADD PRIMARY KEY (v)            -- v holds a NULL
+    PG 18.6   ERROR: column "v" of relation "b" contains null values [23502]
+    9.0.3     ALTER TABLE
+```
+
+The constraint is what the application was told it could rely on: an
+upsert written as "this can only match one row", a join written as
+"this side is unique", a dedup switched off because the database
+enforces it. Each of those is wrong for as long as the duplicates sit
+there, and nothing said so. `CREATE UNIQUE INDEX` over the same rows
+was already refused correctly — one of the two routes to the check did
+not call it.
+
+A UNIQUE over NULLs is still accepted: NULLs do not collide.
+
+### Fixed — what another object depends on cannot be dropped, emptied or retyped
+
+```text
+  DROP TABLE mp            -- another table has a FOREIGN KEY to mp
+    PG 18.6   ERROR: cannot drop table mp because other objects depend on it
+              DETAIL: constraint m_v_fkey on table m depends on table mp [2BP01]
+    9.0.3     DROP TABLE  -- m keeps a key pointing at nothing
+  TRUNCATE mp              -- same
+    PG 18.6   ERROR: cannot truncate a table referenced in a foreign key
+              constraint                                             [0A000]
+    9.0.3     TRUNCATE  -- every row of m stops satisfying its key
+  ALTER TABLE w ALTER COLUMN v TYPE bigint    -- a view selects v
+    PG 18.6   ERROR: cannot alter type of a column used by a view or rule [0A000]
+    9.0.3     ALTER TABLE  -- the view answers a type it was not made with
+```
+
+`DROP ... CASCADE` takes the dependent constraints with it, and
+`TRUNCATE ... CASCADE` empties the referencing tables too, as
+PostgreSQL does. Naming both sides in one statement — `DROP TABLE
+parent, child`, `TRUNCATE a, b` — is accepted, because the dependent is
+going as well.
+
+### Fixed — three DDL refusals were filed under the wrong SQLSTATE
+
+SPG produced PostgreSQL's sentence, DETAIL and HINT byte for byte and
+left the code on the catch-all `42000`:
+
+| refusal | was | is |
+|---|---|---|
+| `check constraint "c" of relation "t" is violated by some row` | 42000 | 23514 |
+| `cannot drop column v of table w because other objects depend on it` | 42000 | 2BP01 |
+| `cannot drop table t because other objects depend on it` | 42000 | 2BP01 |
+
+A migration tool that branches on `2BP01` to retry with CASCADE, or on
+`23514` to report which data does not satisfy a constraint, saw an
+unclassified error. The constraint name is also lifted into the `n`
+diagnostic field for the DDL-time wordings now.
+
+### Added — three acceptance harnesses
+
+`xtests/gates/g5-shutdown.sh` (stop under load and restart),
+`g5-migrate.sh` (36 schema changes over 2,000 rows, both engines, same
+recipe) and `g5-longrun.sh` (16 MB values, 100k rows, a transaction held
+open across another connection's commits, churn growth, and whether an
+index still saves reads once the table is big). `g5-connections.sh`
+gained the `terminate` row its own header had claimed since it was
+written.
+
+---
+
 ## [9.0.3] — 2026-09-23
 
 COPY, re-measured against PostgreSQL 18.6 while checking the 9.0.2
