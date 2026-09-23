@@ -50,12 +50,26 @@ Q
 ask() { # <port> <sql> -> yes / no / err:…
   # `< /dev/null`: psql runs under docker's -i, so without it the client
   # reads the question list this loop is being fed from.
-  local out; out=$(q "$1" -tAc "$2" < /dev/null 2>&1 | tr -d '[:space:]')
-  case "$out" in
-    ''|0) echo no ;;
-    *[!0-9]*) echo "err:$(echo "$out" | head -c 40)" ;;
-    *) echo yes ;;
-  esac
+  #
+  # Every question here asks whether the view SHOWS something while a
+  # load is running, and one sample is one instant. The load sleeps
+  # between its transactions, so a single sample of "is any session in
+  # a transaction" can land in the gap and read `no` for an engine that
+  # answers it the rest of the time — that is how 9.1.0's candidate
+  # failed this row once and passed it on four reruns, as did 9.0.4's.
+  # So a `no` is sampled again, a few times; a `yes` or an error is
+  # final at once. This cannot turn a real `no` into `yes`: the answer
+  # is `yes` only when a sample actually saw it, and both legs are
+  # asked the same way.
+  local out tries=0
+  while :; do
+    out=$(q "$1" -tAc "$2" < /dev/null 2>&1 | tr -d '[:space:]')
+    case "$out" in
+      ''|0) tries=$((tries + 1)); [ "$tries" -ge 5 ] && { echo no; return; }; sleep 0.2 ;;
+      *[!0-9]*) echo "err:$(echo "$out" | head -c 40)"; return ;;
+      *) echo yes; return ;;
+    esac
+  done
 }
 
 # Does a slow statement reach the log? Asked of the container's own
