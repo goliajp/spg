@@ -343,6 +343,23 @@ impl Engine {
         let matview_capture = !self.matview_maintainable.is_empty();
         if self.redo_capture || matview_capture {
             self.active_catalog_mut().enable_redo_all();
+        } else if self.active_catalog().any_redo_capturing() {
+            // 9.1.0 — `drain_redo` now leaves capture on (so the sweep
+            // writes only the tables that captured something), which
+            // makes turning it OFF this statement's job when capture is
+            // no longer wanted.
+            //
+            // Asked through the READ-ONLY catalog first, and only then
+            // taken for writing. `active_catalog_mut` marks a
+            // transaction's shadow dirty, and the first cut called it on
+            // every statement: a read-only REPEATABLE READ transaction
+            // then looked as though it had written, and its COMMIT
+            // installed the catalog it froze at BEGIN — erasing whatever
+            // other connections had committed meanwhile.
+            // `round559_a_frozen_view_keeps_its_count` and
+            // `a_readonly_repeatable_read_commit_does_not_revert_another_connection`
+            // caught it.
+            self.active_catalog_mut().disable_redo_all();
         }
         // v7.38 Epic P (panic isolation) — run statement execution
         // behind a catch_unwind firewall so a panic in query

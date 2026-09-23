@@ -205,8 +205,67 @@ fn catalog_drain_redo_replays_multi_table() {
     normalize_rowids_dense(&mut c2, &["a", "b"]);
     assert_eq!(c1.serialize(), c2.serialize(), "multi-table redo diverged");
 
-    // drain stopped capture: a second drain is empty.
+    // Nothing new was captured, so a second drain is empty. (9.1.0 — a
+    // drain no longer switches capture off; a statement that captures
+    // nothing does that itself, via `disable_redo_all`.)
     assert!(c1.drain_redo().is_empty());
+}
+
+/// 9.1.0 — a catalog clone shares its tables, and a write copies only
+/// the table it writes.
+///
+/// A catalog is cloned on every write — the commit round's pre-image,
+/// a statement's own undo point — and each clone deep-copied every
+/// table's schema and index definitions. On sentori's 26 tables that
+/// was the largest thing a single-row UPDATE did: ~280 µs a statement,
+/// ~187 µs once tables were shared. Asserted on the SHARING, not on a
+/// timing: the pointers are the claim, and a timing bound loose enough
+/// for a shared machine could not see the difference reliably.
+#[test]
+fn a_catalog_clone_shares_its_tables_until_one_is_written() {
+    let mut c1 = Catalog::new();
+    for name in ["a", "b"] {
+        c1.create_table(TableSchema::new(
+            name,
+            vec![
+                ColumnSchema::new("id", DataType::BigInt, false),
+                ColumnSchema::new("v", DataType::Text, true),
+            ],
+        ))
+        .unwrap();
+    }
+    let mk = |id: i64| Row::new(alloc::vec![Value::BigInt(id), Value::text("x")]);
+    c1.get_mut("a").unwrap().insert(mk(1)).unwrap();
+    c1.get_mut("b").unwrap().insert(mk(2)).unwrap();
+    let pos = |c: &Catalog, n: &str| c.resolve_index(n).unwrap();
+    let shared =
+        |x: &Catalog, y: &Catalog, n: &str| Arc::ptr_eq(&x.tables[pos(x, n)], &y.tables[pos(y, n)]);
+
+    let mut c2 = c1.clone();
+    assert!(
+        shared(&c1, &c2, "a") && shared(&c1, &c2, "b"),
+        "a clone copies no table"
+    );
+
+    // The steady-state redo sweeps must not unshare anything: with
+    // capture off and nothing pending, they take no table for writing.
+    c2.disable_redo_all();
+    let _ = c2.drain_redo();
+    assert!(
+        shared(&c1, &c2, "a") && shared(&c1, &c2, "b"),
+        "an idle redo sweep copied a table"
+    );
+
+    // A write through one side copies that table only...
+    c2.get_mut("a").unwrap().insert(mk(3)).unwrap();
+    assert!(!shared(&c1, &c2, "a"), "the written table must be copied");
+    assert!(
+        shared(&c1, &c2, "b"),
+        "the untouched table must stay shared"
+    );
+    // ...and the other side does not see it.
+    assert_eq!(c1.get("a").unwrap().row_count(), 1);
+    assert_eq!(c2.get("a").unwrap().row_count(), 2);
 }
 
 /// v7.34 (crash-recovery P0 #2) — the row-level redo WAL codec (S2):
