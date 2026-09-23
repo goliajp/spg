@@ -129,7 +129,10 @@ cancel_check() { # <port>
   : > "$WORK/sleep.$1"
   pid=$(sleeper "$1" 30)
   sleep 2
-  target=$(q "$1" -tAc "SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND backend_type = 'client backend' LIMIT 1" < /dev/null 2>/dev/null | tr -d '[:space:]')
+  # This lookup's own text contains the pattern it searches for, so it
+  # matches itself; without pg_backend_pid() it can cancel the asker and
+  # leave the sleeper untouched, which reads as "not cancelled (silent)".
+  target=$(q "$1" -tAc "SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND backend_type = 'client backend' AND pid <> pg_backend_pid() ORDER BY pid LIMIT 1" < /dev/null 2>/dev/null | tr -d '[:space:]')
   [ -n "$target" ] || { kill "$pid" 2>/dev/null; echo "the statement is not visible"; return; }
   q "$1" -tAc "SELECT pg_cancel_backend($target)" < /dev/null >/dev/null 2>&1
   while [ $waited -lt 12 ]; do
@@ -144,6 +147,36 @@ cancel_check() { # <port>
 }
 a=$(cancel_check "$PORT"); b=$(cancel_check "$PGPORT")
 judge cancel "$a" "$b"
+
+# --- terminate --------------------------------------------------------
+# What the header has claimed all along and the panel never asked. An
+# operator kills a session that is holding something; the target must be
+# told it was an administrator and its connection must close, and no
+# other connection may be touched.
+terminate_check() { # <port>
+  local pid target waited=0 other
+  : > "$WORK/sleep.$1"
+  pid=$(sleeper "$1" 30)
+  sleep 2
+  target=$(q "$1" -tAc "SELECT pid FROM pg_stat_activity WHERE query LIKE '%pg_sleep(30)%' AND backend_type = 'client backend' AND pid <> pg_backend_pid() ORDER BY pid LIMIT 1" < /dev/null 2>/dev/null | tr -d '[:space:]')
+  [ -n "$target" ] || { kill "$pid" 2>/dev/null; echo "the statement is not visible"; return; }
+  q "$1" -tAc "SELECT pg_terminate_backend($target)" < /dev/null >/dev/null 2>&1
+  while [ $waited -lt 12 ]; do
+    grep -qiE "57P01|administrator command" "$WORK/sleep.$1" 2>/dev/null && break
+    sleep 1; waited=$((waited + 1))
+  done
+  kill "$pid" 2>/dev/null
+  # A connection opened after the signal must still work: the kill has
+  # to land on one backend, not on the server.
+  other=$(q "$1" -tAc "SELECT 'alive'" < /dev/null 2>/dev/null | tr -d '[:space:]')
+  if ! grep -qiE "57P01|administrator command" "$WORK/sleep.$1" 2>/dev/null; then
+    echo "not terminated: $(head -1 "$WORK/sleep.$1" | cut -c1-30)"
+  elif [ "$other" != "alive" ]; then
+    echo "it took the server down too"
+  else echo ok; fi
+}
+a=$(terminate_check "$PORT"); b=$(terminate_check "$PGPORT")
+judge terminate "$a" "$b"
 
 # --- idle timeout ----------------------------------------------------
 # A connection that does nothing for longer than the timeout must be
