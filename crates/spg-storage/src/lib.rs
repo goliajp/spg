@@ -5312,7 +5312,11 @@ pub struct ExclRangeIndex {
 struct TxWriteTrack {
     version: u64,
     inserted: Vec<(usize, row_header::RowId)>,
-    tombstoned: Vec<row_header::RowId>,
+    /// 9.0.4 — `(slot, RowId)`. The slot is what the tombstone was
+    /// applied to, and it travels with the write-set so a replay onto a
+    /// fresher relation can check one array element instead of hunting
+    /// for the id. See [`TxWriteSet::tombstoned`].
+    tombstoned: Vec<(usize, row_header::RowId)>,
 }
 
 /// v7.38.11 — hot-tier BRIN granularity: slots per summarised range.
@@ -6261,8 +6265,21 @@ pub fn format_uuid(b: &[u8; 16]) -> String {
 pub struct TxWriteSet {
     /// INSERTs and UPDATE-new-versions (`header.xmin == v`).
     pub inserted: Vec<(row_header::RowId, Row<'static>)>,
-    /// DELETE / UPDATE-old-version targets (`header.xmax == v`).
-    pub tombstoned: Vec<row_header::RowId>,
+    /// DELETE / UPDATE-old-version targets (`header.xmax == v`), each
+    /// with the slot it was found in.
+    ///
+    /// 9.0.4 — the slot is an ADVISORY hint: rows are append-only and a
+    /// tombstone keeps its slot, so the same RowId almost always sits at
+    /// the same index in the fresher relation a replay lands on. A hint
+    /// that does not check out falls back to the exact search, so a
+    /// stale one costs a lookup and can never give a wrong answer.
+    ///
+    /// Without it, `rowid_position`'s binary search — which assumes
+    /// `rowids` ascends — misses for exactly the rows a previous replay
+    /// re-stamped, and every miss walked the whole relation. Counted on
+    /// the customer's ingest at 4 clients: the exact search now runs
+    /// ZERO times where it used to be the replay's only way in.
+    pub tombstoned: Vec<(row_header::RowId, u32)>,
 }
 
 impl TxWriteSet {

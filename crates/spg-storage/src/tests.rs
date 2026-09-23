@@ -5355,7 +5355,13 @@ mod tx_writeset {
         old.mark_rows_deleted(&[0], 77);
         let ws = old.extract_tx_writeset(77);
         assert_eq!(ws.inserted.len(), 1);
-        assert_eq!(ws.tombstoned, alloc::vec![rid1]);
+        assert_eq!(
+            ws.tombstoned
+                .iter()
+                .map(|(r, _)| *r)
+                .collect::<alloc::vec::Vec<_>>(),
+            alloc::vec![rid1]
+        );
         let inserted_rid = ws.inserted[0].0;
 
         // "Fresh" base: same rows 1,2 (same RowIds by construction —
@@ -5438,10 +5444,12 @@ mod tx_writeset {
         // find the out-of-order slot, not report a phantom conflict.
         let ws_del = crate::TxWriteSet {
             inserted: alloc::vec::Vec::new(),
-            tombstoned: alloc::vec![rid3],
+            tombstoned: alloc::vec![(rid3, u32::MAX)],
         };
         assert!(
-            fresh.tombstone_conflicts(&[rid3], 62).is_empty(),
+            fresh
+                .tombstone_conflicts(&[(rid3, u32::MAX)], 62)
+                .is_empty(),
             "an out-of-order RowId read as missing"
         );
         assert!(fresh.replay_tx_writeset(&ws_del, 62).is_empty());
@@ -5470,7 +5478,7 @@ mod tx_writeset {
         fresh2.mark_rows_deleted(&[0], 88);
         let ws1 = crate::TxWriteSet {
             inserted: alloc::vec::Vec::new(),
-            tombstoned: alloc::vec![RowId(1)],
+            tombstoned: alloc::vec![(RowId(1), u32::MAX)],
         };
         assert!(fresh2.replay_tx_writeset(&ws1, 88).is_empty());
     }

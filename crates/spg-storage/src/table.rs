@@ -379,7 +379,7 @@ impl Table {
                 .get(position)
                 .copied()
                 .unwrap_or(crate::row_header::RowId::UNASSIGNED);
-            self.write_track_for(xmax).tombstoned.push(rid);
+            self.write_track_for(xmax).tombstoned.push((position, rid));
         }
         // v7.37.15 (Epic W durable-tombstone slice) — capture the
         // in-place tombstone as row-level redo so a gate-on
@@ -442,7 +442,7 @@ impl Table {
                     .get(position)
                     .copied()
                     .unwrap_or(crate::row_header::RowId::UNASSIGNED);
-                self.write_track_for(xmax).tombstoned.push(rid);
+                self.write_track_for(xmax).tombstoned.push((position, rid));
             }
             if capture {
                 rowids.push(
@@ -506,13 +506,18 @@ impl Table {
             if ok {
                 return crate::TxWriteSet {
                     inserted,
-                    tombstoned: track.tombstoned.clone(),
+                    tombstoned: track
+                        .tombstoned
+                        .iter()
+                        .map(|&(pos, rid)| (rid, u32::try_from(pos).unwrap_or(u32::MAX)))
+                        .collect(),
                 };
             }
         }
         let mut inserted: alloc::vec::Vec<(crate::row_header::RowId, Row<'static>)> =
             alloc::vec::Vec::new();
-        let mut tombstoned: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
+        let mut tombstoned: alloc::vec::Vec<(crate::row_header::RowId, u32)> =
+            alloc::vec::Vec::new();
         for (i, h) in self.headers.iter().enumerate() {
             let rid = self
                 .rowids
@@ -525,7 +530,7 @@ impl Table {
                 inserted.push((rid, row.clone()));
             }
             if h.xmax == v {
-                tombstoned.push(rid);
+                tombstoned.push((rid, u32::try_from(i).unwrap_or(u32::MAX)));
             }
         }
         crate::TxWriteSet {
@@ -551,6 +556,28 @@ impl Table {
     /// tombstone. At pgbench scale 5 (500k accounts) that alone cost
     /// 2.4x throughput at c=4 while PG18 got FASTER on the same widening
     /// — the O(rows) signature that named this attack.
+    /// 9.0.4 — the slot a RowId lives in, given the slot it lived in
+    /// when the write-set was taken.
+    ///
+    /// Rows are append-only and a tombstone keeps its slot, so the hint
+    /// is right unless the relation has been compacted since. Checking
+    /// it is one array read; being wrong only costs the exact search
+    /// below.
+    ///
+    /// This is what the replay path uses, because it is the path the
+    /// search below is WORST at: the replay restores original RowIds
+    /// into freshly appended slots, which is exactly what breaks the
+    /// ascending order the binary search needs — so the rows a replay
+    /// has to find are the rows the binary search is guaranteed to miss,
+    /// and every miss walked the whole relation.
+    fn rowid_at(&self, rid: crate::row_header::RowId, hint: u32) -> Option<usize> {
+        let hint = hint as usize;
+        if self.rowids.get(hint) == Some(&rid) {
+            return Some(hint);
+        }
+        self.rowid_position(rid)
+    }
+
     fn rowid_position(&self, rid: crate::row_header::RowId) -> Option<usize> {
         let n = self.rowids.len();
         let (mut lo, mut hi) = (0usize, n);
@@ -575,18 +602,18 @@ impl Table {
     #[must_use]
     pub fn tombstone_conflicts(
         &self,
-        rids: &[crate::row_header::RowId],
+        rids: &[(crate::row_header::RowId, u32)],
         v: u64,
     ) -> alloc::vec::Vec<crate::row_header::RowId> {
         rids.iter()
-            .filter(|rid| match self.rowid_position(**rid) {
+            .filter(|(rid, hint)| match self.rowid_at(*rid, *hint) {
                 Some(i) => self
                     .headers
                     .get(i)
                     .is_some_and(|h| h.xmax != crate::row_header::XMAX_ALIVE && h.xmax != v),
                 None => true,
             })
-            .copied()
+            .map(|(rid, _)| *rid)
             .collect()
     }
 
@@ -604,7 +631,41 @@ impl Table {
         ws: &crate::TxWriteSet,
         v: u64,
     ) -> alloc::vec::Vec<crate::row_header::RowId> {
-        for (rid, row) in &ws.inserted {
+        self.replay_tx_writeset_keyed(ws, v, None)
+    }
+
+    /// [`Table::replay_tx_writeset`] with each replayed row's index keys
+    /// supplied, one slice per row of `ws.inserted`.
+    ///
+    /// 9.0.4 — a replay that supplies none puts every expression index
+    /// and every locale-collated index of this relation OUT OF SERVICE
+    /// (`insert_keyed` cannot key the row, so the index goes stale), and
+    /// the next statement rebuilds it from every row. Under a second
+    /// concurrent writer the rebase runs per statement, so the customer's
+    /// `issues` — `UNIQUE (project_id, fingerprint)` on a text column,
+    /// under the collation every shipped image runs — was retired and
+    /// rebuilt several times per transaction. Profiled on the ingest at 4
+    /// clients: `rebuild_expression_index` was 12% of the server's own
+    /// work, the ICU sort keys it recomputes another 9%, and the index
+    /// inserts it re-does the single largest entry in the profile.
+    pub fn replay_tx_writeset_keyed(
+        &mut self,
+        ws: &crate::TxWriteSet,
+        v: u64,
+        keys: Option<&[alloc::vec::Vec<Option<Value<'static>>>]>,
+    ) -> alloc::vec::Vec<crate::row_header::RowId> {
+        // 9.0.4 — where this call put each row it replayed.
+        //
+        // The tombstones below routinely target rows this same replay
+        // just appended (a transaction that UPDATEs the same row twice
+        // tombstones its own new version), and those sit at a slot no
+        // hint from the old shadow can name — the base they are being
+        // replayed onto has grown by other transactions' rows since.
+        // Without this they fell through to the exact search, which is
+        // the walk this whole path exists to avoid.
+        let mut replayed: alloc::collections::BTreeMap<crate::row_header::RowId, usize> =
+            alloc::collections::BTreeMap::new();
+        for (i, (rid, row)) in ws.inserted.iter().enumerate() {
             // Full insert (validation + index maintenance + fresh
             // header/rowid), then re-stamp the header's xmin and put
             // the ORIGINAL RowId back. The allocator id the insert
@@ -612,7 +673,7 @@ impl Table {
             // a gap is harmless. Insert can only fail on schema
             // mismatch, impossible for a row this same relation
             // already accepted; a debug_assert documents that.
-            let res = self.insert(row.clone());
+            let res = self.insert_keyed(row.clone(), keys.and_then(|k| k.get(i)).map(|v| &v[..]));
             debug_assert!(res.is_ok(), "writeset replay re-inserts a validated row");
             if res.is_err() {
                 continue;
@@ -629,10 +690,14 @@ impl Table {
             // SECOND rebase's fast extraction would miss every row the
             // first rebase replayed — a lost write.
             self.write_track_for(v).inserted.push((last, *rid));
+            replayed.insert(*rid, last);
         }
         let mut conflicts: alloc::vec::Vec<crate::row_header::RowId> = alloc::vec::Vec::new();
-        for rid in &ws.tombstoned {
-            let pos = self.rowid_position(*rid);
+        for &(rid, hint) in &ws.tombstoned {
+            let pos = match replayed.get(&rid) {
+                Some(&p) => Some(p),
+                None => self.rowid_at(rid, hint),
+            };
             match pos {
                 Some(i) => match self.headers.get_mut(i) {
                     Some(h) if h.xmax == crate::row_header::XMAX_ALIVE => {
@@ -640,12 +705,12 @@ impl Table {
                         self.dead_rows += 1;
                         // v7.38.2 (R2) — same funnel-bypass recording
                         // as the insert replay above.
-                        self.write_track_for(v).tombstoned.push(*rid);
+                        self.write_track_for(v).tombstoned.push((i, rid));
                     }
                     Some(h) if h.xmax == v => {} // already ours (idempotent)
-                    _ => conflicts.push(*rid),
+                    _ => conflicts.push(rid),
                 },
-                None => conflicts.push(*rid),
+                None => conflicts.push(rid),
             }
         }
         conflicts
