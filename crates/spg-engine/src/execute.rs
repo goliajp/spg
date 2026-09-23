@@ -660,6 +660,52 @@ impl Engine {
         e.0 = e.0.saturating_add(ins);
         e.1 = e.1.saturating_add(upd);
         e.2 = e.2.saturating_add(del);
+        // 9.0.5 — the two "since" counters autovacuum and autoanalyze
+        // are judged on, which PostgreSQL 18 reports beside them.
+        let m = self
+            .table_maintenance_stats
+            .entry(alloc::string::String::from(table))
+            .or_default();
+        m.mod_since_analyze = m
+            .mod_since_analyze
+            .saturating_add(ins)
+            .saturating_add(upd)
+            .saturating_add(del);
+        m.ins_since_vacuum = m.ins_since_vacuum.saturating_add(ins);
+    }
+
+    /// 9.0.5 — one VACUUM over `table` finished. `auto` separates the
+    /// daemon's from an operator's, which PostgreSQL counts apart.
+    pub(crate) fn note_vacuum(&mut self, table: &str, at_us: i64, took_us: u64, auto: bool) {
+        let m = self
+            .table_maintenance_stats
+            .entry(alloc::string::String::from(table))
+            .or_default();
+        m.ins_since_vacuum = 0;
+        if auto {
+            m.autovacuum_count = m.autovacuum_count.saturating_add(1);
+            m.total_autovacuum_us = m.total_autovacuum_us.saturating_add(took_us);
+        } else {
+            m.vacuum_count = m.vacuum_count.saturating_add(1);
+            m.total_vacuum_us = m.total_vacuum_us.saturating_add(took_us);
+            m.last_vacuum_us = Some(at_us);
+        }
+    }
+
+    /// 9.0.5 — one ANALYZE over `table` finished.
+    pub(crate) fn note_analyze(&mut self, table: &str, took_us: u64, auto: bool) {
+        let m = self
+            .table_maintenance_stats
+            .entry(alloc::string::String::from(table))
+            .or_default();
+        m.mod_since_analyze = 0;
+        if auto {
+            m.autoanalyze_count = m.autoanalyze_count.saturating_add(1);
+            m.total_autoanalyze_us = m.total_autoanalyze_us.saturating_add(took_us);
+        } else {
+            m.analyze_count = m.analyze_count.saturating_add(1);
+            m.total_analyze_us = m.total_analyze_us.saturating_add(took_us);
+        }
     }
 
     pub fn prepare_cached(&mut self, sql: &str) -> Result<Statement, ParseError> {
@@ -871,11 +917,49 @@ impl Engine {
     /// placeholders` walk (a no-op when params are empty). Caller
     /// must already hold the engine write lock — read would be
     /// cleaner, but `current_tx` mutation keeps it `&mut`.
+    /// 9.1.0 — open the wall-clock window `spg_stat_query` and the
+    /// slow-query log are recorded from. `None` when there is no text
+    /// to record under, or no clock to read.
+    fn stat_window(&self, sql: Option<&str>) -> Option<i64> {
+        sql.and(self.clock).map(|f| f())
+    }
+
+    /// 9.1.0 — close it. One place, so the three statement entry paths
+    /// record the same way: the simple-query one, the extended
+    /// protocol's, and the read-only prepared-SELECT fast paths.
+    fn stat_record(&mut self, sql: Option<&str>, t0: Option<i64>, row_count: u64) {
+        let (Some(text), Some(t0)) = (sql, t0) else {
+            return;
+        };
+        let now = self.clock.map_or(t0, |f| f());
+        let elapsed = now.saturating_sub(t0).max(0) as u64;
+        self.query_stats
+            .record_with_rows(text, elapsed, now as u64, row_count);
+        if let (Some(threshold), Some(logger)) =
+            (self.slow_query_threshold_us(), self.slow_query_logger)
+            && elapsed >= threshold
+        {
+            logger(text, elapsed);
+        }
+    }
+
     pub fn execute_prepared_select_no_params(
         &mut self,
         stmt: &spg_sql::ast::SelectStatement,
         cancel: CancelToken<'_>,
     ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_select_no_params_as(stmt, cancel, None)
+    }
+
+    /// 9.1.0 — the same, told which text this statement is, so it
+    /// reaches `spg_stat_query`. See [`Self::execute_prepared_in_as`].
+    pub fn execute_prepared_select_no_params_as(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        sql: Option<&str>,
+    ) -> Result<QueryResult, EngineError> {
+        let start_us = self.stat_window(sql);
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
         // v7.38 Epic P (panic isolation) — Slice 3: route this read-only
@@ -895,6 +979,10 @@ impl Engine {
         #[cfg(not(feature = "std"))]
         let result = self.exec_select_cancel(stmt, cancel);
         self.current_tx = saved;
+        if let Ok(QueryResult::Rows { rows, .. }) = &result {
+            let n = rows.len() as u64;
+            self.stat_record(sql, start_us, n);
+        }
         result
     }
 
@@ -1328,11 +1416,29 @@ impl Engine {
         &mut self,
         stmt: &spg_sql::ast::SelectStatement,
         cancel: CancelToken<'_>,
-        mut emit: F,
+        emit: F,
     ) -> Result<usize, EngineError>
     where
         F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
     {
+        self.execute_prepared_select_streaming_as(stmt, cancel, emit, None)
+    }
+
+    /// 9.1.0 — the same, told which text this statement is, so it
+    /// reaches `spg_stat_query`. This is the path a driver's
+    /// parameterless SELECT takes, so without it the view saw none of
+    /// them. See [`Self::execute_prepared_in_as`].
+    pub fn execute_prepared_select_streaming_as<F>(
+        &mut self,
+        stmt: &spg_sql::ast::SelectStatement,
+        cancel: CancelToken<'_>,
+        mut emit: F,
+        sql: Option<&str>,
+    ) -> Result<usize, EngineError>
+    where
+        F: FnMut(StreamItem<'_>) -> Result<(), EngineError>,
+    {
+        let start_us = self.stat_window(sql);
         let saved = self.current_tx;
         self.current_tx = Some(IMPLICIT_TX);
         // v7.38 Epic P (panic isolation) — Slice 3: route the streaming
@@ -1360,6 +1466,10 @@ impl Engine {
         #[cfg(not(feature = "std"))]
         let inner = self.exec_select_streaming(stmt, cancel, &mut emit);
         self.current_tx = saved;
+        if let Ok(n) = &inner {
+            let n = *n as u64;
+            self.stat_record(sql, start_us, n);
+        }
         inner
     }
 
@@ -1753,10 +1863,36 @@ impl Engine {
 
     pub fn execute_prepared_in_with_cancel(
         &mut self,
+        stmt: Statement,
+        params: &[Value<'static>],
+        tx_id: TxId,
+        cancel: CancelToken<'_>,
+    ) -> Result<QueryResult, EngineError> {
+        self.execute_prepared_in_as(stmt, params, tx_id, cancel, None)
+    }
+
+    /// 9.1.0 — the extended protocol's execute, told which text this
+    /// statement is.
+    ///
+    /// `spg_stat_query` and the slow-query log are recorded by the
+    /// simple-query path only, so neither could see a statement sent
+    /// through Parse/Bind/Execute — which is how sqlx, asyncpg and most
+    /// drivers send EVERYTHING. A per-statement timing view that covers
+    /// the protocol an application does not use covers nothing, and it
+    /// said so nowhere.
+    ///
+    /// The text is the PARSE message's, not the bind-final render: one
+    /// entry per prepared statement, the way `pg_stat_statements`
+    /// groups them, and no rendering cost on the hot path because the
+    /// caller already holds it. `None` keeps the old behaviour for
+    /// callers that have no text to give.
+    pub fn execute_prepared_in_as(
+        &mut self,
         mut stmt: Statement,
         params: &[Value<'static>],
         tx_id: TxId,
         cancel: CancelToken<'_>,
+        sql: Option<&str>,
     ) -> Result<QueryResult, EngineError> {
         // 9.0.0 — one clock reading for this statement; see
         // `Engine::begin_statement`.
@@ -1786,7 +1922,18 @@ impl Engine {
         // for the duration, so a caught panic rolls back the right tx; the
         // `saved` restore below still runs because the catch converts the
         // unwind into a normal `Result` return.
+        // 9.1.0 — the same wall-clock window the simple-query path
+        // opens, so this protocol's statements reach `spg_stat_query`
+        // and the slow-query log too.
+        let start_us = self.stat_window(sql);
         let result = self.execute_stmt_catching(stmt, cancel);
+        if let Ok(ok) = &result {
+            let row_count: u64 = match ok {
+                QueryResult::Rows { rows, .. } => rows.len() as u64,
+                QueryResult::CommandOk { affected, .. } => *affected as u64,
+            };
+            self.stat_record(sql, start_us, row_count);
+        }
         self.current_tx = saved;
         // r1059 — the r196 per-slot epoch witness, on THIS entry path
         // too. The bump lived only in `execute_in_with_cancel`, so an

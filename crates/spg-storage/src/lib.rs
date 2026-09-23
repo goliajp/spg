@@ -5228,18 +5228,44 @@ pub struct ScanStats {
     pub seq_tup_read: core::sync::atomic::AtomicU64,
     pub idx_scan: core::sync::atomic::AtomicU64,
     pub idx_tup_fetch: core::sync::atomic::AtomicU64,
+    /// 9.0.5 — when the last scan of each kind happened, for
+    /// PostgreSQL 18's `last_seq_scan` / `last_idx_scan`. Microseconds
+    /// since the epoch; 0 = never.
+    ///
+    /// Taken from [`STATEMENT_MICROS`], not from a clock: the scan path
+    /// is hot and the statement has already read the clock once, which
+    /// is also the reading every other thing this statement reports
+    /// uses.
+    pub last_seq_scan_us: core::sync::atomic::AtomicI64,
+    pub last_idx_scan_us: core::sync::atomic::AtomicI64,
 }
 
 impl Clone for ScanStats {
     fn clone(&self) -> Self {
-        use core::sync::atomic::{AtomicU64, Ordering};
+        use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
         Self {
             seq_scan: AtomicU64::new(self.seq_scan.load(Ordering::Relaxed)),
             seq_tup_read: AtomicU64::new(self.seq_tup_read.load(Ordering::Relaxed)),
             idx_scan: AtomicU64::new(self.idx_scan.load(Ordering::Relaxed)),
             idx_tup_fetch: AtomicU64::new(self.idx_tup_fetch.load(Ordering::Relaxed)),
+            last_seq_scan_us: AtomicI64::new(self.last_seq_scan_us.load(Ordering::Relaxed)),
+            last_idx_scan_us: AtomicI64::new(self.last_idx_scan_us.load(Ordering::Relaxed)),
         }
     }
+}
+
+/// 9.0.5 — the reading the statement now running took, mirrored down
+/// here so a scan can stamp itself without a clock call. Written once
+/// per statement by the engine's statement scope; 0 until one has run.
+pub static STATEMENT_MICROS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+
+/// Set by the engine when it pins a statement's clock reading.
+pub fn set_statement_micros(us: i64) {
+    STATEMENT_MICROS.store(us, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn statement_micros() -> i64 {
+    STATEMENT_MICROS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// v7.39 (round 215) — the lower-bound sort key for a range value, used by

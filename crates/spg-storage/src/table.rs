@@ -157,6 +157,9 @@ impl Table {
     pub fn note_seq_scan(&self) {
         use core::sync::atomic::Ordering;
         self.scan_stats.seq_scan.fetch_add(1, Ordering::Relaxed);
+        self.scan_stats
+            .last_seq_scan_us
+            .store(crate::statement_micros(), Ordering::Relaxed);
         let visible = (self.rows.len() as u64).saturating_sub(self.dead_rows);
         self.scan_stats
             .seq_tup_read
@@ -168,6 +171,9 @@ impl Table {
     pub fn note_index_scan(&self, fetched: u64) {
         use core::sync::atomic::Ordering;
         self.scan_stats.idx_scan.fetch_add(1, Ordering::Relaxed);
+        self.scan_stats
+            .last_idx_scan_us
+            .store(crate::statement_micros(), Ordering::Relaxed);
         self.scan_stats
             .idx_tup_fetch
             .fetch_add(fetched, Ordering::Relaxed);
