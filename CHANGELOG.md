@@ -8,6 +8,91 @@ the current build; this file is a release-organized view.
 
 ---
 
+## [9.1.0] — 2026-09-24
+
+A transaction that writes nothing now costs nothing, and the two
+observability views an operator actually reads answer what PostgreSQL's
+answer. Measured against PostgreSQL 18.6 at one client, both engines in
+containers with the same limits, pgbench through the extended protocol:
+
+```text
+  workload                              9.1.0    9.0.4    PG 18
+  SELECT 1                             13,957   13,283   14,063
+  BEGIN; COMMIT;                        5,057      765    7,321
+  BEGIN; SELECT count(*) …; COMMIT;     3,371      691    4,592
+  the ingest transaction (writes)          352      340      547
+```
+
+### Fixed — a transaction that writes nothing writes no WAL and does not fsync
+
+PostgreSQL assigns no transaction id and writes no WAL for a transaction
+that never writes, so `BEGIN; SELECT …; COMMIT;` costs it two round
+trips and no disk. SPG wrote both ends of the transaction and fsynced at
+the commit. An ORM wraps its reads in transactions, so that was every
+read — 4.9× slower than it needed to be, and the WAL grew from pure
+reads, which shows up again in recovery time and in the size of a
+backup.
+
+Counted in bytes, which is what was wrong: ten read-only transactions
+wrote 940 bytes on 9.0.4 and 440 on 9.0.3. They now write **zero**.
+
+The `BEGIN` is held on the connection and written only when the
+transaction produces its first record, so a transaction that does write
+is logged exactly as before — including a `ROLLBACK`, which still has
+something to undo on replay. COPY appends its rows without going through
+the statement path, so it writes the deferred `BEGIN` first: otherwise
+the rows would sit in the log with no transaction around them.
+
+### Fixed — 9.0.4 made the WAL grow faster than it should have
+
+9.0.4 added a record naming the clock and random readings each statement
+drew from, so a restart replays the values it committed. It was written
+for statements that write nothing too, which took a read-only
+transaction from 44 bytes of WAL to 94. Subsumed by the fix above.
+
+### Fixed — `pg_stat_user_tables` has PostgreSQL 18's columns
+
+It had 16 of 30, and the missing 14 did not read as zero — a query
+naming `autovacuum_count`, `n_mod_since_analyze` or `last_seq_scan` was
+REFUSED with `column … does not exist`, so a monitoring dashboard got an
+error rather than a number. All thirty are answered now, in PostgreSQL's
+order:
+
+* `vacuum_count` / `autovacuum_count` / `analyze_count` /
+  `autoanalyze_count` and their `total_*_time` companions,
+* `n_mod_since_analyze` / `n_ins_since_vacuum`, reset by the ANALYZE and
+  the VACUUM they measure distance from,
+* `last_seq_scan` / `last_idx_scan`, stamped from the reading the
+  statement already took — no clock call on the scan path,
+* `n_tup_hot_upd` / `n_tup_newpage_upd` answer 0. A heap-only-tuple
+  update is a PostgreSQL storage optimisation SPG's storage has no path
+  for, so zero is the count, not a placeholder.
+
+`VACUUM <table>` also stamped `last_autovacuum` rather than
+`last_vacuum`, so an operator's vacuum was reported as the daemon's work
+and `last_vacuum` was NULL whatever anyone did.
+
+### Fixed — `spg_stat_query` sees statements sent through the extended protocol
+
+The per-statement timings and the slow-query log were recorded by the
+simple-query path only. sqlx, asyncpg and most drivers send everything
+through Parse/Bind/Execute, so a view meant to answer "which statement
+is slow" covered the protocol the application does not use — and said so
+nowhere. An operator reading it saw a short, plausible list.
+
+The text recorded is the Parse message's, so there is one entry per
+prepared statement the way `pg_stat_statements` groups them, and nothing
+is rendered on the hot path because the server already holds it.
+
+### Added — `Engine::execute_prepared_in_as` and its two siblings
+
+`execute_prepared_in_as`, `execute_prepared_select_no_params_as` and
+`execute_prepared_select_streaming_as` take the statement's text so the
+engine can record it. The existing methods delegate to them with `None`
+and behave exactly as before, which is why this is a minor release.
+
+---
+
 ## [9.0.4] — 2026-09-24
 
 Two surfaces a production database is judged on that nothing here had
