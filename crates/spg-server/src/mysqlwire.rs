@@ -701,6 +701,7 @@ fn command_loop(
         terminate: std::sync::atomic::AtomicBool::new(false),
         sock,
         notify_queue: std::sync::Mutex::new(Vec::new()),
+        tx_unlogged: std::sync::atomic::AtomicBool::new(false),
     });
     // Stamp the id into the thread slot `pg_backend_pid()` /
     // `CONNECTION_ID()` read during evaluation on this thread.
@@ -1717,7 +1718,7 @@ fn handle_com_query(
     // acking. The mysql-wire path was non-durable like pgwire pre-7.33:
     // a COM_QUERY write was lost on crash. A durability failure turns
     // the write into an error, never a silent OK.
-    let outcome = match crate::pgwire::persist_wire_write(state, sql, &outcome, conn_tx_id) {
+    let outcome = match crate::pgwire::persist_wire_write(state, sql, &outcome, conn_state) {
         Ok(()) => outcome,
         Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
             "durability append failed: {e}"
@@ -2010,6 +2011,9 @@ fn handle_com_stmt_execute(
     };
 
     let _scope = StatementScope::begin(conn_state, &entry.sql);
+    // 9.1.0 — kept for the stats record below, before the binary
+    // parameters are parsed into `entry`.
+    let entry_sql = entry.sql.clone();
 
     // Parse parameters per the binary protocol.
     let parse_res = parse_execute_params(&mut entry, &payload[9..]);
@@ -2064,7 +2068,16 @@ fn handle_com_stmt_execute(
             };
             // See the COM_QUERY path: the insert id is read under the
             // guard that ran the statement.
-            let r = engine.execute_prepared_in(stmt, &params, conn_tx_id);
+            // 9.1.0 — with the PREPARE's own text, so the statement
+            // reaches `spg_stat_query` and the slow-query log the way a
+            // simple-query one does.
+            let r = engine.execute_prepared_in_as(
+                stmt,
+                &params,
+                conn_tx_id,
+                spg_engine::CancelToken::none(),
+                Some(entry_sql.as_str()),
+            );
             let insert_id = engine.statement_insert_id();
             (r, render, insert_id)
         };
@@ -2084,7 +2097,7 @@ fn handle_com_stmt_execute(
     // non-durable pre-7.33, lost on crash).
     let outcome = match render {
         Some(render) => {
-            match crate::pgwire::persist_wire_write(state, &render, &outcome, conn_tx_id) {
+            match crate::pgwire::persist_wire_write(state, &render, &outcome, conn_state) {
                 Ok(()) => outcome,
                 Err(e) => Err(spg_engine::EngineError::Unsupported(format!(
                     "durability append failed: {e}"

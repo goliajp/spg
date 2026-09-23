@@ -562,6 +562,99 @@ pub(crate) struct ConnState {
     /// then flushes its own queue as 'A' NotificationResponse messages at
     /// its next statement boundary.
     pub(crate) notify_queue: std::sync::Mutex<Vec<(String, String)>>,
+    /// 9.0.5 — this connection has an open transaction whose `BEGIN` has
+    /// NOT been written to the WAL yet.
+    ///
+    /// PostgreSQL assigns no transaction id and writes no WAL for a
+    /// transaction that never writes, so `BEGIN; SELECT …; COMMIT;`
+    /// costs it two round trips and no disk. SPG logged the `BEGIN` and
+    /// the `COMMIT` and fsynced at the commit, which an ORM pays on
+    /// every read it wraps in a transaction — measured at one client,
+    /// 863 tps against PostgreSQL's 4,511 for the same shape, and the
+    /// whole difference came back when `synchronous_commit` was turned
+    /// off.
+    ///
+    /// So the `BEGIN` is held here instead, and written only when the
+    /// transaction produces its first record. Per CONNECTION, not in a
+    /// map keyed by transaction slot: slots are reused, and a
+    /// connection that dies mid-transaction would leave an entry that
+    /// prefixes the NEXT connection's autocommit write with a `BEGIN`
+    /// no `COMMIT` ever follows — replay would roll that write back.
+    pub(crate) tx_unlogged: AtomicBool,
+}
+
+/// 9.0.5 — which end of a transaction a statement is, for the WAL.
+///
+/// Text, not the AST: this runs per statement on the connection's
+/// thread, and the parse has already happened upstream. The first word
+/// is what PostgreSQL's own `BEGIN` / `COMMIT` / `END` / `ROLLBACK`
+/// spellings differ in; `ROLLBACK TO SAVEPOINT` is deliberately NOT a
+/// close, because the transaction it names is still open.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxEdge {
+    Opens,
+    Closes,
+    Neither,
+}
+
+pub(crate) fn wal_tx_edge(sql: &str) -> TxEdge {
+    let lower = sql.trim_start().to_ascii_lowercase();
+    let mut words = lower.split(|c: char| c.is_whitespace() || c == ';' || c == '(');
+    let first = words.next().unwrap_or("");
+    match first {
+        "begin" | "start" => TxEdge::Opens,
+        "commit" | "end" | "abort" => TxEdge::Closes,
+        "rollback" => {
+            // `ROLLBACK TO [SAVEPOINT] x` unwinds to a savepoint and
+            // leaves the transaction open.
+            if words.find(|w| !w.is_empty()) == Some("to") {
+                TxEdge::Neither
+            } else {
+                TxEdge::Closes
+            }
+        }
+        _ => TxEdge::Neither,
+    }
+}
+
+#[cfg(test)]
+mod tx_edge_tests {
+    use super::{TxEdge, wal_tx_edge};
+
+    fn opens(s: &str) -> bool {
+        wal_tx_edge(s) == TxEdge::Opens
+    }
+    fn closes(s: &str) -> bool {
+        wal_tx_edge(s) == TxEdge::Closes
+    }
+
+    #[test]
+    fn the_spellings_postgresql_accepts() {
+        for s in [
+            "BEGIN",
+            "begin;",
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "START TRANSACTION",
+            "  begin work ",
+        ] {
+            assert!(opens(s), "{s:?} opens a transaction");
+        }
+        for s in ["COMMIT", "commit;", "END", "END WORK", "ROLLBACK", "ABORT"] {
+            assert!(closes(s), "{s:?} closes one");
+        }
+        // These leave the transaction open, so the deferred BEGIN must
+        // not be discarded on them.
+        for s in [
+            "ROLLBACK TO SAVEPOINT s",
+            "ROLLBACK TO s",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "SELECT 1",
+            "INSERT INTO t VALUES (1)",
+        ] {
+            assert!(!opens(s) && !closes(s), "{s:?} is neither end");
+        }
+    }
 }
 
 impl ConnState {
