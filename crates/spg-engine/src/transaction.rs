@@ -344,13 +344,20 @@ impl Engine {
             // right after, which is exactly PG's "never visible".
             let own_inserted: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
                 ws.inserted.iter().map(|(rid, _)| *rid).collect();
-            let conflicted: Vec<spg_storage::row_header::RowId> = new_t
-                .tombstone_conflicts(&ws.tombstoned, v)
-                .into_iter()
-                .filter(|rid| !own_inserted.contains(rid))
+            // 9.0.4 — filter BEFORE the probe, not after. A tombstone
+            // naming a row this tx inserted cannot be in the fresh base,
+            // so the probe was guaranteed to miss it and pay the exact
+            // search for an answer this filter then threw away.
+            let foreign: Vec<(spg_storage::row_header::RowId, u32)> = ws
+                .tombstoned
+                .iter()
+                .filter(|(rid, _)| !own_inserted.contains(rid))
+                .copied()
                 .collect();
+            let conflicted: Vec<spg_storage::row_header::RowId> =
+                new_t.tombstone_conflicts(&foreign, v);
             if !conflicted.is_empty() {
-                ws.tombstoned.retain(|rid| !conflicted.contains(rid));
+                ws.tombstoned.retain(|(rid, _)| !conflicted.contains(rid));
                 if let Some(tp) = pairs.get(tname.as_str()) {
                     let dropped_new: Vec<spg_storage::row_header::RowId> = tp
                         .iter()
@@ -371,7 +378,7 @@ impl Engine {
                 .tombstoned
                 .iter()
                 .copied()
-                .partition(|rid| own_inserted.contains(rid));
+                .partition(|(rid, _)| own_inserted.contains(rid));
             let phase1 = spg_storage::TxWriteSet {
                 inserted: Vec::new(),
                 tombstoned: plain_tombs,
@@ -395,7 +402,7 @@ impl Engine {
                 // key 6 and failed the NEXT statement with a spurious duplicate
                 // key — losing the row.
                 let own_cycle_set: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
-                    own_cycle.iter().copied().collect();
+                    own_cycle.iter().map(|(rid, _)| *rid).collect();
                 let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
                     .inserted
                     .iter()
@@ -436,6 +443,13 @@ impl Engine {
                     }
                 }
             }
+            // 9.0.4 — the replayed rows carry their index keys.
+            //
+            // Without them every expression index and every
+            // locale-collated index of the relation drops out of service
+            // on the first replayed row, and the next statement rebuilds
+            // it from every row. See `Table::replay_tx_writeset_keyed`.
+            let key_functions = crate::expr_index::function_scope(&fresh, Some(tname.as_str()));
             let Some(new_t) = fresh.get_mut(tname) else {
                 return Ok(());
             };
@@ -443,7 +457,18 @@ impl Engine {
                 inserted: core::mem::take(&mut ws.inserted),
                 tombstoned: own_cycle,
             };
-            let leftover = new_t.replay_tx_writeset(&phase2, v);
+            let keys = match crate::expr_index::ExprKeyPlan::for_table(new_t)? {
+                Some(plan) => {
+                    let cols = new_t.schema().columns.clone();
+                    let mut out = Vec::with_capacity(phase2.inserted.len());
+                    for (_, row) in &phase2.inserted {
+                        out.push(plan.row_keys(&cols, &row.values, key_functions.as_ref())?);
+                    }
+                    Some(out)
+                }
+                None => None,
+            };
+            let leftover = new_t.replay_tx_writeset_keyed(&phase2, v, keys.as_deref());
             debug_assert!(leftover.is_empty(), "insert replay must be clean");
         }
         if let Some(st) = self.tx_catalogs.get_mut(&tx_id) {
@@ -789,7 +814,7 @@ impl Engine {
                     .tombstoned
                     .iter()
                     .copied()
-                    .partition(|rid| own_inserted.contains(rid));
+                    .partition(|(rid, _)| own_inserted.contains(rid));
                 let phase1 = spg_storage::TxWriteSet {
                     inserted: Vec::new(),
                     tombstoned: plain_tombs,
@@ -802,7 +827,7 @@ impl Engine {
                 // above): an INSERT-then-UPDATE of the same key in one tx staged
                 // both versions as inserts and false-tripped a duplicate key.
                 let own_cycle_set: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
-                    own_cycle.iter().copied().collect();
+                    own_cycle.iter().map(|(rid, _)| *rid).collect();
                 let inserted_rows: Vec<Vec<spg_storage::Value<'static>>> = ws
                     .inserted
                     .iter()
@@ -845,6 +870,8 @@ impl Engine {
                         break 'merge;
                     }
                 }
+                // 9.0.4 — keys, for the same reason as the RC rebase.
+                let key_functions = crate::expr_index::function_scope(&fresh, Some(tname.as_str()));
                 let Some(new_t) = fresh.get_mut(tname) else {
                     conflict = Some(alloc::format!("table {tname:?} was dropped concurrently"));
                     break 'merge;
@@ -853,7 +880,18 @@ impl Engine {
                     inserted: ws.inserted.clone(),
                     tombstoned: own_cycle,
                 };
-                let leftover = new_t.replay_tx_writeset(&phase2, v);
+                let keys = match crate::expr_index::ExprKeyPlan::for_table(new_t)? {
+                    Some(plan) => {
+                        let cols = new_t.schema().columns.clone();
+                        let mut out = Vec::with_capacity(phase2.inserted.len());
+                        for (_, row) in &phase2.inserted {
+                            out.push(plan.row_keys(&cols, &row.values, key_functions.as_ref())?);
+                        }
+                        Some(out)
+                    }
+                    None => None,
+                };
+                let leftover = new_t.replay_tx_writeset_keyed(&phase2, v, keys.as_deref());
                 debug_assert!(leftover.is_empty(), "insert replay must be clean");
             }
             match conflict {

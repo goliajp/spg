@@ -152,7 +152,7 @@ impl crate::Engine {
             };
             let ws = theirs.extract_tx_writeset(v);
             let gone: alloc::collections::BTreeSet<spg_storage::row_header::RowId> =
-                ws.tombstoned.iter().copied().collect();
+                ws.tombstoned.iter().map(|(rid, _)| *rid).collect();
             'rows: for (rid, row) in &ws.inserted {
                 if gone.contains(rid) {
                     continue;
