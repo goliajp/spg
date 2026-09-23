@@ -638,7 +638,7 @@ fn handle_pg_simple_query(
         }
         match copy {
             CopyIntent::From(spec) => {
-                handle_copy_from_stdin(stream, state, role, &spec, tx_state, conn_state.tx_id)?;
+                handle_copy_from_stdin(stream, state, role, &spec, tx_state, conn_state)?;
             }
             CopyIntent::FromFile(spec) => {
                 handle_copy_from_file(stream, state, role, &spec, tx_state, conn_state.tx_id)?;
@@ -1203,7 +1203,7 @@ fn handle_pg_simple_query(
     let result = if queue_persisted {
         result
     } else {
-        match persist_wire_write(state, sql, &result, conn_state.tx_id) {
+        match persist_wire_write(state, sql, &result, conn_state) {
             Ok(()) => result,
             Err(e) => Err(EngineError::Unsupported(format!(
                 "durability append failed: {e}"
@@ -1498,7 +1498,7 @@ fn handle_pg_simple_query_one_into_wbuf(
     let result = if queue_persisted {
         result
     } else {
-        match persist_wire_write(state, sql, &result, conn_state.tx_id) {
+        match persist_wire_write(state, sql, &result, conn_state) {
             Ok(()) => result,
             Err(e) => Err(EngineError::Unsupported(format!(
                 "durability append failed: {e}"
@@ -1895,6 +1895,7 @@ fn run_pg_session(
         database: std::sync::RwLock::new(startup_db.clone()),
         sock,
         notify_queue: std::sync::Mutex::new(Vec::new()),
+        tx_unlogged: std::sync::atomic::AtomicBool::new(false),
     });
 
     // v7.39 (round 319) — install this connection's session BEFORE seeding
@@ -3070,12 +3071,39 @@ fn trace_frontend_message(msg_type: u8, body: &[u8], tx_state: u8) {
     );
 }
 
+/// 9.0.5 — write the transaction's deferred `BEGIN`, if one is still
+/// waiting, so the record about to be appended lands INSIDE the
+/// transaction it belongs to.
+///
+/// Every path that appends to the WAL on a connection has to call this
+/// first. COPY is the one that does not go through
+/// [`persist_wire_write`]: `BEGIN; COPY t FROM STDIN; COMMIT;` would
+/// otherwise put the rows in the log with no transaction around them,
+/// and a torn COPY would replay as a run of separate commits.
+pub(crate) fn flush_deferred_begin(
+    state: &Arc<ServerState>,
+    conn_state: &crate::ConnState,
+) -> std::io::Result<()> {
+    if state.wal.is_none() {
+        return Ok(());
+    }
+    if conn_state
+        .tx_unlogged
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
+    {
+        let mysql = state.engine.read().is_ok_and(|e| e.in_mysql_dialect());
+        crate::wal::append_wal_dialect(state, "BEGIN", false, mysql)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn persist_wire_write(
     state: &Arc<ServerState>,
     sql: &str,
     result: &Result<QueryResult, EngineError>,
-    tx_id: spg_engine::TxId,
+    conn_state: &crate::ConnState,
 ) -> std::io::Result<()> {
+    let tx_id = conn_state.tx_id;
     // v7.39 (round 178) — a DML with RETURNING answers `Rows`, not
     // `CommandOk`. Pre-r178 this let-else dropped it ("SELECT —
     // nothing to persist"), so `INSERT … RETURNING` over pgwire /
@@ -3091,6 +3119,39 @@ pub(crate) fn persist_wire_write(
     };
     let modified_catalog = &modified_catalog;
     if state.wal.is_some() {
+        // 9.0.5 — a transaction's first RECORD is what starts it.
+        //
+        // PostgreSQL assigns no transaction id and writes no WAL for a
+        // transaction that never writes, so `BEGIN; SELECT …; COMMIT;`
+        // costs it two round trips and no disk. SPG wrote both ends and
+        // fsynced at the commit — 863 tps against PostgreSQL's 4,511 at
+        // one client for that shape, with the whole difference coming
+        // back when `synchronous_commit` was turned off. An ORM wraps
+        // its reads in transactions, so that was every read.
+        //
+        // The `BEGIN` is held on the connection instead. It is written
+        // by `flush_deferred_begin` when something finally has to be
+        // logged; if the transaction ends without that happening,
+        // neither end is written and there is no fsync.
+        match crate::wal_tx_edge(sql) {
+            crate::TxEdge::Opens => {
+                conn_state
+                    .tx_unlogged
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            crate::TxEdge::Closes => {
+                if conn_state
+                    .tx_unlogged
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    // Nothing was logged between the two ends, so there
+                    // is nothing to close — and nothing to fsync.
+                    return Ok(());
+                }
+            }
+            crate::TxEdge::Neither => {}
+        }
         // v7.37.15 (r172) — session synchronous_commit decides whether
         // this append fsyncs. Safe to read here: no engine lock is
         // held (the no-WAL branch below takes engine.read() itself).
@@ -3123,6 +3184,10 @@ pub(crate) fn persist_wire_write(
         // v7.39.2 — the dialect travels with the statement; see
         // `append_wal_dialect`.
         let mysql = state.engine.read().is_ok_and(|e| e.in_mysql_dialect());
+        // 9.0.5 — this statement is the first thing the transaction
+        // logs, so its `BEGIN` goes in front of it. Without fsync: the
+        // COMMIT is still the durability point.
+        flush_deferred_begin(state, conn_state)?;
         crate::wal::append_wal_dialect(
             state,
             sql,
@@ -4738,8 +4803,10 @@ fn handle_execute(
         // text-format fallback payloads in the extended-protocol
         // streaming path.
         let ext_arena = bumpalo::Bump::new();
-        let stream_emit_result =
-            eng.execute_prepared_select_streaming(s, cancel, |item| match item {
+        let stream_emit_result = eng.execute_prepared_select_streaming_as(
+            s,
+            cancel,
+            |item| match item {
                 spg_engine::StreamItem::Header(cols) => {
                     // v7.39 — Execute must not emit RowDescription
                     // (Describe owns it); keep the columns for the
@@ -4757,7 +4824,12 @@ fn handle_execute(
                     &wire_tz,
                 )
                 .map_err(|e| spg_engine::EngineError::Unsupported(e.to_string())),
-            });
+            },
+            // 9.1.0 — the Parse message's text, so a driver's
+            // parameterless SELECT reaches `spg_stat_query` too. This is
+            // the path they nearly all take.
+            Some(stmt.sql.as_str()),
+        );
         drop(eng);
         let row_count = match stream_emit_result {
             Ok(n) => n,
@@ -4872,11 +4944,15 @@ fn handle_execute(
                 // added it for mysql-wire; its doc comment says pgwire "achieves
                 // [the same] by rendering bind-final SQL through execute_in",
                 // and that was true of the simple-query path only.
-                eng.execute_prepared_in_with_cancel(
+                // 9.1.0 — with the Parse message's own text, so this
+                // statement reaches `spg_stat_query` and the slow-query
+                // log. It is already held here; nothing is rendered.
+                eng.execute_prepared_in_as(
                     stmt.ast.clone(),
                     &portal.params,
                     conn_state.tx_id,
                     cancel,
+                    Some(stmt.sql.as_str()),
                 )
             };
             // 7.38.1 S2.2 — the row-lock wait loop, extended-protocol
@@ -4901,11 +4977,12 @@ fn handle_execute(
                     .engine
                     .write()
                     .map_err(|_| proto("Execute: engine lock poisoned".to_string()))?;
-                result = eng.execute_prepared_in_with_cancel(
+                result = eng.execute_prepared_in_as(
                     stmt.ast.clone(),
                     &portal.params,
                     conn_state.tx_id,
                     cancel,
+                    Some(stmt.sql.as_str()),
                 );
             }
             (result, false)
@@ -4929,7 +5006,7 @@ fn handle_execute(
         let mut bind_ast = stmt.ast.clone();
         spg_engine::substitute_placeholders(&mut bind_ast, &portal.params)
             .map_err(|e| proto(format!("Execute: bind-final render failed: {e}")))?;
-        persist_wire_write(state, &bind_ast.to_string(), &result, conn_state.tx_id)
+        persist_wire_write(state, &bind_ast.to_string(), &result, conn_state)
             .map_err(|e| proto(format!("Execute: durability append failed: {e}")))?;
     }
     let (wire_style, wire_tz) = state
@@ -6234,8 +6311,14 @@ fn handle_copy_from_stdin(
     role: Role,
     spec: &spg_engine::copy::CopyFromStdinSpec,
     tx_state: &mut u8,
-    tx_id: spg_engine::TxId,
+    conn_state: &crate::ConnState,
 ) -> std::io::Result<()> {
+    let tx_id = conn_state.tx_id;
+    // 9.0.5 — COPY appends its rows itself, not through
+    // `persist_wire_write`. If this connection is inside a transaction
+    // whose `BEGIN` is still deferred, it goes in now — otherwise the
+    // rows would sit in the log with no transaction around them.
+    flush_deferred_begin(state, conn_state)?;
     if !role.can_write() {
         send_error(
             stream,

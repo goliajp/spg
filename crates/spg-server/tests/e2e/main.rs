@@ -156,6 +156,13 @@ mod e2e_derived_sort_work_mem_v7411;
 mod e2e_disk_watermark;
 mod e2e_dml_kill_restart_matrix_round179;
 mod e2e_empty_target_list_round341;
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args
+)]
+mod e2e_empty_transaction_is_free_905;
 mod e2e_error_caret_900;
 mod e2e_error_position_900;
 mod e2e_error_position_round95;
@@ -196,12 +203,6 @@ mod e2e_function_visible_same_query;
 )]
 mod e2e_fuzz;
 mod e2e_gen_series_tstz_round119;
-#[allow(
-    clippy::cast_lossless,
-    clippy::cast_possible_truncation,
-    clippy::doc_markdown,
-    clippy::uninlined_format_args
-)]
 mod e2e_graceful_shutdown;
 #[allow(
     clippy::cast_lossless,
@@ -527,6 +528,7 @@ mod e2e_spg_stat_activity;
 mod e2e_spg_statistic;
 mod e2e_sq8;
 mod e2e_ssi_write_skew_round832;
+mod e2e_stat_query_sees_prepared_910;
 mod e2e_statement_clock_900;
 mod e2e_statement_timeout;
 #[allow(clippy::doc_markdown, clippy::uninlined_format_args)]
