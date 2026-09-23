@@ -323,6 +323,21 @@ impl Engine {
         self
     }
 
+    /// 9.0.4 — install the destination without a floor: nothing is
+    /// logged until a session asks for it with
+    /// `SET log_min_duration_statement`.
+    ///
+    /// A host that starts with the log off used to clear the callback
+    /// too, and then no session could turn it on — the documented knob
+    /// was accepted and did nothing, which is how the shipped images
+    /// behaved (their default is PG's `-1`).
+    #[must_use]
+    pub const fn with_slow_query_logger(mut self, logger: SlowQueryLogger) -> Self {
+        self.slow_query_threshold_us = None;
+        self.slow_query_logger = Some(logger);
+        self
+    }
+
     /// v7.37.16 — turn the slow-query log off, the state PG expresses
     /// as `log_min_duration_statement = -1`. Clears the floor and the
     /// callback together, so an engine re-registered in the same

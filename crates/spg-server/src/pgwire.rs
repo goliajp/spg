@@ -1061,12 +1061,42 @@ fn handle_pg_simple_query(
             engine_lock.execute_readonly_select_streaming(sql, cancel, &mut emit)
         };
         drop(prepared_stmt);
+        // 9.0.4 — read while the lock is held; the arm below needs it
+        // after the lock is gone.
+        let slow_floor_us = engine_lock.slow_query_threshold_us();
         drop(engine_lock);
         conn_state
             .wait_event
             .store(0, std::sync::atomic::Ordering::Relaxed);
         match stream_result {
             Ok(n) => {
+                // 9.0.4 — a streamed SELECT reaches the slow-query log.
+                //
+                // The engine's own measurement sits in
+                // `execute_inner_with_cancel`, which this path does not
+                // go through, so the log an operator turns on to find a
+                // slow query never showed one — measured against
+                // PostgreSQL 18.6, which logs it:
+                //
+                //   SET log_min_duration_statement = 1;
+                //   SELECT count(*) FROM s a, s b WHERE a.id = b.id;
+                //     PG: duration: 412.663 ms   SPG: nothing
+                //
+                // The reading is the one `StatementScope` already took;
+                // this adds one clock read per streamed SELECT, and only
+                // when a floor is set.
+                if let Some(floor) = slow_floor_us {
+                    let started = conn_state
+                        .last_query_start_us
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let elapsed = wallclock_unix_micros().saturating_sub(started);
+                    if started > 0
+                        && let Ok(elapsed) = u64::try_from(elapsed)
+                        && elapsed >= floor
+                    {
+                        crate::log_slow_query(sql, elapsed);
+                    }
+                }
                 // v7.39 (round 318, V51) — and the statement's diagnostics.
                 // The streaming fast path used to skip `drain_notices`
                 // entirely, so a NOTICE or WARNING raised by a SELECT was
