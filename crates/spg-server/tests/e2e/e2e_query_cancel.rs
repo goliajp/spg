@@ -189,3 +189,168 @@ fn cancel_with_wrong_secret_is_a_noop() {
     }
     assert!(saw_row);
 }
+
+/// 9.0.4 — a statement asleep in `pg_sleep` is served outside the
+/// engine lock, by the server's own slicing loop, and that loop used to
+/// raise the cancellation as a spelled-out MESSAGE rather than the
+/// `Cancelled` variant. A message goes through the catch-all, so the
+/// client was told `42000` — the class drivers read as a programming
+/// error and never retry — where PostgreSQL says `57014`.
+///
+/// Both reasons the token trips are pinned, because the variant is also
+/// what lets them be told apart: a timeout keeps PostgreSQL's timeout
+/// sentence, a cancel from elsewhere gets its "user request" one.
+#[test]
+fn statement_timeout_on_a_sleeping_statement_is_57014() {
+    let dir = unique_tmpdir("qcancel3");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = ChildGuard(raw);
+    let addr = addrs.pgwire.clone().expect("pgwire addr");
+
+    let mut s = TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    send_startup(&mut s, "anyone");
+    let _ = handshake(&mut s);
+
+    send_query(&mut s, "SET statement_timeout = '300ms'");
+    loop {
+        if read_message(&mut s).ty == b'Z' {
+            break;
+        }
+    }
+
+    send_query(&mut s, "SELECT pg_sleep(5)");
+    let mut said = None;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'E' => said = Some(String::from_utf8_lossy(&m.body).to_string()),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    let said = said.expect("the sleep was never cut short");
+    assert!(said.contains("57014"), "PG's query_canceled, got {said:?}");
+    assert!(
+        said.contains("statement timeout"),
+        "PG's timeout sentence, got {said:?}"
+    );
+
+    // And the session is still usable, as it is after any ERROR.
+    send_query(&mut s, "SELECT 1");
+    let mut saw_row = false;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'D' => saw_row = true,
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    assert!(saw_row, "session unusable after the timeout");
+}
+
+/// 9.0.4 — the same loop, tripped by another connection's
+/// CancelRequest instead of by the clock. PostgreSQL names the reason:
+/// "canceling statement due to user request".
+#[test]
+fn cancel_request_on_a_sleeping_statement_names_the_user() {
+    let dir = unique_tmpdir("qcancel4");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = ChildGuard(raw);
+    let addr = addrs.pgwire.clone().expect("pgwire addr");
+
+    let mut s = TcpStream::connect(&addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    send_startup(&mut s, "anyone");
+    let (pid, secret) = handshake(&mut s);
+
+    let addr2 = addr.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        send_cancel(&addr2, pid, secret);
+    });
+    send_query(&mut s, "SELECT pg_sleep(5)");
+    let mut said = None;
+    loop {
+        let m = read_message(&mut s);
+        match m.ty {
+            b'E' => said = Some(String::from_utf8_lossy(&m.body).to_string()),
+            b'Z' => break,
+            _ => {}
+        }
+    }
+    canceller.join().unwrap();
+    let said = said.expect("the sleep was never cancelled");
+    assert!(said.contains("57014"), "PG's query_canceled, got {said:?}");
+    assert!(
+        said.contains("user request"),
+        "PG names the sender, got {said:?}"
+    );
+}
+
+/// 9.0.4 — `pg_terminate_backend` answers the victim's statement with
+/// the FATAL, the way PostgreSQL does.
+///
+/// Terminate trips the cancel flag as well, so the victim used to be
+/// told `57014 canceling statement due to statement timeout` — an
+/// ordinary error. A client running one statement acts on it and
+/// leaves, and the 57P01 the session loop sends at the next message
+/// boundary arrives at a socket nobody is reading. Measured on
+/// PostgreSQL 18.6, psql shows exactly one line:
+/// `FATAL: 57P01: terminating connection due to administrator command`.
+#[test]
+fn terminate_answers_the_statement_with_the_fatal() {
+    let dir = unique_tmpdir("qterm");
+    let db = dir.join("spg.db");
+    let (raw, addrs) = local_spawn(&db);
+    let _child = ChildGuard(raw);
+    let addr = addrs.pgwire.clone().expect("pgwire addr");
+
+    let mut victim = TcpStream::connect(&addr).unwrap();
+    victim
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    send_startup(&mut victim, "anyone");
+    let (pid, _secret) = handshake(&mut victim);
+
+    let addr2 = addr.clone();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut k = TcpStream::connect(&addr2).unwrap();
+        k.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        send_startup(&mut k, "anyone");
+        let _ = handshake(&mut k);
+        send_query(&mut k, &format!("SELECT pg_terminate_backend({pid})"));
+        loop {
+            if read_message(&mut k).ty == b'Z' {
+                return;
+            }
+        }
+    });
+
+    send_query(&mut victim, "SELECT pg_sleep(5)");
+    let m = loop {
+        let m = read_message(&mut victim);
+        if m.ty == b'E' {
+            break m;
+        }
+        assert_ne!(m.ty, b'Z', "the sleep finished instead of being terminated");
+    };
+    killer.join().unwrap();
+    let text = String::from_utf8_lossy(&m.body).to_string();
+    assert!(
+        text.contains("57P01"),
+        "PostgreSQL's admin_shutdown, got {text:?}"
+    );
+    assert!(
+        text.contains("FATAL"),
+        "an ERROR tells a pool the session is still good; got {text:?}"
+    );
+    assert!(
+        text.contains("terminating connection due to administrator command"),
+        "PostgreSQL's sentence, got {text:?}"
+    );
+}
