@@ -3112,12 +3112,12 @@ pub(crate) fn backend_count_decr() {
     BACKEND_COUNT.fetch_sub(1, Ordering::Relaxed);
 }
 
-struct ConnectionGuard {
+pub(crate) struct ConnectionGuard {
     state: Arc<ServerState>,
 }
 
 impl ConnectionGuard {
-    fn try_claim(state: &Arc<ServerState>) -> Option<Self> {
+    pub(crate) fn try_claim(state: &Arc<ServerState>) -> Option<Self> {
         let max = state.limits.max_connections;
         loop {
             let current = state.active_connections.load(Ordering::Acquire);

@@ -112,14 +112,35 @@ pub fn spawn_listener(
         .name("spg-pgwire-listen".into())
         .spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else {
+                let Ok(mut stream) = stream else {
                     continue;
                 };
+                // 9.0.4 — `max_connections` and the idle timeout reach
+                // THIS listener too.
+                //
+                // Both were claimed and set on the native accept loop
+                // only, and every PostgreSQL client arrives here: a
+                // server told to cap connections at five took nine, and
+                // one told to close a session idle for three seconds
+                // answered it after six. An operator's cap on a
+                // connection pool is what keeps the process from running
+                // out of memory.
+                //
+                // The slot is claimed HERE — before a thread exists — and
+                // the refusal is delivered after the startup message, the
+                // point PostgreSQL delivers it; a client that has not
+                // finished negotiating reads an early ErrorResponse as a
+                // broken SSL exchange.
+                let claimed = crate::ConnectionGuard::try_claim(&state);
+                if let Some(secs) = state.limits.idle_timeout_sec {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(secs)));
+                }
                 let state = Arc::clone(&state);
                 let _ = thread::Builder::new()
                     .name("spg-pgwire-conn".into())
                     .spawn(move || {
-                        if let Err(e) = handle_conn(stream, &state) {
+                        let _guard = claimed.as_ref(); // released with this thread
+                        if let Err(e) = handle_conn(stream, &state, claimed.is_none()) {
                             eprintln!("spg-server: pg-wire conn error: {e}");
                         }
                     });
@@ -1673,7 +1694,11 @@ fn dispatch_pg_simple_query_multi(
 
 /// New pgwire connection: negotiate optional TLS (SSLRequest), then run the
 /// session over the plain or TLS-wrapped stream.
-fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Result<()> {
+fn handle_conn(
+    mut stream: TcpStream,
+    state: &Arc<ServerState>,
+    over_capacity: bool,
+) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     // v7.39 (round 318, V51) — a shutdown handle for pg_terminate_backend.
     // Cloned before the stream is borrowed by the TLS wrapper.
@@ -1691,7 +1716,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 let mut tls_conn =
                     crate::mysqlwire::build_server_connection().map_err(std::io::Error::other)?;
                 let mut tls = rustls::Stream::new(&mut tls_conn, &mut stream);
-                return run_pg_session(&mut tls, state, true, sock);
+                return run_pg_session(&mut tls, state, true, sock, over_capacity);
             }
             Some(80877104) => {
                 let mut hdr = [0u8; 8];
@@ -1716,7 +1741,7 @@ fn handle_conn(mut stream: TcpStream, state: &Arc<ServerState>) -> std::io::Resu
                 }
                 return Ok(());
             }
-            _ => return run_pg_session(&mut stream, state, false, sock),
+            _ => return run_pg_session(&mut stream, state, false, sock, over_capacity),
         }
     }
 }
@@ -1759,6 +1784,7 @@ fn run_pg_session(
     state: &Arc<ServerState>,
     secure: bool,
     sock: Option<TcpStream>,
+    over_capacity: bool,
 ) -> std::io::Result<()> {
     // v7.38.18 — the peer address, taken BEFORE `sock` is handed on.
     // The hba rules need it and the socket does not survive that far.
@@ -1768,6 +1794,13 @@ fn run_pg_session(
         .map(|a| a.ip());
     // ---- Startup phase ----
     let (user, params) = read_startup(stream)?;
+    // 9.0.4 — PostgreSQL 18.6 answers the startup message of a
+    // connection it has no room for with
+    // `FATAL: sorry, too many clients already` (53300) and closes.
+    if over_capacity {
+        send_fatal(stream, "53300", "sorry, too many clients already")?;
+        return Ok(());
+    }
     // v7.39 (TLS) — SPG_REQUIRE_TLS refuses a plaintext connection. Reported
     // after the startup so the client sees a clean ErrorResponse (SQLSTATE
     // 08P01) rather than a dropped socket.
@@ -2292,6 +2325,28 @@ fn run_pg_session(
                         } else {
                             Ok(())
                         };
+                    }
+                    // 9.0.4 — the idle timeout expired between messages.
+                    //
+                    // The socket's read timeout is how the limit is
+                    // expressed, and dropping the connection on it left
+                    // the client reading `unexpected eof`. PostgreSQL
+                    // 18.6 says what it did: `FATAL: terminating
+                    // connection due to idle-session timeout` (57P05).
+                    // Only at a message boundary — a timeout with a
+                    // partial header is a truncated message, not an idle
+                    // session.
+                    if peek_have == 0
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        )
+                    {
+                        return send_fatal(
+                            stream,
+                            "57P05",
+                            "terminating connection due to idle-session timeout",
+                        );
                     }
                     return Err(e);
                 }
@@ -7375,6 +7430,28 @@ fn send_fatal_terminated(stream: &mut dyn Write) -> std::io::Result<()> {
             .to_be_bytes(),
     )?;
     stream.write_all(&body)
+}
+
+/// 9.0.4 — a `FATAL` ErrorResponse on a connection that is about to be
+/// closed, which is how PostgreSQL refuses one it cannot serve.
+///
+/// `send_error` writes `ERROR`; a client reads that as "this statement
+/// failed" and keeps the connection. `FATAL` is what tells it the
+/// connection is over.
+fn send_fatal(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
+    let mut body = Vec::with_capacity(msg.len() + 32);
+    body.push(b'S');
+    body.extend_from_slice(b"FATAL\0");
+    body.push(b'V');
+    body.extend_from_slice(b"FATAL\0");
+    body.push(b'C');
+    body.extend_from_slice(sqlstate.as_bytes());
+    body.push(0);
+    body.push(b'M');
+    body.extend_from_slice(msg.as_bytes());
+    body.push(0);
+    body.push(0);
+    send_msg(stream, b'E', &body)
 }
 
 fn send_error(stream: &mut dyn Write, sqlstate: &str, msg: &str) -> std::io::Result<()> {
