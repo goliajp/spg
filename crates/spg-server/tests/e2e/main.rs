@@ -503,6 +503,7 @@ mod e2e_session_sync_commit_round172;
 mod e2e_set_limit_over_the_wire_900;
 mod e2e_setop_orderby_wire_round233;
 mod e2e_show_isolation_round118;
+mod e2e_shutdown_tells_904;
 #[allow(
     clippy::cast_lossless,
     clippy::cast_possible_truncation,
