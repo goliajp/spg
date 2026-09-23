@@ -23,6 +23,29 @@ containers with the same limits, pgbench through the extended protocol:
   the ingest transaction (writes)          352      340      547
 ```
 
+### Fixed — every write copied the whole catalog, three times
+
+A catalog is cloned on every write: the commit round keeps a pre-image
+to roll back to if the fsync fails, and a statement keeps one to undo
+itself. The rows inside a table were already shared between clones, but
+each clone still deep-copied every table's schema and index definitions
+and then dropped them again. On sentori's 26 tables that was the largest
+single thing a one-row UPDATE did.
+
+Tables are copy-on-write now: a clone copies pointers, and a write copies
+only the table it writes.
+
+```text
+  one-row UPDATE by primary key                 before     after
+                                                ~284 µs    ~187 µs
+  sentori ingest, durability off, SPG vs PG     538 : 1,132   635 : 1,106 tps
+  sentori ingest, durability on,  SPG vs PG                   330 :   420 tps
+```
+
+With durability on, the fsync now costs the same on both engines
+(1,455 vs 1,476 µs per transaction); what remains is the work itself,
+spread across the statement with no single part at 10% or more.
+
 ### Fixed — a transaction that writes nothing writes no WAL and does not fsync
 
 PostgreSQL assigns no transaction id and writes no WAL for a transaction
