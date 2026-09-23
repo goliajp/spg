@@ -293,6 +293,7 @@ impl Engine {
         tables: &[String],
         _restart_identity: bool,
         only: bool,
+        cascade: bool,
     ) -> Result<QueryResult, EngineError> {
         // RESTART IDENTITY is parsed but not honored yet — the
         // SequenceDef doesn't expose a restart primitive on the
@@ -326,6 +327,42 @@ impl Engine {
                         frontier.push(kid.clone());
                         targets.push(kid);
                     }
+                }
+            }
+        }
+        // 9.0.4 — a table another one references cannot simply be
+        // emptied: every row on the other side would stop satisfying its
+        // foreign key, with nothing said. Measured on PostgreSQL 18.6:
+        //
+        // ```text
+        //   ERROR:  0A000: cannot truncate a table referenced in a
+        //                  foreign key constraint
+        //   DETAIL:  Table "m" references "mp".
+        //   HINT:  Truncate table "m" at the same time, or use
+        //          TRUNCATE ... CASCADE.
+        // ```
+        //
+        // A referencing table named in the SAME statement is fine — both
+        // sides are emptied together — and CASCADE pulls the rest in,
+        // transitively, which is what PostgreSQL does.
+        {
+            let mut i = 0;
+            while i < targets.len() {
+                let name = targets[i].clone();
+                i += 1;
+                for (child, _) in self.referencing_foreign_keys(&name) {
+                    if targets.iter().any(|t| t.eq_ignore_ascii_case(&child)) {
+                        continue;
+                    }
+                    if !cascade {
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "cannot truncate a table referenced in a foreign key constraint\n\
+                             DETAIL:  Table \"{child}\" references \"{name}\".\n\
+                             HINT:  Truncate table \"{child}\" at the same time, or use \
+                             TRUNCATE ... CASCADE."
+                        )));
+                    }
+                    targets.push(child);
                 }
             }
         }

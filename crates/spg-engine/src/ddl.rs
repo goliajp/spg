@@ -1806,6 +1806,30 @@ impl Engine {
         // expression if supplied, or as a direct CAST of
         // the existing value) and re-coerce to the new
         // type. Indices on the column get rebuilt.
+        //
+        // 9.0.4 — but not while a view reads that column. The view's
+        // body is stored as text and re-planned on use, so SPG changed
+        // the type underneath it and said nothing; the view then
+        // answered a different type than the one it was created with.
+        // PostgreSQL refuses, and has no CASCADE for this one:
+        //
+        // ```text
+        //   ERROR:  0A000: cannot alter type of a column used by a view or rule
+        //   DETAIL:  rule _RETURN on view wv depends on column "v"
+        // ```
+        //
+        // Before the borrow below, because the check reads the whole
+        // catalog. Same reader set the DROP COLUMN refusal uses, so the
+        // two cannot disagree about what "reads this column" means.
+        {
+            let readers = self.views_reading_column(tbl, &column);
+            if let Some(v) = readers.first() {
+                return Err(EngineError::Unsupported(alloc::format!(
+                    "cannot alter type of a column used by a view or rule\n\
+                     DETAIL:  rule _RETURN on view {v} depends on column \"{column}\""
+                )));
+            }
+        }
         let new_data_type = column_type_to_data_type(new_type);
         // v7.39 (round 713) — `TYPE <ty> COLLATE <name>`. PG refuses a
         // collation on a non-collatable type; on a collatable one it
@@ -2171,6 +2195,91 @@ impl Engine {
                 Some((stored, names))
             }
         };
+        // 9.0.4 — the rows that are ALREADY there have to satisfy the
+        // constraint before it is installed.
+        //
+        // Measured on PostgreSQL 18.6, adding a UNIQUE or a PRIMARY KEY
+        // over a column that already repeats is refused —
+        //
+        // ```text
+        //   PG 18.6    ERROR: could not create unique index "mu"
+        //              DETAIL: Key (v)=(2) is duplicated.
+        //   SPG 9.0.3  ALTER TABLE  -- and both rows stay
+        // ```
+        //
+        // — and a PRIMARY KEY over a column holding a NULL is refused
+        // with `column "v" of relation "b" contains null values`. SPG
+        // installed both silently, so an application was told it had a
+        // key it did not have: the duplicates it was written to rely on
+        // being impossible were sitting in the table.
+        //
+        // The detector is the one `ATTACH PARTITION` already asks, so
+        // the NULL rule cannot drift between the two. It runs here,
+        // before the mutable borrow below, because it reads the whole
+        // table.
+        if let Some(t) = self.active_catalog().get(tbl) {
+            let cols_for_check: Vec<String> = match &tc {
+                spg_sql::ast::TableConstraint::PrimaryKey { columns, .. }
+                | spg_sql::ast::TableConstraint::Unique { columns, .. } => adopted
+                    .as_ref()
+                    .map_or_else(|| columns.clone(), |(_, names)| names.clone()),
+                _ => Vec::new(),
+            };
+            let positions: Vec<usize> = cols_for_check
+                .iter()
+                .filter_map(|c| {
+                    t.schema()
+                        .columns
+                        .iter()
+                        .position(|sc| sc.name.eq_ignore_ascii_case(c))
+                })
+                .collect();
+            if !positions.is_empty() && positions.len() == cols_for_check.len() {
+                let probe = spg_storage::UniquenessConstraint {
+                    is_primary_key: is_pk,
+                    columns: positions.clone(),
+                    nulls_not_distinct: nnd,
+                    name: con_name.clone(),
+                    deferrable: false,
+                    initially_deferred: false,
+                };
+                // PostgreSQL reports the NULL first: a PRIMARY KEY
+                // implies NOT NULL, and it is checked while the rows are
+                // rewritten, ahead of the index build.
+                if is_pk {
+                    for (&pos, name) in positions.iter().zip(cols_for_check.iter()) {
+                        let has_null = t.rows().iter().enumerate().any(|(i, row)| {
+                            !t.headers().get(i).is_some_and(|h| h.is_deleted())
+                                && row.values.get(pos).is_none_or(spg_storage::Value::is_null)
+                        });
+                        if has_null {
+                            return Err(EngineError::Unsupported(alloc::format!(
+                                "column {name:?} of relation {tbl:?} contains null values"
+                            )));
+                        }
+                    }
+                }
+                if let Some(dup) = crate::constraints::first_duplicate_key(
+                    self.active_catalog(),
+                    tbl,
+                    &probe,
+                    self.speaks_mysql,
+                ) {
+                    let cols = dup.columns.join(", ");
+                    let vals = dup
+                        .key
+                        .iter()
+                        .map(crate::eval::value_to_text)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let name = &dup.conname;
+                    return Err(EngineError::Unsupported(alloc::format!(
+                        "could not create unique index {name:?} \
+                         DETAIL: Key ({cols})=({vals}) is duplicated."
+                    )));
+                }
+            }
+        }
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
         })?;
@@ -2902,6 +3011,50 @@ impl Engine {
             }
         }
         found
+    }
+
+    /// 9.0.4 — the foreign keys on OTHER tables that point at `target`.
+    ///
+    /// `DROP TABLE mp` succeeded while another table's FOREIGN KEY
+    /// referenced it, and `TRUNCATE mp` emptied it while rows referenced
+    /// its keys — in both cases leaving a constraint that no longer
+    /// means anything and rows that no longer satisfy it, with nothing
+    /// said. Measured on PostgreSQL 18.6:
+    ///
+    /// ```text
+    ///   DROP TABLE mp
+    ///     ERROR: cannot drop table mp because other objects depend on it
+    ///     DETAIL: constraint m_v_fkey on table m depends on table mp
+    ///   TRUNCATE mp
+    ///     ERROR: cannot truncate a table referenced in a foreign key constraint
+    ///     DETAIL: Table "m" references "mp".
+    /// ```
+    ///
+    /// A table's own self-reference is left out: dropping or emptying it
+    /// takes the referencing rows with it.
+    ///
+    /// Returns `(child table, constraint name)`, in catalog order.
+    pub(crate) fn referencing_foreign_keys(
+        &self,
+        target: &str,
+    ) -> Vec<(alloc::string::String, alloc::string::String)> {
+        let cat = self.active_catalog();
+        let mut out = Vec::new();
+        for tname in cat.table_names() {
+            if tname.eq_ignore_ascii_case(target) {
+                continue;
+            }
+            let Some(t) = cat.get(&tname) else { continue };
+            for fk in &t.schema().foreign_keys {
+                if fk.parent_table.eq_ignore_ascii_case(target) {
+                    out.push((
+                        tname.clone(),
+                        crate::system_catalog::pg_fk_conname(t, fk, &tname),
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// 9.0.0 — PostgreSQL's refusal, word for word. Measured: the DETAIL
@@ -4152,11 +4305,47 @@ impl Engine {
         if_exists: bool,
         cascade: bool,
     ) -> Result<QueryResult, EngineError> {
+        let all_named = names.clone();
         for name in names {
             // 9.0.0 — a view that reads this table is broken by the
             // drop; PostgreSQL refuses unless CASCADE takes it too.
             if self.active_catalog().get(&name).is_some() {
                 self.settle_view_dependents("table", &name, cascade)?;
+                // 9.0.4 — and the foreign keys pointing AT it. Without
+                // CASCADE PostgreSQL refuses; with it, the dependent
+                // constraints go and the child tables stay.
+                // A referencing table named in the SAME statement is
+                // not a dependency: both sides go together, which is
+                // what `DROP TABLE parent, child` means and what
+                // PostgreSQL allows.
+                let refs: Vec<_> = self
+                    .referencing_foreign_keys(&name)
+                    .into_iter()
+                    .filter(|(child, _)| !all_named.iter().any(|n| n.eq_ignore_ascii_case(child)))
+                    .collect();
+                if !refs.is_empty() {
+                    if !cascade {
+                        let mut detail = alloc::string::String::new();
+                        for (i, (child, con)) in refs.iter().enumerate() {
+                            let head = if i == 0 { "DETAIL:  " } else { "" };
+                            detail.push_str(&alloc::format!(
+                                "{head}constraint {con} on table {child} depends on table {name}\n"
+                            ));
+                        }
+                        return Err(EngineError::Unsupported(alloc::format!(
+                            "cannot drop table {name} because other objects depend on it\n\
+                             {detail}HINT:  Use DROP ... CASCADE to drop the dependent \
+                             objects too."
+                        )));
+                    }
+                    for (child, _) in &refs {
+                        if let Some(t) = self.active_catalog_mut().get_mut(child) {
+                            t.schema_mut()
+                                .foreign_keys
+                                .retain(|fk| !fk.parent_table.eq_ignore_ascii_case(&name));
+                        }
+                    }
+                }
             }
             // v7.39 (round 642) — dropping a partition parent drops its
             // partitions with it.
