@@ -622,5 +622,7 @@ mod cross_version_compat;
 mod e2e_autocommit_row_locks_903;
 mod e2e_copy_903;
 mod e2e_merge_pipeline_903;
+mod e2e_observability_904;
 mod e2e_statement_atomicity_903;
 mod e2e_text_key_writes_903;
+mod e2e_volatile_inputs_survive_restart_904;

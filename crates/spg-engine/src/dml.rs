@@ -759,7 +759,11 @@ use crate::{
 /// Pre-borrow snapshots gathered by `prepare_insert_snapshots` for the
 /// INSERT row loop, taken before the mutable catalog borrow opens.
 struct InsertSnapshots {
-    clock: Option<crate::ClockFn>,
+    // 9.0.4 — the transaction's clock reading, taken once. A runtime
+    // DEFAULT answers `now()` with the instant the statement started,
+    // the way `now()` written in the statement does; reading the clock
+    // per row stored a different timestamp on each row of one INSERT.
+    clock: Option<i64>,
     before_insert_triggers: Vec<(spg_storage::FunctionDef, String, String)>,
     after_insert_triggers: Vec<(spg_storage::FunctionDef, String, String)>,
     trigger_session_cfg: Option<String>,
@@ -1755,7 +1759,7 @@ impl Engine {
         // v7.17.0 Phase 2.1 — snapshot the clock pointer before
         // we hold the catalog mutably so ON UPDATE runtime
         // overrides see the engine wall clock.
-        let clock_for_on_update = self.clock;
+        let clock_for_on_update = self.default_now_micros();
         // v7.31 (mailrs round-28) — the candidate-gathering phase
         // below is READ-ONLY (it builds `planned`; the mutation
         // happens after `let _ = table`). Borrow the catalog
@@ -1993,8 +1997,11 @@ impl Engine {
                 if matches!(expr, Expr::FunctionCall { name, args, ..}
                     if name == "__column_default" && args.is_empty())
                 {
-                    let v =
-                        resolve_column_default_free(&schema_cols[*pos], self.clock, Some(&sess))?;
+                    let v = resolve_column_default_free(
+                        &schema_cols[*pos],
+                        self.default_now_micros(),
+                        Some(&sess),
+                    )?;
                     new_vals[*pos] = v;
                     continue;
                 }
@@ -4462,10 +4469,10 @@ impl Engine {
         &mut self,
         table_name: &str,
     ) -> Result<InsertSnapshots, EngineError> {
-        // v7.9.21 — snapshot the clock fn pointer before the mut
-        // borrow on the catalog opens; runtime DEFAULT eval needs
-        // it inside the row hot loop.
-        let clock = self.clock;
+        // v7.9.21 — snapshot the clock reading before the mut borrow on
+        // the catalog opens; runtime DEFAULT eval needs it inside the
+        // row hot loop.
+        let clock = self.default_now_micros();
         // v7.12.4 — snapshot row-level triggers + their referenced
         // functions before the mut borrow on the catalog opens.
         // Cloned out so the row hot loop can fire them without
@@ -7855,7 +7862,9 @@ fn parse_insert_rows(
     column_meta: &[ColumnSchema],
     tuple_pos: &Option<Vec<Option<usize>>>,
     expected_tuple_len: usize,
-    clock: Option<crate::ClockFn>,
+    // 9.0.4 — the transaction's clock reading, not the clock itself: a
+    // runtime DEFAULT answers with the instant the statement started.
+    clock: Option<i64>,
     seq_floors: &alloc::collections::BTreeMap<usize, i64>,
     enum_label_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,
     set_variant_lookup: &alloc::collections::BTreeMap<usize, Vec<String>>,

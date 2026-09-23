@@ -1160,10 +1160,19 @@ fn tail_wal_v2_filtered(
                         Err(_) => OwnerKind::Skip,
                     }
                 };
-                let accept = match &owner_kind {
-                    OwnerKind::Dml(owner) => filter.accepts_owner(owner),
-                    OwnerKind::Skip => false,
-                };
+                // 9.0.4 — a volatile-inputs record names no table, so it
+                // cannot be matched against the publication; it goes to
+                // every subscriber. Each one REPLACES the last, and only
+                // the statement that follows consumes it, so the readings
+                // a filtered-out statement left behind are overwritten
+                // before anything can apply them.
+                let carries_readings =
+                    is_v3 && pending[cur + 8] == crate::WAL_V3_TYPE_VOLATILE_INPUTS;
+                let accept = carries_readings
+                    || match &owner_kind {
+                        OwnerKind::Dml(owner) => filter.accepts_owner(owner),
+                        OwnerKind::Skip => false,
+                    };
                 if accept {
                     // Flush any pending SKIP run first.
                     if let Some(start) = skip_run_start.take() {
@@ -1375,6 +1384,9 @@ fn follow_once(
         .append(true)
         .open(wal_path)?;
     let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    // 9.0.4 — carried BETWEEN drains: the volatile-inputs record and
+    // the statement it belongs to can arrive in different frames.
+    let mut volatiles: Option<(i64, u64)> = None;
     // v6.7.5 — per-segment chunk assembly state. Populated by
     // `FRAME_TYPE_SEGMENT_FILE_CHUNK` frames; drained + committed
     // to disk once a segment has every chunk in flight.
@@ -1476,6 +1488,19 @@ fn follow_once(
                         let type_byte = pending[cur + 8];
                         match type_byte {
                             crate::WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
+                            // 9.0.4 — what the next record's statement
+                            // drew from. A follower re-EXECUTES the SQL,
+                            // so without it `now()` and
+                            // `gen_random_uuid()` answered differently on
+                            // the follower than on the primary and the
+                            // two held different rows.
+                            crate::WAL_V3_TYPE_VOLATILE_INPUTS => {
+                                volatiles = decode_volatile_inputs(sql_bytes);
+                                cur += header_len + rec_len;
+                                applied_offset =
+                                    applied_offset.saturating_add((header_len + rec_len) as u64);
+                                continue;
+                            }
                             other => {
                                 return Err(std::io::Error::other(format!(
                                     "replicated WAL v3 unknown type byte {other:#04x} at follower offset {} — refusing to apply",
@@ -1492,7 +1517,7 @@ fn follow_once(
                             .engine
                             .write()
                             .map_err(|_| std::io::Error::other("engine lock poisoned"))?;
-                        if let Err(e) = eng.execute(sql) {
+                        if let Err(e) = apply_replicated(&mut eng, sql, volatiles.take()) {
                             return Err(std::io::Error::other(format!(
                                 "follower apply rejected {sql:?}: {e}"
                             )));
@@ -1699,6 +1724,9 @@ fn subscribe_once(
     // `lag_state.follower_applied_pos`, and exit on the
     // shutdown flag between frame reads.
     let mut pending: Vec<u8> = Vec::with_capacity(4096);
+    // 9.0.4 — carried BETWEEN drains: the volatile-inputs record and
+    // the statement it belongs to can arrive in different frames.
+    let mut volatiles: Option<(i64, u64)> = None;
     loop {
         if shutdown.load(Ordering::Acquire) {
             return Ok(());
@@ -1768,6 +1796,14 @@ fn subscribe_once(
                         let type_byte = pending[cur + 8];
                         match type_byte {
                             crate::WAL_V3_TYPE_AUTO_COMMIT_SQL => {}
+                            // 9.0.4 — see the follower loop above.
+                            crate::WAL_V3_TYPE_VOLATILE_INPUTS => {
+                                volatiles = decode_volatile_inputs(sql_bytes);
+                                cur += header_len + rec_len;
+                                applied_offset =
+                                    applied_offset.saturating_add((header_len + rec_len) as u64);
+                                continue;
+                            }
                             // v6.1.4 silently skips durability-checkpoint
                             // markers (no engine state to mutate). v6.1.5
                             // will treat unknown types as fatal once
@@ -1805,7 +1841,7 @@ fn subscribe_once(
                         // happens to exist already). Anything else
                         // surfaces and kills the connection so the
                         // worker can reconnect with a clean state.
-                        if let Err(e) = eng.execute(sql) {
+                        if let Err(e) = apply_replicated(&mut eng, sql, volatiles.take()) {
                             // Subscription-friendly tolerant apply:
                             // "table already exists", "duplicate" → log
                             // and continue. Anything else bails so the
@@ -1899,6 +1935,32 @@ fn read_exact_with_shutdown(
         }
     }
     Ok(true)
+}
+
+/// 9.0.4 — the `[i64 LE micros][u64 LE random state]` a
+/// `WAL_V3_TYPE_VOLATILE_INPUTS` record carries. A malformed payload
+/// reads as `None`, which applies the next statement the way every
+/// build before 9.0.4 did rather than stopping the stream.
+fn decode_volatile_inputs(payload: &[u8]) -> Option<(i64, u64)> {
+    let arr = <[u8; 16]>::try_from(payload).ok()?;
+    Some((
+        i64::from_le_bytes(arr[..8].try_into().ok()?),
+        u64::from_le_bytes(arr[8..].try_into().ok()?),
+    ))
+}
+
+/// 9.0.4 — run a replicated statement at the readings the primary
+/// recorded for it, so the two sides hold the same rows. A stream from
+/// a primary older than 9.0.4 carries no readings and runs as before.
+fn apply_replicated(
+    engine: &mut spg_engine::Engine,
+    sql: &str,
+    volatiles: Option<(i64, u64)>,
+) -> Result<spg_engine::QueryResult, spg_engine::EngineError> {
+    match volatiles {
+        Some((at, random)) => engine.replay_statement(at, random, sql),
+        None => engine.execute(sql),
+    }
 }
 
 #[cfg(test)]

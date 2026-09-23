@@ -47,6 +47,7 @@ use spg_engine::QueryResult;
 use spg_storage::{ColumnSchema, DataType, Value};
 
 use crate::ServerState;
+use crate::StatementScope;
 
 /// v7.17.0 Phase 3.P0-77 — trait object surface that bridges
 /// plain TCP and the rustls-wrapped TLS stream. Every command-
@@ -935,39 +936,6 @@ pub(crate) const CMD_STMT_PREPARE: u8 = 0x16;
 pub(crate) const CMD_STMT_EXECUTE: u8 = 0x17;
 pub(crate) const CMD_STMT_CLOSE: u8 = 0x19;
 pub(crate) const CMD_STMT_RESET: u8 = 0x1a;
-
-/// v7.39 (round 317, V36) — publish what this connection is running.
-/// A mysql-wire connection is in the shared registry now, so it has to
-/// keep `current_sql` / `last_query_start_us` honest the way a pgwire
-/// connection does; otherwise `SHOW PROCESSLIST` and `pg_stat_activity`
-/// would list it as permanently idle while it runs a long statement.
-/// RAII, so an error return clears the slot too.
-struct StatementScope<'a> {
-    conn: &'a Arc<crate::ConnState>,
-}
-
-impl<'a> StatementScope<'a> {
-    fn begin(conn: &'a Arc<crate::ConnState>, sql: &str) -> Self {
-        if let Ok(mut g) = conn.current_sql.write() {
-            g.clear();
-            g.push_str(sql);
-        }
-        conn.last_query_start_us
-            .store(now_micros(), std::sync::atomic::Ordering::Relaxed);
-        Self { conn }
-    }
-}
-
-impl Drop for StatementScope<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut g) = self.conn.current_sql.write() {
-            g.clear();
-        }
-        self.conn
-            .last_query_start_us
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-}
 
 fn now_micros() -> i64 {
     std::time::SystemTime::now()

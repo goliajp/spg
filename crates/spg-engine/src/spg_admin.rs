@@ -401,11 +401,21 @@ impl Engine {
                 // 'idle in transaction' inside a txn, else 'idle'.
                 // v7.39 (round 474) — PG reports NULL state for a background
                 // process; only a client backend is idle or active.
+                // 9.0.4 — the transaction is asked of the ENGINE, which
+                // is the one thing that knows. The host's flag is still
+                // read (the MySQL wire sets it), but on the PostgreSQL
+                // wire nothing ever did, so `idle in transaction` was a
+                // state no connection could reach and `xact_start` was
+                // NULL for every row.
+                let xact_start_us = r.tx_id.and_then(|tx| self.xact_start_micros(tx));
+                let in_tx = xact_start_us.is_some()
+                    || r.tx_id.is_some_and(|tx| self.is_tx_open(tx))
+                    || r.in_transaction;
                 let state = if r.backend_type != "client backend" {
                     ""
                 } else if !r.current_sql.is_empty() {
                     "active"
-                } else if r.in_transaction {
+                } else if in_tx {
                     "idle in transaction"
                 } else {
                     "idle"
@@ -439,17 +449,19 @@ impl Engine {
                     Value::Null,               // client_hostname
                     Value::Int(r.client_port), // client_port
                     started.clone(),           // backend_start
-                    if r.in_transaction {
-                        started.clone()
-                    } else {
-                        Value::Null
+                    // PG reports when the TRANSACTION started, not when
+                    // the connection did.
+                    match (xact_start_us, in_tx) {
+                        (Some(us), _) => Value::Timestamp(us),
+                        (None, true) => started.clone(),
+                        (None, false) => Value::Null,
                     }, // xact_start
                     if r.current_sql.is_empty() {
                         Value::Null
                     } else {
                         started
                     }, // query_start
-                    Value::Null,               // state_change
+                    Value::Null, // state_change
                     Value::text(r.wait_event_type),
                     Value::text(r.wait_event),
                     if state.is_empty() {
@@ -827,12 +839,58 @@ impl Engine {
     /// from the live LockTable; the SQL surface ships now so
     /// adopters can already write monitoring queries / dashboards
     /// against the stable column set.
+    /// 9.0.4 — and it does. The row set was empty in every build from
+    /// v7.37.14 on: the comment said "until v7.37.15", v7.37.15 built
+    /// the lock table, and nothing came back here. Measured against
+    /// PostgreSQL 18.6 on the published 9.0.3, with a `FOR UPDATE`
+    /// transaction running: PG listed 11 rows, SPG 0.
     pub(crate) fn exec_pg_locks(&self) -> QueryResult {
         let columns = pg_locks_schema();
-        // Empty row set until v7.37.15. Documented as the stable
-        // SQL surface — the row content fills in once tuple locks
-        // exist (B2.5 in AUDIT-3-categories).
-        let rows: Vec<Row<'static>> = Vec::new();
+        // The relation a `RelId` names, so `relation` reads as a table
+        // name rather than as an internal number.
+        let names: alloc::collections::BTreeMap<u64, String> = self
+            .catalog
+            .table_names()
+            .into_iter()
+            .filter_map(|n| {
+                let rel = self.catalog.get(&n)?.rel_id();
+                Some((rel.0, n))
+            })
+            .collect();
+        let rows: Vec<Row<'static>> = self
+            .locks
+            .enumerate()
+            .into_iter()
+            .map(|(rel, row, version, mode, granted)| {
+                Row::new(alloc::vec![
+                    Value::text(String::from("tuple")),
+                    // The same source `current_database()` reads; "spg"
+                    // is the embedded default there too.
+                    Value::text(
+                        self.session_param("spg.database")
+                            .map_or_else(|| String::from("spg"), String::from),
+                    ),
+                    names.get(&rel.0).map_or_else(
+                        || Value::text(alloc::format!("{}", rel.0)),
+                        |n| Value::text(n.clone()),
+                    ),
+                    // PG's `virtualtransaction` is "backendID/localXID";
+                    // SPG's writer version is the identity a lock is
+                    // held under, and the row id says which row.
+                    Value::text(alloc::format!("{version}/{}", row.0)),
+                    Value::Int(0),
+                    Value::text(String::from(match mode {
+                        crate::locks::LockMode::KeyShare => "KeyShareLock",
+                        crate::locks::LockMode::Share => "ShareLock",
+                        crate::locks::LockMode::NoKeyUpdate => "ExclusiveLock",
+                        crate::locks::LockMode::Exclusive => "AccessExclusiveLock",
+                    })),
+                    Value::Bool(granted),
+                    Value::Bool(false),
+                    Value::Null,
+                ])
+            })
+            .collect();
         QueryResult::Rows { columns, rows }
     }
 
@@ -1287,7 +1345,10 @@ pub(crate) fn pg_locks_schema() -> Vec<ColumnSchema> {
         ColumnSchema::new("mode", DataType::Text, false),
         ColumnSchema::new("granted", DataType::Bool, false),
         ColumnSchema::new("fastpath", DataType::Bool, false),
-        ColumnSchema::new("waitstart_us", DataType::BigInt, false),
+        // 9.0.4 — nullable, as PostgreSQL's `waitstart` is: a granted
+        // lock never waited. Declared NOT NULL, the first row
+        // `pg_locks` ever produced was refused by its own schema.
+        ColumnSchema::new("waitstart_us", DataType::BigInt, true),
     ]
 }
 

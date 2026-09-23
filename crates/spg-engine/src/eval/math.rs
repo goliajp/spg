@@ -54,9 +54,69 @@ std::thread_local! {
 
 /// Per-thread distinct starting states: golden-ratio steps of a
 /// process counter, so two threads never begin on the same stream.
+///
+/// 9.0.4 — and distinct between PROCESSES, once a host calls
+/// [`seed_process_random`]. Both this counter's start and
+/// `PRNG_SENTINEL` are compile-time constants, so nothing in a
+/// thread's first state came from the process it was running in:
+/// two servers from the same image answered `gen_random_uuid()` with
+/// the same uuid, and a restarted one issued the same sequence again.
+/// PostgreSQL 18.6 answers differently on every start.
 #[cfg(feature = "std")]
 static PRNG_THREAD_SALT: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+
+/// 9.0.4 — mix `seed` into where every thread's stream starts.
+///
+/// A host calls this ONCE, before it serves anything, with something
+/// that differs between runs (`spg-server` uses the wall clock and its
+/// process id). Threads that have already drawn keep the stream they
+/// are on; at startup none has. A host that never calls it keeps the
+/// fixed streams, which is what the test suite and `no_std` embedders
+/// rely on — see [`prng_install_seed`] for the seed a test pins.
+pub fn seed_process_random(seed: u64) {
+    #[cfg(feature = "std")]
+    PRNG_THREAD_SALT.store(
+        seed ^ 0x9E37_79B9_7F4A_7C15,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    #[cfg(not(feature = "std"))]
+    prng_set_state(seed);
+}
+
+/// The calling thread's PRNG state, materialised if this thread has
+/// not drawn yet.
+///
+/// 9.0.4 — materialising is the point: the state is what recovery
+/// replays a statement from ([`crate::Engine::replay_statement`]), and
+/// reading a not-yet-drawn thread as "0" would record a state the
+/// statement never drew from.
+#[must_use]
+pub fn random_state() -> u64 {
+    #[cfg(feature = "std")]
+    {
+        PRNG_TL.with(|c| {
+            let x = c.get();
+            if x != 0 {
+                return x;
+            }
+            let fresh = thread_start_state();
+            c.set(fresh);
+            fresh
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        PRNG_STATE.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Where a thread that has not drawn yet begins.
+#[cfg(feature = "std")]
+fn thread_start_state() -> u64 {
+    use core::sync::atomic::Ordering;
+    PRNG_SENTINEL ^ PRNG_THREAD_SALT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+}
 
 fn xorshift(mut x: u64) -> u64 {
     if x == 0 {
@@ -76,9 +136,7 @@ pub(super) fn prng_next_u64() -> u64 {
         PRNG_TL.with(|c| {
             let mut x = c.get();
             if x == 0 {
-                use core::sync::atomic::Ordering;
-                x = PRNG_SENTINEL
-                    ^ PRNG_THREAD_SALT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+                x = thread_start_state();
             }
             let next = xorshift(x);
             c.set(next);
@@ -162,6 +220,14 @@ pub(super) fn prng_seed(seed: f64) {
 /// documented test-mode caveat.
 pub(crate) fn prng_install_seed(seed: u64) {
     prng_set_state(seed);
+}
+
+/// 9.0.4 — put the calling thread's PRNG back on a state
+/// [`random_state`] read earlier, so the draws that follow are the
+/// draws that followed the first time. Recovery's half of
+/// [`crate::Engine::replay_statement`].
+pub(crate) fn restore_random_state(state: u64) {
+    prng_set_state(state);
 }
 
 /// Advance the PRNG and return a uniform double in [0, 1).

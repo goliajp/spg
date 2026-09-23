@@ -644,7 +644,12 @@ impl Engine {
                 serializable: self.current_isolation_level
                     == spg_sql::ast::IsolationLevel::Serializable,
                 begin_commit_seq: self.commit_seq,
-                xact_start_micros: self.clock.map(|f| f()),
+                // 9.0.4 — the BEGIN statement's own reading, so a
+                // transaction replayed from the WAL starts at the
+                // instant it started the first time (and `now()`,
+                // which answers from the transaction, with it).
+                xact_start_micros: crate::clock::stmt_start_micros()
+                    .or_else(|| self.clock.map(|f| f())),
                 shadow_dirty: false,
                 aborted: false,
                 constraints_deferred: None,

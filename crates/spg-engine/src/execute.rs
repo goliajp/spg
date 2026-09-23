@@ -475,6 +475,71 @@ impl Engine {
         crate::clock::StatementClock::begin(self.clock)
     }
 
+    /// 9.0.4 — the instant a runtime DEFAULT answers the clock with.
+    ///
+    /// PostgreSQL reads the clock once per transaction, and `now()` in a
+    /// DEFAULT answers from that reading exactly as `now()` in the
+    /// statement's own text does — so every row of one INSERT carries the
+    /// same timestamp. See [`crate::ddl::eval_runtime_default_free`].
+    pub(crate) fn default_now_micros(&self) -> Option<i64> {
+        // Readings already taken, in the order `clock_at` prefers them.
+        // Not `clock_at()` itself: it reads the wall clock for a field
+        // this does not use, and a host whose clock counts its calls
+        // (the slow-query log's test clock) can tell.
+        self.current_tx
+            .and_then(|tx| self.tx_catalogs.get(&tx))
+            .and_then(|st| st.xact_start_micros)
+            .or_else(crate::clock::stmt_start_micros)
+            .or_else(|| self.clock.map(|f| f()))
+    }
+
+    /// 9.0.4 — the instant and the random state the running statement
+    /// started from, for a host that records them.
+    ///
+    /// `None` when no statement is running, or when no clock is
+    /// installed — there is nothing to record then.
+    #[must_use]
+    pub fn statement_volatiles(&self) -> Option<(i64, u64)> {
+        crate::statement_volatiles()
+    }
+
+    /// 9.0.4 — run `sql` the way recovery has to: at the instant it
+    /// first ran, drawing from the random state it first drew from.
+    ///
+    /// SPG's WAL records the SQL TEXT, so recovery RUNS the statement
+    /// again. Every value it derived from the clock or the PRNG was
+    /// therefore derived afresh: on the published 9.0.3, a
+    /// `DEFAULT now()` column came back holding the moment of
+    /// recovery, one restart after another, and stopped moving only
+    /// once a CHECKPOINT had written the row out. PostgreSQL 18.6
+    /// keeps what it stored. Handing the statement back its own
+    /// readings is what makes running it again produce what it
+    /// produced.
+    ///
+    /// # Errors
+    /// Whatever the statement raises.
+    pub fn replay_statement(
+        &mut self,
+        at_micros: i64,
+        random_state: u64,
+        sql: &str,
+    ) -> Result<QueryResult, EngineError> {
+        let saved_clock = self.clock;
+        let saved_fixed = crate::FIXED_CLOCK_MICROS.load(core::sync::atomic::Ordering::Relaxed);
+        crate::FIXED_CLOCK_MICROS.store(at_micros, core::sync::atomic::Ordering::Relaxed);
+        // `clock_timestamp()` reads the clock itself rather than the
+        // statement's pinned start, so the clock has to answer the
+        // recorded instant too, not just the statement guard.
+        self.clock = Some(crate::fixed_clock_from_env);
+        let out = {
+            let _stmt = crate::clock::StatementClock::begin_at(at_micros, random_state);
+            self.execute(sql)
+        };
+        self.clock = saved_clock;
+        crate::FIXED_CLOCK_MICROS.store(saved_fixed, core::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// 8.0.3 — the three clock readings for the statement being prepared:
     /// the transaction's BEGIN when this slot has one open, the statement's
     /// own start otherwise, and the wall clock. See `clock::ClockAt`.

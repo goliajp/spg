@@ -256,7 +256,11 @@ fn auto_commit_write_emits_single_v3_record() {
         s.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
 
         // Three auto-commit writes: one DDL + two DML. v4.34 would
-        // have written 9 records (3 per write); v4.41 writes 3.
+        // have written 9 records (3 per write); v4.41 writes 3, and
+        // 9.0.4 writes 6 — each statement is preceded by the 16-byte
+        // record of what it drew from the clock and the PRNG, without
+        // which recovery re-derives those values and changes the rows
+        // (`e2e_volatile_inputs_survive_restart_904.rs`).
         for sql in [
             "CREATE TABLE t (v INT NOT NULL)",
             "INSERT INTO t VALUES (1)",
@@ -271,8 +275,8 @@ fn auto_commit_write_emits_single_v3_record() {
     let (v1, v2, v3) = count_record_versions(&bytes);
     assert_eq!(
         (v1, v2, v3),
-        (0, 0, 3),
-        "v4.41 must emit exactly 3 v3 records (1 per auto-commit write), got v1={v1} v2={v2} v3={v3}, total bytes={}",
+        (0, 0, 6),
+        "9.0.4 must emit exactly 2 v3 records per auto-commit write (readings, then SQL), got v1={v1} v2={v2} v3={v3}, total bytes={}",
         bytes.len()
     );
     fs::remove_dir_all(&dir).ok();

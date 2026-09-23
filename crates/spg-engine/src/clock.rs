@@ -831,6 +831,56 @@ pub(crate) fn stmt_start_micros() -> Option<i64> {
     (v != UNSET).then_some(v)
 }
 
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// The PRNG state this backend's statement started from.
+    static STMT_RANDOM: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(not(feature = "std"))]
+static STMT_RANDOM: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "std")]
+fn load_stmt_random() -> u64 {
+    STMT_RANDOM.with(core::cell::Cell::get)
+}
+
+#[cfg(not(feature = "std"))]
+fn load_stmt_random() -> u64 {
+    STMT_RANDOM.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "std")]
+fn store_stmt_random(v: u64) {
+    STMT_RANDOM.with(|c| c.set(v));
+}
+
+#[cfg(not(feature = "std"))]
+fn store_stmt_random(v: u64) {
+    STMT_RANDOM.store(v, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The PRNG state the running statement started from, if one is
+/// running. See [`StatementClock`].
+pub(crate) fn stmt_random_state() -> Option<u64> {
+    (load_stmt_start() != UNSET).then(load_stmt_random)
+}
+
+/// 9.0.4 — the instant and the random state the running statement
+/// started from, for a host that records them.
+///
+/// A free function, not a method: both readings live per backend, and a
+/// host that has to reach for the engine lock to read them would
+/// deadlock — `append_wal_dialect` runs with that lock already held.
+///
+/// `None` when no statement is running, or when the host installed no
+/// clock: there is nothing to record then, and a WAL record without
+/// them replays the way every build before 9.0.4 did.
+#[must_use]
+pub fn statement_volatiles() -> Option<(i64, u64)> {
+    Some((stmt_start_micros()?, stmt_random_state()?))
+}
+
 /// 9.0.0 — a running statement, for the length of one.
 ///
 /// PostgreSQL reads the clock once when a statement starts
@@ -854,27 +904,55 @@ pub(crate) fn stmt_start_micros() -> Option<i64> {
 /// re-entrant execute (a trigger's SQL, a wire handler inside an
 /// engine entry point) belongs to the statement that provoked it and
 /// reads the same instant.
+/// 9.0.4 — the statement's random state is read here too, and for the
+/// same reason the instant is: both are inputs the statement draws
+/// from, and recovery has to give it the same ones. SPG's WAL records
+/// the SQL text, so a statement is RUN AGAIN on the way back; every
+/// value it derived from the clock or the PRNG would otherwise be
+/// derived afresh. See [`crate::Engine::replay_statement`].
 #[derive(Debug)]
 #[must_use = "the reading is released when the guard drops"]
 pub struct StatementClock {
     prev: i64,
+    prev_random: u64,
 }
 
 impl StatementClock {
     /// Pin `clock`'s reading for the statement about to run.
+    ///
+    /// The clock is read only when this IS the statement — a
+    /// re-entrant begin reads nothing, which a host whose clock counts
+    /// its calls can tell.
     pub(crate) fn begin(clock: Option<crate::ClockFn>) -> Self {
         let prev = load_stmt_start();
+        let prev_random = load_stmt_random();
         if prev == UNSET
             && let Some(f) = clock
         {
             store_stmt_start(f());
+            store_stmt_random(crate::eval::math::random_state());
         }
-        Self { prev }
+        Self { prev, prev_random }
+    }
+
+    /// 9.0.4 — pin the readings recovery recorded, rather than taking
+    /// fresh ones, and put the PRNG back on the state the statement
+    /// drew from.
+    pub(crate) fn begin_at(micros: i64, random: u64) -> Self {
+        let prev = load_stmt_start();
+        let prev_random = load_stmt_random();
+        if prev == UNSET {
+            store_stmt_start(micros);
+            crate::eval::math::restore_random_state(random);
+            store_stmt_random(random);
+        }
+        Self { prev, prev_random }
     }
 }
 
 impl Drop for StatementClock {
     fn drop(&mut self) {
         store_stmt_start(self.prev);
+        store_stmt_random(self.prev_random);
     }
 }

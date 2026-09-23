@@ -741,6 +741,42 @@ pub(crate) fn signal_backend(pid: u32, terminate: bool) -> bool {
 pub(crate) static BACKGROUND_WORKERS: std::sync::OnceLock<Vec<&'static str>> =
     std::sync::OnceLock::new();
 
+/// v7.39 (round 317, V36) — publish what this connection is running,
+/// and stop publishing it when the statement ends.
+///
+/// 9.0.4 — used by BOTH wires. It lived in `mysqlwire` and its doc said
+/// a pgwire connection kept these honest "the way a pgwire connection
+/// does"; the PostgreSQL wire set `current_sql` and never cleared it, so
+/// every live connection read `active` for as long as it stayed open and
+/// no connection could ever be `idle` or `idle in transaction`.
+/// Measured against PostgreSQL 18.6, which reports both.
+///
+/// RAII, so an error return clears the slot too.
+pub(crate) struct StatementScope<'a> {
+    conn: &'a std::sync::Arc<ConnState>,
+}
+
+impl<'a> StatementScope<'a> {
+    pub(crate) fn begin(conn: &'a std::sync::Arc<ConnState>, sql: &str) -> Self {
+        if let Ok(mut g) = conn.current_sql.write() {
+            g.clear();
+            g.push_str(sql);
+        }
+        conn.last_query_start_us
+            .store(crate::pgwire::wallclock_unix_micros(), Ordering::Relaxed);
+        Self { conn }
+    }
+}
+
+impl Drop for StatementScope<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.conn.current_sql.write() {
+            g.clear();
+        }
+        self.conn.last_query_start_us.store(0, Ordering::Relaxed);
+    }
+}
+
 pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
     let Some(state) = ACTIVITY_STATE.get() else {
         return Vec::new();
@@ -773,6 +809,10 @@ pub(crate) fn activity_snapshot() -> Vec<spg_engine::ActivityRow> {
                 wait_event_type: c.wait_event_type_str().to_string(),
                 wait_event: c.wait_event_str().to_string(),
                 elapsed_us: c.elapsed_us(),
+                // 9.0.4 — the slot, so the engine can say whether this
+                // connection is in a transaction and when it began. The
+                // flag below is only ever written by the MySQL wire.
+                tx_id: Some(c.tx_id),
                 in_transaction: c.in_transaction.load(Ordering::Relaxed),
                 application_name,
                 backend_type: "client backend".into(),
@@ -912,10 +952,34 @@ fn startup_hardening() {
 #[cfg(not(unix))]
 fn startup_hardening() {}
 
+/// 9.0.4 — give this process its own random streams.
+///
+/// The engine's PRNG started every thread from compile-time constants,
+/// so nothing in a stream came from the process it ran in: two servers
+/// started from the same image answered `gen_random_uuid()` with the
+/// same uuid, and a restarted one handed out the sequence it had handed
+/// out before. Measured against PostgreSQL 18.6, which answers
+/// differently on every start; every published SPG image from 7.40.11
+/// to 9.0.3 repeats. A `gen_random_uuid()` primary key — sentori's
+/// `events.id` — collides on the first write after a bounce.
+///
+/// `SPG_TEST_RANDOM_SEED` keeps its meaning: a suite that pins the seed
+/// wants the fixed streams, and this would undo the pin.
+fn seed_process_random() {
+    if env::var_os("SPG_TEST_RANDOM_SEED").is_some() {
+        return;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    spg_engine::seed_process_random(nanos ^ (u64::from(std::process::id()) << 32));
+}
+
 fn main() {
     // v7.38 (read01 P5.25) — startup hardening: pin LC_NUMERIC=C and warn on
     // running as root.
     startup_hardening();
+    seed_process_random();
     // v6.10.4 — peek for `--replay-only` before parsing the
     // positional addr arg. The flag re-targets the boot path:
     // load the catalog snapshot + replay the WAL into the
