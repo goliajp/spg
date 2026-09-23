@@ -672,6 +672,13 @@ pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, Stri
             "44000"
         } else if msg.contains("violates check constraint")
             || msg.contains("CHECK constraint violation")
+            // 9.0.4 — the ALTER-time wording. PostgreSQL 18.6 answers
+            // `ALTER TABLE … ADD CONSTRAINT … CHECK` over rows that do
+            // not satisfy it with the same 23514 it uses at INSERT
+            // time; SPG produced the sentence byte for byte and left
+            // the code on the catch-all, so a client catching 23514 to
+            // say "your data does not satisfy this" caught nothing.
+            || msg.contains("is violated by some row")
         {
             "23514"
         } else if msg.contains("violates not-null constraint")
@@ -717,7 +724,22 @@ pub fn error_to_wire(e: &EngineError) -> (alloc::borrow::Cow<'static, str>, Stri
             "42704"
         // v7.39 (read01 round 58) — DROP ROLE with grants still pointing at it
         // (PG 2BP01 dependent_objects_still_exist).
-        } else if msg.contains("cannot be dropped because some objects depend on it") {
+        // 9.0.4 — PostgreSQL files both of these under 0A000: emptying
+        // a table another one references, and changing the type of a
+        // column a view reads. Neither has a way to say "do it anyway",
+        // which is what 0A000 means here.
+        } else if msg.contains("cannot truncate a table referenced in a foreign key constraint")
+            || msg.contains("cannot alter type of a column used by a view or rule")
+        {
+            "0A000"
+        } else if msg.contains("cannot be dropped because some objects depend on it")
+            // 9.0.4 — and the wording every DROP of a relation, column
+            // or schema uses. SPG produced PostgreSQL's sentence, its
+            // DETAIL and its HINT byte for byte and left the code on the
+            // catch-all 42000 — so a migration tool that branches on
+            // 2BP01 to run the CASCADE form saw an unclassified error.
+            || msg.contains("because other objects depend on it")
+        {
             "2BP01"
         // v7.39 (read01 round 62) — an overloaded name with no signature to
         // disambiguate it (PG 42725 ambiguous_function).

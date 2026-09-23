@@ -3314,13 +3314,17 @@ impl Engine {
             Statement::Truncate {
                 tables,
                 restart_identity,
-                cascade: _,
+                cascade,
                 only,
             } => {
                 for t in &tables {
                     self.bump_table_change(t);
                 }
-                self.exec_truncate(tables.as_slice(), restart_identity, only)
+                // 9.0.4 — `cascade` used to be recorded and dropped here.
+                // It decides whether emptying a table that another one
+                // references is refused or takes that one with it, so
+                // the flag has to reach the truncate.
+                self.exec_truncate(tables.as_slice(), restart_identity, only, cascade)
             }
             // v6.7.3 — COMPACT COLD SEGMENTS.
             Statement::CompactColdSegments => self.exec_compact_cold_segments(),
