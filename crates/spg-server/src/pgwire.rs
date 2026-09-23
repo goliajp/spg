@@ -2914,9 +2914,13 @@ fn execute_with_role(
                 // carries statement_timeout) is the judge here.
                 Err(EngineError::DeferrableWouldBlock) => {
                     if cancel.is_cancelled() {
-                        return Err(EngineError::Unsupported(
-                            "canceling statement due to statement timeout".into(),
-                        ));
+                        // 9.0.4 — `Cancelled`, not a message. The token
+                        // trips for two reasons, and only the variant
+                        // reaches the mapping that tells them apart: a
+                        // spelled-out message lands on the catch-all
+                        // 42000, so a client waiting for 57014 sees a
+                        // class it reads as a programming error.
+                        return Err(EngineError::Cancelled);
                     }
                     crate::lock_wait_backoff(waits);
                     waits += 1;
@@ -2959,9 +2963,11 @@ pub(crate) fn serve_pg_sleep(micros: u64, cancel: CancelToken<'_>) -> Result<(),
             return Ok(());
         }
         if cancel.is_cancelled() {
-            return Err(EngineError::Unsupported(
-                "canceling statement due to statement timeout".into(),
-            ));
+            // 9.0.4 — see the deferrable wait above: the variant is
+            // what carries "cancelled" to the SQLSTATE mapping, and
+            // what lets a cancel from another connection be reported
+            // as a user request rather than a timeout.
+            return Err(EngineError::Cancelled);
         }
         std::thread::sleep((end - now).min(SLICE));
     }
@@ -5323,6 +5329,22 @@ fn engine_error_to_wire_conn(
     e: &EngineError,
     conn_state: &crate::ConnState,
 ) -> (std::borrow::Cow<'static, str>, String) {
+    // 9.0.4 — terminate outranks cancel, and it has its own SQLSTATE.
+    // `pg_terminate_backend` trips the cancel flag too, so without this
+    // the victim was told `57014` and psql, running a single `-c`, left
+    // as soon as it had an ERROR it could act on — the 57P01 that the
+    // session loop sends at the next message boundary reached a socket
+    // nobody was reading. PostgreSQL answers the statement ITSELF with
+    // the FATAL, and that is the only thing the client ever sees.
+    if conn_state
+        .terminate
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return (
+            std::borrow::Cow::Borrowed("57P01"),
+            "terminating connection due to administrator command".to_string(),
+        );
+    }
     if matches!(e, EngineError::Cancelled)
         && conn_state
             .cancel_flag
@@ -5563,6 +5585,19 @@ mod engine_error_sqlstate_tests {
         assert_eq!(
             code("CHECK constraint violation on \"t\" (row #0): \"(y > 0)\""),
             "23514"
+        );
+        // 9.0.4 — the ALTER-time wording. SPG produced PostgreSQL's
+        // sentence byte for byte and left the code on the catch-all, so
+        // an application catching 23514 to say "your data does not
+        // satisfy this constraint" caught nothing.
+        assert_eq!(
+            code("check constraint \"kc\" of relation \"k\" is violated by some row"),
+            "23514"
+        );
+        // And the constraint added over rows that already repeat.
+        assert_eq!(
+            code("could not create unique index \"mu\" DETAIL: Key (v)=(2) is duplicated."),
+            "23505"
         );
         // v7.39 (round 132) — WITH CHECK OPTION violation maps to 44000.
         assert_eq!(
@@ -7489,8 +7524,21 @@ fn send_error_full(
     // t (table name), D (detail), s (schema — SPG is single-schema
     // `public`).
     let mut body = Vec::new();
+    // 9.0.4 — the severity follows the SQLSTATE. Class 57's shutdown
+    // codes end the connection, and PostgreSQL reports them as FATAL;
+    // sending them as ERROR tells a pool the session is still good.
+    let severity: &[u8] = match sqlstate {
+        "57P01" | "57P02" | "57P03" | "57P05" => b"FATAL",
+        _ => b"ERROR",
+    };
     body.push(b'S');
-    body.extend_from_slice(b"ERROR");
+    body.extend_from_slice(severity);
+    body.push(0);
+    // PostgreSQL sends the localised severity in `S` and the
+    // non-localised one in `V`; a client that reads `V` must not see a
+    // connection-ending error as an ordinary one either.
+    body.push(b'V');
+    body.extend_from_slice(severity);
     body.push(0);
     body.push(b'C');
     body.extend_from_slice(sqlstate.as_bytes());
@@ -7545,6 +7593,14 @@ fn send_error_full(
         .or_else(|| quoted_after("violates foreign key constraint "))
         .or_else(|| quoted_after("violates check constraint "))
         .or_else(|| quoted_after("violates exclusion constraint "))
+        // 9.0.4 — the DDL-time wordings. PostgreSQL fills `n` for
+        // these too: `check constraint "kc" of relation "k" is
+        // violated by some row`, and `could not create unique index
+        // "mu"` when a constraint is added over rows that repeat.
+        // Tried last, so the `violates …` forms above keep their
+        // longer, more specific match.
+        .or_else(|| quoted_after("check constraint "))
+        .or_else(|| quoted_after("could not create unique index "))
     {
         body.push(b'n');
         body.extend_from_slice(con.as_bytes());
