@@ -585,6 +585,7 @@ mod e2e_wal;
 mod e2e_wal_binary;
 #[allow(unsafe_code)]
 mod e2e_wal_compression;
+mod e2e_wal_damaged_tail_904;
 mod e2e_wal_fsync_global_tx_round304;
 #[allow(unused_mut, unused_variables, clippy::uninlined_format_args)]
 mod e2e_wal_level;
