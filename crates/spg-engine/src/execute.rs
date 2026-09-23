@@ -475,6 +475,31 @@ impl Engine {
         crate::clock::StatementClock::begin(self.clock)
     }
 
+    /// The floor a statement has to cross to reach the slow-query log,
+    /// or `None` when nothing is logged.
+    ///
+    /// 9.0.4 — the SESSION's `log_min_duration_statement` first. It was
+    /// read from the environment at boot and nowhere else, so the
+    /// documented way to turn slow-query logging on —
+    ///
+    ///   SET log_min_duration_statement = 1;
+    ///
+    /// — was accepted, was reflected by `SHOW`, and logged nothing.
+    /// Measured against PostgreSQL 18.6, which logs the next statement.
+    /// PG's scale: milliseconds, `-1` off, `0` everything.
+    #[must_use]
+    pub fn slow_query_threshold_us(&self) -> Option<u64> {
+        match self.session_param("log_min_duration_statement") {
+            Some(v) => match v.trim().trim_end_matches("ms").parse::<i64>() {
+                Ok(ms) => u64::try_from(ms).ok().map(|ms| ms.saturating_mul(1_000)),
+                // Unparseable is not a reason to change what the server
+                // was started with.
+                Err(_) => self.slow_query_threshold_us,
+            },
+            None => self.slow_query_threshold_us,
+        }
+    }
+
     /// 9.0.4 — the instant a runtime DEFAULT answers the clock with.
     ///
     /// PostgreSQL reads the clock once per transaction, and `now()` in a
@@ -1936,7 +1961,7 @@ impl Engine {
             // v6.5.6 — slow-query log: fire callback when elapsed
             // exceeds the configured floor.
             if let (Some(threshold), Some(logger)) =
-                (self.slow_query_threshold_us, self.slow_query_logger)
+                (self.slow_query_threshold_us(), self.slow_query_logger)
                 && elapsed >= threshold
             {
                 logger(sql, elapsed);

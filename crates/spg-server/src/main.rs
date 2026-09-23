@@ -2349,9 +2349,12 @@ fn run(
         let wired = prev
             .with_activity_provider(activity_snapshot)
             .with_audit_providers(audit_chain_snapshot, audit_verify_snapshot);
+        // 9.0.4 — the destination is installed either way. Off at boot
+        // used to mean the callback was not there at all, so
+        // `SET log_min_duration_statement = 1` had nothing to reach.
         *e = match slow_query_threshold_us_from_raw(env_resolve("SPG_SLOW_QUERY_THRESHOLD_MS")) {
             Some(slow_us) => wired.with_slow_query_log(slow_us, log_slow_query),
-            None => wired.without_slow_query_log(),
+            None => wired.with_slow_query_logger(log_slow_query),
         };
         // v7.39 (round 476) — `pg_current_wal_lsn()` reports the WAL's real
         // byte position. Only when a WAL exists: without one, 0/0 is the

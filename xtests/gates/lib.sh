@@ -61,3 +61,29 @@ SQL
   local n; n=$(q "$port" -tAc "SELECT count(*) FROM issues")
   [ "$n" = "$issues" ] || { echo "✗ :$port seeded $n issues, wanted $issues"; return 2; }
 }
+
+# Where an image keeps its data. SPG's images declare /data; the
+# postgres images keep theirs under /var/lib/postgresql.
+datadir() { case "$1" in postgres:*|*/postgres:*) echo /var/lib/postgresql ;; *) echo /data ;; esac; }
+
+# A hash of one table's contents, order-independent: COPY writes the
+# rows, the host sorts them. Row counts are the weakest thing a backup
+# check can compare, so nothing here compares them.
+# `< /dev/null` because psql runs with docker's -i: without it the
+# client reads the CALLER's stdin and eats whatever is feeding the loop.
+table_hash() { q "$1" -tAc "COPY (SELECT * FROM $2) TO STDOUT" < /dev/null 2>/dev/null | LC_ALL=C sort | hashsum; }
+
+hashsum() { if command -v md5 >/dev/null; then md5 -q; else md5sum | cut -d' ' -f1; fi; }
+
+# The public tables, in a fixed order. Sorted HERE, not by the server:
+# `ORDER BY` asks the server's collation, and two versions of the same
+# engine may not sort `issue_user_hits` to the same place — which reads
+# as a table appearing and disappearing when two lists are compared.
+tables() { q "$1" -tAc "SELECT tablename FROM pg_tables WHERE schemaname = 'public'" < /dev/null | LC_ALL=C sort; }
+
+# Every table's hash, one `name hash` line each.
+fingerprint_db() {
+  local p=$1 t list
+  list=$(tables "$p")
+  for t in $list; do echo "$t $(table_hash "$p" "$t")"; done
+}
