@@ -96,6 +96,22 @@ pub(crate) const WAL_V3_TYPE_COMPRESSED_SQL: u8 = 0x03;
 /// PostgreSQL session still writes 0x01 / 0x03 exactly as before, so a
 /// WAL from a PG-only deployment is byte-identical to 7.39.1's.
 pub(crate) const WAL_V3_TYPE_MYSQL_SQL: u8 = 0x04;
+/// 9.0.4 — the clock reading and the PRNG state the NEXT SQL record's
+/// statement ran under. Payload `[i64 LE micros][u64 LE random state]`.
+///
+/// The WAL records SQL TEXT, so recovery runs the statement again, and
+/// a value the statement derived from the clock or the PRNG was
+/// derived afresh. Measured on the published 9.0.3 against PostgreSQL
+/// 18.6: a `DEFAULT now()` column came back holding the moment of
+/// recovery, moving again on the next restart and settling only once a
+/// CHECKPOINT had written the row out — so a stopped-and-copied data
+/// directory held different data from the one it was copied from.
+///
+/// Written as its OWN record, immediately before the SQL record it
+/// belongs to and in the same group, so the plain / compressed /
+/// MySQL SQL tags are unchanged and a WAL without these records — one
+/// an older build wrote — replays exactly as it did before.
+pub(crate) const WAL_V3_TYPE_VOLATILE_INPUTS: u8 = 0x05;
 /// The `algo` byte for an uncompressed `WAL_V3_TYPE_MYSQL_SQL` payload.
 pub(crate) const WAL_COMPRESS_ALGO_NONE: u8 = 0x00;
 pub(crate) const WAL_COMPRESS_ALGO_LZSS: u8 = 0x01;
@@ -103,6 +119,22 @@ pub(crate) const WAL_COMPRESS_ALGO_LZSS: u8 = 0x01;
 /// skip the encoder — LZSS overhead doesn't pay off below ~256 B.
 /// Operator-tunable via `SPG_COMPRESSION_MIN_BYTES` env (v6.6.3).
 pub(crate) const WAL_COMPRESS_MIN_BYTES: usize = 256;
+
+/// 9.0.4 — the record that precedes a statement's own, carrying what
+/// the statement drew from. `None` (no statement running, or no clock
+/// installed) writes nothing: the SQL record then replays as it always
+/// did.
+pub(crate) fn encode_wal_volatile_inputs(volatiles: Option<(i64, u64)>) -> Vec<u8> {
+    let Some((micros, random)) = volatiles else {
+        return Vec::new();
+    };
+    let mut payload = [0u8; 16];
+    payload[..8].copy_from_slice(&micros.to_le_bytes());
+    payload[8..].copy_from_slice(&random.to_le_bytes());
+    // 16 bytes cannot alias the framing sentinels, so this cannot fail.
+    encode_wal_v3_record(WAL_V3_TYPE_VOLATILE_INPUTS, &payload)
+        .expect("a 16-byte payload is always encodable")
+}
 
 pub(crate) fn encode_wal_record(sql: &str) -> std::io::Result<Vec<u8>> {
     let len = u32::try_from(sql.len())
@@ -972,6 +1004,13 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
             // backing). Stays cheap regardless of row count.
             let pre = engine.catalog().clone();
             for task in group {
+                // 9.0.4 — the statement starts HERE, on the leader's
+                // thread, so the instant and the random state recorded
+                // below are the ones it goes on to draw from:
+                // `execute_in_with_cancel`'s own guard is a no-op
+                // inside this one.
+                let _task_clock = engine.begin_statement();
+                let volatiles = engine.statement_volatiles();
                 // r194 — encode the WAL frame BEFORE executing: it
                 // depends only on the SQL text, and an autocommit
                 // statement can't be rolled back individually after
@@ -983,7 +1022,11 @@ pub(crate) fn run_leader_commit_round(state: &ServerState) {
                     encode_wal_auto_commit_sql_metrics(&task.sql, &state.metrics)
                 };
                 let wal_bytes = match encoded {
-                    Ok(b) => b,
+                    Ok(b) => {
+                        let mut framed = encode_wal_volatile_inputs(volatiles);
+                        framed.extend_from_slice(&b);
+                        framed
+                    }
                     Err(e) => {
                         let _ = task.ack.send(CommitResult {
                             result: Err(spg_engine::EngineError::Unsupported(format!(
@@ -1217,11 +1260,18 @@ pub(crate) fn append_wal_dialect(
         return Ok(());
     };
     WAL_APPENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let entry = if mysql {
-        encode_wal_auto_commit_sql_mysql(sql, &state.metrics)?
+    // 9.0.4 — what the statement drew from goes in front of it; see
+    // `WAL_V3_TYPE_VOLATILE_INPUTS`. This path runs on the connection's
+    // own thread, inside the statement guard the wire opened, so the
+    // readings are the statement's.
+    // No engine lock here: this runs with it already held on some
+    // paths, and both readings live per backend anyway.
+    let mut entry = encode_wal_volatile_inputs(spg_engine::statement_volatiles());
+    if mysql {
+        entry.extend_from_slice(&encode_wal_auto_commit_sql_mysql(sql, &state.metrics)?);
     } else {
-        encode_wal_record(sql)?
-    };
+        entry.extend_from_slice(&encode_wal_record(sql)?);
+    }
     let mut f = wal
         .lock()
         .map_err(|_| std::io::Error::other("wal mutex poisoned"))?;
@@ -1341,8 +1391,21 @@ pub(crate) fn wal_volume_free_bytes(path: &Path) -> std::io::Result<u64> {
 /// continues) instead of failing the boot. "One statement failed
 /// to replay" ≠ "the WAL is corrupt" — framing and CRC damage
 /// still error out in the callers.
-pub(crate) fn replay_execute_quarantining(engine: &mut Engine, sql: &str, frame_off: usize) {
-    if let Err(e) = engine.execute(sql) {
+/// 9.0.4 — `volatiles` is what the preceding `WAL_V3_TYPE_VOLATILE_INPUTS`
+/// record carried: the instant and the random state the statement ran
+/// under the first time. `None` — a WAL an older build wrote — runs it
+/// the way this function always did.
+pub(crate) fn replay_execute_quarantining(
+    engine: &mut Engine,
+    sql: &str,
+    frame_off: usize,
+    volatiles: Option<(i64, u64)>,
+) {
+    let outcome = match volatiles {
+        Some((at, random)) => engine.replay_statement(at, random, sql),
+        None => engine.execute(sql),
+    };
+    if let Err(e) = outcome {
         eprintln!(
             "spg-server: WAL replay QUARANTINED statement at offset {frame_off} \
              (boot continues): {sql:?} rejected: {e:?}"
@@ -1350,18 +1413,35 @@ pub(crate) fn replay_execute_quarantining(engine: &mut Engine, sql: &str, frame_
     }
 }
 
+/// 9.0.4 — `pending` holds what the last `WAL_V3_TYPE_VOLATILE_INPUTS`
+/// record carried; a SQL record consumes it. Records that are not SQL
+/// leave it alone, so a durability marker between the two does not
+/// separate them.
 pub(crate) fn dispatch_v3_record(
     tag: u8,
     payload: &[u8],
     frame_off: usize,
     engine: &mut Engine,
+    pending: &mut Option<(i64, u64)>,
 ) -> std::io::Result<bool> {
     match tag {
+        WAL_V3_TYPE_VOLATILE_INPUTS => {
+            let Ok(arr) = <[u8; 16]>::try_from(payload) else {
+                return Err(std::io::Error::other(format!(
+                    "WAL volatile_inputs at offset {frame_off} has {}-byte payload (expected 16)",
+                    payload.len()
+                )));
+            };
+            let micros = i64::from_le_bytes(arr[..8].try_into().expect("checked len above"));
+            let random = u64::from_le_bytes(arr[8..].try_into().expect("checked len above"));
+            *pending = Some((micros, random));
+            Ok(false)
+        }
         WAL_V3_TYPE_AUTO_COMMIT_SQL => {
             let sql = core::str::from_utf8(payload).map_err(|_| {
                 std::io::Error::other("v3 auto_commit_sql payload has non-UTF-8 SQL")
             })?;
-            replay_execute_quarantining(engine, sql, frame_off);
+            replay_execute_quarantining(engine, sql, frame_off, pending.take());
             Ok(true)
         }
         WAL_V3_TYPE_MYSQL_SQL => {
@@ -1392,7 +1472,7 @@ pub(crate) fn dispatch_v3_record(
                 .map_err(|_| std::io::Error::other("v3 mysql_sql payload has non-UTF-8 SQL"))?;
             let was = engine.in_mysql_dialect();
             engine.set_mysql_dialect(true);
-            replay_execute_quarantining(engine, sql, frame_off);
+            replay_execute_quarantining(engine, sql, frame_off, pending.take());
             engine.set_mysql_dialect(was);
             Ok(true)
         }
@@ -1423,7 +1503,7 @@ pub(crate) fn dispatch_v3_record(
                     "WAL compressed_sql at offset {frame_off}: decompressed bytes are not valid UTF-8"
                 ))
             })?;
-            replay_execute_quarantining(engine, sql, frame_off);
+            replay_execute_quarantining(engine, sql, frame_off, pending.take());
             Ok(true)
         }
         WAL_V3_TYPE_DURABILITY_CHECKPOINT => {
@@ -1469,6 +1549,9 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
         .unwrap_or(0);
     let mut cur = 0;
     let mut applied = 0usize;
+    // 9.0.4 — what the last volatile-inputs record carried, waiting
+    // for the statement it belongs to.
+    let mut pending: Option<(i64, u64)> = None;
     while cur < bytes.len() {
         if bytes.len() - cur < 4 {
             eprintln!(
@@ -1549,11 +1632,12 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
         // `durability_checkpoint`) that shouldn't increment the user-
         // SQL `applied` counter.
         let count_as_applied = if let Some(tag) = v3_type_tag {
-            dispatch_v3_record(tag, payload, frame_off, engine)?
+            dispatch_v3_record(tag, payload, frame_off, engine, &mut pending)?
         } else {
             let sql = core::str::from_utf8(payload)
                 .map_err(|_| std::io::Error::other("WAL entry has non-UTF-8 SQL"))?;
-            replay_execute_quarantining(engine, sql, frame_off);
+            // v1/v2 frames predate the volatile-inputs record.
+            replay_execute_quarantining(engine, sql, frame_off, None);
             true
         };
         cur += len;

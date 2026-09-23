@@ -302,7 +302,7 @@ pub const MYSQL_COMPILE_OS: &str = if cfg!(target_os = "linux") {
 pub use crate::users::{Role, ScramSecrets, UserError, UserStore};
 pub use cancel::{CancelToken, MonotonicNowFn};
 /// 9.0.0 — see [`Engine::begin_statement`].
-pub use clock::StatementClock;
+pub use clock::{StatementClock, statement_volatiles};
 pub use execute::{RowCells, StreamItem};
 /// 9.0.0 — see [`Engine::prepare_select_streaming`].
 pub use readonly::PreparedSelect;
@@ -326,6 +326,7 @@ pub(crate) use ddl::{
     resolve_column_default_free,
 };
 pub(crate) use envelope::{EnvelopeParse, build_envelope, split_envelope};
+pub use eval::math::{random_state, seed_process_random};
 use expr_analysis::*;
 pub use expr_index::INDEX_REBUILDS;
 pub use index_access::MULTI_EQ_PROBES;
@@ -662,9 +663,10 @@ pub type ClockFn = fn() -> i64;
 /// Backing store for `SPG_TEST_FIXED_CLOCK_MICROS` (test-mode GUC).
 /// Only ever written when that GUC is set; production engines never
 /// touch it.
-static FIXED_CLOCK_MICROS: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+pub(crate) static FIXED_CLOCK_MICROS: core::sync::atomic::AtomicI64 =
+    core::sync::atomic::AtomicI64::new(0);
 
-fn fixed_clock_from_env() -> i64 {
+pub(crate) fn fixed_clock_from_env() -> i64 {
     FIXED_CLOCK_MICROS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
@@ -1917,6 +1919,17 @@ pub struct ActivityRow {
     pub wait_event_type: String,
     pub wait_event: String,
     pub elapsed_us: i64,
+    /// 9.0.4 — the connection's transaction slot, so the engine can
+    /// answer `state` and `xact_start` from the transaction ITSELF.
+    ///
+    /// `in_transaction` below is a flag the host keeps, and on the
+    /// PostgreSQL wire nothing ever wrote it: every connection read
+    /// `idle` however long it had been sitting in an open transaction,
+    /// and `xact_start` was NULL for all of them. `idle in transaction`
+    /// is the state an operator goes looking for.
+    ///
+    /// `None` for a background process, which has no slot.
+    pub tx_id: Option<TxId>,
     pub in_transaction: bool,
     /// v7.17 Phase 2.4 — startup-param `application_name` (or the
     /// last value the client sent via `SET application_name = '...'`).
@@ -1949,6 +1962,7 @@ impl ActivityRow {
             wait_event_type: String::new(),
             wait_event: String::new(),
             elapsed_us: 0,
+            tx_id: None,
             in_transaction: false,
             application_name: String::new(),
             backend_type: backend_type.into(),
@@ -3545,6 +3559,16 @@ impl Engine {
     /// this is false for the autocommit id.
     pub fn is_tx_open(&self, tx_id: TxId) -> bool {
         self.tx_catalogs.contains_key(&tx_id)
+    }
+
+    /// 9.0.4 — when this slot's transaction began, if it has one open.
+    ///
+    /// What PostgreSQL's `pg_stat_activity.xact_start` reports. SPG
+    /// reported the CONNECTION's start there, on the rows where it
+    /// reported anything at all.
+    #[must_use]
+    pub fn xact_start_micros(&self, tx_id: TxId) -> Option<i64> {
+        self.tx_catalogs.get(&tx_id)?.xact_start_micros
     }
 
     /// v7.40.12 — must this connection's transaction WAIT before taking

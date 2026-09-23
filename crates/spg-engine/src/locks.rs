@@ -253,6 +253,31 @@ impl LockTable {
         self.entries.len()
     }
 
+    /// 9.0.4 — every lock this table holds or is being waited on, as
+    /// `(relation, row, writer version, mode, granted)`.
+    ///
+    /// `pg_locks` answered an empty row set from v7.37.14 — "until
+    /// v7.37.15", said the comment, and v7.37.15 built this table
+    /// without coming back for it. An operator watching for contention
+    /// saw nothing, ever, on a server whose rows were locked.
+    #[must_use]
+    pub fn enumerate(&self) -> Vec<(RelId, RowId, u64, LockMode, bool)> {
+        let mut out = Vec::new();
+        for (&(rel, row), entry) in &self.entries {
+            for &(version, mode) in &entry.holders {
+                out.push((rel, row, version, mode, true));
+            }
+            for &version in &entry.waiters {
+                // A waiter's mode is not kept per row — the wait-for
+                // graph is keyed on the version — so report the
+                // strongest, which is what a waiter on a held row is
+                // blocked by.
+                out.push((rel, row, version, LockMode::Exclusive, false));
+            }
+        }
+        out
+    }
+
     /// DFS over `wait_for` from `start`; returns the set of versions on
     /// a cycle through `start`, or `None` if the wait graph is acyclic
     /// from here. Bounded by the number of active waiters.

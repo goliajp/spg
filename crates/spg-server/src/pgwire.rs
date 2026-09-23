@@ -446,16 +446,10 @@ fn handle_pg_simple_query(
         e.set_current_session(conn_state.pid);
     }
     let now_us = wallclock_unix_micros();
-    conn_state
-        .last_query_start_us
-        .store(now_us, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut s) = conn_state.current_sql.write() {
-        s.clear();
-        match std::str::from_utf8(sql_bytes) {
-            Ok(valid) => s.push_str(valid),
-            Err(_) => s.push_str(&String::from_utf8_lossy(sql_bytes)),
-        }
-    }
+    // 9.0.4 — RAII, so the slot empties when the statement ends. It used
+    // to be set and never cleared, which left every open connection
+    // reading `active` for ever.
+    let _scope = crate::StatementScope::begin(conn_state, &String::from_utf8_lossy(sql_bytes));
     let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
         send_error(wbuf, "22021", "invalid UTF-8 in query")?;
         send_ready_for_query(wbuf, *tx_state)?;
@@ -1301,16 +1295,10 @@ fn handle_pg_simple_query_one_into_wbuf(
     // Mirror the activity registry update from the single-stmt path
     // so spg_stat_activity surfaces the current substatement.
     let now_us = wallclock_unix_micros();
-    conn_state
-        .last_query_start_us
-        .store(now_us, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut s) = conn_state.current_sql.write() {
-        s.clear();
-        match std::str::from_utf8(sql_bytes) {
-            Ok(valid) => s.push_str(valid),
-            Err(_) => s.push_str(&String::from_utf8_lossy(sql_bytes)),
-        }
-    }
+    // 9.0.4 — RAII, so the slot empties when the statement ends. It used
+    // to be set and never cleared, which left every open connection
+    // reading `active` for ever.
+    let _scope = crate::StatementScope::begin(conn_state, &String::from_utf8_lossy(sql_bytes));
     let Ok(sql_str) = std::str::from_utf8(sql_bytes) else {
         send_error(wbuf, "22021", "invalid UTF-8 in query")?;
         return Ok(());
@@ -5142,7 +5130,7 @@ fn monotonic_now_us() -> u64 {
 /// Negligible per call, but every wire-probe SCALARSQ visits this
 /// path, so the cumulative attack budget bills it as one of the
 /// small-wins.
-fn wallclock_unix_micros() -> i64 {
+pub(crate) fn wallclock_unix_micros() -> i64 {
     use std::sync::OnceLock;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     static ORIGIN: OnceLock<(Instant, i64)> = OnceLock::new();

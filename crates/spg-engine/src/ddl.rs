@@ -65,9 +65,9 @@ pub(crate) fn rebuild_all_excl_indexes(cat: &mut spg_storage::Catalog) {
 }
 
 use crate::{
-    CancelToken, ClockFn, Engine, EngineError, QueryResult, check_existing_unique_violation,
-    coerce_value, column_type_to_data_type, enforce_fk_inserts, eval, infer_column_types,
-    literal_expr_to_value, resolve_foreign_key, rewrite_column_in_source, users,
+    CancelToken, Engine, EngineError, QueryResult, check_existing_unique_violation, coerce_value,
+    column_type_to_data_type, enforce_fk_inserts, eval, infer_column_types, literal_expr_to_value,
+    resolve_foreign_key, rewrite_column_in_source, users,
 };
 
 /// v7.39 (round 475) — the column a `to_tsvector(…)` index key reads.
@@ -1681,7 +1681,7 @@ impl Engine {
         // with back-fill of the DEFAULT (or NULL) into every
         // existing row. Column positions don't shift, so we
         // skip index rebuild.
-        let clock = self.clock;
+        let clock = self.default_now_micros();
         let add_mysql = self.speaks_mysql;
         let table = self.active_catalog_mut().get_mut(tbl).ok_or_else(|| {
             EngineError::Storage(StorageError::TableNotFound { name: tbl.into() })
@@ -4052,7 +4052,7 @@ impl Engine {
         stmt: CreateTableStatement,
     ) -> Result<QueryResult, EngineError> {
         let table_name = stmt.name.clone();
-        let clock = self.clock;
+        let clock = self.default_now_micros();
         let existing_col_names: alloc::collections::BTreeSet<String> = self
             .active_catalog()
             .get(&table_name)
@@ -8416,20 +8416,29 @@ fn truncate_ident(name: &mut String) {
 
 pub(crate) fn resolve_column_default_free(
     col: &ColumnSchema,
-    clock_fn: Option<ClockFn>,
+    now_us: Option<i64>,
     // v7.39 (round 525) — the session, for a DEFAULT that names one.
     sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Value<'static>, EngineError> {
     if let Some(rt) = &col.runtime_default {
-        return eval_runtime_default_free(rt, col.ty, clock_fn, sess);
+        return eval_runtime_default_free(rt, col.ty, now_us, sess);
     }
     Ok(col.default.clone().unwrap_or(Value::Null))
 }
 
+/// `now_us` is the instant this DEFAULT answers the clock with — the
+/// transaction's reading, taken once ([`crate::Engine::default_now_micros`]).
+///
+/// 9.0.4 — it used to be a `ClockFn`, read afresh here, and so once per
+/// ROW: `INSERT INTO t (id) VALUES (1), (2)` into a `DEFAULT now()`
+/// column stored two instants 813 µs apart where PostgreSQL 18.6 stores
+/// one. That also put the value out of reach of the WAL's record of what
+/// the statement drew from, so a statement replayed on the way back
+/// could not land on it.
 pub(crate) fn eval_runtime_default_free(
     rt: &str,
     ty: DataType,
-    clock_fn: Option<ClockFn>,
+    now_us: Option<i64>,
     sess: Option<&crate::eval::DmlSession>,
 ) -> Result<Value<'static>, EngineError> {
     let s = rt.trim().to_ascii_lowercase();
@@ -8448,10 +8457,7 @@ pub(crate) fn eval_runtime_default_free(
     } else {
         with_no_parens
     };
-    let now_us = match clock_fn {
-        Some(f) => f(),
-        None => 0,
-    };
+    let now_us = now_us.unwrap_or(0);
     let v = match canonical {
         "now" | "current_timestamp" | "localtimestamp" => Value::Timestamp(now_us),
         "current_date" => Value::Date((now_us / 86_400_000_000) as i32),
