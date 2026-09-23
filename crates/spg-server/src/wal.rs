@@ -397,7 +397,14 @@ pub(crate) fn append_durability_marker(state: &ServerState) -> std::io::Result<u
                 ));
             }
         }
-        wal.write_all(&entry)?;
+        // 9.0.4 — see `append_wal_v3_group`: a partial write leaves a
+        // half-record the next append hides behind, and recovery then
+        // refuses to run.
+        let pre_marker_len = wal.metadata()?.len();
+        if let Err(e) = wal.write_all(&entry) {
+            let _ = wal.set_len(pre_marker_len);
+            return Err(e);
+        }
         pre_marker_offset
         // wal mutex guard dropped here
     };
@@ -649,7 +656,24 @@ pub(crate) fn append_wal_v3_group(
     // successful fsync made them durable, and replay resurrected the
     // rolled-back statements (silent-wrong, r190 chaos pin).
     let pre_append_len = f.metadata()?.len();
-    f.write_all(&batched)?;
+    // 9.0.4 — a FAILED write leaves what it managed to write. `write_all`
+    // can return an error after some of the bytes have landed, and on
+    // ENOSPC it does: the WAL then holds a half-record, the next
+    // successful append lands behind it, and recovery reads the
+    // half-record's length across into it —
+    //
+    //   spg-server: fatal: WAL CRC mismatch at offset 879201 … refusing
+    //   to replay
+    //
+    // — so the database did not come up again at all. Measured by
+    // `xtests/gates/g5-diskfull.sh` on the published 9.0.3 against
+    // PostgreSQL 18.6, which takes the same filling, the same freeing
+    // and the same restart in its stride. The rollback the fsync path
+    // has always done belongs here too.
+    if let Err(e) = f.write_all(&batched) {
+        let _ = f.set_len(pre_append_len);
+        return Err(e);
+    }
     // v5.4.2 — in async-commit mode the flusher thread is
     // responsible for `sync_data`; the client's CC may return
     // before the bytes reach disk. v4.42 group-commit semantics
@@ -1311,7 +1335,24 @@ pub(crate) fn append_wal_dialect(
     }
     // r190 (D13) — same failed-fsync byte rollback as the group path.
     let pre_append_len = f.metadata()?.len();
-    f.write_all(&entry)?;
+    // 9.0.4 — a FAILED write leaves what it managed to write. `write_all`
+    // can return an error after some of the bytes have landed, and on
+    // ENOSPC it does: the WAL then holds a half-record, the next
+    // successful append lands behind it, and recovery reads the
+    // half-record's length across into it —
+    //
+    //   spg-server: fatal: WAL CRC mismatch at offset 879201 … refusing
+    //   to replay
+    //
+    // — so the database did not come up again at all. Measured by
+    // `xtests/gates/g5-diskfull.sh` on the published 9.0.3 against
+    // PostgreSQL 18.6, which takes the same filling, the same freeing
+    // and the same restart in its stride. The rollback the fsync path
+    // has always done belongs here too.
+    if let Err(e) = f.write_all(&entry) {
+        let _ = f.set_len(pre_append_len);
+        return Err(e);
+    }
     // v5.4.2 — async-commit mode opts out of the per-write
     // `sync_data`; durability rides on the flusher thread's
     // periodic `durability_checkpoint` markers instead.
@@ -1537,7 +1578,101 @@ pub(crate) fn dispatch_v3_record(
     }
 }
 
+/// 9.0.4 — what recovery made of a WAL: how many statements it applied,
+/// and how many BYTES of the file it was able to read.
+///
+/// `valid_bytes < bytes.len()` means the tail is damaged and the caller
+/// should cut the file there before appending to it again — otherwise
+/// the next write lands behind the damage and is lost on the restart
+/// after this one.
+pub(crate) struct WalReplay {
+    pub(crate) applied: usize,
+    pub(crate) valid_bytes: usize,
+}
+
 pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Result<usize> {
+    replay_wal_bytes_reporting(bytes, engine).map(|r| r.applied)
+}
+
+/// 9.0.4 — does a readable chain of records run from `at` to the end of
+/// the file?
+///
+/// This is what tells a torn TAIL from corruption in the MIDDLE. A write
+/// cut short leaves bytes nothing can follow; a bit flipped inside one
+/// record leaves every record behind it intact, and those are records
+/// the operator has not lost yet. So the first ends recovery and the
+/// second refuses to boot, which is the distinction
+/// `e2e_chaos::chaos_wal_bit_flip_caught_by_crc32_refuses_to_replay` has
+/// pinned since v4.37.
+///
+/// Framing only — the same header shapes the replay loop reads, and no
+/// payload is interpreted.
+fn records_follow(bytes: &[u8], at: usize) -> bool {
+    let mut cur = at;
+    let mut seen = 0usize;
+    while cur < bytes.len() {
+        if bytes.len() - cur < 4 {
+            return false;
+        }
+        let raw_len = u32::from_le_bytes(bytes[cur..cur + 4].try_into().expect("checked"));
+        cur += 4;
+        let is_v2 = raw_len & WAL_V2_SENTINEL != 0;
+        let is_v3 = is_v2 && (raw_len & WAL_V3_FLAG != 0);
+        let len_mask = if is_v3 {
+            !(WAL_V2_SENTINEL | WAL_V3_FLAG)
+        } else {
+            !WAL_V2_SENTINEL
+        };
+        let len = (raw_len & len_mask) as usize;
+        let expected = if is_v2 {
+            if bytes.len() - cur < 4 {
+                return false;
+            }
+            let c = u32::from_le_bytes(bytes[cur..cur + 4].try_into().expect("checked"));
+            cur += 4;
+            Some(c)
+        } else {
+            None
+        };
+        let tag = if is_v3 {
+            if bytes.len() - cur < 1 {
+                return false;
+            }
+            let t = bytes[cur];
+            cur += 1;
+            Some(t)
+        } else {
+            None
+        };
+        if cur + len > bytes.len() {
+            return false;
+        }
+        if let Some(expected) = expected {
+            let payload = &bytes[cur..cur + len];
+            let actual = match tag {
+                Some(t) => {
+                    let mut buf = Vec::with_capacity(1 + payload.len());
+                    buf.push(t);
+                    buf.extend_from_slice(payload);
+                    spg_crypto::crc32::crc32(&buf)
+                }
+                None => spg_crypto::crc32::crc32(payload),
+            };
+            if actual != expected {
+                return false;
+            }
+        }
+        cur += len;
+        seen += 1;
+    }
+    seen > 0
+}
+
+/// As [`replay_wal_bytes`], and says where the readable WAL ends.
+pub(crate) fn replay_wal_bytes_reporting(
+    bytes: &[u8],
+    engine: &mut Engine,
+) -> std::io::Result<WalReplay> {
     // r1055 (7.38 S3.4) — widen the kill window deterministically: a
     // crash-during-recovery test needs recovery to take long enough
     // to be killed IN, and a sleep per applied frame is the honest
@@ -1580,6 +1715,7 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
                     "spg-server: v2/v3 WAL truncated at offset {cur} (need 4-byte CRC, have {})",
                     bytes.len() - cur
                 );
+                cur = frame_off;
                 break;
             }
             let crc_arr: [u8; 4] = bytes[cur..cur + 4].try_into().expect("checked");
@@ -1596,6 +1732,7 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
                 eprintln!(
                     "spg-server: v3 WAL truncated at offset {cur} (need 1-byte type, have 0)"
                 );
+                cur = frame_off;
                 break;
             }
             let t = bytes[cur];
@@ -1606,6 +1743,7 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
         };
         if cur + len > bytes.len() {
             eprintln!("spg-server: WAL entry truncated (payload_len={len}) — dropping tail");
+            cur = frame_off;
             break;
         }
         let payload = &bytes[cur..cur + len];
@@ -1621,9 +1759,37 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
                 spg_crypto::crc32::crc32(payload)
             };
             if actual != expected {
-                return Err(std::io::Error::other(format!(
-                    "WAL CRC mismatch at offset {frame_off} (expected={expected:#010x}, computed={actual:#010x}, payload_len={len}) — corruption detected, refusing to replay"
-                )));
+                // 9.0.4 — a record that does not check out ends recovery,
+                // unless readable records follow it.
+                //
+                // PostgreSQL reads a break in the chain as the end of the
+                // usable log and comes up on what preceded it. Refusing
+                // instead meant a database that had once run out of disk
+                // never started again: the failed append left a
+                // half-record, the next one landed behind it, and this
+                // check fired on every boot from then on
+                // (`xtests/gates/g5-diskfull.sh`, measured on 9.0.3
+                // against PostgreSQL 18.6, which survives it).
+                //
+                // But a bit flipped INSIDE one record leaves every record
+                // behind it intact, and those are not the operator's to
+                // lose silently — that case still refuses.
+                if records_follow(bytes, cur + len) {
+                    return Err(std::io::Error::other(format!(
+                        "WAL CRC mismatch at offset {frame_off} (expected={expected:#010x}, computed={actual:#010x}, payload_len={len}) — readable records follow it, so this is damage INSIDE the log, not a torn tail; refusing to replay"
+                    )));
+                }
+                //
+                // Loud, and it says what it is dropping: this is the
+                // one place a WAL byte is ever discarded.
+                eprintln!(
+                    "spg-server: WAL CRC mismatch at offset {frame_off} \
+                     (expected={expected:#010x}, computed={actual:#010x}, payload_len={len}) \
+                     — recovery ENDS here; dropping the {} byte(s) from this offset on",
+                    bytes.len() - frame_off
+                );
+                cur = frame_off;
+                break;
             }
         }
         // Dispatch by frame version. v1/v2 payload is the SQL text
@@ -1648,7 +1814,12 @@ pub(crate) fn replay_wal_bytes(bytes: &[u8], engine: &mut Engine) -> std::io::Re
             }
         }
     }
-    Ok(applied)
+    // `cur` is where the readable WAL ends: every break above rewinds it
+    // to the start of the record it could not read.
+    Ok(WalReplay {
+        applied,
+        valid_bytes: cur,
+    })
 }
 
 #[cfg(test)]

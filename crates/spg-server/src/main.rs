@@ -2718,6 +2718,8 @@ fn replay_wal_into_engine(
         && p.exists()
     {
         let mut bytes = fs::read(p)?;
+        let file_len = bytes.len();
+        let mut pitr_capped = false;
         // v4.25 PITR: SPG_REPLAY_UPTO caps replay at a specific
         // byte offset of the WAL. Anything past that offset is
         // ignored on this boot — operator's restore mechanism.
@@ -2734,6 +2736,7 @@ fn replay_wal_into_engine(
                     bytes.len()
                 );
                 bytes.truncate(upto_usize);
+                pitr_capped = true;
             }
         }
         // v5.3.1: skip WAL bytes before the manifest's recorded
@@ -2743,6 +2746,13 @@ fn replay_wal_into_engine(
         // up to the same offset for disk reclaim; v5.3.1 only
         // optimises replay time.
         let baseline_usize = usize::try_from(manifest_wal_baseline).unwrap_or(usize::MAX);
+        // Where `bytes` starts inside the file once the drain below has
+        // run: what the cut at the end has to add back.
+        let replay_from = if baseline_usize > 0 && baseline_usize <= bytes.len() {
+            baseline_usize
+        } else {
+            0
+        };
         if baseline_usize > 0 && baseline_usize <= bytes.len() {
             eprintln!(
                 "spg-server: manifest skip — WAL replay starts at offset {manifest_wal_baseline} \
@@ -2762,7 +2772,27 @@ fn replay_wal_into_engine(
                 bytes.len()
             );
         }
-        let applied = replay_wal_bytes(&bytes, engine)?;
+        let replay = crate::wal::replay_wal_bytes_reporting(&bytes, engine)?;
+        let applied = replay.applied;
+        // 9.0.4 — cut the file where recovery stopped reading.
+        //
+        // A damaged tail is not an error any more (see the CRC branch in
+        // `replay_wal_bytes_reporting`), and leaving it in place would
+        // make the next append land BEHIND it: the record would be
+        // durable on disk and invisible to the restart after this one.
+        // A database that had once run out of disk hit exactly this.
+        // Never when PITR shortened the replay — those bytes are being
+        // held back on purpose, not dropped.
+        if replay.valid_bytes < bytes.len() && !pitr_capped {
+            let keep = replay_from + replay.valid_bytes;
+            eprintln!(
+                "spg-server: cutting the WAL at offset {keep} — the {} byte(s) past it                  could not be read and nothing may be written behind them",
+                file_len - keep
+            );
+            let f = fs::OpenOptions::new().write(true).open(p)?;
+            f.set_len(keep as u64)?;
+            f.sync_all()?;
+        }
         eprintln!(
             "spg-server: replayed {} WAL entries from {}",
             applied,
